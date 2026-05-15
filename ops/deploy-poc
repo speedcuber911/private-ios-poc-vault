@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""Stage, manifest, sign, and optionally rsync a static POC."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CONFIG = Path("~/.poc-vault/secrets/config.env").expanduser()
+DEFAULT_KEY = Path("~/.poc-vault/secrets/signing/manifest-ed25519.key").expanduser()
+SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+class DeployError(Exception):
+    """Raised when a POC cannot be deployed."""
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+def load_env_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.is_file():
+        return values
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        values[key] = os.path.expandvars(os.path.expanduser(value))
+    return values
+
+
+def validate_slug(slug: str) -> None:
+    if not SLUG_RE.fullmatch(slug):
+        raise DeployError(
+            f"Invalid slug {slug!r}. Use lowercase letters, numbers, and hyphens only."
+        )
+
+
+def validate_source(source: Path) -> None:
+    if not source.exists():
+        raise DeployError(f"Source does not exist: {source}")
+    if source.is_file() and source.suffix.lower() not in (".html", ".htm"):
+        raise DeployError("Single-file sources must be .html or .htm files")
+    if source.is_dir() and not (source / "index.html").is_file():
+        raise DeployError(f"Folder source must contain index.html: {source}")
+
+
+def copy_source(source: Path, public_dir: Path) -> None:
+    if source.resolve() == public_dir.resolve():
+        return
+
+    if public_dir.exists():
+        shutil.rmtree(public_dir)
+    public_dir.mkdir(parents=True, exist_ok=True)
+
+    if source.is_file():
+        shutil.copy2(source, public_dir / "index.html")
+        return
+
+    def ignore(_dir: str, names: list[str]) -> set[str]:
+        ignored = {".DS_Store", ".git", ".hg", ".svn", "node_modules"}
+        return {name for name in names if name in ignored}
+
+    shutil.copytree(source, public_dir, ignore=ignore, dirs_exist_ok=True)
+
+
+def write_metadata(
+    poc_dir: Path, slug: str, title: str, description: str, force: bool
+) -> None:
+    metadata_path = poc_dir / "poc.json"
+    created_at = utc_now()
+    if metadata_path.is_file():
+        try:
+            existing = json.loads(metadata_path.read_text(encoding="utf-8"))
+            created_at = existing.get("createdAt") or created_at
+        except json.JSONDecodeError:
+            if not force:
+                raise DeployError(f"Existing metadata is invalid JSON: {metadata_path}")
+
+    metadata = {
+        "createdAt": created_at,
+        "description": description,
+        "slug": slug,
+        "title": title,
+        "updatedAt": utc_now(),
+    }
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def run(cmd: list[str], cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
+    printable = " ".join(cmd)
+    print(f"+ {printable}")
+    return subprocess.run(cmd, cwd=cwd, check=True, text=True)
+
+
+def sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def render_and_sign(
+    pocs_dir: Path,
+    build_dir: Path,
+    base_url: str | None,
+    key_path: Path,
+) -> tuple[Path, Path]:
+    build_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = build_dir / "manifest.json"
+    signature_path = build_dir / "manifest.sig.json"
+
+    render_cmd = [
+        sys.executable,
+        str(ROOT / "ops" / "render-manifest.py"),
+        "--pocs-dir",
+        str(pocs_dir),
+        "-o",
+        str(manifest_path),
+    ]
+    if base_url:
+        render_cmd.extend(["--base-url", base_url])
+    run(render_cmd)
+
+    sign_cmd = [
+        sys.executable,
+        str(ROOT / "ops" / "sign-manifest.py"),
+        str(manifest_path),
+        "--key",
+        str(key_path),
+        "-o",
+        str(signature_path),
+        "--allow-missing-key",
+    ]
+    run(sign_cmd)
+    return manifest_path, signature_path
+
+
+def append_log(event: dict[str, object], log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, sort_keys=True, ensure_ascii=False) + "\n")
+
+
+def remote_shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def rsync_to_server(
+    config: dict[str, str],
+    slug: str,
+    poc_public_dir: Path,
+    manifest_path: Path,
+    signature_path: Path,
+    local_only: bool,
+) -> bool:
+    host = config.get("DEPLOY_HOST") or config.get("HOST")
+    if local_only or not host:
+        print("No DEPLOY_HOST configured; leaving deploy artifacts local.")
+        return False
+
+    user = config.get("DEPLOY_USER", "deploy")
+    server_root = config.get("SERVER_ROOT", "/srv/poc-vault").rstrip("/")
+    remote = f"{user}@{host}"
+    staging_poc = f"{server_root}/staging/pocs/{slug}"
+    live_poc = f"{server_root}/pocs/{slug}"
+    manifest_dir = f"{server_root}/manifest"
+    key_path = config.get("KEY_PATH")
+    ssh_cmd = ["ssh"]
+    rsync_cmd = ["rsync", "-az", "--delete"]
+    if key_path:
+        ssh_options = f"ssh -i {key_path} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+        ssh_cmd.extend(["-i", key_path, "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new"])
+        rsync_cmd.extend(["-e", ssh_options])
+
+    run(ssh_cmd + [remote, "mkdir", "-p", staging_poc, live_poc, manifest_dir, f"{server_root}/staging"])
+    run(rsync_cmd + [f"{poc_public_dir}/", f"{remote}:{staging_poc}/"])
+    run(["rsync", "-az"] + (["-e", ssh_options] if key_path else []) + [str(manifest_path), f"{remote}:{server_root}/staging/manifest.json"])
+    if signature_path.is_file():
+        run(
+            ["rsync", "-az"]
+            + (["-e", ssh_options] if key_path else [])
+            + [
+                str(signature_path),
+                f"{remote}:{server_root}/staging/manifest.sig.json"
+            ]
+        )
+
+    promote = " && ".join(
+        [
+            f"mkdir -p {remote_shell_quote(live_poc)}",
+            f"rsync -a --delete {remote_shell_quote(staging_poc + '/')} {remote_shell_quote(live_poc + '/')}",
+            f"cp {remote_shell_quote(server_root + '/staging/manifest.json')} {remote_shell_quote(manifest_dir + '/manifest.json')}",
+            (
+                f"test ! -f {remote_shell_quote(server_root + '/staging/manifest.sig.json')} "
+                f"|| cp {remote_shell_quote(server_root + '/staging/manifest.sig.json')} "
+                f"{remote_shell_quote(manifest_dir + '/manifest.sig.json')}"
+            ),
+        ]
+    )
+    run(ssh_cmd + [remote, promote])
+    return True
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--slug", required=True)
+    parser.add_argument("--title", required=True)
+    parser.add_argument("--description", required=True)
+    parser.add_argument("--source", required=True, type=Path)
+    parser.add_argument("--pocs-dir", type=Path, default=ROOT / "pocs")
+    parser.add_argument("--build-dir", type=Path, default=ROOT / "build")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--key", type=Path, default=DEFAULT_KEY)
+    parser.add_argument("--force", action="store_true", help="Replace an existing slug.")
+    parser.add_argument(
+        "--local-only",
+        action="store_true",
+        help="Stage, render, and sign locally without attempting rsync.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    slug = args.slug.strip()
+    source = args.source.expanduser().resolve()
+    pocs_dir = args.pocs_dir.expanduser().resolve()
+    build_dir = args.build_dir.expanduser().resolve()
+
+    try:
+        validate_slug(slug)
+        validate_source(source)
+        poc_dir = pocs_dir / slug
+        public_dir = poc_dir / "public"
+        if poc_dir.exists() and not args.force:
+            raise DeployError(f"{poc_dir} already exists. Re-run with --force to replace it.")
+
+        poc_dir.mkdir(parents=True, exist_ok=True)
+        copy_source(source, public_dir)
+        if not (public_dir / "index.html").is_file():
+            raise DeployError(f"Staged POC is missing index.html: {public_dir}")
+        write_metadata(poc_dir, slug, args.title.strip(), args.description.strip(), args.force)
+
+        config = {**load_env_file(args.config.expanduser()), **os.environ}
+        base_url = None
+        wildcard = config.get("POC_WILDCARD_DOMAIN")
+        if wildcard and wildcard.startswith("*."):
+            base_url = f"https://{{slug}}.{wildcard[2:]}"
+        elif config.get("VAULT_DOMAIN"):
+            base_url = f"https://{config['VAULT_DOMAIN']}/pocs/{{slug}}"
+
+        manifest_path, signature_path = render_and_sign(
+            pocs_dir=pocs_dir,
+            build_dir=build_dir,
+            base_url=base_url,
+            key_path=args.key.expanduser(),
+        )
+        deployed = rsync_to_server(
+            config,
+            slug,
+            public_dir,
+            manifest_path,
+            signature_path,
+            local_only=args.local_only,
+        )
+    except (DeployError, subprocess.CalledProcessError) as exc:
+        print(f"deploy-poc: {exc}", file=sys.stderr)
+        return 1
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    deployed_poc = next(poc for poc in manifest["pocs"] if poc["slug"] == slug)
+    event = {
+        "artifactHash": deployed_poc["artifactHash"],
+        "deployed": deployed,
+        "event": "deploy-poc",
+        "manifestSha256": f"sha256:{sha256_path(manifest_path)}",
+        "signatureWritten": signature_path.is_file(),
+        "slug": slug,
+        "source": str(source),
+        "timestamp": utc_now(),
+    }
+    append_log(event, ROOT / "ops" / "deploys.log")
+    print(f"POC {slug!r} staged. Manifest: {manifest_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

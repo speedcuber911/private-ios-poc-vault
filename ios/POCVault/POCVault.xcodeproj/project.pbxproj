@@ -1,0 +1,495 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		200000000000000000000002 /* ManifestTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000003 /* ManifestTests.swift */; };
+		200000000000000000000003 /* POCVaultApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000006 /* POCVaultApp.swift */; };
+		200000000000000000000004 /* POCEntry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000007 /* POCEntry.swift */; };
+		200000000000000000000005 /* POCManifest.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000008 /* POCManifest.swift */; };
+		200000000000000000000006 /* ClientIdentityStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000009 /* ClientIdentityStore.swift */; };
+		200000000000000000000007 /* ManifestClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000010 /* ManifestClient.swift */; };
+		200000000000000000000008 /* AuthenticatedWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000011 /* AuthenticatedWebView.swift */; };
+		200000000000000000000009 /* LibraryViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000012 /* LibraryViewModel.swift */; };
+		200000000000000000000010 /* LibraryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000013 /* LibraryView.swift */; };
+		200000000000000000000011 /* DiagnosticsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000014 /* DiagnosticsView.swift */; };
+		200000000000000000000012 /* Resources/AppIcon/AppIcon60x60@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000015 /* Resources/AppIcon/AppIcon60x60@2x.png */; };
+		200000000000000000000013 /* Resources/AppIcon/AppIcon60x60@3x.png in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000016 /* Resources/AppIcon/AppIcon60x60@3x.png */; };
+		200000000000000000000014 /* Resources/AppIcon/AppIcon1024.png in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000017 /* Resources/AppIcon/AppIcon1024.png */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		300000000000000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 000000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 111111111111111111111111;
+			remoteInfo = POCVault;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		100000000000000000000001 /* POC Vault.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "POC Vault.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		100000000000000000000003 /* ManifestTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManifestTests.swift; sourceTree = "<group>"; };
+		100000000000000000000004 /* POCVaultTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = POCVaultTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		100000000000000000000005 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		100000000000000000000006 /* POCVaultApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = POCVaultApp.swift; sourceTree = "<group>"; };
+		100000000000000000000007 /* POCEntry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = POCEntry.swift; sourceTree = "<group>"; };
+		100000000000000000000008 /* POCManifest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = POCManifest.swift; sourceTree = "<group>"; };
+		100000000000000000000009 /* ClientIdentityStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientIdentityStore.swift; sourceTree = "<group>"; };
+		100000000000000000000010 /* ManifestClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManifestClient.swift; sourceTree = "<group>"; };
+		100000000000000000000011 /* AuthenticatedWebView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthenticatedWebView.swift; sourceTree = "<group>"; };
+		100000000000000000000012 /* LibraryViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryViewModel.swift; sourceTree = "<group>"; };
+		100000000000000000000013 /* LibraryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryView.swift; sourceTree = "<group>"; };
+		100000000000000000000014 /* DiagnosticsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsView.swift; sourceTree = "<group>"; };
+		100000000000000000000015 /* Resources/AppIcon/AppIcon60x60@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "Resources/AppIcon/AppIcon60x60@2x.png"; sourceTree = "<group>"; };
+		100000000000000000000016 /* Resources/AppIcon/AppIcon60x60@3x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "Resources/AppIcon/AppIcon60x60@3x.png"; sourceTree = "<group>"; };
+		100000000000000000000017 /* Resources/AppIcon/AppIcon1024.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = Resources/AppIcon/AppIcon1024.png; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		400000000000000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		400000000000000000000002 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		500000000000000000000001 = {
+			isa = PBXGroup;
+			children = (
+				500000000000000000000002 /* POCVault */,
+				500000000000000000000003 /* POCVaultTests */,
+				500000000000000000000004 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		500000000000000000000002 /* POCVault */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000005 /* Info.plist */,
+				100000000000000000000006 /* POCVaultApp.swift */,
+				500000000000000000000005 /* Models */,
+				500000000000000000000006 /* Security */,
+				500000000000000000000007 /* Networking */,
+				500000000000000000000008 /* Web */,
+				500000000000000000000009 /* Views */,
+				100000000000000000000015 /* Resources/AppIcon/AppIcon60x60@2x.png */,
+				100000000000000000000016 /* Resources/AppIcon/AppIcon60x60@3x.png */,
+				100000000000000000000017 /* Resources/AppIcon/AppIcon1024.png */,
+			);
+			path = POCVault;
+			sourceTree = "<group>";
+		};
+		500000000000000000000003 /* POCVaultTests */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000003 /* ManifestTests.swift */,
+			);
+			path = POCVaultTests;
+			sourceTree = "<group>";
+		};
+		500000000000000000000004 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000001 /* POC Vault.app */,
+				100000000000000000000004 /* POCVaultTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		500000000000000000000005 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000007 /* POCEntry.swift */,
+				100000000000000000000008 /* POCManifest.swift */,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
+		500000000000000000000006 /* Security */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000009 /* ClientIdentityStore.swift */,
+			);
+			path = Security;
+			sourceTree = "<group>";
+		};
+		500000000000000000000007 /* Networking */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000010 /* ManifestClient.swift */,
+			);
+			path = Networking;
+			sourceTree = "<group>";
+		};
+		500000000000000000000008 /* Web */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000011 /* AuthenticatedWebView.swift */,
+			);
+			path = Web;
+			sourceTree = "<group>";
+		};
+		500000000000000000000009 /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000012 /* LibraryViewModel.swift */,
+				100000000000000000000013 /* LibraryView.swift */,
+				100000000000000000000014 /* DiagnosticsView.swift */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		111111111111111111111111 /* POCVault */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 800000000000000000000002 /* Build configuration list for PBXNativeTarget "POCVault" */;
+			buildPhases = (
+				600000000000000000000001 /* Sources */,
+				400000000000000000000001 /* Frameworks */,
+				600000000000000000000002 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = POCVault;
+			productName = "POC Vault";
+			productReference = 100000000000000000000001 /* POC Vault.app */;
+			productType = "com.apple.product-type.application";
+		};
+		222222222222222222222222 /* POCVaultTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 800000000000000000000003 /* Build configuration list for PBXNativeTarget "POCVaultTests" */;
+			buildPhases = (
+				600000000000000000000003 /* Sources */,
+				400000000000000000000002 /* Frameworks */,
+				600000000000000000000004 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				700000000000000000000001 /* PBXTargetDependency */,
+			);
+			name = POCVaultTests;
+			productName = POCVaultTests;
+			productReference = 100000000000000000000004 /* POCVaultTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		000000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1600;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					111111111111111111111111 = {
+						CreatedOnToolsVersion = 16.0;
+					};
+					222222222222222222222222 = {
+						CreatedOnToolsVersion = 16.0;
+						TestTargetID = 111111111111111111111111;
+					};
+				};
+			};
+			buildConfigurationList = 800000000000000000000001 /* Build configuration list for PBXProject "POCVault" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 500000000000000000000001;
+			productRefGroup = 500000000000000000000004 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				111111111111111111111111 /* POCVault */,
+				222222222222222222222222 /* POCVaultTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		600000000000000000000002 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				200000000000000000000012 /* Resources/AppIcon/AppIcon60x60@2x.png in Resources */,
+				200000000000000000000013 /* Resources/AppIcon/AppIcon60x60@3x.png in Resources */,
+				200000000000000000000014 /* Resources/AppIcon/AppIcon1024.png in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		600000000000000000000004 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		600000000000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				200000000000000000000003 /* POCVaultApp.swift in Sources */,
+				200000000000000000000004 /* POCEntry.swift in Sources */,
+				200000000000000000000005 /* POCManifest.swift in Sources */,
+				200000000000000000000006 /* ClientIdentityStore.swift in Sources */,
+				200000000000000000000007 /* ManifestClient.swift in Sources */,
+				200000000000000000000008 /* AuthenticatedWebView.swift in Sources */,
+				200000000000000000000009 /* LibraryViewModel.swift in Sources */,
+				200000000000000000000010 /* LibraryView.swift in Sources */,
+				200000000000000000000011 /* DiagnosticsView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		600000000000000000000003 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				200000000000000000000002 /* ManifestTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		700000000000000000000001 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 111111111111111111111111 /* POCVault */;
+			targetProxy = 300000000000000000000001 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		900000000000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		900000000000000000000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		900000000000000000000003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = POCVault/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				POC_VAULT_MANIFEST_URL = "https://vault.pocs.example.com/manifest.json";
+				POC_VAULT_SIGNATURE_URL = "https://vault.pocs.example.com/manifest.sig.json";
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.pocvault;
+				PRODUCT_MODULE_NAME = POCVault;
+				PRODUCT_NAME = "POC Vault";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		900000000000000000000004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = POCVault/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				POC_VAULT_MANIFEST_URL = "https://vault.pocs.example.com/manifest.json";
+				POC_VAULT_SIGNATURE_URL = "https://vault.pocs.example.com/manifest.sig.json";
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.pocvault;
+				PRODUCT_MODULE_NAME = POCVault;
+				PRODUCT_NAME = "POC Vault";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+		900000000000000000000005 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.pocvault.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/POC Vault.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/POC Vault";
+			};
+			name = Debug;
+		};
+		900000000000000000000006 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.pocvault.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/POC Vault.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/POC Vault";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		800000000000000000000001 /* Build configuration list for PBXProject "POCVault" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				900000000000000000000001 /* Debug */,
+				900000000000000000000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		800000000000000000000002 /* Build configuration list for PBXNativeTarget "POCVault" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				900000000000000000000003 /* Debug */,
+				900000000000000000000004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		800000000000000000000003 /* Build configuration list for PBXNativeTarget "POCVaultTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				900000000000000000000005 /* Debug */,
+				900000000000000000000006 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 000000000000000000000001 /* Project object */;
+}

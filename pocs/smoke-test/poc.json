@@ -1,0 +1,7 @@
+{
+  "createdAt": "2026-05-15T00:00:00Z",
+  "description": "A tiny first POC used to verify deploy, manifest, and iOS loading.",
+  "slug": "smoke-test",
+  "title": "Smoke Test",
+  "updatedAt": "2026-05-15T18:15:25Z"
+}

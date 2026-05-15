@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Serve a local signed POC Vault manifest and static POCs for iOS Simulator."""
+
+from __future__ import annotations
+
+import argparse
+import mimetypes
+import re
+import subprocess
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+class SimulatorVaultServer(ThreadingHTTPServer):
+    def __init__(self, server_address: tuple[str, int], handler_class: type[BaseHTTPRequestHandler]):
+        super().__init__(server_address, handler_class)
+        self.manifest_dir = ROOT / "build" / "simulator"
+        self.pocs_dir = ROOT / "pocs"
+
+
+class Handler(BaseHTTPRequestHandler):
+    server: SimulatorVaultServer
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path)
+
+        if path == "/healthz":
+            self.send_bytes(b"ok\n", "text/plain")
+            return
+        if path == "/manifest.json":
+            self.send_file(self.server.manifest_dir / "manifest.json", "application/json")
+            return
+        if path == "/manifest.sig.json":
+            self.send_file(self.server.manifest_dir / "manifest.sig.json", "application/json")
+            return
+        if path.startswith("/pocs/"):
+            self.serve_poc(path)
+            return
+
+        self.send_error(404)
+
+    def serve_poc(self, path: str) -> None:
+        parts = path.strip("/").split("/", 2)
+        if len(parts) < 2 or parts[0] != "pocs":
+            self.send_error(404)
+            return
+
+        slug = parts[1]
+        if not SLUG_RE.fullmatch(slug):
+            self.send_error(404)
+            return
+
+        relative = parts[2] if len(parts) == 3 and parts[2] else "index.html"
+        if relative.endswith("/"):
+            relative += "index.html"
+
+        candidate = (self.server.pocs_dir / slug / "public" / relative).resolve()
+        public_root = (self.server.pocs_dir / slug / "public").resolve()
+        if not str(candidate).startswith(str(public_root)) or not candidate.is_file():
+            self.send_error(404)
+            return
+
+        self.send_file(candidate)
+
+    def send_file(self, path: Path, content_type: str | None = None) -> None:
+        if not path.is_file():
+            self.send_error(404)
+            return
+        guessed = content_type or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        self.send_bytes(path.read_bytes(), guessed)
+
+    def send_bytes(self, payload: bytes, content_type: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format: str, *args: object) -> None:
+        sys.stderr.write("sim-vault: " + format % args + "\n")
+
+
+def refresh_manifest(host: str, port: int) -> None:
+    manifest_dir = ROOT / "build" / "simulator"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = manifest_dir / "manifest.json"
+    signature_path = manifest_dir / "manifest.sig.json"
+    base_url = f"http://{host}:{port}/pocs/{{slug}}"
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "ops" / "render-manifest.py"),
+            "--pocs-dir",
+            str(ROOT / "pocs"),
+            "--base-url",
+            base_url,
+            "-o",
+            str(manifest_path),
+        ],
+        cwd=ROOT,
+        check=True,
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "ops" / "sign-manifest.py"),
+            str(manifest_path),
+            "-o",
+            str(signature_path),
+        ],
+        cwd=ROOT,
+        check=True,
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8787)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    refresh_manifest(args.host, args.port)
+    server = SimulatorVaultServer((args.host, args.port), Handler)
+    print(f"POC Vault simulator server on http://{args.host}:{args.port}")
+    server.serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

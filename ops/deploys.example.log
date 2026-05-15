@@ -1,0 +1,2 @@
+{"event":"log-created","note":"ops/deploy-poc appends JSON lines to ops/deploys.log"}
+{"artifactHash":"sha256:<artifact-sha>","deployed":true,"event":"deploy-poc","manifestSha256":"sha256:<manifest-sha>","signatureWritten":true,"slug":"example-poc","source":"<local-source-path>","timestamp":"2026-01-01T00:00:00Z"}
