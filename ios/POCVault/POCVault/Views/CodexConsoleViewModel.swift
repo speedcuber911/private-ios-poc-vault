@@ -9,6 +9,7 @@ final class CodexConsoleViewModel: ObservableObject {
     @Published private(set) var jobs: [CodexJob] = []
     @Published private(set) var isRefreshing = false
     @Published private(set) var isCreating = false
+    @Published private(set) var isTranscribing = false
     @Published private(set) var cancellingJobIDs: Set<String> = []
     @Published private(set) var lastRefreshedAt: Date?
     @Published var selectedWorkspaceID: String? {
@@ -80,11 +81,15 @@ final class CodexConsoleViewModel: ObservableObject {
     }
 
     var visibleThreads: [CodexThread] {
-        threadsForSelectedWorkspace.filter { !$0.isSmokeTest }
+        threads.filter { !$0.isSmokeTest }
     }
 
     var visibleThreadCount: Int {
         visibleThreads.count
+    }
+
+    var threadFeedItems: [CodexThreadFeedItem] {
+        CodexThreadFeedItem.makeFeed(threads: threads, jobs: jobs)
     }
 
     var composeWorkspaceID: String {
@@ -117,6 +122,39 @@ final class CodexConsoleViewModel: ObservableObject {
 
     func removeSkill(_ skill: CodexSkill) {
         selectedSkills.removeAll { $0 == skill }
+    }
+
+    func appendTranscription(_ text: String) {
+        let transcript = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !transcript.isEmpty else { return }
+
+        let existingPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if existingPrompt.isEmpty {
+            prompt = transcript
+        } else {
+            prompt = "\(existingPrompt)\n\n\(transcript)"
+        }
+    }
+
+    func transcribePromptAudio(fileURL: URL) async {
+        if let text = await transcribeAudioText(fileURL: fileURL) {
+            appendTranscription(text)
+        }
+    }
+
+    func transcribeAudioText(fileURL: URL) async -> String? {
+        isTranscribing = true
+        defer { isTranscribing = false }
+
+        do {
+            let transcription = try await client.transcribeAudio(fileURL: fileURL)
+            errorMessage = nil
+            return transcription.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch {
+            guard !Self.isCancellation(error) else { return nil }
+            errorMessage = error.localizedDescription
+            return nil
+        }
     }
 
     func bootstrapIfNeeded() async {

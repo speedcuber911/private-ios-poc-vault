@@ -1,43 +1,51 @@
 import SwiftUI
 import UIKit
+import AVFoundation
 
 struct CodexConsoleView: View {
     @ObservedObject var viewModel: CodexConsoleViewModel
-    @State private var path: [String] = []
-    @State private var resultsExpanded = false
+    @State private var path: [CodexRoute] = []
 
     var body: some View {
         NavigationStack(path: $path) {
             ZStack {
                 CodexTheme.background.ignoresSafeArea()
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 20) {
-                        CodexHeader(viewModel: viewModel)
+                GeometryReader { proxy in
+                    ScrollView(.vertical) {
+                        VStack(alignment: .leading, spacing: 20) {
+                            CodexHeader(viewModel: viewModel)
 
-                        CodexPromptCard(
-                            viewModel: viewModel,
-                            onCreated: { jobID in path.append(jobID) },
-                            onOpenJob: { jobID in path.append(jobID) }
-                        )
+                            CodexPromptCard(
+                                viewModel: viewModel,
+                                onCreated: { jobID in
+                                    if let selectedSessionID = viewModel.selectedSessionID {
+                                        path.append(.thread(selectedSessionID))
+                                    } else {
+                                        path.append(.job(jobID))
+                                    }
+                                },
+                                onOpenJob: { jobID in path.append(.job(jobID)) }
+                            )
 
-                        if let errorMessage = viewModel.errorMessage {
-                            CodexErrorCard(summary: CodexErrorSummary(message: errorMessage)) {
-                                Task { await viewModel.refreshAll() }
+                            if let errorMessage = viewModel.errorMessage {
+                                CodexErrorCard(summary: CodexErrorSummary(message: errorMessage)) {
+                                    Task { await viewModel.refreshAll() }
+                                }
                             }
-                        }
 
-                        CollapsibleResultsSection(
-                            viewModel: viewModel,
-                            isExpanded: $resultsExpanded
-                        ) { jobID in
-                            path.append(jobID)
+                            CodexThreadFeedSection(
+                                viewModel: viewModel,
+                                onOpenThread: { sessionID in path.append(.thread(sessionID)) },
+                                onOpenJob: { jobID in path.append(.job(jobID)) }
+                            )
                         }
+                        .padding(.horizontal, 20)
+                        .padding(.top, 8)
+                        .padding(.bottom, 132)
+                        .frame(width: proxy.size.width, alignment: .leading)
                     }
-                    .padding(.horizontal, 20)
-                    .padding(.top, 8)
-                    .padding(.bottom, 132)
+                    .scrollDismissesKeyboard(.interactively)
                 }
-                .scrollDismissesKeyboard(.interactively)
             }
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
@@ -45,17 +53,22 @@ struct CodexConsoleView: View {
             .refreshable {
                 await viewModel.refreshAll()
             }
-            .navigationDestination(for: String.self) { jobID in
-                CodexJobDetailView(
-                    jobID: jobID,
-                    viewModel: viewModel,
-                    onCreated: { newJobID in
-                        path.append(newJobID)
-                    },
-                    onContinueThread: {
-                        path.removeAll()
-                    }
-                )
+            .navigationDestination(for: CodexRoute.self) { route in
+                switch route {
+                case .job(let jobID):
+                    CodexJobDetailView(
+                        jobID: jobID,
+                        viewModel: viewModel,
+                        onOpenThread: { sessionID in path.append(.thread(sessionID)) },
+                        onOpenJob: { jobID in path.append(.job(jobID)) }
+                    )
+                case .thread(let sessionID):
+                    CodexThreadDetailView(
+                        sessionID: sessionID,
+                        viewModel: viewModel,
+                        onOpenJob: { jobID in path.append(.job(jobID)) }
+                    )
+                }
             }
             .task {
                 await viewModel.bootstrapIfNeeded()
@@ -63,6 +76,11 @@ struct CodexConsoleView: View {
             }
         }
     }
+}
+
+private enum CodexRoute: Hashable {
+    case job(String)
+    case thread(String)
 }
 
 private enum CodexTheme {
@@ -115,11 +133,12 @@ private struct CodexPromptCard: View {
     @FocusState private var promptIsFocused: Bool
     @State private var showingSkillPicker = false
     @State private var showingThreadPicker = false
+    @StateObject private var audioRecorder = CodexPromptAudioRecorder()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 6) {
-                Text(viewModel.selectedSession == nil ? "What should Codex do?" : "Continue this thread")
+                Text(viewModel.selectedSessionID == nil ? "What should Codex do?" : "Continue this thread")
                     .font(.title2.weight(.semibold))
                     .foregroundStyle(CodexTheme.text)
                 Text(contextText)
@@ -176,6 +195,29 @@ private struct CodexPromptCard: View {
                 Spacer()
 
                 Button {
+                    toggleRecording()
+                } label: {
+                    ZStack {
+                        if viewModel.isTranscribing {
+                            ProgressView()
+                                .tint(CodexTheme.text)
+                        } else {
+                            Image(systemName: audioRecorder.isRecording ? "stop.fill" : "mic.fill")
+                                .font(.system(size: 15, weight: .bold))
+                                .foregroundStyle(audioRecorder.isRecording ? Color.white : CodexTheme.text)
+                        }
+                    }
+                    .frame(width: 44, height: 44)
+                    .background(audioRecorder.isRecording ? AppTheme.statusError : CodexTheme.raisedPanel, in: Circle())
+                    .overlay {
+                        Circle().stroke(CodexTheme.stroke, lineWidth: 1)
+                    }
+                }
+                .buttonStyle(.plain)
+                .disabled(viewModel.isCreating || viewModel.isTranscribing)
+                .accessibilityLabel(audioRecorder.isRecording ? "Stop recording prompt" : "Record prompt")
+
+                Button {
                     promptIsFocused = false
                     Task {
                         if let jobID = await viewModel.createJobFromCompose() {
@@ -199,7 +241,7 @@ private struct CodexPromptCard: View {
         .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .stroke(promptIsFocused ? CodexTheme.accent : CodexTheme.stroke, lineWidth: 1)
+                .stroke(CodexTheme.stroke, lineWidth: 1)
         }
         .toolbar {
             ToolbarItemGroup(placement: .keyboard) {
@@ -230,13 +272,41 @@ private struct CodexPromptCard: View {
     private var canCreate: Bool {
         !viewModel.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !viewModel.isCreating
+            && !viewModel.isTranscribing
+            && !audioRecorder.isRecording
     }
 
     private var disabledReason: String {
+        if audioRecorder.isRecording {
+            return "Recording"
+        }
+        if viewModel.isTranscribing {
+            return "Transcribing"
+        }
         if viewModel.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return "Enter a prompt"
         }
         return "Ready"
+    }
+
+    private func toggleRecording() {
+        if audioRecorder.isRecording {
+            guard let fileURL = audioRecorder.stopRecording() else { return }
+            Task {
+                await viewModel.transcribePromptAudio(fileURL: fileURL)
+                audioRecorder.deleteRecording(at: fileURL)
+            }
+            return
+        }
+
+        promptIsFocused = false
+        Task {
+            do {
+                try await audioRecorder.startRecording()
+            } catch {
+                viewModel.errorMessage = error.localizedDescription
+            }
+        }
     }
 
     private var contextText: String {
@@ -251,6 +321,110 @@ private struct CodexPromptCard: View {
         }
         return "Start fresh, or choose a recent thread to continue."
     }
+}
+
+@MainActor
+private final class CodexPromptAudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
+    @Published private(set) var isRecording = false
+    private var recorder: AVAudioRecorder?
+    private var recordingURL: URL?
+
+    func startRecording() async throws {
+        guard !isRecording else { return }
+        guard await requestPermission() else {
+            throw RecordingError.microphoneDenied
+        }
+
+        let session = AVAudioSession.sharedInstance()
+        let configuration = CodexPromptAudioRecordingConfiguration.devicePromptDefaults
+        do {
+            try session.setCategory(configuration.category, mode: configuration.mode, options: configuration.options)
+            try session.setActive(true)
+        } catch {
+            throw RecordingError.startFailed
+        }
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-prompt-\(UUID().uuidString)")
+            .appendingPathExtension("wav")
+        let recorder: AVAudioRecorder
+        do {
+            recorder = try AVAudioRecorder(url: url, settings: configuration.settings)
+        } catch {
+            try? session.setActive(false, options: .notifyOthersOnDeactivation)
+            throw RecordingError.startFailed
+        }
+        recorder.delegate = self
+        recorder.prepareToRecord()
+        guard recorder.record() else {
+            try? session.setActive(false, options: .notifyOthersOnDeactivation)
+            throw RecordingError.startFailed
+        }
+
+        self.recorder = recorder
+        recordingURL = url
+        isRecording = true
+    }
+
+    func stopRecording() -> URL? {
+        guard isRecording else { return nil }
+        recorder?.stop()
+        recorder = nil
+        isRecording = false
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        return recordingURL
+    }
+
+    func deleteRecording(at url: URL) {
+        try? FileManager.default.removeItem(at: url)
+        if recordingURL == url {
+            recordingURL = nil
+        }
+    }
+
+    private func requestPermission() async -> Bool {
+        await withCheckedContinuation { continuation in
+            AVAudioApplication.requestRecordPermission { granted in
+                continuation.resume(returning: granted)
+            }
+        }
+    }
+
+    private enum RecordingError: LocalizedError {
+        case microphoneDenied
+        case startFailed
+
+        var errorDescription: String? {
+            switch self {
+            case .microphoneDenied:
+                return "Microphone access is not enabled for POC Vault."
+            case .startFailed:
+                return "Could not start microphone recording. Please try again."
+            }
+        }
+    }
+}
+
+struct CodexPromptAudioRecordingConfiguration {
+    let category: AVAudioSession.Category
+    let mode: AVAudioSession.Mode
+    let options: AVAudioSession.CategoryOptions
+    let settings: [String: Any]
+
+    static let devicePromptDefaults = CodexPromptAudioRecordingConfiguration(
+        category: .record,
+        mode: .default,
+        options: [],
+        settings: [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: 16_000.0,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsNonInterleaved: false
+        ]
+    )
 }
 
 private struct CodexThreadStrip: View {
@@ -321,7 +495,7 @@ private struct CodexThreadPickerSheet: View {
     @State private var showingSmokeThreads = false
 
     private var filteredThreads: [CodexThread] {
-        let threads = viewModel.threadsForSelectedWorkspace.filter { showingSmokeThreads || !$0.isSmokeTest }
+        let threads = viewModel.threads.filter { showingSmokeThreads || !$0.isSmokeTest }
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !query.isEmpty else { return threads }
         return threads.filter { thread in
@@ -439,12 +613,13 @@ private struct CodexThreadRow: View {
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
             Button(action: onContinue) {
-                VStack(alignment: .leading, spacing: 7) {
-                    HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text(thread.displayTitle)
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(CodexTheme.text)
-                            .lineLimit(1)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
                         if isSelected {
                             Image(systemName: "checkmark.circle.fill")
                                 .font(.caption.weight(.bold))
@@ -456,12 +631,10 @@ private struct CodexThreadRow: View {
                             .foregroundStyle(CodexTheme.dim)
                     }
 
-                    Text(thread.previewText)
-                        .font(.caption)
-                        .foregroundStyle(CodexTheme.muted)
-                        .lineLimit(2)
-
                     HStack(spacing: 8) {
+                        Text(thread.workspaceLabel)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(CodexTheme.dim)
                         if let status = thread.lastJobStatus {
                             CodexStatusChip(status: status)
                         }
@@ -473,9 +646,15 @@ private struct CodexThreadRow: View {
                                 .frame(height: 24)
                                 .background(CodexTheme.raisedPanel, in: Capsule())
                         }
-                        Text("\(thread.jobCount) \(thread.jobCount == 1 ? "job" : "jobs")")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(CodexTheme.dim)
+                        if thread.jobCount > 0 {
+                            Text("\(thread.jobCount) \(thread.jobCount == 1 ? "job" : "jobs")")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(CodexTheme.dim)
+                        } else if thread.hasSessionFile {
+                            Text("Session")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(CodexTheme.dim)
+                        }
                         Text(thread.shortID)
                             .font(.caption2.monospaced())
                             .foregroundStyle(CodexTheme.dim)
@@ -529,36 +708,25 @@ private struct CodexControlStrip: View {
     ]
 
     var body: some View {
-        ViewThatFits(in: .horizontal) {
-            controlRow
-
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 10) {
-                    skillsButton
-                    Spacer(minLength: 0)
-                }
-
-                HStack(spacing: 10) {
-                    modelMenu
-                    reasoningMenu
-                    Spacer(minLength: 0)
-                }
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                skillsButton
+                Spacer(minLength: 0)
             }
+
+            HStack(spacing: 10) {
+                modelMenu
+                reasoningMenu
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(CodexTheme.raisedPanel, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .stroke(CodexTheme.stroke, lineWidth: 1)
-        }
-    }
-
-    private var controlRow: some View {
-        HStack(spacing: 10) {
-            skillsButton
-            modelMenu
-            reasoningMenu
-            Spacer(minLength: 8)
         }
     }
 
@@ -783,132 +951,149 @@ private struct CodexSkillRow: View {
     }
 }
 
-private struct CodexJobsSection: View {
+private struct CodexThreadFeedSection: View {
     @ObservedObject var viewModel: CodexConsoleViewModel
-    let onSelect: (String) -> Void
+    let onOpenThread: (String) -> Void
+    let onOpenJob: (String) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if viewModel.isRefreshing && viewModel.jobs.isEmpty {
-                CodexEmptyState(symbol: "arrow.triangle.2.circlepath", title: "Loading jobs", message: "Fetching Codex activity.")
-            } else if viewModel.jobs.isEmpty {
-                CodexEmptyState(symbol: "terminal", title: "No results yet", message: "Send a prompt to see the first result here.")
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Threads")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(CodexTheme.dim)
+                        .tracking(1.4)
+                        .textCase(.uppercase)
+                    Text(summaryText)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(CodexTheme.dim)
+                }
+
+                Spacer()
+
+                Button {
+                    Task { await viewModel.refreshAll() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(CodexTheme.text)
+                        .frame(width: 34, height: 34)
+                        .background(CodexTheme.raisedPanel, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .disabled(viewModel.isRefreshing)
+                .accessibilityLabel("Refresh threads")
+            }
+            .padding(.horizontal, 2)
+
+            if viewModel.isRefreshing && viewModel.threadFeedItems.isEmpty {
+                CodexEmptyState(symbol: "arrow.triangle.2.circlepath", title: "Loading threads", message: "Fetching Codex activity.")
+            } else if viewModel.threadFeedItems.isEmpty {
+                CodexEmptyState(symbol: "bubble.left.and.bubble.right", title: "No threads yet", message: "Send a prompt and its thread will appear here.")
             } else {
                 VStack(spacing: 10) {
-                    ForEach(viewModel.jobs) { job in
-                        Button {
-                            onSelect(job.id)
-                        } label: {
-                            CodexJobRow(job: job, isCancelling: viewModel.isCancelling(job.id))
+                    ForEach(viewModel.threadFeedItems) { item in
+                        CodexThreadFeedRow(item: item, isSelected: item.sessionID == viewModel.selectedSessionID) {
+                            if let sessionID = item.sessionID {
+                                viewModel.selectSessionID(sessionID, workspaceID: item.workspaceID)
+                                onOpenThread(sessionID)
+                            } else if let jobID = item.jobID {
+                                onOpenJob(jobID)
+                            }
                         }
-                        .buttonStyle(.plain)
                     }
                 }
-            }
-        }
-    }
-}
-
-private struct CollapsibleResultsSection: View {
-    @ObservedObject var viewModel: CodexConsoleViewModel
-    @Binding var isExpanded: Bool
-    let onSelect: (String) -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.18)) {
-                    isExpanded.toggle()
-                }
-            } label: {
-                HStack(spacing: 10) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Results")
-                            .font(.caption.weight(.bold))
-                            .foregroundStyle(CodexTheme.dim)
-                            .tracking(1.4)
-                            .textCase(.uppercase)
-                        Text(summaryText)
-                            .font(.caption.weight(.medium))
-                            .foregroundStyle(CodexTheme.dim)
-                    }
-
-                    Spacer()
-
-                    Image(systemName: "chevron.down")
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(CodexTheme.accent)
-                        .rotationEffect(.degrees(isExpanded ? 180 : 0))
-                }
-                .padding(.horizontal, 14)
-                .frame(minHeight: 58)
-                .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(CodexTheme.stroke, lineWidth: 1)
-                }
-            }
-            .buttonStyle(.plain)
-
-            if isExpanded {
-                CodexJobsSection(viewModel: viewModel, onSelect: onSelect)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
     }
 
     private var summaryText: String {
-        if viewModel.isRefreshing && viewModel.jobs.isEmpty {
+        if viewModel.isRefreshing && viewModel.threadFeedItems.isEmpty {
             return "Loading..."
         }
-        let count = viewModel.jobs.count
+        let count = viewModel.threadFeedItems.count
         if count == 0 {
-            return "No results yet"
+            return "No threads yet"
         }
-        return "\(count) \(count == 1 ? "result" : "results")"
+        return "\(count) \(count == 1 ? "thread" : "threads")"
     }
 }
 
-private struct CodexJobRow: View {
-    let job: CodexJob
-    let isCancelling: Bool
+private struct CodexThreadFeedRow: View {
+    let item: CodexThreadFeedItem
+    let isSelected: Bool
+    let onOpen: () -> Void
 
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(isCancelling ? "Canceling" : job.status.label)
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(job.status.tint)
+        Button(action: onOpen) {
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(item.title)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(CodexTheme.text)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
 
-                    Spacer(minLength: 8)
+                        if isSelected {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(CodexTheme.accent)
+                        }
 
-                    Text(timestampText)
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(CodexTheme.dim)
+                        Spacer(minLength: 8)
+
+                        Text(timestampText)
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(CodexTheme.dim)
+                    }
+
+                    Text(item.preview)
+                        .font(.subheadline)
+                        .foregroundStyle(CodexTheme.muted)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    HStack(spacing: 8) {
+                        Text(item.workspaceLabel)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(CodexTheme.dim)
+                        if let status = item.status {
+                            CodexStatusChip(status: status)
+                        }
+                        if item.isPendingSession {
+                            Text("Starting thread")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(CodexTheme.dim)
+                                .padding(.horizontal, 8)
+                                .frame(height: 24)
+                                .background(CodexTheme.raisedPanel, in: Capsule())
+                        }
+                        Text(item.shortID)
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(CodexTheme.dim)
+                    }
                 }
 
-                Text("\"\(job.displayPrompt)\"")
-                    .font(.subheadline.italic())
-                    .foregroundStyle(CodexTheme.muted)
-                    .lineLimit(1)
+                Image(systemName: item.jobID == nil ? "bubble.left" : "chevron.right")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(CodexTheme.dim)
             }
-
-            Image(systemName: "chevron.right")
-                .font(.caption.weight(.bold))
-                .foregroundStyle(CodexTheme.dim)
+            .padding(14)
+            .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(isSelected ? CodexTheme.accent.opacity(0.7) : CodexTheme.stroke, lineWidth: 1)
+            }
         }
-        .padding(14)
-        .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(CodexTheme.stroke, lineWidth: 1)
-        }
+        .buttonStyle(.plain)
+        .disabled(item.jobID == nil && item.sessionID == nil)
     }
 
     private var timestampText: String {
-        guard let date = job.updatedAt ?? job.createdAt else {
-            return job.id
+        guard let date = item.updatedAt else {
+            return ""
         }
         return Self.relativeFormatter.localizedString(for: date, relativeTo: Date())
     }
@@ -1057,8 +1242,8 @@ private struct CodexEmptyState: View {
 private struct CodexJobDetailView: View {
     let jobID: String
     @ObservedObject var viewModel: CodexConsoleViewModel
-    let onCreated: (String) -> Void
-    let onContinueThread: () -> Void
+    let onOpenThread: (String) -> Void
+    let onOpenJob: (String) -> Void
 
     @State private var job: CodexJob?
     @State private var errorMessage: String?
@@ -1080,14 +1265,6 @@ private struct CodexJobDetailView: View {
 
                     if let job {
                         CodexDetailHeader(job: job)
-                        if let threadSessionID = job.threadSessionId {
-                            CodexThreadReplyCard(
-                                sessionID: threadSessionID,
-                                workspaceID: job.workspaceId,
-                                viewModel: viewModel,
-                                onCreated: onCreated
-                            )
-                        }
                         CodexMarkdownBlock(
                             title: "Answer",
                             symbol: "text.bubble",
@@ -1145,11 +1322,11 @@ private struct CodexJobDetailView: View {
                 if let sessionID = job?.threadSessionId {
                     Button {
                         viewModel.selectSessionID(sessionID, workspaceID: job?.workspaceId)
-                        onContinueThread()
+                        onOpenThread(sessionID)
                     } label: {
                         Image(systemName: "bubble.left.and.text.bubble.right")
                     }
-                    .accessibilityLabel("Continue thread in compose")
+                    .accessibilityLabel("Open thread")
                 }
 
                 Button {
@@ -1229,38 +1406,227 @@ private struct CodexJobDetailView: View {
         defer { isRetrying = false }
 
         if let newJobID = await viewModel.retry(job) {
-            onCreated(newJobID)
+            onOpenJob(newJobID)
         }
     }
 }
 
-private struct CodexThreadReplyCard: View {
+private struct CodexThreadDetailView: View {
     let sessionID: String
-    let workspaceID: String?
     @ObservedObject var viewModel: CodexConsoleViewModel
-    let onCreated: (String) -> Void
+    let onOpenJob: (String) -> Void
 
-    @State private var replyText = ""
-    @State private var isSending = false
-    @FocusState private var isFocused: Bool
+    private var thread: CodexThread? {
+        viewModel.threads.first { $0.sessionId == sessionID || $0.id == sessionID }
+    }
+
+    var body: some View {
+        ZStack {
+            CodexTheme.background.ignoresSafeArea()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    CodexThreadOverviewCard(thread: thread, sessionID: sessionID)
+
+                    if let thread, thread.hasActiveJobs {
+                        CodexThreadProgressCard()
+                    }
+
+                    CodexThreadLatestAnswerCard(thread: thread)
+                }
+                .padding(16)
+                .padding(.bottom, 164)
+            }
+            .scrollDismissesKeyboard(.interactively)
+        }
+        .safeAreaInset(edge: .bottom) {
+            CodexThreadComposerDock(
+                sessionID: sessionID,
+                workspaceID: thread?.workspaceId ?? viewModel.selectedWorkspaceID,
+                viewModel: viewModel
+            )
+            .padding(.horizontal, 16)
+            .padding(.top, 10)
+            .padding(.bottom, 10)
+            .background(CodexTheme.background.opacity(0.97))
+        }
+        .navigationTitle(thread?.displayTitle ?? String(sessionID.prefix(10)))
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                if let latestJobID = thread?.lastJobId {
+                    Button {
+                        onOpenJob(latestJobID)
+                    } label: {
+                        Image(systemName: "terminal")
+                    }
+                    .accessibilityLabel("Open latest run")
+                }
+
+                Button {
+                    Task {
+                        await viewModel.refreshJobs()
+                        await viewModel.refreshThreads()
+                    }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .accessibilityLabel("Refresh thread")
+                .disabled(viewModel.isRefreshing)
+            }
+        }
+        .refreshable {
+            await viewModel.refreshJobs()
+            await viewModel.refreshThreads()
+        }
+        .task(id: sessionID) {
+            viewModel.selectSessionID(sessionID, workspaceID: thread?.workspaceId)
+            await viewModel.refreshThreads()
+        }
+    }
+}
+
+private struct CodexThreadOverviewCard: View {
+    let thread: CodexThread?
+    let sessionID: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(thread?.displayTitle ?? "Codex thread")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(CodexTheme.text)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 8) {
+                    Text(thread?.workspaceLabel ?? "Codex")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(CodexTheme.dim)
+                    if let status = thread?.lastJobStatus {
+                        CodexStatusChip(status: status)
+                    }
+                    Text(thread?.shortID ?? String(sessionID.prefix(12)))
+                        .font(.caption.monospaced())
+                        .foregroundStyle(CodexTheme.dim)
+                        .lineLimit(1)
+                }
+            }
+
+            if let lastPrompt = CodexThreadText.trimmed(thread?.lastPrompt) {
+                Text(lastPrompt)
+                    .font(.subheadline)
+                    .foregroundStyle(CodexTheme.muted)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(CodexTheme.stroke, lineWidth: 1)
+        }
+    }
+}
+
+private struct CodexThreadProgressCard: View {
+    var body: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .tint(CodexTheme.accent)
+            Text("Codex is working in this thread")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(CodexTheme.text)
+            Spacer()
+        }
+        .padding(14)
+        .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(CodexTheme.stroke, lineWidth: 1)
+        }
+    }
+}
+
+private struct CodexThreadLatestAnswerCard: View {
+    let thread: CodexThread?
+
+    var body: some View {
+        if let result = CodexThreadText.trimmed(thread?.lastResult) {
+            CodexThreadMarkdownCard(title: "Latest answer", symbol: "text.bubble", text: result)
+        } else if let error = CodexThreadText.trimmed(thread?.lastError) {
+            CodexThreadMarkdownCard(title: "Last error", symbol: "exclamationmark.bubble", text: error, isError: true)
+        } else {
+            CodexEmptyState(
+                symbol: "bubble.left.and.bubble.right",
+                title: thread?.hasActiveJobs == true ? "Waiting for answer" : "No answer yet",
+                message: thread?.hasActiveJobs == true
+                    ? "Pull to refresh, or open the latest run from the toolbar."
+                    : "Reply below to continue this thread."
+            )
+        }
+    }
+}
+
+private struct CodexThreadMarkdownCard: View {
+    let title: String
+    let symbol: String
+    let text: String
+    var isError = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
-                Image(systemName: "bubble.left.and.text.bubble.right")
-                    .foregroundStyle(CodexTheme.accent)
-                Text("Reply in this thread")
+                Image(systemName: symbol)
+                    .foregroundStyle(isError ? AppTheme.statusError : CodexTheme.accent)
+                Text(title)
                     .font(.subheadline.weight(.bold))
                     .foregroundStyle(CodexTheme.text)
                 Spacer()
-                Text(String(sessionID.prefix(12)))
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(CodexTheme.dim)
             }
 
+            VStack(alignment: .leading, spacing: 12) {
+                ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
+                    switch segment.kind {
+                    case .prose:
+                        CodexMarkdownProse(text: segment.text)
+                    case .code(let language):
+                        CodexMarkdownCode(text: segment.text, language: language)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(16)
+        .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(isError ? AppTheme.statusError.opacity(0.45) : CodexTheme.stroke, lineWidth: 1)
+        }
+    }
+
+    private var segments: [CodexMarkdownSegment] {
+        CodexMarkdownParser.segments(from: text)
+    }
+}
+
+private struct CodexThreadComposerDock: View {
+    let sessionID: String
+    let workspaceID: String?
+    @ObservedObject var viewModel: CodexConsoleViewModel
+
+    @State private var replyText = ""
+    @State private var isSending = false
+    @State private var lastSubmittedJobID: String?
+    @StateObject private var audioRecorder = CodexPromptAudioRecorder()
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
             ZStack(alignment: .topLeading) {
                 if replyText.isEmpty {
-                    Text("Write the next message...")
+                    Text("Reply to this thread...")
                         .font(.system(size: 15, weight: .medium))
                         .foregroundStyle(CodexTheme.dim)
                         .padding(.horizontal, 4)
@@ -1275,34 +1641,54 @@ private struct CodexThreadReplyCard: View {
                     .textInputAutocapitalization(.sentences)
                     .autocorrectionDisabled()
                     .focused($isFocused)
-                    .frame(minHeight: 104, maxHeight: 150)
+                    .frame(minHeight: 74, maxHeight: 124)
             }
 
             HStack(spacing: 10) {
-                Button {
-                    viewModel.selectSessionID(sessionID, workspaceID: workspaceID)
-                    isFocused = false
-                } label: {
-                    Text("Use in compose")
-                }
-                .buttonStyle(CodexPillButtonStyle())
+                Text(statusText)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(CodexTheme.dim)
+                    .lineLimit(1)
 
                 Spacer()
+
+                Button {
+                    toggleRecording()
+                } label: {
+                    ZStack {
+                        if viewModel.isTranscribing {
+                            ProgressView()
+                                .tint(CodexTheme.text)
+                        } else {
+                            Image(systemName: audioRecorder.isRecording ? "stop.fill" : "mic.fill")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundStyle(audioRecorder.isRecording ? Color.white : CodexTheme.text)
+                        }
+                    }
+                    .frame(width: 42, height: 42)
+                    .background(audioRecorder.isRecording ? AppTheme.statusError : CodexTheme.raisedPanel, in: Circle())
+                    .overlay {
+                        Circle().stroke(CodexTheme.stroke, lineWidth: 1)
+                    }
+                }
+                .buttonStyle(.plain)
+                .disabled(isSending || viewModel.isCreating || viewModel.isTranscribing)
+                .accessibilityLabel(audioRecorder.isRecording ? "Stop recording reply" : "Record reply")
 
                 Button {
                     isFocused = false
                     Task { await send() }
                 } label: {
-                    Label(isSending ? "Sending" : "Send reply", systemImage: "paperplane.fill")
+                    Label(isSending ? "Sending" : "Send", systemImage: "paperplane.fill")
                 }
                 .buttonStyle(CodexPillButtonStyle(isAccent: true))
                 .disabled(!canSend)
             }
         }
-        .padding(14)
-        .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .padding(12)
+        .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .stroke(isFocused ? CodexTheme.accent : CodexTheme.stroke, lineWidth: 1)
         }
         .toolbar {
@@ -1319,7 +1705,55 @@ private struct CodexThreadReplyCard: View {
     }
 
     private var canSend: Bool {
-        !replyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isSending
+        !replyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !isSending
+            && !viewModel.isCreating
+            && !viewModel.isTranscribing
+            && !audioRecorder.isRecording
+    }
+
+    private var statusText: String {
+        if audioRecorder.isRecording { return "Recording" }
+        if viewModel.isTranscribing { return "Transcribing" }
+        if isSending || viewModel.isCreating { return "Sending" }
+        if let lastSubmittedJobID {
+            return "Sent \(String(lastSubmittedJobID.prefix(8)))"
+        }
+        return "Thread \(String(sessionID.prefix(8)))"
+    }
+
+    private func toggleRecording() {
+        if audioRecorder.isRecording {
+            guard let fileURL = audioRecorder.stopRecording() else { return }
+            Task {
+                if let transcript = await viewModel.transcribeAudioText(fileURL: fileURL) {
+                    appendTranscription(transcript)
+                }
+                audioRecorder.deleteRecording(at: fileURL)
+            }
+            return
+        }
+
+        isFocused = false
+        Task {
+            do {
+                try await audioRecorder.startRecording()
+            } catch {
+                viewModel.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func appendTranscription(_ text: String) {
+        let transcript = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !transcript.isEmpty else { return }
+
+        let existingReply = replyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if existingReply.isEmpty {
+            replyText = transcript
+        } else {
+            replyText = "\(existingReply)\n\n\(transcript)"
+        }
     }
 
     private func send() async {
@@ -1327,10 +1761,19 @@ private struct CodexThreadReplyCard: View {
         isSending = true
         defer { isSending = false }
 
+        viewModel.selectSessionID(sessionID, workspaceID: workspaceID)
         if let newJobID = await viewModel.createFollowUp(prompt: message, sessionID: sessionID, workspaceID: workspaceID) {
             replyText = ""
-            onCreated(newJobID)
+            lastSubmittedJobID = newJobID
+            await viewModel.refreshThreads()
         }
+    }
+}
+
+private enum CodexThreadText {
+    static func trimmed(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
 
@@ -1515,13 +1958,16 @@ private struct CodexRawActivityBlock: View {
     }
 
     private var statusText: String {
+        if preview.originalCharacterCount == 0 {
+            return "Empty"
+        }
         if preview.isTruncated {
-            return "Showing a safe preview"
+            return "Showing latest activity"
         }
         if logsIncluded == "full" {
             return "Full log loaded"
         }
-        return "Preview"
+        return "Latest activity"
     }
 
     private static func compactCount(_ value: Int) -> String {
@@ -1651,12 +2097,19 @@ private struct CodexMarkdownProse: View {
     let text: String
 
     var body: some View {
-        Text(text)
+        Text(markdownText)
             .font(.system(size: 14))
             .foregroundStyle(CodexTheme.text)
             .lineSpacing(3)
             .textSelection(.enabled)
             .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var markdownText: AttributedString {
+        let options = AttributedString.MarkdownParsingOptions(
+            interpretedSyntax: .inlineOnlyPreservingWhitespace
+        )
+        return (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
     }
 }
 

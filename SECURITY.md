@@ -15,7 +15,7 @@ infrastructure, not just static demo hosting.
 - client CA private keys
 - client certificate private keys
 - manifest signing private keys
-- copied Codex auth JSON or OpenAI API keys
+- copied Codex auth JSON, OpenAI API keys, or Azure Speech API keys
 - passphrases
 - local config files copied from `~/.poc-vault/secrets`
 
@@ -74,6 +74,8 @@ Live `/v1/codex/*` routes require:
 - exact subject allowlist for `CN=iphone` and `CN=parikshit-mac`
 - backend re-check of the forwarded certificate subject
 - session/thread listing should expose metadata only, not raw transcript content
+- transcription requests should require the same mTLS boundary and must keep
+  Azure Speech credentials only in server-side environment files
 
 The Codex runner must not be able to read POC Vault private material:
 

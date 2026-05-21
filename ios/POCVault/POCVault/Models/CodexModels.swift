@@ -320,7 +320,14 @@ struct CodexThread: Decodable, Hashable, Identifiable {
     }
 
     var displayTitle: String {
-        workspaceName?.trimmedNonEmpty ?? workspaceId?.trimmedNonEmpty ?? "Codex thread"
+        Self.threadTitle(from: lastPrompt)
+            ?? Self.threadTitle(from: lastResult)
+            ?? Self.threadTitle(from: lastError)
+            ?? workspaceLabel
+    }
+
+    var workspaceLabel: String {
+        workspaceName?.trimmedNonEmpty ?? workspaceId?.trimmedNonEmpty ?? "Codex"
     }
 
     var shortID: String {
@@ -335,8 +342,242 @@ struct CodexThread: Decodable, Hashable, Identifiable {
             ?? sessionId
     }
 
+    var feedPreview: String {
+        lastResult?.trimmedNonEmpty
+            ?? lastError?.trimmedNonEmpty
+            ?? lastPrompt?.trimmedNonEmpty
+            ?? cwd?.trimmedNonEmpty
+            ?? sessionId
+    }
+
     var hasActiveJobs: Bool {
         activeJobCount > 0 || lastJobStatus?.isActive == true
+    }
+
+    static func threadTitle(from value: String?) -> String? {
+        guard var text = normalizedThreadText(value) else { return nil }
+        if let pullRequestTitle = githubPullRequestTitle(in: text) {
+            return pullRequestTitle
+        }
+        text = stripPromptLeadIns(text)
+
+        let lowered = text.lowercased()
+        if lowered.hasPrefix("read-only security audit") {
+            return "Read-only security audit"
+        }
+        if lowered.contains("loading spinner"), lowered.contains("2 pr") {
+            return "Review loading-spinner PRs"
+        }
+        if lowered.contains("shlok"), lowered.contains("2 pr") {
+            return "Review Shlok's PRs"
+        }
+
+        return compactTitle(text)
+    }
+
+    private static func githubPullRequestTitle(in value: String) -> String? {
+        let pattern = #"https?://github\.com/[^/\s]+/([^/\s]+)/pull/([0-9]+)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
+        let nsRange = NSRange(value.startIndex..<value.endIndex, in: value)
+        guard let match = regex.firstMatch(in: value, range: nsRange),
+              match.numberOfRanges >= 3,
+              let repoRange = Range(match.range(at: 1), in: value),
+              let numberRange = Range(match.range(at: 2), in: value) else {
+            return nil
+        }
+        return "\(value[repoRange]) PR #\(value[numberRange])"
+    }
+
+    private static func stripPromptLeadIns(_ value: String) -> String {
+        var text = value
+        replacePrefix("Review and merge Hey parikshit, I was adding these ", in: &text, with: "Review and merge ")
+        replacePrefix("Hey parikshit can you ", in: &text)
+        replacePrefix("Hey parikshit, can you ", in: &text)
+        replacePrefix("Hey parikshit, ", in: &text)
+        replacePrefix("Hey parikshit ", in: &text)
+        return text
+    }
+
+    private static func replacePrefix(_ prefix: String, in text: inout String, with replacement: String = "") {
+        guard let range = text.range(of: prefix, options: [.caseInsensitive, .anchored]) else { return }
+        text.replaceSubrange(range, with: replacement)
+    }
+
+    private static func compactTitle(_ value: String) -> String? {
+        var text = value.replacingOccurrences(
+            of: #"https?://\S+"#,
+            with: "",
+            options: .regularExpression
+        )
+        text = normalizedThreadText(text) ?? text
+        guard !text.isEmpty else { return nil }
+
+        let limit = 76
+        guard text.count > limit else { return text }
+        return "\(text.prefix(limit).trimmingCharacters(in: .whitespacesAndNewlines))..."
+    }
+
+    private static func normalizedThreadText(_ value: String?) -> String? {
+        value?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+            .trimmedNonEmpty
+    }
+}
+
+struct CodexTranscriptionResponse: Decodable, Hashable {
+    let text: String
+    let provider: String?
+    let model: String?
+    let audioBytes: Int?
+    let durationMilliseconds: Int?
+}
+
+struct CodexThreadFeedItem: Hashable, Identifiable {
+    enum Source: Hashable {
+        case thread(CodexThread)
+        case pendingJob(CodexJob)
+    }
+
+    let source: Source
+
+    var id: String {
+        switch source {
+        case .thread(let thread):
+            return "thread-\(thread.sessionId)"
+        case .pendingJob(let job):
+            return "job-\(job.id)"
+        }
+    }
+
+    var title: String {
+        switch source {
+        case .thread(let thread):
+            return thread.displayTitle
+        case .pendingJob(let job):
+            return CodexThread.threadTitle(from: job.displayPrompt) ?? job.displayPrompt
+        }
+    }
+
+    var preview: String {
+        switch source {
+        case .thread(let thread):
+            return thread.feedPreview
+        case .pendingJob(let job):
+            if let output = job.displayOutput?.trimmedNonEmpty {
+                return output
+            }
+            if job.status.isActive {
+                return "Starting on EC2. The thread will attach as soon as Codex opens a session."
+            }
+            return job.errorMessage?.trimmedNonEmpty ?? "No thread session was captured for this run."
+        }
+    }
+
+    var workspaceLabel: String {
+        switch source {
+        case .thread(let thread):
+            return thread.workspaceLabel
+        case .pendingJob(let job):
+            return job.workspaceName?.trimmedNonEmpty ?? job.workspaceId?.trimmedNonEmpty ?? "Codex"
+        }
+    }
+
+    var workspaceID: String? {
+        switch source {
+        case .thread(let thread):
+            return thread.workspaceId
+        case .pendingJob(let job):
+            return job.workspaceId
+        }
+    }
+
+    var updatedAt: Date? {
+        switch source {
+        case .thread(let thread):
+            return thread.updatedAt ?? thread.timestamp
+        case .pendingJob(let job):
+            return job.updatedAt ?? job.createdAt
+        }
+    }
+
+    var status: CodexJobStatus? {
+        switch source {
+        case .thread(let thread):
+            return thread.lastJobStatus
+        case .pendingJob(let job):
+            return job.status
+        }
+    }
+
+    var jobID: String? {
+        switch source {
+        case .thread(let thread):
+            return thread.lastJobId
+        case .pendingJob(let job):
+            return job.id
+        }
+    }
+
+    var sessionID: String? {
+        switch source {
+        case .thread(let thread):
+            return thread.sessionId
+        case .pendingJob:
+            return nil
+        }
+    }
+
+    var isPendingSession: Bool {
+        if case .pendingJob = source {
+            return true
+        }
+        return false
+    }
+
+    var isSmokeTest: Bool {
+        if case .thread(let thread) = source {
+            return thread.isSmokeTest
+        }
+        return false
+    }
+
+    var shortID: String {
+        switch source {
+        case .thread(let thread):
+            return thread.shortID
+        case .pendingJob(let job):
+            return String(job.id.prefix(12))
+        }
+    }
+
+    var isActive: Bool {
+        switch source {
+        case .thread(let thread):
+            return thread.hasActiveJobs
+        case .pendingJob(let job):
+            return job.status.isActive
+        }
+    }
+
+    static func makeFeed(threads: [CodexThread], jobs: [CodexJob]) -> [CodexThreadFeedItem] {
+        let visibleThreads = threads.filter { !$0.isSmokeTest }
+        let threadSessionIDs = Set(visibleThreads.map(\.sessionId))
+        let threadJobIDs = Set(visibleThreads.compactMap(\.lastJobId))
+        let threadItems = visibleThreads.map { CodexThreadFeedItem(source: .thread($0)) }
+        let pendingJobItems = jobs
+            .filter { job in
+                if threadJobIDs.contains(job.id) { return false }
+                if let sessionID = job.threadSessionId, threadSessionIDs.contains(sessionID) { return false }
+                return job.status.isActive
+            }
+            .map { CodexThreadFeedItem(source: .pendingJob($0)) }
+
+        return (pendingJobItems + threadItems).sorted {
+            ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast)
+        }
     }
 }
 
@@ -365,7 +606,7 @@ enum CodexReasoningEffort: String, CaseIterable, Identifiable, Codable {
 enum CodexDisplayLimits {
     static let answerCharacters = 24_000
     static let promptCharacters = 12_000
-    static let rawActivityCharacters = 40_000
+    static let rawActivityCharacters = 8_000
 }
 
 struct CodexTextPreview: Equatable {
@@ -617,47 +858,34 @@ struct CodexJob: Decodable, Hashable, Identifiable {
         serverTruncated: Bool
     ) -> CodexTextPreview {
         var rendered = ""
-        var originalCount = 0
-        var didTruncate = serverTruncated
 
         for (label, value) in sections {
             guard let trimmed = value?.trimmedNonEmpty else { continue }
             let separator = rendered.isEmpty ? "" : "\n\n---\n\n"
             let header = "\(separator)## \(label)\n\n"
-            originalCount += header.count + trimmed.count
-
-            guard rendered.count < limit else {
-                didTruncate = true
-                continue
-            }
-
-            let remaining = limit - rendered.count
-            if header.count >= remaining {
-                rendered += String(header.prefix(remaining))
-                didTruncate = true
-                continue
-            }
-
-            rendered += header
-            let remainingAfterHeader = limit - rendered.count
-            if trimmed.count > remainingAfterHeader {
-                rendered += String(trimmed.prefix(remainingAfterHeader))
-                didTruncate = true
-            } else {
-                rendered += trimmed
-            }
+            rendered += header + trimmed
         }
 
         if rendered.trimmedNonEmpty == nil {
             rendered = "No raw activity captured."
         }
 
-        if originalCount > rendered.count {
-            didTruncate = true
-        }
+        let originalCount = rendered.count
+        var didTruncate = serverTruncated
 
-        if didTruncate {
-            rendered += "\n\n[Preview truncated. Open the full activity log only when needed.]"
+        if originalCount > limit {
+            rendered = """
+            [Showing latest activity. Older log output is hidden in this preview.]
+
+            \(String(rendered.suffix(limit)))
+            """
+            didTruncate = true
+        } else if serverTruncated {
+            rendered = """
+            [Showing latest activity from the server preview.]
+
+            \(rendered)
+            """
         }
 
         return CodexTextPreview(

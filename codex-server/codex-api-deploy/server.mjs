@@ -19,6 +19,12 @@ const codexHome = process.env.CODEX_HOME || path.join(runHome, ".codex");
 const dangerousMode = parseBooleanEnv("CODEX_DANGEROUS_MODE", true);
 const maxConcurrent = parseIntegerEnv("CODEX_MAX_CONCURRENT", 1, 1, 16);
 const maxBodyBytes = parseIntegerEnv("CODEX_MAX_BODY_BYTES", 1024 * 1024, 1, 20 * 1024 * 1024);
+const maxTranscriptionAudioBytes = parseIntegerEnv(
+  "CODEX_MAX_TRANSCRIPTION_AUDIO_BYTES",
+  25 * 1024 * 1024,
+  1024,
+  250 * 1024 * 1024,
+);
 const maxOutputBytes = parseIntegerEnv("CODEX_MAX_OUTPUT_BYTES", 5 * 1024 * 1024, 1, 50 * 1024 * 1024);
 const responseOutputBytes = Math.min(
   parseIntegerEnv("CODEX_RESPONSE_OUTPUT_BYTES", 64 * 1024, 1, maxOutputBytes),
@@ -37,6 +43,11 @@ const threadSummaryCharacters = parseIntegerEnv("CODEX_THREAD_SUMMARY_CHARACTERS
 
 const terminalStatuses = new Set(["succeeded", "failed", "cancelled", "timeout"]);
 const allowedReasoningEfforts = new Set(["low", "medium", "high", "xhigh"]);
+const azureSpeechEndpoint = cleanOptionalEndpoint(process.env.AZURE_SPEECH_ENDPOINT);
+const azureSpeechApiKey = cleanOptionalSecret(process.env.AZURE_SPEECH_API_KEY || process.env.AZURE_SPEECH_KEY);
+const azureSpeechApiVersion = cleanApiVersion(process.env.AZURE_SPEECH_API_VERSION || "2025-10-15");
+const azureSpeechModel = cleanDisplayName(process.env.AZURE_SPEECH_TRANSCRIPTION_MODEL || "mai-transcribe-1", "Azure Speech transcription model", 120);
+const azureSpeechLocales = splitCsv(process.env.AZURE_SPEECH_LOCALES || "en");
 const jobs = new Map();
 const activeChildren = new Map();
 let queuedJobIds = [];
@@ -123,6 +134,41 @@ function cleanDisplayName(value, name, maxLength) {
     throw new Error(`${name} is invalid`);
   }
   return value;
+}
+
+function cleanOptionalEndpoint(value) {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text) return null;
+  let url;
+  try {
+    url = new URL(text);
+  } catch {
+    throw new Error("AZURE_SPEECH_ENDPOINT must be a valid URL");
+  }
+  if (!["https:", "http:"].includes(url.protocol) || !url.host) {
+    throw new Error("AZURE_SPEECH_ENDPOINT must include a supported protocol and host");
+  }
+  url.pathname = url.pathname.replace(/\/+$/, "");
+  url.search = "";
+  url.hash = "";
+  return url.toString().replace(/\/+$/, "");
+}
+
+function cleanOptionalSecret(value) {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text) return null;
+  if (/[\0\r\n]/.test(text)) {
+    throw new Error("AZURE_SPEECH_API_KEY is invalid");
+  }
+  return text;
+}
+
+function cleanApiVersion(value) {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!/^\d{4}-\d{2}-\d{2}(?:-preview)?$/.test(text)) {
+    throw new Error("AZURE_SPEECH_API_VERSION is invalid");
+  }
+  return text;
 }
 
 function cleanWorkspacePath(value, id) {
@@ -260,6 +306,34 @@ function readBody(req) {
   });
 }
 
+function readBinaryBody(req, byteLimit) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > byteLimit) {
+        reject(Object.assign(new Error("audio body too large"), { status: 413 }));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+
+    req.on("end", () => {
+      const body = Buffer.concat(chunks);
+      if (body.length === 0) {
+        reject(Object.assign(new Error("audio body is required"), { status: 400 }));
+        return;
+      }
+      resolve(body);
+    });
+
+    req.on("error", reject);
+  });
+}
+
 function authorize(req) {
   const verify = headerValue(req.headers["x-ssl-client-verify"]);
   const subject = headerValue(req.headers["x-ssl-client-s-dn"]);
@@ -319,6 +393,17 @@ async function routeRequest(req, res) {
     const limit = clampLimit(url.searchParams.get("limit"));
     const workspaceId = url.searchParams.get("workspaceId");
     return sendJson(res, 200, { threads: listWorkspaceThreads({ workspaceId, limit }) });
+  }
+
+  if (req.method === "POST" && url.pathname === "/v1/codex/transcriptions") {
+    const audio = await readBinaryBody(req, maxTranscriptionAudioBytes);
+    const transcript = await transcribeAudio({
+      audio,
+      contentType: cleanAudioContentType(req.headers["content-type"]),
+      filename: cleanAudioFilename(req.headers["x-audio-filename"]),
+      certSubject: auth.subject,
+    });
+    return sendJson(res, 200, transcript);
   }
 
   if (req.method === "GET" && url.pathname === "/v1/codex/jobs") {
@@ -504,6 +589,152 @@ function cleanOptionalSessionId(value) {
   return value;
 }
 
+async function transcribeAudio({ audio, contentType, filename, certSubject }) {
+  if (!azureSpeechEndpoint || !azureSpeechApiKey) {
+    throw Object.assign(new Error("Azure Speech is not configured for transcription"), { status: 503 });
+  }
+
+  const definition = {
+    locales: azureSpeechLocales.length > 0 ? azureSpeechLocales : ["en"],
+    enhancedMode: {
+      enabled: true,
+      model: azureSpeechModel,
+    },
+  };
+  const form = multipartFormData([
+    {
+      name: "audio",
+      filename,
+      contentType,
+      value: audio,
+    },
+    {
+      name: "definition",
+      value: Buffer.from(JSON.stringify(definition), "utf8"),
+    },
+  ]);
+  const endpoint = `${azureSpeechEndpoint}/speechtotext/transcriptions:transcribe?api-version=${encodeURIComponent(azureSpeechApiVersion)}`;
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": form.contentType,
+      "content-length": String(form.body.length),
+      "ocp-apim-subscription-key": azureSpeechApiKey,
+    },
+    body: form.body,
+  });
+  const responseText = await response.text();
+  let payload = null;
+  if (responseText.trim()) {
+    try {
+      payload = JSON.parse(responseText);
+    } catch {
+      payload = null;
+    }
+  }
+
+  if (!response.ok) {
+    throw Object.assign(new Error(`Azure Speech failed with HTTP ${response.status}: ${azureSpeechErrorMessage(payload, responseText)}`), {
+      status: 502,
+    });
+  }
+
+  const text = azureTranscriptText(payload);
+  appendAudit(
+    "transcription_created",
+    { id: null, status: "succeeded", workspaceId: null, certSubject },
+    { provider: "azure-speech", model: azureSpeechModel, audioBytes: audio.length },
+  );
+  return {
+    text,
+    provider: "azure-speech",
+    model: azureSpeechModel,
+    audioBytes: audio.length,
+    durationMilliseconds: Number.isFinite(payload?.durationMilliseconds) ? payload.durationMilliseconds : null,
+  };
+}
+
+function multipartFormData(parts) {
+  const boundary = `----codex-${crypto.randomUUID()}`;
+  const chunks = [];
+  for (const part of parts) {
+    chunks.push(Buffer.from(`--${boundary}\r\n`, "utf8"));
+    const disposition = [`form-data`, `name="${escapeMultipartValue(part.name)}"`];
+    if (part.filename) disposition.push(`filename="${escapeMultipartValue(part.filename)}"`);
+    chunks.push(Buffer.from(`content-disposition: ${disposition.join("; ")}\r\n`, "utf8"));
+    if (part.contentType) {
+      chunks.push(Buffer.from(`content-type: ${part.contentType}\r\n`, "utf8"));
+    }
+    chunks.push(Buffer.from("\r\n", "utf8"));
+    chunks.push(Buffer.isBuffer(part.value) ? part.value : Buffer.from(String(part.value), "utf8"));
+    chunks.push(Buffer.from("\r\n", "utf8"));
+  }
+  chunks.push(Buffer.from(`--${boundary}--\r\n`, "utf8"));
+  return {
+    body: Buffer.concat(chunks),
+    contentType: `multipart/form-data; boundary=${boundary}`,
+  };
+}
+
+function escapeMultipartValue(value) {
+  return String(value).replace(/["\r\n]/g, "_");
+}
+
+function cleanAudioContentType(value) {
+  const raw = headerValue(value).split(";")[0].trim().toLowerCase();
+  const allowed = new Set([
+    "audio/wav",
+    "audio/x-wav",
+    "audio/wave",
+    "audio/mpeg",
+    "audio/mp4",
+    "audio/m4a",
+    "audio/flac",
+    "audio/webm",
+    "audio/aac",
+    "audio/ogg",
+    "application/octet-stream",
+  ]);
+  return allowed.has(raw) ? raw : "audio/wav";
+}
+
+function cleanAudioFilename(value) {
+  const raw = path.basename(headerValue(value).trim());
+  const cleaned = raw.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 120);
+  return cleaned && /\.[A-Za-z0-9]{2,8}$/.test(cleaned) ? cleaned : "phone-prompt.wav";
+}
+
+function azureTranscriptText(payload) {
+  const combinedText = Array.isArray(payload?.combinedPhrases)
+    ? payload.combinedPhrases
+        .map((phrase) => cleanApiText(phrase?.text || "").trim())
+        .filter(Boolean)
+        .join("\n")
+        .trim()
+    : "";
+  if (combinedText) return combinedText;
+
+  const phraseText = Array.isArray(payload?.phrases)
+    ? payload.phrases
+        .map((phrase) => cleanApiText(phrase?.text || "").trim())
+        .filter(Boolean)
+        .join(" ")
+        .trim()
+    : "";
+  if (phraseText) return phraseText;
+
+  throw Object.assign(new Error("Azure Speech returned no transcript"), { status: 502 });
+}
+
+function azureSpeechErrorMessage(payload, fallback) {
+  const message =
+    payload?.error?.message ||
+    payload?.message ||
+    payload?.innerError?.message ||
+    cleanApiText(fallback || "").trim();
+  return message || "transcription request failed";
+}
+
 function findSessionMeta(sessionId) {
   const sessionsDir = path.join(codexHome, "sessions");
   const sessionFile = findSessionFile(sessionsDir, sessionId);
@@ -675,12 +906,11 @@ function readSessionSummary(sessionFile) {
       if (entry?.type !== "response_item") continue;
       const message = entry.payload;
       if (message?.type !== "message") continue;
-      const text = boundedThreadText(messageText(message));
-      if (!text) continue;
+      const text = messageText(message);
       if (message.role === "user" && !firstUserPrompt) {
-        firstUserPrompt = text;
+        firstUserPrompt = userPromptSummary(text);
       } else if (message.role === "assistant") {
-        lastAssistantAnswer = text;
+        lastAssistantAnswer = boundedThreadText(text);
       }
     } catch {
       continue;
@@ -726,13 +956,36 @@ function summaryText(value) {
   return boundedThreadText(value);
 }
 
+function userPromptSummary(value) {
+  const text = normalizedThreadText(value);
+  if (!text || isInjectedContextMessage(text)) return null;
+  return boundedThreadText(stripSkillInstructionPrefix(text));
+}
+
+function isInjectedContextMessage(text) {
+  const head = text.slice(0, 1000).toLowerCase();
+  return (
+    head.startsWith("# agents.md instructions for ") ||
+    head.startsWith("<environment_context>") ||
+    (head.includes("<instructions>") && head.includes("<environment_context>"))
+  );
+}
+
+function stripSkillInstructionPrefix(text) {
+  return text.replace(/^Use these Codex skills for this task: [^.]+[.]\s*/i, "");
+}
+
 function boundedThreadText(value) {
-  const text = cleanApiText(value || "")
-    .replace(/\s+/g, " ")
-    .trim();
+  const text = normalizedThreadText(value);
   if (!text) return null;
   if (text.length <= threadSummaryCharacters) return text;
   return `${text.slice(0, threadSummaryCharacters - 1).trimEnd()}…`;
+}
+
+function normalizedThreadText(value) {
+  return cleanApiText(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function isSmokeThread(job) {
@@ -1090,12 +1343,14 @@ async function toJobResponse(job, shape = responseShape("preview")) {
       value: "",
       byteLimit: shape.byteLimit,
       includeFull: shape.includeFullLogs,
+      slice: "suffix",
     }),
     shapeTextPayload({
       file: job.stderrPath || path.join(logsDir, `${job.id}.stderr.log`),
       value: "",
       byteLimit: shape.byteLimit,
       includeFull: shape.includeFullLogs,
+      slice: "suffix",
     }),
     shapeTextPayload({
       file: job.resultPath || path.join(logsDir, `${job.id}.answer.md`),
@@ -1141,23 +1396,23 @@ async function toJobResponse(job, shape = responseShape("preview")) {
   };
 }
 
-async function shapeTextPayload({ file, value, byteLimit, includeFull, trim = false }) {
+async function shapeTextPayload({ file, value, byteLimit, includeFull, trim = false, slice = "prefix" }) {
   try {
     const stat = await fsp.stat(file);
     if (stat.size > 0 || !value) {
-      return await shapeTextFile(file, stat.size, byteLimit, includeFull, trim);
+      return await shapeTextFile(file, stat.size, byteLimit, includeFull, trim, slice);
     }
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
 
-  return shapeTextValue(value, byteLimit, includeFull, trim);
+  return shapeTextValue(value, byteLimit, includeFull, trim, slice);
 }
 
-async function shapeTextFile(file, byteCount, byteLimit, includeFull, trim) {
-  const raw = includeFull ? await fsp.readFile(file, "utf8") : await readTextFilePrefix(file, byteLimit);
+async function shapeTextFile(file, byteCount, byteLimit, includeFull, trim, slice) {
+  const raw = includeFull ? await fsp.readFile(file, "utf8") : await readTextFileSlice(file, byteCount, byteLimit, slice);
   const text = cleanPayloadText(raw, trim);
-  const preview = includeFull ? cleanPayloadText(prefixByBytes(raw, byteLimit), trim) : text;
+  const preview = includeFull ? cleanPayloadText(sliceByBytes(raw, byteLimit, slice), trim) : text;
   return {
     text,
     preview,
@@ -1166,13 +1421,13 @@ async function shapeTextFile(file, byteCount, byteLimit, includeFull, trim) {
   };
 }
 
-function shapeTextValue(value, byteLimit, includeFull, trim) {
+function shapeTextValue(value, byteLimit, includeFull, trim, slice) {
   const raw = value ? String(value) : "";
   const byteCount = Buffer.byteLength(raw, "utf8");
-  const text = cleanPayloadText(includeFull ? raw : prefixByBytes(raw, byteLimit), trim);
+  const text = cleanPayloadText(includeFull ? raw : sliceByBytes(raw, byteLimit, slice), trim);
   return {
     text,
-    preview: text,
+    preview: cleanPayloadText(sliceByBytes(raw, byteLimit, slice), trim),
     bytes: byteCount,
     truncated: !includeFull && byteCount > byteLimit,
   };
@@ -1194,9 +1449,41 @@ async function readTextFilePrefix(file, byteLimit) {
   }
 }
 
+async function readTextFileSuffix(file, byteCount, byteLimit) {
+  const handle = await fsp.open(file, "r");
+  try {
+    const length = Math.min(byteCount, byteLimit);
+    const offset = Math.max(0, byteCount - length);
+    const buffer = Buffer.alloc(length);
+    const { bytesRead } = await handle.read(buffer, 0, length, offset);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readTextFileSlice(file, byteCount, byteLimit, slice) {
+  if (slice === "suffix") {
+    return readTextFileSuffix(file, byteCount, byteLimit);
+  }
+  return readTextFilePrefix(file, byteLimit);
+}
+
 function prefixByBytes(value, byteLimit) {
   const buffer = Buffer.from(value, "utf8");
   return buffer.subarray(0, Math.min(buffer.length, byteLimit)).toString("utf8");
+}
+
+function suffixByBytes(value, byteLimit) {
+  const buffer = Buffer.from(value, "utf8");
+  return buffer.subarray(Math.max(0, buffer.length - byteLimit)).toString("utf8");
+}
+
+function sliceByBytes(value, byteLimit, slice) {
+  if (slice === "suffix") {
+    return suffixByBytes(value, byteLimit);
+  }
+  return prefixByBytes(value, byteLimit);
 }
 
 function cleanAssistantResult(value) {

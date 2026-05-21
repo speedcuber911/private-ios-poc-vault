@@ -32,6 +32,8 @@ The server exposes an async job API for Codex:
 - `POST /v1/codex/jobs`: enqueue a Codex job.
 - `GET /v1/codex/jobs/<id>`: job detail with stdout, stderr, result, and status.
 - `POST /v1/codex/jobs/<id>/cancel`: cancel queued or running jobs.
+- `POST /v1/codex/transcriptions`: transcribe phone-recorded prompt audio
+  through the configured Azure Speech endpoint.
 
 All `/v1/codex/*` routes sit behind nginx mTLS. There is no bearer-token auth in
 the current live design.
@@ -96,6 +98,42 @@ content.
 previews so the phone UI can show readable thread history without raw
 stdout/stderr streams. Tune the preview length with
 `CODEX_THREAD_SUMMARY_CHARACTERS`.
+
+When a thread has no persisted job summary yet, the server reads bounded
+previews from the saved Codex session JSONL file. It skips injected
+AGENTS/environment context messages and strips skill-instruction prefixes before
+choosing the prompt preview.
+
+Job stdout and stderr previews use the latest log tail by default. The full log
+payload is returned only when the caller explicitly requests full logs.
+
+## Phone Transcription
+
+The iOS app can record short spoken prompts and replies, then upload the audio
+to:
+
+```text
+POST /v1/codex/transcriptions
+```
+
+The endpoint accepts binary audio, requires the same mTLS identity as every
+other `/v1/codex/*` route, and forwards the clip to Azure Speech as multipart
+form data. Audio is not written to the Codex job log store by the Node service.
+
+Configure the following only in `/etc/codex-api.env` or a local test
+environment:
+
+```text
+CODEX_MAX_TRANSCRIPTION_AUDIO_BYTES=26214400
+AZURE_SPEECH_ENDPOINT=
+AZURE_SPEECH_API_KEY=
+AZURE_SPEECH_API_VERSION=2025-10-15
+AZURE_SPEECH_TRANSCRIPTION_MODEL=mai-transcribe-1
+AZURE_SPEECH_LOCALES=en
+```
+
+If Azure Speech is not configured, the endpoint returns service unavailable
+rather than accepting the upload.
 
 ## Codex Login State
 
@@ -214,4 +252,16 @@ curl -sS \
   -H 'Content-Type: application/json' \
   -d '{"workspaceId":"scratch","resumeSessionId":"<session-id>","prompt":"Continue from here.","timeoutMs":600000}' \
   https://codex.pocs.conformal.live/v1/codex/jobs
+```
+
+Transcribe phone audio when Azure Speech is configured:
+
+```bash
+curl -sS \
+  --cert ~/.poc-vault/secrets/clients/parikshit-mac/parikshit-mac.crt \
+  --key ~/.poc-vault/secrets/clients/parikshit-mac/parikshit-mac.key \
+  -H 'Content-Type: audio/wav' \
+  -H 'X-Audio-Filename: phone-prompt.wav' \
+  --data-binary @phone-prompt.wav \
+  https://codex.pocs.conformal.live/v1/codex/transcriptions
 ```

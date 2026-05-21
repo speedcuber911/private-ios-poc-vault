@@ -64,6 +64,22 @@ latest-answer previews from the saved Codex session file.
 unknown session ids and sessions outside the requested workspace before running
 `codex exec resume`.
 
+## Phone Transcription
+
+`POST /v1/codex/transcriptions` accepts short phone-recorded audio clips and
+forwards them to Azure Speech. Configure `AZURE_SPEECH_ENDPOINT` and
+`AZURE_SPEECH_API_KEY` only in `/etc/codex-api.env`; keep those values out of
+the repo. The default model is `mai-transcribe-1` with the `en` language code.
+
+The endpoint reads a bounded binary body, sanitizes the uploaded content type
+and filename, sends multipart form data to Azure, and returns normalized text
+with provider/model metadata. `CODEX_MAX_TRANSCRIPTION_AUDIO_BYTES` controls the
+Node-side upload limit; nginx currently allows up to `30m` for the Codex API
+virtual host.
+
+If Azure Speech is not configured, the endpoint returns `503`. Azure failures
+are surfaced as `502` responses with the provider error message when available.
+
 ## Auth Headers
 
 nginx forwards:

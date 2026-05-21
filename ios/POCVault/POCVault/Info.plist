@@ -35,6 +35,8 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>POC Vault uses the microphone to turn spoken Codex prompts into text.</string>
 	<key>POCVaultManifestURL</key>
 	<string>$(POC_VAULT_MANIFEST_URL)</string>
 	<key>POCVaultCodexBaseURL</key>

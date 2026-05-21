@@ -130,11 +130,36 @@ final class CodexClient: NSObject, URLSessionDelegate {
         return try? decoder.decode(CodexJob.self, from: data)
     }
 
+    func transcribeAudio(fileURL: URL) async throws -> CodexTranscriptionResponse {
+        let data = try Data(contentsOf: fileURL)
+        return try await transcribeAudio(
+            data: data,
+            filename: fileURL.lastPathComponent.isEmpty ? "phone-prompt.wav" : fileURL.lastPathComponent,
+            contentType: "audio/wav"
+        )
+    }
+
+    func transcribeAudio(data: Data, filename: String, contentType: String) async throws -> CodexTranscriptionResponse {
+        let responseData = try await perform(
+            path: "/v1/codex/transcriptions",
+            method: "POST",
+            body: data,
+            contentType: contentType,
+            additionalHeaders: ["X-Audio-Filename": filename]
+        )
+        guard !responseData.isEmpty else {
+            throw CodexClientError.emptyResponse
+        }
+        return try decoder.decode(CodexTranscriptionResponse.self, from: responseData)
+    }
+
     private func perform(
         path: String,
         method: String = "GET",
         queryItems: [URLQueryItem] = [],
-        body: Data? = nil
+        body: Data? = nil,
+        contentType: String = "application/json",
+        additionalHeaders: [String: String] = [:]
     ) async throws -> Data {
         let url = endpoint(path: path, queryItems: queryItems)
         guard url.scheme != nil, url.host != nil else {
@@ -147,7 +172,10 @@ final class CodexClient: NSObject, URLSessionDelegate {
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if let body {
             request.httpBody = body
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue(contentType, forHTTPHeaderField: "Content-Type")
+        }
+        for (field, value) in additionalHeaders {
+            request.setValue(value, forHTTPHeaderField: field)
         }
 
         let (data, response) = try await session.data(for: request)

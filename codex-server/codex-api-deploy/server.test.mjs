@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import http from "node:http";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -53,6 +54,52 @@ async function startServer(env) {
       if (child.exitCode !== null) return;
       child.kill("SIGTERM");
       await new Promise((resolve) => child.once("exit", resolve));
+    },
+  };
+}
+
+async function startFakeAzureSpeech() {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      requests.push({
+        method: req.method,
+        url: req.url,
+        headers: req.headers,
+        body: Buffer.concat(chunks).toString("latin1"),
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          durationMilliseconds: 1200,
+          combinedPhrases: [{ text: "Run the smoke test from the phone." }],
+          phrases: [
+            {
+              offsetMilliseconds: 0,
+              durationMilliseconds: 1200,
+              text: "Run the smoke test from the phone.",
+              locale: "en-US",
+              confidence: 0.98,
+            },
+          ],
+        }),
+      );
+    });
+  });
+
+  const port = await freePort();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", resolve);
+  });
+
+  return {
+    endpoint: `http://127.0.0.1:${port}`,
+    requests,
+    async stop() {
+      await new Promise((resolve) => server.close(resolve));
     },
   };
 }
@@ -138,7 +185,7 @@ async function writeSessionFile(codexHome, sessionId, cwd) {
   );
 }
 
-async function writeSessionTranscriptFile(codexHome, sessionId, cwd, { userPrompt, assistantAnswer }) {
+async function writeSessionTranscriptFile(codexHome, sessionId, cwd, { contextPrompt, userPrompt, assistantAnswer }) {
   const sessionDir = path.join(codexHome, "sessions", "2026", "05", "20");
   await fs.mkdir(sessionDir, { recursive: true });
   const lines = [
@@ -153,9 +200,22 @@ async function writeSessionTranscriptFile(codexHome, sessionId, cwd, { userPromp
       payload: {
         type: "message",
         role: "user",
-        content: [{ type: "input_text", text: userPrompt }],
+        content: [{ type: "input_text", text: contextPrompt ?? userPrompt }],
       },
     },
+    ...(contextPrompt
+      ? [
+          {
+            type: "response_item",
+            timestamp: "2026-05-20T00:00:01.500Z",
+            payload: {
+              type: "message",
+              role: "user",
+              content: [{ type: "input_text", text: userPrompt }],
+            },
+          },
+        ]
+      : []),
     {
       type: "response_item",
       timestamp: "2026-05-20T00:00:02.000Z",
@@ -240,6 +300,72 @@ test("mTLS allowlist gates API routes while healthz remains public", async () =>
   }
 });
 
+test("transcribes uploaded phone audio through configured Azure Speech endpoint", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  const azure = await startFakeAzureSpeech();
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_BIN: await makeFakeCodex(tmpDir),
+    AZURE_SPEECH_ENDPOINT: azure.endpoint,
+    AZURE_SPEECH_API_KEY: "test-key",
+    AZURE_SPEECH_TRANSCRIPTION_MODEL: "mai-transcribe-1",
+    AZURE_SPEECH_LOCALES: "en",
+  });
+  try {
+    const response = await fetch(`${server.baseUrl}/v1/codex/transcriptions`, {
+      method: "POST",
+      headers: {
+        "content-type": "audio/wav",
+        "x-audio-filename": "phone-prompt.wav",
+      },
+      body: Buffer.from("RIFFfake-phone-audio", "utf8"),
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+
+    assert.equal(body.text, "Run the smoke test from the phone.");
+    assert.equal(body.provider, "azure-speech");
+    assert.equal(body.model, "mai-transcribe-1");
+    assert.equal(azure.requests.length, 1);
+    assert.equal(azure.requests[0].method, "POST");
+    assert.match(azure.requests[0].url, /^\/speechtotext\/transcriptions:transcribe\?api-version=2025-10-15$/);
+    assert.equal(azure.requests[0].headers["ocp-apim-subscription-key"], "test-key");
+    assert.match(azure.requests[0].headers["content-type"], /^multipart\/form-data; boundary=/);
+    assert.match(azure.requests[0].body, /name="audio"; filename="phone-prompt.wav"/);
+    assert.match(azure.requests[0].body, /"model":"mai-transcribe-1"/);
+  } finally {
+    await server.stop();
+    await azure.stop();
+  }
+});
+
+test("transcription endpoint returns unavailable until Azure Speech is configured", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_BIN: await makeFakeCodex(tmpDir),
+  });
+  try {
+    const response = await fetch(`${server.baseUrl}/v1/codex/transcriptions`, {
+      method: "POST",
+      headers: { "content-type": "audio/wav" },
+      body: Buffer.from("RIFFfake-phone-audio", "utf8"),
+    });
+    assert.equal(response.status, 503);
+    assert.match((await response.json()).error, /Azure Speech is not configured/);
+  } finally {
+    await server.stop();
+  }
+});
+
 test("lists EC2-native Codex threads with safe latest-job summaries", async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
   const workspaceDir = path.join(tmpDir, "scratch");
@@ -310,7 +436,8 @@ test("backfills readable thread summaries from session transcripts and flags smo
   const smokeJobId = "019e46a4-0000-7000-8000-000000000003";
   await fs.mkdir(workspaceDir, { recursive: true });
   await writeSessionTranscriptFile(codexHome, transcriptSessionId, workspaceDir, {
-    userPrompt: "Audit the vault deployment shape",
+    contextPrompt: "# AGENTS.md instructions for /srv/codex-workspaces/poc-vault\n<INSTRUCTIONS>POC Vault</INSTRUCTIONS>\n<environment_context><cwd>/srv/codex-workspaces/poc-vault</cwd></environment_context>",
+    userPrompt: "Use these Codex skills for this task: human-code-review.\n\nAudit the vault deployment shape",
     assistantAnswer: "The deployment uses mTLS and registered workspaces.",
   });
   await writeSessionFile(codexHome, smokeSessionId, workspaceDir);
@@ -537,11 +664,11 @@ test("job responses bound logs by default and return full logs only when request
     const listJob = (await list.json()).jobs[0];
     assert.equal(listJob.id, jobId);
     assert.equal(listJob.logsIncluded, "compact");
-    assert.equal(listJob.stdout, "stdout-x");
-    assert.equal(listJob.stdoutPreview, "stdout-x");
+    assert.equal(listJob.stdout, "xxx-tail");
+    assert.equal(listJob.stdoutPreview, "xxx-tail");
     assert.equal(listJob.stdoutBytes, Buffer.byteLength(stdout));
     assert.equal(listJob.stdoutTruncated, true);
-    assert.equal(listJob.stderr, "stderr-y");
+    assert.equal(listJob.stderr, "yyy-tail");
     assert.equal(listJob.stderrBytes, Buffer.byteLength(stderr));
     assert.equal(listJob.stderrTruncated, true);
     assert.equal(listJob.result, "result-z");
@@ -552,11 +679,11 @@ test("job responses bound logs by default and return full logs only when request
     assert.equal(detail.status, 200);
     const detailJob = await detail.json();
     assert.equal(detailJob.logsIncluded, "preview");
-    assert.equal(detailJob.stdout, "stdout-xxxxxxxxx");
-    assert.equal(detailJob.stdoutPreview, "stdout-xxxxxxxxx");
+    assert.equal(detailJob.stdout, "xxxxxxxxxxx-tail");
+    assert.equal(detailJob.stdoutPreview, "xxxxxxxxxxx-tail");
     assert.equal(detailJob.stdoutBytes, Buffer.byteLength(stdout));
     assert.equal(detailJob.stdoutTruncated, true);
-    assert.equal(detailJob.stderr, "stderr-yyyyyyyyy");
+    assert.equal(detailJob.stderr, "yyyyyyyyyyy-tail");
     assert.equal(detailJob.stderrTruncated, true);
     assert.equal(detailJob.result, "result-zzzzzzzzz");
     assert.equal(detailJob.resultPreview, "result-zzzzzzzzz");
@@ -567,7 +694,7 @@ test("job responses bound logs by default and return full logs only when request
     const fullJob = await full.json();
     assert.equal(fullJob.logsIncluded, "full");
     assert.equal(fullJob.stdout, stdout);
-    assert.equal(fullJob.stdoutPreview, "stdout-xxxxxxxxx");
+    assert.equal(fullJob.stdoutPreview, "xxxxxxxxxxx-tail");
     assert.equal(fullJob.stdoutBytes, Buffer.byteLength(stdout));
     assert.equal(fullJob.stdoutTruncated, false);
     assert.equal(fullJob.stderr, stderr);
