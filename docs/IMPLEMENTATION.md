@@ -77,6 +77,8 @@ console:
   handling for GitHub pull request URLs.
 - Raw job activity previews now favor the latest log tail so active failures
   show the newest useful lines first.
+- Thread detail opens on a bounded latest-answer preview and can expand/load the
+  latest job detail when the user wants the full answer.
 
 The compose controls support model selection, reasoning effort selection, and a
 searchable skill picker. Selected skills are applied client-side by prefixing
@@ -178,11 +180,12 @@ service-unavailable response instead of silently accepting audio.
 ## Security Model
 
 The live perimeter is certificate-based mTLS, not hardware-bound iPhone-only
-access. Current Codex API subject allowlist:
+access. The Codex API subject allowlist is configured per install with
+`CODEX_ALLOWED_CERT_SUBJECTS`, for example:
 
 ```text
 CN=iphone
-CN=parikshit-mac
+CN=operator
 ```
 
 nginx verifies the client certificate and forwards certificate status/subject
@@ -204,6 +207,19 @@ The root `README.md` now reads as a GitHub-facing project overview instead of
 only an internal runbook. It explains the product story, architecture, security
 model, POC deploy flow, iOS provisioning, simulator workflow, Codex console, and
 verification steps.
+
+`docs/MULTI_INSTALL.md` documents how a new owner can install the same stack on
+their own EC2/domain using a local `~/.poc-vault/secrets/config.env`. The
+portable install path is:
+
+- `ops/init-install-config` creates owner-local config plus optional local SSH
+  and manifest signing keys.
+- `ops/provision-ec2.sh` creates or checks AWS resources.
+- `ops/install-server.sh` renders the static vault nginx config on the host.
+- `ops/render-codex-api-config` renders install-specific Codex env/nginx files.
+- `ops/install-codex-api.sh` installs the Codex API service on the host.
+- `ops/provision-ios-support.sh` writes URLs and the trusted manifest public
+  key into the app support config for physical devices.
 
 The Codex server docs now call out:
 

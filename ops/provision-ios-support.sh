@@ -8,13 +8,14 @@ if [[ -f "$CONFIG_FILE" ]]; then
 fi
 
 DEVICE="${DEVICE:-}"
-BUNDLE_ID="${BUNDLE_ID:-${IOS_BUNDLE_ID:-com.parikshit.pocvault}}"
+BUNDLE_ID="${BUNDLE_ID:-${IOS_BUNDLE_ID:-com.example.pocvault}}"
 LOCAL_SECRETS_DIR="${LOCAL_SECRETS_DIR:-$HOME/.poc-vault/secrets}"
 P12_PATH="${IPHONE_P12_PATH:-$LOCAL_SECRETS_DIR/clients/iphone/iphone.p12}"
-VAULT_DOMAIN="${VAULT_DOMAIN:-vault.pocs.conformal.live}"
+VAULT_DOMAIN="${VAULT_DOMAIN:-vault.pocs.example.com}"
 POC_VAULT_MANIFEST_URL="${POC_VAULT_MANIFEST_URL:-https://${VAULT_DOMAIN}/manifest.json}"
 POC_VAULT_SIGNATURE_URL="${POC_VAULT_SIGNATURE_URL:-https://${VAULT_DOMAIN}/manifest.sig.json}"
 POC_VAULT_CODEX_BASE_URL="${POC_VAULT_CODEX_BASE_URL:-https://codex.${VAULT_DOMAIN#vault.}}"
+POC_VAULT_MANIFEST_PUBLIC_KEY="${POC_VAULT_MANIFEST_PUBLIC_KEY:-${MANIFEST_PUBLIC_KEY:-}}"
 
 usage() {
   cat <<USAGE
@@ -69,16 +70,19 @@ tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
 config_json="$tmpdir/vault-config.json"
-python3 - "$POC_VAULT_MANIFEST_URL" "$POC_VAULT_SIGNATURE_URL" "$POC_VAULT_CODEX_BASE_URL" >"$config_json" <<'PY'
+python3 - "$POC_VAULT_MANIFEST_URL" "$POC_VAULT_SIGNATURE_URL" "$POC_VAULT_CODEX_BASE_URL" "$POC_VAULT_MANIFEST_PUBLIC_KEY" >"$config_json" <<'PY'
 import json
 import sys
 
-manifest_url, signature_url, codex_base_url = sys.argv[1:4]
-print(json.dumps({
+manifest_url, signature_url, codex_base_url, manifest_public_key = sys.argv[1:5]
+payload = {
     "codexBaseURL": codex_base_url,
     "manifestURL": manifest_url,
     "signatureURL": signature_url,
-}, indent=2, sort_keys=True))
+}
+if manifest_public_key:
+    payload["manifestPublicKey"] = manifest_public_key
+print(json.dumps(payload, indent=2, sort_keys=True))
 PY
 
 xcrun devicectl device copy to \

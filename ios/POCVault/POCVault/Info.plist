@@ -43,6 +43,8 @@
 	<string>$(POC_VAULT_CODEX_BASE_URL)</string>
 	<key>POCVaultSignatureURL</key>
 	<string>$(POC_VAULT_SIGNATURE_URL)</string>
+	<key>POCVaultManifestPublicKey</key>
+	<string>$(POC_VAULT_MANIFEST_PUBLIC_KEY)</string>
 	<key>UIRequiresFullScreen</key>
 	<true/>
 	<key>UILaunchScreen</key>

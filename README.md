@@ -154,15 +154,28 @@ AWS_REGION=ap-south-1
 DOMAIN_ROOT=example.com
 VAULT_DOMAIN=vault.pocs.example.com
 POC_WILDCARD_DOMAIN=*.pocs.example.com
+CODEX_DOMAIN=codex.pocs.example.com
 DEPLOY_HOST=
 DEPLOY_USER=deploy
 SERVER_ROOT=/srv/poc-vault
 KEY_PATH=$HOME/.poc-vault/secrets/ssh/poc-vault.pem
 CLIENT_CERT_DAYS=90
 POC_VAULT_CODEX_BASE_URL=https://codex.pocs.example.com
+POC_VAULT_MANIFEST_PUBLIC_KEY=
 ```
 
 Do not copy real values from local config into this repository.
+
+For a new owner or teammate installing against their own EC2/domain, start with:
+
+```bash
+ops/init-install-config --domain-root example.com --bundle-id com.example.pocvault
+```
+
+Then follow [docs/MULTI_INSTALL.md](docs/MULTI_INSTALL.md). That flow keeps
+AWS, DNS, certificate subjects, iOS bundle id, manifest signing key, and Codex
+runtime config outside git while rendering install-specific nginx and systemd
+environment files.
 
 ## Deploy A POC
 
@@ -286,6 +299,7 @@ Support config shape:
 ```json
 {
   "codexBaseURL": "https://codex.pocs.example.com",
+  "manifestPublicKey": "<base64url-ed25519-public-key>",
   "manifestURL": "https://vault.pocs.example.com/manifest.json",
   "signatureURL": "https://vault.pocs.example.com/manifest.sig.json"
 }
@@ -354,7 +368,8 @@ https://<configured-codex-domain>/v1/codex/*
 Current API behavior:
 
 - `/v1/codex/*` is protected by mTLS.
-- Allowed certificate subjects are `CN=iphone` and `CN=parikshit-mac`.
+- Allowed certificate subjects are configured per install with
+  `CODEX_ALLOWED_CERT_SUBJECTS`.
 - Jobs are async and persisted on the VM.
 - Job history, detail logs, cancel, timeout, sessions, and thread summaries are
   supported.

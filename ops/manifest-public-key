@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""Print the trusted manifest Ed25519 public key for iOS support config."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import importlib.util
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_KEY = Path("~/.poc-vault/secrets/signing/manifest-ed25519.key").expanduser()
+from cryptography.hazmat.primitives import serialization  # noqa: E402
+
+
+SIGN_MANIFEST_PATH = ROOT / "ops" / "sign-manifest.py"
+spec = importlib.util.spec_from_file_location("sign_manifest", SIGN_MANIFEST_PATH)
+if spec is None or spec.loader is None:
+    raise RuntimeError(f"Could not load {SIGN_MANIFEST_PATH}")
+sign_manifest = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(sign_manifest)
+
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--key", type=Path, default=DEFAULT_KEY)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    key = sign_manifest.load_private_key(args.key.expanduser())
+    public_key = key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    print(b64url(public_key))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

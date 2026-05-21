@@ -11,7 +11,11 @@ fi
 PORT="${POC_VAULT_SIM_PORT:-8787}"
 SERVER_LOG="/tmp/poc-vault-simulator-server.log"
 SCREEN_NAME="poc-vault-simulator-server-${PORT}"
-BUNDLE_ID="${BUNDLE_ID:-${IOS_BUNDLE_ID:-com.parikshit.pocvault}}"
+BUNDLE_ID="${BUNDLE_ID:-${IOS_BUNDLE_ID:-com.example.pocvault}}"
+POC_VAULT_MANIFEST_PUBLIC_KEY="${POC_VAULT_MANIFEST_PUBLIC_KEY:-}"
+if [[ -z "$POC_VAULT_MANIFEST_PUBLIC_KEY" && -f "${LOCAL_SECRETS_DIR:-$HOME/.poc-vault/secrets}/signing/manifest-ed25519.key" ]]; then
+  POC_VAULT_MANIFEST_PUBLIC_KEY="$("$ROOT/ops/manifest-public-key" 2>/dev/null || true)"
+fi
 OLD_LAUNCH_LABEL="${BUNDLE_ID}.simulator"
 
 server_alive() {
@@ -53,6 +57,8 @@ xcodebuild build \
   -sdk iphonesimulator26.5 \
   -arch arm64 \
   PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+  POC_VAULT_CODEX_BASE_URL="${POC_VAULT_CODEX_BASE_URL:-http://127.0.0.1:${PORT}}" \
+  POC_VAULT_MANIFEST_PUBLIC_KEY="$POC_VAULT_MANIFEST_PUBLIC_KEY" \
   CODE_SIGNING_ALLOWED=NO >/tmp/poc-vault-simulator-build.log
 
 APP_PATH="$ROOT/ios/POCVault/build/Debug-iphonesimulator/POC Vault.app"

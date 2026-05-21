@@ -1416,8 +1416,16 @@ private struct CodexThreadDetailView: View {
     @ObservedObject var viewModel: CodexConsoleViewModel
     let onOpenJob: (String) -> Void
 
+    @State private var latestJob: CodexJob?
+    @State private var latestJobError: String?
+    @State private var isLoadingLatestJob = false
+
     private var thread: CodexThread? {
         viewModel.threads.first { $0.sessionId == sessionID || $0.id == sessionID }
+    }
+
+    private var latestJobID: String? {
+        thread?.lastJobId
     }
 
     var body: some View {
@@ -1429,10 +1437,23 @@ private struct CodexThreadDetailView: View {
                     CodexThreadOverviewCard(thread: thread, sessionID: sessionID)
 
                     if let thread, thread.hasActiveJobs {
-                        CodexThreadProgressCard()
+                        CodexThreadProgressCard(
+                            latestJob: latestJob,
+                            isLoadingLogs: isLoadingLatestJob,
+                            loadError: latestJobError
+                        ) {
+                            Task { await loadLatestJob(includeFullLogs: true) }
+                        }
                     }
 
-                    CodexThreadLatestAnswerCard(thread: thread)
+                    CodexThreadLatestAnswerCard(
+                        thread: thread,
+                        latestJob: latestJob,
+                        isLoadingFullAnswer: isLoadingLatestJob,
+                        loadError: latestJobError
+                    ) {
+                        Task { await loadLatestJob(includeFullLogs: true) }
+                    }
                 }
                 .padding(16)
                 .padding(.bottom, 164)
@@ -1478,10 +1499,31 @@ private struct CodexThreadDetailView: View {
         .refreshable {
             await viewModel.refreshJobs()
             await viewModel.refreshThreads()
+            await loadLatestJob(includeFullLogs: true)
         }
         .task(id: sessionID) {
             viewModel.selectSessionID(sessionID, workspaceID: thread?.workspaceId)
             await viewModel.refreshThreads()
+        }
+        .task(id: latestJobID) {
+            await loadLatestJob()
+        }
+    }
+
+    private func loadLatestJob(includeFullLogs: Bool = false) async {
+        guard let latestJobID else {
+            latestJob = nil
+            latestJobError = nil
+            return
+        }
+        isLoadingLatestJob = true
+        defer { isLoadingLatestJob = false }
+
+        do {
+            latestJob = try await viewModel.loadJob(id: latestJobID, includeFullLogs: includeFullLogs)
+            latestJobError = nil
+        } catch {
+            latestJobError = error.localizedDescription
         }
     }
 }
@@ -1531,14 +1573,74 @@ private struct CodexThreadOverviewCard: View {
 }
 
 private struct CodexThreadProgressCard: View {
+    let latestJob: CodexJob?
+    let isLoadingLogs: Bool
+    let loadError: String?
+    let onLoadLogs: () -> Void
+    @State private var isExpanded = false
+
     var body: some View {
-        HStack(spacing: 10) {
-            ProgressView()
-                .tint(CodexTheme.accent)
-            Text("Codex is working in this thread")
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(CodexTheme.text)
-            Spacer()
+        VStack(alignment: .leading, spacing: 12) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    isExpanded.toggle()
+                }
+                if isExpanded {
+                    onLoadLogs()
+                }
+            } label: {
+                HStack(spacing: 10) {
+                    ProgressView()
+                        .tint(CodexTheme.accent)
+                    Text("Codex is working in this thread")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(CodexTheme.text)
+                    Spacer()
+                    Text(isExpanded ? "Hide logs" : "Logs")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(CodexTheme.dim)
+                    Image(systemName: "chevron.down")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(CodexTheme.accent)
+                        .rotationEffect(.degrees(isExpanded ? 180 : 0))
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                HStack(spacing: 10) {
+                    Text(logStatusText)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(CodexTheme.dim)
+
+                    Spacer()
+
+                    Button(action: onLoadLogs) {
+                        Label(isLoadingLogs ? "Loading" : "Refresh", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(CodexPillButtonStyle())
+                    .disabled(isLoadingLogs)
+                }
+
+                if let loadError = CodexThreadText.trimmed(loadError) {
+                    Text(loadError)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(AppTheme.statusError)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                ScrollView(.horizontal) {
+                    Text(logText)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(hasLogs ? CodexTheme.muted : CodexTheme.dim)
+                        .textSelection(.enabled)
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxWidth: .infinity, maxHeight: 260, alignment: .leading)
+                .background(CodexTheme.raisedPanel, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
         }
         .padding(14)
         .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -1547,16 +1649,59 @@ private struct CodexThreadProgressCard: View {
                 .stroke(CodexTheme.stroke, lineWidth: 1)
         }
     }
+
+    private var hasLogs: Bool {
+        latestJob?.rawActivityPreview.originalCharacterCount ?? 0 > 0
+    }
+
+    private var logText: String {
+        guard let latestJob else {
+            return isLoadingLogs ? "Loading latest activity..." : "Tap Refresh to load the latest activity."
+        }
+        return latestJob.rawActivityPreview.text
+    }
+
+    private var logStatusText: String {
+        guard let latestJob else {
+            return isLoadingLogs ? "Loading latest activity" : "No activity loaded"
+        }
+        if latestJob.rawActivityPreview.isTruncated {
+            return "Showing latest activity"
+        }
+        if latestJob.logsIncluded == "full" {
+            return "Full log loaded"
+        }
+        return "Latest activity"
+    }
 }
 
 private struct CodexThreadLatestAnswerCard: View {
     let thread: CodexThread?
+    let latestJob: CodexJob?
+    let isLoadingFullAnswer: Bool
+    let loadError: String?
+    let onLoadFullAnswer: () -> Void
 
     var body: some View {
-        if let result = CodexThreadText.trimmed(thread?.lastResult) {
-            CodexThreadMarkdownCard(title: "Latest answer", symbol: "text.bubble", text: result)
-        } else if let error = CodexThreadText.trimmed(thread?.lastError) {
-            CodexThreadMarkdownCard(title: "Last error", symbol: "exclamationmark.bubble", text: error, isError: true)
+        if let answerText {
+            CodexThreadMarkdownCard(
+                title: latestJob == nil && thread?.lastJobId != nil ? "Latest answer preview" : "Latest answer",
+                symbol: "text.bubble",
+                text: answerText,
+                isLoadingFullAnswer: isLoadingFullAnswer,
+                loadError: loadError,
+                onLoadFullAnswer: onLoadFullAnswer
+            )
+        } else if let errorText {
+            CodexThreadMarkdownCard(
+                title: "Last error",
+                symbol: "exclamationmark.bubble",
+                text: errorText,
+                isError: true,
+                isLoadingFullAnswer: isLoadingFullAnswer,
+                loadError: loadError,
+                onLoadFullAnswer: onLoadFullAnswer
+            )
         } else {
             CodexEmptyState(
                 symbol: "bubble.left.and.bubble.right",
@@ -1567,6 +1712,16 @@ private struct CodexThreadLatestAnswerCard: View {
             )
         }
     }
+
+    private var answerText: String? {
+        CodexThreadText.trimmed(latestJob?.displayOutput)
+            ?? CodexThreadText.trimmed(thread?.lastResult)
+    }
+
+    private var errorText: String? {
+        CodexThreadText.trimmed(latestJob?.errorMessage)
+            ?? CodexThreadText.trimmed(thread?.lastError)
+    }
 }
 
 private struct CodexThreadMarkdownCard: View {
@@ -1574,16 +1729,49 @@ private struct CodexThreadMarkdownCard: View {
     let symbol: String
     let text: String
     var isError = false
+    var isLoadingFullAnswer = false
+    var loadError: String?
+    var onLoadFullAnswer: (() -> Void)?
+    @State private var isExpanded = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
-                Image(systemName: symbol)
-                    .foregroundStyle(isError ? AppTheme.statusError : CodexTheme.accent)
-                Text(title)
-                    .font(.subheadline.weight(.bold))
-                    .foregroundStyle(CodexTheme.text)
-                Spacer()
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    isExpanded.toggle()
+                }
+                if isExpanded {
+                    onLoadFullAnswer?()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: symbol)
+                        .foregroundStyle(isError ? AppTheme.statusError : CodexTheme.accent)
+                    Text(title)
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(CodexTheme.text)
+                    Spacer()
+                    if isLoadingFullAnswer {
+                        ProgressView()
+                            .tint(CodexTheme.text)
+                    }
+                    Text(isExpanded ? "Hide" : "Open")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(CodexTheme.dim)
+                    Image(systemName: "chevron.down")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(CodexTheme.accent)
+                        .rotationEffect(.degrees(isExpanded ? 180 : 0))
+                }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isExpanded ? "Collapse \(title)" : "Expand \(title)")
+
+            if let loadError = CodexThreadText.trimmed(loadError) {
+                Text(loadError)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(AppTheme.statusError)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             VStack(alignment: .leading, spacing: 12) {
@@ -1597,6 +1785,28 @@ private struct CodexThreadMarkdownCard: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            .lineLimit(isExpanded ? nil : 9)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    isExpanded.toggle()
+                }
+                if isExpanded {
+                    onLoadFullAnswer?()
+                }
+            }
+
+            if !isExpanded {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        isExpanded = true
+                    }
+                    onLoadFullAnswer?()
+                } label: {
+                    Label("Show full answer", systemImage: "arrow.down.right.and.arrow.up.left")
+                }
+                .buttonStyle(CodexPillButtonStyle(isAccent: true))
+            }
         }
         .padding(16)
         .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: 16, style: .continuous))

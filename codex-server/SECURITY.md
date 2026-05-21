@@ -5,10 +5,10 @@ infrastructure even though the repo itself should contain no secrets.
 
 ## Current Perimeter
 
-The public endpoint is:
+The public endpoint is configured per install:
 
 ```text
-https://codex.pocs.conformal.live
+https://<CODEX_DOMAIN>
 ```
 
 The trusted routes are `/v1/codex/*`. They require:
@@ -17,11 +17,12 @@ The trusted routes are `/v1/codex/*`. They require:
 2. exact certificate-subject allowlist
 3. backend re-check of the forwarded certificate subject
 
-The current allowed subjects are:
+The allowed subjects come from `CODEX_ALLOWED_CERT_SUBJECTS`. A fresh install
+usually starts with:
 
 ```text
 CN=iphone
-CN=parikshit-mac
+CN=operator
 ```
 
 `/healthz` is public by design and must not expose secrets.
@@ -83,11 +84,11 @@ The runner owns only:
 Run these checks after any deployment or auth change:
 
 ```bash
-curl -sS -w '\nHTTP:%{http_code}\n' https://codex.pocs.conformal.live/healthz
-curl -sS -w '\nHTTP:%{http_code}\n' https://codex.pocs.conformal.live/v1/codex/health
-curl -sS --cert ~/.poc-vault/secrets/clients/parikshit-mac/parikshit-mac.crt \
-  --key ~/.poc-vault/secrets/clients/parikshit-mac/parikshit-mac.key \
-  https://codex.pocs.conformal.live/v1/codex/health
+curl -sS -w '\nHTTP:%{http_code}\n' https://<CODEX_DOMAIN>/healthz
+curl -sS -w '\nHTTP:%{http_code}\n' https://<CODEX_DOMAIN>/v1/codex/health
+curl -sS --cert ~/.poc-vault/secrets/clients/operator/operator.crt \
+  --key ~/.poc-vault/secrets/clients/operator/operator.key \
+  https://<CODEX_DOMAIN>/v1/codex/health
 ```
 
 On the VM, check:

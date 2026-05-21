@@ -99,22 +99,25 @@ enum AppConfiguration {
     static let manifestURL = configuredURL(
         supportValue: supportConfig?.manifestURL,
         infoKey: "POCVaultManifestURL",
-        fallback: "https://vault.pocs.conformal.live/manifest.json"
+        fallback: "https://vault.pocs.example.com/manifest.json"
     )
     static let signatureURL = configuredURL(
         supportValue: supportConfig?.signatureURL,
         infoKey: "POCVaultSignatureURL",
-        fallback: "https://vault.pocs.conformal.live/manifest.sig.json"
+        fallback: "https://vault.pocs.example.com/manifest.sig.json"
     )
     static let codexBaseURL = configuredURL(
         supportValue: supportConfig?.codexBaseURL,
         infoKey: "POCVaultCodexBaseURL",
-        fallback: "https://codex.pocs.conformal.live"
+        fallback: "https://codex.pocs.example.com"
     )
     static let runtimeMode = "Production Vault"
 #endif
 
-    static let trustedManifestPublicKey = Data([
+    static let trustedManifestPublicKey = configuredPublicKey(
+        supportValue: supportConfig?.manifestPublicKey,
+        infoKey: "POCVaultManifestPublicKey"
+    ) ?? Data([
         0xf9, 0xba, 0xb6, 0x22, 0xa2, 0xad, 0x92, 0xd2,
         0x27, 0xeb, 0x34, 0x4f, 0xfa, 0x99, 0x30, 0xb1,
         0xaa, 0xdf, 0x77, 0xee, 0xaf, 0xb6, 0xde, 0x82,
@@ -140,9 +143,45 @@ enum AppConfiguration {
         return URL(string: value) ?? URL(string: fallback)!
     }
 
+    private static func configuredPublicKey(supportValue: String?, infoKey: String) -> Data? {
+        let infoValue = Bundle.main.object(forInfoDictionaryKey: infoKey) as? String
+        return [supportValue, infoValue]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty && !$0.contains("$(") }
+            .flatMap(rawPublicKeyData)
+    }
+
+    private static func rawPublicKeyData(from value: String) -> Data? {
+        let compact = value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: " ", with: "")
+        if compact.count == 64,
+           compact.allSatisfy({ $0.isHexDigit }) {
+            var bytes = Data()
+            var index = compact.startIndex
+            while index < compact.endIndex {
+                let next = compact.index(index, offsetBy: 2)
+                guard let byte = UInt8(compact[index..<next], radix: 16) else { return nil }
+                bytes.append(byte)
+                index = next
+            }
+            return bytes.count == 32 ? bytes : nil
+        }
+
+        let padded = compact
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+            .padding(toLength: ((compact.count + 3) / 4) * 4, withPad: "=", startingAt: 0)
+        guard let decoded = Data(base64Encoded: padded), decoded.count == 32 else {
+            return nil
+        }
+        return decoded
+    }
+
     private struct SupportConfig: Decodable {
         let manifestURL: String?
         let signatureURL: String?
         let codexBaseURL: String?
+        let manifestPublicKey: String?
     }
 }

@@ -10,7 +10,8 @@ This directory contains the deployable files for the async Codex job service.
 - `server.test.mjs`: local tests that use a fake `codex` binary.
 - `codex-api.env.example`: non-secret environment file template for
   `/etc/codex-api.env`.
-- `codex-api.nginx.conf`: nginx virtual host for `codex.pocs.conformal.live`.
+- `codex-api.nginx.conf.template`: owner-specific nginx virtual host template.
+- `codex-api.nginx.conf`: example rendered nginx virtual host.
 - `codex-api.service`: systemd unit for `codex-runner`.
 
 ## Local Check
@@ -26,7 +27,7 @@ The current template uses:
 
 ```text
 CODEX_REQUIRE_MTLS=true
-CODEX_ALLOWED_CERT_SUBJECTS=CN=iphone,CN=parikshit-mac
+CODEX_ALLOWED_CERT_SUBJECTS=CN=iphone,CN=operator
 CODEX_DANGEROUS_MODE=true
 CODEX_MAX_CONCURRENT=1
 CODEX_DEFAULT_TIMEOUT_MS=600000
@@ -48,6 +49,24 @@ current live values are:
 ```
 
 Do not accept arbitrary paths from the phone.
+
+## Rendering For An Install
+
+From the repo root, render owner-specific env and nginx files with:
+
+```bash
+ops/render-codex-api-config
+```
+
+The renderer reads `~/.poc-vault/secrets/config.env` by default and writes to:
+
+```text
+build/codex-api/codex-api.env
+build/codex-api/codex-api.nginx.conf
+```
+
+On the EC2 host, `ops/install-codex-api.sh` renders and installs those files to
+`/etc/codex-api.env` and `/etc/nginx/conf.d/codex-api.conf`.
 
 ## Resumable Sessions
 

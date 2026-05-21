@@ -1,8 +1,6 @@
-# Example rendered nginx config. Prefer generating an owner-specific config with:
-#   ops/render-codex-api-config
-#
-# Keep the subject strings exactly aligned with CODEX_ALLOWED_CERT_SUBJECTS in
-# /etc/codex-api.env.
+# Generated copies of this template should be installed to
+# /etc/nginx/conf.d/codex-api.conf. Keep CODEX_ALLOWED_CERT_SUBJECTS in
+# /etc/codex-api.env aligned with the map below.
 map $ssl_client_verify $codex_client_verified {
     default 0;
     SUCCESS 1;
@@ -10,21 +8,20 @@ map $ssl_client_verify $codex_client_verified {
 
 map $ssl_client_s_dn $codex_client_subject_allowed {
     default 0;
-    "CN=iphone" 1;
-    "CN=operator" 1;
+__CODEX_ALLOWED_SUBJECT_MAP__
 }
 
 server {
     listen 443 ssl;
-    server_name codex.pocs.example.com;
+    server_name __CODEX_DOMAIN__;
 
-    ssl_certificate /etc/poc-vault/tls/server.crt;
-    ssl_certificate_key /etc/poc-vault/tls/server.key;
+    ssl_certificate __TLS_DIR__/server.crt;
+    ssl_certificate_key __TLS_DIR__/server.key;
 
     # Client certs are optional at the TLS layer so /healthz can stay public.
-    # Every /v1/codex route below enforces SUCCESS plus an exact subject allowlist.
-    ssl_client_certificate /etc/codex-api/mtls/client-ca.crt;
-    ssl_crl /etc/codex-api/mtls/client-crl.pem;
+    # Every /v1/codex route below enforces SUCCESS plus the exact subject map.
+    ssl_client_certificate __CODEX_MTLS_DIR__/client-ca.crt;
+    ssl_crl __CODEX_MTLS_DIR__/client-crl.pem;
     ssl_verify_client optional;
     ssl_verify_depth 2;
 
@@ -38,7 +35,7 @@ server {
 
     location = /healthz {
         access_log off;
-        proxy_pass http://127.0.0.1:8787/healthz;
+        proxy_pass __CODEX_API_UPSTREAM__/healthz;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
@@ -56,7 +53,7 @@ server {
         proxy_http_version 1.1;
         proxy_read_timeout 1200s;
         proxy_send_timeout 1200s;
-        proxy_pass http://127.0.0.1:8787;
+        proxy_pass __CODEX_API_UPSTREAM__;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;

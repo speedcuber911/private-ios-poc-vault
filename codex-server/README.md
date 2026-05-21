@@ -4,16 +4,16 @@ This workspace owns the EC2-side Codex job API used by the POC Vault iPhone app.
 It lives inside `/Users/pariksj/Desktop/poc-vault/codex-server` so the iOS vault
 app and server runner can be changed together when their contract moves.
 
-Live endpoint:
+Configured endpoint shape:
 
 ```text
-https://codex.pocs.conformal.live
+https://<CODEX_DOMAIN>
 ```
 
 Remote host:
 
 ```text
-personal AWS / ap-south-1 / poc-vault EC2
+owner AWS account / configured region / POC Vault EC2
 ```
 
 ## What It Provides
@@ -41,11 +41,12 @@ the current live design.
 ## Current Auth Contract
 
 nginx and the backend both treat the client certificate subject as the operator
-identity. The intended allowlist is strict:
+identity. The intended allowlist is strict and configured with
+`CODEX_ALLOWED_CERT_SUBJECTS`. A fresh install usually starts with:
 
 ```text
 CN=iphone
-CN=parikshit-mac
+CN=operator
 ```
 
 Requests without a verified client certificate are rejected before they reach
@@ -166,8 +167,21 @@ Key files:
 - `server.mjs`: async job API and worker.
 - `server.test.mjs`: local fake-Codex tests.
 - `codex-api.env.example`: non-secret systemd environment template.
-- `codex-api.nginx.conf`: nginx mTLS virtual host.
+- `codex-api.nginx.conf.template`: owner-specific nginx mTLS template.
+- `codex-api.nginx.conf`: example rendered nginx mTLS virtual host.
 - `codex-api.service`: systemd service unit.
+
+Render owner-specific files from the repo root with:
+
+```bash
+ops/render-codex-api-config
+```
+
+Install the service on an EC2 host with:
+
+```bash
+sudo POC_VAULT_CONFIG=~/.poc-vault/secrets/config.env ops/install-codex-api.sh
+```
 
 ## Deploy Shape
 
@@ -198,70 +212,78 @@ Expected result: both tests pass.
 
 ## Live Verification
 
+Set a helper URL first:
+
+```bash
+CODEX_URL=https://<configured-codex-domain>
+CLIENT_CERT=~/.poc-vault/secrets/clients/operator/operator.crt
+CLIENT_KEY=~/.poc-vault/secrets/clients/operator/operator.key
+```
+
 No cert should fail:
 
 ```bash
 curl -sS -w '\nHTTP:%{http_code}\n' \
-  https://codex.pocs.conformal.live/v1/codex/health
+  "$CODEX_URL/v1/codex/health"
 ```
 
-Mac cert should pass:
+Allowlisted client cert should pass:
 
 ```bash
 curl -sS \
-  --cert ~/.poc-vault/secrets/clients/parikshit-mac/parikshit-mac.crt \
-  --key ~/.poc-vault/secrets/clients/parikshit-mac/parikshit-mac.key \
-  https://codex.pocs.conformal.live/v1/codex/health
+  --cert "$CLIENT_CERT" \
+  --key "$CLIENT_KEY" \
+  "$CODEX_URL/v1/codex/health"
 ```
 
 Submit a small job:
 
 ```bash
 curl -sS \
-  --cert ~/.poc-vault/secrets/clients/parikshit-mac/parikshit-mac.crt \
-  --key ~/.poc-vault/secrets/clients/parikshit-mac/parikshit-mac.key \
+  --cert "$CLIENT_CERT" \
+  --key "$CLIENT_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"workspaceId":"scratch","prompt":"Reply with exactly codex-async-ok and nothing else.","timeoutMs":600000}' \
-  https://codex.pocs.conformal.live/v1/codex/jobs
+  "$CODEX_URL/v1/codex/jobs"
 ```
 
 List resumable sessions without transcript content:
 
 ```bash
 curl -sS \
-  --cert ~/.poc-vault/secrets/clients/parikshit-mac/parikshit-mac.crt \
-  --key ~/.poc-vault/secrets/clients/parikshit-mac/parikshit-mac.key \
-  'https://codex.pocs.conformal.live/v1/codex/sessions?workspaceId=scratch&limit=20'
+  --cert "$CLIENT_CERT" \
+  --key "$CLIENT_KEY" \
+  "$CODEX_URL/v1/codex/sessions?workspaceId=scratch&limit=20"
 ```
 
 List EC2-native threads:
 
 ```bash
 curl -sS \
-  --cert ~/.poc-vault/secrets/clients/parikshit-mac/parikshit-mac.crt \
-  --key ~/.poc-vault/secrets/clients/parikshit-mac/parikshit-mac.key \
-  'https://codex.pocs.conformal.live/v1/codex/threads?workspaceId=scratch&limit=20'
+  --cert "$CLIENT_CERT" \
+  --key "$CLIENT_KEY" \
+  "$CODEX_URL/v1/codex/threads?workspaceId=scratch&limit=20"
 ```
 
 Resume a server-side session by id:
 
 ```bash
 curl -sS \
-  --cert ~/.poc-vault/secrets/clients/parikshit-mac/parikshit-mac.crt \
-  --key ~/.poc-vault/secrets/clients/parikshit-mac/parikshit-mac.key \
+  --cert "$CLIENT_CERT" \
+  --key "$CLIENT_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"workspaceId":"scratch","resumeSessionId":"<session-id>","prompt":"Continue from here.","timeoutMs":600000}' \
-  https://codex.pocs.conformal.live/v1/codex/jobs
+  "$CODEX_URL/v1/codex/jobs"
 ```
 
 Transcribe phone audio when Azure Speech is configured:
 
 ```bash
 curl -sS \
-  --cert ~/.poc-vault/secrets/clients/parikshit-mac/parikshit-mac.crt \
-  --key ~/.poc-vault/secrets/clients/parikshit-mac/parikshit-mac.key \
+  --cert "$CLIENT_CERT" \
+  --key "$CLIENT_KEY" \
   -H 'Content-Type: audio/wav' \
   -H 'X-Audio-Filename: phone-prompt.wav' \
   --data-binary @phone-prompt.wav \
-  https://codex.pocs.conformal.live/v1/codex/transcriptions
+  "$CODEX_URL/v1/codex/transcriptions"
 ```

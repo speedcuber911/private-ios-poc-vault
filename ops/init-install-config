@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${POC_VAULT_CONFIG:-$HOME/.poc-vault/secrets/config.env}"
+SECRETS_DIR="${LOCAL_SECRETS_DIR:-$HOME/.poc-vault/secrets}"
+DOMAIN_ROOT="example.com"
+AWS_REGION="ap-south-1"
+INSTANCE_NAME="poc-vault"
+INSTANCE_TYPE="t3.micro"
+KEY_NAME="poc-vault"
+HOSTED_ZONE_ID=""
+ADMIN_CIDR=""
+DEPLOY_HOST=""
+DEPLOY_USER="deploy"
+SERVER_ROOT="/srv/poc-vault"
+BUNDLE_ID="com.example.pocvault"
+DEVELOPMENT_TEAM=""
+VAULT_DOMAIN=""
+POC_WILDCARD_DOMAIN=""
+CODEX_DOMAIN=""
+CODEX_ALLOWED_CERT_SUBJECTS="CN=iphone,CN=operator"
+FORCE=false
+GENERATE_KEYS=true
+
+usage() {
+  cat <<USAGE
+Usage: $(basename "$0") [options]
+
+Creates a local POC Vault owner config at:
+  ${CONFIG_FILE}
+
+This file is intentionally outside git. Use it to make one checkout installable
+against different owner EC2 instances, domains, iOS bundle ids, and Codex API
+subjects.
+
+Options:
+  --config <path>                  Config path to write
+  --secrets-dir <path>             Local secret root
+  --domain-root <domain>           Root domain, for example example.com
+  --vault-domain <host>            Manifest host, default vault.pocs.<domain-root>
+  --poc-wildcard-domain <pattern>  POC host pattern, default *.pocs.<domain-root>
+  --codex-domain <host>            Codex host, default codex.pocs.<domain-root>
+  --aws-region <region>            AWS region for EC2 provisioning
+  --instance-name <name>           EC2 Name tag
+  --instance-type <type>           EC2 instance type
+  --key-name <name>                EC2 key pair name
+  --hosted-zone-id <id>            Optional Route53 hosted zone id
+  --admin-cidr <cidr>              Optional SSH admin CIDR
+  --deploy-host <host>             Optional existing EC2 host/IP
+  --bundle-id <id>                 iOS app bundle id
+  --development-team <team-id>     Apple development team id
+  --codex-allowed-subjects <csv>   Cert subjects allowed on /v1/codex/*
+  --no-generate-keys               Do not create local SSH/signing keys
+  --force                          Overwrite an existing config
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --config) CONFIG_FILE="${2:-}"; shift 2 ;;
+    --secrets-dir) SECRETS_DIR="${2:-}"; shift 2 ;;
+    --domain-root) DOMAIN_ROOT="${2:-}"; shift 2 ;;
+    --vault-domain) VAULT_DOMAIN="${2:-}"; shift 2 ;;
+    --poc-wildcard-domain) POC_WILDCARD_DOMAIN="${2:-}"; shift 2 ;;
+    --codex-domain) CODEX_DOMAIN="${2:-}"; shift 2 ;;
+    --aws-region) AWS_REGION="${2:-}"; shift 2 ;;
+    --instance-name) INSTANCE_NAME="${2:-}"; shift 2 ;;
+    --instance-type) INSTANCE_TYPE="${2:-}"; shift 2 ;;
+    --key-name) KEY_NAME="${2:-}"; shift 2 ;;
+    --hosted-zone-id) HOSTED_ZONE_ID="${2:-}"; shift 2 ;;
+    --admin-cidr) ADMIN_CIDR="${2:-}"; shift 2 ;;
+    --deploy-host) DEPLOY_HOST="${2:-}"; shift 2 ;;
+    --bundle-id) BUNDLE_ID="${2:-}"; shift 2 ;;
+    --development-team) DEVELOPMENT_TEAM="${2:-}"; shift 2 ;;
+    --codex-allowed-subjects) CODEX_ALLOWED_CERT_SUBJECTS="${2:-}"; shift 2 ;;
+    --no-generate-keys) GENERATE_KEYS=false; shift ;;
+    --force) FORCE=true; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -z "$CONFIG_FILE" || -z "$SECRETS_DIR" || -z "$DOMAIN_ROOT" ]]; then
+  echo "config path, secrets dir, and domain root are required" >&2
+  exit 1
+fi
+
+VAULT_DOMAIN="${VAULT_DOMAIN:-vault.pocs.${DOMAIN_ROOT}}"
+POC_WILDCARD_DOMAIN="${POC_WILDCARD_DOMAIN:-*.pocs.${DOMAIN_ROOT}}"
+CODEX_DOMAIN="${CODEX_DOMAIN:-codex.pocs.${DOMAIN_ROOT}}"
+POC_DOMAIN_SUFFIX="${POC_WILDCARD_DOMAIN#*.}"
+KEY_PATH="${SECRETS_DIR}/ssh/${KEY_NAME}.pem"
+SSH_PUBLIC_KEY_PATH="${KEY_PATH}.pub"
+MANIFEST_KEY_PATH="${SECRETS_DIR}/signing/manifest-ed25519.key"
+MANIFEST_PUBLIC_KEY=""
+
+if [[ -f "$CONFIG_FILE" && "$FORCE" != "true" ]]; then
+  echo "Config already exists: ${CONFIG_FILE}" >&2
+  echo "Re-run with --force to overwrite it." >&2
+  exit 1
+fi
+
+install -d -m 0700 "$(dirname "$CONFIG_FILE")" "$SECRETS_DIR" "$SECRETS_DIR/ssh" "$SECRETS_DIR/signing"
+
+if [[ "$GENERATE_KEYS" == "true" ]]; then
+  if [[ ! -f "$KEY_PATH" ]]; then
+    ssh-keygen -t ed25519 -N "" -f "$KEY_PATH" -C "${INSTANCE_NAME} deploy key" >/dev/null
+    chmod 0600 "$KEY_PATH"
+  fi
+  if [[ ! -f "$MANIFEST_KEY_PATH" ]]; then
+    ssh-keygen -t ed25519 -N "" -f "$MANIFEST_KEY_PATH" -C "${INSTANCE_NAME} manifest signing" >/dev/null
+    chmod 0600 "$MANIFEST_KEY_PATH"
+  fi
+fi
+
+if [[ -f "$MANIFEST_KEY_PATH" ]]; then
+  MANIFEST_PUBLIC_KEY="$(python3 "$SCRIPT_DIR/manifest-public-key" --key "$MANIFEST_KEY_PATH" 2>/dev/null || true)"
+fi
+
+umask 077
+cat >"$CONFIG_FILE" <<EOF
+# POC Vault owner-local configuration.
+# Keep this file outside git. It may contain paths and secret placeholders.
+
+AWS_REGION=${AWS_REGION}
+DOMAIN_ROOT=${DOMAIN_ROOT}
+VAULT_DOMAIN=${VAULT_DOMAIN}
+POC_WILDCARD_DOMAIN=${POC_WILDCARD_DOMAIN}
+POC_DOMAIN_SUFFIX=${POC_DOMAIN_SUFFIX}
+CODEX_DOMAIN=${CODEX_DOMAIN}
+POC_VAULT_CODEX_BASE_URL=https://${CODEX_DOMAIN}
+POC_VAULT_MANIFEST_URL=https://${VAULT_DOMAIN}/manifest.json
+POC_VAULT_SIGNATURE_URL=https://${VAULT_DOMAIN}/manifest.sig.json
+POC_VAULT_MANIFEST_PUBLIC_KEY=${MANIFEST_PUBLIC_KEY}
+
+INSTANCE_NAME=${INSTANCE_NAME}
+INSTANCE_TYPE=${INSTANCE_TYPE}
+KEY_NAME=${KEY_NAME}
+KEY_PATH=${KEY_PATH}
+SSH_PUBLIC_KEY_PATH=${SSH_PUBLIC_KEY_PATH}
+ADMIN_CIDR=${ADMIN_CIDR}
+HOSTED_ZONE_ID=${HOSTED_ZONE_ID}
+DEPLOY_USER=${DEPLOY_USER}
+DEPLOY_HOST=${DEPLOY_HOST}
+SERVER_ROOT=${SERVER_ROOT}
+LOCAL_SECRETS_DIR=${SECRETS_DIR}
+
+TLS_DIR=/etc/poc-vault/tls
+NGINX_CONF_PATH=/etc/nginx/conf.d/poc-vault.conf
+CODEX_API_INSTALL_DIR=/opt/codex-api
+CODEX_API_ENV_PATH=/etc/codex-api.env
+CODEX_API_NGINX_CONF_PATH=/etc/nginx/conf.d/codex-api.conf
+CODEX_MTLS_DIR=/etc/codex-api/mtls
+CODEX_ALLOWED_CERT_SUBJECTS=${CODEX_ALLOWED_CERT_SUBJECTS}
+CODEX_WORKSPACES='[{"id":"scratch","name":"Scratch","path":"/srv/codex-workspaces/scratch"},{"id":"poc-vault","name":"POC Vault","path":"/srv/codex-workspaces/poc-vault"}]'
+
+CLIENT_CERT_DAYS=90
+CLIENT_CA_DAYS=3650
+CLIENT_P12_PASSWORD=
+IPHONE_P12_PASSWORD=
+
+BUNDLE_ID=${BUNDLE_ID}
+IOS_BUNDLE_ID=${BUNDLE_ID}
+DEVELOPMENT_TEAM=${DEVELOPMENT_TEAM}
+
+LE_EMAIL=
+AZURE_SPEECH_ENDPOINT=
+AZURE_SPEECH_API_KEY=
+AZURE_SPEECH_API_VERSION=2025-10-15
+AZURE_SPEECH_TRANSCRIPTION_MODEL=mai-transcribe-1
+AZURE_SPEECH_LOCALES=en
+EOF
+
+cat <<SUMMARY
+Created POC Vault install config
+  config:       ${CONFIG_FILE}
+  secrets:      ${SECRETS_DIR}
+  vault:        https://${VAULT_DOMAIN}
+  pocs:         https://<slug>.${POC_DOMAIN_SUFFIX}
+  codex:        https://${CODEX_DOMAIN}
+  bundle_id:    ${BUNDLE_ID}
+
+Next:
+  1. Fill CLIENT_P12_PASSWORD/IPHONE_P12_PASSWORD and LE_EMAIL in the config.
+  2. Run ops/provision-ec2.sh or set DEPLOY_HOST for an existing EC2.
+  3. Follow docs/MULTI_INSTALL.md for server install and verification.
+SUMMARY

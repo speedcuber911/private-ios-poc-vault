@@ -3,9 +3,9 @@
 POC Vault is designed to keep private prototypes behind mutual TLS, but the repo
 must stay free of credentials.
 
-The same iOS app also controls the Codex job API at
-`https://codex.pocs.conformal.live`. Treat that endpoint as agent-runner
-infrastructure, not just static demo hosting.
+The same iOS app can also control a configured Codex job API at
+`https://<CODEX_DOMAIN>`. Treat that endpoint as agent-runner infrastructure,
+not just static demo hosting.
 
 ## Never Commit
 
@@ -71,7 +71,7 @@ workspace lives inside this repo at:
 Live `/v1/codex/*` routes require:
 
 - nginx mTLS verification success
-- exact subject allowlist for `CN=iphone` and `CN=parikshit-mac`
+- exact subject allowlist configured by `CODEX_ALLOWED_CERT_SUBJECTS`
 - backend re-check of the forwarded certificate subject
 - session/thread listing should expose metadata only, not raw transcript content
 - transcription requests should require the same mTLS boundary and must keep
