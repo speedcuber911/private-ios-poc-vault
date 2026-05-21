@@ -6,6 +6,8 @@ The idea is simple: agents can keep producing static demos, but the user sees
 them as a private native library on iPhone. Each demo is just HTML/CSS/JS hosted
 behind mutual TLS. The iOS app fetches a signed manifest, shows the list of
 available POCs, and opens each one in an authenticated full-screen WebView.
+The same app also has a Codex tab that can trigger async Codex jobs on the EC2
+box while the Mac is off.
 
 No app update is required when a new POC is added.
 
@@ -21,7 +23,12 @@ turns that into a repeatable loop:
 4. The iPhone app refreshes and shows the new POC.
 5. The POC opens in a full-screen authenticated WebView.
 
-The app is deliberately boring and stable. The experiments live on the backend.
+For remote agent work, the Codex tab uses the same installed client certificate
+to call `https://codex.pocs.conformal.live`, enqueue a job, and poll results
+while the Mac is off.
+
+The app is deliberately boring and stable. The experiments and Codex workloads
+live on the backend.
 
 ## Architecture
 
@@ -34,6 +41,8 @@ flowchart LR
   VM --> DNS["vault + wildcard POC DNS"]
   DNS --> App["iOS POC Vault app"]
   App --> WebView["Authenticated full-screen WebView"]
+  App --> Codex["Codex Console tab"]
+  Codex --> API["codex.pocs.conformal.live / async jobs"]
 ```
 
 Core pieces:
@@ -44,6 +53,8 @@ Core pieces:
 - `build/manifest.json`: generated POC registry.
 - `build/manifest.sig.json`: Ed25519 signature sidecar.
 - `ios/POCVault/`: SwiftUI app that reads the manifest and opens POCs.
+- `ios/POCVault/POCVault/Views/CodexConsoleView.swift`: iOS Codex console.
+- `codex-server/`: EC2 Codex job API workspace colocated with this repo.
 - nginx mTLS: blocks clients without a valid client certificate.
 
 ## Security Model
@@ -53,6 +64,9 @@ POC Vault is private by default.
 - Public DNS can point to the VM.
 - HTTPS can be open to the internet on port 443.
 - nginx requires a valid client certificate for `/manifest.json` and POC pages.
+- nginx also requires mTLS for `https://codex.pocs.conformal.live/v1/codex/*`.
+- Codex API certificate subjects are strictly allowlisted to `CN=iphone` and
+  `CN=parikshit-mac`.
 - `/healthz` is intentionally public for diagnostics.
 - The iOS app verifies the manifest signature before trusting entries.
 - Secrets live outside the repo under `~/.poc-vault/secrets`.
@@ -84,6 +98,64 @@ For normal POC work, change only:
 Change `ios/POCVault/` only for vault-app features, identity/enrollment changes,
 manifest schema changes, signing/project settings, or security behavior.
 
+## Codex Console
+
+The iOS app includes a Codex tab for running remote Codex work on the EC2 box.
+The server code is colocated in this repo because the phone shell and runner are
+operationally coupled, even though the static POC hosting contract is still
+separate from the Codex API contract.
+
+Current live API:
+
+```text
+https://codex.pocs.conformal.live
+```
+
+Current local server workspace:
+
+```text
+/Users/pariksj/Desktop/poc-vault/codex-server
+```
+
+Current API behavior:
+
+- `/v1/codex/*` is protected by mTLS.
+- Allowed certificate subjects are `CN=iphone` and `CN=parikshit-mac`.
+- Jobs are async and persisted on the VM.
+- The API supports job history, detail logs, cancel, timeout, session listing,
+  and `resumeSessionId` for continuing an old server thread.
+- Workspaces are predefined; the phone cannot send arbitrary filesystem paths.
+- The live Codex runner uses the remote `codex-runner` user.
+
+The Codex UI uses the same `ClientIdentityStore` as the manifest and WebView
+flows. On a physical iPhone, import the `client.p12` in Diagnostics first. The
+current phone UI is intentionally simple: prompt plus collapsible Results. Do
+not reintroduce endpoint cards, workspace cards, offline/online labels, a thread
+picker, or tick icons unless the user asks for that UI again. The prompt editor
+includes a keyboard `Done` control, supports interactive scroll-to-dismiss, and
+dismisses the keyboard when `Run` starts.
+
+Remote workspace ids:
+
+```text
+scratch
+poc-vault
+```
+
+## Current POC Catalog
+
+Checked-in static POCs:
+
+- `bmw-i7-m4-acceleration`: BMW i7 xDrive60 versus BMW M4 Competition xDrive
+  acceleration and limiter comparison.
+- `india-ctc-calculator`: mobile-first reverse salary calculator for India
+  monthly in-hand targets.
+- `sfs-data-readiness`: Project Leap data-readiness workbench with asks,
+  owners, schemas, and a 30-day plan.
+- `sfs-leap-workbench`: internal SFS Project Leap technical wave planning
+  workbench.
+- `smoke-test`: small static smoke page used by deploy and server verification.
+
 ## Deployment Configuration
 
 This repository ships with example domains only. Real deployment values should
@@ -92,6 +164,7 @@ live outside git in `~/.poc-vault/secrets/config.env`.
 - Region: `ap-south-1` by default, configurable with `AWS_REGION`
 - Vault host: configured with `VAULT_DOMAIN`
 - POC host pattern: configured with `POC_WILDCARD_DOMAIN`
+- Codex host: configured with `POC_VAULT_CODEX_BASE_URL`
 - Server root: `/srv/poc-vault`
 - Deploy user: `deploy`
 
@@ -129,6 +202,7 @@ DEPLOY_USER=deploy
 SERVER_ROOT=/srv/poc-vault
 KEY_PATH=$HOME/.poc-vault/secrets/ssh/poc-vault.pem
 CLIENT_CERT_DAYS=90
+POC_VAULT_CODEX_BASE_URL=https://codex.pocs.example.com
 ```
 
 ## Deploy A POC
@@ -197,10 +271,11 @@ raw 32-byte base64/base64url.
 
 ## iOS App
 
-The app has two jobs:
+The app has three jobs:
 
 - show the signed manifest as a native private library
 - open each POC URL in an authenticated `WKWebView`
+- submit and monitor async Codex jobs from the Codex tab
 
 POC detail screens are full-screen. There is no standard navigation bar above
 hosted pages. The shell uses a small translucent floating back button over the
@@ -246,6 +321,7 @@ Support config shape:
 
 ```json
 {
+  "codexBaseURL": "https://codex.pocs.example.com",
   "manifestURL": "https://vault.pocs.example.com/manifest.json",
   "signatureURL": "https://vault.pocs.example.com/manifest.sig.json"
 }
@@ -303,6 +379,8 @@ curl -fsS http://127.0.0.1:8787/healthz
 ├── AGENTS.md
 ├── README.md
 ├── SECURITY.md
+├── codex-server/
+│   └── codex-api-deploy/
 ├── ios/
 │   ├── launch-simulator.sh
 │   └── POCVault/
@@ -327,6 +405,7 @@ python3 -m py_compile ops/render-manifest.py ops/sign-manifest.py ops/deploy-poc
 bash -n ios/launch-simulator.sh
 python3 ops/render-manifest.py --pocs-dir pocs -o build/manifest.json
 python3 ops/sign-manifest.py build/manifest.json --allow-missing-key
+cd codex-server/codex-api-deploy && node --check server.mjs && node --test server.test.mjs
 ```
 
 Live checks for a configured private instance:

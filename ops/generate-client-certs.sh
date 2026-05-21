@@ -11,6 +11,7 @@ LOCAL_SECRETS_DIR="${LOCAL_SECRETS_DIR:-$HOME/.poc-vault/secrets}"
 CLIENT_NAME="${1:-default}"
 CLIENT_CERT_DAYS="${CLIENT_CERT_DAYS:-825}"
 CLIENT_CA_DAYS="${CLIENT_CA_DAYS:-3650}"
+CLIENT_P12_PASSWORD="${CLIENT_P12_PASSWORD:-}"
 umask 077
 
 usage() {
@@ -39,6 +40,14 @@ require_cmd openssl
 safe_name="$(printf '%s' "$CLIENT_NAME" | tr -c 'A-Za-z0-9_.@-' '_')"
 if [[ -z "$safe_name" || "$safe_name" == "_" ]]; then
   echo "Invalid client name: ${CLIENT_NAME}" >&2
+  exit 1
+fi
+if [[ -z "$CLIENT_P12_PASSWORD" && "$safe_name" == "iphone" ]]; then
+  CLIENT_P12_PASSWORD="${IPHONE_P12_PASSWORD:-}"
+fi
+if [[ -z "$CLIENT_P12_PASSWORD" ]]; then
+  echo "Set CLIENT_P12_PASSWORD before exporting a client .p12." >&2
+  echo "For the iPhone client, IPHONE_P12_PASSWORD is also accepted." >&2
   exit 1
 fi
 
@@ -110,6 +119,11 @@ client_key="$client_dir/${safe_name}.key"
 client_csr="$client_dir/${safe_name}.csr"
 client_crt="$client_dir/${safe_name}.crt"
 client_p12="$client_dir/${safe_name}.p12"
+p12_pass_file="$client_dir/.${safe_name}.p12-pass"
+cleanup() {
+  rm -f "$p12_pass_file"
+}
+trap cleanup EXIT
 
 if [[ -f "$client_crt" ]]; then
   echo "Client certificate already exists: ${client_crt}" >&2
@@ -128,12 +142,17 @@ openssl ca -batch \
   -in "$client_csr" \
   -out "$client_crt" >/dev/null 2>&1
 openssl ca -config "$ca_conf" -gencrl -out "$crl" >/dev/null 2>&1
+printf '%s' "$CLIENT_P12_PASSWORD" >"$p12_pass_file"
+chmod 0600 "$p12_pass_file"
 openssl pkcs12 -export \
   -inkey "$client_key" \
   -in "$client_crt" \
   -certfile "$ca_crt" \
   -out "$client_p12" \
-  -passout pass: >/dev/null 2>&1
+  -passout "file:${p12_pass_file}" \
+  -keypbe PBE-SHA1-3DES \
+  -certpbe PBE-SHA1-3DES \
+  -macalg sha1 >/dev/null 2>&1
 
 chmod 0600 "$client_key" "$client_p12"
 chmod 0644 "$client_crt" "$ca_crt" "$crl"

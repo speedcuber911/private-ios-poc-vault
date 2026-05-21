@@ -10,8 +10,10 @@
 build/*
 !build/.gitkeep
 ops/deploys.log
+ops/__pycache__/
 ios/POCVault/Local*.xcconfig
 ios/POCVault/build/
+ios/POCVault/build-device*/
 DerivedData/
 xcuserdata/
 *.xcuserstate

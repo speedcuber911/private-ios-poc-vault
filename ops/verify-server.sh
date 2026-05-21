@@ -8,7 +8,14 @@ if [[ -f "$CONFIG_FILE" ]]; then
 fi
 
 VAULT_DOMAIN="${VAULT_DOMAIN:-vault.pocs.example.com}"
-POC_VERIFY_HOST="${POC_VERIFY_HOST:-smoke-test.pocs.example.com}"
+POC_WILDCARD_DOMAIN="${POC_WILDCARD_DOMAIN:-*.pocs.example.com}"
+if [[ -z "${POC_VERIFY_HOST:-}" ]]; then
+  if [[ "$POC_WILDCARD_DOMAIN" == \*.* ]]; then
+    POC_VERIFY_HOST="smoke-test.${POC_WILDCARD_DOMAIN#*.}"
+  else
+    POC_VERIFY_HOST="$POC_WILDCARD_DOMAIN"
+  fi
+fi
 MANIFEST_PATH="${MANIFEST_PATH:-/manifest.json}"
 POC_VERIFY_PATH="${POC_VERIFY_PATH:-/}"
 LOCAL_SECRETS_DIR="${LOCAL_SECRETS_DIR:-$HOME/.poc-vault/secrets}"
@@ -58,7 +65,11 @@ require_cmd curl
 curl_status() {
   local url="$1"
   shift
-  curl -sS -o /dev/null -w '%{http_code}' "${CURL_EXTRA_ARGS[@]}" "$@" "$url"
+  if [[ "${#CURL_EXTRA_ARGS[@]}" -gt 0 ]]; then
+    curl -sS -o /dev/null -w '%{http_code}' "${CURL_EXTRA_ARGS[@]}" "$@" "$url"
+  else
+    curl -sS -o /dev/null -w '%{http_code}' "$@" "$url"
+  fi
 }
 
 expect_status() {
@@ -100,7 +111,11 @@ poc_url="https://${POC_VERIFY_HOST}${POC_VERIFY_PATH}"
 expect_status "health without client cert" '^2[0-9][0-9]$' "$health_url"
 expect_status "manifest blocked without client cert" '^(400|401|403|495|496)$' "$manifest_url" || true
 
-if mapfile -t client_pair < <(find_client_pair); then
+client_pair=()
+if client_pair_output="$(find_client_pair)"; then
+  while IFS= read -r line; do
+    client_pair+=("$line")
+  done <<<"$client_pair_output"
   client_cert="${client_pair[0]}"
   client_key="${client_pair[1]}"
   tls_args=(--cert "$client_cert" --key "$client_key")

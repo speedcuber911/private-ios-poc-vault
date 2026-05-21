@@ -3,6 +3,10 @@
 POC Vault is designed to keep private prototypes behind mutual TLS, but the repo
 must stay free of credentials.
 
+The same iOS app also controls the Codex job API at
+`https://codex.pocs.conformal.live`. Treat that endpoint as agent-runner
+infrastructure, not just static demo hosting.
+
 ## Never Commit
 
 - `.p12`, `.pem`, `.key`, `.crt`, `.csr`, `.mobileconfig`
@@ -11,6 +15,7 @@ must stay free of credentials.
 - client CA private keys
 - client certificate private keys
 - manifest signing private keys
+- copied Codex auth JSON or OpenAI API keys
 - passphrases
 - local config files copied from `~/.poc-vault/secrets`
 
@@ -53,3 +58,31 @@ based. Any client with a valid client certificate can access the vault.
 
 For stronger device binding, generate the private key on the iPhone and avoid
 exporting it to the Mac or repo tooling.
+
+## Codex API Security
+
+The Codex API is not part of the static POC manifest contract. Its local
+workspace lives inside this repo at:
+
+```text
+/Users/pariksj/Desktop/poc-vault/codex-server
+```
+
+Live `/v1/codex/*` routes require:
+
+- nginx mTLS verification success
+- exact subject allowlist for `CN=iphone` and `CN=parikshit-mac`
+- backend re-check of the forwarded certificate subject
+- session/thread listing should expose metadata only, not raw transcript content
+
+The Codex runner must not be able to read POC Vault private material:
+
+```text
+/etc/poc-vault/tls/client-ca.key
+/etc/poc-vault/tls/server.key
+~/.poc-vault/secrets/signing/manifest-ed25519.key
+```
+
+On the VM, Codex jobs run as `codex-runner`, with runtime data under
+`/var/lib/codex-api` and predefined workspaces under `/srv/codex-workspaces`.
+Do not change the app or API to accept arbitrary workspace paths from the phone.

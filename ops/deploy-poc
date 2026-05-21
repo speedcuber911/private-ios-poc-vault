@@ -20,6 +20,27 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path("~/.poc-vault/secrets/config.env").expanduser()
 DEFAULT_KEY = Path("~/.poc-vault/secrets/signing/manifest-ed25519.key").expanduser()
 SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+IGNORED_SOURCE_NAMES = {".DS_Store", ".git", ".hg", ".svn", "node_modules"}
+BLOCKED_SOURCE_NAMES = {
+    ".env",
+    ".npmrc",
+    ".netrc",
+    ".pypirc",
+    ".ssh",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+}
+BLOCKED_SOURCE_SUFFIXES = {
+    ".crt",
+    ".csr",
+    ".env",
+    ".key",
+    ".mobileconfig",
+    ".p12",
+    ".pem",
+}
 
 
 class DeployError(Exception):
@@ -61,6 +82,35 @@ def validate_source(source: Path) -> None:
         raise DeployError("Single-file sources must be .html or .htm files")
     if source.is_dir() and not (source / "index.html").is_file():
         raise DeployError(f"Folder source must contain index.html: {source}")
+    assert_safe_static_source(source)
+
+
+def assert_safe_static_source(source: Path) -> None:
+    candidates = [source] if source.is_file() else [source, *source.rglob("*")]
+    for path in candidates:
+        rel = path.relative_to(source) if path != source and source.is_dir() else Path(path.name)
+        if any(part in IGNORED_SOURCE_NAMES for part in rel.parts):
+            continue
+        if path.is_symlink():
+            raise DeployError(f"Source contains a symlink, which is not deployable: {rel}")
+        if should_ignore_source(path.name):
+            continue
+        if has_blocked_source_name(path):
+            raise DeployError(f"Source contains secret-like file or directory: {rel}")
+
+
+def should_ignore_source(name: str) -> bool:
+    return name in IGNORED_SOURCE_NAMES
+
+
+def has_blocked_source_name(path: Path) -> bool:
+    name = path.name
+    lower_name = name.lower()
+    return (
+        lower_name in BLOCKED_SOURCE_NAMES
+        or lower_name.endswith(".env")
+        or path.suffix.lower() in BLOCKED_SOURCE_SUFFIXES
+    )
 
 
 def copy_source(source: Path, public_dir: Path) -> None:
@@ -76,8 +126,7 @@ def copy_source(source: Path, public_dir: Path) -> None:
         return
 
     def ignore(_dir: str, names: list[str]) -> set[str]:
-        ignored = {".DS_Store", ".git", ".hg", ".svn", "node_modules"}
-        return {name for name in names if name in ignored}
+        return {name for name in names if should_ignore_source(name)}
 
     shutil.copytree(source, public_dir, ignore=ignore, dirs_exist_ok=True)
 

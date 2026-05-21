@@ -11,7 +11,7 @@ fi
 PORT="${POC_VAULT_SIM_PORT:-8787}"
 SERVER_LOG="/tmp/poc-vault-simulator-server.log"
 SCREEN_NAME="poc-vault-simulator-server-${PORT}"
-BUNDLE_ID="${BUNDLE_ID:-${IOS_BUNDLE_ID:-com.example.pocvault}}"
+BUNDLE_ID="${BUNDLE_ID:-${IOS_BUNDLE_ID:-com.parikshit.pocvault}}"
 OLD_LAUNCH_LABEL="${BUNDLE_ID}.simulator"
 
 server_alive() {

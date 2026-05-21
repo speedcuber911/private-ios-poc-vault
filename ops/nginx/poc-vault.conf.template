@@ -24,7 +24,10 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
+    # Keep HTTP/2 off here. WebKit can coalesce the vault host and wildcard POC
+    # hosts over the shared certificate, which nginx rejects as 421 when the
+    # reused TLS SNI and request Host differ.
+    listen 443 ssl;
     server_name __VAULT_DOMAIN__;
 
     ssl_certificate __TLS_DIR__/server.crt;
@@ -84,7 +87,8 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
+    # Keep HTTP/2 off here for the same SNI/Host isolation reason as above.
+    listen 443 ssl;
     server_name "~^(?<poc_slug>[a-z0-9][a-z0-9-]{0,62})\.__POC_DOMAIN_SUFFIX_REGEX__$";
 
     ssl_certificate __TLS_DIR__/server.crt;

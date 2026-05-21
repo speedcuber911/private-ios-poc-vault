@@ -3,6 +3,8 @@
 This repo is a private vault for static AI-generated POCs. Keep the working
 model simple: every POC lives under `pocs/<slug>/`, ships static files under
 `public/`, and is advertised through a signed manifest consumed by the iOS app.
+The remote Codex job API lives inside this repo at `codex-server/` because the
+phone app and EC2 runner are tightly coupled.
 
 ## Read This First
 
@@ -15,6 +17,8 @@ model simple: every POC lives under `pocs/<slug>/`, ships static files under
 - Read `SECURITY.md` before pushing or adding new operational files.
 - Be careful with the current worktree. POC deploys can legitimately modify
   ignored `ops/deploys.log` and create untracked `pocs/<slug>/` folders.
+- For Codex server/API work, switch to
+  `/Users/pariksj/Desktop/poc-vault/codex-server`.
 
 ## Non-Negotiable Architecture Rule
 
@@ -46,6 +50,9 @@ public and should return `200`.
 Security wording matters: today the perimeter is "valid client certificate",
 not "hardware-bound iPhone only." The Mac has the iPhone cert/key for operator
 verification. Treat anything under `~/.poc-vault/secrets` as highly sensitive.
+
+Codex API wording also matters: live `/v1/codex/*` should stay mTLS-only, with
+the exact allowed subjects `CN=iphone` and `CN=parikshit-mac`.
 
 ## Scope Rules
 
@@ -133,6 +140,34 @@ If the user asks for visual polish of a hosted POC, edit the POC's HTML/CSS/JS,
 not the iOS shell, unless the complaint is specifically about the shell chrome
 or app library.
 
+## Codex Console Contract
+
+The iOS app has a Codex tab that talks to:
+
+```text
+https://codex.pocs.conformal.live
+```
+
+The server implementation lives in this repo at:
+
+```text
+/Users/pariksj/Desktop/poc-vault/codex-server
+```
+
+The Codex tab may be edited here only for iOS shell behavior, such as prompt
+entry, keyboard handling, job lists, job detail logs, simplified result
+rendering, cancel/retry behavior, and mTLS client wiring.
+
+Do not add arbitrary-path execution from the iOS app. The server exposes only
+registered workspace ids, currently `scratch` and `poc-vault`.
+
+The phone Codex screen should stay simple: prompt plus collapsible Results. Do
+not reintroduce endpoint cards, workspace cards, offline/online labels, a thread
+picker, or tick icons unless the user explicitly asks for them.
+
+The prompt editor must remain usable on iPhone: keep the keyboard accessory
+`Done` action, interactive scroll dismissal, and keyboard dismissal on `Run`.
+
 ## Physical iPhone Provisioning
 
 The app expects a `.p12` at:
@@ -149,6 +184,14 @@ Documents/support/vault-config.json
 
 with `manifestURL` and `signatureURL` values from local config. The passphrase lives in
 `IPHONE_P12_PASSWORD` inside `~/.poc-vault/secrets/config.env`.
+
+`vault-config.json` can also include:
+
+```json
+{
+  "codexBaseURL": "https://codex.pocs.conformal.live"
+}
+```
 
 Opening Diagnostics creates the support directory if it is missing.
 
@@ -223,4 +266,5 @@ When you deploy or change the vault, tell the user:
 - whether unauthenticated access is blocked
 - whether manifest and POC return `200` with the client cert
 - whether the iPhone app was rebuilt/installed or only backend files changed
+- whether Codex API health/job checks passed, if Codex was touched
 - any uncommitted or intentionally untouched files
