@@ -1,0 +1,1324 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SFS Data Readiness Workbench</title>
+  <style>
+    :root {
+      --background: #fafafa;
+      --foreground: #101114;
+      --muted: #6f727a;
+      --muted-2: #8b8e96;
+      --surface: #ffffff;
+      --surface-2: #f4f4f5;
+      --border: #dedfe3;
+      --primary: #b8232e;
+      --primary-dark: #841923;
+      --green: #177245;
+      --amber: #93610c;
+      --blue: #1d5f89;
+      --shadow: 0 18px 45px rgba(16, 17, 20, 0.08);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color-scheme: light;
+    }
+
+    * { box-sizing: border-box; }
+
+    html {
+      min-height: 100%;
+      scroll-behavior: smooth;
+      background: var(--background);
+      overflow-x: hidden;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100%;
+      color: var(--foreground);
+      background: var(--background);
+      overflow-x: hidden;
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+
+    button {
+      cursor: pointer;
+    }
+
+    .app-shell {
+      width: min(100%, 1440px);
+      margin: 0 auto;
+      padding: 18px;
+    }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 30;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      margin: -18px -18px 18px;
+      padding: 14px 18px;
+      background: rgba(250, 250, 250, 0.88);
+      border-bottom: 1px solid var(--border);
+      backdrop-filter: blur(18px);
+    }
+
+    .brand {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .mark {
+      width: 38px;
+      height: 38px;
+      flex: 0 0 auto;
+      display: grid;
+      place-items: center;
+      border-radius: 9px;
+      background: var(--foreground);
+      color: #fff;
+      font-family: Georgia, serif;
+      font-size: 22px;
+    }
+
+    .brand h1 {
+      margin: 0;
+      font-size: 15px;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+
+    .brand p {
+      margin: 2px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .top-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex: 0 0 auto;
+    }
+
+    .button {
+      min-height: 40px;
+      padding: 0 14px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--foreground);
+      font-size: 13px;
+      font-weight: 650;
+      transition: border-color 150ms ease, background 150ms ease, transform 150ms ease;
+    }
+
+    .button:hover {
+      border-color: #b9bbc2;
+      transform: translateY(-1px);
+    }
+
+    .button.primary {
+      border-color: var(--primary);
+      background: var(--primary);
+      color: #fff;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1.1fr) minmax(320px, 0.9fr);
+      gap: 18px;
+      align-items: stretch;
+      margin-bottom: 18px;
+    }
+
+    .hero-copy {
+      min-width: 0;
+      padding: 34px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .eyebrow {
+      margin: 0 0 14px;
+      color: var(--primary);
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+
+    .hero h2 {
+      max-width: 880px;
+      margin: 0;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: clamp(38px, 6vw, 76px);
+      line-height: 0.98;
+      letter-spacing: 0;
+    }
+
+    .hero-copy > p {
+      max-width: 700px;
+      margin: 18px 0 0;
+      color: var(--muted);
+      font-size: 17px;
+      line-height: 1.55;
+    }
+
+    .hero-panel {
+      min-width: 0;
+      padding: 22px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: #15161a;
+      color: #fff;
+      box-shadow: var(--shadow);
+    }
+
+    .hero-panel h3 {
+      margin: 0 0 14px;
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0;
+      color: rgba(255, 255, 255, 0.66);
+    }
+
+    .signal-list {
+      display: grid;
+      gap: 14px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .signal-list li {
+      display: grid;
+      grid-template-columns: 88px minmax(0, 1fr);
+      gap: 12px;
+      align-items: baseline;
+      padding-bottom: 14px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+    }
+
+    .signal-list li:last-child {
+      padding-bottom: 0;
+      border-bottom: 0;
+    }
+
+    .signal-number {
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: 32px;
+      line-height: 1;
+    }
+
+    .signal-text {
+      color: rgba(255, 255, 255, 0.76);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .mobile-controls {
+      display: none;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .select,
+    .search {
+      width: 100%;
+      min-height: 44px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--foreground);
+      padding: 0 12px;
+      font-size: 14px;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 300px minmax(0, 1fr);
+      gap: 18px;
+      align-items: start;
+    }
+
+    .rail {
+      position: sticky;
+      top: 82px;
+      max-height: calc(100svh - 100px);
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--surface);
+    }
+
+    .rail-inner {
+      padding: 12px;
+    }
+
+    .rail-title {
+      margin: 4px 4px 10px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+
+    .case-list {
+      display: grid;
+      gap: 6px;
+    }
+
+    .case-button {
+      width: 100%;
+      padding: 10px;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      background: transparent;
+      text-align: left;
+      color: var(--foreground);
+      transition: background 150ms ease, border-color 150ms ease;
+    }
+
+    .case-button:hover,
+    .case-button.active {
+      background: var(--surface-2);
+      border-color: var(--border);
+    }
+
+    .case-button.active {
+      border-color: rgba(184, 35, 46, 0.42);
+    }
+
+    .case-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+
+    .case-button strong {
+      display: block;
+      margin-top: 5px;
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .workspace {
+      min-width: 0;
+      display: grid;
+      gap: 18px;
+    }
+
+    .section {
+      min-width: 0;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--surface);
+      overflow: hidden;
+    }
+
+    .section-head {
+      padding: 18px 18px 0;
+    }
+
+    .section-head h3 {
+      margin: 0;
+      font-size: 18px;
+      letter-spacing: 0;
+    }
+
+    .section-head p {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .section-body {
+      padding: 18px;
+    }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      border-top: 1px solid var(--border);
+      border-left: 1px solid var(--border);
+    }
+
+    .stat {
+      min-width: 0;
+      padding: 18px;
+      border-right: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      background: #fbfbfc;
+    }
+
+    .stat b {
+      display: block;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: 38px;
+      line-height: 1;
+      letter-spacing: 0;
+    }
+
+    .stat span {
+      display: block;
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+    }
+
+    .tabs {
+      display: flex;
+      gap: 8px;
+      padding: 12px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--surface);
+      overflow-x: auto;
+    }
+
+    .tab {
+      flex: 0 0 auto;
+      min-height: 38px;
+      padding: 0 12px;
+      border: 0;
+      border-radius: 8px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 750;
+      white-space: nowrap;
+    }
+
+    .tab.active {
+      background: var(--foreground);
+      color: #fff;
+    }
+
+    .case-detail {
+      display: grid;
+      gap: 18px;
+    }
+
+    .detail-top {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 260px;
+      gap: 18px;
+      align-items: start;
+    }
+
+    .detail-title h3 {
+      margin: 0;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: clamp(30px, 5vw, 54px);
+      line-height: 1;
+      letter-spacing: 0;
+    }
+
+    .detail-title p {
+      margin: 12px 0 0;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.55;
+    }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      max-width: 100%;
+      min-height: 28px;
+      padding: 0 9px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      color: var(--muted);
+      background: var(--surface);
+      font-size: 12px;
+      font-weight: 720;
+    }
+
+    .chip.red {
+      border-color: rgba(184, 35, 46, 0.24);
+      color: var(--primary-dark);
+      background: rgba(184, 35, 46, 0.07);
+    }
+
+    .readiness-card {
+      padding: 16px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: #fbfbfc;
+    }
+
+    .readiness-label {
+      margin: 0 0 8px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+
+    .readiness-value {
+      margin: 0;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: 34px;
+      line-height: 1;
+    }
+
+    .readiness-card p:last-child {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .detail-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .info-block {
+      min-width: 0;
+      padding: 16px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--surface);
+    }
+
+    .info-block h4 {
+      margin: 0 0 10px;
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+
+    .info-block p,
+    .info-block li {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .info-block p {
+      margin: 0;
+    }
+
+    .info-block ul {
+      display: grid;
+      gap: 7px;
+      margin: 0;
+      padding-left: 18px;
+    }
+
+    .source-grid,
+    .plan-grid,
+    .tool-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .source-card,
+    .plan-card,
+    .tool-card {
+      min-width: 0;
+      padding: 15px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: #fbfbfc;
+    }
+
+    .source-card h4,
+    .plan-card h4,
+    .tool-card h4 {
+      margin: 0 0 8px;
+      font-size: 14px;
+    }
+
+    .source-card p,
+    .plan-card p,
+    .tool-card p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .ask-list {
+      display: grid;
+      gap: 8px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      counter-reset: asks;
+    }
+
+    .ask-list li {
+      position: relative;
+      min-height: 42px;
+      padding: 11px 12px 11px 46px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #fbfbfc;
+      color: var(--foreground);
+      font-size: 14px;
+      line-height: 1.35;
+      counter-increment: asks;
+    }
+
+    .ask-list li::before {
+      content: counter(asks);
+      position: absolute;
+      left: 12px;
+      top: 10px;
+      width: 23px;
+      height: 23px;
+      display: grid;
+      place-items: center;
+      border-radius: 7px;
+      background: var(--foreground);
+      color: #fff;
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .schema-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .schema-item {
+      padding: 14px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #fbfbfc;
+    }
+
+    .schema-item code {
+      display: block;
+      margin-bottom: 8px;
+      color: var(--primary-dark);
+      font-size: 13px;
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
+
+    .schema-item span {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .hidden {
+      display: none !important;
+    }
+
+    @media (max-width: 980px) {
+      .app-shell {
+        padding: 12px;
+      }
+
+      .topbar {
+        margin: -12px -12px 12px;
+        padding: 12px;
+      }
+
+      .top-actions {
+        display: none;
+      }
+
+      .hero,
+      .layout,
+      .detail-top,
+      .detail-grid,
+      .source-grid,
+      .plan-grid,
+      .tool-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .hero-copy {
+        padding: 22px;
+      }
+
+      .hero-panel {
+        padding: 18px;
+      }
+
+      .mobile-controls {
+        display: grid;
+      }
+
+      .rail,
+      .tabs.desktop-tabs {
+        display: none;
+      }
+
+      .stats-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 520px) {
+      .brand p {
+        display: none;
+      }
+
+      .hero h2 {
+        font-size: 39px;
+      }
+
+      .hero-copy > p {
+        font-size: 15px;
+      }
+
+      .stats-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .signal-list li {
+        grid-template-columns: 74px minmax(0, 1fr);
+      }
+
+      .section-head,
+      .section-body {
+        padding: 15px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="mark">C</div>
+        <div>
+          <h1>SFS Data Readiness Workbench</h1>
+          <p>Project Leap technical ask pack - internal Conformal view</p>
+        </div>
+      </div>
+      <div class="top-actions">
+        <button class="button" data-jump="asks">Data pack</button>
+        <button class="button" data-jump="tools">Tools to learn</button>
+        <button class="button primary" id="copyBrief">Copy team note</button>
+      </div>
+    </header>
+
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">Demo to production</p>
+        <h2>The next step is data truth, not another demo.</h2>
+        <p>The cockpit proved the experience. This workbench turns every Project Leap use case into source-system asks, missing-capture schemas, team owners, and a first proof we can actually build.</p>
+      </div>
+      <aside class="hero-panel">
+        <h3>Readiness read</h3>
+        <ul class="signal-list">
+          <li><span class="signal-number">21</span><span class="signal-text">Use cases reviewed from the SFS/Bain ODS.</span></li>
+          <li><span class="signal-number">50</span><span class="signal-text">Field notes found in the Notion export; coverage is strongest in procurement.</span></li>
+          <li><span class="signal-number">14</span><span class="signal-text">Assumed demo tables. Useful as target schema, not proof of SFS reality.</span></li>
+          <li><span class="signal-number">30d</span><span class="signal-text">Enough time to convert this into a proposal-ready technical discovery pack.</span></li>
+        </ul>
+      </aside>
+    </section>
+
+    <section class="section" id="overview">
+      <div class="section-head">
+        <h3>What we should say upfront</h3>
+        <p>We are not replacing SAP, Ariba, Growthbook, Concur, ByteEdge, or TMS systems. We need read-only extracts, owners, and missing-capture workflows so the AI layer can sit on top with traceability.</p>
+      </div>
+      <div class="section-body">
+        <div class="stats-grid">
+          <div class="stat"><b>1</b><span>Enterprise assistant should be Wave 1 because the demo already proves the product motion.</span></div>
+          <div class="stat"><b>2</b><span>Field force and procurement should become integrated suites, not 14 separate products.</span></div>
+          <div class="stat"><b>3</b><span>Logistics should be buy-and-customize, with Conformal owning fit-gap and analytics.</span></div>
+          <div class="stat"><b>4</b><span>Platform foundation is mandatory: semantic layer, evals, audit, SSO, and data quality.</span></div>
+        </div>
+      </div>
+    </section>
+
+    <div class="mobile-controls">
+      <select class="select" id="mobileView">
+        <option value="cases">Use cases</option>
+        <option value="asks">Data pack</option>
+        <option value="schemas">Missing schemas</option>
+        <option value="tools">Tools to learn</option>
+        <option value="plan">30-day plan</option>
+      </select>
+      <input class="search" id="mobileSearch" type="search" placeholder="Search use cases, sources, asks" />
+    </div>
+
+    <div class="tabs desktop-tabs">
+      <button class="tab active" data-view="cases">Use cases</button>
+      <button class="tab" data-view="asks">Data pack</button>
+      <button class="tab" data-view="schemas">Missing schemas</button>
+      <button class="tab" data-view="tools">Tools to learn</button>
+      <button class="tab" data-view="plan">30-day plan</button>
+    </div>
+
+    <div class="layout">
+      <aside class="rail">
+        <div class="rail-inner">
+          <p class="rail-title">Use cases</p>
+          <input class="search" id="search" type="search" placeholder="Search use cases" />
+          <div class="case-list" id="caseList" style="margin-top: 10px;"></div>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <section class="section view-panel" id="casesPanel">
+          <div class="section-body">
+            <div class="case-detail" id="caseDetail"></div>
+          </div>
+        </section>
+
+        <section class="section view-panel hidden" id="asksPanel">
+          <div class="section-head">
+            <h3>Minimum data pack for discovery</h3>
+            <p>Masked samples are enough for the first sprint. The point is to validate grain, history, row counts, join keys, freshness, and owner accountability.</p>
+          </div>
+          <div class="section-body">
+            <ol class="ask-list" id="dataPack"></ol>
+          </div>
+        </section>
+
+        <section class="section view-panel hidden" id="schemasPanel">
+          <div class="section-head">
+            <h3>Missing-capture schemas</h3>
+            <p>These are not all final production tables. They are workshop artifacts that make SFS say, clearly, whether the workflow exists today.</p>
+          </div>
+          <div class="section-body">
+            <div class="schema-list" id="schemaList"></div>
+          </div>
+        </section>
+
+        <section class="section view-panel hidden" id="toolsPanel">
+          <div class="section-head">
+            <h3>Tools and systems to learn</h3>
+            <p>Learn data objects and integration paths, not full implementation consulting.</p>
+          </div>
+          <div class="section-body">
+            <div class="tool-grid" id="toolGrid"></div>
+          </div>
+        </section>
+
+        <section class="section view-panel hidden" id="planPanel">
+          <div class="section-head">
+            <h3>30-day technical plan</h3>
+            <p>This is how we get from demo credibility to proposal credibility.</p>
+          </div>
+          <div class="section-body">
+            <div class="plan-grid" id="planGrid"></div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <script>
+    const cases = [
+      {
+        id: "01",
+        theme: "Enterprise",
+        name: "Enterprise Chat Assistant",
+        wave: "Wave 1",
+        type: "Agentic AI",
+        readiness: "High demo readiness; medium data readiness",
+        read: "Productionize the current cockpit over real SFS data with permissions, metric definitions, trace, evals, and export.",
+        sources: ["SAP SD", "SAP FI-AR", "SAP FI/CO", "SAP MM", "SAP inventory", "Growthbook", "Review decks"],
+        asks: ["24-36 months of sales, collections, targets, P&L, inventory, procurement and master data.", "Official metric dictionary for revenue, margin, DSO, receivables, stock ageing, target achievement.", "SSO, role access, Azure/security constraints, and SAP extraction path."],
+        missing: "metric_definition table for formulas, grain, source, owner, approval, and effective dates.",
+        proof: "20 leadership questions answered with cited sources, SQL trace, chart, and data freshness badge.",
+        owners: "CFO/controller, sales ops, SFS IT, SAP SD/MM/FI owners, Azure/security."
+      },
+      {
+        id: "02",
+        theme: "Procurement",
+        name: "Historical Spend Analysis and Price Insights",
+        wave: "Wave 3",
+        type: "Data product + AI layer",
+        readiness: "Strong SAP base; taxonomy gap",
+        read: "Build spend cube and anomaly analytics first. Chat is useful after the cube is trusted.",
+        sources: ["SAP MM purchase register", "Vendor master", "Material master", "Ariba", "Complinity", "Concur"],
+        asks: ["36 months of PO-line data with vendor, material, plant, UoM, quantity, unit price, line value and PO date.", "Vendor and material master extracts.", "Category managers for taxonomy and BPV threshold workshops."],
+        missing: "spend_taxonomy, vendor_crosswalk, spend_anomaly, BPV and price variance rules.",
+        proof: "Category x vendor x SKU x region x month spend cube with top 20 BPV leakages.",
+        owners: "Procurement head, category managers, SAP MM, vendor master, Concur/Complinity."
+      },
+      {
+        id: "03",
+        theme: "Procurement",
+        name: "Real-Time Import Data Analysis",
+        wave: "Wave 3",
+        type: "External data intelligence",
+        readiness: "Low until EXIM provider and HSN map exist",
+        read: "Market intelligence product. Accuracy depends on provider lag, HSN mapping, and grade/spec matching.",
+        sources: ["EXIM provider", "SAP purchase register", "SAP material master", "Commodity indices"],
+        asks: ["Priority HSN/SKU list.", "HSN coverage report from material master.", "Permission to evaluate EXIM vendors or existing provider details."],
+        missing: "hsn_sku_map and exim_transaction tables with landed-cost normalization.",
+        proof: "For 10 HSNs, show SFS purchase price versus EXIM benchmark and top source countries.",
+        owners: "Procurement category owners, legal/procurement, SAP material owner."
+      },
+      {
+        id: "04",
+        theme: "Procurement",
+        name: "AI-Driven Preparation Material For Negotiations",
+        wave: "Wave 3",
+        type: "Agentic AI",
+        readiness: "Medium if procurement data arrives; outcome logging missing",
+        read: "Generate negotiation briefs from purchase history, EXIM benchmarks, vendor patterns, and commodity signals.",
+        sources: ["SAP purchase register", "Vendor master", "EXIM", "Commodity feeds", "Ariba RFQ/contracts", "Buyer notes"],
+        asks: ["PO history by commodity/vendor.", "Vendor performance and contract/RFQ history.", "Category playbooks and historical negotiation material."],
+        missing: "negotiation_brief and negotiation_outcome tables to close the learning loop.",
+        proof: "5 negotiation packs with target price range, vendor pattern, EXIM benchmark, and talking points.",
+        owners: "Category managers, sourcing buyers, SAP MM, Ariba, external-data owner."
+      },
+      {
+        id: "05",
+        theme: "Procurement",
+        name: "AI-Led Vendor Identification and Recommendation",
+        wave: "Wave 3",
+        type: "Decision engine",
+        readiness: "Medium; external discovery needed",
+        read: "Rank current and potential vendors, then feed Ariba RFQ/onboarding rather than replacing it.",
+        sources: ["SAP vendor master", "PO/GRN history", "Quality data", "Ariba SLP/RFQ", "EXIM exporters", "Vendor databases"],
+        asks: ["Vendor master and purchase history.", "Delivery and quality performance.", "Current onboarding and approved-vendor rules."],
+        missing: "vendor_score and market_vendor_candidate tables.",
+        proof: "Ranked vendor list for 5 materials with evidence, risk flags, and suggested RFQ action.",
+        owners: "Procurement, quality, SAP MM/vendor master, Ariba, legal/compliance."
+      },
+      {
+        id: "06",
+        theme: "Procurement",
+        name: "Vendor Creditworthiness and Fraud Check",
+        wave: "Wave 3",
+        type: "Risk intelligence",
+        readiness: "Medium internal base; external signals needed",
+        read: "Vendor risk profile using GST/MCA/litigation/credit signals and entity resolution.",
+        sources: ["SAP vendor master", "Complinity", "MCA21", "GST", "Credit bureau", "Litigation databases"],
+        asks: ["Legal name, GSTIN, PAN/CIN if available, onboarding date, active status.", "Blocked vendor and dispute history.", "PII/security approval for beneficial-owner data."],
+        missing: "vendor_risk_signal and beneficial_owner_edge tables.",
+        proof: "Risk profile for top 50 vendors with duplicate, director, GST/MCA, litigation, and risk explanation.",
+        owners: "Procurement compliance, vendor master owner, legal, security."
+      },
+      {
+        id: "07",
+        theme: "Procurement",
+        name: "AI-Driven Should-Cost Analysis",
+        wave: "Wave 3",
+        type: "Model + data product",
+        readiness: "Medium; assumptions are the work",
+        read: "Cost model for top 5-10 materials with category-specific assumptions and sensitivity.",
+        sources: ["SAP PO history", "Material master", "EXIM", "FX", "Diesel/crude", "MSP/agri indices", "BOM/spec inputs"],
+        asks: ["Priority material list.", "Specs/grades and UoM conversions.", "Input cost drivers, logistics, processing, and margin assumptions."],
+        missing: "should_cost_model and should_cost_component tables.",
+        proof: "Should-cost model for 3-5 priority SKUs with sensitivity to FX, EXIM, commodity index, and freight.",
+        owners: "Category managers, finance/procurement analytics, SAP MM, external-data owner."
+      },
+      {
+        id: "08",
+        theme: "Field Force",
+        name: "Field Performance Tracking Dashboard",
+        wave: "Wave 2",
+        type: "Data product + assistant",
+        readiness: "Medium if SAP + Growthbook join works",
+        read: "Performance cockpit for MGO/TBM/RBM with field assistant layer.",
+        sources: ["SAP sales", "SAP collections", "Targets", "Growthbook activity", "Dealer master", "Product master"],
+        asks: ["MGO/TBM/RBM hierarchy.", "Targets and incentive logic.", "Dealer x SKU x month sales, collections, and Growthbook logs."],
+        missing: "field_activity_outcome table tying visits to order, next action, and conversion.",
+        proof: "MGO/TBM/RBM dashboard with target, actual, collection risk, visit intensity, and top dealer actions.",
+        owners: "Sales ops, Growthbook admin, SAP SD/FI, field leadership."
+      },
+      {
+        id: "09",
+        theme: "Field Force",
+        name: "Activity Analytics (Growthbook + SAP)",
+        wave: "Wave 2",
+        type: "Analytics",
+        readiness: "Unknown until Growthbook raw events arrive",
+        read: "Only valuable if activity events can be linked to orders, collections, and dealer movement.",
+        sources: ["Growthbook events", "SAP sales", "Collections", "Dealer master", "MGO hierarchy"],
+        asks: ["Raw Growthbook event export.", "Event taxonomy, location/time, purpose, outcome.", "Dealer and MGO ID crosswalk to SAP."],
+        missing: "field_activity_event table with planned flag, geo, duration, outcome and source.",
+        proof: "Activity-to-conversion analysis: visits before order, no-order visits, and high-activity low-sales regions.",
+        owners: "Growthbook admin, sales ops, SAP SD."
+      },
+      {
+        id: "10",
+        theme: "Field Force",
+        name: "Pricing, Policy and Scheme Dissemination Chatbot",
+        wave: "Wave 2",
+        type: "Retrieval + rules agent",
+        readiness: "Medium; scheme rules likely unstructured",
+        read: "Field-facing scheme assistant grounded in circulars and SAP pricing conditions.",
+        sources: ["SAP pricing conditions", "Scheme circulars", "WhatsApp/email archives", "Dealer tiers", "Product/geography master"],
+        asks: ["12-24 months of scheme circulars.", "Active scheme list and eligibility rules.", "Dealer tier, region, product mappings."],
+        missing: "scheme_master, scheme_rule, and scheme_document tables.",
+        proof: "TBM asks which scheme applies to dealer X for SKU Y today and gets cited eligibility logic.",
+        owners: "Sales ops, marketing/trade schemes, SAP SD pricing, field leadership."
+      },
+      {
+        id: "11",
+        theme: "Field Force",
+        name: "Dealer Profiles and Field-Visit Conversation Inputs",
+        wave: "Wave 2",
+        type: "Mobile workflow + AI",
+        readiness: "Medium; visit note capture missing",
+        read: "Dealer 360 plus structured visit capture. Combines SAP facts with current field notes.",
+        sources: ["SAP dealer master", "Sales", "Collections", "Inventory/secondary if available", "Growthbook visits", "Complaints"],
+        asks: ["Dealer master, sales and collections history.", "Visit history and current notes format.", "Field workflow constraints for TBM/MGO."],
+        missing: "dealer_profile_snapshot, visit_conversation_note, and action_item tables.",
+        proof: "Mobile dealer profile for top 20 dealers in one territory with next-best action.",
+        owners: "Sales ops, Growthbook, SAP SD/FI, TBM/MGO pilot users."
+      },
+      {
+        id: "12",
+        theme: "Field Force",
+        name: "AI-Enabled Sales Coaching",
+        wave: "Wave 2",
+        type: "Knowledge assistant",
+        readiness: "Medium if content is approved and structured",
+        read: "Coaching assistant grounded in product knowledge, objections, schemes, and field performance.",
+        sources: ["ByteEdge", "Product manuals", "Scheme circulars", "FAQs", "Objection decks", "Field outcomes"],
+        asks: ["Training content and product FAQs.", "Common objections and approved responses.", "ByteEdge completion data and role mapping."],
+        missing: "coaching_content_chunk and coaching_interaction tables.",
+        proof: "MGO asks product/scheme objection questions and receives approved answers with sources.",
+        owners: "Training/ByteEdge, product marketing, sales ops, field users."
+      },
+      {
+        id: "13",
+        theme: "Field Force",
+        name: "Unified Product and Partner-Level Visibility",
+        wave: "Wave 2",
+        type: "Semantic layer",
+        readiness: "Medium; scorecard definition needed",
+        read: "Partner scorecard and drilldown. It is a semantic-layer product more than an AI product.",
+        sources: ["SAP sales", "Collections", "Product master", "Dealer master", "Targets", "Growthbook", "Secondary sales"],
+        asks: ["Partner hierarchy, targets, sales, collection, product mix.", "Dealer tier, geography, visit activity.", "Secondary sales/inventory if captured."],
+        missing: "partner_scorecard_snapshot table with growth classification and next action.",
+        proof: "National to RBM to TBM to dealer drilldown with standardized scorecard.",
+        owners: "Sales ops, finance, SAP SD/FI, Growthbook."
+      },
+      {
+        id: "14",
+        theme: "Field Force",
+        name: "Real-Time Warehouse Stock Visibility",
+        wave: "Wave 2",
+        type: "Operational data layer",
+        readiness: "Medium for own stock; low for vendor warehouses",
+        read: "Queryable stock/ATP layer for field teams. Vendor warehouse stock is likely the gap.",
+        sources: ["SAP inventory", "WM/EWM", "Open orders", "In-transit", "Vendor warehouse feeds", "TMS"],
+        asks: ["Stock by SKU x plant/storage location.", "ATP/open order logic and refresh frequency.", "Vendor warehouse and territory/dealer mapping."],
+        missing: "stock_snapshot, vendor_stock_feed, and substitution_map tables.",
+        proof: "TBM searches SKU and sees stock, nearest location, substitutes, and freshness timestamp.",
+        owners: "Supply chain, SAP MM/WM, logistics, vendor warehouse owner."
+      },
+      {
+        id: "15",
+        theme: "Field Force",
+        name: "Early Warning For Sales Performance and Dealer Churn Risk",
+        wave: "Wave 2",
+        type: "Predictive model + workflow",
+        readiness: "Medium; needs churn labels and intervention capture",
+        read: "Risk model plus intervention workflow. It fails without a churn definition and action logging.",
+        sources: ["SAP sales", "Collections", "Schemes", "Dealer master", "Growthbook visits", "Complaints", "Secondary sales"],
+        asks: ["36 months of dealer sales/collections.", "Scheme participation, visits, product mix, credit exposure.", "Churn definition and historical examples."],
+        missing: "dealer_churn_label, churn_intervention, and risk_score_snapshot tables.",
+        proof: "Monthly ranked risk list with contributing factors and intervention suggestions for one pilot region.",
+        owners: "Sales ops, finance/collections, TBM/RBM pilot users, SAP SD/FI."
+      },
+      {
+        id: "16",
+        theme: "Logistics",
+        name: "Freight Price Discovery",
+        wave: "Wave 4",
+        type: "Buy and customize",
+        readiness: "Medium if historical freight data exists",
+        read: "Lead vendor evaluation, integration and analytics. Do not custom-build a TMS.",
+        sources: ["FreightTiger/Shipsy/FarEye/Locus", "SAP shipment/order", "Freight invoices", "Lane masters", "Rate cards", "Diesel/toll"],
+        asks: ["Lane history, vendor list, freight invoices.", "Vehicle types, service levels, route/lane definitions.", "Current RFQ and rate-card process."],
+        missing: "freight_lane_rate and freight_quote_event tables.",
+        proof: "TMS fit-gap and one lane-rate benchmark dashboard.",
+        owners: "Logistics, procurement, SAP SD/MM, shortlisted TMS vendors."
+      },
+      {
+        id: "17",
+        theme: "Logistics",
+        name: "Optimal Route and Pickup/Drop Recommendation",
+        wave: "Wave 4",
+        type: "Buy and customize",
+        readiness: "Low until TMS route data exists",
+        read: "Use a TMS optimization module rather than building route optimization from scratch.",
+        sources: ["SAP orders/deliveries", "Inventory", "Vehicle capacity", "Dealer geocodes", "Historical trips", "TMS optimizer"],
+        asks: ["Delivery addresses/geocodes.", "Order priorities, capacity and dispatch constraints.", "Route plans and actual trip data."],
+        missing: "route_plan and route_stop tables.",
+        proof: "Run one week of historical orders through optimizer and compare planned versus actual distance/cost.",
+        owners: "Logistics operations, TMS vendor, SAP order/delivery owner."
+      },
+      {
+        id: "18",
+        theme: "Logistics",
+        name: "E-Proof of Delivery Execution",
+        wave: "Wave 4",
+        type: "Buy and customize",
+        readiness: "Vendor-led; low agentic value",
+        read: "Mobile workflow and SAP/TMS integration. It should be bought/configured.",
+        sources: ["TMS/POD vendor", "SAP delivery/invoice", "Dealer master", "QR/barcode data"],
+        asks: ["Current POD process.", "Delivery document and invoice linkage.", "Evidence, exception reasons, and dealer confirmation workflow."],
+        missing: "epod_event table with geotag, signature/photo references, condition and SAP posting status.",
+        proof: "Fit-gap against one vendor product and integration design for SAP posting.",
+        owners: "Logistics, SAP SD delivery, dealer/channel ops, TMS/POD vendor."
+      },
+      {
+        id: "19",
+        theme: "Logistics",
+        name: "Real-Time Consignment Monitoring",
+        wave: "Wave 4",
+        type: "Buy and customize",
+        readiness: "Medium if carrier/GPS feeds exist",
+        read: "Shipment visibility. Buy tracking and integrate into SFS surfaces.",
+        sources: ["TMS", "GPS provider", "Carrier APIs", "E-waybill", "SAP shipment/order"],
+        asks: ["Shipment IDs, carriers and GPS availability.", "Tracking update frequency.", "Dealer visibility and exception workflow."],
+        missing: "consignment_event and shipment_order_link tables.",
+        proof: "Live tracker for a small set of consignments with ETA and delay alerts.",
+        owners: "Logistics, carriers/TMS vendors, SAP delivery owner, dealer service."
+      },
+      {
+        id: "20",
+        theme: "Logistics",
+        name: "Ocean Freight Tracking and Optimization",
+        wave: "Wave 4",
+        type: "Buy and customize",
+        readiness: "Low; depends on forwarder/provider access",
+        read: "Use Project44-style or forwarder portal aggregation. Do not build carrier tracking in-house.",
+        sources: ["Forwarders", "Container tracking providers", "Global visibility platform", "SAP import POs", "EXIM/customs"],
+        asks: ["Import PO list and forwarders.", "Container numbers, booking data, ports, ETD/ETA.", "Demurrage/detention data if impact is measured."],
+        missing: "ocean_shipment and ocean_event tables.",
+        proof: "Compare 2-3 visibility vendors and demonstrate unified container status.",
+        owners: "Import procurement, logistics, forwarders, finance."
+      },
+      {
+        id: "21",
+        theme: "Platform",
+        name: "Technology and Infrastructure Setup",
+        wave: "Wave 0",
+        type: "Mandatory foundation",
+        readiness: "Unknown; must validate Azure/SAP constraints",
+        read: "Shared foundation so this does not become 21 disconnected pilots.",
+        sources: ["Azure", "SAP Basis", "SSO/Entra", "Data lake", "Model gateway", "CI/CD", "Observability"],
+        asks: ["Azure tenant/subscription and network/security constraints.", "Preferred model provider and SSO setup.", "SAP connectivity path and existing warehouse/lake/BI stack."],
+        missing: "data_asset_registry, dq_check_result, agent_eval_result, and agent_audit_log tables.",
+        proof: "One read-only SAP extract in governed semantic layer, queried by assistant with audit trace.",
+        owners: "SFS IT, Azure/security, SAP Basis, data/BI owner, legal/security approver."
+      }
+    ];
+
+    const dataPack = [
+      "36 months of SAP purchase register at PO-line grain.",
+      "36 months of SAP primary sales and billing at invoice-line grain.",
+      "24-36 months of collections and receivables ageing.",
+      "Current material master with product hierarchy, HSN, UoM, active/inactive flag.",
+      "Current vendor master with GSTIN, legal name, region, category, active/inactive flag.",
+      "Current customer/dealer master with territory, credit limit, dealer tier, onboarding date.",
+      "Current field hierarchy: ZBM/RBM/TBM/MGO mapping.",
+      "Growthbook activity/event export for at least 12 months.",
+      "Current target files and incentive logic for MGO/TBM/RBM.",
+      "Current scheme circulars and pricing-policy repository.",
+      "Inventory snapshot extract by plant/storage location/SKU.",
+      "Any existing logistics lane/rate/shipment tracker."
+    ];
+
+    const schemas = [
+      ["metric_definition", "Formula, source, grain, owner, approval, effective dates for every enterprise metric."],
+      ["spend_taxonomy + spend_anomaly", "Procurement taxonomy, BPV leakage, anomaly rules, review status."],
+      ["hsn_sku_map + exim_transaction", "Join EXIM data to SFS SKUs and normalize landed-cost benchmarks."],
+      ["negotiation_brief + negotiation_outcome", "Persist generated briefs and actual negotiation results for closed-loop learning."],
+      ["vendor_score + vendor_risk_signal", "Vendor ranking, risk evidence, MCA/GST/litigation/credit signals."],
+      ["field_activity_event + field_activity_outcome", "Tie Growthbook visits to SAP sales outcomes and next actions."],
+      ["scheme_master + scheme_rule", "Turn circulars and SAP pricing conditions into queryable eligibility logic."],
+      ["dealer_profile_snapshot + visit_conversation_note", "Dealer 360 plus structured capture from field conversations."],
+      ["stock_snapshot + vendor_stock_feed", "Own warehouse stock and vendor warehouse feed freshness."],
+      ["freight_lane_rate + consignment_event", "Freight rates, quotes, shipment tracking, ETA and exception data."],
+      ["data_asset_registry + agent_eval_result", "Platform governance, freshness, data quality, evals and audit trail."]
+    ];
+
+    const tools = [
+      ["SAP S/4HANA SD", "Sales orders, billing, dealer/customer master, pricing conditions and scheme logic."],
+      ["SAP S/4HANA MM", "Purchase orders, GRN, material master, vendor master, stock movements."],
+      ["SAP FI-AR/FI-CO", "Receivables, clearing, credit exposure, P&L, GL, cost center and budgets."],
+      ["SAP extraction paths", "CDS, OData, BW/ODP, SLT/replication, scheduled extracts and read-only roles."],
+      ["SAP Ariba", "Sourcing, Supplier Lifecycle, Contracts, RFQ workflows, supplier performance, APIs/exports."],
+      ["Growthbook + ByteEdge", "Field activity events, hierarchy, visit outcomes, training content and completions."],
+      ["Azure data stack", "Entra ID, Key Vault, Private Link, ADLS, Data Factory, Databricks/Fabric/Synapse, Purview."],
+      ["External data", "EXIM providers, MCA21/GST, credit bureau, litigation, commodity, FX, diesel and toll feeds."],
+      ["Agent operations", "Golden questions, evals, semantic layer, prompt/tool trace, RBAC, audit, cost and latency logs."]
+    ];
+
+    const plan = [
+      ["Week 1", "Name owners, collect masked extracts, confirm source systems, data history, grain, refresh and extraction routes."],
+      ["Week 2", "Profile completeness, row counts, join keys, duplicate IDs, missing tags and data-readiness by use case."],
+      ["Week 3", "Load one SAP sales/collections slice and one procurement slice; run golden leadership and procurement questions."],
+      ["Week 4", "Finalize wave architecture, data assumptions, acceptance tests, exclusions and production SOW."],
+      ["Commercial stance", "Price Platform + Enterprise Assistant separately, then Field Force and Procurement as integrated suites."],
+      ["Explicit exclusions", "No custom TMS, no custom E-PoD, no ocean carrier tracking build, no promises on uncaptured secondary sales."]
+    ];
+
+    const brief = `We have completed a first technical read of all 21 use cases across the SFS/Bain sheet, our demo data model, and the available field-level data notes. The demo proves the AI experience, but production depends on validating source-system access and data capture.\n\nFor the next working session, we want to align on four things:\n1. Which SAP/Ariba/Growthbook/Concur/ByteEdge/logistics systems currently hold the required data.\n2. How much history exists, at what grain, and how it can be extracted read-only.\n3. Which fields are not captured today and need new workflow/schema design.\n4. Which 5-6 use cases should enter detailed discovery first.\n\nOur recommendation is to start with Platform + Enterprise Assistant, then fold Field Force and Procurement into two integrated suites rather than treating the sheet as 21 separate builds.`;
+
+    let selectedId = "01";
+    let activeView = "cases";
+
+    const byId = (id) => document.getElementById(id);
+
+    function renderCaseList() {
+      const search = (byId("search").value || byId("mobileSearch").value || "").toLowerCase();
+      const list = byId("caseList");
+      const filtered = cases.filter((item) => {
+        const haystack = [item.name, item.theme, item.wave, item.type, item.sources.join(" "), item.asks.join(" ")].join(" ").toLowerCase();
+        return haystack.includes(search);
+      });
+      list.innerHTML = filtered.map((item) => `
+        <button class="case-button ${item.id === selectedId ? "active" : ""}" data-case="${item.id}">
+          <span class="case-meta"><span>${item.theme}</span><span>${item.wave}</span></span>
+          <strong>${item.id}. ${item.name}</strong>
+        </button>
+      `).join("");
+      list.querySelectorAll("[data-case]").forEach((button) => {
+        button.addEventListener("click", () => {
+          selectedId = button.dataset.case;
+          activeView = "cases";
+          setView("cases");
+          render();
+        });
+      });
+    }
+
+    function renderCaseDetail() {
+      const item = cases.find((entry) => entry.id === selectedId) || cases[0];
+      byId("caseDetail").innerHTML = `
+        <div class="detail-top">
+          <div class="detail-title">
+            <div class="chips">
+              <span class="chip red">${item.theme}</span>
+              <span class="chip">${item.wave}</span>
+              <span class="chip">${item.type}</span>
+            </div>
+            <h3>${item.name}</h3>
+            <p>${item.read}</p>
+          </div>
+          <aside class="readiness-card">
+            <p class="readiness-label">Readiness</p>
+            <p class="readiness-value">${item.id}</p>
+            <p>${item.readiness}</p>
+          </aside>
+        </div>
+        <div class="detail-grid">
+          <div class="info-block">
+            <h4>Likely source systems</h4>
+            <ul>${item.sources.map((source) => `<li>${source}</li>`).join("")}</ul>
+          </div>
+          <div class="info-block">
+            <h4>Data asks</h4>
+            <ul>${item.asks.map((ask) => `<li>${ask}</li>`).join("")}</ul>
+          </div>
+          <div class="info-block">
+            <h4>Missing capture / schema</h4>
+            <p>${item.missing}</p>
+          </div>
+          <div class="info-block">
+            <h4>First proof</h4>
+            <p>${item.proof}</p>
+          </div>
+          <div class="info-block">
+            <h4>Team asks</h4>
+            <p>${item.owners}</p>
+          </div>
+          <div class="info-block">
+            <h4>Conformal stance</h4>
+            <p>${item.theme === "Logistics" ? "Buy-and-customize. We should lead vendor fit-gap, data integration and analytics rather than build the whole system." : item.theme === "Platform" ? "Mandatory foundation. Without this, every use case becomes a disconnected pilot." : "Build as part of an integrated suite with shared semantic layer, evals and audit."}</p>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderStaticLists() {
+      byId("dataPack").innerHTML = dataPack.map((item) => `<li>${item}</li>`).join("");
+      byId("schemaList").innerHTML = schemas.map(([name, desc]) => `<div class="schema-item"><code>${name}</code><span>${desc}</span></div>`).join("");
+      byId("toolGrid").innerHTML = tools.map(([title, desc]) => `<div class="tool-card"><h4>${title}</h4><p>${desc}</p></div>`).join("");
+      byId("planGrid").innerHTML = plan.map(([title, desc]) => `<div class="plan-card"><h4>${title}</h4><p>${desc}</p></div>`).join("");
+    }
+
+    function setView(view) {
+      activeView = view;
+      document.querySelectorAll(".view-panel").forEach((panel) => panel.classList.add("hidden"));
+      byId(`${view}Panel`).classList.remove("hidden");
+      document.querySelectorAll(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.view === view));
+      byId("mobileView").value = view;
+      if (view === "cases") {
+        window.scrollTo({ top: byId("casesPanel").offsetTop - 80, behavior: "smooth" });
+      }
+    }
+
+    function render() {
+      renderCaseList();
+      renderCaseDetail();
+    }
+
+    document.querySelectorAll(".tab").forEach((tab) => {
+      tab.addEventListener("click", () => setView(tab.dataset.view));
+    });
+
+    byId("mobileView").addEventListener("change", (event) => setView(event.target.value));
+    byId("search").addEventListener("input", renderCaseList);
+    byId("mobileSearch").addEventListener("input", () => {
+      byId("search").value = byId("mobileSearch").value;
+      renderCaseList();
+      setView("cases");
+    });
+
+    document.querySelectorAll("[data-jump]").forEach((button) => {
+      button.addEventListener("click", () => setView(button.dataset.jump));
+    });
+
+    byId("copyBrief").addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(brief);
+        byId("copyBrief").textContent = "Copied";
+        setTimeout(() => { byId("copyBrief").textContent = "Copy team note"; }, 1400);
+      } catch (error) {
+        alert(brief);
+      }
+    });
+
+    renderStaticLists();
+    render();
+  </script>
+</body>
+</html>

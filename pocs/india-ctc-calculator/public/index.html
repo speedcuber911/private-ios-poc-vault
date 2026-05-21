@@ -1,0 +1,580 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>India CTC Calculator</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #15130f;
+      --muted: #635f56;
+      --line: #ded8cd;
+      --paper: #fbfaf6;
+      --panel: #ffffff;
+      --accent: #0f766e;
+      --accent-dark: #0b5751;
+      --warn: #a15c12;
+      --shadow: 0 18px 50px rgba(35, 29, 20, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--paper);
+      color: var(--ink);
+      letter-spacing: 0;
+    }
+
+    button,
+    input {
+      font: inherit;
+    }
+
+    a {
+      color: var(--accent-dark);
+      text-decoration-thickness: 1px;
+      text-underline-offset: 3px;
+    }
+
+    .app {
+      min-height: 100svh;
+      padding: 18px 14px 28px;
+    }
+
+    .hero {
+      padding: 18px 2px 24px;
+    }
+
+    .eyebrow {
+      margin: 0 0 12px;
+      color: var(--accent-dark);
+      font-size: 0.76rem;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      max-width: 11ch;
+      margin: 0;
+      font-size: clamp(2.5rem, 14vw, 5rem);
+      line-height: 0.92;
+      letter-spacing: 0;
+    }
+
+    .hero p {
+      max-width: 38rem;
+      margin: 18px 0 0;
+      color: var(--muted);
+      font-size: 1.02rem;
+      line-height: 1.45;
+    }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 14px;
+      max-width: 1180px;
+      margin: 0 auto;
+    }
+
+    .workspace > * {
+      min-width: 0;
+    }
+
+    .panel {
+      max-width: 100%;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .target {
+      padding: 16px;
+    }
+
+    .target-top {
+      display: grid;
+      gap: 14px;
+    }
+
+    .label {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-size: 0.82rem;
+      font-weight: 700;
+    }
+
+    .label strong {
+      color: var(--ink);
+      font-size: 1rem;
+    }
+
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--accent);
+    }
+
+    .number-row {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .field {
+      display: grid;
+      gap: 6px;
+    }
+
+    .field span {
+      color: var(--muted);
+      font-size: 0.78rem;
+      font-weight: 700;
+    }
+
+    .field input {
+      width: 100%;
+      min-height: 44px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      color: var(--ink);
+      background: #fffdf8;
+    }
+
+    .result {
+      display: grid;
+      gap: 12px;
+      margin-top: 16px;
+      padding-top: 16px;
+      border-top: 1px solid var(--line);
+    }
+
+    .primary-number {
+      display: grid;
+      gap: 4px;
+    }
+
+    .primary-number span {
+      color: var(--muted);
+      font-size: 0.78rem;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+
+    .primary-number b {
+      color: var(--accent-dark);
+      font-size: clamp(2rem, 12vw, 3.9rem);
+      line-height: 0.94;
+    }
+
+    .mini-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .metric {
+      min-height: 84px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fffdf8;
+    }
+
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 0.72rem;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+
+    .metric b {
+      display: block;
+      margin-top: 6px;
+      font-size: 1.12rem;
+      line-height: 1.1;
+    }
+
+    .table-panel {
+      padding: 0;
+    }
+
+    .table-head {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 16px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .table-head h2,
+    .assumptions h2 {
+      margin: 0;
+      font-size: 1.1rem;
+    }
+
+    .table-head p {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    table {
+      width: 100%;
+      min-width: 710px;
+      border-collapse: collapse;
+    }
+
+    th,
+    td {
+      padding: 13px 12px;
+      border-bottom: 1px solid var(--line);
+      text-align: right;
+      white-space: nowrap;
+      font-size: 0.9rem;
+    }
+
+    th:first-child,
+    td:first-child {
+      position: sticky;
+      left: 0;
+      z-index: 1;
+      text-align: left;
+      background: var(--panel);
+    }
+
+    th {
+      color: var(--muted);
+      font-size: 0.72rem;
+      font-weight: 900;
+      text-transform: uppercase;
+      background: #f3efe6;
+    }
+
+    tr.active td,
+    tr.active td:first-child {
+      background: #e4f4f1;
+      font-weight: 800;
+    }
+
+    .assumptions {
+      padding: 16px;
+    }
+
+    .assumptions ul {
+      margin: 12px 0 0;
+      padding-left: 18px;
+      color: var(--muted);
+      line-height: 1.5;
+      font-size: 0.9rem;
+    }
+
+    .note {
+      margin-top: 14px;
+      padding: 12px;
+      border: 1px solid #e7c99d;
+      border-radius: 8px;
+      color: #65400e;
+      background: #fff7e7;
+      font-size: 0.86rem;
+      line-height: 1.45;
+    }
+
+    @media (min-width: 720px) {
+      .app {
+        padding: 34px 28px 44px;
+      }
+
+      .hero {
+        max-width: 1180px;
+        margin: 0 auto;
+        padding: 28px 0 34px;
+      }
+
+      h1 {
+        max-width: 14ch;
+        font-size: clamp(4.4rem, 9vw, 7rem);
+      }
+
+      .workspace {
+        grid-template-columns: minmax(320px, 0.86fr) minmax(440px, 1.14fr);
+        align-items: start;
+      }
+
+      .target {
+        position: sticky;
+        top: 20px;
+        padding: 20px;
+      }
+
+      .number-row {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .assumptions {
+        grid-column: 1 / -1;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <section class="hero" aria-labelledby="page-title">
+      <p class="eyebrow">India salary reverse calculator</p>
+      <h1 id="page-title">CTC for monthly in-hand</h1>
+      <p>Work backwards from a target monthly take-home under the FY 2025-26 new tax regime. The default target is Rs 8.5L/month.</p>
+    </section>
+
+    <section class="workspace">
+      <div class="panel target">
+        <div class="target-top">
+          <div>
+            <div class="label">
+              <span>Target in-hand per month</span>
+              <strong id="targetLabel">Rs 8.50L</strong>
+            </div>
+            <input id="targetRange" type="range" min="700000" max="1000000" step="25000" value="850000" aria-label="Target monthly in-hand">
+          </div>
+        </div>
+
+        <div class="number-row">
+          <label class="field">
+            <span>Monthly post-tax deductions</span>
+            <input id="monthlyDeductions" type="number" min="0" step="5000" value="0" inputmode="numeric">
+          </label>
+          <label class="field">
+            <span>Variable pay in CTC (%)</span>
+            <input id="variablePay" type="number" min="0" max="80" step="1" value="0" inputmode="numeric">
+          </label>
+        </div>
+
+        <div class="result" aria-live="polite">
+          <div class="primary-number">
+            <span>Total CTC required</span>
+            <b id="requiredCtc">Rs 1.42 Cr</b>
+          </div>
+
+          <div class="mini-grid">
+            <div class="metric">
+              <span>Annual tax</span>
+              <b id="annualTax">Rs 39.57L</b>
+            </div>
+            <div class="metric">
+              <span>Monthly tax</span>
+              <b id="monthlyTax">Rs 3.30L</b>
+            </div>
+            <div class="metric">
+              <span>Monthly gross</span>
+              <b id="monthlyGross">Rs 11.80L</b>
+            </div>
+            <div class="metric">
+              <span>Fixed CTC if variable</span>
+              <b id="fixedCtc">Rs 1.42 Cr</b>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel table-panel">
+        <div class="table-head">
+          <div>
+            <h2>7L to 10L monthly table</h2>
+            <p>Generated from the same calculator settings.</p>
+          </div>
+        </div>
+        <div class="table-wrap" role="region" aria-label="CTC table" tabindex="0">
+          <table>
+            <thead>
+              <tr>
+                <th>Monthly in-hand</th>
+                <th>Required CTC</th>
+                <th>Annual tax</th>
+                <th>Monthly tax</th>
+                <th>Monthly gross</th>
+                <th>Tax rate</th>
+              </tr>
+            </thead>
+            <tbody id="tableBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel assumptions">
+        <h2>Assumptions</h2>
+        <ul>
+          <li>India new tax regime for FY 2025-26 / AY 2026-27.</li>
+          <li>Salaried standard deduction: Rs 75,000.</li>
+          <li>Health and education cess: 4% of income tax.</li>
+          <li>CTC here means taxable gross salary before income tax. Employer PF, gratuity, insurance, reimbursements, ESOPs, surcharge, old-regime deductions, and professional tax are not included unless you enter them as monthly deductions.</li>
+          <li>Sources checked: Income Tax Department budget highlights and Budget 2026 FAQ pages.</li>
+        </ul>
+        <div class="note">For Rs 8.5L/month in-hand with the defaults, the required CTC is about Rs 1.42 Cr/year, with about Rs 39.57L annual tax.</div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const slabs = [
+      [400000, 0],
+      [800000, 0.05],
+      [1200000, 0.10],
+      [1600000, 0.15],
+      [2000000, 0.20],
+      [2400000, 0.25],
+      [Number.POSITIVE_INFINITY, 0.30]
+    ];
+
+    const standardDeduction = 75000;
+    const cessRate = 0.04;
+    const targetRange = document.getElementById("targetRange");
+    const targetLabel = document.getElementById("targetLabel");
+    const monthlyDeductions = document.getElementById("monthlyDeductions");
+    const variablePay = document.getElementById("variablePay");
+    const tableBody = document.getElementById("tableBody");
+
+    function slabTax(taxableIncome) {
+      let tax = 0;
+      let previous = 0;
+
+      for (const [limit, rate] of slabs) {
+        if (taxableIncome > previous) {
+          tax += (Math.min(taxableIncome, limit) - previous) * rate;
+        }
+        previous = limit;
+        if (taxableIncome <= limit) break;
+      }
+
+      return tax;
+    }
+
+    function annualTax(grossAnnual) {
+      const taxable = Math.max(0, grossAnnual - standardDeduction);
+      let baseTax = slabTax(taxable);
+
+      if (taxable <= 1200000) {
+        baseTax = 0;
+      } else if (taxable <= 1270588) {
+        baseTax = Math.min(baseTax, taxable - 1200000);
+      }
+
+      return baseTax * (1 + cessRate);
+    }
+
+    function netAnnual(grossAnnual, deductionsAnnual) {
+      return grossAnnual - annualTax(grossAnnual) - deductionsAnnual;
+    }
+
+    function solveGrossForMonthly(targetMonthly) {
+      const deductionsAnnual = cleanNumber(monthlyDeductions.value) * 12;
+      const requiredNet = targetMonthly * 12;
+      let low = requiredNet + deductionsAnnual;
+      let high = low / 0.5;
+
+      while (netAnnual(high, deductionsAnnual) < requiredNet) {
+        high *= 1.2;
+      }
+
+      for (let index = 0; index < 80; index += 1) {
+        const mid = (low + high) / 2;
+        if (netAnnual(mid, deductionsAnnual) < requiredNet) {
+          low = mid;
+        } else {
+          high = mid;
+        }
+      }
+
+      return high;
+    }
+
+    function cleanNumber(value) {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+    }
+
+    function formatLakh(value) {
+      const lakh = value / 100000;
+      if (lakh >= 100) {
+        return `Rs ${(lakh / 100).toFixed(2)} Cr`;
+      }
+      return `Rs ${lakh.toFixed(2)}L`;
+    }
+
+    function formatMonthlyLabel(value) {
+      return `Rs ${(value / 100000).toFixed(2)}L`;
+    }
+
+    function formatPercent(value) {
+      return `${value.toFixed(1)}%`;
+    }
+
+    function renderSummary() {
+      const target = cleanNumber(targetRange.value);
+      const gross = solveGrossForMonthly(target);
+      const tax = annualTax(gross);
+      const variable = Math.min(80, cleanNumber(variablePay.value)) / 100;
+      const fixed = gross * (1 - variable);
+
+      targetLabel.textContent = formatMonthlyLabel(target);
+      document.getElementById("requiredCtc").textContent = formatLakh(gross);
+      document.getElementById("annualTax").textContent = formatLakh(tax);
+      document.getElementById("monthlyTax").textContent = formatLakh(tax / 12);
+      document.getElementById("monthlyGross").textContent = formatLakh(gross / 12);
+      document.getElementById("fixedCtc").textContent = formatLakh(fixed);
+    }
+
+    function renderTable() {
+      const active = cleanNumber(targetRange.value);
+      const rows = [];
+
+      for (let monthly = 700000; monthly <= 1000000; monthly += 50000) {
+        const gross = solveGrossForMonthly(monthly);
+        const tax = annualTax(gross);
+        const effectiveRate = tax / gross * 100;
+        const isActive = Math.abs(monthly - active) < 25000;
+
+        rows.push(`
+          <tr class="${isActive ? "active" : ""}">
+            <td>${formatMonthlyLabel(monthly)}</td>
+            <td>${formatLakh(gross)}</td>
+            <td>${formatLakh(tax)}</td>
+            <td>${formatLakh(tax / 12)}</td>
+            <td>${formatLakh(gross / 12)}</td>
+            <td>${formatPercent(effectiveRate)}</td>
+          </tr>
+        `);
+      }
+
+      tableBody.innerHTML = rows.join("");
+    }
+
+    function render() {
+      renderSummary();
+      renderTable();
+    }
+
+    targetRange.addEventListener("input", render);
+    monthlyDeductions.addEventListener("input", render);
+    variablePay.addEventListener("input", render);
+    render();
+  </script>
+</body>
+</html>
