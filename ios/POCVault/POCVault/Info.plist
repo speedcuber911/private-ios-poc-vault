@@ -37,6 +37,8 @@
 	</dict>
 	<key>POCVaultManifestURL</key>
 	<string>$(POC_VAULT_MANIFEST_URL)</string>
+	<key>POCVaultCodexBaseURL</key>
+	<string>$(POC_VAULT_CODEX_BASE_URL)</string>
 	<key>POCVaultSignatureURL</key>
 	<string>$(POC_VAULT_SIGNATURE_URL)</string>
 	<key>UIRequiresFullScreen</key>

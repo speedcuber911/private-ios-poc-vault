@@ -4,6 +4,7 @@ import SwiftUI
 struct POCVaultApp: App {
     @StateObject private var identityStore: ClientIdentityStore
     @StateObject private var libraryViewModel: LibraryViewModel
+    @StateObject private var codexViewModel: CodexConsoleViewModel
     private let manifestClient: ManifestClient
 
     init() {
@@ -14,16 +15,22 @@ struct POCVaultApp: App {
             identityStore: identityStore,
             trustedPublicKeyRawRepresentation: AppConfiguration.trustedManifestPublicKey
         )
+        let codexClient = CodexClient(
+            baseURL: AppConfiguration.codexBaseURL,
+            identityStore: identityStore
+        )
 
         _identityStore = StateObject(wrappedValue: identityStore)
         _libraryViewModel = StateObject(wrappedValue: LibraryViewModel(client: manifestClient))
+        _codexViewModel = StateObject(wrappedValue: CodexConsoleViewModel(client: codexClient))
         self.manifestClient = manifestClient
     }
 
     var body: some Scene {
         WindowGroup {
-            LibraryView(
-                viewModel: libraryViewModel,
+            POCVaultRootView(
+                libraryViewModel: libraryViewModel,
+                codexViewModel: codexViewModel,
                 identityStore: identityStore,
                 manifestClient: manifestClient
             )
@@ -31,21 +38,78 @@ struct POCVaultApp: App {
     }
 }
 
+struct POCVaultRootView: View {
+    @ObservedObject var libraryViewModel: LibraryViewModel
+    @ObservedObject var codexViewModel: CodexConsoleViewModel
+    @ObservedObject var identityStore: ClientIdentityStore
+    let manifestClient: ManifestClient
+
+    var body: some View {
+        TabView {
+            LibraryView(
+                viewModel: libraryViewModel,
+                identityStore: identityStore,
+                manifestClient: manifestClient
+            )
+            .tabItem {
+                Label("Vault", systemImage: "lock.rectangle.stack")
+            }
+
+            CodexConsoleView(viewModel: codexViewModel)
+                .tabItem {
+                    Label("Codex", systemImage: "terminal")
+                }
+        }
+        .tint(AppTheme.accent)
+        .preferredColorScheme(.dark)
+        .task {
+            identityStore.importIdentityFromSetupEnvironmentIfNeeded()
+        }
+    }
+}
+
+enum AppTheme {
+    static let bgCanvas = Color(red: 0.055, green: 0.055, blue: 0.058)
+    static let bgSurface = Color(red: 0.095, green: 0.096, blue: 0.102)
+    static let bgSurfaceHi = Color(red: 0.145, green: 0.146, blue: 0.154)
+    static let strokeSubtle = Color.white.opacity(0.07)
+    static let strokeStrong = Color.white.opacity(0.14)
+    static let textPrimary = Color.white.opacity(0.94)
+    static let textSecondary = Color.white.opacity(0.62)
+    static let textTertiary = Color.white.opacity(0.40)
+    static let accent = Color(red: 0.86, green: 0.86, blue: 0.82)
+    static let statusOK = Color(red: 0.58, green: 0.70, blue: 0.60)
+    static let statusWarn = Color(red: 0.74, green: 0.64, blue: 0.42)
+    static let statusError = Color(red: 0.78, green: 0.45, blue: 0.43)
+    static let statusInfo = Color(red: 0.58, green: 0.64, blue: 0.72)
+    static let statusNeutral = Color.white.opacity(0.46)
+}
+
 enum AppConfiguration {
 #if targetEnvironment(simulator)
     static let manifestURL = URL(string: "http://127.0.0.1:8787/manifest.json")!
     static let signatureURL = URL(string: "http://127.0.0.1:8787/manifest.sig.json")!
+    static let codexBaseURL = configuredURL(
+        supportValue: supportConfig?.codexBaseURL,
+        infoKey: "POCVaultCodexBaseURL",
+        fallback: "http://127.0.0.1:8787"
+    )
     static let runtimeMode = "Simulator Preview"
 #else
     static let manifestURL = configuredURL(
         supportValue: supportConfig?.manifestURL,
         infoKey: "POCVaultManifestURL",
-        fallback: "https://vault.pocs.example.com/manifest.json"
+        fallback: "https://vault.pocs.conformal.live/manifest.json"
     )
     static let signatureURL = configuredURL(
         supportValue: supportConfig?.signatureURL,
         infoKey: "POCVaultSignatureURL",
-        fallback: "https://vault.pocs.example.com/manifest.sig.json"
+        fallback: "https://vault.pocs.conformal.live/manifest.sig.json"
+    )
+    static let codexBaseURL = configuredURL(
+        supportValue: supportConfig?.codexBaseURL,
+        infoKey: "POCVaultCodexBaseURL",
+        fallback: "https://codex.pocs.conformal.live"
     )
     static let runtimeMode = "Production Vault"
 #endif
@@ -79,5 +143,6 @@ enum AppConfiguration {
     private struct SupportConfig: Decodable {
         let manifestURL: String?
         let signatureURL: String?
+        let codexBaseURL: String?
     }
 }

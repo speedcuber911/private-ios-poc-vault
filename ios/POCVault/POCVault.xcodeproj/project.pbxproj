@@ -20,6 +20,10 @@
 		200000000000000000000012 /* Resources/AppIcon/AppIcon60x60@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000015 /* Resources/AppIcon/AppIcon60x60@2x.png */; };
 		200000000000000000000013 /* Resources/AppIcon/AppIcon60x60@3x.png in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000016 /* Resources/AppIcon/AppIcon60x60@3x.png */; };
 		200000000000000000000014 /* Resources/AppIcon/AppIcon1024.png in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000017 /* Resources/AppIcon/AppIcon1024.png */; };
+		200000000000000000000015 /* CodexModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000018 /* CodexModels.swift */; };
+		200000000000000000000016 /* CodexClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000019 /* CodexClient.swift */; };
+		200000000000000000000017 /* CodexConsoleViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000020 /* CodexConsoleViewModel.swift */; };
+		200000000000000000000018 /* CodexConsoleView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000021 /* CodexConsoleView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -49,6 +53,10 @@
 		100000000000000000000015 /* Resources/AppIcon/AppIcon60x60@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "Resources/AppIcon/AppIcon60x60@2x.png"; sourceTree = "<group>"; };
 		100000000000000000000016 /* Resources/AppIcon/AppIcon60x60@3x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "Resources/AppIcon/AppIcon60x60@3x.png"; sourceTree = "<group>"; };
 		100000000000000000000017 /* Resources/AppIcon/AppIcon1024.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = Resources/AppIcon/AppIcon1024.png; sourceTree = "<group>"; };
+		100000000000000000000018 /* CodexModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexModels.swift; sourceTree = "<group>"; };
+		100000000000000000000019 /* CodexClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexClient.swift; sourceTree = "<group>"; };
+		100000000000000000000020 /* CodexConsoleViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexConsoleViewModel.swift; sourceTree = "<group>"; };
+		100000000000000000000021 /* CodexConsoleView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexConsoleView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -117,6 +125,7 @@
 			children = (
 				100000000000000000000007 /* POCEntry.swift */,
 				100000000000000000000008 /* POCManifest.swift */,
+				100000000000000000000018 /* CodexModels.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -133,6 +142,7 @@
 			isa = PBXGroup;
 			children = (
 				100000000000000000000010 /* ManifestClient.swift */,
+				100000000000000000000019 /* CodexClient.swift */,
 			);
 			path = Networking;
 			sourceTree = "<group>";
@@ -151,6 +161,8 @@
 				100000000000000000000012 /* LibraryViewModel.swift */,
 				100000000000000000000013 /* LibraryView.swift */,
 				100000000000000000000014 /* DiagnosticsView.swift */,
+				100000000000000000000020 /* CodexConsoleViewModel.swift */,
+				100000000000000000000021 /* CodexConsoleView.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -265,6 +277,10 @@
 				200000000000000000000009 /* LibraryViewModel.swift in Sources */,
 				200000000000000000000010 /* LibraryView.swift in Sources */,
 				200000000000000000000011 /* DiagnosticsView.swift in Sources */,
+				200000000000000000000015 /* CodexModels.swift in Sources */,
+				200000000000000000000016 /* CodexClient.swift in Sources */,
+				200000000000000000000017 /* CodexConsoleViewModel.swift in Sources */,
+				200000000000000000000018 /* CodexConsoleView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -395,12 +411,14 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = QRXV2V66Y6;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = POCVault/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				POC_VAULT_MANIFEST_URL = "https://vault.pocs.example.com/manifest.json";
-				POC_VAULT_SIGNATURE_URL = "https://vault.pocs.example.com/manifest.sig.json";
-				PRODUCT_BUNDLE_IDENTIFIER = com.example.pocvault;
+				POC_VAULT_CODEX_BASE_URL = "https://codex.pocs.conformal.live";
+				POC_VAULT_MANIFEST_URL = "https://vault.pocs.conformal.live/manifest.json";
+				POC_VAULT_SIGNATURE_URL = "https://vault.pocs.conformal.live/manifest.sig.json";
+				PRODUCT_BUNDLE_IDENTIFIER = com.parikshit.pocvault;
 				PRODUCT_MODULE_NAME = POCVault;
 				PRODUCT_NAME = "POC Vault";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
@@ -413,12 +431,14 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = QRXV2V66Y6;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = POCVault/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				POC_VAULT_MANIFEST_URL = "https://vault.pocs.example.com/manifest.json";
-				POC_VAULT_SIGNATURE_URL = "https://vault.pocs.example.com/manifest.sig.json";
-				PRODUCT_BUNDLE_IDENTIFIER = com.example.pocvault;
+				POC_VAULT_CODEX_BASE_URL = "https://codex.pocs.conformal.live";
+				POC_VAULT_MANIFEST_URL = "https://vault.pocs.conformal.live/manifest.json";
+				POC_VAULT_SIGNATURE_URL = "https://vault.pocs.conformal.live/manifest.sig.json";
+				PRODUCT_BUNDLE_IDENTIFIER = com.parikshit.pocvault;
 				PRODUCT_MODULE_NAME = POCVault;
 				PRODUCT_NAME = "POC Vault";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
@@ -434,7 +454,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.example.pocvault.tests;
+				PRODUCT_BUNDLE_IDENTIFIER = com.parikshit.pocvault.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SWIFT_VERSION = 5.0;
@@ -450,7 +470,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.example.pocvault.tests;
+				PRODUCT_BUNDLE_IDENTIFIER = com.parikshit.pocvault.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SWIFT_VERSION = 5.0;

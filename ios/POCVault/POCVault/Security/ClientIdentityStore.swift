@@ -28,15 +28,37 @@ enum ClientIdentityStoreError: Error, LocalizedError {
 final class ClientIdentityStore: ObservableObject {
     static let supportDirectoryName = "support"
     static let defaultP12Name = "client.p12"
+    private static let preferredClientCertificateNames = ["iphone"]
 
     @Published private(set) var lastImportedCertificateName: String?
 
     private let defaults: UserDefaults
-    private let persistentRefKey = "com.example.pocvault.identity.persistentRef"
+    private let persistentRefKey = "com.parikshit.pocvault.identity.persistentRef"
     private var cachedIdentity: SecIdentity?
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
+    }
+
+    static func resolvedImportPassphrase(
+        explicitPassphrase: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String {
+        let explicit = explicitPassphrase.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !explicit.isEmpty {
+            return explicit
+        }
+
+        return environment["POC_VAULT_P12_PASSPHRASE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    static func isPreferredClientCertificateName(_ name: String?) -> Bool {
+        guard let normalizedName = name?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !normalizedName.isEmpty else {
+            return false
+        }
+        return preferredClientCertificateNames.contains(normalizedName)
     }
 
     var supportDirectory: URL {
@@ -92,6 +114,25 @@ final class ClientIdentityStore: ObservableObject {
     }
 
     @discardableResult
+    func importIdentityFromSetupEnvironmentIfNeeded() -> Bool {
+        let setupPassphrase = Self.resolvedImportPassphrase(explicitPassphrase: "")
+        guard
+            !setupPassphrase.isEmpty,
+            !hasStoredIdentity,
+            FileManager.default.fileExists(atPath: expectedSupportP12URL.path)
+        else {
+            return false
+        }
+
+        do {
+            try importIdentityFromSupport(passphrase: setupPassphrase)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    @discardableResult
     func importIdentity(from url: URL, passphrase: String) throws -> URLCredential {
         let data = try Data(contentsOf: url)
         let identity = try Self.identity(fromPKCS12: data, passphrase: passphrase)
@@ -111,27 +152,59 @@ final class ClientIdentityStore: ObservableObject {
             return cachedIdentity
         }
 
-        guard let persistentRef = defaults.data(forKey: persistentRefKey) else {
-            return nil
+        if let persistentRef = defaults.data(forKey: persistentRefKey) {
+            let query: [String: Any] = [
+                kSecValuePersistentRef as String: persistentRef,
+                kSecReturnRef as String: true
+            ]
+
+            var item: CFTypeRef?
+            let status = SecItemCopyMatching(query as CFDictionary, &item)
+            if status == errSecSuccess,
+               let item,
+               CFGetTypeID(item) == SecIdentityGetTypeID() {
+                let identity = (item as! SecIdentity)
+                cachedIdentity = identity
+                return identity
+            }
+
+            defaults.removeObject(forKey: persistentRefKey)
         }
 
-        let query: [String: Any] = [
-            kSecValuePersistentRef as String: persistentRef,
-            kSecReturnRef as String: true
-        ]
-
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        guard status == errSecSuccess else {
-            return nil
-        }
-
-        cachedIdentity = (item as! SecIdentity)
-        return cachedIdentity
+        return recoverExistingPreferredIdentity()
     }
 
     var hasStoredIdentity: Bool {
         identity() != nil
+    }
+
+    private func recoverExistingPreferredIdentity() -> SecIdentity? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassIdentity,
+            kSecReturnRef as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll
+        ]
+
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess, let identities = item as? [SecIdentity] else {
+            return nil
+        }
+
+        for identity in identities {
+            let commonName = certificateCommonName(for: identity)
+            guard Self.isPreferredClientCertificateName(commonName),
+                  let persistentRef = try? persistentRef(for: identity) else {
+                continue
+            }
+
+            defaults.set(persistentRef, forKey: persistentRefKey)
+            cachedIdentity = identity
+            lastImportedCertificateName = commonName
+            return identity
+        }
+
+        return nil
     }
 
     private func save(identity: SecIdentity, label: String) throws {

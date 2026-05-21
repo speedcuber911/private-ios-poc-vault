@@ -12,7 +12,7 @@ struct DiagnosticsView: View {
     var body: some View {
         NavigationStack {
             ZStack {
-                VaultTheme.background.ignoresSafeArea()
+                AppTheme.bgCanvas.ignoresSafeArea()
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
                         VStack(alignment: .leading, spacing: 6) {
@@ -20,7 +20,7 @@ struct DiagnosticsView: View {
                                 .font(.system(size: 34, weight: .bold, design: .rounded))
                             Text(AppConfiguration.runtimeMode)
                                 .font(.subheadline.weight(.medium))
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(AppTheme.textSecondary)
                         }
                         .padding(.top, 18)
 
@@ -34,7 +34,11 @@ struct DiagnosticsView: View {
                             }
                         }
                         .padding(18)
-                        .background(.white.opacity(0.88), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                        .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .stroke(AppTheme.strokeSubtle, lineWidth: 1)
+                        }
                     }
                     .padding(.horizontal, 20)
                     .padding(.bottom, 28)
@@ -58,13 +62,27 @@ struct DiagnosticsView: View {
                     .accessibilityLabel("Refresh diagnostics")
                 }
             }
-            .onAppear(perform: refreshChecks)
+            .onAppear(perform: refreshAndImportFromSetupEnvironmentIfNeeded)
         }
+    }
+
+    private func refreshAndImportFromSetupEnvironmentIfNeeded() {
+        refreshChecks()
+        let setupPassphrase = ClientIdentityStore.resolvedImportPassphrase(explicitPassphrase: "")
+        guard
+            !setupPassphrase.isEmpty,
+            !identityStore.hasStoredIdentity,
+            FileManager.default.fileExists(atPath: identityStore.expectedSupportP12URL.path)
+        else {
+            return
+        }
+        importDefaultCertificate()
     }
 
     private func importDefaultCertificate() {
         do {
-            _ = try identityStore.importIdentityFromSupport(passphrase: passphrase)
+            let resolvedPassphrase = ClientIdentityStore.resolvedImportPassphrase(explicitPassphrase: passphrase)
+            _ = try identityStore.importIdentityFromSupport(passphrase: resolvedPassphrase)
             importError = nil
             passphrase = ""
         } catch {
@@ -135,15 +153,15 @@ struct DiagnosticsView: View {
             if isSimulatorPreview {
                 Text("The simulator uses a local signed vault at 127.0.0.1. Physical iPhone builds still use the installed client certificate.")
                     .font(.subheadline)
-                    .foregroundStyle(VaultTheme.muted)
+                    .foregroundStyle(AppTheme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
                 Text("Expected file")
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(AppTheme.textTertiary)
                 Text("Documents/support/client.p12")
                     .font(.callout.monospaced())
-                    .foregroundStyle(VaultTheme.ink)
+                    .foregroundStyle(AppTheme.textPrimary)
 
                 SecureField("P12 passphrase", text: $passphrase)
                     .textContentType(.password)
@@ -160,13 +178,17 @@ struct DiagnosticsView: View {
                 if let importError {
                     Text(importError)
                         .font(.footnote)
-                        .foregroundStyle(.red)
+                        .foregroundStyle(AppTheme.statusError)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
         .padding(18)
-        .background(.white.opacity(0.88), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(AppTheme.strokeSubtle, lineWidth: 1)
+        }
     }
 
     private var isSimulatorPreview: Bool {
@@ -188,14 +210,14 @@ private struct DiagnosticRow: View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: check.isPassing ? "checkmark.circle.fill" : "xmark.circle.fill")
                 .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(check.isPassing ? .green : .red)
+                .foregroundStyle(check.isPassing ? AppTheme.statusOK : AppTheme.statusError)
             VStack(alignment: .leading, spacing: 3) {
                 Text(check.title)
                     .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(VaultTheme.ink)
+                    .foregroundStyle(AppTheme.textPrimary)
                 Text(check.detail)
                     .font(.footnote)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(AppTheme.textSecondary)
                     .lineLimit(3)
                     .truncationMode(.middle)
             }
