@@ -1,0 +1,33 @@
+[Unit]
+Description=Codex async job API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/codex-api
+EnvironmentFile=/etc/codex-api.env
+Environment=NODE_ENV=production
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/node /opt/codex-api/server.mjs
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+User=codex-runner
+Group=codex-runner
+
+StateDirectory=codex-api
+RuntimeDirectory=codex-api
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/codex-api /srv/codex-workspaces /tmp
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
