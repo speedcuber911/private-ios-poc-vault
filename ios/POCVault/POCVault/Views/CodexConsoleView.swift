@@ -305,7 +305,7 @@ private struct CodexThreadStrip: View {
         if let selectedSessionID = viewModel.selectedSessionID {
             return String(selectedSessionID.prefix(12))
         }
-        let count = viewModel.threadsForSelectedWorkspace.count
+        let count = viewModel.visibleThreadCount
         if count > 0 {
             return "\(count) \(count == 1 ? "thread" : "threads")"
         }
@@ -318,9 +318,10 @@ private struct CodexThreadPickerSheet: View {
     let onOpenJob: (String) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var searchText = ""
+    @State private var showingSmokeThreads = false
 
     private var filteredThreads: [CodexThread] {
-        let threads = viewModel.threadsForSelectedWorkspace
+        let threads = viewModel.threadsForSelectedWorkspace.filter { showingSmokeThreads || !$0.isSmokeTest }
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !query.isEmpty else { return threads }
         return threads.filter { thread in
@@ -347,6 +348,17 @@ private struct CodexThreadPickerSheet: View {
                         dismiss()
                     } label: {
                         Label("Start new thread", systemImage: "plus.bubble")
+                    }
+                    .listRowBackground(CodexTheme.panel)
+                }
+
+                if viewModel.threads.contains(where: \.isSmokeTest) {
+                    Section {
+                        Toggle(isOn: $showingSmokeThreads) {
+                            Text("Show smoke tests")
+                                .foregroundStyle(CodexTheme.text)
+                        }
+                        .toggleStyle(.switch)
                     }
                     .listRowBackground(CodexTheme.panel)
                 }
@@ -452,6 +464,14 @@ private struct CodexThreadRow: View {
                     HStack(spacing: 8) {
                         if let status = thread.lastJobStatus {
                             CodexStatusChip(status: status)
+                        }
+                        if thread.isSmokeTest {
+                            Text("Smoke")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(CodexTheme.dim)
+                                .padding(.horizontal, 8)
+                                .frame(height: 24)
+                                .background(CodexTheme.raisedPanel, in: Capsule())
                         }
                         Text("\(thread.jobCount) \(thread.jobCount == 1 ? "job" : "jobs")")
                             .font(.caption2.weight(.semibold))

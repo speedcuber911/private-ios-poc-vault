@@ -31,6 +31,7 @@ CODEX_DANGEROUS_MODE=true
 CODEX_MAX_CONCURRENT=1
 CODEX_DEFAULT_TIMEOUT_MS=600000
 CODEX_MAX_TIMEOUT_MS=1800000
+CODEX_THREAD_SUMMARY_CHARACTERS=240
 ```
 
 `CODEX_DANGEROUS_MODE=true` intentionally matches the user's v1 preference for
@@ -56,6 +57,8 @@ is inside a registered workspace. It does not return transcript content.
 `GET /v1/codex/threads` returns safe EC2-native thread summaries by merging
 those sessions with persisted job metadata. It includes latest prompt/result
 summary fields and job counts, but not raw stdout/stderr transcript streams.
+If no persisted job summary exists yet, it uses bounded first-prompt and
+latest-answer previews from the saved Codex session file.
 
 `POST /v1/codex/jobs` accepts optional `resumeSessionId`. The backend rejects
 unknown session ids and sessions outside the requested workspace before running

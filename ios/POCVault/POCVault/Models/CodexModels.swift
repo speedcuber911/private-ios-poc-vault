@@ -260,6 +260,7 @@ struct CodexThread: Decodable, Hashable, Identifiable {
     let lastResult: String?
     let lastError: String?
     let hasSessionFile: Bool
+    let isSmokeTest: Bool
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -280,6 +281,7 @@ struct CodexThread: Decodable, Hashable, Identifiable {
         case lastResult
         case lastError
         case hasSessionFile
+        case isSmokeTest
     }
 
     init(from decoder: Decoder) throws {
@@ -314,6 +316,7 @@ struct CodexThread: Decodable, Hashable, Identifiable {
         self.lastResult = try container.decodeLooseStringIfPresent(forKey: .lastResult)
         self.lastError = try container.decodeLooseStringIfPresent(forKey: .lastError)
         self.hasSessionFile = (try container.decodeIfPresent(Bool.self, forKey: .hasSessionFile)) ?? true
+        self.isSmokeTest = (try container.decodeIfPresent(Bool.self, forKey: .isSmokeTest)) ?? false
     }
 
     var displayTitle: String {

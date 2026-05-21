@@ -451,6 +451,7 @@ test("lists only sessions inside registered workspaces", async () => {
     assert.equal(allBody.sessions[0].workspaceId, "scratch");
     assert.equal(allBody.sessions[0].workspaceName, "Scratch");
     assert.equal(allBody.sessions[0].cwd, workspaceDir);
+    assert.equal("summary" in allBody.sessions[0], false);
 
     const filtered = await fetch(`${server.baseUrl}/v1/codex/sessions?workspaceId=scratch`);
     assert.equal(filtered.status, 200);

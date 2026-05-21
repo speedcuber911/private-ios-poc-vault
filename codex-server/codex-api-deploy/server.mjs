@@ -33,6 +33,7 @@ const defaultTimeoutMs = Math.min(
   parseIntegerEnv("CODEX_DEFAULT_TIMEOUT_MS", 10 * 60 * 1000, 1000, 24 * 60 * 60 * 1000),
   maxTimeoutMs,
 );
+const threadSummaryCharacters = parseIntegerEnv("CODEX_THREAD_SUMMARY_CHARACTERS", 240, 40, 2000);
 
 const terminalStatuses = new Set(["succeeded", "failed", "cancelled", "timeout"]);
 const allowedReasoningEfforts = new Set(["low", "medium", "high", "xhigh"]);
@@ -541,7 +542,7 @@ function cleanSessionTimestamp(value) {
   return typeof value === "string" && value.length <= 80 && !/[\0\r\n]/.test(value) ? value : null;
 }
 
-function listWorkspaceSessions({ workspaceId, limit }) {
+function listWorkspaceSessions({ workspaceId, limit, includeSummary = false }) {
   let selectedWorkspace = null;
   if (workspaceId) {
     const cleanId = cleanWorkspaceId(workspaceId);
@@ -559,7 +560,7 @@ function listWorkspaceSessions({ workspaceId, limit }) {
       if (!workspace) return null;
       if (selectedWorkspace && workspace.id !== selectedWorkspace.id) return null;
       const stat = fs.statSync(file);
-      return {
+      const session = {
         id: meta.id,
         workspaceId: workspace.id,
         workspaceName: workspace.name,
@@ -567,6 +568,10 @@ function listWorkspaceSessions({ workspaceId, limit }) {
         timestamp: meta.timestamp,
         updatedAt: stat.mtime.toISOString(),
       };
+      if (includeSummary) {
+        session.summary = readSessionSummary(file);
+      }
+      return session;
     })
     .filter(Boolean)
     .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
@@ -584,7 +589,7 @@ function listWorkspaceThreads({ workspaceId, limit }) {
   }
 
   const threadMap = new Map();
-  for (const session of listWorkspaceSessions({ workspaceId, limit: 200 })) {
+  for (const session of listWorkspaceSessions({ workspaceId, limit: 200, includeSummary: true })) {
     threadMap.set(session.id, {
       ...session,
       sessionId: session.id,
@@ -651,11 +656,93 @@ function threadSummary(thread) {
     activeJobCount,
     lastJobId: lastJob?.id || null,
     lastJobStatus: lastJob?.status || null,
-    lastPrompt: cleanApiText(lastJob?.prompt || "").trim() || null,
-    lastResult: cleanApiText(lastJob?.result || "").trim() || null,
+    lastPrompt: summaryText(lastJob?.prompt) || thread.summary?.firstUserPrompt || null,
+    lastResult: summaryText(lastJob?.result) || thread.summary?.lastAssistantAnswer || null,
     lastError: cleanApiText(lastJob?.error || "").trim() || null,
     hasSessionFile: Boolean(thread.hasSessionFile),
+    isSmokeTest: isSmokeThread(lastJob),
   };
+}
+
+function readSessionSummary(sessionFile) {
+  let firstUserPrompt = null;
+  let lastAssistantAnswer = null;
+
+  for (const line of readSessionLines(sessionFile)) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line);
+      if (entry?.type !== "response_item") continue;
+      const message = entry.payload;
+      if (message?.type !== "message") continue;
+      const text = boundedThreadText(messageText(message));
+      if (!text) continue;
+      if (message.role === "user" && !firstUserPrompt) {
+        firstUserPrompt = text;
+      } else if (message.role === "assistant") {
+        lastAssistantAnswer = text;
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return { firstUserPrompt, lastAssistantAnswer };
+}
+
+function readSessionLines(sessionFile) {
+  const maxBytes = 1024 * 1024;
+  const stat = fs.statSync(sessionFile);
+  if (stat.size <= maxBytes) {
+    return fs.readFileSync(sessionFile, "utf8").split("\n");
+  }
+
+  const buffer = Buffer.alloc(maxBytes);
+  const fd = fs.openSync(sessionFile, "r");
+  try {
+    fs.readSync(fd, buffer, 0, maxBytes, Math.max(0, stat.size - maxBytes));
+    return buffer.toString("utf8").split("\n");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function messageText(message) {
+  const content = Array.isArray(message.content) ? message.content : [];
+  return content
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (!part || typeof part !== "object") return "";
+      if (typeof part.text === "string") return part.text;
+      if (typeof part.input_text === "string") return part.input_text;
+      if (typeof part.output_text === "string") return part.output_text;
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function summaryText(value) {
+  return boundedThreadText(value);
+}
+
+function boundedThreadText(value) {
+  const text = cleanApiText(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return null;
+  if (text.length <= threadSummaryCharacters) return text;
+  return `${text.slice(0, threadSummaryCharacters - 1).trimEnd()}…`;
+}
+
+function isSmokeThread(job) {
+  if (!job) return false;
+  const prompt = summaryText(job.prompt)?.toLowerCase() || "";
+  const result = summaryText(job.result)?.toLowerCase() || "";
+  return (
+    (prompt.includes("reply with exactly codex-async-ok") && result === "codex-async-ok") ||
+    (prompt.includes("reply with exactly resume-ok") && result === "resume-ok")
+  );
 }
 
 function maxIso(left, right) {

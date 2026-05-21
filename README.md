@@ -124,6 +124,8 @@ Current API behavior:
 - Jobs are async and persisted on the VM.
 - The API supports job history, detail logs, cancel, timeout, session listing,
   and `resumeSessionId` for continuing an old server thread.
+- Thread summaries expose bounded prompt/result previews for navigation, but
+  session listings stay metadata-only.
 - Workspaces are predefined; the phone cannot send arbitrary filesystem paths.
 - The live Codex runner uses the remote `codex-runner` user.
 

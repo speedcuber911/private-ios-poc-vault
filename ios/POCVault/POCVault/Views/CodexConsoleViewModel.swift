@@ -79,6 +79,14 @@ final class CodexConsoleViewModel: ObservableObject {
         return threads.filter { $0.workspaceId == nil || $0.workspaceId == selectedWorkspaceID }
     }
 
+    var visibleThreads: [CodexThread] {
+        threadsForSelectedWorkspace.filter { !$0.isSmokeTest }
+    }
+
+    var visibleThreadCount: Int {
+        visibleThreads.count
+    }
+
     var composeWorkspaceID: String {
         selectedWorkspaceID
             ?? workspaces.first(where: { $0.id == "poc-vault" })?.id

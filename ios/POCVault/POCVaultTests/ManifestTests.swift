@@ -265,7 +265,8 @@ final class ManifestTests: XCTestCase {
                   "lastPrompt": "continue this thread",
                   "lastResult": "thread answer",
                   "lastError": null,
-                  "hasSessionFile": true
+                  "hasSessionFile": true,
+                  "isSmokeTest": true
                 }
                 """.utf8
             )
@@ -281,6 +282,7 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(thread.previewText, "continue this thread")
         XCTAssertTrue(thread.hasActiveJobs)
         XCTAssertTrue(thread.hasSessionFile)
+        XCTAssertTrue(thread.isSmokeTest)
     }
 
     func testCodexJobDecodesResumeSessionID() throws {

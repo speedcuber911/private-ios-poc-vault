@@ -26,7 +26,8 @@ The server exposes an async job API for Codex:
 - `GET /v1/codex/sessions?workspaceId=scratch&limit=50`: resumable session
   metadata for sessions whose saved `cwd` is inside a registered workspace.
 - `GET /v1/codex/threads?workspaceId=scratch&limit=50`: EC2-native thread
-  summaries, merging resumable sessions with the latest persisted job metadata.
+  summaries, merging resumable sessions with latest persisted job metadata and
+  bounded prompt/result previews.
 - `GET /v1/codex/jobs?limit=50`: persistent job history.
 - `POST /v1/codex/jobs`: enqueue a Codex job.
 - `GET /v1/codex/jobs/<id>`: job detail with stdout, stderr, result, and status.
@@ -85,6 +86,16 @@ poc-vault  -> /srv/codex-workspaces/poc-vault
 
 The remote `poc-vault` workspace is a separate copy of the local POC Vault repo.
 It is not the live nginx static root and it is not the local Mac checkout.
+
+## Thread Summaries
+
+`GET /v1/codex/sessions` stays metadata-only. It should not return transcript
+content.
+
+`GET /v1/codex/threads` can return bounded `lastPrompt` and `lastResult`
+previews so the phone UI can show readable thread history without raw
+stdout/stderr streams. Tune the preview length with
+`CODEX_THREAD_SUMMARY_CHARACTERS`.
 
 ## Codex Login State
 
