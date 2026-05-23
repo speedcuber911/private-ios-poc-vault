@@ -1,8 +1,8 @@
 # Codex Server Agent Contract
 
 This workspace owns the personal EC2 Codex job API. It now lives inside
-`/Users/pariksj/Desktop/poc-vault/codex-server` because the iOS shell and remote
-runner are tightly coupled.
+`/Users/pariksj/Desktop/poc-vault/codex-server` because the Relay iOS app and
+remote runner are tightly coupled.
 
 ## Working Rules
 

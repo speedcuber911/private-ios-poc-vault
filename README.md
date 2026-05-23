@@ -1,22 +1,21 @@
-# Private iOS POC Vault
+# Relay
 
-Relay is the user-facing iOS app for this private, iPhone-first delivery system
-for static AI-generated proofs of concept. The repository and backend still use
-the older POC Vault naming in several internal places, but user-facing product
-branding should be Relay.
+Relay is a private, iPhone-first control surface for remote AI agent work and
+authenticated internal demos. From the phone, it can browse signed static POCs,
+start and continue Codex or Claude runs on EC2, review bounded thread output,
+and send spoken prompts through the protected agent API.
 
-POC Vault is the internal platform name for the system that turns scattered
-local demos into a signed, authenticated library that can be browsed from a
-native iOS app and opened in a full-screen WebView.
+The repository and backend still use the older POC Vault naming in internal
+places. Treat POC Vault as the static-hosting and legacy platform vocabulary,
+not the full product identity.
 
-The project has three core ideas:
+The project has four core ideas:
 
-- POCs are backend-driven static assets. A new demo should not require an app
-  release.
+- Relay is the phone control surface for remote agent work.
+- POCs are backend-driven static assets. A new demo should not require an app release.
 - Access is private by default. Manifest files, POC pages, and the Codex job API
   sit behind mutual TLS.
-- The phone is the control surface. It can browse deployed prototypes and start
-  remote Codex jobs even when the Mac is off.
+- Agent runs happen on registered EC2 workspaces, not arbitrary phone-supplied paths.
 
 ## What This Project Delivers
 
@@ -24,14 +23,15 @@ The project has three core ideas:
 | --- | --- |
 | Private POC hosting | Static HTML/CSS/JS demos live under `pocs/<slug>/public/` and are served through nginx. |
 | Signed discovery | `build/manifest.json` is generated from source metadata and signed with an Ed25519 sidecar. |
-| Native iOS shell | SwiftUI app loads the signed manifest, presents a private POC library, and opens demos in an authenticated `WKWebView`. |
+| Relay iOS app | SwiftUI app presents the agent console, private POC library, diagnostics, and authenticated WebViews. |
 | One-command deploys | `ops/deploy-poc` validates, stages, signs, logs, rsyncs, and promotes POCs to the VM. |
 | Local simulator mode | Simulator builds use a local signed vault on `127.0.0.1:8787` instead of production mTLS. |
-| Remote agent control | The Codex tab talks to an EC2-side async Codex/Claude job API for registered workspaces. |
+| Remote agent control | The agent console talks to an EC2-side async Codex/Claude job API for registered workspaces. |
 | Operational hardening | Secrets stay outside git, protected routes require client certificates, and verification scripts check the live perimeter. |
 
-The result is a repeatable loop: build a static demo, deploy it, refresh the
-iPhone library, and open it privately without changing native code.
+The result is a private mobile workflow: start or continue remote agent work,
+review results from the phone, and open deployed internal demos without changing
+native code for each POC.
 
 ## Branding
 
@@ -46,20 +46,25 @@ iPhone library, and open it privately without changing native code.
 - Do not rename internal identifiers just to match the Relay brand. The bundle
   id, module, target, repo path, backend config keys, and workspace names stay
   stable unless a deeper rename is requested.
+- The current icon source lives at
+  `ios/POCVault/POCVault/Resources/AppIcon/relay-logo.svg`; generated app-icon
+  PNGs live in the AppIcon resource folders, while Xcode build output stays
+  ignored.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
+  Phone["Relay iOS app"] --> AgentConsole["Agent console"]
+  AgentConsole --> CodexAPI["EC2 Codex/Claude job API"]
+  CodexAPI --> Workspaces["Registered workspaces"]
   Agent["Agent builds static POC"] --> Source["pocs/<slug>/public"]
   Source --> Deploy["ops/deploy-poc"]
   Deploy --> Manifest["Generated manifest + signature"]
   Deploy --> VM["EC2 static root"]
   VM --> Nginx["nginx mTLS"]
-  Nginx --> App["Relay iOS app"]
-  App --> WebView["Authenticated WebView"]
-  App --> CodexTab["Codex tab"]
-  CodexTab --> CodexAPI["EC2 Codex job API"]
+  Nginx --> Phone
+  Phone --> WebView["Authenticated WebView"]
 ```
 
 ### Repository Responsibilities
@@ -68,7 +73,7 @@ flowchart LR
 .
 ├── pocs/                 # Source metadata and static POC assets
 ├── ops/                  # Deploy, signing, verification, cert, and server scripts
-├── ios/POCVault/         # Native Relay iOS shell; legacy internal path
+├── ios/POCVault/         # Native Relay iOS app; legacy internal path
 ├── codex-server/         # EC2 async Codex job API
 ├── build/                # Generated manifest and signature artifacts
 ├── README.md             # Project overview and operating guide
@@ -78,8 +83,8 @@ flowchart LR
 
 ## Backend-Driven POC Contract
 
-The iOS app is a vault shell, not a hardcoded catalog. Adding, replacing, hiding,
-or updating a POC should only touch backend-driven assets:
+Relay is not a hardcoded POC catalog. Adding, replacing, hiding, or updating a
+POC should only touch backend-driven assets:
 
 - `pocs/<slug>/poc.json`
 - `pocs/<slug>/public/**`
@@ -88,8 +93,8 @@ or updating a POC should only touch backend-driven assets:
 - remote files promoted by `ops/deploy-poc`
 
 Do not edit `ios/POCVault/` for ordinary POC creation. Native changes are
-reserved for the vault shell itself, enrollment/identity, manifest schema,
-signing/project settings, or security behavior.
+reserved for Relay app behavior, enrollment/identity, manifest schema,
+signing/project settings, agent console behavior, or security behavior.
 
 Each deployable POC has:
 
@@ -112,8 +117,8 @@ Minimum metadata:
 
 ## Security Model
 
-POC Vault is designed so public DNS can point at the VM while protected routes
-remain inaccessible to ordinary web clients.
+Relay's backend is designed so public DNS can point at the VM while protected
+routes remain inaccessible to ordinary web clients.
 
 - `/healthz` is intentionally public for diagnostics.
 - `/manifest.json`, `/manifest.sig.json`, and POC pages require a valid client
@@ -268,11 +273,16 @@ signature sidecar.
 
 ## iOS App
 
-The iOS app is named Relay. It has three jobs:
+The iOS app is named Relay. It has four jobs:
 
-1. load and verify the signed manifest
-2. open POCs in an authenticated full-screen `WKWebView`
-3. submit and monitor async Codex jobs from the Codex tab
+1. start, continue, monitor, cancel, and review remote Codex/Claude agent runs
+2. record spoken prompts and send them for authenticated transcription
+3. load and verify the signed POC manifest
+4. open POCs in an authenticated full-screen `WKWebView`
+
+The current tab layout is Library, Codex, Claude, and Status. Codex and Claude
+use provider-specific console view models and brand tab marks; Status combines
+recent provider activity with the Diagnostics health view.
 
 The app intentionally does not know individual POCs at compile time. POC detail
 screens have no standard navigation bar above hosted pages; the shell uses a
@@ -365,11 +375,11 @@ Health check:
 curl -fsS http://127.0.0.1:8787/healthz
 ```
 
-## Codex Console
+## Agent Console
 
-The iOS app includes a Codex tab for remote Codex and Claude work on EC2. The
-server lives inside this repository because the phone shell and the runner API
-are deployed as one operational system.
+Relay includes an agent console for remote Codex and Claude work on EC2. The
+server lives inside this repository because the iOS app, static POC host, and
+runner API are deployed as one operational system.
 
 Server workspace:
 
@@ -397,21 +407,27 @@ Current API behavior:
   Claude thread is resumed by Claude.
 - Phone-recorded prompt audio can be transcribed through the authenticated
   Codex API when Azure Speech is configured on the server.
-- Workspaces are predefined; the phone cannot request arbitrary filesystem
-  paths.
+- Workspaces can be configured in `/etc/codex-api.env` or safely selected from
+  directory listings under the configured EC2 workspace root; the phone still
+  cannot request arbitrary filesystem paths.
+- Successful answers with fenced code blocks can expose job-scoped artifacts
+  for raw download or sandboxed preview. These artifacts are not added to the
+  signed POC manifest unless they are separately deployed through
+  `ops/deploy-poc`.
 
-Registered workspace ids:
+Seeded workspace ids:
 
 ```text
 scratch
 poc-vault
+sigiq
 ```
 
 For server-specific deployment and verification details, read
 [codex-server/README.md](codex-server/README.md).
 
-For a complete implementation walkthrough across the POC host, iOS shell,
-Codex console, transcription flow, security model, and verification commands,
+For a complete implementation walkthrough across Relay, the POC host, agent
+console, transcription flow, security model, and verification commands,
 read [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md).
 
 For the full project history and rationale behind the current architecture,

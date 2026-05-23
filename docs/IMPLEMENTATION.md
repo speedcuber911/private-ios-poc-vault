@@ -1,7 +1,7 @@
-# POC Vault Implementation Notes
+# Relay Implementation Notes
 
-This document summarizes the current shipped shape of POC Vault across static
-POC hosting, the iOS shell, and the EC2 Codex runner. It is meant to help a new
+This document summarizes the current shipped shape of Relay across the iOS app,
+static POC hosting, and the EC2 Codex/Claude runner. It is meant to help a new
 reviewer understand what has been built without reading every Swift, Node, and
 ops file first.
 
@@ -10,19 +10,20 @@ For a chronological account of how the repo reached this shape, read
 
 ## System Summary
 
-POC Vault is a private iPhone-first system for browsing static AI-generated
-POCs and running remote Codex jobs from the phone.
+Relay is a private iPhone-first system for controlling remote Codex/Claude
+agent runs, reviewing bounded thread output, transcribing spoken prompts, and
+browsing authenticated static POCs.
 
 The platform has three connected layers:
 
-1. Static POCs are stored under `pocs/<slug>/public/`, discovered through a
+1. The Relay iOS app presents the agent console, POC library, diagnostics, and
+   authenticated WebViews.
+2. Static POCs are stored under `pocs/<slug>/public/`, discovered through a
    generated manifest, and served through nginx behind mTLS.
-2. The iOS app verifies the signed manifest, shows a native POC library, opens
-   hosted demos in an authenticated WebView, and exposes a Codex console tab.
 3. The EC2 Codex server accepts authenticated job requests from the phone,
-   persists job state, runs Codex in registered workspaces, exposes thread
-   summaries, and now supports phone-recorded prompt transcription through Azure
-   Speech.
+   persists job state, runs Codex or Claude in registered workspaces, exposes
+   thread summaries, and supports phone-recorded prompt transcription through
+   Azure Speech.
 
 The important architectural boundary is still intact: ordinary POC creation is
 backend-driven and does not require changes in `ios/POCVault/`.
@@ -48,13 +49,20 @@ The iOS app only needs the manifest and signature URLs. New POCs should appear
 after a manifest refresh; the app should not learn individual POC slugs at
 compile time.
 
-## iOS Vault Shell
+## Relay iOS App
 
-The iOS app is a SwiftUI shell with three user-facing jobs:
+The iOS app is a SwiftUI app with four user-facing jobs:
 
+- let the user create, monitor, continue, cancel, and review remote Codex/Claude jobs
+- record short voice prompts and upload them for authenticated transcription
 - load and verify the signed POC manifest
 - open protected POC URLs in a full-screen authenticated `WKWebView`
-- let the user create, monitor, and continue remote Codex jobs
+
+The root tab layout is Library, Codex, Claude, and Status. Codex and Claude use
+separate `CodexConsoleViewModel` instances so provider defaults, selected model,
+reasoning/effort, selected thread, active jobs, and completion notifications do
+not bleed between providers. Status merges recent provider activity and embeds
+Diagnostics for certificate, manifest, and health checks.
 
 Production flows require a client certificate imported through Diagnostics.
 The physical app expects `Documents/support/client.p12` and can also consume a
@@ -64,9 +72,9 @@ Codex base URLs.
 Simulator builds intentionally bypass production mTLS and use the local preview
 server from `ios/launch-simulator.sh`.
 
-## Codex Console UX
+## Agent Console UX
 
-The Codex tab has moved from a job-list surface to a prompt-first,
+The Relay agent console has moved from a job-list surface to a prompt-first,
 thread-oriented operator console:
 
 - The compose panel starts a new thread or continues a selected thread.
@@ -85,9 +93,19 @@ thread-oriented operator console:
   latest job detail when the user wants the full answer.
 
 The compose controls support provider, model, effort/reasoning, attachments,
-voice transcription, and a searchable Codex skill picker. Selected skills are
-applied client-side by prefixing the outgoing prompt; this does not change the
-server API contract.
+voice transcription, Claude permission modes, and a searchable skill picker.
+Selected skills are applied client-side by prefixing the outgoing prompt; this
+does not change the server API contract.
+
+The workspace picker is a safe directory browser backed by the Codex API. It can
+select a configured workspace such as `sigiq` or a child directory such as
+`sigiq/ai-tutor`, but the server derives the runnable workspace id only after
+realpath and browse-root checks.
+
+Successful jobs can show job-scoped artifacts when the server extracts fenced
+code blocks from an answer. The phone can open mTLS-protected previews or fetch
+raw artifact bytes for sharing; artifacts remain run output, not signed POC
+catalog entries.
 
 ## Phone Voice Prompts
 
@@ -119,11 +137,13 @@ Current authenticated API surface:
 ```text
 GET  /v1/codex/health
 GET  /v1/codex/workspaces
+GET  /v1/codex/workspace-dirs?path=<path>&q=<query>
 GET  /v1/codex/ui
 GET  /v1/codex/sessions?workspaceId=<id>&provider=<provider>&limit=<n>
 GET  /v1/codex/threads?workspaceId=<id>&provider=<provider>&limit=<n>
 GET  /v1/codex/threads/<sessionId>?provider=<provider>
 GET  /v1/codex/jobs?provider=<provider>&limit=<n>
+POST /v1/codex/workspaces/select
 POST /v1/codex/jobs
 GET  /v1/codex/jobs/<id>
 POST /v1/codex/jobs/<id>/cancel
@@ -139,7 +159,11 @@ Job execution behavior:
 - stdout, stderr, and result files are persisted under
   `/var/lib/codex-api/logs`.
 - Running jobs are marked failed on service restart so they do not stay stuck.
-- Jobs run only in registered workspaces from `CODEX_WORKSPACES`.
+- Jobs run only in configured workspaces from `CODEX_WORKSPACES` or safe
+  directory-derived workspaces under the configured workspace browse root.
+- The directory browser is rooted at `/srv/codex-workspaces` by default, skips
+  hidden directories, resolves real paths, and rejects traversal or symlink
+  escapes before returning a selectable workspace id.
 - Jobs support `provider=codex` and `provider=claude`; omitted provider
   defaults to `codex`.
 - `resumeSessionId` is accepted only when the session exists in `CODEX_HOME`
@@ -171,6 +195,15 @@ Browser review behavior:
   Node proxy settings `CODEX_PROXY_BASE_URL`, `CODEX_PROXY_CLIENT_CERT`, and
   `CODEX_PROXY_CLIENT_KEY`.
 
+Artifact behavior:
+
+- Successful job answers are scanned for fenced code blocks.
+- Safe, bounded blocks are written under `/var/lib/codex-api/artifacts/<jobId>/`.
+- `raw` routes download artifacts with attachment headers.
+- `preview` routes sandbox previewable HTML, SVG, and Markdown.
+- HTML/CSS/JS answer sets also get a generated `preview.html` artifact.
+- Artifact routes stay under `/v1/codex/*` and require the same mTLS boundary.
+
 Output preview behavior:
 
 - List responses use compact bounded log previews.
@@ -180,7 +213,7 @@ Output preview behavior:
 - stdout and stderr previews use suffix slices so the phone sees recent log
   output first.
 
-## Transcription Configuration
+## Upload And Transcription Configuration
 
 Azure Speech settings belong only in `/etc/codex-api.env` on the VM or in local
 test environment variables. Do not commit real values.
@@ -188,6 +221,10 @@ test environment variables. Do not commit real values.
 | Variable | Purpose |
 | --- | --- |
 | `CODEX_MAX_TRANSCRIPTION_AUDIO_BYTES` | Maximum uploaded audio size. The template uses 25 MiB. |
+| `CODEX_MAX_BODY_BYTES` | Maximum JSON request body. The template uses 30 MiB so phone attachments fit under nginx. |
+| `CODEX_MAX_JOB_ATTACHMENTS` | Maximum files attached to one job. The template uses 6. |
+| `CODEX_MAX_JOB_ATTACHMENT_BYTES` | Maximum decoded size for one attachment. The template uses 8 MiB. |
+| `CODEX_MAX_JOB_ATTACHMENT_TOTAL_BYTES` | Maximum decoded attachment total for one job. The template uses 18 MiB. |
 | `AZURE_SPEECH_ENDPOINT` | Azure Speech endpoint base URL. |
 | `AZURE_SPEECH_API_KEY` | Azure Speech subscription key. |
 | `AZURE_SPEECH_API_VERSION` | API version, defaulting to `2025-10-15`. |

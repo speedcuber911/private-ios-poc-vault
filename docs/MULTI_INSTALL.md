@@ -1,8 +1,9 @@
-# Multi-Install Setup
+# Relay Multi-Install Setup
 
-POC Vault can be installed by another owner against their own AWS account, EC2
-instance, domain, certificates, iOS bundle id, and Codex runner. The key is to
-keep all owner-specific values in a local config file outside git:
+Relay can be installed by another owner against their own AWS account, EC2
+instance, domain, certificates, iOS bundle id, static POC host, and Codex/Claude
+runner. The key is to keep all owner-specific values in a local config file
+outside git:
 
 ```text
 ~/.poc-vault/secrets/config.env
@@ -172,6 +173,7 @@ It also prepares:
 /var/lib/codex-api
 /srv/codex-workspaces/scratch
 /srv/codex-workspaces/poc-vault
+/srv/codex-workspaces/sigiq
 /etc/codex-api/mtls
 ```
 

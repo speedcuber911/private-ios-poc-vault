@@ -1,10 +1,18 @@
-# POC Vault Agent Contract
+# Relay Agent Contract
 
-This repo is a private vault for static AI-generated POCs. Keep the working
-model simple: every POC lives under `pocs/<slug>/`, ships static files under
-`public/`, and is advertised through a signed manifest consumed by the iOS app.
-The remote Codex job API lives inside this repo at `codex-server/` because the
-phone app and EC2 runner are tightly coupled.
+This repo now powers `Relay`: a private iPhone control surface for remote
+Codex/Claude agent work and authenticated static POC viewing. The historical
+POC Vault subsystem is still here, but do not treat it as the whole product.
+
+There are two main surfaces:
+
+- Hosted POCs: every POC lives under `pocs/<slug>/`, ships static files under
+  `public/`, and is advertised through a signed manifest consumed by the iOS app.
+- Remote agents: the phone talks to the EC2 Codex/Claude job API in
+  `codex-server/` to start, monitor, continue, cancel, and review agent runs.
+
+The remote job API lives inside this repo because the Relay iOS app, static POC
+hosting, and EC2 runner are tightly coupled.
 
 ## Read This First
 
@@ -37,14 +45,14 @@ phone app and EC2 runner are tightly coupled.
 ## Non-Negotiable Architecture Rule
 
 POCs are backend-driven. Creating, updating, or deploying a POC must not require
-changes under `ios/POCVault/`. The iOS app reads the signed manifest and opens
-the published URL in an authenticated WebView; it does not know individual POCs
-at compile time.
+changes under `ios/POCVault/`. Relay reads the signed manifest and opens the
+published URL in an authenticated WebView; it does not know individual POCs at
+compile time.
 
-Touch `ios/POCVault/` only when the user explicitly asks to change the vault app
-itself, the manifest schema, enrollment/identity, signing/project settings, or
-security behavior. If a POC request seems to need native code, first implement
-it as static web assets or server-hosted behavior and call out the limitation.
+Touch `ios/POCVault/` only when the user explicitly asks to change Relay app
+behavior, the manifest schema, enrollment/identity, signing/project settings, or
+security behavior. If a POC request seems to need native code, first implement it
+as static web assets or server-hosted behavior and call out the limitation.
 
 ## Deployment Configuration
 
@@ -140,7 +148,8 @@ https://<slug>.<configured-poc-domain>/
 
 ## iOS App Contract
 
-The iOS app is a vault shell, not a POC implementation surface.
+The iOS app is `Relay`, not merely a vault shell. It is the mobile control
+surface for agent runs and authenticated POC viewing.
 
 - User-facing name and visual identity: `Relay`.
 - Canonical physical-device bundle id: `com.parikshit.pocvault`.
@@ -155,12 +164,12 @@ The iOS app is a vault shell, not a POC implementation surface.
 - Each POC should remain self-contained as static web assets.
 
 If the user asks for visual polish of a hosted POC, edit the POC's HTML/CSS/JS,
-not the iOS shell, unless the complaint is specifically about the shell chrome
-or app library.
+not Relay's native app code, unless the complaint is specifically about native
+chrome or the app library.
 
-## Codex Console Contract
+## Agent Console Contract
 
-The iOS app has a Codex tab that talks to:
+Relay has an agent console that talks to:
 
 ```text
 https://codex.pocs.conformal.live
@@ -172,12 +181,13 @@ The server implementation lives in this repo at:
 /Users/pariksj/Desktop/poc-vault/codex-server
 ```
 
-The Codex tab may be edited here only for iOS shell behavior, such as prompt
-entry, keyboard handling, job lists, job detail logs, simplified result
-rendering, cancel/retry behavior, and mTLS client wiring.
+The agent console may be edited here for iOS behavior such as prompt entry,
+keyboard handling, provider/model/skill controls, job lists, thread browsing,
+job detail logs, simplified result rendering, voice prompt capture,
+cancel/retry behavior, and mTLS client wiring.
 
 Do not add arbitrary-path execution from the iOS app. The server exposes only
-registered workspace ids, currently `scratch` and `poc-vault`.
+registered workspace ids, currently `scratch`, `poc-vault`, and `sigiq`.
 
 The phone Codex screen should stay simple: prompt plus collapsible Results. Do
 not reintroduce endpoint cards, workspace cards, offline/online labels, a thread

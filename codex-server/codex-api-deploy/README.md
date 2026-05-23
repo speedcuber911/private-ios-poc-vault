@@ -36,6 +36,10 @@ AWS_REGION=
 AWS_DEFAULT_REGION=
 CODEX_DANGEROUS_MODE=true
 CODEX_MAX_CONCURRENT=1
+CODEX_MAX_BODY_BYTES=31457280
+CODEX_MAX_JOB_ATTACHMENTS=6
+CODEX_MAX_JOB_ATTACHMENT_BYTES=8388608
+CODEX_MAX_JOB_ATTACHMENT_TOTAL_BYTES=18874368
 CODEX_DEFAULT_TIMEOUT_MS=600000
 CODEX_MAX_TIMEOUT_MS=1800000
 CODEX_THREAD_SUMMARY_CHARACTERS=240
@@ -44,17 +48,23 @@ CODEX_THREAD_SUMMARY_CHARACTERS=240
 `CODEX_DANGEROUS_MODE=true` intentionally matches the user's v1 preference for
 a powerful runner. Keep that fact explicit in handoffs.
 
+`CODEX_MAX_BODY_BYTES` is intentionally aligned with the nginx `30m` upload
+limit so phone attachments can survive base64 JSON overhead. Tighten the
+attachment-specific limits first if an install wants smaller uploads.
+
 ## Workspaces
 
-Only workspaces listed in `CODEX_WORKSPACES` can be selected by the API. The
-current live values are:
+`CODEX_WORKSPACES` seeds the known workspace roots. The current live values are:
 
 ```text
 /srv/codex-workspaces/scratch
 /srv/codex-workspaces/poc-vault
+/srv/codex-workspaces/sigiq
 ```
 
-Do not accept arbitrary paths from the phone.
+Directory-derived workspaces can also be selected under the configured browse
+root through the directory workspace endpoints below. Do not accept arbitrary
+paths from the phone.
 
 ## Rendering For An Install
 
@@ -120,6 +130,41 @@ Node server forwards live `/v1/codex/*` GET requests with the configured cert.
 unknown session ids, provider mismatches, and sessions outside the requested
 workspace before running the provider-specific resume command. Threads are
 provider-locked; a Claude thread cannot accept a Codex follow-up and vice versa.
+
+## Job Artifacts
+
+Successful jobs parse fenced code blocks from the saved answer and expose them
+as job-scoped artifacts. Job responses include `artifacts`, each with `id`,
+`kind`, `filename`, `title`, `language`, `contentType`, `bytes`, `rawURL`, and
+`previewURL`.
+
+Artifact routes stay under the mTLS-protected Codex namespace:
+
+```text
+GET /v1/codex/jobs/<jobId>/artifacts/<artifactId>/raw
+GET /v1/codex/jobs/<jobId>/artifacts/<artifactId>/preview
+```
+
+Raw downloads use attachment headers and `nosniff`. Previewable HTML, SVG, and
+Markdown render inside a sandboxed wrapper. HTML plus CSS/JS blocks are also
+assembled into a job-only `preview.html` artifact. These artifacts are not POC
+Library entries and do not use `ops/deploy-poc`.
+
+## Directory Workspaces
+
+Relay can browse safe EC2 workspace directories with:
+
+```text
+GET  /v1/codex/workspace-dirs?path=<relative-or-absolute-path>&q=<query>
+POST /v1/codex/workspaces/select
+```
+
+The browse root defaults to `/srv/codex-workspaces` and can be overridden with
+`CODEX_WORKSPACE_BROWSE_ROOT` or `CODEX_WORKSPACE_ROOT`. The server resolves
+real paths, rejects files, traversal, and symlink escapes, and skips hidden
+directories in listings. Selected child folders get deterministic `dir-*`
+workspace ids and jobs, sessions, threads, and job responses resolve to the
+deepest matching workspace path.
 
 ## Phone Transcription
 

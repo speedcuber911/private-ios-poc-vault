@@ -1,9 +1,8 @@
 # Codex Server Workspace
 
-This workspace owns the EC2-side Codex/Claude job API used by the POC Vault
-iPhone app. It lives inside `/Users/pariksj/Desktop/poc-vault/codex-server` so
-the iOS vault app and server runner can be changed together when their contract
-moves.
+This workspace owns the EC2-side Codex/Claude job API used by the Relay iPhone
+app. It lives inside `/Users/pariksj/Desktop/poc-vault/codex-server` so the iOS
+app and server runner can be changed together when their contract moves.
 
 Configured endpoint shape:
 
@@ -23,7 +22,11 @@ The server exposes an async job API for Codex and Claude providers:
 
 - `GET /healthz`: public process health for uptime checks.
 - `GET /v1/codex/health`: authenticated health.
-- `GET /v1/codex/workspaces`: predefined workspace registry.
+- `GET /v1/codex/workspaces`: configured and selected workspace registry.
+- `GET /v1/codex/workspace-dirs?path=sigiq&q=tutor`: browse/search safe
+  EC2 directories under the configured workspace root.
+- `POST /v1/codex/workspaces/select`: validate a browsed directory and return
+  a deterministic workspace id for running jobs there.
 - `GET /v1/codex/ui`: authenticated browser UI for reviewing Codex threads.
 - `GET /v1/codex/sessions?workspaceId=scratch&provider=codex&limit=50`:
   resumable Codex session metadata for sessions whose saved `cwd` is inside a
@@ -68,8 +71,8 @@ Requests without a verified client certificate are rejected before they reach
 the backend. Requests with other certificate subjects are rejected by the nginx
 subject map.
 
-The iOS app reuses the same `ClientIdentityStore` as the POC Vault manifest and
-WebView flow, so the Codex tab works with the imported `client.p12`.
+The iOS app reuses the same `ClientIdentityStore` as the signed manifest and
+WebView flow, so the Relay agent console works with the imported `client.p12`.
 
 ## Remote Runtime
 
@@ -111,15 +114,25 @@ Claude job results are captured from stdout.
 
 ## Workspaces
 
-Jobs can target only the predefined workspaces in `/etc/codex-api.env`:
+Jobs can target configured workspaces in `/etc/codex-api.env` and
+directory-derived workspaces selected under the safe browse root:
 
 ```text
 scratch    -> /srv/codex-workspaces/scratch
 poc-vault  -> /srv/codex-workspaces/poc-vault
+sigiq      -> /srv/codex-workspaces/sigiq
 ```
 
 The remote `poc-vault` workspace is a separate copy of the local POC Vault repo.
 It is not the live nginx static root and it is not the local Mac checkout.
+The remote `sigiq` workspace is a folder-level project containing the SigiQ
+repository checkouts used by Relay agent runs.
+
+Relay can browse below the workspace root, select a child directory such as
+`/srv/codex-workspaces/sigiq/ai-tutor`, and run Codex or Claude from that exact
+directory. The API resolves real paths, rejects traversal and symlink escapes,
+skips hidden directories in listings, and derives stable `dir-*` workspace ids
+from the selected relative path. It does not accept arbitrary EC2 paths.
 
 ## Thread Summaries
 
@@ -140,6 +153,16 @@ stdout/stderr streams. Tune the preview length with
 The browser review surface lives at `/v1/codex/ui`. It uses the same mTLS
 boundary as the API, lists recent threads, filters by workspace/search text,
 shows bounded transcript messages, and can open full job logs intentionally.
+
+## Job Artifacts
+
+When a successful Codex or Claude answer contains fenced code blocks, the API
+extracts them into job-scoped artifacts under the runner data directory. Job
+responses include artifact metadata and mTLS-protected `rawURL` / `previewURL`
+routes. Raw routes download files with attachment headers; preview routes render
+HTML, SVG, and Markdown through a sandboxed iframe wrapper. Multi-block
+HTML/CSS/JS answers also get an assembled `preview.html` artifact. These are
+run artifacts only and are not added to the signed POC Library manifest.
 
 For local browser review from a tool that cannot present a client certificate,
 run the Node service with `CODEX_PROXY_BASE_URL`, `CODEX_PROXY_CLIENT_CERT`, and
@@ -240,6 +263,7 @@ The deployment is intentionally small:
 4. Copy the client CA certificate and CRL to `/etc/codex-api/mtls`.
 5. Restart `codex-api` and reload nginx after `nginx -t`.
 6. Sync the POC Vault source copy to `/srv/codex-workspaces/poc-vault`.
+7. Sync SigiQ repository checkouts to `/srv/codex-workspaces/sigiq`.
 
 Do not expose SSH broadly for deployment. If a temporary security-group ingress
 rule is added, remove it before handoff.

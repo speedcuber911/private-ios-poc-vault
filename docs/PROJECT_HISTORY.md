@@ -1,4 +1,4 @@
-# POC Vault Project History
+# Relay Project History
 
 This document records what has happened in this repository and why the system
 looks the way it does today. It is intentionally more narrative than the root
@@ -7,8 +7,10 @@ the evolution, tradeoffs, and current boundaries.
 
 ## Current Shape
 
-POC Vault is a private static POC delivery system plus a phone-controlled remote
-agent runner.
+Relay is a private iPhone control surface for remote Codex/Claude agent work
+plus authenticated static POC delivery. The older POC Vault name still appears
+in paths, bundle identifiers, server roots, and manifest vocabulary, but it is
+now an internal/static-hosting subsystem rather than the full product identity.
 
 The repository now contains four connected surfaces:
 
@@ -16,8 +18,8 @@ The repository now contains four connected surfaces:
 - `ops/`: local and remote operational tooling for rendering manifests,
   signing them, deploying static assets, provisioning support files, and
   verifying live mTLS behavior.
-- `ios/POCVault/`: the SwiftUI vault shell that loads the signed manifest,
-  opens POCs in an authenticated WebView, and exposes a Codex/Claude console.
+- `ios/POCVault/`: the SwiftUI Relay app that exposes the agent console,
+  diagnostics, signed POC library, and authenticated WebViews.
 - `codex-server/`: the EC2-side async job API that lets the phone start,
   inspect, continue, and cancel agent runs in registered server workspaces.
 
@@ -33,11 +35,12 @@ iOS code.
 The repo began as a sanitized private POC hosting platform. The initial shape
 included:
 
-- a SwiftUI iOS shell under `ios/POCVault/`
+- a SwiftUI iOS app under `ios/POCVault/`
 - signed manifest rendering and verification
 - a static POC layout under `pocs/<slug>/public/`
 - deploy, certificate, server-install, simulator, and verification scripts in
   `ops/`
+- the native app that later became Relay
 - a first `smoke-test` POC
 - a repo-level security contract in `SECURITY.md`
 
@@ -74,13 +77,13 @@ on the EC2 host. It added:
 - a workspace registry instead of arbitrary phone-supplied paths
 - systemd/nginx deployment assets under `codex-server/codex-api-deploy/`
 
-The service exists inside this repo because the iOS shell, the EC2 runner, and
-the static vault are one operational unit. The phone can control only registered
-workspace ids such as `scratch` and `poc-vault`.
+The service exists inside this repo because the Relay app, EC2 runner, and
+static POC host are one operational unit. The phone can control only registered
+workspace ids such as `scratch`, `poc-vault`, and `sigiq`.
 
-### 4. iOS Codex Console
+### 4. iOS Agent Console
 
-The iOS app then gained a Codex tab. The first version could:
+The iOS app then gained an agent console. The first version could:
 
 - list workspaces and jobs
 - submit prompts to the EC2 job API
@@ -228,9 +231,10 @@ committed.
 
 ### 13. Current iOS Console Direction
 
-The current iOS console is a provider-aware control surface. The app can show
-Codex and Claude affordances, select models and effort/reasoning levels, record
-voice prompts, browse threads, and open bounded detail views.
+The current Relay console is a provider-aware control surface. The app can show
+Codex and Claude affordances, select models and effort/reasoning levels, choose
+Claude permission modes, record voice prompts, browse threads, and open bounded
+detail views.
 
 Codex-specific skills remain client-side prompt decoration. Selecting skills
 adds a text prefix to the prompt; it does not create a new backend contract.
@@ -239,6 +243,22 @@ The phone UI should stay simple: prompt plus results, with compact controls and
 thread detail when needed. Avoid reintroducing endpoint cards, workspace cards,
 offline labels, or broad infrastructure controls unless the user explicitly
 asks for them.
+
+### 14. Workspace Browser, Artifacts, And Relay Branding
+
+The latest worktree adds three cleanup-level product refinements:
+
+- Relay now has source and generated app icon assets that follow the Relay
+  brand instead of a vault metaphor.
+- The agent console can browse safe directories under the EC2 workspace root and
+  select child workspaces such as `sigiq/ai-tutor` without allowing arbitrary
+  paths from the phone.
+- Successful agent answers can expose job-scoped code artifacts with protected
+  raw and sandboxed preview routes.
+
+These features keep the existing boundaries: dynamic workspace ids are derived
+server-side after realpath checks, artifacts are run output rather than POC
+catalog entries, and ordinary POC deployment still goes through `ops/deploy-poc`.
 
 ## Security Decisions
 
