@@ -67,7 +67,7 @@ fi
 
 install -d -m 0755 -o root -g root "$INSTALL_DIR" "$(dirname "$ENV_PATH")" "$(dirname "$NGINX_CONF_PATH")"
 install -d -m 0750 -o "$RUNNER_USER" -g "$RUNNER_USER" "$DATA_DIR" "$DATA_DIR/jobs" "$DATA_DIR/logs" "$DATA_DIR/run-home"
-install -d -m 0755 -o "$RUNNER_USER" -g "$RUNNER_USER" "$WORKSPACE_ROOT" "$WORKSPACE_ROOT/scratch" "$WORKSPACE_ROOT/poc-vault"
+install -d -m 0755 -o "$RUNNER_USER" -g "$RUNNER_USER" "$WORKSPACE_ROOT" "$WORKSPACE_ROOT/scratch" "$WORKSPACE_ROOT/poc-vault" "$WORKSPACE_ROOT/sigiq"
 install -d -m 0755 -o root -g root "$CODEX_MTLS_DIR"
 
 if [[ -f "$TLS_DIR/client-ca.crt" ]]; then

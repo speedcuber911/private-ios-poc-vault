@@ -61,7 +61,8 @@ def env_value(config: dict[str, str], name: str, default: str) -> str:
 def render_env(config: dict[str, str], output: Path) -> None:
     workspace_default = (
         '[{"id":"scratch","name":"Scratch","path":"/srv/codex-workspaces/scratch"},'
-        '{"id":"poc-vault","name":"POC Vault","path":"/srv/codex-workspaces/poc-vault"}]'
+        '{"id":"poc-vault","name":"POC Vault","path":"/srv/codex-workspaces/poc-vault"},'
+        '{"id":"sigiq","name":"SigiQ","path":"/srv/codex-workspaces/sigiq"}]'
     )
     aws_region = env_value(config, "AWS_REGION", env_value(config, "AWS_DEFAULT_REGION", ""))
     aws_default_region = env_value(config, "AWS_DEFAULT_REGION", aws_region)
@@ -69,18 +70,26 @@ def render_env(config: dict[str, str], output: Path) -> None:
         ("CODEX_API_HOST", "127.0.0.1"),
         ("CODEX_API_PORT", "8787"),
         ("CODEX_REQUIRE_MTLS", "true"),
-        ("CODEX_ALLOWED_CERT_SUBJECTS", "CN=iphone,CN=operator"),
+        ("CODEX_ALLOWED_CERT_SUBJECTS", "CN=iphone,CN=parikshit-mac"),
         ("CODEX_DATA_DIR", "/var/lib/codex-api"),
         ("CODEX_BIN", "/usr/bin/codex"),
         ("CLAUDE_BIN", "/usr/bin/claude"),
         ("CLAUDE_CODE_USE_BEDROCK", ""),
+        ("CLAUDE_AWS_PROFILE", "sigiq"),
+        ("CLAUDE_DEFAULT_MODEL", "sonnet"),
+        ("CLAUDE_SONNET_MODEL", "sonnet"),
+        ("CLAUDE_OPUS_MODEL", "global.anthropic.claude-opus-4-6-v1"),
+        ("CLAUDE_HAIKU_MODEL", "global.anthropic.claude-haiku-4-5-20251001-v1:0"),
         ("AWS_REGION", aws_region),
         ("AWS_DEFAULT_REGION", aws_default_region),
         ("CODEX_RUN_HOME", "/var/lib/codex-api/run-home"),
         ("CODEX_HOME", "/var/lib/codex-api/run-home/.codex"),
         ("CODEX_DANGEROUS_MODE", "true"),
         ("CODEX_MAX_CONCURRENT", "1"),
-        ("CODEX_MAX_BODY_BYTES", "1048576"),
+        ("CODEX_MAX_BODY_BYTES", "31457280"),
+        ("CODEX_MAX_JOB_ATTACHMENTS", "6"),
+        ("CODEX_MAX_JOB_ATTACHMENT_BYTES", "8388608"),
+        ("CODEX_MAX_JOB_ATTACHMENT_TOTAL_BYTES", "18874368"),
         ("CODEX_MAX_TRANSCRIPTION_AUDIO_BYTES", "26214400"),
         ("CODEX_MAX_OUTPUT_BYTES", "5242880"),
         ("CODEX_RESPONSE_OUTPUT_BYTES", "65536"),
@@ -108,7 +117,7 @@ def render_env(config: dict[str, str], output: Path) -> None:
 def subject_map(subjects: str) -> str:
     entries = [entry.strip() for entry in subjects.split(",") if entry.strip()]
     if not entries:
-        entries = ["CN=iphone", "CN=operator"]
+        entries = ["CN=iphone", "CN=parikshit-mac"]
     return "\n".join(f'    "{entry.replace(chr(34), "_")}" 1;' for entry in entries)
 
 
@@ -117,7 +126,7 @@ def render_nginx(config: dict[str, str], template: Path, output: Path) -> None:
     mtls_dir = env_value(config, "CODEX_MTLS_DIR", "/etc/codex-api/mtls")
     host = env_value(config, "CODEX_API_HOST", "127.0.0.1")
     port = env_value(config, "CODEX_API_PORT", "8787")
-    allowed_subjects = env_value(config, "CODEX_ALLOWED_CERT_SUBJECTS", "CN=iphone,CN=operator")
+    allowed_subjects = env_value(config, "CODEX_ALLOWED_CERT_SUBJECTS", "CN=iphone,CN=parikshit-mac")
     rendered = template.read_text(encoding="utf-8")
     replacements = {
         "__CODEX_DOMAIN__": codex_domain(config),

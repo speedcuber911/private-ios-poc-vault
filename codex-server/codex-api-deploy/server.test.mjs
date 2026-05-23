@@ -183,6 +183,31 @@ async function makeFakeCodex(tmpDir) {
   return fakeCodex;
 }
 
+async function makeAnswerCodex(tmpDir, answer) {
+  const fakeCodex = path.join(tmpDir, "fake-codex-answer");
+  await fs.writeFile(
+    fakeCodex,
+    [
+      "#!/bin/sh",
+      "out=''",
+      "prev=''",
+      "for arg in \"$@\"; do",
+      "  if [ \"$prev\" = '-o' ]; then out=\"$arg\"; fi",
+      "  prev=\"$arg\"",
+      "done",
+      "cat >/dev/null",
+      "if [ -n \"$out\" ]; then cat > \"$out\" <<'ANSWER_EOF'",
+      answer,
+      "ANSWER_EOF",
+      "fi",
+      "exit 0",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  return fakeCodex;
+}
+
 async function makeSkill(root, dirname, { name = dirname, description = "Use when testing dynamic skills.", body = "Follow this test skill." } = {}) {
   const skillDir = path.join(root, dirname);
   await fs.mkdir(skillDir, { recursive: true });
@@ -260,8 +285,25 @@ async function makeArgEchoClaude(tmpDir) {
       "printf 'claude args:'",
       "for arg in \"$@\"; do printf ' [%s]' \"$arg\"; done",
       "printf '\\n'",
+      "printf 'claude aws profile:%s\\n' \"$AWS_PROFILE\"",
+      "printf 'claude aws access:%s\\n' \"${AWS_ACCESS_KEY_ID:-}\"",
       "printf 'claude cwd:%s\\n' \"$(pwd -P)\"",
       "printf 'claude prompt:%s\\n' \"$prompt\"",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  return fakeClaude;
+}
+
+async function makeFailingStdoutClaude(tmpDir) {
+  const fakeClaude = path.join(tmpDir, "fake-claude-failing-stdout");
+  await fs.writeFile(
+    fakeClaude,
+    [
+      "#!/bin/sh",
+      "printf 'selected model failed on bedrock\\n'",
+      "exit 1",
       "",
     ].join("\n"),
     { mode: 0o755 },
@@ -952,6 +994,314 @@ test("creates an async job in a registered workspace and persists output", async
   }
 });
 
+test("browses and selects only directories inside the workspace root", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const browseRoot = path.join(tmpDir, "workspaces");
+  const sigiqDir = path.join(browseRoot, "sigiq");
+  const aiTutorDir = path.join(sigiqDir, "ai-tutor");
+  const hiddenDir = path.join(sigiqDir, ".hidden");
+  const outsideDir = path.join(tmpDir, "outside");
+  await fs.mkdir(path.join(aiTutorDir, ".git"), { recursive: true });
+  await fs.mkdir(path.join(aiTutorDir, "backend", "api"), { recursive: true });
+  await fs.mkdir(hiddenDir, { recursive: true });
+  await fs.mkdir(outsideDir, { recursive: true });
+  await fs.symlink(outsideDir, path.join(sigiqDir, "outside-link"));
+
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_WORKSPACE_BROWSE_ROOT: browseRoot,
+    CODEX_WORKSPACES: JSON.stringify([{ id: "sigiq", name: "SigiQ", path: sigiqDir }]),
+    CODEX_BIN: await makeFakeCodex(tmpDir),
+  });
+  try {
+    const rootResponse = await fetch(`${server.baseUrl}/v1/codex/workspace-dirs`);
+    assert.equal(rootResponse.status, 200);
+    const rootBody = await rootResponse.json();
+    assert.equal(rootBody.relativePath, "");
+    assert.deepEqual(rootBody.entries.map((entry) => entry.name), ["sigiq"]);
+    assert.equal(rootBody.entries[0].workspaceId, "sigiq");
+    assert.equal(rootBody.entries[0].isRegistered, true);
+
+    const sigiqResponse = await fetch(`${server.baseUrl}/v1/codex/workspace-dirs?path=sigiq`);
+    assert.equal(sigiqResponse.status, 200);
+    const sigiqBody = await sigiqResponse.json();
+    assert.equal(sigiqBody.relativePath, "sigiq");
+    assert.equal(sigiqBody.parentPath, await fs.realpath(browseRoot));
+    assert.deepEqual(sigiqBody.entries.map((entry) => entry.name), ["ai-tutor"]);
+    assert.equal(sigiqBody.entries[0].hasGit, true);
+    assert.equal(sigiqBody.entries[0].workspaceId, "dir-sigiq-ai-tutor");
+
+    const searchResponse = await fetch(`${server.baseUrl}/v1/codex/workspace-dirs?path=sigiq&q=tutor`);
+    assert.equal(searchResponse.status, 200);
+    const searchBody = await searchResponse.json();
+    assert.deepEqual(searchBody.entries.map((entry) => entry.relativePath), ["sigiq/ai-tutor"]);
+
+    const rootSearchResponse = await fetch(`${server.baseUrl}/v1/codex/workspace-dirs?q=ai-tutor`);
+    assert.equal(rootSearchResponse.status, 200);
+    const rootSearchBody = await rootSearchResponse.json();
+    assert.deepEqual(rootSearchBody.entries.map((entry) => entry.relativePath), ["sigiq/ai-tutor"]);
+
+    const createWorkspaceResponse = await fetch(`${server.baseUrl}/v1/codex/workspaces/create`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ parentPath: "sigiq", name: "new-workspace" }),
+    });
+    assert.equal(createWorkspaceResponse.status, 201);
+    const createdWorkspace = await createWorkspaceResponse.json();
+    assert.equal(createdWorkspace.id, "dir-sigiq-new-workspace");
+    assert.equal(createdWorkspace.name, "SigiQ / new-workspace");
+    assert.equal(createdWorkspace.path, await fs.realpath(path.join(sigiqDir, "new-workspace")));
+
+    const createdListResponse = await fetch(`${server.baseUrl}/v1/codex/workspace-dirs?path=sigiq`);
+    assert.equal(createdListResponse.status, 200);
+    const createdListBody = await createdListResponse.json();
+    assert(createdListBody.entries.some((entry) => entry.workspaceId === "dir-sigiq-new-workspace"));
+
+    const badCreateResponse = await fetch(`${server.baseUrl}/v1/codex/workspaces/create`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ parentPath: "sigiq", name: "../escape" }),
+    });
+    assert.equal(badCreateResponse.status, 400);
+
+    const selectResponse = await fetch(`${server.baseUrl}/v1/codex/workspaces/select`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: "sigiq/ai-tutor" }),
+    });
+    assert.equal(selectResponse.status, 200);
+    const realAiTutorDir = await fs.realpath(aiTutorDir);
+    assert.deepEqual(await selectResponse.json(), {
+      id: "dir-sigiq-ai-tutor",
+      name: "SigiQ / ai-tutor",
+      path: realAiTutorDir,
+    });
+
+    const escapeResponse = await fetch(`${server.baseUrl}/v1/codex/workspaces/select`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: path.join(sigiqDir, "outside-link") }),
+    });
+    assert.equal(escapeResponse.status, 400);
+    assert.match((await escapeResponse.json()).error, /workspace root/i);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("runs jobs and aggregates threads from a selected directory workspace", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const browseRoot = path.join(tmpDir, "workspaces");
+  const sigiqDir = path.join(browseRoot, "sigiq");
+  const aiTutorDir = path.join(sigiqDir, "ai-tutor");
+  const codexHome = path.join(tmpDir, "codex-home");
+  const sessionId = "019e54ab-0000-7000-8000-000000000001";
+  await fs.mkdir(aiTutorDir, { recursive: true });
+
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_HOME: codexHome,
+    CODEX_WORKSPACE_BROWSE_ROOT: browseRoot,
+    CODEX_WORKSPACES: JSON.stringify([{ id: "sigiq", name: "SigiQ", path: sigiqDir }]),
+    CODEX_BIN: await makeSessionWritingCodex(tmpDir, sessionId),
+  });
+  try {
+    const selected = await fetch(`${server.baseUrl}/v1/codex/workspaces/select`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: "sigiq/ai-tutor" }),
+    });
+    assert.equal(selected.status, 200);
+    const workspace = await selected.json();
+    assert.equal(workspace.id, "dir-sigiq-ai-tutor");
+
+    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspaceId: workspace.id, prompt: "run from child workspace", timeoutMs: 5000 }),
+    });
+    assert.equal(create.status, 202);
+    const created = await create.json();
+    assert.equal(created.workspaceId, "dir-sigiq-ai-tutor");
+
+    const job = await waitForJob(server.baseUrl, created.id);
+    assert.equal(job.status, "succeeded");
+    assert.equal(job.workspaceId, "dir-sigiq-ai-tutor");
+    assert.equal(job.workspaceName, "SigiQ / ai-tutor");
+    assert.match(job.stdout, /session stdout: run from child workspace/);
+
+    const parentCreate = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspaceId: "sigiq", prompt: "run from parent workspace", timeoutMs: 5000 }),
+    });
+    assert.equal(parentCreate.status, 202);
+    const parentJob = await waitForJob(server.baseUrl, (await parentCreate.json()).id);
+    assert.equal(parentJob.status, "succeeded");
+    assert.equal(parentJob.workspaceId, "sigiq");
+
+    const scopedJobs = await fetch(`${server.baseUrl}/v1/codex/jobs?workspaceId=dir-sigiq-ai-tutor`);
+    assert.equal(scopedJobs.status, 200);
+    const scopedJobsBody = await scopedJobs.json();
+    assert.deepEqual(scopedJobsBody.jobs.map((item) => item.workspaceId), ["dir-sigiq-ai-tutor"]);
+
+    const threads = await fetch(`${server.baseUrl}/v1/codex/threads?workspaceId=dir-sigiq-ai-tutor`);
+    assert.equal(threads.status, 200);
+    const threadBody = await threads.json();
+    assert.deepEqual(threadBody.threads.map((thread) => thread.workspaceId), ["dir-sigiq-ai-tutor"]);
+    assert.deepEqual(threadBody.threads.map((thread) => thread.workspaceName), ["SigiQ / ai-tutor"]);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("extracts response code artifacts and serves raw downloads and sandboxed previews", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  const dataDir = path.join(tmpDir, "data");
+  const answer = [
+    "Here is a tiny static app.",
+    "",
+    "```html index.html",
+    "<main class=\"card\"><h1>Hello artifact</h1><button id=\"go\">Go</button></main>",
+    "```",
+    "",
+    "```css styles.css",
+    ".card { color: rebeccapurple; }",
+    "```",
+    "",
+    "```js filename=app.js",
+    "document.getElementById('go').textContent = 'Ready';",
+    "```",
+    "",
+  ].join("\n");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: dataDir,
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_BIN: await makeAnswerCodex(tmpDir, answer),
+  });
+  try {
+    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspaceId: "scratch", prompt: "build a static app", timeoutMs: 5000 }),
+    });
+    assert.equal(create.status, 202);
+    const created = await create.json();
+    assert.deepEqual(created.artifacts, []);
+
+    const job = await waitForJob(server.baseUrl, created.id);
+    assert.equal(job.status, "succeeded");
+    assert.equal(job.artifacts.length, 4);
+    assert.deepEqual(
+      job.artifacts.map((artifact) => [artifact.kind, artifact.filename, artifact.language]),
+      [
+        ["staticPreview", "index.html", "html"],
+        ["code", "styles.css", "css"],
+        ["code", "app.js", "js"],
+        ["staticPreview", "preview.html", "html"],
+      ],
+    );
+    assert.equal(job.artifacts[0].rawURL, `/v1/codex/jobs/${created.id}/artifacts/artifact-001/raw`);
+    assert.equal(job.artifacts[0].previewURL, `/v1/codex/jobs/${created.id}/artifacts/artifact-001/preview`);
+    assert.equal(job.artifacts[3].previewURL, `/v1/codex/jobs/${created.id}/artifacts/artifact-004/preview`);
+
+    const raw = await fetch(`${server.baseUrl}${job.artifacts[0].rawURL}`);
+    assert.equal(raw.status, 200);
+    assert.equal(raw.headers.get("content-disposition"), 'attachment; filename="index.html"');
+    assert.equal(raw.headers.get("x-content-type-options"), "nosniff");
+    assert.match(await raw.text(), /Hello artifact/);
+
+    const preview = await fetch(`${server.baseUrl}${job.artifacts[3].previewURL}`);
+    assert.equal(preview.status, 200);
+    assert.match(preview.headers.get("content-type"), /^text\/html/);
+    const wrapper = await preview.text();
+    assert.match(wrapper, /sandbox="allow-scripts"/);
+    assert.match(wrapper, /srcdoc=/);
+    assert.match(wrapper, /Hello artifact/);
+    assert.match(wrapper, /rebeccapurple/);
+    assert.match(wrapper, /getElementById/);
+
+    const persisted = JSON.parse(await fs.readFile(path.join(dataDir, "jobs", `${created.id}.json`), "utf8"));
+    assert.equal(persisted.artifacts.length, 4);
+    assert.equal(persisted.artifacts[0].path.includes(path.join(dataDir, "artifacts", created.id)), true);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("keeps artifact extraction bounded and falls back from unsafe filenames", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  const largeBlock = "x".repeat(1024 * 1024 + 1);
+  const answer = [
+    "```js ../../secret.env",
+    "console.log('safe fallback');",
+    "```",
+    "",
+    "```txt huge.txt",
+    largeBlock,
+    "```",
+    "",
+  ].join("\n");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_BIN: await makeAnswerCodex(tmpDir, answer),
+  });
+  try {
+    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspaceId: "scratch", prompt: "return artifacts", timeoutMs: 5000 }),
+    });
+    assert.equal(create.status, 202);
+    const created = await create.json();
+    const job = await waitForJob(server.baseUrl, created.id);
+
+    assert.equal(job.status, "succeeded");
+    assert.equal(job.artifacts.length, 1);
+    assert.equal(job.artifacts[0].filename, "artifact-001.js");
+    assert.equal(job.artifacts[0].bytes, "console.log('safe fallback');".length);
+    assert.doesNotMatch(job.artifacts[0].rawURL, /\.\./);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("returns an empty artifact list when the response has no fenced code", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_BIN: await makeAnswerCodex(tmpDir, "Plain answer without code fences."),
+  });
+  try {
+    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspaceId: "scratch", prompt: "answer plainly", timeoutMs: 5000 }),
+    });
+    assert.equal(create.status, 202);
+    const created = await create.json();
+    const job = await waitForJob(server.baseUrl, created.id);
+
+    assert.equal(job.status, "succeeded");
+    assert.deepEqual(job.artifacts, []);
+  } finally {
+    await server.stop();
+  }
+});
+
 test("injects selected provider skills into the runner prompt and rejects unknown skills", async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
   const workspaceDir = path.join(tmpDir, "scratch");
@@ -1320,6 +1670,7 @@ test("persists providers and filters jobs, sessions, and threads by provider", a
     assert.equal(finishedClaudeJob.status, "succeeded");
     assert.equal(finishedClaudeJob.provider, "claude");
     assert.match(finishedClaudeJob.stdout, /--model\] \[sonnet\]/);
+    assert.match(finishedClaudeJob.stdout, /claude aws profile:sigiq/);
 
     const claudeJobs = await fetch(`${server.baseUrl}/v1/codex/jobs?provider=claude&limit=20`);
     assert.equal(claudeJobs.status, 200);
@@ -1387,10 +1738,50 @@ test("runs Claude jobs with configured binary, stdin prompt, and stdout result",
     assert.equal(job.provider, "claude");
     assert.equal(job.sessionId, created.sessionId);
     assert.equal(job.permissionMode, "plan");
-    assert.match(job.stdout, new RegExp(`claude args: .*\\[--print\\].*\\[--dangerously-skip-permissions\\].*\\[--model\\] \\[sonnet\\].*\\[--effort\\] \\[high\\].*\\[--permission-mode\\] \\[plan\\].*\\[--session-id\\] \\[${created.sessionId}\\]`));
+    assert.equal(job.model, "sonnet");
+    assert.equal(job.reasoningEffort, null);
+    assert.match(job.stdout, new RegExp(`claude args: .*\\[--print\\].*\\[--dangerously-skip-permissions\\].*\\[--model\\] \\[sonnet\\].*\\[--permission-mode\\] \\[plan\\].*\\[--session-id\\] \\[${created.sessionId}\\]`));
+    assert.doesNotMatch(job.stdout, /--effort/);
+    assert.match(job.stdout, /claude aws profile:sigiq/);
+    assert.match(job.stdout, /claude aws access:\n/);
     assert.match(job.stdout, new RegExp(`claude cwd:${realWorkspaceDir}`));
     assert.match(job.stdout, /claude prompt:explain the run/);
     assert.equal(job.result, job.stdout.trim());
+  } finally {
+    await server.stop();
+  }
+});
+
+test("surfaces Claude stdout as the failure message when stderr is empty", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_BIN: await makeFakeCodex(tmpDir),
+    CLAUDE_BIN: await makeFailingStdoutClaude(tmpDir),
+  });
+  try {
+    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: "scratch",
+        provider: "claude",
+        prompt: "fail with useful output",
+        model: "sonnet",
+        timeoutMs: 5000,
+      }),
+    });
+    assert.equal(create.status, 202);
+    const created = await create.json();
+    const job = await waitForJob(server.baseUrl, created.id);
+    assert.equal(job.status, "failed");
+    assert.equal(job.error, "selected model failed on bedrock");
+    assert.equal(job.result, "");
+    assert.match(job.stdout, /selected model failed on bedrock/);
   } finally {
     await server.stop();
   }

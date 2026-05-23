@@ -19,7 +19,7 @@ DEVELOPMENT_TEAM=""
 VAULT_DOMAIN=""
 POC_WILDCARD_DOMAIN=""
 CODEX_DOMAIN=""
-CODEX_ALLOWED_CERT_SUBJECTS="CN=iphone,CN=operator"
+CODEX_ALLOWED_CERT_SUBJECTS="CN=iphone,CN=parikshit-mac"
 FORCE=false
 GENERATE_KEYS=true
 
@@ -157,7 +157,7 @@ CODEX_API_ENV_PATH=/etc/codex-api.env
 CODEX_API_NGINX_CONF_PATH=/etc/nginx/conf.d/codex-api.conf
 CODEX_MTLS_DIR=/etc/codex-api/mtls
 CODEX_ALLOWED_CERT_SUBJECTS=${CODEX_ALLOWED_CERT_SUBJECTS}
-CODEX_WORKSPACES='[{"id":"scratch","name":"Scratch","path":"/srv/codex-workspaces/scratch"},{"id":"poc-vault","name":"POC Vault","path":"/srv/codex-workspaces/poc-vault"}]'
+CODEX_WORKSPACES='[{"id":"scratch","name":"Scratch","path":"/srv/codex-workspaces/scratch"},{"id":"poc-vault","name":"POC Vault","path":"/srv/codex-workspaces/poc-vault"},{"id":"sigiq","name":"SigiQ","path":"/srv/codex-workspaces/sigiq"}]'
 
 CLIENT_CERT_DAYS=90
 CLIENT_CA_DAYS=3650

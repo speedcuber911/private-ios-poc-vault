@@ -14,6 +14,7 @@ const dataDir = process.env.CODEX_DATA_DIR || "/var/lib/codex-api";
 const jobsDir = path.join(dataDir, "jobs");
 const logsDir = path.join(dataDir, "logs");
 const attachmentsDir = path.join(dataDir, "attachments");
+const artifactsDir = path.join(dataDir, "artifacts");
 const auditPath = path.join(dataDir, "audit.jsonl");
 const codexBin = process.env.CODEX_BIN || "/usr/bin/codex";
 const claudeBin = process.env.CLAUDE_BIN || "/usr/bin/claude";
@@ -24,7 +25,7 @@ const npmCacheDir = process.env.NPM_CONFIG_CACHE || process.env.npm_config_cache
 const bunCacheDir = process.env.BUN_INSTALL_CACHE_DIR || path.join(runHome, ".bun-cache");
 const dangerousMode = parseBooleanEnv("CODEX_DANGEROUS_MODE", true);
 const maxConcurrent = parseIntegerEnv("CODEX_MAX_CONCURRENT", 1, 1, 16);
-const maxBodyBytes = parseIntegerEnv("CODEX_MAX_BODY_BYTES", 20 * 1024 * 1024, 1, 50 * 1024 * 1024);
+const maxBodyBytes = parseIntegerEnv("CODEX_MAX_BODY_BYTES", 30 * 1024 * 1024, 1, 50 * 1024 * 1024);
 const maxJobAttachments = parseIntegerEnv("CODEX_MAX_JOB_ATTACHMENTS", 6, 0, 20);
 const maxJobAttachmentBytes = parseIntegerEnv("CODEX_MAX_JOB_ATTACHMENT_BYTES", 8 * 1024 * 1024, 1, 25 * 1024 * 1024);
 const maxJobAttachmentTotalBytes = parseIntegerEnv(
@@ -40,6 +41,9 @@ const maxTranscriptionAudioBytes = parseIntegerEnv(
   250 * 1024 * 1024,
 );
 const maxOutputBytes = parseIntegerEnv("CODEX_MAX_OUTPUT_BYTES", 5 * 1024 * 1024, 1, 50 * 1024 * 1024);
+const maxJobArtifacts = parseIntegerEnv("CODEX_MAX_JOB_ARTIFACTS", 12, 0, 50);
+const maxArtifactBytes = parseIntegerEnv("CODEX_MAX_ARTIFACT_BYTES", 1024 * 1024, 1024, 25 * 1024 * 1024);
+const maxArtifactTotalBytes = parseIntegerEnv("CODEX_MAX_ARTIFACT_TOTAL_BYTES", 5 * 1024 * 1024, 1024, 50 * 1024 * 1024);
 const maxJobSkills = parseIntegerEnv("CODEX_MAX_JOB_SKILLS", 6, 0, 20);
 const maxSkillPromptBytes = parseIntegerEnv("CODEX_MAX_SKILL_PROMPT_BYTES", 20 * 1024, 1024, 256 * 1024);
 const maxSkillDiscoveryFiles = parseIntegerEnv("CODEX_MAX_SKILL_DISCOVERY_FILES", 600, 1, 5000);
@@ -57,12 +61,23 @@ const defaultTimeoutMs = Math.min(
   maxTimeoutMs,
 );
 const threadSummaryCharacters = parseIntegerEnv("CODEX_THREAD_SUMMARY_CHARACTERS", 240, 40, 2000);
+const workspaceBrowseRoot = realpathOrResolve(
+  process.env.CODEX_WORKSPACE_BROWSE_ROOT || process.env.CODEX_WORKSPACE_ROOT || "/srv/codex-workspaces",
+);
+const maxWorkspaceDirEntries = parseIntegerEnv("CODEX_MAX_WORKSPACE_DIR_ENTRIES", 100, 1, 1000);
 
 const terminalStatuses = new Set(["succeeded", "failed", "cancelled", "timeout"]);
 const allowedReasoningEfforts = new Set(["low", "medium", "high", "xhigh"]);
 const allowedJobProviders = new Set(["codex", "claude"]);
 const allowedClaudePermissionModes = new Set(["acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"]);
-const claudeDefaultModel = cleanOptionalModel(process.env.CLAUDE_DEFAULT_MODEL || "sonnet");
+const claudeAwsProfile = cleanOptionalAwsProfile(process.env.CLAUDE_AWS_PROFILE || process.env.AWS_PROFILE || "sigiq");
+const claudeAwsRegion = cleanOptionalAwsProfile(process.env.CLAUDE_AWS_REGION);
+const claudeModelAliases = {
+  sonnet: process.env.CLAUDE_SONNET_MODEL || "sonnet",
+  opus: process.env.CLAUDE_OPUS_MODEL || "global.anthropic.claude-opus-4-6-v1",
+  haiku: process.env.CLAUDE_HAIKU_MODEL || "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+};
+const claudeDefaultModel = normalizeClaudeModel(cleanOptionalModel(process.env.CLAUDE_DEFAULT_MODEL || "sonnet"));
 const azureSpeechEndpoint = cleanOptionalEndpoint(process.env.AZURE_SPEECH_ENDPOINT);
 const azureSpeechApiKey = cleanOptionalSecret(process.env.AZURE_SPEECH_API_KEY || process.env.AZURE_SPEECH_KEY);
 const azureSpeechApiVersion = cleanApiVersion(process.env.AZURE_SPEECH_API_VERSION || "2025-10-15");
@@ -72,6 +87,7 @@ const proxyBaseUrl = cleanOptionalEndpoint(process.env.CODEX_PROXY_BASE_URL || p
 const proxyClientCertPath = cleanOptionalFilePath(process.env.CODEX_PROXY_CLIENT_CERT || process.env.CODEX_REMOTE_CLIENT_CERT);
 const proxyClientKeyPath = cleanOptionalFilePath(process.env.CODEX_PROXY_CLIENT_KEY || process.env.CODEX_REMOTE_CLIENT_KEY);
 const jobs = new Map();
+const dynamicWorkspaces = new Map();
 const activeChildren = new Map();
 let queuedJobIds = [];
 
@@ -79,6 +95,7 @@ fs.mkdirSync(dataDir, { recursive: true });
 fs.mkdirSync(jobsDir, { recursive: true });
 fs.mkdirSync(logsDir, { recursive: true });
 fs.mkdirSync(attachmentsDir, { recursive: true });
+fs.mkdirSync(artifactsDir, { recursive: true });
 
 const workspaces = loadWorkspaces();
 loadPersistedJobs();
@@ -122,6 +139,7 @@ function loadWorkspaces() {
     : [
         { id: "scratch", name: "Scratch", path: "/srv/codex-workspaces/scratch" },
         { id: "poc-vault", name: "POC Vault", path: "/srv/codex-workspaces/poc-vault" },
+        { id: "sigiq", name: "SigiQ", path: "/srv/codex-workspaces/sigiq" },
       ];
 
   if (!Array.isArray(configured) || configured.length === 0) {
@@ -151,6 +169,116 @@ function loadWorkspaces() {
   }
 
   return registry;
+}
+
+function workspaceList() {
+  const byId = new Map(workspaces);
+  for (const workspace of dynamicWorkspaces.values()) {
+    byId.set(workspace.id, workspace);
+  }
+  return [...byId.values()].sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function resolveWorkspaceById(id) {
+  return workspaces.get(id) || dynamicWorkspaces.get(id) || findDynamicWorkspaceById(id);
+}
+
+function publicWorkspace(workspace) {
+  return {
+    id: workspace.id,
+    name: workspace.name,
+    path: workspace.path,
+  };
+}
+
+function browseWorkspaceForPath(workspacePath, { materialize = false } = {}) {
+  const resolvedPath = realpathOrResolve(workspacePath);
+  const exactRegistered = [...workspaces.values()].find((workspace) => workspace.path === resolvedPath);
+  if (exactRegistered) return exactRegistered;
+  const exactDynamic = [...dynamicWorkspaces.values()].find((workspace) => workspace.path === resolvedPath);
+  if (exactDynamic) return exactDynamic;
+
+  if (!pathBelongsToRoot(resolvedPath, workspaceBrowseRoot) || resolvedPath === workspaceBrowseRoot) {
+    return null;
+  }
+
+  const relativePath = path.relative(workspaceBrowseRoot, resolvedPath);
+  if (!relativePath || relativePath.startsWith("..") || path.isAbsolute(relativePath)) return null;
+
+  const workspace = {
+    id: dynamicWorkspaceId(relativePath),
+    name: dynamicWorkspaceName(relativePath),
+    path: resolvedPath,
+    dynamic: true,
+  };
+
+  const existingById = workspaces.get(workspace.id) || dynamicWorkspaces.get(workspace.id);
+  if (existingById) {
+    if (existingById.path === workspace.path) return existingById;
+    workspace.id = `${workspace.id}-${shortHash(relativePath)}`;
+  }
+
+  if (materialize) {
+    dynamicWorkspaces.set(workspace.id, workspace);
+  }
+  return workspace;
+}
+
+function findDynamicWorkspaceById(id) {
+  if (typeof id !== "string" || !id.startsWith("dir-")) return null;
+  const stack = [workspaceBrowseRoot];
+  let visited = 0;
+  while (stack.length > 0 && visited < 5000) {
+    const current = stack.pop();
+    visited += 1;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith(".")) continue;
+      const entryPath = safeRealDirectory(path.join(current, entry.name));
+      if (!entryPath || !pathBelongsToRoot(entryPath, workspaceBrowseRoot)) continue;
+      const workspace = browseWorkspaceForPath(entryPath);
+      if (workspace?.id === id) {
+        dynamicWorkspaces.set(workspace.id, workspace);
+        return workspace;
+      }
+      stack.push(entryPath);
+    }
+  }
+  return null;
+}
+
+function dynamicWorkspaceId(relativePath) {
+  const slug = relativePath
+    .split(path.sep)
+    .filter(Boolean)
+    .map((segment) =>
+      segment
+        .toLowerCase()
+        .replace(/[^a-z0-9._-]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .replace(/--+/g, "-"),
+    )
+    .filter(Boolean)
+    .join("-");
+  return `dir-${slug || "workspace"}`.slice(0, 80);
+}
+
+function dynamicWorkspaceName(relativePath) {
+  const segments = relativePath.split(path.sep).filter(Boolean);
+  const first = segments[0];
+  const firstPath = first ? path.join(workspaceBrowseRoot, first) : null;
+  const firstWorkspace = firstPath ? [...workspaces.values()].find((workspace) => workspace.path === realpathOrResolve(firstPath)) : null;
+  const displaySegments = segments.map((segment, index) => (index === 0 && firstWorkspace ? firstWorkspace.name : segment));
+  return displaySegments.join(" / ");
+}
+
+function shortHash(value) {
+  return crypto.createHash("sha256").update(value).digest("hex").slice(0, 8);
 }
 
 function cleanWorkspaceId(value) {
@@ -218,6 +346,172 @@ function cleanWorkspacePath(value, id) {
   return path.resolve(value);
 }
 
+function workspaceDirectoryResponse({ requestedPath = "", query = "" } = {}) {
+  const currentPath = resolveBrowseDirectory(requestedPath || "");
+  const relativePath = relativeBrowsePath(currentPath);
+  const search = typeof query === "string" ? query.trim().toLowerCase() : "";
+  const entries = workspaceDirectoryEntries(currentPath, search);
+  const parent = currentPath === workspaceBrowseRoot ? null : path.dirname(currentPath);
+  const selectedWorkspace = currentPath === workspaceBrowseRoot ? null : browseWorkspaceForPath(currentPath);
+
+  return {
+    rootPath: workspaceBrowseRoot,
+    currentPath,
+    relativePath,
+    parentPath: parent && pathBelongsToRoot(parent, workspaceBrowseRoot) ? parent : null,
+    selectedWorkspace: selectedWorkspace ? publicWorkspace(selectedWorkspace) : null,
+    entries,
+  };
+}
+
+function workspaceDirectoryEntries(currentPath, search) {
+  const results = [];
+  const stack = [{ dir: currentPath, depth: 0 }];
+  const pathSearch = search.includes("/") || search.includes("\\");
+  const normalizedPathSearch = search.replaceAll("\\", "/");
+
+  while (stack.length > 0 && results.length < maxWorkspaceDirEntries) {
+    const { dir, depth } = stack.pop();
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    entries.sort((left, right) => right.name.localeCompare(left.name));
+    for (const dirent of entries) {
+      if (dirent.name.startsWith(".")) continue;
+      const entryPath = safeRealDirectory(path.join(dir, dirent.name));
+      if (!entryPath || !pathBelongsToRoot(entryPath, workspaceBrowseRoot)) continue;
+      const relativePath = relativeBrowsePath(entryPath);
+      const matches =
+        !search ||
+        dirent.name.toLowerCase().includes(search) ||
+        (pathSearch && relativePath.toLowerCase().includes(normalizedPathSearch));
+      if (matches) {
+        const workspace = browseWorkspaceForPath(entryPath);
+        results.push({
+          name: dirent.name,
+          path: entryPath,
+          relativePath,
+          workspaceId: workspace?.id || null,
+          workspaceName: workspace?.name || null,
+          hasGit: fs.existsSync(path.join(entryPath, ".git")),
+          isRegistered: Boolean(workspace && workspaces.get(workspace.id)),
+        });
+        if (results.length >= maxWorkspaceDirEntries) break;
+      }
+      if (search && depth < 8) stack.push({ dir: entryPath, depth: depth + 1 });
+    }
+  }
+
+  return results.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+}
+
+function selectWorkspaceDirectory(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw Object.assign(new Error("request body must be a JSON object"), { status: 400 });
+  }
+  const selectedPath = resolveBrowseDirectory(body.path || "");
+  if (selectedPath === workspaceBrowseRoot) {
+    throw Object.assign(new Error("workspace root cannot be selected"), { status: 400 });
+  }
+  const workspace = browseWorkspaceForPath(selectedPath, { materialize: true });
+  if (!workspace) {
+    throw Object.assign(new Error("selected path is not inside the workspace root"), { status: 400 });
+  }
+  return workspace;
+}
+
+function createWorkspaceDirectory(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw Object.assign(new Error("request body must be a JSON object"), { status: 400 });
+  }
+
+  const parentPath = resolveBrowseDirectory(body.parentPath || body.path || "");
+  const name = cleanWorkspaceDirectoryName(body.name);
+  const targetPath = path.resolve(parentPath, name);
+  if (!pathBelongsToRoot(targetPath, workspaceBrowseRoot) || targetPath === workspaceBrowseRoot) {
+    throw Object.assign(new Error("workspace path must stay inside the workspace root"), { status: 400 });
+  }
+
+  try {
+    fs.mkdirSync(targetPath, { recursive: false, mode: 0o755 });
+  } catch (error) {
+    if (error.code === "EEXIST") {
+      throw Object.assign(new Error("workspace folder already exists"), { status: 409 });
+    }
+    throw error;
+  }
+
+  const workspacePath = safeRealDirectory(targetPath);
+  if (!workspacePath) {
+    throw Object.assign(new Error("workspace folder could not be created"), { status: 500 });
+  }
+  return browseWorkspaceForPath(workspacePath, { materialize: true });
+}
+
+function cleanWorkspaceDirectoryName(value) {
+  if (typeof value !== "string") {
+    throw Object.assign(new Error("workspace folder name is invalid"), { status: 400 });
+  }
+  const name = value.trim();
+  if (
+    name.length === 0 ||
+    name.length > 80 ||
+    name === "." ||
+    name === ".." ||
+    name.startsWith(".") ||
+    /[\/\\\0\r\n]/.test(name) ||
+    !/^[A-Za-z0-9][A-Za-z0-9._ -]*$/.test(name)
+  ) {
+    throw Object.assign(new Error("workspace folder name is invalid"), { status: 400 });
+  }
+  return name;
+}
+
+function resolveBrowseDirectory(value) {
+  if (typeof value !== "string" || /[\0\r\n]/.test(value)) {
+    throw Object.assign(new Error("workspace path is invalid"), { status: 400 });
+  }
+  const trimmed = value.trim();
+  const candidate = trimmed
+    ? path.resolve(path.isAbsolute(trimmed) ? trimmed : path.join(workspaceBrowseRoot, trimmed))
+    : workspaceBrowseRoot;
+  const resolved = safeRealDirectory(candidate);
+  if (!resolved) {
+    throw Object.assign(new Error("workspace directory was not found"), { status: 404 });
+  }
+  if (!pathBelongsToRoot(resolved, workspaceBrowseRoot)) {
+    throw Object.assign(new Error("workspace path must stay inside the workspace root"), { status: 400 });
+  }
+  return resolved;
+}
+
+function safeRealDirectory(candidate) {
+  let resolved;
+  try {
+    resolved = fs.realpathSync(candidate);
+    const stat = fs.statSync(resolved);
+    if (!stat.isDirectory()) return null;
+  } catch {
+    return null;
+  }
+  return resolved;
+}
+
+function relativeBrowsePath(value) {
+  const relativePath = path.relative(workspaceBrowseRoot, value);
+  return relativePath ? relativePath.split(path.sep).join("/") : "";
+}
+
+function pathBelongsToRoot(candidate, root) {
+  const resolvedCandidate = realpathOrResolve(candidate);
+  const resolvedRoot = realpathOrResolve(root);
+  return resolvedCandidate === resolvedRoot || resolvedCandidate.startsWith(`${resolvedRoot}${path.sep}`);
+}
+
 function loadPersistedJobs() {
   const files = fs.readdirSync(jobsDir).filter((file) => file.endsWith(".json")).sort();
   for (const file of files) {
@@ -226,6 +520,7 @@ function loadPersistedJobs() {
       if (!job || typeof job.id !== "string") continue;
 
       job.provider = normalizeJobProvider(job.provider);
+      job.artifacts = sanitizePersistedArtifacts(job);
       ensureLogPaths(job);
       if (job.status === "running") {
         const finishedAt = nowIso();
@@ -267,6 +562,7 @@ function jobPath(id) {
 
 function persistJob(job) {
   ensureLogPaths(job);
+  job.artifacts = sanitizePersistedArtifacts(job);
   const file = jobPath(job.id);
   const tmpFile = `${file}.tmp`;
   fs.writeFileSync(tmpFile, `${JSON.stringify(job, null, 2)}\n`, "utf8");
@@ -315,6 +611,15 @@ function sendHtml(res, status, body) {
     "content-type": "text/html; charset=utf-8",
     "cache-control": "no-store",
     "content-length": Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+function sendBytes(res, status, body, headers = {}) {
+  res.writeHead(status, {
+    "cache-control": "no-store",
+    "content-length": body.length,
+    ...headers,
   });
   res.end(body);
 }
@@ -439,11 +744,33 @@ async function routeRequest(req, res) {
 
   if (req.method === "GET" && url.pathname === "/v1/codex/workspaces") {
     return sendJson(res, 200, {
-      workspaces: [...workspaces.values()].map((workspace) => ({
+      workspaces: workspaceList().map((workspace) => ({
         id: workspace.id,
         name: workspace.name,
+        path: workspace.path,
       })),
     });
+  }
+
+  if (req.method === "GET" && url.pathname === "/v1/codex/workspace-dirs") {
+    return sendJson(
+      res,
+      200,
+      workspaceDirectoryResponse({
+        requestedPath: url.searchParams.get("path"),
+        query: url.searchParams.get("q"),
+      }),
+    );
+  }
+
+  if (req.method === "POST" && url.pathname === "/v1/codex/workspaces/select") {
+    const body = await readBody(req);
+    return sendJson(res, 200, publicWorkspace(selectWorkspaceDirectory(body)));
+  }
+
+  if (req.method === "POST" && url.pathname === "/v1/codex/workspaces/create") {
+    const body = await readBody(req);
+    return sendJson(res, 201, publicWorkspace(createWorkspaceDirectory(body)));
   }
 
   if (req.method === "GET" && url.pathname === "/v1/codex/sessions") {
@@ -483,9 +810,12 @@ async function routeRequest(req, res) {
 
   if (req.method === "GET" && url.pathname === "/v1/codex/jobs") {
     const limit = clampLimit(url.searchParams.get("limit"));
+    const workspaceId = url.searchParams.get("workspaceId");
     const provider = cleanProviderFilter(url.searchParams.get("provider"));
+    const selectedWorkspace = resolveOptionalWorkspaceFilter(workspaceId);
     const selectedJobs = [...jobs.values()]
       .filter((job) => !provider || normalizeJobProvider(job.provider) === provider)
+      .filter((job) => !selectedWorkspace || workspaceForJob(job)?.id === selectedWorkspace.id)
       .sort((left, right) => Date.parse(right.createdAt || 0) - Date.parse(left.createdAt || 0))
       .slice(0, limit);
     return sendJson(res, 200, {
@@ -502,6 +832,15 @@ async function routeRequest(req, res) {
     appendAudit("job_created", job);
     processQueue();
     return sendJson(res, 202, await toJobResponse(job, responseShape("preview")));
+  }
+
+  const artifactMatch = url.pathname.match(/^\/v1\/codex\/jobs\/([^/]+)\/artifacts\/([^/]+)\/(raw|preview)$/);
+  if (artifactMatch && req.method === "GET") {
+    const [, jobId, artifactId, mode] = artifactMatch;
+    if (!isSafeJobId(jobId) || !isSafeArtifactId(artifactId)) return sendError(res, 404, "artifact not found");
+    const job = jobs.get(jobId);
+    if (!job) return sendError(res, 404, "artifact not found");
+    return serveJobArtifact(res, job, artifactId, mode);
   }
 
   const jobMatch = url.pathname.match(/^\/v1\/codex\/jobs\/([^/]+)(?:\/(cancel))?$/);
@@ -544,6 +883,10 @@ function clampLimit(value) {
 
 function isSafeJobId(id) {
   return /^[a-f0-9-]{36}$/.test(id);
+}
+
+function isSafeArtifactId(id) {
+  return /^artifact-[0-9]{3}$/.test(id);
 }
 
 function responseShape(mode) {
@@ -651,7 +994,7 @@ function createJob(body, certSubject) {
   }
 
   const workspaceId = cleanWorkspaceId(body.workspaceId);
-  const workspace = workspaces.get(workspaceId);
+  const workspace = resolveWorkspaceById(workspaceId);
   if (!workspace) {
     throw Object.assign(new Error("workspaceId is not registered"), { status: 400 });
   }
@@ -706,11 +1049,12 @@ function createJob(body, certSubject) {
     stderrPath: path.join(logsDir, `${id}.stderr.log`),
     resultPath: path.join(logsDir, `${id}.answer.md`),
     result: null,
+    artifacts: [],
     error: null,
     certSubject,
     timeoutMs,
     model: cleanProviderModel(provider, body.model),
-    reasoningEffort: cleanOptionalReasoningEffort(body.reasoningEffort),
+    reasoningEffort: provider === "codex" ? cleanOptionalReasoningEffort(body.reasoningEffort) : null,
     permissionMode: provider === "claude" ? permissionMode : null,
     resumeSessionId,
     sessionId: resumeSessionId || (provider === "claude" ? crypto.randomUUID() : null),
@@ -730,11 +1074,23 @@ function cleanOptionalModel(value) {
   return value;
 }
 
+function cleanOptionalAwsProfile(value) {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value !== "string" || !/^[A-Za-z0-9._:-]{1,100}$/.test(value)) {
+    throw Object.assign(new Error("AWS profile or region is invalid"), { status: 400 });
+  }
+  return value;
+}
+
 function cleanProviderModel(provider, value) {
   const model = cleanOptionalModel(value);
   if (provider !== "claude") return model;
   if (!model) return claudeDefaultModel;
-  return model;
+  return normalizeClaudeModel(model);
+}
+
+function normalizeClaudeModel(model) {
+  return claudeModelAliases[model] || model;
 }
 
 function cleanOptionalProvider(value) {
@@ -1088,6 +1444,344 @@ function boundedSkillBody(file) {
   return `${prefixByBytes(cleaned, maxSkillPromptBytes).trimEnd()}\n\n[Skill truncated by server prompt budget.]`;
 }
 
+function extractJobArtifacts(job, answerText) {
+  if (maxJobArtifacts <= 0 || !answerText) return [];
+  const blocks = parseMarkdownCodeBlocks(answerText);
+  if (!blocks.length) return [];
+
+  const jobArtifactsDir = path.join(artifactsDir, job.id);
+  const saved = [];
+  let totalBytes = 0;
+
+  for (const block of blocks) {
+    if (saved.length >= maxJobArtifacts) break;
+    const content = cleanArtifactContent(block.content);
+    const bytes = Buffer.byteLength(content, "utf8");
+    if (bytes === 0 || bytes > maxArtifactBytes || totalBytes + bytes > maxArtifactTotalBytes) continue;
+
+    const ordinal = saved.length + 1;
+    const parsed = parseFenceInfo(block.info);
+    const filename = safeArtifactFilename(parsed.filename, parsed.language, ordinal);
+    const language = parsed.language || languageForFilename(filename);
+    const artifact = writeJobArtifact({
+      job,
+      ordinal,
+      filename,
+      language,
+      content,
+      kind: kindForArtifact(filename, language),
+    });
+    saved.push({ artifact, content });
+    totalBytes += bytes;
+  }
+
+  const assembled = assembleStaticPreviewArtifact(job, saved, totalBytes);
+  if (assembled) saved.push(assembled);
+
+  if (!saved.length) {
+    removeArtifactDirectory(jobArtifactsDir);
+    return [];
+  }
+
+  return saved.map((entry) => entry.artifact);
+}
+
+function parseMarkdownCodeBlocks(text) {
+  const blocks = [];
+  const lines = String(text).split(/\r?\n/);
+  let current = null;
+
+  for (const line of lines) {
+    const fence = line.match(/^\s*(`{3,}|~{3,})(.*)$/);
+    if (!fence) {
+      if (current) current.lines.push(line);
+      continue;
+    }
+
+    const marker = fence[1][0];
+    if (!current) {
+      current = { marker, length: fence[1].length, info: fence[2].trim(), lines: [] };
+      continue;
+    }
+
+    if (marker === current.marker && fence[1].length >= current.length) {
+      blocks.push({ info: current.info, content: current.lines.join("\n") });
+      current = null;
+    } else {
+      current.lines.push(line);
+    }
+  }
+
+  return blocks;
+}
+
+function parseFenceInfo(info) {
+  const tokens = String(info || "").trim().split(/\s+/).filter(Boolean);
+  let language = "";
+  let filename = "";
+
+  for (const token of tokens) {
+    const keyValue = token.match(/^(?:file|filename|path|name)=([^=]+)$/i);
+    if (keyValue && !filename) {
+      filename = stripFenceQuotes(keyValue[1]);
+      continue;
+    }
+
+    if (!language && looksLikeFilename(token)) {
+      filename ||= stripFenceQuotes(token);
+      language = languageForFilename(filename);
+      continue;
+    }
+
+    if (!language) {
+      language = cleanArtifactLanguage(token);
+      continue;
+    }
+
+    if (!filename && looksLikeFilename(token)) {
+      filename = stripFenceQuotes(token);
+    }
+  }
+
+  return { language, filename };
+}
+
+function stripFenceQuotes(value) {
+  const trimmed = String(value || "").trim();
+  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function looksLikeFilename(value) {
+  const raw = stripFenceQuotes(value);
+  return /[./\\]/.test(raw) || /^[A-Za-z0-9_-]+\.[A-Za-z0-9._-]+$/.test(raw);
+}
+
+function cleanArtifactLanguage(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9#+._-]/g, "")
+    .slice(0, 40);
+}
+
+function cleanArtifactContent(value) {
+  return cleanApiText(value || "").replace(/\s+$/, "");
+}
+
+function safeArtifactFilename(value, language, ordinal) {
+  const fallback = `artifact-${String(ordinal).padStart(3, "0")}${extensionForLanguage(language)}`;
+  const raw = stripFenceQuotes(value);
+  if (!raw || raw.includes("/") || raw.includes("\\") || raw.includes("..")) return fallback;
+  const cleaned = raw
+    .replace(/[^A-Za-z0-9._-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 120);
+  if (!cleaned || cleaned === "." || cleaned === ".." || cleaned.startsWith(".")) return fallback;
+  if (hasBlockedArtifactFilename(cleaned)) return fallback;
+  return path.extname(cleaned) ? cleaned : `${cleaned}${extensionForLanguage(language)}`;
+}
+
+function hasBlockedArtifactFilename(filename) {
+  const lower = filename.toLowerCase();
+  return [".env", ".pem", ".key", ".p12", ".crt", ".csr", ".mobileconfig"].some((suffix) => lower.endsWith(suffix));
+}
+
+function extensionForLanguage(language) {
+  switch (cleanArtifactLanguage(language)) {
+    case "html":
+    case "htm":
+      return ".html";
+    case "css":
+      return ".css";
+    case "javascript":
+    case "js":
+    case "jsx":
+      return ".js";
+    case "typescript":
+    case "ts":
+      return ".ts";
+    case "tsx":
+      return ".tsx";
+    case "json":
+      return ".json";
+    case "svg":
+      return ".svg";
+    case "markdown":
+    case "md":
+      return ".md";
+    case "python":
+    case "py":
+      return ".py";
+    case "swift":
+      return ".swift";
+    case "bash":
+    case "sh":
+    case "shell":
+      return ".sh";
+    case "text":
+    case "txt":
+      return ".txt";
+    default:
+      return ".txt";
+  }
+}
+
+function languageForFilename(filename) {
+  switch (path.extname(String(filename || "")).toLowerCase()) {
+    case ".html":
+    case ".htm":
+      return "html";
+    case ".css":
+      return "css";
+    case ".js":
+    case ".mjs":
+    case ".cjs":
+      return "js";
+    case ".jsx":
+      return "jsx";
+    case ".ts":
+      return "ts";
+    case ".tsx":
+      return "tsx";
+    case ".json":
+      return "json";
+    case ".svg":
+      return "svg";
+    case ".md":
+    case ".markdown":
+      return "markdown";
+    case ".py":
+      return "python";
+    case ".swift":
+      return "swift";
+    case ".sh":
+      return "bash";
+    case ".txt":
+      return "text";
+    default:
+      return "";
+  }
+}
+
+function kindForArtifact(filename, language) {
+  const normalized = cleanArtifactLanguage(language || languageForFilename(filename));
+  if (["html", "htm", "svg"].includes(normalized)) return "staticPreview";
+  if (["markdown", "md"].includes(normalized)) return "document";
+  return "code";
+}
+
+function contentTypeForArtifact(filename, language) {
+  const normalized = cleanArtifactLanguage(language || languageForFilename(filename));
+  switch (normalized) {
+    case "html":
+    case "htm":
+      return "text/html; charset=utf-8";
+    case "css":
+      return "text/css; charset=utf-8";
+    case "javascript":
+    case "js":
+    case "jsx":
+      return "text/javascript; charset=utf-8";
+    case "json":
+      return "application/json; charset=utf-8";
+    case "svg":
+      return "image/svg+xml; charset=utf-8";
+    case "markdown":
+    case "md":
+      return "text/markdown; charset=utf-8";
+    default:
+      return "text/plain; charset=utf-8";
+  }
+}
+
+function writeJobArtifact({ job, ordinal, filename, language, content, kind }) {
+  const id = `artifact-${String(ordinal).padStart(3, "0")}`;
+  const jobArtifactsDir = path.join(artifactsDir, job.id);
+  fs.mkdirSync(jobArtifactsDir, { recursive: true });
+  const filePath = path.join(jobArtifactsDir, `${id}-${filename}`);
+  fs.writeFileSync(filePath, content, "utf8");
+  const bytes = Buffer.byteLength(content, "utf8");
+  return {
+    id,
+    kind,
+    filename,
+    title: titleForArtifact(filename),
+    language: language || null,
+    contentType: contentTypeForArtifact(filename, language),
+    bytes,
+    path: filePath,
+    rawURL: artifactRoute(job.id, id, "raw"),
+    previewURL: isPreviewableArtifact(filename, language, kind) ? artifactRoute(job.id, id, "preview") : null,
+  };
+}
+
+function titleForArtifact(filename) {
+  return String(filename || "Artifact").replace(/[-_]+/g, " ");
+}
+
+function isPreviewableArtifact(filename, language, kind) {
+  if (kind === "staticPreview") return true;
+  const normalized = cleanArtifactLanguage(language || languageForFilename(filename));
+  return ["markdown", "md"].includes(normalized);
+}
+
+function artifactRoute(jobId, artifactId, mode) {
+  return `/v1/codex/jobs/${jobId}/artifacts/${artifactId}/${mode}`;
+}
+
+function assembleStaticPreviewArtifact(job, saved, totalBytes) {
+  if (saved.length >= maxJobArtifacts) return null;
+  const html = saved.find((entry) => ["html", "htm"].includes(cleanArtifactLanguage(entry.artifact.language || languageForFilename(entry.artifact.filename))));
+  if (!html) return null;
+  const cssBlocks = saved
+    .filter((entry) => cleanArtifactLanguage(entry.artifact.language || languageForFilename(entry.artifact.filename)) === "css")
+    .map((entry) => entry.content);
+  const jsBlocks = saved
+    .filter((entry) => ["js", "javascript"].includes(cleanArtifactLanguage(entry.artifact.language || languageForFilename(entry.artifact.filename))))
+    .map((entry) => entry.content);
+  if (!cssBlocks.length && !jsBlocks.length) return null;
+
+  const content = assembleStaticHtml(html.content, cssBlocks, jsBlocks);
+  const bytes = Buffer.byteLength(content, "utf8");
+  if (bytes > maxArtifactBytes || totalBytes + bytes > maxArtifactTotalBytes) return null;
+
+  const ordinal = saved.length + 1;
+  const artifact = writeJobArtifact({
+    job,
+    ordinal,
+    filename: "preview.html",
+    language: "html",
+    content,
+    kind: "staticPreview",
+  });
+  return { artifact, content };
+}
+
+function assembleStaticHtml(html, cssBlocks, jsBlocks) {
+  let document = html.trim();
+  if (!/<html[\s>]/i.test(document)) {
+    document = `<!doctype html>\n<html>\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1">\n</head>\n<body>\n${document}\n</body>\n</html>`;
+  }
+
+  const styles = cssBlocks.length ? `<style>\n${cssBlocks.join("\n\n")}\n</style>\n` : "";
+  const scripts = jsBlocks.length ? `<script>\n${jsBlocks.join("\n\n")}\n</script>\n` : "";
+  if (styles && /<\/head>/i.test(document)) {
+    document = document.replace(/<\/head>/i, `${styles}</head>`);
+  } else if (styles) {
+    document = `${styles}${document}`;
+  }
+  if (scripts && /<\/body>/i.test(document)) {
+    document = document.replace(/<\/body>/i, `${scripts}</body>`);
+  } else if (scripts) {
+    document = `${document}\n${scripts}`;
+  }
+  return document;
+}
+
 function cleanOptionalSessionId(value) {
   if (value === undefined || value === null || value === "") return null;
   if (typeof value !== "string" || !isSafeJobId(value)) {
@@ -1274,10 +1968,32 @@ function findThreadResumeMeta(sessionId) {
 }
 
 function resumeMetaBelongsToWorkspace(meta, workspace) {
+  const metaWorkspace = workspaceForPath(meta.workspacePath || meta.cwd);
+  if (metaWorkspace) return metaWorkspace.id === workspace.id;
   if (meta.workspaceId) return meta.workspaceId === workspace.id;
-  if (meta.workspacePath) return sessionBelongsToWorkspace(meta.workspacePath, workspace.path);
-  if (meta.cwd) return sessionBelongsToWorkspace(meta.cwd, workspace.path);
   return false;
+}
+
+function workspaceForJob(job) {
+  return workspaceForPath(job?.workspacePath) || resolveWorkspaceById(job?.workspaceId);
+}
+
+function workspaceForPath(value) {
+  if (typeof value !== "string" || value.length === 0 || /[\0\r\n]/.test(value)) return null;
+  const resolvedPath = realpathOrResolve(value);
+  if (pathBelongsToRoot(resolvedPath, workspaceBrowseRoot) && resolvedPath !== workspaceBrowseRoot) {
+    return browseWorkspaceForPath(resolvedPath, { materialize: true });
+  }
+  let best = null;
+  for (const workspace of workspaces.values()) {
+    if (!sessionBelongsToWorkspace(resolvedPath, workspace.path)) continue;
+    if (!best || workspace.path.length > best.path.length) best = workspace;
+  }
+  for (const workspace of dynamicWorkspaces.values()) {
+    if (!sessionBelongsToWorkspace(resolvedPath, workspace.path)) continue;
+    if (!best || workspace.path.length > best.path.length) best = workspace;
+  }
+  return best;
 }
 
 function readSessionMeta(sessionFile, expectedSessionId = null) {
@@ -1317,14 +2033,7 @@ function cleanSessionTimestamp(value) {
 }
 
 function listWorkspaceSessions({ workspaceId, provider = null, limit, includeSummary = false }) {
-  let selectedWorkspace = null;
-  if (workspaceId) {
-    const cleanId = cleanWorkspaceId(workspaceId);
-    selectedWorkspace = workspaces.get(cleanId);
-    if (!selectedWorkspace) {
-      throw Object.assign(new Error("workspaceId is not registered"), { status: 400 });
-    }
-  }
+  const selectedWorkspace = resolveOptionalWorkspaceFilter(workspaceId);
 
   const sessionMap = new Map();
   for (const file of walkSessionFiles(path.join(codexHome, "sessions"))) {
@@ -1356,7 +2065,7 @@ function listWorkspaceSessions({ workspaceId, provider = null, limit, includeSum
     if (!sessionId) continue;
     const jobProvider = normalizeJobProvider(job.provider);
     if (provider && jobProvider !== provider) continue;
-    const workspace = workspaces.get(job.workspaceId);
+    const workspace = workspaceForJob(job);
     if (!workspace) continue;
     if (selectedWorkspace && workspace.id !== selectedWorkspace.id) continue;
 
@@ -1384,14 +2093,7 @@ function listWorkspaceSessions({ workspaceId, provider = null, limit, includeSum
 }
 
 function listWorkspaceThreads({ workspaceId, provider = null, limit }) {
-  let selectedWorkspace = null;
-  if (workspaceId) {
-    const cleanId = cleanWorkspaceId(workspaceId);
-    selectedWorkspace = workspaces.get(cleanId);
-    if (!selectedWorkspace) {
-      throw Object.assign(new Error("workspaceId is not registered"), { status: 400 });
-    }
-  }
+  const selectedWorkspace = resolveOptionalWorkspaceFilter(workspaceId);
 
   const threadMap = new Map();
   for (const session of listWorkspaceSessions({ workspaceId, provider, limit: 200, includeSummary: true })) {
@@ -1410,7 +2112,7 @@ function listWorkspaceThreads({ workspaceId, provider = null, limit }) {
     const jobProvider = normalizeJobProvider(job.provider);
     if (provider && jobProvider !== provider) continue;
 
-    const workspace = workspaces.get(job.workspaceId);
+    const workspace = workspaceForJob(job);
     if (!workspace) continue;
     if (selectedWorkspace && selectedWorkspace.id !== workspace.id) continue;
 
@@ -1440,6 +2142,16 @@ function listWorkspaceThreads({ workspaceId, provider = null, limit }) {
     .map(threadSummary)
     .sort((left, right) => compareIsoDesc(left.updatedAt, right.updatedAt))
     .slice(0, limit);
+}
+
+function resolveOptionalWorkspaceFilter(workspaceId) {
+  if (!workspaceId) return null;
+  const cleanId = cleanWorkspaceId(workspaceId);
+  const workspace = resolveWorkspaceById(cleanId);
+  if (!workspace) {
+    throw Object.assign(new Error("workspaceId is not registered"), { status: 400 });
+  }
+  return workspace;
 }
 
 async function threadDetailResponse(sessionId, { provider = null } = {}) {
@@ -1475,7 +2187,7 @@ async function threadDetailResponse(sessionId, { provider = null } = {}) {
     if (jobThreadId(job) !== sessionId) continue;
     const jobProvider = normalizeJobProvider(job.provider);
     if (provider && jobProvider !== provider) continue;
-    const workspace = workspaces.get(job.workspaceId);
+    const workspace = workspaceForJob(job);
     if (!workspace) continue;
 
     if (thread && thread.provider !== jobProvider) continue;
@@ -1717,10 +2429,7 @@ function walkSessionFiles(rootDir) {
 }
 
 function workspaceForSessionCwd(sessionCwd) {
-  for (const workspace of workspaces.values()) {
-    if (sessionBelongsToWorkspace(sessionCwd, workspace.path)) return workspace;
-  }
-  return null;
+  return workspaceForPath(sessionCwd);
 }
 
 function findSessionFile(rootDir, sessionId) {
@@ -1827,23 +2536,10 @@ function startJob(job) {
   let stderr = "";
 
   const args = buildJobArgs(job);
+  const childEnv = buildJobEnv(job);
   const child = spawn(job.provider === "claude" ? claudeBin : codexBin, args, {
     cwd: job.workspacePath,
-    env: {
-      ...process.env,
-      HOME: runHome,
-      CODEX_HOME: codexHome,
-      NPM_CONFIG_CACHE: npmCacheDir,
-      npm_config_cache: npmCacheDir,
-      NPM_CONFIG_LOGLEVEL: process.env.NPM_CONFIG_LOGLEVEL || "error",
-      npm_config_loglevel: process.env.npm_config_loglevel || "error",
-      NPM_CONFIG_PROGRESS: process.env.NPM_CONFIG_PROGRESS || "false",
-      npm_config_progress: process.env.npm_config_progress || "false",
-      NPM_CONFIG_UPDATE_NOTIFIER: process.env.NPM_CONFIG_UPDATE_NOTIFIER || "false",
-      npm_config_update_notifier: process.env.npm_config_update_notifier || "false",
-      BUN_INSTALL_CACHE_DIR: bunCacheDir,
-      PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
-    },
+    env: childEnv,
     stdio: ["pipe", "pipe", "pipe"],
   });
 
@@ -1909,6 +2605,41 @@ function buildJobArgs(job) {
   return job.provider === "claude" ? buildClaudeArgs(job) : buildCodexArgs(job);
 }
 
+function buildJobEnv(job) {
+  const env = {
+    ...process.env,
+    HOME: runHome,
+    CODEX_HOME: codexHome,
+    NPM_CONFIG_CACHE: npmCacheDir,
+    npm_config_cache: npmCacheDir,
+    NPM_CONFIG_LOGLEVEL: process.env.NPM_CONFIG_LOGLEVEL || "error",
+    npm_config_loglevel: process.env.npm_config_loglevel || "error",
+    NPM_CONFIG_PROGRESS: process.env.NPM_CONFIG_PROGRESS || "false",
+    npm_config_progress: process.env.npm_config_progress || "false",
+    NPM_CONFIG_UPDATE_NOTIFIER: process.env.NPM_CONFIG_UPDATE_NOTIFIER || "false",
+    npm_config_update_notifier: process.env.npm_config_update_notifier || "false",
+    BUN_INSTALL_CACHE_DIR: bunCacheDir,
+    PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
+  };
+
+  if (job.provider === "claude" && claudeAwsProfile) {
+    env.AWS_PROFILE = claudeAwsProfile;
+    env.AWS_SDK_LOAD_CONFIG = process.env.AWS_SDK_LOAD_CONFIG || "1";
+    delete env.AWS_ACCESS_KEY_ID;
+    delete env.AWS_SECRET_ACCESS_KEY;
+    delete env.AWS_SESSION_TOKEN;
+    if (claudeAwsRegion) {
+      env.AWS_REGION = claudeAwsRegion;
+      env.AWS_DEFAULT_REGION = claudeAwsRegion;
+    } else {
+      delete env.AWS_REGION;
+      delete env.AWS_DEFAULT_REGION;
+    }
+  }
+
+  return env;
+}
+
 function buildCodexArgs(job) {
   if (job.resumeSessionId) return buildCodexResumeArgs(job);
 
@@ -1941,7 +2672,6 @@ function buildClaudeArgs(job) {
   const args = ["--print"];
   if (dangerousMode) args.push("--dangerously-skip-permissions");
   if (job.model) args.push("--model", job.model);
-  if (job.reasoningEffort) args.push("--effort", job.reasoningEffort);
   if (job.permissionMode) args.push("--permission-mode", job.permissionMode);
   if (job.resumeSessionId) {
     args.push("--resume", job.resumeSessionId);
@@ -1978,6 +2708,7 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
       ? await readTextFileBounded(job.stdoutPath, maxOutputBytes)
       : await readTextFileBounded(job.resultPath, maxOutputBytes);
   const cleanResult = cleanAssistantResult(resultText).trim();
+  const failedOutputText = job.provider === "claude" ? cleanResult : "";
 
   job.updatedAt = finishedAt;
   job.finishedAt = finishedAt;
@@ -2002,10 +2733,20 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
     job.status = "succeeded";
     job.result = cleanResult || null;
     job.error = null;
+    try {
+      job.artifacts = extractJobArtifacts(job, cleanResult);
+    } catch (error) {
+      job.artifacts = [];
+      appendAudit("artifact_extraction_failed", job, { error: error.message || String(error) });
+    }
   } else {
     job.status = "failed";
     job.result = null;
-    job.error = stderrText || `${job.provider === "claude" ? "claude" : "codex"} exited with code ${code}${signal ? ` and signal ${signal}` : ""}`;
+    job.artifacts = [];
+    job.error =
+      stderrText ||
+      failedOutputText ||
+      `${job.provider === "claude" ? "claude" : "codex"} exited with code ${code}${signal ? ` and signal ${signal}` : ""}`;
   }
 
   persistJob(job);
@@ -2083,16 +2824,19 @@ function findNewWorkspaceSessionId(job, sessionIdsBefore) {
 }
 
 function workspaceSessionEntries(workspacePath) {
+  const workspace = workspaceForPath(workspacePath);
   return walkSessionFiles(path.join(codexHome, "sessions"))
     .map((file) => {
       const meta = readSessionMeta(file);
       if (!meta || !sessionBelongsToWorkspace(meta.cwd, workspacePath)) return null;
+      if (workspace && workspaceForSessionCwd(meta.cwd)?.id !== workspace.id) return null;
       return { id: meta.id, cwd: meta.cwd };
     })
     .filter(Boolean);
 }
 
 async function toJobResponse(job, shape = responseShape("preview")) {
+  const workspace = workspaceForJob(job);
   const [stdout, stderr, result] = await Promise.all([
     shapeTextPayload({
       file: job.stdoutPath || path.join(logsDir, `${job.id}.stdout.log`),
@@ -2121,10 +2865,11 @@ async function toJobResponse(job, shape = responseShape("preview")) {
     id: job.id,
     status: job.status,
     provider: normalizeJobProvider(job.provider),
-    workspaceId: job.workspaceId,
-    workspaceName: job.workspaceName,
+    workspaceId: workspace?.id || job.workspaceId,
+    workspaceName: workspace?.name || job.workspaceName,
     prompt: job.prompt,
     attachments: sanitizeAttachmentResponses(job.attachments),
+    artifacts: publicArtifactResponses(job),
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     startedAt: job.startedAt,
@@ -2166,6 +2911,148 @@ function sanitizeAttachmentResponses(attachments) {
       bytes: Number.isFinite(attachment.bytes) ? attachment.bytes : null,
       path: cleanApiText(attachment.path || ""),
     }));
+}
+
+function sanitizePersistedArtifacts(job) {
+  if (!Array.isArray(job?.artifacts)) return [];
+  return job.artifacts
+    .filter((artifact) => artifact && typeof artifact === "object")
+    .map((artifact) => {
+      const id = isSafeArtifactId(artifact.id) ? artifact.id : "";
+      const filename = safeArtifactFilename(artifact.filename, artifact.language, Number(id.slice(-3)) || 1);
+      const language = cleanArtifactLanguage(artifact.language || languageForFilename(filename));
+      const kind = ["code", "staticPreview", "document"].includes(artifact.kind) ? artifact.kind : kindForArtifact(filename, language);
+      const filePath = cleanOptionalFilePath(artifact.path);
+      if (!id || !filePath || !artifactPathBelongsToJob(job.id, filePath)) return null;
+      const bytes = Number.isFinite(artifact.bytes) && artifact.bytes >= 0 ? artifact.bytes : 0;
+      return {
+        id,
+        kind,
+        filename,
+        title: cleanDisplayName(artifact.title || titleForArtifact(filename), "artifact title", 120),
+        language: language || null,
+        contentType: contentTypeForArtifact(filename, language),
+        bytes,
+        path: filePath,
+        rawURL: artifactRoute(job.id, id, "raw"),
+        previewURL: isPreviewableArtifact(filename, language, kind) ? artifactRoute(job.id, id, "preview") : null,
+      };
+    })
+    .filter(Boolean);
+}
+
+function publicArtifactResponses(job) {
+  return sanitizePersistedArtifacts(job).map((artifact) => ({
+    id: artifact.id,
+    kind: artifact.kind,
+    filename: artifact.filename,
+    title: artifact.title,
+    language: artifact.language,
+    contentType: artifact.contentType,
+    bytes: artifact.bytes,
+    rawURL: artifact.rawURL,
+    previewURL: artifact.previewURL,
+  }));
+}
+
+function artifactPathBelongsToJob(jobId, filePath) {
+  const root = path.resolve(path.join(artifactsDir, jobId));
+  const resolved = path.resolve(filePath);
+  const relative = path.relative(root, resolved);
+  return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+function serveJobArtifact(res, job, artifactId, mode) {
+  const artifact = sanitizePersistedArtifacts(job).find((entry) => entry.id === artifactId);
+  if (!artifact || !artifact.path || !artifactPathBelongsToJob(job.id, artifact.path)) {
+    return sendError(res, 404, "artifact not found");
+  }
+
+  let body;
+  try {
+    body = fs.readFileSync(artifact.path);
+  } catch {
+    return sendError(res, 404, "artifact not found");
+  }
+
+  if (mode === "raw") {
+    return sendBytes(res, 200, body, {
+      "content-type": artifact.contentType || "application/octet-stream",
+      "content-disposition": `attachment; filename="${contentDispositionFilename(artifact.filename)}"`,
+      "x-content-type-options": "nosniff",
+    });
+  }
+
+  if (!artifact.previewURL) return sendError(res, 404, "artifact preview not available");
+  return sendHtml(res, 200, artifactPreviewWrapper(artifact, body.toString("utf8")));
+}
+
+function contentDispositionFilename(filename) {
+  return String(filename || "artifact.txt").replace(/["\r\n\\]/g, "-");
+}
+
+function artifactPreviewWrapper(artifact, rawContent) {
+  const srcdoc = previewSrcdoc(artifact, rawContent);
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(artifact.title || artifact.filename)}</title>
+  <style>
+    html, body { height: 100%; margin: 0; background: #101113; color: #f5f5f0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,.12); background: #17181b; }
+    strong { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    span { color: rgba(245,245,240,.62); font-size: 12px; }
+    iframe { width: 100%; height: calc(100% - 42px); border: 0; background: white; display: block; }
+  </style>
+</head>
+<body data-codex-artifact-preview="true">
+  <header><strong>${escapeHtml(artifact.filename)}</strong><span>${escapeHtml(artifact.kind)}</span></header>
+  <iframe sandbox="allow-scripts" referrerpolicy="no-referrer" srcdoc="${escapeHtmlAttribute(srcdoc)}"></iframe>
+</body>
+</html>`;
+}
+
+function previewSrcdoc(artifact, rawContent) {
+  const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; font-src data:;">`;
+  const language = cleanArtifactLanguage(artifact.language || languageForFilename(artifact.filename));
+  if (language === "markdown" || language === "md") {
+    return `<!doctype html><html><head><meta charset="utf-8">${csp}<style>body{font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.5;margin:24px;color:#202124}pre{white-space:pre-wrap;word-break:break-word}</style></head><body><pre>${escapeHtml(rawContent)}</pre></body></html>`;
+  }
+  if (language === "svg") {
+    return `<!doctype html><html><head><meta charset="utf-8">${csp}<style>body{margin:0;display:grid;place-items:center;min-height:100vh;background:#fff}</style></head><body>${rawContent}</body></html>`;
+  }
+  if (language === "html" || language === "htm") {
+    return injectPreviewCsp(rawContent, csp);
+  }
+  return `<!doctype html><html><head><meta charset="utf-8">${csp}<style>body{font:13px ui-monospace,SFMono-Regular,Menlo,monospace;margin:20px;white-space:pre-wrap;color:#202124}</style></head><body>${escapeHtml(rawContent)}</body></html>`;
+}
+
+function injectPreviewCsp(html, csp) {
+  if (/<head[\s>]/i.test(html)) {
+    return html.replace(/<head([^>]*)>/i, `<head$1>${csp}`);
+  }
+  return `<!doctype html><html><head><meta charset="utf-8">${csp}</head><body>${html}</body></html>`;
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function escapeHtmlAttribute(value) {
+  return escapeHtml(value).replace(/"/g, "&quot;");
+}
+
+function removeArtifactDirectory(directory) {
+  try {
+    fs.rmSync(directory, { recursive: true, force: true });
+  } catch {
+    // Best effort cleanup only.
+  }
 }
 
 async function shapeTextPayload({ file, value, byteLimit, includeFull, trim = false, slice = "prefix" }) {
