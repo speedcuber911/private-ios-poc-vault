@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="40%" r="75%">
+      <stop offset="0%" stop-color="#1E1E22"/>
+      <stop offset="55%" stop-color="#0E0E10"/>
+      <stop offset="100%" stop-color="#040405"/>
+    </radialGradient>
+
+    <!-- left arc fades from tail (outer) to baton end (inner-right) -->
+    <linearGradient id="arcLeft" x1="0%" y1="50%" x2="100%" y2="50%">
+      <stop offset="0%"  stop-color="#DBDAD1" stop-opacity="0.10"/>
+      <stop offset="50%" stop-color="#DBDAD1" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#FFFCEC" stop-opacity="1"/>
+    </linearGradient>
+
+    <linearGradient id="arcRight" x1="0%" y1="50%" x2="100%" y2="50%">
+      <stop offset="0%"  stop-color="#FFFCEC" stop-opacity="1"/>
+      <stop offset="50%" stop-color="#DBDAD1" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#DBDAD1" stop-opacity="0.10"/>
+    </linearGradient>
+
+    <radialGradient id="dotGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"  stop-color="#FFF6D8" stop-opacity="0.95"/>
+      <stop offset="35%" stop-color="#DBDAD1" stop-opacity="0.55"/>
+      <stop offset="70%" stop-color="#DBDAD1" stop-opacity="0.10"/>
+      <stop offset="100%" stop-color="#DBDAD1" stop-opacity="0"/>
+    </radialGradient>
+
+    <radialGradient id="dotCore" cx="42%" cy="38%" r="65%">
+      <stop offset="0%"  stop-color="#FFFFFF"/>
+      <stop offset="55%" stop-color="#F5F1E0"/>
+      <stop offset="100%" stop-color="#C9C7BB"/>
+    </radialGradient>
+  </defs>
+
+  <!-- full-bleed bg (iOS will mask the rounded corners) -->
+  <rect width="1024" height="1024" fill="url(#bg)"/>
+
+  <!-- subtle outer halo ring -->
+  <circle cx="512" cy="512" r="430" fill="none" stroke="#FFFFFF" stroke-opacity="0.04" stroke-width="2"/>
+
+  <!--
+    Two arcs form a horizontal "C ⊃" shape cradling the central baton.
+    Left arc opens to the right, right arc opens to the left.
+    Each arc is a 180° sweep on a 230px-radius circle, with stroke
+    fading from the outer end (tail) toward the inner end (baton hand-off).
+  -->
+
+  <!-- LEFT arc: from top (382,282) sweeping CCW (large-arc) through left to bottom (382,742) -->
+  <path d="M 382 282 A 230 230 0 0 0 382 742"
+        fill="none"
+        stroke="url(#arcLeft)"
+        stroke-width="74"
+        stroke-linecap="round"/>
+
+  <!-- RIGHT arc: from bottom (642,742) sweeping CCW through right to top (642,282) -->
+  <path d="M 642 742 A 230 230 0 0 0 642 282"
+        fill="none"
+        stroke="url(#arcRight)"
+        stroke-width="74"
+        stroke-linecap="round"/>
+
+  <!-- Center baton: glow halo -->
+  <circle cx="512" cy="512" r="200" fill="url(#dotGlow)" opacity="0.7"/>
+
+  <!-- Center baton: solid core -->
+  <circle cx="512" cy="512" r="78" fill="url(#dotCore)"/>
+
+  <!-- specular highlight -->
+  <circle cx="488" cy="488" r="22" fill="#FFFFFF" opacity="0.55"/>
+</svg>
