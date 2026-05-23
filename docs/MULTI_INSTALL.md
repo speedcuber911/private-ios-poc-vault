@@ -36,7 +36,7 @@ ops/init-install-config \
   --domain-root example.com \
   --aws-region ap-south-1 \
   --instance-name poc-vault \
-  --bundle-id com.example.pocvault
+  --bundle-id com.parikshit.pocvault
 ```
 
 This creates:

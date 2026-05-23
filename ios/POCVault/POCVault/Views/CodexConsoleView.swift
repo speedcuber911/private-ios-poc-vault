@@ -1,6 +1,8 @@
 import SwiftUI
 import UIKit
 import AVFoundation
+import PhotosUI
+import UniformTypeIdentifiers
 
 struct CodexConsoleView: View {
     @ObservedObject var viewModel: CodexConsoleViewModel
@@ -99,9 +101,19 @@ private struct CodexHeader: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            VaultLogoMark(size: 34)
+            Image(viewModel.provider.tabIconAssetName)
+                .renderingMode(.template)
+                .resizable()
+                .scaledToFit()
+                .foregroundStyle(viewModel.provider.activityTint)
+                .frame(width: 18, height: 18)
+                .frame(width: 34, height: 34)
+                .background(CodexTheme.raisedPanel, in: Circle())
+                .overlay {
+                    Circle().stroke(CodexTheme.stroke, lineWidth: 1)
+                }
 
-            Text("Codex")
+            Text(viewModel.provider.displayName)
                 .font(.title3.weight(.semibold))
                 .foregroundStyle(CodexTheme.text)
 
@@ -121,7 +133,7 @@ private struct CodexHeader: View {
             }
             .buttonStyle(.plain)
             .disabled(viewModel.isRefreshing)
-            .accessibilityLabel("Refresh Codex")
+            .accessibilityLabel("Refresh \(viewModel.provider.displayName)")
         }
     }
 }
@@ -133,12 +145,16 @@ private struct CodexPromptCard: View {
     @FocusState private var promptIsFocused: Bool
     @State private var showingSkillPicker = false
     @State private var showingThreadPicker = false
+    @State private var showingPhotoPicker = false
+    @State private var selectedPhotoItems: [PhotosPickerItem] = []
+    @State private var showingDocumentPicker = false
+    @State private var showingCameraPicker = false
     @StateObject private var audioRecorder = CodexPromptAudioRecorder()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 6) {
-                Text(viewModel.selectedSessionID == nil ? "What should Codex do?" : "Continue this thread")
+                Text(viewModel.selectedSessionID == nil ? "What should \(viewModel.provider.displayName) do?" : "Continue this thread")
                     .font(.title2.weight(.semibold))
                     .foregroundStyle(CodexTheme.text)
                 Text(contextText)
@@ -149,7 +165,8 @@ private struct CodexPromptCard: View {
 
             CodexControlStrip(
                 viewModel: viewModel,
-                skillCount: viewModel.selectedSkills.count
+                skillCount: viewModel.selectedSkills.count,
+                showsSkillControls: viewModel.provider == .codex
             ) {
                 showingSkillPicker = true
             }
@@ -158,13 +175,13 @@ private struct CodexPromptCard: View {
                 showingThreadPicker = true
             }
 
-            if !viewModel.selectedSkills.isEmpty {
+            if viewModel.provider == .codex && !viewModel.selectedSkills.isEmpty {
                 CodexSelectedSkillStrip(viewModel: viewModel)
             }
 
             ZStack(alignment: .topLeading) {
                 if viewModel.prompt.isEmpty {
-                    Text("Type a prompt for Codex...")
+                    Text("Type a prompt for \(viewModel.provider.displayName)...")
                         .font(.system(size: 16, weight: .medium))
                         .foregroundStyle(CodexTheme.dim)
                         .padding(.horizontal, 4)
@@ -183,6 +200,12 @@ private struct CodexPromptCard: View {
                     .background(Color.clear)
             }
 
+            if !viewModel.attachments.isEmpty {
+                CodexAttachmentTray(attachments: viewModel.attachments) { attachment in
+                    viewModel.removeComposeAttachment(attachment)
+                }
+            }
+
             Divider()
                 .overlay(CodexTheme.stroke)
 
@@ -193,6 +216,13 @@ private struct CodexPromptCard: View {
                     .lineLimit(1)
 
                 Spacer()
+
+                CodexAttachmentMenu(
+                    disabled: viewModel.isCreating || viewModel.isTranscribing,
+                    showingPhotoPicker: $showingPhotoPicker,
+                    showingDocumentPicker: $showingDocumentPicker,
+                    showingCameraPicker: $showingCameraPicker
+                )
 
                 Button {
                     toggleRecording()
@@ -227,8 +257,11 @@ private struct CodexPromptCard: View {
                 } label: {
                     Label(viewModel.isCreating ? "Sending" : "Send", systemImage: "paperplane.fill")
                         .font(.subheadline.weight(.bold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
                         .foregroundStyle(canCreate ? AppTheme.bgCanvas : CodexTheme.dim)
-                        .padding(.horizontal, 20)
+                        .padding(.horizontal, 18)
+                        .frame(minWidth: 104)
                         .frame(height: 44)
                         .background((canCreate ? CodexTheme.accent : CodexTheme.raisedPanel), in: Capsule())
                 }
@@ -267,10 +300,34 @@ private struct CodexPromptCard: View {
             .presentationDetents([.medium, .large])
             .presentationDragIndicator(.visible)
         }
+        .sheet(isPresented: $showingDocumentPicker) {
+            CodexDocumentPicker { urls in
+                Task { await importDocuments(urls) }
+            }
+        }
+        .fullScreenCover(isPresented: $showingCameraPicker) {
+            CodexCameraPicker { data in
+                viewModel.addComposeAttachment(
+                    data: data,
+                    filename: "camera-\(Self.fileTimestamp()).jpg",
+                    contentType: "image/jpeg"
+                )
+            }
+            .ignoresSafeArea()
+        }
+        .photosPicker(
+            isPresented: $showingPhotoPicker,
+            selection: $selectedPhotoItems,
+            maxSelectionCount: 6,
+            matching: .images
+        )
+        .onChange(of: selectedPhotoItems) { _, items in
+            Task { await importPhotos(items) }
+        }
     }
 
     private var canCreate: Bool {
-        !viewModel.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        (!viewModel.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !viewModel.attachments.isEmpty)
             && !viewModel.isCreating
             && !viewModel.isTranscribing
             && !audioRecorder.isRecording
@@ -283,8 +340,11 @@ private struct CodexPromptCard: View {
         if viewModel.isTranscribing {
             return "Transcribing"
         }
-        if viewModel.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if viewModel.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && viewModel.attachments.isEmpty {
             return "Enter a prompt"
+        }
+        if !viewModel.attachments.isEmpty {
+            return "\(viewModel.attachments.count) attached"
         }
         return "Ready"
     }
@@ -307,6 +367,51 @@ private struct CodexPromptCard: View {
                 viewModel.errorMessage = error.localizedDescription
             }
         }
+    }
+
+    private func importPhotos(_ items: [PhotosPickerItem]) async {
+        guard !items.isEmpty else { return }
+        for item in items {
+            guard let data = try? await item.loadTransferable(type: Data.self) else {
+                await MainActor.run { viewModel.errorMessage = "Could not read the selected photo." }
+                continue
+            }
+            let contentType = item.supportedContentTypes.first(where: { $0.conforms(to: .image) }) ?? .jpeg
+            await MainActor.run {
+                viewModel.addComposeAttachment(
+                    data: data,
+                    filename: "photo-\(Self.fileTimestamp()).\(contentType.preferredFilenameExtension ?? "jpg")",
+                    contentType: contentType.preferredMIMEType ?? "image/jpeg"
+                )
+            }
+        }
+        await MainActor.run { selectedPhotoItems = [] }
+    }
+
+    private func importDocuments(_ urls: [URL]) async {
+        for url in urls {
+            let isScoped = url.startAccessingSecurityScopedResource()
+            defer {
+                if isScoped {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+            do {
+                let data = try Data(contentsOf: url)
+                let contentType = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
+                await MainActor.run {
+                    viewModel.addComposeAttachment(data: data, filename: url.lastPathComponent, contentType: contentType)
+                }
+            } catch {
+                await MainActor.run {
+                    viewModel.errorMessage = "Could not read \(url.lastPathComponent)."
+                }
+            }
+        }
+    }
+
+    private static func fileTimestamp() -> String {
+        String(Int(Date().timeIntervalSince1970))
     }
 
     private var contextText: String {
@@ -397,7 +502,7 @@ private final class CodexPromptAudioRecorder: NSObject, ObservableObject, AVAudi
         var errorDescription: String? {
             switch self {
             case .microphoneDenied:
-                return "Microphone access is not enabled for POC Vault."
+                return "Microphone access is not enabled for Relay."
             case .startFailed:
                 return "Could not start microphone recording. Please try again."
             }
@@ -447,7 +552,7 @@ private struct CodexThreadStrip: View {
                     )
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Start a new Codex thread")
+            .accessibilityLabel("Start a new \(viewModel.provider.displayName) thread")
 
             Button(action: onBrowse) {
                 HStack(spacing: 8) {
@@ -466,7 +571,7 @@ private struct CodexThreadStrip: View {
                 .background(CodexTheme.raisedPanel, in: Capsule())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Browse Codex threads")
+            .accessibilityLabel("Browse \(viewModel.provider.displayName) threads")
 
             Spacer(minLength: 0)
         }
@@ -573,7 +678,7 @@ private struct CodexThreadPickerSheet: View {
             .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search threads")
             .scrollContentBackground(.hidden)
             .background(AppTheme.bgCanvas)
-            .navigationTitle("Threads")
+            .navigationTitle("\(viewModel.provider.displayName) Threads")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -599,7 +704,7 @@ private struct CodexThreadPickerSheet: View {
 
     private var emptyMessage: String {
         searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? "Run a Codex job on EC2 and it will appear here."
+            ? "Run a \(viewModel.provider.displayName) job on EC2 and it will appear here."
             : searchText
     }
 }
@@ -693,33 +798,54 @@ private struct CodexThreadRow: View {
     }()
 }
 
+struct CodexControlStripLayout: Equatable {
+    let controlHeight: CGFloat = 36
+    let visibleRowCount = 3
+    let showsSkillButton: Bool
+    let reservesSkillSlot: Bool
+    let showsRunMode: Bool
+
+    init(provider: CodexProvider) {
+        showsSkillButton = provider == .codex
+        reservesSkillSlot = provider != .codex
+        showsRunMode = provider == .codex
+    }
+}
+
 private struct CodexControlStrip: View {
     @ObservedObject var viewModel: CodexConsoleViewModel
     let skillCount: Int
+    let showsSkillControls: Bool
     let onSkillsTapped: () -> Void
-
-    private let models = [
-        "gpt-5.5",
-        "gpt-5.4",
-        "gpt-5.4-mini",
-        "gpt-5.3-codex",
-        "gpt-5.3-codex-spark",
-        "gpt-5.2"
-    ]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
-                skillsButton
+                if layout.showsSkillButton && showsSkillControls {
+                    skillsButton
+                } else if layout.reservesSkillSlot {
+                    Color.clear
+                        .frame(width: 1, height: layout.controlHeight)
+                        .accessibilityHidden(true)
+                }
                 Spacer(minLength: 0)
             }
+            .frame(height: layout.controlHeight, alignment: .leading)
 
             HStack(spacing: 10) {
                 modelMenu
+                if layout.showsRunMode {
+                    modeMenu
+                }
+                Spacer(minLength: 0)
+            }
+            .frame(height: layout.controlHeight, alignment: .leading)
+
+            HStack(spacing: 10) {
                 reasoningMenu
                 Spacer(minLength: 0)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(height: layout.controlHeight, alignment: .leading)
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -728,6 +854,10 @@ private struct CodexControlStrip: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .stroke(CodexTheme.stroke, lineWidth: 1)
         }
+    }
+
+    private var layout: CodexControlStripLayout {
+        CodexControlStripLayout(provider: viewModel.provider)
     }
 
     private var skillsButton: some View {
@@ -750,12 +880,12 @@ private struct CodexControlStrip: View {
             )
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Choose Codex skills")
+        .accessibilityLabel("Choose \(viewModel.provider.displayName) skills")
     }
 
     private var modelMenu: some View {
         Menu {
-            ForEach(models, id: \.self) { model in
+            ForEach(viewModel.modelOptions, id: \.self) { model in
                 Button {
                     viewModel.selectedModel = model
                 } label: {
@@ -779,16 +909,17 @@ private struct CodexControlStrip: View {
             }
             .foregroundStyle(CodexTheme.text)
             .padding(.horizontal, 12)
+            .frame(minWidth: 132, alignment: .leading)
             .frame(height: 36)
             .background(CodexTheme.raisedPanel, in: Capsule())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Choose model")
+        .accessibilityLabel("Choose \(viewModel.provider.displayName) model")
     }
 
     private var reasoningMenu: some View {
         Menu {
-            ForEach(CodexReasoningEffort.allCases) { effort in
+            ForEach(viewModel.reasoningEffortOptions) { effort in
                 Button {
                     viewModel.selectedReasoningEffort = effort
                 } label: {
@@ -806,17 +937,54 @@ private struct CodexControlStrip: View {
                 Text(viewModel.selectedReasoningEffort.label)
                     .font(.caption.weight(.bold))
                     .lineLimit(1)
+                    .minimumScaleFactor(0.82)
                 Image(systemName: "chevron.down")
                     .font(.caption2.weight(.bold))
             }
             .foregroundStyle(CodexTheme.text)
             .padding(.horizontal, 12)
+            .frame(minWidth: 110, alignment: .leading)
             .frame(height: 36)
             .background(CodexTheme.raisedPanel, in: Capsule())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Choose reasoning effort")
+        .accessibilityLabel("Choose \(viewModel.provider == .claude ? "Claude effort" : "reasoning effort")")
         .accessibilityValue(viewModel.selectedReasoningEffort.label)
+    }
+
+    private var modeMenu: some View {
+        Menu {
+            ForEach(CodexRunMode.allCases) { mode in
+                Button {
+                    viewModel.selectedRunMode = mode
+                } label: {
+                    if mode == viewModel.selectedRunMode {
+                        Label(mode.label, systemImage: "checkmark")
+                    } else {
+                        Text(mode.label)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: viewModel.selectedRunMode == .speed ? "bolt.fill" : "dial.medium")
+                    .font(.caption.weight(.bold))
+                Text(viewModel.selectedRunMode.label)
+                    .font(.caption.weight(.bold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.82)
+                Image(systemName: "chevron.down")
+                    .font(.caption2.weight(.bold))
+            }
+            .foregroundStyle(viewModel.selectedRunMode == .speed ? AppTheme.bgCanvas : CodexTheme.text)
+            .padding(.horizontal, 12)
+            .frame(minWidth: 118, alignment: .leading)
+            .frame(height: 36)
+            .background(viewModel.selectedRunMode == .speed ? CodexTheme.accent : CodexTheme.raisedPanel, in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Choose Codex run mode")
+        .accessibilityValue(viewModel.selectedRunMode.label)
     }
 }
 
@@ -847,6 +1015,168 @@ private struct CodexSelectedSkillStrip: View {
                 }
             }
             .padding(.vertical, 2)
+        }
+    }
+}
+
+private struct CodexAttachmentMenu: View {
+    let disabled: Bool
+    @Binding var showingPhotoPicker: Bool
+    @Binding var showingDocumentPicker: Bool
+    @Binding var showingCameraPicker: Bool
+
+    var body: some View {
+        Menu {
+            Button {
+                showingPhotoPicker = true
+            } label: {
+                Label("Photo library", systemImage: "photo.on.rectangle")
+            }
+
+            Button {
+                showingDocumentPicker = true
+            } label: {
+                Label("Files", systemImage: "doc")
+            }
+
+            if UIImagePickerController.isSourceTypeAvailable(.camera) {
+                Button {
+                    showingCameraPicker = true
+                } label: {
+                    Label("Camera", systemImage: "camera")
+                }
+            }
+        } label: {
+            Image(systemName: "paperclip")
+                .font(.system(size: 15, weight: .bold))
+                .foregroundStyle(disabled ? CodexTheme.dim : CodexTheme.text)
+                .frame(width: 44, height: 44)
+                .background(CodexTheme.raisedPanel, in: Circle())
+                .overlay {
+                    Circle().stroke(CodexTheme.stroke, lineWidth: 1)
+                }
+        }
+        .disabled(disabled)
+        .accessibilityLabel("Attach file")
+    }
+}
+
+private struct CodexAttachmentTray: View {
+    let attachments: [CodexJobAttachment]
+    let onRemove: (CodexJobAttachment) -> Void
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(attachments) { attachment in
+                    HStack(spacing: 7) {
+                        Image(systemName: symbol(for: attachment.contentType))
+                            .font(.caption.weight(.bold))
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(attachment.filename)
+                                .font(.caption.weight(.semibold))
+                                .lineLimit(1)
+                            Text(byteText(attachment.byteCount))
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(CodexTheme.dim)
+                        }
+                        Button {
+                            onRemove(attachment)
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(CodexTheme.dim)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Remove \(attachment.filename)")
+                    }
+                    .foregroundStyle(CodexTheme.text)
+                    .padding(.horizontal, 10)
+                    .frame(height: 44)
+                    .background(CodexTheme.raisedPanel, in: Capsule())
+                }
+            }
+            .padding(.vertical, 2)
+        }
+    }
+
+    private func symbol(for contentType: String) -> String {
+        if contentType.hasPrefix("image/") { return "photo" }
+        if contentType == "application/pdf" { return "doc.richtext" }
+        return "doc"
+    }
+
+    private func byteText(_ bytes: Int) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    }
+}
+
+private struct CodexDocumentPicker: UIViewControllerRepresentable {
+    let onPick: ([URL]) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onPick: onPick)
+    }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: true)
+        picker.allowsMultipleSelection = true
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let onPick: ([URL]) -> Void
+
+        init(onPick: @escaping ([URL]) -> Void) {
+            self.onPick = onPick
+        }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            onPick(urls)
+        }
+    }
+}
+
+private struct CodexCameraPicker: UIViewControllerRepresentable {
+    let onImageData: (Data) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onImageData: onImageData)
+    }
+
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let picker = UIImagePickerController()
+        picker.sourceType = .camera
+        picker.mediaTypes = ["public.image"]
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIImagePickerController, context: Context) {}
+
+    final class Coordinator: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
+        let onImageData: (Data) -> Void
+
+        init(onImageData: @escaping (Data) -> Void) {
+            self.onImageData = onImageData
+        }
+
+        func imagePickerController(
+            _ picker: UIImagePickerController,
+            didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
+        ) {
+            if let image = info[.originalImage] as? UIImage,
+               let data = image.jpegData(compressionQuality: 0.86) {
+                onImageData(data)
+            }
+            picker.dismiss(animated: true)
+        }
+
+        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+            picker.dismiss(animated: true)
         }
     }
 }
@@ -988,9 +1318,15 @@ private struct CodexThreadFeedSection: View {
             .padding(.horizontal, 2)
 
             if viewModel.isRefreshing && viewModel.threadFeedItems.isEmpty {
-                CodexEmptyState(symbol: "arrow.triangle.2.circlepath", title: "Loading threads", message: "Fetching Codex activity.")
+                CodexEmptyState(symbol: "arrow.triangle.2.circlepath", title: "Loading threads", message: "Fetching \(viewModel.provider.displayName) activity.")
+            } else if viewModel.connectionNotice != nil && viewModel.threadFeedItems.isEmpty && viewModel.lastRefreshedAt == nil {
+                CodexEmptyState(
+                    symbol: "wifi.exclamationmark",
+                    title: viewModel.connectionNoticeTitle,
+                    message: viewModel.connectionNoticeMessage
+                )
             } else if viewModel.threadFeedItems.isEmpty {
-                CodexEmptyState(symbol: "bubble.left.and.bubble.right", title: "No threads yet", message: "Send a prompt and its thread will appear here.")
+                CodexEmptyState(symbol: "bubble.left.and.bubble.right", title: "No threads yet", message: "Send a \(viewModel.provider.displayName) prompt and its thread will appear here.")
             } else {
                 VStack(spacing: 10) {
                     ForEach(viewModel.threadFeedItems) { item in
@@ -1011,6 +1347,12 @@ private struct CodexThreadFeedSection: View {
     private var summaryText: String {
         if viewModel.isRefreshing && viewModel.threadFeedItems.isEmpty {
             return "Loading..."
+        }
+        if viewModel.connectionNotice != nil && viewModel.threadFeedItems.isEmpty && viewModel.lastRefreshedAt == nil {
+            return "Reconnecting..."
+        }
+        if viewModel.connectionNotice != nil && !viewModel.threadFeedItems.isEmpty {
+            return "Showing last loaded threads"
         }
         let count = viewModel.threadFeedItems.count
         if count == 0 {
@@ -1199,6 +1541,39 @@ private struct CodexErrorCard: View {
     }
 }
 
+private struct CodexNoticeCard: View {
+    let symbol: String
+    let title: String
+    let message: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: symbol)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(CodexTheme.accent)
+                .padding(.top, 2)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(CodexTheme.text)
+                Text(message)
+                    .font(.callout)
+                    .foregroundStyle(CodexTheme.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(14)
+        .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(CodexTheme.stroke, lineWidth: 1)
+        }
+    }
+}
+
 private struct CodexPillButtonStyle: ButtonStyle {
     var isAccent = false
 
@@ -1239,6 +1614,34 @@ private struct CodexEmptyState: View {
     }
 }
 
+private struct CodexLoadNotice: Equatable {
+    let symbol: String
+    let title: String
+    let message: String
+
+    static let jobUnavailable = CodexLoadNotice(
+        symbol: "terminal",
+        title: "Run unavailable",
+        message: "This run is no longer available in job history. The thread can still be continued from its saved context."
+    )
+
+    static let latestRunUnavailable = CodexLoadNotice(
+        symbol: "clock.badge.exclamationmark",
+        title: "Latest run unavailable",
+        message: "The latest run is no longer available in job history. Showing the saved thread context instead."
+    )
+
+    static func connectionInterrupted(provider: CodexProvider, hasCachedContent: Bool) -> CodexLoadNotice {
+        CodexLoadNotice(
+            symbol: "wifi.exclamationmark",
+            title: hasCachedContent ? "Refresh skipped" : "\(provider.displayName) is reconnecting",
+            message: hasCachedContent
+                ? "The connection dropped while refreshing. Keeping the content already loaded here."
+                : "The connection dropped while loading this run. Try refresh once the phone reconnects."
+        )
+    }
+}
+
 private struct CodexJobDetailView: View {
     let jobID: String
     @ObservedObject var viewModel: CodexConsoleViewModel
@@ -1247,6 +1650,7 @@ private struct CodexJobDetailView: View {
 
     @State private var job: CodexJob?
     @State private var errorMessage: String?
+    @State private var loadNotice: CodexLoadNotice?
     @State private var isLoading = false
     @State private var isRetrying = false
     @State private var isLoadingFullActivity = false
@@ -1257,6 +1661,14 @@ private struct CodexJobDetailView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
+                    if let loadNotice {
+                        CodexNoticeCard(
+                            symbol: loadNotice.symbol,
+                            title: loadNotice.title,
+                            message: loadNotice.message
+                        )
+                    }
+
                     if let errorMessage {
                         CodexErrorCard(summary: CodexErrorSummary(message: errorMessage)) {
                             Task { await load() }
@@ -1288,8 +1700,12 @@ private struct CodexJobDetailView: View {
                         }
                     } else if isLoading {
                         CodexEmptyState(symbol: "arrow.triangle.2.circlepath", title: "Loading job", message: jobID)
-                    } else {
-                        CodexEmptyState(symbol: "terminal", title: "Job unavailable", message: jobID)
+                    } else if loadNotice == nil {
+                        CodexEmptyState(
+                            symbol: "terminal",
+                            title: "Run unavailable",
+                            message: "This run could not be loaded from job history."
+                        )
                     }
                 }
                 .padding(16)
@@ -1359,7 +1775,7 @@ private struct CodexJobDetailView: View {
 
     private func answerEmptyText(for job: CodexJob) -> String {
         if job.status.isActive {
-            return "Codex is still working. Pull to refresh or wait for the answer to appear here."
+            return "\(viewModel.provider.displayName) is still working. Pull to refresh or wait for the answer to appear here."
         }
         if job.rawActivityPreview.originalCharacterCount > 0 {
             return "This job has raw activity logs but no clean answer was captured. Open Activity log below."
@@ -1386,8 +1802,19 @@ private struct CodexJobDetailView: View {
         do {
             job = try await viewModel.loadJob(id: jobID, includeFullLogs: includeFullLogs)
             errorMessage = nil
+            loadNotice = nil
         } catch {
-            errorMessage = error.localizedDescription
+            if CodexConsoleViewModel.isHTTPNotFound(error) {
+                job = nil
+                errorMessage = nil
+                loadNotice = .jobUnavailable
+            } else if CodexConsoleViewModel.isTransientConnection(error) {
+                errorMessage = nil
+                loadNotice = .connectionInterrupted(provider: viewModel.provider, hasCachedContent: job != nil)
+            } else {
+                loadNotice = nil
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -1416,59 +1843,90 @@ private struct CodexThreadDetailView: View {
     @ObservedObject var viewModel: CodexConsoleViewModel
     let onOpenJob: (String) -> Void
 
+    @State private var threadDetail: CodexThreadDetail?
+    @State private var threadDetailError: String?
     @State private var latestJob: CodexJob?
     @State private var latestJobError: String?
+    @State private var latestJobNotice: CodexLoadNotice?
+    @State private var isLoadingThreadDetail = false
     @State private var isLoadingLatestJob = false
 
     private var thread: CodexThread? {
-        viewModel.threads.first { $0.sessionId == sessionID || $0.id == sessionID }
+        threadDetail?.thread ?? viewModel.threads.first { $0.sessionId == sessionID || $0.id == sessionID }
     }
 
     private var latestJobID: String? {
         thread?.lastJobId
     }
 
+    private var chatItems: [CodexThreadChatItem] {
+        CodexThreadChatItem.makeTranscript(
+            detail: threadDetail,
+            thread: thread,
+            latestJob: latestJob
+        )
+    }
+
     var body: some View {
         ZStack {
             CodexTheme.background.ignoresSafeArea()
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    CodexThreadOverviewCard(thread: thread, sessionID: sessionID)
+            ScrollViewReader { scrollProxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        CodexThreadOverviewCard(
+                            provider: viewModel.provider,
+                            thread: thread,
+                            sessionID: sessionID
+                        )
 
-                    if let thread, thread.hasActiveJobs {
-                        CodexThreadProgressCard(
-                            latestJob: latestJob,
-                            isLoadingLogs: isLoadingLatestJob,
-                            loadError: latestJobError
+                        if let thread, thread.hasActiveJobs {
+                            CodexThreadProgressCard(
+                                latestJob: latestJob,
+                                provider: viewModel.provider,
+                                isLoadingLogs: isLoadingLatestJob,
+                                loadError: latestJobError,
+                                loadNotice: latestJobNotice
+                            ) {
+                                Task { await loadLatestJob(includeFullLogs: true) }
+                            }
+                        }
+
+                        CodexThreadChatTranscriptView(
+                            provider: viewModel.provider,
+                            thread: thread,
+                            items: chatItems,
+                            isLoading: isLoadingThreadDetail,
+                            loadError: threadDetailError,
+                            loadNotice: latestJobNotice
                         ) {
-                            Task { await loadLatestJob(includeFullLogs: true) }
+                            Task { await refreshThreadDetailAndLatestJob() }
                         }
                     }
-
-                    CodexThreadLatestAnswerCard(
-                        thread: thread,
-                        latestJob: latestJob,
-                        isLoadingFullAnswer: isLoadingLatestJob,
-                        loadError: latestJobError
-                    ) {
-                        Task { await loadLatestJob(includeFullLogs: true) }
+                    .padding(16)
+                    .padding(.bottom, 18)
+                }
+                .scrollDismissesKeyboard(.interactively)
+                .onChange(of: chatItems.count) { _, _ in
+                    guard let lastID = chatItems.last?.id else { return }
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        scrollProxy.scrollTo(lastID, anchor: .bottom)
                     }
                 }
-                .padding(16)
-                .padding(.bottom, 164)
             }
-            .scrollDismissesKeyboard(.interactively)
         }
         .safeAreaInset(edge: .bottom) {
             CodexThreadComposerDock(
                 sessionID: sessionID,
                 workspaceID: thread?.workspaceId ?? viewModel.selectedWorkspaceID,
-                viewModel: viewModel
+                viewModel: viewModel,
+                onSent: {
+                    Task { await refreshThreadDetailAndLatestJob() }
+                }
             )
-            .padding(.horizontal, 16)
+            .padding(.horizontal, 12)
             .padding(.top, 10)
-            .padding(.bottom, 10)
+            .padding(.bottom, 8)
             .background(CodexTheme.background.opacity(0.97))
         }
         .navigationTitle(thread?.displayTitle ?? String(sessionID.prefix(10)))
@@ -1486,8 +1944,7 @@ private struct CodexThreadDetailView: View {
 
                 Button {
                     Task {
-                        await viewModel.refreshJobs()
-                        await viewModel.refreshThreads()
+                        await refreshThreadDetailAndLatestJob()
                     }
                 } label: {
                     Image(systemName: "arrow.clockwise")
@@ -1497,16 +1954,45 @@ private struct CodexThreadDetailView: View {
             }
         }
         .refreshable {
-            await viewModel.refreshJobs()
-            await viewModel.refreshThreads()
-            await loadLatestJob(includeFullLogs: true)
+            await refreshThreadDetailAndLatestJob(includeFullLogs: true)
         }
         .task(id: sessionID) {
             viewModel.selectSessionID(sessionID, workspaceID: thread?.workspaceId)
-            await viewModel.refreshThreads()
+            await refreshThreadDetailAndLatestJob()
         }
         .task(id: latestJobID) {
             await loadLatestJob()
+        }
+    }
+
+    private func refreshThreadDetailAndLatestJob(includeFullLogs: Bool = false) async {
+        await viewModel.refreshJobs()
+        await viewModel.refreshThreads()
+        await loadThreadDetail()
+        await loadLatestJob(includeFullLogs: includeFullLogs)
+    }
+
+    private func loadThreadDetail() async {
+        isLoadingThreadDetail = true
+        defer { isLoadingThreadDetail = false }
+
+        do {
+            let detail = try await viewModel.loadThreadDetail(sessionID: sessionID)
+            threadDetail = detail
+            threadDetailError = nil
+            if latestJob == nil, let latestJobID = detail.thread.lastJobId {
+                latestJob = detail.jobs.first { $0.id == latestJobID }
+            }
+        } catch {
+            if CodexConsoleViewModel.isTransientConnection(error) {
+                threadDetailError = threadDetail == nil
+                    ? "Could not load the full chat yet. Showing the saved summary."
+                    : nil
+            } else if CodexConsoleViewModel.isHTTPNotFound(error) {
+                threadDetailError = "Full chat is not available for this thread yet."
+            } else {
+                threadDetailError = error.localizedDescription
+            }
         }
     }
 
@@ -1514,6 +2000,7 @@ private struct CodexThreadDetailView: View {
         guard let latestJobID else {
             latestJob = nil
             latestJobError = nil
+            latestJobNotice = nil
             return
         }
         isLoadingLatestJob = true
@@ -1522,26 +2009,38 @@ private struct CodexThreadDetailView: View {
         do {
             latestJob = try await viewModel.loadJob(id: latestJobID, includeFullLogs: includeFullLogs)
             latestJobError = nil
+            latestJobNotice = nil
         } catch {
-            latestJobError = error.localizedDescription
+            if CodexConsoleViewModel.isHTTPNotFound(error) {
+                latestJob = nil
+                latestJobError = nil
+                latestJobNotice = .latestRunUnavailable
+            } else if CodexConsoleViewModel.isTransientConnection(error) {
+                latestJobError = nil
+                latestJobNotice = .connectionInterrupted(provider: viewModel.provider, hasCachedContent: latestJob != nil)
+            } else {
+                latestJobNotice = nil
+                latestJobError = error.localizedDescription
+            }
         }
     }
 }
 
 private struct CodexThreadOverviewCard: View {
+    let provider: CodexProvider
     let thread: CodexThread?
     let sessionID: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             VStack(alignment: .leading, spacing: 6) {
-                Text(thread?.displayTitle ?? "Codex thread")
+                Text(thread?.displayTitle ?? "\(provider.displayName) thread")
                     .font(.title3.weight(.semibold))
                     .foregroundStyle(CodexTheme.text)
                     .fixedSize(horizontal: false, vertical: true)
 
                 HStack(spacing: 8) {
-                    Text(thread?.workspaceLabel ?? "Codex")
+                    Text(thread?.workspaceLabel ?? provider.displayName)
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(CodexTheme.dim)
                     if let status = thread?.lastJobStatus {
@@ -1574,8 +2073,10 @@ private struct CodexThreadOverviewCard: View {
 
 private struct CodexThreadProgressCard: View {
     let latestJob: CodexJob?
+    let provider: CodexProvider
     let isLoadingLogs: Bool
     let loadError: String?
+    let loadNotice: CodexLoadNotice?
     let onLoadLogs: () -> Void
     @State private var isExpanded = false
 
@@ -1592,7 +2093,7 @@ private struct CodexThreadProgressCard: View {
                 HStack(spacing: 10) {
                     ProgressView()
                         .tint(CodexTheme.accent)
-                    Text("Codex is working in this thread")
+                    Text("\(provider.displayName) is working in this thread")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(CodexTheme.text)
                     Spacer()
@@ -1623,7 +2124,12 @@ private struct CodexThreadProgressCard: View {
                     .disabled(isLoadingLogs)
                 }
 
-                if let loadError = CodexThreadText.trimmed(loadError) {
+                if let loadNotice {
+                    Text(loadNotice.message)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(CodexTheme.dim)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if let loadError = CodexThreadText.trimmed(loadError) {
                     Text(loadError)
                         .font(.caption.weight(.medium))
                         .foregroundStyle(AppTheme.statusError)
@@ -1656,6 +2162,9 @@ private struct CodexThreadProgressCard: View {
 
     private var logText: String {
         guard let latestJob else {
+            if let loadNotice {
+                return loadNotice.message
+            }
             return isLoadingLogs ? "Loading latest activity..." : "Tap Refresh to load the latest activity."
         }
         return latestJob.rawActivityPreview.text
@@ -1663,6 +2172,9 @@ private struct CodexThreadProgressCard: View {
 
     private var logStatusText: String {
         guard let latestJob else {
+            if loadNotice != nil {
+                return "Logs unavailable"
+            }
             return isLoadingLogs ? "Loading latest activity" : "No activity loaded"
         }
         if latestJob.rawActivityPreview.isTruncated {
@@ -1675,11 +2187,249 @@ private struct CodexThreadProgressCard: View {
     }
 }
 
+private struct CodexThreadChatTranscriptView: View {
+    let provider: CodexProvider
+    let thread: CodexThread?
+    let items: [CodexThreadChatItem]
+    let isLoading: Bool
+    let loadError: String?
+    let loadNotice: CodexLoadNotice?
+    let onRefresh: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Chat")
+                        .font(.headline.weight(.semibold))
+                        .foregroundStyle(CodexTheme.text)
+                    Text(subtitle)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(CodexTheme.dim)
+                        .lineLimit(1)
+                }
+
+                Spacer()
+
+                Button(action: onRefresh) {
+                    if isLoading {
+                        ProgressView()
+                            .tint(CodexTheme.text)
+                            .frame(width: 32, height: 32)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(CodexTheme.text)
+                            .frame(width: 32, height: 32)
+                    }
+                }
+                .background(CodexTheme.raisedPanel, in: Circle())
+                .buttonStyle(.plain)
+                .accessibilityLabel("Refresh chat")
+            }
+
+            if let loadError = CodexThreadText.trimmed(loadError) {
+                Text(loadError)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(AppTheme.statusError)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if let loadNotice {
+                Text(loadNotice.message)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(CodexTheme.dim)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if items.isEmpty {
+                CodexEmptyState(
+                    symbol: "bubble.left.and.bubble.right",
+                    title: thread?.hasActiveJobs == true ? "Waiting for answer" : "No chat yet",
+                    message: thread?.hasActiveJobs == true
+                        ? "\(provider.displayName) is working. This chat will update as soon as the backend records a response."
+                        : "Send a reply below to continue this thread."
+                )
+            } else {
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    ForEach(items) { item in
+                        CodexThreadChatBubble(provider: provider, item: item)
+                            .id(item.id)
+                    }
+                }
+            }
+        }
+    }
+
+    private var subtitle: String {
+        if items.isEmpty {
+            return isLoading ? "Loading full thread" : "Thread history"
+        }
+        let turnCount = max(1, items.filter { $0.role == .user }.count)
+        let countText = turnCount == 1 ? "1 turn" : "\(turnCount) turns"
+        let progressCount = items.reduce(0) { $0 + $1.progressCount }
+        let progressText = progressCount > 0 ? " · \(progressCount) updates collapsed" : ""
+        if thread?.hasActiveJobs == true {
+            return "\(countText)\(progressText) · live"
+        }
+        return "\(countText)\(progressText)"
+    }
+}
+
+private struct CodexThreadChatBubble: View {
+    let provider: CodexProvider
+    let item: CodexThreadChatItem
+    @State private var isExpanded = false
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            if item.alignment == .trailing {
+                Spacer(minLength: 20)
+            }
+
+            VStack(alignment: bubbleAlignment, spacing: 7) {
+                HStack(spacing: 6) {
+                    Text(speakerLabel)
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(headerColor)
+                    if let timestampText {
+                        Text(timestampText)
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(item.role == .user ? AppTheme.bgCanvas.opacity(0.62) : CodexTheme.dim)
+                    }
+                }
+
+                if shouldShowBody {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(Array(visibleSegments.enumerated()), id: \.offset) { _, segment in
+                            switch segment.kind {
+                            case .prose:
+                                CodexMarkdownProse(text: segment.text, color: bodyColor)
+                            case .code(let language):
+                                CodexMarkdownCode(text: segment.text, language: language)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .lineLimit(shouldCollapse ? 8 : nil)
+                } else if item.progressCount > 0 {
+                    Text("\(item.progressCount) progress \(item.progressCount == 1 ? "update" : "updates")")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(CodexTheme.muted)
+                }
+
+                if item.isLong {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            isExpanded.toggle()
+                        }
+                    } label: {
+                        Label(expandButtonTitle, systemImage: isExpanded ? "chevron.up" : "chevron.down")
+                    }
+                    .buttonStyle(CodexPillButtonStyle(isAccent: item.role == .assistant || item.kind == .progressSummary))
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 11)
+            .frame(maxWidth: bubbleMaxWidth, alignment: alignment)
+            .background(background, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .stroke(strokeColor, lineWidth: item.role == .user ? 0 : 1)
+            }
+
+            if item.alignment == .leading {
+                Spacer(minLength: 20)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: alignment)
+    }
+
+    private var shouldCollapse: Bool {
+        item.kind != .progressSummary && item.isLong && !isExpanded
+    }
+
+    private var shouldShowBody: Bool {
+        item.kind != .progressSummary || isExpanded
+    }
+
+    private var expandButtonTitle: String {
+        if item.kind == .progressSummary {
+            return isExpanded ? "Hide updates" : "Open updates"
+        }
+        return isExpanded ? "Collapse" : "Open"
+    }
+
+    private var visibleSegments: [CodexMarkdownSegment] {
+        CodexMarkdownParser.segments(from: item.text)
+    }
+
+    private var speakerLabel: String {
+        item.role == .assistant ? provider.displayName : item.speakerLabel
+    }
+
+    private var alignment: Alignment {
+        switch item.alignment {
+        case .leading:
+            return .leading
+        case .trailing:
+            return .trailing
+        case .center:
+            return .center
+        }
+    }
+
+    private var bubbleAlignment: HorizontalAlignment {
+        item.alignment == .trailing ? .trailing : .leading
+    }
+
+    private var bubbleMaxWidth: CGFloat {
+        item.alignment == .center ? .infinity : 310
+    }
+
+    private var cornerRadius: CGFloat {
+        item.role == .user ? 18 : 14
+    }
+
+    private var background: Color {
+        switch item.role {
+        case .user:
+            return CodexTheme.accent
+        case .assistant:
+            return CodexTheme.panel
+        case .status:
+            return item.isError ? AppTheme.statusError.opacity(0.12) : CodexTheme.raisedPanel.opacity(item.kind == .progressSummary ? 0.72 : 1)
+        }
+    }
+
+    private var strokeColor: Color {
+        item.isError ? AppTheme.statusError.opacity(0.42) : CodexTheme.stroke
+    }
+
+    private var headerColor: Color {
+        item.role == .user ? AppTheme.bgCanvas.opacity(0.72) : CodexTheme.dim
+    }
+
+    private var bodyColor: Color {
+        item.role == .user ? AppTheme.bgCanvas.opacity(0.92) : CodexTheme.text
+    }
+
+    private var timestampText: String? {
+        guard let timestamp = item.timestamp else { return nil }
+        return Self.relativeFormatter.localizedString(for: timestamp, relativeTo: Date())
+    }
+
+    private static let relativeFormatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter
+    }()
+}
+
 private struct CodexThreadLatestAnswerCard: View {
     let thread: CodexThread?
     let latestJob: CodexJob?
     let isLoadingFullAnswer: Bool
     let loadError: String?
+    let loadNotice: CodexLoadNotice?
     let onLoadFullAnswer: () -> Void
 
     var body: some View {
@@ -1701,6 +2451,12 @@ private struct CodexThreadLatestAnswerCard: View {
                 isLoadingFullAnswer: isLoadingFullAnswer,
                 loadError: loadError,
                 onLoadFullAnswer: onLoadFullAnswer
+            )
+        } else if let loadNotice {
+            CodexNoticeCard(
+                symbol: loadNotice.symbol,
+                title: loadNotice.title,
+                message: loadNotice.message
             )
         } else {
             CodexEmptyState(
@@ -1825,15 +2581,37 @@ private struct CodexThreadComposerDock: View {
     let sessionID: String
     let workspaceID: String?
     @ObservedObject var viewModel: CodexConsoleViewModel
+    let onSent: () -> Void
 
     @State private var replyText = ""
     @State private var isSending = false
     @State private var lastSubmittedJobID: String?
+    @State private var showingOptions = false
+    @State private var showingSkillPicker = false
+    @State private var showingPhotoPicker = false
+    @State private var selectedPhotoItems: [PhotosPickerItem] = []
+    @State private var showingDocumentPicker = false
+    @State private var showingCameraPicker = false
+    @State private var attachments: [CodexJobAttachment] = []
     @StateObject private var audioRecorder = CodexPromptAudioRecorder()
     @FocusState private var isFocused: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
+            if showsExpandedControls {
+                CodexControlStrip(
+                    viewModel: viewModel,
+                    skillCount: viewModel.selectedSkills.count,
+                    showsSkillControls: viewModel.provider == .codex
+                ) {
+                    showingSkillPicker = true
+                }
+            }
+
+            if viewModel.provider == .codex && !viewModel.selectedSkills.isEmpty {
+                CodexSelectedSkillStrip(viewModel: viewModel)
+            }
+
             ZStack(alignment: .topLeading) {
                 if replyText.isEmpty {
                     Text("Reply to this thread...")
@@ -1851,7 +2629,13 @@ private struct CodexThreadComposerDock: View {
                     .textInputAutocapitalization(.sentences)
                     .autocorrectionDisabled()
                     .focused($isFocused)
-                    .frame(minHeight: 74, maxHeight: 124)
+                    .frame(minHeight: textEditorHeight, maxHeight: expandedForTyping ? 112 : 46)
+            }
+
+            if !attachments.isEmpty {
+                CodexAttachmentTray(attachments: attachments) { attachment in
+                    attachments.removeAll { $0.id == attachment.id }
+                }
             }
 
             HStack(spacing: 10) {
@@ -1861,6 +2645,29 @@ private struct CodexThreadComposerDock: View {
                     .lineLimit(1)
 
                 Spacer()
+
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        showingOptions.toggle()
+                    }
+                } label: {
+                    Label(optionsLabel, systemImage: "slider.horizontal.3")
+                        .labelStyle(.iconOnly)
+                        .frame(width: 38, height: 38)
+                }
+                .background(showsExpandedControls ? CodexTheme.accent.opacity(0.16) : CodexTheme.raisedPanel, in: Circle())
+                .overlay {
+                    Circle().stroke(showsExpandedControls ? CodexTheme.accent.opacity(0.45) : CodexTheme.stroke, lineWidth: 1)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(optionsLabel)
+
+                CodexAttachmentMenu(
+                    disabled: isSending || viewModel.isCreating || viewModel.isTranscribing,
+                    showingPhotoPicker: $showingPhotoPicker,
+                    showingDocumentPicker: $showingDocumentPicker,
+                    showingCameraPicker: $showingCameraPicker
+                )
 
                 Button {
                     toggleRecording()
@@ -1890,12 +2697,16 @@ private struct CodexThreadComposerDock: View {
                     Task { await send() }
                 } label: {
                     Label(isSending ? "Sending" : "Send", systemImage: "paperplane.fill")
+                        .font(.caption.weight(.bold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
+                        .frame(minWidth: 82)
                 }
                 .buttonStyle(CodexPillButtonStyle(isAccent: true))
                 .disabled(!canSend)
             }
         }
-        .padding(12)
+        .padding(10)
         .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
@@ -1912,10 +2723,41 @@ private struct CodexThreadComposerDock: View {
                 .font(.body.weight(.semibold))
             }
         }
+        .sheet(isPresented: $showingSkillPicker) {
+            CodexSkillPickerSheet(viewModel: viewModel)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+        }
+        .sheet(isPresented: $showingDocumentPicker) {
+            CodexDocumentPicker { urls in
+                Task { await importDocuments(urls) }
+            }
+        }
+        .fullScreenCover(isPresented: $showingCameraPicker) {
+            CodexCameraPicker { data in
+                appendAttachment(
+                    data: data,
+                    filename: "camera-\(Self.fileTimestamp()).jpg",
+                    contentType: "image/jpeg"
+                )
+            }
+            .ignoresSafeArea()
+        }
+        .photosPicker(
+            isPresented: $showingPhotoPicker,
+            selection: $selectedPhotoItems,
+            maxSelectionCount: 6,
+            matching: .images
+        )
+        .onChange(of: selectedPhotoItems) { _, items in
+            Task { await importPhotos(items) }
+        }
+        .animation(.easeInOut(duration: 0.18), value: showsExpandedControls)
+        .animation(.easeInOut(duration: 0.18), value: expandedForTyping)
     }
 
     private var canSend: Bool {
-        !replyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        (!replyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
             && !isSending
             && !viewModel.isCreating
             && !viewModel.isTranscribing
@@ -1929,7 +2771,30 @@ private struct CodexThreadComposerDock: View {
         if let lastSubmittedJobID {
             return "Sent \(String(lastSubmittedJobID.prefix(8)))"
         }
+        if !attachments.isEmpty {
+            return "\(attachments.count) attached"
+        }
         return "Thread \(String(sessionID.prefix(8)))"
+    }
+
+    private var expandedForTyping: Bool {
+        isFocused || !replyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var showsExpandedControls: Bool {
+        showingOptions || expandedForTyping || !attachments.isEmpty || (viewModel.provider == .codex && !viewModel.selectedSkills.isEmpty)
+    }
+
+    private var textEditorHeight: CGFloat {
+        expandedForTyping ? 72 : 36
+    }
+
+    private var optionsLabel: String {
+        if viewModel.provider == .codex {
+            let skillText = viewModel.selectedSkills.isEmpty ? "skills" : "\(viewModel.selectedSkills.count) skills"
+            return "\(viewModel.selectedRunMode.label), \(viewModel.selectedReasoningEffort.label), \(skillText)"
+        }
+        return "\(viewModel.selectedModel), \(viewModel.selectedReasoningEffort.label)"
     }
 
     private func toggleRecording() {
@@ -1966,16 +2831,82 @@ private struct CodexThreadComposerDock: View {
         }
     }
 
+    private func appendAttachment(data: Data, filename: String, contentType: String) {
+        guard let attachment = viewModel.makeAttachment(
+            data: data,
+            filename: filename,
+            contentType: contentType,
+            existing: attachments
+        ) else {
+            return
+        }
+        attachments.append(attachment)
+    }
+
+    private func importPhotos(_ items: [PhotosPickerItem]) async {
+        guard !items.isEmpty else { return }
+        for item in items {
+            guard let data = try? await item.loadTransferable(type: Data.self) else {
+                await MainActor.run { viewModel.errorMessage = "Could not read the selected photo." }
+                continue
+            }
+            let contentType = item.supportedContentTypes.first(where: { $0.conforms(to: .image) }) ?? .jpeg
+            await MainActor.run {
+                appendAttachment(
+                    data: data,
+                    filename: "photo-\(Self.fileTimestamp()).\(contentType.preferredFilenameExtension ?? "jpg")",
+                    contentType: contentType.preferredMIMEType ?? "image/jpeg"
+                )
+            }
+        }
+        await MainActor.run { selectedPhotoItems = [] }
+    }
+
+    private func importDocuments(_ urls: [URL]) async {
+        for url in urls {
+            let isScoped = url.startAccessingSecurityScopedResource()
+            defer {
+                if isScoped {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+            do {
+                let data = try Data(contentsOf: url)
+                let contentType = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
+                await MainActor.run {
+                    appendAttachment(data: data, filename: url.lastPathComponent, contentType: contentType)
+                }
+            } catch {
+                await MainActor.run {
+                    viewModel.errorMessage = "Could not read \(url.lastPathComponent)."
+                }
+            }
+        }
+    }
+
+    private static func fileTimestamp() -> String {
+        String(Int(Date().timeIntervalSince1970))
+    }
+
     private func send() async {
         let message = replyText
+        let outgoingAttachments = attachments
         isSending = true
         defer { isSending = false }
 
         viewModel.selectSessionID(sessionID, workspaceID: workspaceID)
-        if let newJobID = await viewModel.createFollowUp(prompt: message, sessionID: sessionID, workspaceID: workspaceID) {
+        if let newJobID = await viewModel.createFollowUp(
+            prompt: message,
+            sessionID: sessionID,
+            workspaceID: workspaceID,
+            attachments: outgoingAttachments
+        ) {
             replyText = ""
+            attachments = []
+            showingOptions = false
             lastSubmittedJobID = newJobID
             await viewModel.refreshThreads()
+            onSent()
         }
     }
 }
@@ -2305,11 +3236,12 @@ private struct CodexMarkdownBlock: View {
 
 private struct CodexMarkdownProse: View {
     let text: String
+    var color: Color = CodexTheme.text
 
     var body: some View {
         Text(markdownText)
             .font(.system(size: 14))
-            .foregroundStyle(CodexTheme.text)
+            .foregroundStyle(color)
             .lineSpacing(3)
             .textSelection(.enabled)
             .fixedSize(horizontal: false, vertical: true)

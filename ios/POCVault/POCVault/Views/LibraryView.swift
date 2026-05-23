@@ -70,7 +70,7 @@ struct LibraryView: View {
 
                     StatusCard(
                         symbol: "exclamationmark.lock",
-                        title: "Vault unavailable",
+                        title: "Relay unavailable",
                         message: message
                     )
 
@@ -209,10 +209,10 @@ private struct VaultHeader: View {
 
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
-            VaultLogoMark(size: 36)
+            RelayLogoMark(size: 36)
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("POC Vault")
+                Text("Relay")
                     .font(.system(size: 28, weight: .semibold))
                     .foregroundStyle(AppTheme.textPrimary)
                 HStack(spacing: 6) {
@@ -248,17 +248,31 @@ private struct VaultHeader: View {
     }
 }
 
-struct VaultLogoMark: View {
+struct RelayLogoMark: View {
     let size: CGFloat
 
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: size * 0.24, style: .continuous)
-                .fill(AppTheme.bgSurfaceHi)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            Color(red: 0.12, green: 0.13, blue: 0.16),
+                            Color(red: 0.05, green: 0.06, blue: 0.07)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
 
-            Image(systemName: "lock.fill")
-                .font(.system(size: size * 0.44, weight: .semibold))
+            Image(systemName: "terminal.fill")
+                .font(.system(size: size * 0.42, weight: .semibold))
                 .foregroundStyle(AppTheme.textPrimary)
+
+            Circle()
+                .fill(AppTheme.statusOK)
+                .frame(width: size * 0.18, height: size * 0.18)
+                .offset(x: size * 0.26, y: -size * 0.26)
         }
         .frame(width: size, height: size)
         .overlay {

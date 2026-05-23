@@ -128,6 +128,9 @@ https://<slug>.<configured-poc-domain>/
 
 The iOS app is a vault shell, not a POC implementation surface.
 
+- Canonical physical-device bundle id: `com.parikshit.pocvault`.
+- Do not use, reintroduce, install, or document sample/example bundle ids.
+- The tests bundle id should follow the same prefix: `com.parikshit.pocvault.tests`.
 - Library screen loads the configured production manifest URL.
 - Simulator builds load `http://127.0.0.1:8787/manifest.json`.
 - POC detail screens use a full-screen `WKWebView`.

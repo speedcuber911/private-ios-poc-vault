@@ -11,7 +11,7 @@ fi
 PORT="${POC_VAULT_SIM_PORT:-8787}"
 SERVER_LOG="/tmp/poc-vault-simulator-server.log"
 SCREEN_NAME="poc-vault-simulator-server-${PORT}"
-BUNDLE_ID="${BUNDLE_ID:-${IOS_BUNDLE_ID:-com.example.pocvault}}"
+BUNDLE_ID="${BUNDLE_ID:-${IOS_BUNDLE_ID:-com.parikshit.pocvault}}"
 POC_VAULT_MANIFEST_PUBLIC_KEY="${POC_VAULT_MANIFEST_PUBLIC_KEY:-}"
 if [[ -z "$POC_VAULT_MANIFEST_PUBLIC_KEY" && -f "${LOCAL_SECRETS_DIR:-$HOME/.poc-vault/secrets}/signing/manifest-ed25519.key" ]]; then
   POC_VAULT_MANIFEST_PUBLIC_KEY="$("$ROOT/ops/manifest-public-key" 2>/dev/null || true)"

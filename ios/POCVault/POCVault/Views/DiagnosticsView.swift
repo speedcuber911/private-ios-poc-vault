@@ -3,64 +3,74 @@ import SwiftUI
 struct DiagnosticsView: View {
     @ObservedObject var identityStore: ClientIdentityStore
     let manifestClient: ManifestClient
+    var showsNavigationChrome = true
 
     @Environment(\.dismiss) private var dismiss
     @State private var passphrase = ""
     @State private var checks: [DiagnosticCheck] = []
     @State private var importError: String?
+    @State private var isImportExpanded = false
+
+    private let contentHorizontalPadding: CGFloat = 18
+    private let cardCornerRadius: CGFloat = 14
 
     var body: some View {
         NavigationStack {
             ZStack {
                 AppTheme.bgCanvas.ignoresSafeArea()
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 18) {
+                    VStack(alignment: .leading, spacing: 16) {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text("Diagnostics")
-                                .font(.system(size: 34, weight: .bold, design: .rounded))
+                            Text(screenTitle)
+                                .font(.system(size: showsNavigationChrome ? 34 : 34, weight: .bold, design: .rounded))
+                                .foregroundStyle(AppTheme.textPrimary)
                             Text(AppConfiguration.runtimeMode)
                                 .font(.subheadline.weight(.medium))
                                 .foregroundStyle(AppTheme.textSecondary)
                         }
-                        .padding(.top, 18)
+                        .padding(.top, showsNavigationChrome ? 18 : 16)
 
                         certificatePanel
 
                         VStack(alignment: .leading, spacing: 12) {
                             Text("Checks")
-                                .font(.headline)
+                                .font(.headline.weight(.bold))
+                                .foregroundStyle(AppTheme.textPrimary)
                             ForEach(checks) { check in
                                 DiagnosticRow(check: check)
                             }
                         }
-                        .padding(18)
-                        .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                .stroke(AppTheme.strokeSubtle, lineWidth: 1)
-                        }
+                        .padding(16)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .diagnosticCard(cornerRadius: cardCornerRadius)
                     }
-                    .padding(.horizontal, 20)
-                    .padding(.bottom, 28)
+                    .padding(.horizontal, contentHorizontalPadding)
+                    .padding(.bottom, showsNavigationChrome ? 28 : 190)
                 }
             }
-            .navigationTitle("Diagnostics")
+            .navigationTitle(showsNavigationChrome ? "Diagnostics" : "")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Done") {
-                        dismiss()
+                if showsNavigationChrome {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("Done") {
+                            dismiss()
+                        }
                     }
-                }
 
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        refreshChecks()
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
+                            refreshChecks()
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .accessibilityLabel("Refresh diagnostics")
                     }
-                    .accessibilityLabel("Refresh diagnostics")
                 }
+            }
+            .toolbar(showsNavigationChrome ? .visible : .hidden, for: .navigationBar)
+            .refreshable {
+                refreshChecks()
             }
             .onAppear(perform: refreshAndImportFromSetupEnvironmentIfNeeded)
         }
@@ -147,52 +157,118 @@ struct DiagnosticsView: View {
     @ViewBuilder
     private var certificatePanel: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Label(isSimulatorPreview ? "Simulator Preview" : "Client Certificate", systemImage: isSimulatorPreview ? "macwindow" : "key")
-                .font(.headline)
-
             if isSimulatorPreview {
-                Text("The simulator uses a local signed vault at 127.0.0.1. Physical iPhone builds still use the installed client certificate.")
-                    .font(.subheadline)
-                    .foregroundStyle(AppTheme.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                certificateHeader(
+                    title: "Simulator Preview",
+                    detail: "Local signed vault at 127.0.0.1",
+                    symbol: "macwindow",
+                    isPassing: true
+                )
             } else {
-                Text("Expected file")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(AppTheme.textTertiary)
-                Text("Documents/support/client.p12")
-                    .font(.callout.monospaced())
-                    .foregroundStyle(AppTheme.textPrimary)
+                certificateHeader(
+                    title: "Client certificate",
+                    detail: identityStore.hasStoredIdentity ? "Installed for mTLS" : "Import required",
+                    symbol: "key.fill",
+                    isPassing: identityStore.hasStoredIdentity
+                )
 
-                SecureField("P12 passphrase", text: $passphrase)
-                    .textContentType(.password)
-                    .textFieldStyle(.roundedBorder)
-
-                Button {
-                    importDefaultCertificate()
-                } label: {
-                    Label("Import Certificate", systemImage: "square.and.arrow.down")
-                        .frame(maxWidth: .infinity)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Expected file")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(AppTheme.textTertiary)
+                    Text("Documents/support/client.p12")
+                        .font(.footnote.monospaced())
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
                 }
-                .buttonStyle(.borderedProminent)
 
-                if let importError {
-                    Text(importError)
-                        .font(.footnote)
-                        .foregroundStyle(AppTheme.statusError)
-                        .fixedSize(horizontal: false, vertical: true)
+                if identityStore.hasStoredIdentity {
+                    DisclosureGroup(isExpanded: $isImportExpanded) {
+                        importCertificateForm
+                            .padding(.top, 10)
+                    } label: {
+                        Text("Reimport certificate")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(AppTheme.textPrimary)
+                    }
+                    .tint(AppTheme.textSecondary)
+                } else {
+                    importCertificateForm
                 }
             }
         }
-        .padding(18)
-        .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(AppTheme.strokeSubtle, lineWidth: 1)
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .diagnosticCard(cornerRadius: cardCornerRadius)
+    }
+
+    private func certificateHeader(title: String, detail: String, symbol: String, isPassing: Bool) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            Image(systemName: symbol)
+                .font(.system(size: 18, weight: .bold))
+                .foregroundStyle(isPassing ? AppTheme.statusOK : AppTheme.statusWarn)
+                .frame(width: 34, height: 34)
+                .background((isPassing ? AppTheme.statusOK : AppTheme.statusWarn).opacity(0.16), in: Circle())
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.headline.weight(.bold))
+                    .foregroundStyle(AppTheme.textPrimary)
+                Text(detail)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(AppTheme.textSecondary)
+            }
+
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var importCertificateForm: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SecureField(
+                "",
+                text: $passphrase,
+                prompt: Text("P12 passphrase").foregroundColor(AppTheme.textTertiary)
+            )
+            .textContentType(.password)
+            .font(.subheadline.weight(.medium))
+            .foregroundStyle(AppTheme.textPrimary)
+            .padding(.horizontal, 12)
+            .frame(height: 42)
+            .background(AppTheme.bgSurfaceHi, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(AppTheme.strokeSubtle, lineWidth: 1)
+            }
+
+            Button {
+                importDefaultCertificate()
+            } label: {
+                Label("Import certificate", systemImage: "square.and.arrow.down")
+                    .font(.subheadline.weight(.bold))
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 42)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Color.black.opacity(0.82))
+            .background(AppTheme.accent, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+            if let importError {
+                Text(importError)
+                    .font(.footnote)
+                    .foregroundStyle(AppTheme.statusError)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
     private var isSimulatorPreview: Bool {
         AppConfiguration.runtimeMode == "Simulator Preview"
+    }
+
+    private var screenTitle: String {
+        showsNavigationChrome ? "Diagnostics" : "Health"
     }
 }
 
@@ -209,8 +285,9 @@ private struct DiagnosticRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: check.isPassing ? "checkmark.circle.fill" : "xmark.circle.fill")
-                .font(.system(size: 18, weight: .semibold))
+                .font(.system(size: 17, weight: .semibold))
                 .foregroundStyle(check.isPassing ? AppTheme.statusOK : AppTheme.statusError)
+                .frame(width: 24, height: 24, alignment: .top)
             VStack(alignment: .leading, spacing: 3) {
                 Text(check.title)
                     .font(.subheadline.weight(.semibold))
@@ -218,9 +295,31 @@ private struct DiagnosticRow: View {
                 Text(check.detail)
                     .font(.footnote)
                     .foregroundStyle(AppTheme.textSecondary)
-                    .lineLimit(3)
+                    .lineLimit(2)
                     .truncationMode(.middle)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 2)
+    }
+}
+
+private struct DiagnosticCardModifier: ViewModifier {
+    let cornerRadius: CGFloat
+
+    func body(content: Content) -> some View {
+        content
+            .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .stroke(AppTheme.strokeSubtle, lineWidth: 1)
+            }
+    }
+}
+
+private extension View {
+    func diagnosticCard(cornerRadius: CGFloat) -> some View {
+        modifier(DiagnosticCardModifier(cornerRadius: cornerRadius))
     }
 }

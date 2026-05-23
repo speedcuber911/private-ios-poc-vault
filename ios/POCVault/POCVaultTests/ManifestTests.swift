@@ -120,6 +120,61 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(job.reasoningEffort, "high")
     }
 
+    func testCodexProviderDefaultsAreProviderSpecific() throws {
+        XCTAssertEqual(CodexProvider.defaultProvider, .codex)
+        XCTAssertEqual(CodexProvider.codex.displayName, "Codex")
+        XCTAssertEqual(CodexProvider.codex.defaultModel, "gpt-5.5")
+        XCTAssertEqual(CodexProvider.codex.defaultReasoningEffort, .xhigh)
+
+        XCTAssertEqual(CodexProvider.claude.displayName, "Claude")
+        XCTAssertEqual(CodexProvider.claude.defaultModel, "sonnet")
+        XCTAssertEqual(CodexProvider.claude.defaultReasoningEffort, .high)
+        XCTAssertEqual(CodexProvider.claude.reasoningEffortOptions, CodexReasoningEffort.allCases)
+    }
+
+    func testCodexProviderTabIconsUseBrandAssets() throws {
+        XCTAssertEqual(CodexProvider.codex.tabIconAssetName, "ChatGPTMark")
+        XCTAssertEqual(CodexProvider.claude.tabIconAssetName, "ClaudeMark")
+    }
+
+    func testConsoleControlStripLayoutKeepsProvidersVerticallyAligned() throws {
+        let codexLayout = CodexControlStripLayout(provider: .codex)
+        let claudeLayout = CodexControlStripLayout(provider: .claude)
+
+        XCTAssertEqual(codexLayout.visibleRowCount, 3)
+        XCTAssertEqual(claudeLayout.visibleRowCount, codexLayout.visibleRowCount)
+        XCTAssertEqual(codexLayout.controlHeight, 36)
+        XCTAssertEqual(claudeLayout.controlHeight, codexLayout.controlHeight)
+        XCTAssertTrue(codexLayout.showsSkillButton)
+        XCTAssertFalse(claudeLayout.showsSkillButton)
+        XCTAssertTrue(claudeLayout.reservesSkillSlot)
+        XCTAssertTrue(codexLayout.showsRunMode)
+        XCTAssertFalse(claudeLayout.showsRunMode)
+    }
+
+    func testCodexJobDefaultsMissingProviderToCodexAndDecodesClaude() throws {
+        let legacyJob = try decodeCodexJob(
+            """
+            {
+              "id": "job-legacy",
+              "status": "succeeded"
+            }
+            """
+        )
+        let claudeJob = try decodeCodexJob(
+            """
+            {
+              "id": "job-claude",
+              "status": "running",
+              "provider": "claude"
+            }
+            """
+        )
+
+        XCTAssertEqual(legacyJob.provider, .codex)
+        XCTAssertEqual(claudeJob.provider, .claude)
+    }
+
     func testCodexJobDisplayOutputUsesErrorForFailedJobs() throws {
         let job = try decodeCodexJob(
             """
@@ -308,6 +363,29 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(thread.isSmokeTest)
     }
 
+    func testCodexThreadDefaultsMissingProviderToCodexAndDecodesClaude() throws {
+        let legacyThread = try decodeCodexThread(
+            """
+            {
+              "id": "thread-legacy",
+              "sessionId": "thread-legacy"
+            }
+            """
+        )
+        let claudeThread = try decodeCodexThread(
+            """
+            {
+              "id": "thread-claude",
+              "sessionId": "thread-claude",
+              "provider": "claude"
+            }
+            """
+        )
+
+        XCTAssertEqual(legacyThread.provider, .codex)
+        XCTAssertEqual(claudeThread.provider, .claude)
+    }
+
     func testCodexThreadBuildsReadableTitleFromPullRequestURL() throws {
         let thread = try JSONDecoder().decode(
             CodexThread.self,
@@ -332,6 +410,136 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(thread.displayTitle, "ai-tutor PR #967")
         XCTAssertEqual(thread.workspaceLabel, "POC Vault")
         XCTAssertEqual(thread.previewText, "Hey parikshit can you review this PR: https://github.com/sigiq/ai-tutor/pull/967 The idea is to reduce latency")
+    }
+
+    func testCodexThreadDetailBuildsChatTranscriptFromMessages() throws {
+        let detail = try JSONDecoder().decode(
+            CodexThreadDetail.self,
+            from: Data(
+                """
+                {
+                  "thread": {
+                    "id": "019e46a5-0000-7000-8000-000000000001",
+                    "sessionId": "019e46a5-0000-7000-8000-000000000001",
+                    "workspaceId": "poc-vault",
+                    "workspaceName": "POC Vault",
+                    "updatedAt": "2026-05-20T12:05:10Z",
+                    "jobCount": 2,
+                    "activeJobCount": 0,
+                    "lastPrompt": "latest prompt",
+                    "lastResult": "latest answer",
+                    "hasSessionFile": true
+                  },
+                  "messages": [
+                    {
+                      "role": "user",
+                      "timestamp": "2026-05-20T12:00:00Z",
+                      "text": "First thing I asked"
+                    },
+                    {
+                      "role": "assistant",
+                      "timestamp": "2026-05-20T12:01:00Z",
+                      "text": "First Codex answer"
+                    },
+                    {
+                      "role": "user",
+                      "timestamp": "2026-05-20T12:04:00Z",
+                      "text": "Second follow up"
+                    }
+                  ],
+                  "jobs": []
+                }
+                """.utf8
+            )
+        )
+
+        let transcript = CodexThreadChatItem.makeTranscript(detail: detail, thread: nil, latestJob: nil)
+
+        XCTAssertEqual(transcript.map(\.role), [.user, .assistant, .user])
+        XCTAssertEqual(transcript.map(\.text), ["First thing I asked", "First Codex answer", "Second follow up"])
+        XCTAssertEqual(transcript.first?.alignment, .trailing)
+        XCTAssertEqual(transcript[1].alignment, .leading)
+        XCTAssertEqual(transcript.first?.isLong, false)
+    }
+
+    func testCodexThreadChatTranscriptCollapsesIntermediateAssistantUpdates() throws {
+        let detail = try JSONDecoder().decode(
+            CodexThreadDetail.self,
+            from: Data(
+                """
+                {
+                  "thread": {
+                    "id": "019e46a5-0000-7000-8000-000000000002",
+                    "sessionId": "019e46a5-0000-7000-8000-000000000002",
+                    "workspaceId": "poc-vault",
+                    "workspaceName": "POC Vault",
+                    "updatedAt": "2026-05-20T12:05:10Z",
+                    "jobCount": 1,
+                    "activeJobCount": 0,
+                    "hasSessionFile": true
+                  },
+                  "messages": [
+                    {
+                      "role": "user",
+                      "timestamp": "2026-05-20T12:00:00Z",
+                      "text": "Check my PRs"
+                    },
+                    {
+                      "role": "assistant",
+                      "timestamp": "2026-05-20T12:00:10Z",
+                      "text": "I will inspect GitHub."
+                    },
+                    {
+                      "role": "assistant",
+                      "timestamp": "2026-05-20T12:00:20Z",
+                      "text": "Retrying with supported fields."
+                    },
+                    {
+                      "role": "assistant",
+                      "timestamp": "2026-05-20T12:01:00Z",
+                      "text": "Final answer: no assigned PRs."
+                    }
+                  ],
+                  "jobs": []
+                }
+                """.utf8
+            )
+        )
+
+        let transcript = CodexThreadChatItem.makeTranscript(detail: detail, thread: nil, latestJob: nil)
+
+        XCTAssertEqual(transcript.map(\.role), [.user, .status, .assistant])
+        XCTAssertEqual(transcript[1].speakerLabel, "Thinking")
+        XCTAssertEqual(transcript[1].progressCount, 2)
+        XCTAssertEqual(transcript[2].text, "Final answer: no assigned PRs.")
+    }
+
+    func testCodexThreadChatTranscriptFallsBackToThreadSummary() throws {
+        let thread = try JSONDecoder().decode(
+            CodexThread.self,
+            from: Data(
+                """
+                {
+                  "id": "019e46a5-0000-7000-8000-000000000001",
+                  "sessionId": "019e46a5-0000-7000-8000-000000000001",
+                  "workspaceId": "poc-vault",
+                  "workspaceName": "POC Vault",
+                  "updatedAt": "2026-05-20T12:05:10Z",
+                  "jobCount": 1,
+                  "activeJobCount": 0,
+                  "lastJobStatus": "succeeded",
+                  "lastPrompt": "Can you check the server?",
+                  "lastResult": "Server is healthy.",
+                  "hasSessionFile": false
+                }
+                """.utf8
+            )
+        )
+
+        let transcript = CodexThreadChatItem.makeTranscript(detail: nil, thread: thread, latestJob: nil)
+
+        XCTAssertEqual(transcript.map(\.role), [.user, .assistant])
+        XCTAssertEqual(transcript.map(\.text), ["Can you check the server?", "Server is healthy."])
     }
 
     func testCodexThreadFeedUsesThreadsInsteadOfDuplicateJobs() throws {
@@ -379,7 +587,7 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(feed.first?.preview, "Sent the Slack DM.")
     }
 
-    func testCodexThreadFeedShowsOnlyActiveJobsWaitingForSessionDiscovery() throws {
+    func testCodexThreadFeedShowsActiveAndFailedJobsWaitingForSessionDiscovery() throws {
         let activeJob = try decodeCodexJob(
             """
             {
@@ -408,11 +616,13 @@ final class ManifestTests: XCTestCase {
 
         let feed = CodexThreadFeedItem.makeFeed(threads: [], jobs: [oldOrphanJob, activeJob])
 
-        XCTAssertEqual(feed.count, 1)
+        XCTAssertEqual(feed.count, 2)
         XCTAssertEqual(feed.first?.jobID, "job-starting")
         XCTAssertTrue(feed.first?.isPendingSession == true)
         XCTAssertEqual(feed.first?.title, "Check deployment health")
         XCTAssertTrue(feed.first?.preview.contains("Starting on EC2") == true)
+        XCTAssertEqual(feed.last?.jobID, "job-old-orphan")
+        XCTAssertEqual(feed.last?.preview, "No session")
     }
 
     func testCodexJobDecodesResumeSessionID() throws {
@@ -469,13 +679,190 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(payload?["resumeSessionId"] as? String, "2026-05-20T12-00-00-abc123")
     }
 
+    func testCodexCreateJobRequestEncodesProvider() throws {
+        let request = CodexCreateJobRequest(
+            workspaceId: "scratch",
+            prompt: "continue carefully",
+            timeoutMs: 120_000,
+            model: "sonnet",
+            reasoningEffort: "high",
+            provider: .claude,
+            resumeSessionId: "thread-123"
+        )
+
+        let payload = try JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any]
+
+        XCTAssertEqual(payload?["provider"] as? String, "claude")
+    }
+
+    func testCodexCreateJobRequestEncodesAttachments() throws {
+        let attachment = CodexJobAttachment(
+            filename: "capture.png",
+            contentType: "image/png",
+            data: Data("phone-image".utf8)
+        )
+        let request = CodexCreateJobRequest(
+            workspaceId: "poc-vault",
+            prompt: "Look at the screenshot",
+            timeoutMs: 180_000,
+            model: "gpt-5.5",
+            reasoningEffort: "low",
+            attachments: [attachment],
+            resumeSessionId: "2026-05-20T12-00-00-abc123"
+        )
+
+        let payload = try JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any]
+        let attachments = payload?["attachments"] as? [[String: Any]]
+
+        XCTAssertEqual(attachments?.count, 1)
+        XCTAssertEqual(attachments?.first?["filename"] as? String, "capture.png")
+        XCTAssertEqual(attachments?.first?["contentType"] as? String, "image/png")
+        XCTAssertEqual(attachments?.first?["dataBase64"] as? String, Data("phone-image".utf8).base64EncodedString())
+    }
+
     func testCodexViewModelTreatsSwiftCancellationAsNonError() throws {
         XCTAssertTrue(CodexConsoleViewModel.isCancellation(CancellationError()))
+    }
+
+    @MainActor
+    func testCodexViewModelUsesProviderSpecificDefaults() throws {
+        let codexViewModel = CodexConsoleViewModel(
+            client: CodexClient(
+                baseURL: URL(string: "https://codex.example.test")!,
+                identityStore: ClientIdentityStore()
+            )
+        )
+        let claudeViewModel = CodexConsoleViewModel(
+            client: CodexClient(
+                baseURL: URL(string: "https://codex.example.test")!,
+                identityStore: ClientIdentityStore()
+            ),
+            provider: .claude
+        )
+
+        XCTAssertEqual(codexViewModel.provider, .codex)
+        XCTAssertEqual(codexViewModel.selectedModel, "gpt-5.5")
+        XCTAssertEqual(codexViewModel.selectedReasoningEffort, .xhigh)
+        XCTAssertEqual(claudeViewModel.provider, .claude)
+        XCTAssertEqual(claudeViewModel.selectedModel, "sonnet")
+        XCTAssertEqual(claudeViewModel.selectedReasoningEffort, .high)
+        XCTAssertEqual(claudeViewModel.connectionNoticeTitle, "Claude needs certificate")
     }
 
     func testCodexViewModelTreatsURLSessionCancellationAsNonError() throws {
         XCTAssertTrue(CodexConsoleViewModel.isCancellation(URLError(.cancelled)))
         XCTAssertFalse(CodexConsoleViewModel.isCancellation(URLError(.notConnectedToInternet)))
+    }
+
+    func testCodexViewModelClassifiesMissingJobAsNotFound() throws {
+        XCTAssertTrue(CodexConsoleViewModel.isHTTPNotFound(CodexClientError.httpFailure(404, "job not found")))
+        XCTAssertFalse(CodexConsoleViewModel.isHTTPNotFound(CodexClientError.httpFailure(500, "server failed")))
+    }
+
+    func testCodexViewModelClassifiesTransientConnectionFailures() throws {
+        XCTAssertTrue(CodexConsoleViewModel.isTransientConnection(URLError(.networkConnectionLost)))
+        XCTAssertTrue(CodexConsoleViewModel.isTransientConnection(URLError(.timedOut)))
+        XCTAssertFalse(CodexConsoleViewModel.isTransientConnection(CodexClientError.httpFailure(404, "job not found")))
+    }
+
+    func testCodexCompletionSignalDetectsObservedJobCompletion() throws {
+        let job = try decodeCodexJob(
+            """
+            {
+              "id": "job-42",
+              "workspaceName": "POC Vault",
+              "status": "succeeded",
+              "prompt": "Deploy the gallery POC",
+              "result": "Done.",
+              "sessionId": "thread-42"
+            }
+            """
+        )
+
+        let signals = CodexCompletionSignal.completedJobs(
+            previouslyActiveJobIDs: ["job-42"],
+            jobs: [job],
+            notifiedKeys: []
+        )
+
+        XCTAssertEqual(signals.count, 1)
+        XCTAssertEqual(signals.first?.key, "job:job-42")
+        XCTAssertEqual(signals.first?.title, "Codex finished")
+        XCTAssertEqual(signals.first?.body, "Your Codex thread is ready: Deploy the gallery POC")
+        XCTAssertEqual(signals.first?.jobID, "job-42")
+        XCTAssertEqual(signals.first?.sessionID, "thread-42")
+    }
+
+    func testCodexCompletionSignalWaitsForSucceededJobOutput() throws {
+        let job = try decodeCodexJob(
+            """
+            {
+              "id": "job-45",
+              "workspaceName": "POC Vault",
+              "status": "succeeded",
+              "prompt": "Run a report",
+              "sessionId": "thread-45"
+            }
+            """
+        )
+
+        let signals = CodexCompletionSignal.completedJobs(
+            previouslyActiveJobIDs: ["job-45"],
+            jobs: [job],
+            notifiedKeys: []
+        )
+
+        XCTAssertTrue(signals.isEmpty)
+    }
+
+    func testCodexCompletionSignalIgnoresCompletedJobsThatWereNotObservedActive() throws {
+        let job = try decodeCodexJob(
+            """
+            {
+              "id": "job-43",
+              "workspaceName": "POC Vault",
+              "status": "succeeded",
+              "prompt": "Old finished run"
+            }
+            """
+        )
+
+        let signals = CodexCompletionSignal.completedJobs(
+            previouslyActiveJobIDs: [],
+            jobs: [job],
+            notifiedKeys: []
+        )
+
+        XCTAssertTrue(signals.isEmpty)
+    }
+
+    func testCodexCompletionSignalFallsBackToThreadCompletion() throws {
+        let thread = try decodeCodexThread(
+            """
+            {
+              "id": "thread-44",
+              "sessionId": "thread-44",
+              "workspaceName": "POC Vault",
+              "activeJobCount": 0,
+              "lastJobId": "job-44",
+              "lastJobStatus": "failed",
+              "lastPrompt": "Run the smoke check"
+            }
+            """
+        )
+
+        let signals = CodexCompletionSignal.completedThreads(
+            previouslyActiveThreadIDs: ["thread-44"],
+            threads: [thread],
+            notifiedKeys: []
+        )
+
+        XCTAssertEqual(signals.count, 1)
+        XCTAssertEqual(signals.first?.key, "job:job-44")
+        XCTAssertEqual(signals.first?.title, "Codex needs attention")
+        XCTAssertEqual(signals.first?.body, "Codex hit an error: Run the smoke check")
+        XCTAssertEqual(signals.first?.jobID, "job-44")
+        XCTAssertEqual(signals.first?.sessionID, "thread-44")
     }
 
     @MainActor
@@ -540,5 +927,9 @@ final class ManifestTests: XCTestCase {
 
     private func decodeCodexJob(_ json: String) throws -> CodexJob {
         try JSONDecoder().decode(CodexJob.self, from: Data(json.utf8))
+    }
+
+    private func decodeCodexThread(_ json: String) throws -> CodexThread {
+        try JSONDecoder().decode(CodexThread.self, from: Data(json.utf8))
     }
 }

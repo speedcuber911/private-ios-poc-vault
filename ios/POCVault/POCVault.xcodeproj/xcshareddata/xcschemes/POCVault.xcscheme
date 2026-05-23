@@ -15,7 +15,7 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "111111111111111111111111"
-               BuildableName = "POC Vault.app"
+               BuildableName = "Relay.app"
                BlueprintName = "POCVault"
                ReferencedContainer = "container:POCVault.xcodeproj">
             </BuildableReference>
@@ -55,7 +55,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "111111111111111111111111"
-            BuildableName = "POC Vault.app"
+            BuildableName = "Relay.app"
             BlueprintName = "POCVault"
             ReferencedContainer = "container:POCVault.xcodeproj">
          </BuildableReference>

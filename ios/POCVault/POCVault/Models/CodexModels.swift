@@ -82,8 +82,94 @@ struct CodexWorkspace: Decodable, Hashable, Identifiable {
     }
 }
 
+enum CodexProvider: String, CaseIterable, Identifiable, Codable {
+    case codex
+    case claude
+
+    var id: String { rawValue }
+
+    static let defaultProvider = CodexProvider.codex
+
+    init(rawProvider: String?) {
+        let normalized = rawProvider?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        switch normalized {
+        case "claude", "anthropic":
+            self = .claude
+        case "codex", "openai", .none:
+            self = .codex
+        default:
+            self = .codex
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        self.init(rawProvider: try? container.decode(String.self))
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    var displayName: String {
+        switch self {
+        case .codex:
+            return "Codex"
+        case .claude:
+            return "Claude"
+        }
+    }
+
+    var defaultModel: String {
+        switch self {
+        case .codex:
+            return "gpt-5.5"
+        case .claude:
+            return "sonnet"
+        }
+    }
+
+    var modelOptions: [String] {
+        switch self {
+        case .codex:
+            return [
+                "gpt-5.5",
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex",
+                "gpt-5.3-codex-spark",
+                "gpt-5.2"
+            ]
+        case .claude:
+            return [
+                "sonnet",
+                "opus",
+                "haiku"
+            ]
+        }
+    }
+
+    var defaultReasoningEffort: CodexReasoningEffort {
+        switch self {
+        case .codex:
+            return .xhigh
+        case .claude:
+            return .high
+        }
+    }
+
+    var reasoningEffortOptions: [CodexReasoningEffort] {
+        CodexReasoningEffort.allCases
+    }
+}
+
 struct CodexSession: Decodable, Hashable, Identifiable {
     let id: String
+    let provider: CodexProvider
     let workspaceId: String?
     let workspaceName: String?
     let cwd: String?
@@ -102,6 +188,7 @@ struct CodexSession: Decodable, Hashable, Identifiable {
         case createdAt
         case updatedAt
         case lastUsedAt
+        case provider
     }
 
     init(from decoder: Decoder) throws {
@@ -122,6 +209,7 @@ struct CodexSession: Decodable, Hashable, Identifiable {
         let cwd = try container.decodeLooseStringIfPresent(forKey: .cwd)
         let path = try container.decodeLooseStringIfPresent(forKey: .path)
 
+        self.provider = (try container.decodeIfPresent(CodexProvider.self, forKey: .provider)) ?? .defaultProvider
         self.id = id
         self.workspaceId = (try container.decodeLooseStringIfPresent(forKey: .workspaceId))
             ?? workspace?.id
@@ -133,7 +221,7 @@ struct CodexSession: Decodable, Hashable, Identifiable {
     }
 
     var displayTitle: String {
-        workspaceName?.trimmedNonEmpty ?? workspaceId?.trimmedNonEmpty ?? "Codex thread"
+        workspaceName?.trimmedNonEmpty ?? workspaceId?.trimmedNonEmpty ?? "\(provider.displayName) thread"
     }
 
     var shortID: String {
@@ -242,10 +330,20 @@ enum CodexJobStatus: Hashable, Codable {
             return false
         }
     }
+
+    var needsAttention: Bool {
+        switch self {
+        case .failed, .timeout:
+            return true
+        case .queued, .running, .succeeded, .canceling, .canceled, .unknown:
+            return false
+        }
+    }
 }
 
 struct CodexThread: Decodable, Hashable, Identifiable {
     let id: String
+    let provider: CodexProvider
     let sessionId: String
     let workspaceId: String?
     let workspaceName: String?
@@ -264,6 +362,7 @@ struct CodexThread: Decodable, Hashable, Identifiable {
 
     enum CodingKeys: String, CodingKey {
         case id
+        case provider
         case sessionId
         case workspaceId
         case workspaceName
@@ -302,6 +401,7 @@ struct CodexThread: Decodable, Hashable, Identifiable {
         let lastUsedAt = try container.decodeLossyDateIfPresent(forKey: .lastUsedAt)
 
         self.id = id
+        self.provider = (try container.decodeIfPresent(CodexProvider.self, forKey: .provider)) ?? .defaultProvider
         self.sessionId = sessionID?.trimmedNonEmpty ?? id
         self.workspaceId = try container.decodeLooseStringIfPresent(forKey: .workspaceId)
         self.workspaceName = try container.decodeLooseStringIfPresent(forKey: .workspaceName)
@@ -327,7 +427,7 @@ struct CodexThread: Decodable, Hashable, Identifiable {
     }
 
     var workspaceLabel: String {
-        workspaceName?.trimmedNonEmpty ?? workspaceId?.trimmedNonEmpty ?? "Codex"
+        workspaceName?.trimmedNonEmpty ?? workspaceId?.trimmedNonEmpty ?? provider.displayName
     }
 
     var shortID: String {
@@ -427,6 +527,280 @@ struct CodexThread: Decodable, Hashable, Identifiable {
     }
 }
 
+struct CodexThreadDetail: Decodable, Hashable {
+    let thread: CodexThread
+    let messages: [CodexThreadMessage]
+    let jobs: [CodexJob]
+
+    enum CodingKeys: String, CodingKey {
+        case thread
+        case messages
+        case jobs
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.thread = try container.decode(CodexThread.self, forKey: .thread)
+        self.messages = (try? container.decodeIfPresent([CodexThreadMessage].self, forKey: .messages)) ?? []
+        self.jobs = (try? container.decodeIfPresent([CodexJob].self, forKey: .jobs)) ?? []
+    }
+}
+
+enum CodexThreadMessageRole: String, Decodable, Hashable {
+    case user
+    case assistant
+    case status
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let rawValue = (try? container.decode(String.self))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        switch rawValue {
+        case "user":
+            self = .user
+        case "assistant", "codex", "claude":
+            self = .assistant
+        default:
+            self = .status
+        }
+    }
+}
+
+struct CodexThreadMessage: Decodable, Hashable, Identifiable {
+    let role: CodexThreadMessageRole
+    let timestamp: Date?
+    let text: String
+
+    enum CodingKeys: String, CodingKey {
+        case role
+        case timestamp
+        case createdAt
+        case text
+        case content
+        case message
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.role = (try? container.decodeIfPresent(CodexThreadMessageRole.self, forKey: .role)) ?? .status
+        let timestamp = try container.decodeLossyDateIfPresent(forKey: .timestamp)
+        let createdAt = try container.decodeLossyDateIfPresent(forKey: .createdAt)
+        let text = try container.decodeLooseStringIfPresent(forKey: .text)
+        let content = try container.decodeLooseStringIfPresent(forKey: .content)
+        let message = try container.decodeLooseStringIfPresent(forKey: .message)
+        self.timestamp = timestamp ?? createdAt
+        let resolvedText = text ?? content ?? message ?? ""
+        self.text = resolvedText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var id: String {
+        let timestampValue = timestamp?.timeIntervalSince1970.description ?? "undated"
+        return "\(role.rawValue)-\(timestampValue)-\(text)"
+    }
+}
+
+enum CodexThreadChatAlignment: Hashable {
+    case leading
+    case trailing
+    case center
+}
+
+struct CodexThreadChatItem: Hashable, Identifiable {
+    enum Kind: Hashable {
+        case message
+        case progressSummary
+    }
+
+    let role: CodexThreadMessageRole
+    let text: String
+    let timestamp: Date?
+    let isError: Bool
+    let sourceID: String
+    let kind: Kind
+    let progressCount: Int
+
+    var id: String { sourceID }
+
+    var alignment: CodexThreadChatAlignment {
+        if kind == .progressSummary {
+            return .leading
+        }
+        switch role {
+        case .user:
+            return .trailing
+        case .assistant:
+            return .leading
+        case .status:
+            return .center
+        }
+    }
+
+    var speakerLabel: String {
+        if kind == .progressSummary {
+            return "Thinking"
+        }
+        switch role {
+        case .user:
+            return "You"
+        case .assistant:
+            return "Codex"
+        case .status:
+            return isError ? "Issue" : "Status"
+        }
+    }
+
+    var isLong: Bool {
+        kind == .progressSummary || text.count > 420 || text.filter(\.isNewline).count > 6
+    }
+
+    static func makeTranscript(
+        detail: CodexThreadDetail?,
+        thread: CodexThread?,
+        latestJob: CodexJob?
+    ) -> [CodexThreadChatItem] {
+        if let detail, !detail.messages.isEmpty {
+            return groupedTranscript(from: detail.messages)
+        }
+
+        var items: [CodexThreadChatItem] = []
+        let prompt = latestJob?.prompt?.trimmedNonEmpty ?? thread?.lastPrompt?.trimmedNonEmpty
+        if let prompt,
+           let item = chatItem(role: .user, text: prompt, timestamp: latestJob?.createdAt ?? thread?.timestamp, sourceID: "thread-prompt") {
+            items.append(item)
+        }
+
+        let answer = latestJob?.displayOutput?.trimmedNonEmpty ?? thread?.lastResult?.trimmedNonEmpty
+        if let answer,
+           let item = chatItem(role: .assistant, text: answer, timestamp: latestJob?.completedAt ?? thread?.updatedAt, sourceID: "thread-answer") {
+            items.append(item)
+        }
+
+        let error = latestJob?.errorMessage?.trimmedNonEmpty ?? thread?.lastError?.trimmedNonEmpty
+        if answer == nil,
+           let error,
+           let item = chatItem(role: .status, text: error, timestamp: latestJob?.completedAt ?? thread?.updatedAt, isError: true, sourceID: "thread-error") {
+            items.append(item)
+        }
+
+        let workingProviderName = thread?.provider.displayName
+            ?? latestJob?.provider.displayName
+            ?? CodexProvider.defaultProvider.displayName
+        if items.isEmpty,
+           thread?.hasActiveJobs == true,
+           let item = chatItem(
+               role: .status,
+               text: "\(workingProviderName) is working on this thread.",
+               timestamp: thread?.updatedAt,
+               sourceID: "thread-working"
+           ) {
+            items.append(item)
+        }
+
+        return items
+    }
+
+    private static func groupedTranscript(from messages: [CodexThreadMessage]) -> [CodexThreadChatItem] {
+        var items: [CodexThreadChatItem] = []
+        var pendingAssistantMessages: [(offset: Int, message: CodexThreadMessage)] = []
+
+        func flushAssistantMessages() {
+            guard !pendingAssistantMessages.isEmpty else { return }
+            defer { pendingAssistantMessages.removeAll() }
+
+            if pendingAssistantMessages.count == 1,
+               let pending = pendingAssistantMessages.first,
+               let item = chatItem(
+                   role: .assistant,
+                   text: pending.message.text,
+                   timestamp: pending.message.timestamp,
+                   sourceID: "message-\(pending.offset)-\(pending.message.id)"
+               ) {
+                items.append(item)
+                return
+            }
+
+            let progressMessages = pendingAssistantMessages.dropLast()
+            if !progressMessages.isEmpty {
+                let progressText = progressMessages
+                    .enumerated()
+                    .map { index, pending in
+                        let text = pending.message.text
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                            .replacingOccurrences(of: "\n\n", with: "\n")
+                        return "\(index + 1). \(text)"
+                    }
+                    .joined(separator: "\n\n")
+                if let first = progressMessages.first,
+                   let item = chatItem(
+                       role: .status,
+                       text: progressText,
+                       timestamp: first.message.timestamp,
+                       sourceID: "progress-\(first.offset)-\(progressMessages.count)",
+                       kind: .progressSummary,
+                       progressCount: progressMessages.count
+                   ) {
+                    items.append(item)
+                }
+            }
+
+            if let final = pendingAssistantMessages.last,
+               let item = chatItem(
+                   role: .assistant,
+                   text: final.message.text,
+                   timestamp: final.message.timestamp,
+                   sourceID: "message-\(final.offset)-\(final.message.id)"
+               ) {
+                items.append(item)
+            }
+        }
+
+        for (index, message) in messages.enumerated() {
+            switch message.role {
+            case .assistant:
+                pendingAssistantMessages.append((index, message))
+            case .user, .status:
+                flushAssistantMessages()
+                if let item = chatItem(
+                    role: message.role,
+                    text: message.text,
+                    timestamp: message.timestamp,
+                    isError: false,
+                    sourceID: "message-\(index)-\(message.id)"
+                ) {
+                    items.append(item)
+                }
+            }
+        }
+
+        flushAssistantMessages()
+        return items
+    }
+
+    private static func chatItem(
+        role: CodexThreadMessageRole,
+        text: String?,
+        timestamp: Date?,
+        isError: Bool = false,
+        sourceID: String,
+        kind: Kind = .message,
+        progressCount: Int = 0
+    ) -> CodexThreadChatItem? {
+        guard let text = text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+            return nil
+        }
+        return CodexThreadChatItem(
+            role: role,
+            text: text,
+            timestamp: timestamp,
+            isError: isError,
+            sourceID: sourceID,
+            kind: kind,
+            progressCount: progressCount
+        )
+    }
+}
+
 struct CodexTranscriptionResponse: Decodable, Hashable {
     let text: String
     let provider: String?
@@ -470,7 +844,7 @@ struct CodexThreadFeedItem: Hashable, Identifiable {
                 return output
             }
             if job.status.isActive {
-                return "Starting on EC2. The thread will attach as soon as Codex opens a session."
+                return "Starting on EC2. The thread will attach as soon as \(job.provider.displayName) opens a session."
             }
             return job.errorMessage?.trimmedNonEmpty ?? "No thread session was captured for this run."
         }
@@ -481,7 +855,7 @@ struct CodexThreadFeedItem: Hashable, Identifiable {
         case .thread(let thread):
             return thread.workspaceLabel
         case .pendingJob(let job):
-            return job.workspaceName?.trimmedNonEmpty ?? job.workspaceId?.trimmedNonEmpty ?? "Codex"
+            return job.workspaceName?.trimmedNonEmpty ?? job.workspaceId?.trimmedNonEmpty ?? job.provider.displayName
         }
     }
 
@@ -570,8 +944,13 @@ struct CodexThreadFeedItem: Hashable, Identifiable {
         let pendingJobItems = jobs
             .filter { job in
                 if threadJobIDs.contains(job.id) { return false }
-                if let sessionID = job.threadSessionId, threadSessionIDs.contains(sessionID) { return false }
+                if let sessionID = job.threadSessionId,
+                   threadSessionIDs.contains(sessionID),
+                   !job.status.needsAttention {
+                    return false
+                }
                 return job.status.isActive
+                    || job.status.needsAttention
             }
             .map { CodexThreadFeedItem(source: .pendingJob($0)) }
 
@@ -599,6 +978,31 @@ enum CodexReasoningEffort: String, CaseIterable, Identifiable, Codable {
             return "High"
         case .xhigh:
             return "XHigh"
+        }
+    }
+}
+
+enum CodexRunMode: String, CaseIterable, Identifiable, Codable {
+    case quality
+    case speed
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .quality:
+            return "Quality"
+        case .speed:
+            return "Speed"
+        }
+    }
+
+    var effectiveReasoningEffort: CodexReasoningEffort? {
+        switch self {
+        case .quality:
+            return nil
+        case .speed:
+            return .low
         }
     }
 }
@@ -640,6 +1044,7 @@ struct CodexTextPreview: Equatable {
 
 struct CodexJob: Decodable, Hashable, Identifiable {
     let id: String
+    let provider: CodexProvider
     let workspaceId: String?
     let workspaceName: String?
     let status: CodexJobStatus
@@ -668,10 +1073,12 @@ struct CodexJob: Decodable, Hashable, Identifiable {
     let stdoutTruncated: Bool
     let stderrTruncated: Bool
     let resultTruncated: Bool
+    let attachments: [CodexJobAttachmentReference]
 
     enum CodingKeys: String, CodingKey {
         case id
         case jobId
+        case provider
         case workspace
         case workspaceId
         case workspaceName
@@ -707,6 +1114,7 @@ struct CodexJob: Decodable, Hashable, Identifiable {
         case stdoutTruncated
         case stderrTruncated
         case resultTruncated
+        case attachments
     }
 
     init(from decoder: Decoder) throws {
@@ -734,6 +1142,7 @@ struct CodexJob: Decodable, Hashable, Identifiable {
         let message = try container.decodeLooseStringIfPresent(forKey: .message)
 
         self.id = id
+        self.provider = (try container.decodeIfPresent(CodexProvider.self, forKey: .provider)) ?? .defaultProvider
         self.workspaceId = (try container.decodeLooseStringIfPresent(forKey: .workspaceId))
             ?? workspace?.id
         self.workspaceName = (try container.decodeLooseStringIfPresent(forKey: .workspaceName))
@@ -765,10 +1174,11 @@ struct CodexJob: Decodable, Hashable, Identifiable {
         self.stdoutTruncated = (try container.decodeIfPresent(Bool.self, forKey: .stdoutTruncated)) ?? false
         self.stderrTruncated = (try container.decodeIfPresent(Bool.self, forKey: .stderrTruncated)) ?? false
         self.resultTruncated = (try container.decodeIfPresent(Bool.self, forKey: .resultTruncated)) ?? false
+        self.attachments = (try? container.decodeIfPresent([CodexJobAttachmentReference].self, forKey: .attachments)) ?? []
     }
 
     var displayPrompt: String {
-        prompt?.trimmedNonEmpty ?? "Untitled Codex job"
+        prompt?.trimmedNonEmpty ?? "Untitled \(provider.displayName) job"
     }
 
     var displayOutput: String? {
@@ -848,6 +1258,7 @@ struct CodexJob: Decodable, Hashable, Identifiable {
             || logsIncluded != nil
             || sessionId != nil
             || resumeSessionId != nil
+            || !attachments.isEmpty
             || hasTruncatedServerOutput
             || status != .unknown("unknown")
     }
@@ -896,12 +1307,63 @@ struct CodexJob: Decodable, Hashable, Identifiable {
     }
 }
 
+struct CodexJobAttachmentReference: Decodable, Hashable, Identifiable {
+    let filename: String
+    let contentType: String?
+    let bytes: Int?
+    let path: String?
+
+    var id: String {
+        path?.trimmedNonEmpty ?? filename
+    }
+}
+
+struct CodexJobAttachment: Encodable, Hashable, Identifiable {
+    let id: UUID
+    let filename: String
+    let contentType: String
+    let dataBase64: String
+    let byteCount: Int
+
+    init(
+        id: UUID = UUID(),
+        filename: String,
+        contentType: String,
+        data: Data
+    ) {
+        self.id = id
+        self.filename = Self.cleanFilename(filename)
+        self.contentType = contentType.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "application/octet-stream" : contentType
+        self.dataBase64 = data.base64EncodedString()
+        self.byteCount = data.count
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case filename
+        case contentType
+        case dataBase64
+    }
+
+    private static func cleanFilename(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallback = trimmed.isEmpty ? "attachment.bin" : trimmed
+        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
+        let cleaned = fallback.unicodeScalars.map { scalar -> Character in
+            allowed.contains(scalar) ? Character(scalar) : "-"
+        }
+        let result = String(cleaned).prefix(120)
+        return result.isEmpty ? "attachment.bin" : String(result)
+    }
+}
+
 struct CodexCreateJobRequest: Encodable {
     let workspaceId: String
     let prompt: String
     let timeoutMs: Int?
     let model: String?
     let reasoningEffort: String?
+    let provider: CodexProvider
+    let attachments: [CodexJobAttachment]?
     let resumeSessionId: String?
 
     init(
@@ -910,6 +1372,8 @@ struct CodexCreateJobRequest: Encodable {
         timeoutMs: Int?,
         model: String? = nil,
         reasoningEffort: String? = nil,
+        provider: CodexProvider = .defaultProvider,
+        attachments: [CodexJobAttachment] = [],
         resumeSessionId: String? = nil
     ) {
         self.workspaceId = workspaceId
@@ -917,6 +1381,8 @@ struct CodexCreateJobRequest: Encodable {
         self.timeoutMs = timeoutMs
         self.model = model
         self.reasoningEffort = reasoningEffort
+        self.provider = provider
+        self.attachments = attachments.isEmpty ? nil : attachments
         self.resumeSessionId = resumeSessionId
     }
 }

@@ -116,18 +116,33 @@ final class ClientIdentityStore: ObservableObject {
     @discardableResult
     func importIdentityFromSetupEnvironmentIfNeeded() -> Bool {
         let setupPassphrase = Self.resolvedImportPassphrase(explicitPassphrase: "")
+        CodexDiagnostics.log("identity_setup_import_check", fields: [
+            "hasPassphrase": String(!setupPassphrase.isEmpty),
+            "hasStoredIdentity": String(hasStoredIdentity),
+            "supportP12Exists": String(FileManager.default.fileExists(atPath: expectedSupportP12URL.path))
+        ])
         guard
             !setupPassphrase.isEmpty,
-            !hasStoredIdentity,
             FileManager.default.fileExists(atPath: expectedSupportP12URL.path)
         else {
+            CodexDiagnostics.log("identity_setup_import_skipped")
             return false
         }
 
         do {
             try importIdentityFromSupport(passphrase: setupPassphrase)
+            CodexDiagnostics.log("identity_setup_import_success", fields: [
+                "hasStoredIdentity": String(hasStoredIdentity),
+                "certificateName": lastImportedCertificateName ?? ""
+            ])
             return true
         } catch {
+            let nsError = error as NSError
+            CodexDiagnostics.log("identity_setup_import_failed", fields: [
+                "domain": nsError.domain,
+                "code": String(nsError.code),
+                "description": error.localizedDescription
+            ])
             return false
         }
     }

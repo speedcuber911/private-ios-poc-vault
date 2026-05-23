@@ -8,7 +8,7 @@ if [[ -f "$CONFIG_FILE" ]]; then
 fi
 
 DEVICE="${DEVICE:-}"
-BUNDLE_ID="${BUNDLE_ID:-${IOS_BUNDLE_ID:-com.example.pocvault}}"
+BUNDLE_ID="${BUNDLE_ID:-${IOS_BUNDLE_ID:-com.parikshit.pocvault}}"
 LOCAL_SECRETS_DIR="${LOCAL_SECRETS_DIR:-$HOME/.poc-vault/secrets}"
 P12_PATH="${IPHONE_P12_PATH:-$LOCAL_SECRETS_DIR/clients/iphone/iphone.p12}"
 VAULT_DOMAIN="${VAULT_DOMAIN:-vault.pocs.example.com}"
@@ -85,20 +85,18 @@ if manifest_public_key:
 print(json.dumps(payload, indent=2, sort_keys=True))
 PY
 
-xcrun devicectl device copy to \
-  --device "$DEVICE" \
-  --source "$P12_PATH" \
-  --destination Documents/support/client.p12 \
-  --domain-type appDataContainer \
-  --domain-identifier "$BUNDLE_ID" \
-  --timeout 30
+support_dir="$tmpdir/support"
+mkdir -p "$support_dir"
+cp "$P12_PATH" "$support_dir/client.p12"
+cp "$config_json" "$support_dir/vault-config.json"
 
 xcrun devicectl device copy to \
   --device "$DEVICE" \
-  --source "$config_json" \
-  --destination Documents/support/vault-config.json \
+  --source "$support_dir" \
+  --destination Documents \
   --domain-type appDataContainer \
   --domain-identifier "$BUNDLE_ID" \
-  --timeout 30
+  --timeout 30 \
+  --remove-existing-content false
 
 echo "Provisioned iOS support files for bundle ${BUNDLE_ID}."

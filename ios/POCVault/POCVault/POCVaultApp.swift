@@ -5,10 +5,14 @@ struct POCVaultApp: App {
     @StateObject private var identityStore: ClientIdentityStore
     @StateObject private var libraryViewModel: LibraryViewModel
     @StateObject private var codexViewModel: CodexConsoleViewModel
+    @StateObject private var claudeViewModel: CodexConsoleViewModel
     private let manifestClient: ManifestClient
+    private let codexNotificationService: CodexLocalNotificationService
 
     init() {
         let identityStore = ClientIdentityStore()
+        identityStore.importIdentityFromSetupEnvironmentIfNeeded()
+        let codexNotificationService = CodexLocalNotificationService()
         let manifestClient = ManifestClient(
             manifestURL: AppConfiguration.manifestURL,
             signatureURL: AppConfiguration.signatureURL,
@@ -22,8 +26,18 @@ struct POCVaultApp: App {
 
         _identityStore = StateObject(wrappedValue: identityStore)
         _libraryViewModel = StateObject(wrappedValue: LibraryViewModel(client: manifestClient))
-        _codexViewModel = StateObject(wrappedValue: CodexConsoleViewModel(client: codexClient))
+        _codexViewModel = StateObject(wrappedValue: CodexConsoleViewModel(
+            client: codexClient,
+            provider: .codex,
+            completionNotifier: codexNotificationService
+        ))
+        _claudeViewModel = StateObject(wrappedValue: CodexConsoleViewModel(
+            client: codexClient,
+            provider: .claude,
+            completionNotifier: codexNotificationService
+        ))
         self.manifestClient = manifestClient
+        self.codexNotificationService = codexNotificationService
     }
 
     var body: some Scene {
@@ -31,6 +45,7 @@ struct POCVaultApp: App {
             POCVaultRootView(
                 libraryViewModel: libraryViewModel,
                 codexViewModel: codexViewModel,
+                claudeViewModel: claudeViewModel,
                 identityStore: identityStore,
                 manifestClient: manifestClient
             )
@@ -41,6 +56,7 @@ struct POCVaultApp: App {
 struct POCVaultRootView: View {
     @ObservedObject var libraryViewModel: LibraryViewModel
     @ObservedObject var codexViewModel: CodexConsoleViewModel
+    @ObservedObject var claudeViewModel: CodexConsoleViewModel
     @ObservedObject var identityStore: ClientIdentityStore
     let manifestClient: ManifestClient
 
@@ -52,12 +68,43 @@ struct POCVaultRootView: View {
                 manifestClient: manifestClient
             )
             .tabItem {
-                Label("Vault", systemImage: "lock.rectangle.stack")
+                Label("Library", systemImage: "square.grid.2x2")
             }
 
             CodexConsoleView(viewModel: codexViewModel)
                 .tabItem {
-                    Label("Codex", systemImage: "terminal")
+                    Label {
+                        Text(CodexProvider.codex.displayName)
+                    } icon: {
+                        Image(CodexProvider.codex.tabIconAssetName)
+                            .renderingMode(.template)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 24, height: 24)
+                    }
+                }
+
+            CodexConsoleView(viewModel: claudeViewModel)
+                .tabItem {
+                    Label {
+                        Text(CodexProvider.claude.displayName)
+                    } icon: {
+                        Image(CodexProvider.claude.tabIconAssetName)
+                            .renderingMode(.template)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 24, height: 24)
+                    }
+                }
+
+            CodexStatusView(
+                codexViewModel: codexViewModel,
+                claudeViewModel: claudeViewModel,
+                identityStore: identityStore,
+                manifestClient: manifestClient
+            )
+                .tabItem {
+                    Label("Status", systemImage: "waveform.path.ecg")
                 }
         }
         .tint(AppTheme.accent)
@@ -66,6 +113,235 @@ struct POCVaultRootView: View {
             identityStore.importIdentityFromSetupEnvironmentIfNeeded()
         }
     }
+}
+
+extension CodexProvider {
+    var tabIconAssetName: String {
+        switch self {
+        case .codex:
+            return "ChatGPTMark"
+        case .claude:
+            return "ClaudeMark"
+        }
+    }
+
+    var activityTint: Color {
+        switch self {
+        case .codex:
+            return AppTheme.statusInfo
+        case .claude:
+            return AppTheme.statusWarn
+        }
+    }
+}
+
+private struct CodexStatusView: View {
+    @ObservedObject var codexViewModel: CodexConsoleViewModel
+    @ObservedObject var claudeViewModel: CodexConsoleViewModel
+    @ObservedObject var identityStore: ClientIdentityStore
+    let manifestClient: ManifestClient
+    @State private var selectedSection = StatusSection.activity
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                AppTheme.bgCanvas.ignoresSafeArea()
+
+                VStack(spacing: 0) {
+                    Picker("Status view", selection: $selectedSection) {
+                        ForEach(StatusSection.allCases) { section in
+                            Text(section.title).tag(section)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 16)
+                    .padding(.bottom, 12)
+
+                    switch selectedSection {
+                    case .activity:
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 18) {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text("Activity")
+                                        .font(.title2.weight(.semibold))
+                                        .foregroundStyle(AppTheme.textPrimary)
+                                    Text(summaryText)
+                                        .font(.subheadline.weight(.medium))
+                                        .foregroundStyle(AppTheme.textSecondary)
+                                }
+
+                                VStack(spacing: 10) {
+                                    ForEach(Array(activityItems.prefix(24))) { activityItem in
+                                        CodexActivityRow(provider: activityItem.provider, item: activityItem.item)
+                                    }
+                                }
+                            }
+                            .padding(.horizontal, 20)
+                            .padding(.bottom, 110)
+                        }
+                        .scrollDismissesKeyboard(.interactively)
+                    case .health:
+                        DiagnosticsView(
+                            identityStore: identityStore,
+                            manifestClient: manifestClient,
+                            showsNavigationChrome: false
+                        )
+                    }
+                }
+            }
+            .navigationTitle("")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar(.hidden, for: .navigationBar)
+            .refreshable {
+                await refreshAll()
+            }
+            .task {
+                await bootstrapAll()
+            }
+        }
+    }
+
+    private var activityItems: [ProviderActivityItem] {
+        (
+            codexViewModel.threadFeedItems.map { ProviderActivityItem(provider: .codex, item: $0) }
+            + claudeViewModel.threadFeedItems.map { ProviderActivityItem(provider: .claude, item: $0) }
+        )
+        .sorted {
+            ($0.item.updatedAt ?? .distantPast) > ($1.item.updatedAt ?? .distantPast)
+        }
+    }
+
+    private var summaryText: String {
+        let activeCount = activityItems.filter(\.item.isActive).count
+        if activeCount == 0 {
+            return "\(activityItems.count) recent threads across Codex and Claude"
+        }
+        return "\(activeCount) active · \(activityItems.count) recent"
+    }
+
+    private func bootstrapAll() async {
+        async let codexBootstrap: Void = codexViewModel.bootstrapIfNeeded()
+        async let claudeBootstrap: Void = claudeViewModel.bootstrapIfNeeded()
+        _ = await (codexBootstrap, claudeBootstrap)
+    }
+
+    private func refreshAll() async {
+        async let codexRefresh: Void = codexViewModel.refreshAll()
+        async let claudeRefresh: Void = claudeViewModel.refreshAll()
+        _ = await (codexRefresh, claudeRefresh)
+    }
+}
+
+private enum StatusSection: String, CaseIterable, Identifiable {
+    case activity
+    case health
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .activity:
+            return "Activity"
+        case .health:
+            return "Health"
+        }
+    }
+}
+
+private struct ProviderActivityItem: Identifiable {
+    let provider: CodexProvider
+    let item: CodexThreadFeedItem
+
+    var id: String {
+        "\(provider.rawValue)-\(item.id)"
+    }
+}
+
+private struct CodexActivityRow: View {
+    let provider: CodexProvider
+    let item: CodexThreadFeedItem
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: item.isActive ? "bolt.fill" : "bubble.left.and.bubble.right")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(statusColor)
+                    .frame(width: 26, height: 26)
+                    .background(AppTheme.bgSurfaceHi, in: Circle())
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(item.title)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(AppTheme.textPrimary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    Text(item.preview)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 8)
+
+                VStack(alignment: .trailing, spacing: 6) {
+                    Text(provider.displayName)
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(provider.activityTint)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(provider.activityTint.opacity(0.12), in: Capsule())
+
+                    Text(item.status?.label ?? "Thread")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(statusColor)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(statusColor.opacity(0.12), in: Capsule())
+                }
+            }
+
+            HStack(spacing: 8) {
+                Text(item.workspaceLabel)
+                Text(item.shortID)
+                if let updatedAt = item.updatedAt {
+                    Text(Self.relativeFormatter.localizedString(for: updatedAt, relativeTo: Date()))
+                }
+            }
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(AppTheme.textTertiary)
+            .lineLimit(1)
+        }
+        .padding(14)
+        .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(AppTheme.strokeSubtle, lineWidth: 1)
+        }
+    }
+
+    private var statusColor: Color {
+        guard let status = item.status else { return AppTheme.statusInfo }
+        switch status {
+        case .queued, .running, .canceling:
+            return AppTheme.statusWarn
+        case .succeeded:
+            return AppTheme.statusOK
+        case .failed, .timeout:
+            return AppTheme.statusError
+        case .canceled, .unknown:
+            return AppTheme.statusNeutral
+        }
+    }
+
+    private static let relativeFormatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter
+    }()
 }
 
 enum AppTheme {
@@ -111,7 +387,7 @@ enum AppConfiguration {
         infoKey: "POCVaultCodexBaseURL",
         fallback: "https://codex.pocs.example.com"
     )
-    static let runtimeMode = "Production Vault"
+    static let runtimeMode = "Relay Cloud"
 #endif
 
     static let trustedManifestPublicKey = configuredPublicKey(

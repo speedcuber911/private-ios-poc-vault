@@ -1,7 +1,233 @@
 import Foundation
+import UserNotifications
+
+struct CodexCompletionSignal: Equatable {
+    let key: String
+    let title: String
+    let body: String
+    let jobID: String?
+    let sessionID: String?
+
+    var notificationIdentifier: String {
+        "codex-completion-\(key.replacingOccurrences(of: ":", with: "-"))"
+    }
+
+    var threadIdentifier: String {
+        guard let sessionID else { return "codex" }
+        return "codex-thread-\(sessionID)"
+    }
+
+    static func completedJobs(
+        previouslyActiveJobIDs: Set<String>,
+        jobs: [CodexJob],
+        notifiedKeys: Set<String>
+    ) -> [CodexCompletionSignal] {
+        jobs.compactMap { job in
+            guard previouslyActiveJobIDs.contains(job.id),
+                  job.status.shouldNotifyCompletion,
+                  job.isReadyForCompletionNotification else {
+                return nil
+            }
+            let key = "job:\(job.id)"
+            guard !notifiedKeys.contains(key) else { return nil }
+            return CodexCompletionSignal(
+                key: key,
+                title: title(for: job.status, provider: job.provider),
+                body: body(
+                    for: job.status,
+                    provider: job.provider,
+                    subject: subject(from: job.prompt, fallback: job.workspaceName ?? job.workspaceId ?? "your \(job.provider.displayName) run")
+                ),
+                jobID: job.id,
+                sessionID: job.threadSessionId
+            )
+        }
+    }
+
+    static func completedThreads(
+        previouslyActiveThreadIDs: Set<String>,
+        threads: [CodexThread],
+        notifiedKeys: Set<String>
+    ) -> [CodexCompletionSignal] {
+        threads.compactMap { thread in
+            guard previouslyActiveThreadIDs.contains(thread.sessionId),
+                  !thread.hasActiveJobs,
+                  let status = thread.lastJobStatus,
+                  status.shouldNotifyCompletion,
+                  thread.isReadyForCompletionNotification else {
+                return nil
+            }
+            let key = thread.lastJobId.map { "job:\($0)" } ?? "thread:\(thread.sessionId)"
+            guard !notifiedKeys.contains(key) else { return nil }
+            return CodexCompletionSignal(
+                key: key,
+                title: title(for: status, provider: thread.provider),
+                body: body(for: status, provider: thread.provider, subject: subject(from: thread.lastPrompt, fallback: thread.workspaceLabel)),
+                jobID: thread.lastJobId,
+                sessionID: thread.sessionId
+            )
+        }
+    }
+
+    private static func title(for status: CodexJobStatus, provider: CodexProvider) -> String {
+        switch status {
+        case .succeeded:
+            return "\(provider.displayName) finished"
+        case .failed, .timeout:
+            return "\(provider.displayName) needs attention"
+        case .canceled:
+            return "\(provider.displayName) was canceled"
+        case .queued, .running, .canceling, .unknown:
+            return "\(provider.displayName) updated"
+        }
+    }
+
+    private static func body(for status: CodexJobStatus, provider: CodexProvider, subject: String) -> String {
+        switch status {
+        case .succeeded:
+            return "Your \(provider.displayName) thread is ready: \(subject)"
+        case .failed:
+            return "\(provider.displayName) hit an error: \(subject)"
+        case .timeout:
+            return "\(provider.displayName) timed out: \(subject)"
+        case .canceled:
+            return "\(provider.displayName) was canceled: \(subject)"
+        case .queued, .running, .canceling, .unknown:
+            return "\(provider.displayName) updated: \(subject)"
+        }
+    }
+
+    private static func subject(from value: String?, fallback: String) -> String {
+        let rawSubject = CodexThread.threadTitle(from: value) ?? nonEmpty(value) ?? fallback
+        return shortened(rawSubject)
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
+    }
+
+    private static func shortened(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > 120 else { return trimmed }
+        return "\(String(trimmed.prefix(117)).trimmingCharacters(in: .whitespacesAndNewlines))..."
+    }
+}
+
+protocol CodexCompletionNotifying {
+    func prepareForNotifications() async
+    func sendCompletionNotification(_ signal: CodexCompletionSignal) async
+}
+
+struct CodexNoopCompletionNotifier: CodexCompletionNotifying {
+    func prepareForNotifications() async {}
+    func sendCompletionNotification(_ signal: CodexCompletionSignal) async {}
+}
+
+final class CodexLocalNotificationService: NSObject, CodexCompletionNotifying, UNUserNotificationCenterDelegate {
+    private let center: UNUserNotificationCenter
+    private var preparedAuthorization = false
+    private var canSendNotifications = false
+
+    init(center: UNUserNotificationCenter = .current()) {
+        self.center = center
+        super.init()
+        center.delegate = self
+    }
+
+    func prepareForNotifications() async {
+        guard !preparedAuthorization else { return }
+        preparedAuthorization = true
+
+        let settings = await center.notificationSettings()
+        switch settings.authorizationStatus {
+        case .authorized, .provisional, .ephemeral:
+            canSendNotifications = true
+        case .notDetermined:
+            canSendNotifications = ((try? await center.requestAuthorization(options: [.alert, .sound, .badge])) == true)
+        case .denied:
+            canSendNotifications = false
+        @unknown default:
+            canSendNotifications = false
+        }
+    }
+
+    func sendCompletionNotification(_ signal: CodexCompletionSignal) async {
+        await prepareForNotifications()
+        guard canSendNotifications else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = signal.title
+        content.body = signal.body
+        content.sound = .default
+        content.threadIdentifier = signal.threadIdentifier
+        content.userInfo = [
+            "codexCompletionKey": signal.key,
+            "codexJobID": signal.jobID ?? "",
+            "codexSessionID": signal.sessionID ?? ""
+        ]
+
+        let request = UNNotificationRequest(
+            identifier: signal.notificationIdentifier,
+            content: content,
+            trigger: nil
+        )
+        try? await center.add(request)
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .list, .sound])
+    }
+}
+
+private extension CodexJobStatus {
+    var shouldNotifyCompletion: Bool {
+        switch self {
+        case .succeeded, .failed, .canceled, .timeout:
+            return true
+        case .queued, .running, .canceling, .unknown:
+            return false
+        }
+    }
+}
+
+private extension CodexJob {
+    var isReadyForCompletionNotification: Bool {
+        switch status {
+        case .succeeded:
+            return displayOutput?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        case .failed, .timeout, .canceled:
+            return true
+        case .queued, .running, .canceling, .unknown:
+            return false
+        }
+    }
+}
+
+private extension CodexThread {
+    var isReadyForCompletionNotification: Bool {
+        switch lastJobStatus {
+        case .some(.succeeded):
+            return lastResult?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        case .some(.failed), .some(.timeout), .some(.canceled):
+            return true
+        case .some(.queued), .some(.running), .some(.canceling), .some(.unknown), .none:
+            return false
+        }
+    }
+}
 
 @MainActor
 final class CodexConsoleViewModel: ObservableObject {
+    let provider: CodexProvider
+
     @Published private(set) var health: CodexHealth?
     @Published private(set) var workspaces: [CodexWorkspace] = []
     @Published private(set) var sessions: [CodexSession] = []
@@ -12,6 +238,7 @@ final class CodexConsoleViewModel: ObservableObject {
     @Published private(set) var isTranscribing = false
     @Published private(set) var cancellingJobIDs: Set<String> = []
     @Published private(set) var lastRefreshedAt: Date?
+    @Published private(set) var connectionNotice: String?
     @Published var selectedWorkspaceID: String? {
         didSet {
             guard selectedWorkspaceID != oldValue else { return }
@@ -20,17 +247,31 @@ final class CodexConsoleViewModel: ObservableObject {
     }
     @Published var selectedSessionID: String?
     @Published var prompt = ""
-    @Published var timeoutMs = 600_000
-    @Published var selectedModel = "gpt-5.5"
-    @Published var selectedReasoningEffort: CodexReasoningEffort = .xhigh
+    @Published var timeoutMs = 1_800_000
+    @Published var selectedModel = CodexProvider.defaultProvider.defaultModel
+    @Published var selectedReasoningEffort: CodexReasoningEffort = CodexProvider.defaultProvider.defaultReasoningEffort
+    @Published var selectedRunMode: CodexRunMode = .quality
+    @Published private(set) var attachments: [CodexJobAttachment] = []
     @Published private(set) var selectedSkills: [CodexSkill] = []
     @Published var errorMessage: String?
 
     private let client: CodexClient
+    private let completionNotifier: CodexCompletionNotifying
     private var hasBootstrapped = false
+    private var observedActiveJobIDs: Set<String> = []
+    private var observedActiveThreadIDs: Set<String> = []
+    private var notifiedCompletionKeys: Set<String> = []
 
-    init(client: CodexClient) {
+    init(
+        client: CodexClient,
+        provider: CodexProvider = .defaultProvider,
+        completionNotifier: CodexCompletionNotifying = CodexNoopCompletionNotifier()
+    ) {
         self.client = client
+        self.provider = provider
+        self.completionNotifier = completionNotifier
+        self.selectedModel = provider.defaultModel
+        self.selectedReasoningEffort = provider.defaultReasoningEffort
     }
 
     nonisolated static func isCancellation(_ error: Error) -> Bool {
@@ -44,6 +285,42 @@ final class CodexConsoleViewModel: ObservableObject {
         let nsError = error as NSError
         return nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled
     }
+
+    nonisolated static func isHTTPNotFound(_ error: Error) -> Bool {
+        if let codexError = error as? CodexClientError {
+            return codexError.statusCode == 404
+        }
+        let summary = CodexErrorSummary(message: error.localizedDescription)
+        return summary.statusCode == 404
+    }
+
+    nonisolated static func isTransientConnection(_ error: Error) -> Bool {
+        if let urlError = error as? URLError {
+            return transientURLCodes.contains(urlError.code)
+        }
+
+        let nsError = error as NSError
+        let code = URLError.Code(rawValue: nsError.code)
+        if nsError.domain == NSURLErrorDomain,
+           transientURLCodes.contains(code) {
+            return true
+        }
+
+        let message = error.localizedDescription.lowercased()
+        return message.contains("network connection was lost")
+            || message.contains("not connected to the internet")
+            || message.contains("timed out")
+            || message.contains("could not connect")
+    }
+
+    private nonisolated static let transientURLCodes: Set<URLError.Code> = [
+        .networkConnectionLost,
+        .notConnectedToInternet,
+        .timedOut,
+        .cannotFindHost,
+        .cannotConnectToHost,
+        .dnsLookupFailed
+    ]
 
     var endpointDisplay: String {
         guard let host = client.baseURL.host(percentEncoded: false) ?? client.baseURL.host else {
@@ -101,11 +378,39 @@ final class CodexConsoleViewModel: ObservableObject {
     }
 
     var hasActiveJobs: Bool {
-        jobs.contains { $0.status.isActive }
+        jobs.contains { $0.status.isActive } || threads.contains { $0.hasActiveJobs }
+    }
+
+    private var hasCachedCodexContent: Bool {
+        !workspaces.isEmpty || !sessions.isEmpty || !threads.isEmpty || !jobs.isEmpty
+    }
+
+    var shouldShowThreadEmptyState: Bool {
+        !isRefreshing || lastRefreshedAt != nil
+    }
+
+    var connectionNoticeTitle: String {
+        client.hasClientIdentity ? "Reconnecting to \(provider.displayName)" : "\(provider.displayName) needs certificate"
+    }
+
+    var connectionNoticeMessage: String {
+        connectionNotice ?? "Could not refresh Codex yet."
     }
 
     var selectedSkillIDs: Set<String> {
         Set(selectedSkills.map(\.id))
+    }
+
+    var attachmentLimitText: String {
+        "Up to \(Self.maxAttachmentCount) files, \(Self.maxAttachmentBytes / 1_048_576) MB each."
+    }
+
+    var modelOptions: [String] {
+        provider.modelOptions
+    }
+
+    var reasoningEffortOptions: [CodexReasoningEffort] {
+        provider.reasoningEffortOptions
     }
 
     func isCancelling(_ jobID: String) -> Bool {
@@ -122,6 +427,45 @@ final class CodexConsoleViewModel: ObservableObject {
 
     func removeSkill(_ skill: CodexSkill) {
         selectedSkills.removeAll { $0 == skill }
+    }
+
+    func makeAttachment(
+        data: Data,
+        filename: String,
+        contentType: String,
+        existing: [CodexJobAttachment]
+    ) -> CodexJobAttachment? {
+        guard existing.count < Self.maxAttachmentCount else {
+            errorMessage = "You can attach up to \(Self.maxAttachmentCount) files."
+            return nil
+        }
+        guard data.count <= Self.maxAttachmentBytes else {
+            errorMessage = "\(filename) is larger than \(Self.maxAttachmentBytes / 1_048_576) MB."
+            return nil
+        }
+        let totalBytes = existing.reduce(data.count) { $0 + $1.byteCount }
+        guard totalBytes <= Self.maxAttachmentTotalBytes else {
+            errorMessage = "Attachments are larger than \(Self.maxAttachmentTotalBytes / 1_048_576) MB total."
+            return nil
+        }
+        errorMessage = nil
+        return CodexJobAttachment(filename: filename, contentType: contentType, data: data)
+    }
+
+    func addComposeAttachment(data: Data, filename: String, contentType: String) {
+        guard let attachment = makeAttachment(
+            data: data,
+            filename: filename,
+            contentType: contentType,
+            existing: attachments
+        ) else {
+            return
+        }
+        attachments.append(attachment)
+    }
+
+    func removeComposeAttachment(_ attachment: CodexJobAttachment) {
+        attachments.removeAll { $0.id == attachment.id }
     }
 
     func appendTranscription(_ text: String) {
@@ -159,69 +503,155 @@ final class CodexConsoleViewModel: ObservableObject {
 
     func bootstrapIfNeeded() async {
         guard !hasBootstrapped else { return }
-        hasBootstrapped = true
-        await refreshAll()
+        for attempt in 0..<3 {
+            await refreshAll()
+            if lastRefreshedAt != nil || hasCachedCodexContent {
+                hasBootstrapped = true
+                return
+            }
+            guard !Task.isCancelled, attempt < 2 else { return }
+            try? await Task.sleep(nanoseconds: UInt64(attempt + 1) * 1_500_000_000)
+        }
     }
 
     func refreshAll() async {
         isRefreshing = true
         defer { isRefreshing = false }
+        let previouslyActiveJobIDs = observedActiveJobIDs.union(activeJobIDs(in: jobs))
+        let previouslyActiveThreadIDs = observedActiveThreadIDs.union(activeThreadIDs(in: threads))
 
         async let workspaceRequest = client.fetchWorkspaces()
-        async let jobRequest = client.fetchJobs(limit: 50)
-        async let sessionRequest = client.fetchSessions(limit: 50)
-        async let threadRequest = client.fetchThreads(limit: 50)
+        async let jobRequest = client.fetchJobs(provider: provider, limit: 10)
+        async let sessionRequest = client.fetchSessions(provider: provider, limit: 50)
+        async let threadRequest = client.fetchThreads(provider: provider, limit: 50)
         await refreshHealth()
 
+        var refreshErrors: [Error] = []
+        var loadedCoreContent = false
+        var loadedAnyContent = false
+
         do {
-            let (workspaceResponse, jobResponse) = try await (workspaceRequest, jobRequest)
-            let sessionResponse = (try? await sessionRequest) ?? []
-            let threadResponse = (try? await threadRequest) ?? []
+            let workspaceResponse = try await workspaceRequest
             workspaces = workspaceResponse
-            jobs = Self.sortedJobs(jobResponse)
+            loadedCoreContent = true
+            loadedAnyContent = true
+        } catch {
+            if Self.isCancellation(error) { return }
+            refreshErrors.append(error)
+        }
+
+        do {
+            let sessionResponse = try await sessionRequest
             sessions = Self.sortedSessions(sessionResponse)
+            loadedCoreContent = true
+            loadedAnyContent = true
+        } catch {
+            if Self.isCancellation(error) { return }
+            refreshErrors.append(error)
+        }
+
+        do {
+            let threadResponse = try await threadRequest
             threads = Self.sortedThreads(threadResponse)
+            await handleCompletedThreads(threads, previouslyActiveThreadIDs: previouslyActiveThreadIDs)
+            loadedCoreContent = true
+            loadedAnyContent = true
+        } catch {
+            if Self.isCancellation(error) { return }
+            refreshErrors.append(error)
+        }
+
+        do {
+            let jobResponse = try await jobRequest
+            jobs = Self.sortedJobs(jobResponse)
+            await handleCompletedJobs(jobs, previouslyActiveJobIDs: previouslyActiveJobIDs)
+            loadedAnyContent = true
+        } catch {
+            if Self.isCancellation(error) { return }
+            refreshErrors.append(error)
+        }
+
+        if loadedAnyContent {
             selectDefaultWorkspaceIfNeeded()
             clearSelectedSessionIfNeeded()
             errorMessage = nil
+            if loadedCoreContent {
+                connectionNotice = nil
+            }
             lastRefreshedAt = Date()
-        } catch {
-            guard !Self.isCancellation(error) else { return }
-            errorMessage = error.localizedDescription
+            return
         }
+
+        guard let error = refreshErrors.first else { return }
+        if Self.isTransientConnection(error) {
+                errorMessage = nil
+                connectionNotice = connectionFailureMessage(
+                    connectedMessage: "Connection dropped. Keeping \(provider.displayName) content in place and retrying."
+                )
+                return
+        }
+        errorMessage = error.localizedDescription
     }
 
     func refreshJobs() async {
         do {
-            jobs = Self.sortedJobs(try await client.fetchJobs(limit: 50))
+            let previouslyActiveJobIDs = observedActiveJobIDs.union(activeJobIDs(in: jobs))
+            jobs = Self.sortedJobs(try await client.fetchJobs(provider: provider, limit: 10))
+            await handleCompletedJobs(jobs, previouslyActiveJobIDs: previouslyActiveJobIDs)
             errorMessage = nil
+            connectionNotice = nil
             lastRefreshedAt = Date()
         } catch {
             guard !Self.isCancellation(error) else { return }
+            if Self.isTransientConnection(error) {
+                errorMessage = nil
+                connectionNotice = connectionFailureMessage(
+                    connectedMessage: "Connection dropped while refreshing jobs."
+                )
+                return
+            }
             errorMessage = error.localizedDescription
         }
     }
 
     func refreshSessions() async {
         do {
-            sessions = Self.sortedSessions(try await client.fetchSessions(limit: 50))
+            sessions = Self.sortedSessions(try await client.fetchSessions(provider: provider, limit: 50))
             clearSelectedSessionIfNeeded()
             errorMessage = nil
+            connectionNotice = nil
             lastRefreshedAt = Date()
         } catch {
             guard !Self.isCancellation(error) else { return }
+            if Self.isTransientConnection(error) {
+                errorMessage = nil
+                connectionNotice = connectionFailureMessage(
+                    connectedMessage: "Connection dropped while refreshing sessions."
+                )
+                return
+            }
             errorMessage = error.localizedDescription
         }
     }
 
     func refreshThreads() async {
         do {
-            threads = Self.sortedThreads(try await client.fetchThreads(limit: 50))
+            let previouslyActiveThreadIDs = observedActiveThreadIDs.union(activeThreadIDs(in: threads))
+            threads = Self.sortedThreads(try await client.fetchThreads(provider: provider, limit: 50))
+            await handleCompletedThreads(threads, previouslyActiveThreadIDs: previouslyActiveThreadIDs)
             clearSelectedSessionIfNeeded()
             errorMessage = nil
+            connectionNotice = nil
             lastRefreshedAt = Date()
         } catch {
             guard !Self.isCancellation(error) else { return }
+            if Self.isTransientConnection(error) {
+                errorMessage = nil
+                connectionNotice = connectionFailureMessage(
+                    connectedMessage: "Connection dropped while refreshing threads."
+                )
+                return
+            }
             errorMessage = error.localizedDescription
         }
     }
@@ -238,6 +668,7 @@ final class CodexConsoleViewModel: ObservableObject {
     func pollJobsWhileVisible() async {
         while !Task.isCancelled {
             if hasActiveJobs {
+                await completionNotifier.prepareForNotifications()
                 await refreshJobs()
                 await refreshSessions()
                 await refreshThreads()
@@ -247,26 +678,40 @@ final class CodexConsoleViewModel: ObservableObject {
     }
 
     func loadJob(id: String, includeFullLogs: Bool = false) async throws -> CodexJob {
+        let previouslyActiveJobIDs = observedActiveJobIDs.union(activeJobIDs(in: jobs))
         let job = try await client.fetchJob(id: id, includeFullLogs: includeFullLogs)
         upsert(job)
+        await handleCompletedJobs([job], previouslyActiveJobIDs: previouslyActiveJobIDs)
         return job
+    }
+
+    func loadThreadDetail(sessionID: String) async throws -> CodexThreadDetail {
+        let detail = try await client.fetchThreadDetail(sessionID: sessionID, provider: provider)
+        upsert(detail.thread)
+        for job in detail.jobs {
+            upsert(job)
+        }
+        return detail
     }
 
     func createJobFromCompose() async -> String? {
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedPrompt.isEmpty else {
-            errorMessage = "Add a prompt before starting a Codex job."
+        guard !trimmedPrompt.isEmpty || !attachments.isEmpty else {
+            errorMessage = "Add a prompt or attachment before starting a \(provider.displayName) job."
             return nil
         }
-        let promptForJob = Self.prompt(trimmedPrompt, applying: selectedSkills)
+        let basePrompt = trimmedPrompt.isEmpty ? "Please inspect the attached file(s)." : trimmedPrompt
+        let promptForJob = Self.prompt(basePrompt, applying: selectedSkills, provider: provider)
         let newJobID = await createJob(
             workspaceID: composeWorkspaceID,
             prompt: promptForJob,
             timeoutMs: timeoutMs,
+            attachments: attachments,
             resumeSessionID: selectedSessionID
         )
         if newJobID != nil {
             prompt = ""
+            attachments = []
             selectedSkills = []
         }
         return newJobID
@@ -281,6 +726,10 @@ final class CodexConsoleViewModel: ObservableObject {
             errorMessage = "No workspace is available for retry."
             return nil
         }
+        guard job.provider == provider else {
+            errorMessage = "This job belongs to \(job.provider.displayName). Switch providers to retry it."
+            return nil
+        }
 
         return await createJob(
             workspaceID: workspaceID,
@@ -291,11 +740,19 @@ final class CodexConsoleViewModel: ObservableObject {
     }
 
     func selectSession(_ session: CodexSession) {
+        guard session.provider == provider else {
+            errorMessage = "This session belongs to \(session.provider.displayName)."
+            return
+        }
         selectedWorkspaceID = session.workspaceId ?? selectedWorkspaceID
         selectedSessionID = session.id
     }
 
     func selectThread(_ thread: CodexThread) {
+        guard thread.provider == provider else {
+            errorMessage = "This thread belongs to \(thread.provider.displayName)."
+            return
+        }
         selectedWorkspaceID = thread.workspaceId ?? selectedWorkspaceID
         selectedSessionID = thread.sessionId
     }
@@ -311,10 +768,15 @@ final class CodexConsoleViewModel: ObservableObject {
         selectedSessionID = nil
     }
 
-    func createFollowUp(prompt: String, sessionID: String, workspaceID: String?) async -> String? {
+    func createFollowUp(
+        prompt: String,
+        sessionID: String,
+        workspaceID: String?,
+        attachments: [CodexJobAttachment] = []
+    ) async -> String? {
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedPrompt.isEmpty else {
-            errorMessage = "Add a reply before continuing this thread."
+        guard !trimmedPrompt.isEmpty || !attachments.isEmpty else {
+            errorMessage = "Add a reply or attachment before continuing this thread."
             return nil
         }
         let resolvedWorkspaceID: String
@@ -324,13 +786,25 @@ final class CodexConsoleViewModel: ObservableObject {
         } else {
             resolvedWorkspaceID = composeWorkspaceID
         }
+        if let selectedThread = threads.first(where: { $0.sessionId == sessionID || $0.id == sessionID }),
+           selectedThread.provider != provider {
+            errorMessage = "This thread belongs to \(selectedThread.provider.displayName)."
+            return nil
+        }
 
-        return await createJob(
+        let basePrompt = trimmedPrompt.isEmpty ? "Please inspect the attached file(s)." : trimmedPrompt
+        let promptForJob = Self.prompt(basePrompt, applying: selectedSkills, provider: provider)
+        let newJobID = await createJob(
             workspaceID: resolvedWorkspaceID,
-            prompt: trimmedPrompt,
+            prompt: promptForJob,
             timeoutMs: timeoutMs,
+            attachments: attachments,
             resumeSessionID: sessionID
         )
+        if newJobID != nil {
+            selectedSkills = []
+        }
+        return newJobID
     }
 
     func cancel(id: String) async {
@@ -353,6 +827,7 @@ final class CodexConsoleViewModel: ObservableObject {
         workspaceID: String,
         prompt: String,
         timeoutMs: Int?,
+        attachments: [CodexJobAttachment] = [],
         resumeSessionID: String? = nil
     ) async -> String? {
         isCreating = true
@@ -365,10 +840,17 @@ final class CodexConsoleViewModel: ObservableObject {
                     prompt: prompt,
                     timeoutMs: timeoutMs,
                     model: selectedModel,
-                    reasoningEffort: selectedReasoningEffort.rawValue,
+                    reasoningEffort: effectiveReasoningEffort.rawValue,
+                    provider: provider,
+                    attachments: attachments,
                     resumeSessionId: resumeSessionID
                 )
             )
+            observedActiveJobIDs.insert(response.id)
+            if let resumeSessionID {
+                observedActiveThreadIDs.insert(resumeSessionID)
+            }
+            await completionNotifier.prepareForNotifications()
             if let job = response.job {
                 upsert(job)
             } else if let job = try? await client.fetchJob(id: response.id) {
@@ -384,6 +866,13 @@ final class CodexConsoleViewModel: ObservableObject {
             errorMessage = error.localizedDescription
             return nil
         }
+    }
+
+    private func connectionFailureMessage(connectedMessage: String) -> String {
+        guard client.hasClientIdentity else {
+            return "Client certificate is not available yet. Unlock the phone, open Diagnostics if needed, then refresh \(provider.displayName)."
+        }
+        return connectedMessage
     }
 
     private func selectDefaultWorkspaceIfNeeded() {
@@ -424,7 +913,80 @@ final class CodexConsoleViewModel: ObservableObject {
             jobs.insert(job, at: 0)
         }
         jobs = Self.sortedJobs(jobs)
+        if job.status.isActive {
+            observedActiveJobIDs.insert(job.id)
+            if let sessionID = job.threadSessionId {
+                observedActiveThreadIDs.insert(sessionID)
+            }
+        }
         lastRefreshedAt = Date()
+    }
+
+    private func upsert(_ thread: CodexThread) {
+        if let index = threads.firstIndex(where: { $0.sessionId == thread.sessionId || $0.id == thread.id }) {
+            threads[index] = thread
+        } else {
+            threads.insert(thread, at: 0)
+        }
+        threads = Self.sortedThreads(threads)
+        if thread.hasActiveJobs {
+            observedActiveThreadIDs.insert(thread.sessionId)
+        }
+        lastRefreshedAt = Date()
+    }
+
+    private func handleCompletedJobs(_ loadedJobs: [CodexJob], previouslyActiveJobIDs: Set<String>) async {
+        let signals = CodexCompletionSignal.completedJobs(
+            previouslyActiveJobIDs: previouslyActiveJobIDs,
+            jobs: loadedJobs,
+            notifiedKeys: notifiedCompletionKeys
+        )
+        await sendCompletionSignals(signals)
+
+        let loadedIDs = Set(loadedJobs.map(\.id))
+        let waitingForOutputIDs = Set(loadedJobs.filter {
+            previouslyActiveJobIDs.contains($0.id)
+                && $0.status.shouldNotifyCompletion
+                && !$0.isReadyForCompletionNotification
+        }.map(\.id))
+        observedActiveJobIDs.subtract(loadedIDs.subtracting(waitingForOutputIDs))
+        observedActiveJobIDs.formUnion(activeJobIDs(in: loadedJobs))
+        observedActiveJobIDs.formUnion(waitingForOutputIDs)
+    }
+
+    private func handleCompletedThreads(_ loadedThreads: [CodexThread], previouslyActiveThreadIDs: Set<String>) async {
+        let signals = CodexCompletionSignal.completedThreads(
+            previouslyActiveThreadIDs: previouslyActiveThreadIDs,
+            threads: loadedThreads,
+            notifiedKeys: notifiedCompletionKeys
+        )
+        await sendCompletionSignals(signals)
+
+        let loadedIDs = Set(loadedThreads.map(\.sessionId))
+        let waitingForOutputIDs = Set(loadedThreads.filter {
+            previouslyActiveThreadIDs.contains($0.sessionId)
+                && ($0.lastJobStatus?.shouldNotifyCompletion == true)
+                && !$0.isReadyForCompletionNotification
+        }.map(\.sessionId))
+        observedActiveThreadIDs.subtract(loadedIDs.subtracting(waitingForOutputIDs))
+        observedActiveThreadIDs.formUnion(activeThreadIDs(in: loadedThreads))
+        observedActiveThreadIDs.formUnion(waitingForOutputIDs)
+    }
+
+    private func sendCompletionSignals(_ signals: [CodexCompletionSignal]) async {
+        for signal in signals {
+            guard !notifiedCompletionKeys.contains(signal.key) else { continue }
+            notifiedCompletionKeys.insert(signal.key)
+            await completionNotifier.sendCompletionNotification(signal)
+        }
+    }
+
+    private func activeJobIDs(in jobs: [CodexJob]) -> Set<String> {
+        Set(jobs.filter { $0.status.isActive }.map(\.id))
+    }
+
+    private func activeThreadIDs(in threads: [CodexThread]) -> Set<String> {
+        Set(threads.filter(\.hasActiveJobs).map(\.sessionId))
     }
 
     private static func sortedJobs(_ jobs: [CodexJob]) -> [CodexJob] {
@@ -445,11 +1007,19 @@ final class CodexConsoleViewModel: ObservableObject {
         }
     }
 
-    private static func prompt(_ prompt: String, applying skills: [CodexSkill]) -> String {
+    private static func prompt(_ prompt: String, applying skills: [CodexSkill], provider: CodexProvider) -> String {
         guard !skills.isEmpty else { return prompt }
         let names = skills.map(\.id).joined(separator: ", ")
-        return "Use these Codex skills for this task: \(names).\n\n\(prompt)"
+        return "Use these \(provider.displayName) skills for this task: \(names).\n\n\(prompt)"
     }
+
+    private var effectiveReasoningEffort: CodexReasoningEffort {
+        selectedRunMode.effectiveReasoningEffort ?? selectedReasoningEffort
+    }
+
+    private static let maxAttachmentCount = 6
+    private static let maxAttachmentBytes = 8 * 1_048_576
+    private static let maxAttachmentTotalBytes = 18 * 1_048_576
 }
 
 struct CodexSkill: Identifiable, Hashable {
@@ -463,7 +1033,7 @@ struct CodexSkill: Identifiable, Hashable {
     }
 
     static let all: [CodexSkill] = [
-        CodexSkill(id: "poc-vault-deploy", title: "POC deploy", group: "Vault", summary: "Create, host, publish, or deploy vault POCs."),
+        CodexSkill(id: "poc-vault-deploy", title: "POC deploy", group: "Library", summary: "Create, host, publish, or deploy private POCs."),
         CodexSkill(id: "browser", title: "In-app browser", group: "Browser", summary: "Open and test local web targets in Codex."),
         CodexSkill(id: "chrome", title: "Chrome", group: "Browser", summary: "Use logged-in Chrome sessions and existing tabs."),
         CodexSkill(id: "computer-use", title: "Computer use", group: "Desktop", summary: "Operate local Mac apps by clicking and typing."),
