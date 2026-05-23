@@ -1,4 +1,5 @@
 import http from "node:http";
+import https from "node:https";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -12,13 +13,25 @@ const allowedCertSubjects = new Set(splitCsv(process.env.CODEX_ALLOWED_CERT_SUBJ
 const dataDir = process.env.CODEX_DATA_DIR || "/var/lib/codex-api";
 const jobsDir = path.join(dataDir, "jobs");
 const logsDir = path.join(dataDir, "logs");
+const attachmentsDir = path.join(dataDir, "attachments");
 const auditPath = path.join(dataDir, "audit.jsonl");
-const codexBin = process.env.CODEX_BIN || "/usr/local/bin/codex";
+const codexBin = process.env.CODEX_BIN || "/usr/bin/codex";
+const claudeBin = process.env.CLAUDE_BIN || "/usr/bin/claude";
 const runHome = process.env.CODEX_RUN_HOME || process.env.HOME || "/home/ec2-user";
 const codexHome = process.env.CODEX_HOME || path.join(runHome, ".codex");
+const npmCacheDir = process.env.NPM_CONFIG_CACHE || process.env.npm_config_cache || path.join(runHome, ".npm-cache");
+const bunCacheDir = process.env.BUN_INSTALL_CACHE_DIR || path.join(runHome, ".bun-cache");
 const dangerousMode = parseBooleanEnv("CODEX_DANGEROUS_MODE", true);
 const maxConcurrent = parseIntegerEnv("CODEX_MAX_CONCURRENT", 1, 1, 16);
-const maxBodyBytes = parseIntegerEnv("CODEX_MAX_BODY_BYTES", 1024 * 1024, 1, 20 * 1024 * 1024);
+const maxBodyBytes = parseIntegerEnv("CODEX_MAX_BODY_BYTES", 20 * 1024 * 1024, 1, 50 * 1024 * 1024);
+const maxJobAttachments = parseIntegerEnv("CODEX_MAX_JOB_ATTACHMENTS", 6, 0, 20);
+const maxJobAttachmentBytes = parseIntegerEnv("CODEX_MAX_JOB_ATTACHMENT_BYTES", 8 * 1024 * 1024, 1, 25 * 1024 * 1024);
+const maxJobAttachmentTotalBytes = parseIntegerEnv(
+  "CODEX_MAX_JOB_ATTACHMENT_TOTAL_BYTES",
+  18 * 1024 * 1024,
+  1,
+  50 * 1024 * 1024,
+);
 const maxTranscriptionAudioBytes = parseIntegerEnv(
   "CODEX_MAX_TRANSCRIPTION_AUDIO_BYTES",
   25 * 1024 * 1024,
@@ -43,11 +56,15 @@ const threadSummaryCharacters = parseIntegerEnv("CODEX_THREAD_SUMMARY_CHARACTERS
 
 const terminalStatuses = new Set(["succeeded", "failed", "cancelled", "timeout"]);
 const allowedReasoningEfforts = new Set(["low", "medium", "high", "xhigh"]);
+const allowedJobProviders = new Set(["codex", "claude"]);
 const azureSpeechEndpoint = cleanOptionalEndpoint(process.env.AZURE_SPEECH_ENDPOINT);
 const azureSpeechApiKey = cleanOptionalSecret(process.env.AZURE_SPEECH_API_KEY || process.env.AZURE_SPEECH_KEY);
 const azureSpeechApiVersion = cleanApiVersion(process.env.AZURE_SPEECH_API_VERSION || "2025-10-15");
 const azureSpeechModel = cleanDisplayName(process.env.AZURE_SPEECH_TRANSCRIPTION_MODEL || "mai-transcribe-1", "Azure Speech transcription model", 120);
 const azureSpeechLocales = splitCsv(process.env.AZURE_SPEECH_LOCALES || "en");
+const proxyBaseUrl = cleanOptionalEndpoint(process.env.CODEX_PROXY_BASE_URL || process.env.CODEX_REMOTE_BASE_URL);
+const proxyClientCertPath = cleanOptionalFilePath(process.env.CODEX_PROXY_CLIENT_CERT || process.env.CODEX_REMOTE_CLIENT_CERT);
+const proxyClientKeyPath = cleanOptionalFilePath(process.env.CODEX_PROXY_CLIENT_KEY || process.env.CODEX_REMOTE_CLIENT_KEY);
 const jobs = new Map();
 const activeChildren = new Map();
 let queuedJobIds = [];
@@ -55,6 +72,7 @@ let queuedJobIds = [];
 fs.mkdirSync(dataDir, { recursive: true });
 fs.mkdirSync(jobsDir, { recursive: true });
 fs.mkdirSync(logsDir, { recursive: true });
+fs.mkdirSync(attachmentsDir, { recursive: true });
 
 const workspaces = loadWorkspaces();
 loadPersistedJobs();
@@ -163,6 +181,15 @@ function cleanOptionalSecret(value) {
   return text;
 }
 
+function cleanOptionalFilePath(value) {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text) return null;
+  if (/[\0\r\n]/.test(text)) {
+    throw new Error("proxy client certificate path is invalid");
+  }
+  return path.resolve(text);
+}
+
 function cleanApiVersion(value) {
   const text = typeof value === "string" ? value.trim() : "";
   if (!/^\d{4}-\d{2}-\d{2}(?:-preview)?$/.test(text)) {
@@ -185,6 +212,7 @@ function loadPersistedJobs() {
       const job = JSON.parse(fs.readFileSync(path.join(jobsDir, file), "utf8"));
       if (!job || typeof job.id !== "string") continue;
 
+      job.provider = normalizeJobProvider(job.provider);
       ensureLogPaths(job);
       if (job.status === "running") {
         const finishedAt = nowIso();
@@ -263,6 +291,15 @@ function sendJson(res, status, payload) {
   const body = JSON.stringify(payload);
   res.writeHead(status, {
     "content-type": "application/json",
+    "cache-control": "no-store",
+    "content-length": Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+function sendHtml(res, status, body) {
+  res.writeHead(status, {
+    "content-type": "text/html; charset=utf-8",
     "cache-control": "no-store",
     "content-length": Buffer.byteLength(body),
   });
@@ -374,6 +411,14 @@ async function routeRequest(req, res) {
     return sendJson(res, 200, healthPayload(true));
   }
 
+  if (req.method === "GET" && url.pathname === "/v1/codex/ui") {
+    return sendHtml(res, 200, codexThreadUiHtml());
+  }
+
+  if (shouldProxyCodexRequest(req, url)) {
+    return proxyCodexRequest(req, url, res);
+  }
+
   if (req.method === "GET" && url.pathname === "/v1/codex/workspaces") {
     return sendJson(res, 200, {
       workspaces: [...workspaces.values()].map((workspace) => ({
@@ -386,13 +431,25 @@ async function routeRequest(req, res) {
   if (req.method === "GET" && url.pathname === "/v1/codex/sessions") {
     const limit = clampLimit(url.searchParams.get("limit"));
     const workspaceId = url.searchParams.get("workspaceId");
-    return sendJson(res, 200, { sessions: listWorkspaceSessions({ workspaceId, limit }) });
+    const provider = cleanProviderFilter(url.searchParams.get("provider"));
+    return sendJson(res, 200, { sessions: listWorkspaceSessions({ workspaceId, provider, limit }) });
   }
 
   if (req.method === "GET" && url.pathname === "/v1/codex/threads") {
     const limit = clampLimit(url.searchParams.get("limit"));
     const workspaceId = url.searchParams.get("workspaceId");
-    return sendJson(res, 200, { threads: listWorkspaceThreads({ workspaceId, limit }) });
+    const provider = cleanProviderFilter(url.searchParams.get("provider"));
+    return sendJson(res, 200, { threads: listWorkspaceThreads({ workspaceId, provider, limit }) });
+  }
+
+  const threadMatch = url.pathname.match(/^\/v1\/codex\/threads\/([^/]+)$/);
+  if (threadMatch && req.method === "GET") {
+    const sessionId = decodeURIComponent(threadMatch[1]);
+    const provider = cleanProviderFilter(url.searchParams.get("provider"));
+    if (!isSafeJobId(sessionId)) return sendError(res, 404, "thread not found");
+    const detail = await threadDetailResponse(sessionId, { provider });
+    if (!detail) return sendError(res, 404, "thread not found");
+    return sendJson(res, 200, detail);
   }
 
   if (req.method === "POST" && url.pathname === "/v1/codex/transcriptions") {
@@ -408,7 +465,9 @@ async function routeRequest(req, res) {
 
   if (req.method === "GET" && url.pathname === "/v1/codex/jobs") {
     const limit = clampLimit(url.searchParams.get("limit"));
+    const provider = cleanProviderFilter(url.searchParams.get("provider"));
     const selectedJobs = [...jobs.values()]
+      .filter((job) => !provider || normalizeJobProvider(job.provider) === provider)
       .sort((left, right) => Date.parse(right.createdAt || 0) - Date.parse(left.createdAt || 0))
       .slice(0, limit);
     return sendJson(res, 200, {
@@ -490,6 +549,76 @@ function wantsFullLogs(searchParams) {
     .includes("fullLogs");
 }
 
+function shouldProxyCodexRequest(req, url) {
+  return Boolean(
+    proxyBaseUrl &&
+      ["GET", "POST"].includes(req.method || "") &&
+      url.pathname.startsWith("/v1/codex/") &&
+      url.pathname !== "/v1/codex/transcriptions",
+  );
+}
+
+async function proxyCodexRequest(req, url, res) {
+  const body = req.method === "GET" ? null : await readRawBody(req, maxBodyBytes);
+  return new Promise((resolve, reject) => {
+    const target = new URL(`${url.pathname}${url.search}`, proxyBaseUrl);
+    const transport = target.protocol === "https:" ? https : http;
+    const options = {
+      method: req.method,
+      headers: {
+        accept: headerValue(req.headers.accept) || "application/json",
+        "user-agent": "poc-vault-codex-thread-ui/1",
+      },
+    };
+    const contentType = headerValue(req.headers["content-type"]);
+    if (contentType) options.headers["content-type"] = contentType;
+    if (body) options.headers["content-length"] = String(body.length);
+
+    if (target.protocol === "https:") {
+      if (proxyClientCertPath) options.cert = fs.readFileSync(proxyClientCertPath);
+      if (proxyClientKeyPath) options.key = fs.readFileSync(proxyClientKeyPath);
+    }
+
+    const upstream = transport.request(target, options, (upstreamRes) => {
+      const chunks = [];
+      upstreamRes.on("data", (chunk) => chunks.push(chunk));
+      upstreamRes.on("end", () => {
+        const body = Buffer.concat(chunks);
+        res.writeHead(upstreamRes.statusCode || 502, {
+          "content-type": upstreamRes.headers["content-type"] || "application/json",
+          "cache-control": "no-store",
+          "content-length": body.length,
+        });
+        res.end(body);
+        resolve();
+      });
+    });
+
+    upstream.on("error", reject);
+    upstream.end(body || undefined);
+  });
+}
+
+function readRawBody(req, byteLimit) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > byteLimit) {
+        reject(Object.assign(new Error("request body too large"), { status: 413 }));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
+
 function createJob(body, certSubject) {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     throw Object.assign(new Error("request body must be a JSON object"), { status: 400 });
@@ -509,13 +638,17 @@ function createJob(body, certSubject) {
     throw Object.assign(new Error("workspaceId is not registered"), { status: 400 });
   }
 
+  const provider = cleanOptionalProvider(body.provider);
   const resumeSessionId = cleanOptionalSessionId(body.resumeSessionId);
   if (resumeSessionId) {
-    const sessionMeta = findSessionMeta(resumeSessionId);
-    if (!sessionMeta) {
+    const resumeMeta = findThreadResumeMeta(resumeSessionId);
+    if (!resumeMeta) {
       throw Object.assign(new Error("session not found in runner CODEX_HOME"), { status: 400 });
     }
-    if (!sessionBelongsToWorkspace(sessionMeta.cwd, workspace.path)) {
+    if (resumeMeta.provider !== provider) {
+      throw Object.assign(new Error("session provider does not match requested provider"), { status: 400 });
+    }
+    if (!resumeMetaBelongsToWorkspace(resumeMeta, workspace)) {
       throw Object.assign(new Error("session does not belong to workspace"), { status: 400 });
     }
   }
@@ -528,13 +661,19 @@ function createJob(body, certSubject) {
   const id = crypto.randomUUID();
   const createdAt = nowIso();
   const timeoutMs = Math.min(Math.max(Math.trunc(requestedTimeout), 1000), maxTimeoutMs);
+  const attachments = saveJobAttachments(id, body.attachments);
+  const codexPrompt = promptWithAttachments(body.prompt, attachments);
+  pruneRuntimeCachesIfIdle();
   const job = {
     id,
     status: "queued",
+    provider,
     workspaceId: workspace.id,
     workspaceName: workspace.name,
     workspacePath: workspace.path,
     prompt: body.prompt,
+    codexPrompt,
+    attachments,
     createdAt,
     updatedAt: createdAt,
     startedAt: null,
@@ -552,7 +691,7 @@ function createJob(body, certSubject) {
     model: cleanOptionalModel(body.model),
     reasoningEffort: cleanOptionalReasoningEffort(body.reasoningEffort),
     resumeSessionId,
-    sessionId: resumeSessionId || null,
+    sessionId: resumeSessionId || (provider === "claude" ? crypto.randomUUID() : null),
   };
 
   fs.writeFileSync(job.stdoutPath, "", "utf8");
@@ -569,6 +708,27 @@ function cleanOptionalModel(value) {
   return value;
 }
 
+function cleanOptionalProvider(value) {
+  if (value === undefined || value === null || value === "") return "codex";
+  if (typeof value !== "string") {
+    throw Object.assign(new Error("provider must be codex or claude"), { status: 400 });
+  }
+  const normalized = value.trim().toLowerCase();
+  if (!allowedJobProviders.has(normalized)) {
+    throw Object.assign(new Error("provider must be codex or claude"), { status: 400 });
+  }
+  return normalized;
+}
+
+function cleanProviderFilter(value) {
+  if (value === undefined || value === null || value === "") return null;
+  return cleanOptionalProvider(value);
+}
+
+function normalizeJobProvider(value) {
+  return allowedJobProviders.has(value) ? value : "codex";
+}
+
 function cleanOptionalReasoningEffort(value) {
   if (value === undefined || value === null || value === "") return null;
   if (typeof value !== "string") {
@@ -579,6 +739,83 @@ function cleanOptionalReasoningEffort(value) {
     throw Object.assign(new Error("reasoningEffort must be low, medium, high, or xhigh"), { status: 400 });
   }
   return normalized;
+}
+
+function saveJobAttachments(jobId, attachments) {
+  if (attachments === undefined || attachments === null) return [];
+  if (!Array.isArray(attachments)) {
+    throw Object.assign(new Error("attachments must be an array"), { status: 400 });
+  }
+  if (attachments.length > maxJobAttachments) {
+    throw Object.assign(new Error(`attachments may include at most ${maxJobAttachments} files`), { status: 413 });
+  }
+
+  const jobAttachmentDir = path.join(attachmentsDir, jobId);
+  const saved = [];
+  let totalBytes = 0;
+  for (const [index, attachment] of attachments.entries()) {
+    if (!attachment || typeof attachment !== "object" || Array.isArray(attachment)) {
+      throw Object.assign(new Error("each attachment must be an object"), { status: 400 });
+    }
+
+    const data = decodeAttachmentData(attachment.dataBase64);
+    if (data.length === 0) {
+      throw Object.assign(new Error("attachment data is required"), { status: 400 });
+    }
+    if (data.length > maxJobAttachmentBytes) {
+      throw Object.assign(new Error("attachment is too large"), { status: 413 });
+    }
+    totalBytes += data.length;
+    if (totalBytes > Math.min(maxJobAttachmentTotalBytes, maxBodyBytes)) {
+      throw Object.assign(new Error("attachments are too large"), { status: 413 });
+    }
+
+    fs.mkdirSync(jobAttachmentDir, { recursive: true });
+    const filename = cleanAttachmentFilename(attachment.filename, index);
+    const filePath = path.join(jobAttachmentDir, `${String(index + 1).padStart(2, "0")}-${filename}`);
+    fs.writeFileSync(filePath, data);
+    saved.push({
+      filename,
+      contentType: cleanAttachmentContentType(attachment.contentType),
+      bytes: data.length,
+      path: filePath,
+    });
+  }
+  return saved;
+}
+
+function decodeAttachmentData(value) {
+  if (typeof value !== "string") {
+    throw Object.assign(new Error("attachment dataBase64 is required"), { status: 400 });
+  }
+  const normalized = value.replace(/\s+/g, "");
+  if (!normalized || !/^[A-Za-z0-9+/=_-]+$/.test(normalized)) {
+    throw Object.assign(new Error("attachment dataBase64 is invalid"), { status: 400 });
+  }
+  return Buffer.from(normalized.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+}
+
+function cleanAttachmentFilename(value, index) {
+  const raw = typeof value === "string" ? path.basename(value.trim()) : "";
+  const cleaned = raw.replace(/[^A-Za-z0-9._-]/g, "-").replace(/-+/g, "-").slice(0, 120);
+  if (cleaned && cleaned !== "." && cleaned !== "..") return cleaned;
+  return `attachment-${index + 1}.bin`;
+}
+
+function cleanAttachmentContentType(value) {
+  const raw = typeof value === "string" ? value.split(";")[0].trim().toLowerCase() : "";
+  if (/^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/i.test(raw)) {
+    return raw;
+  }
+  return "application/octet-stream";
+}
+
+function promptWithAttachments(prompt, attachments) {
+  if (!attachments.length) return prompt;
+  const manifest = attachments
+    .map((attachment, index) => `${index + 1}. ${attachment.filename} (${attachment.contentType}, ${attachment.bytes} bytes): ${attachment.path}`)
+    .join("\n");
+  return `${prompt.trimEnd()}\n\nAttached files from the phone are saved on this runner. Use these local paths when inspecting them:\n${manifest}`;
 }
 
 function cleanOptionalSessionId(value) {
@@ -742,6 +979,37 @@ function findSessionMeta(sessionId) {
   return readSessionMeta(sessionFile, sessionId);
 }
 
+function findThreadResumeMeta(sessionId) {
+  const relatedJobs = [...jobs.values()]
+    .filter((job) => jobThreadId(job) === sessionId)
+    .sort((left, right) => compareIsoDesc(left.updatedAt || left.createdAt, right.updatedAt || right.createdAt));
+  if (relatedJobs.length > 0) {
+    const latest = relatedJobs[0];
+    return {
+      provider: normalizeJobProvider(latest.provider),
+      workspaceId: latest.workspaceId || null,
+      workspacePath: latest.workspacePath || null,
+      cwd: null,
+    };
+  }
+
+  const sessionMeta = findSessionMeta(sessionId);
+  if (!sessionMeta) return null;
+  return {
+    provider: normalizeJobProvider(sessionMeta.provider),
+    workspaceId: null,
+    workspacePath: null,
+    cwd: sessionMeta.cwd,
+  };
+}
+
+function resumeMetaBelongsToWorkspace(meta, workspace) {
+  if (meta.workspaceId) return meta.workspaceId === workspace.id;
+  if (meta.workspacePath) return sessionBelongsToWorkspace(meta.workspacePath, workspace.path);
+  if (meta.cwd) return sessionBelongsToWorkspace(meta.cwd, workspace.path);
+  return false;
+}
+
 function readSessionMeta(sessionFile, expectedSessionId = null) {
   const lines = fs.readFileSync(sessionFile, "utf8").split("\n");
   for (const line of lines) {
@@ -758,7 +1026,12 @@ function readSessionMeta(sessionFile, expectedSessionId = null) {
           cwd.length > 0 &&
           !/[\0\r\n]/.test(cwd)
         ) {
-          return { id, cwd, timestamp: cleanSessionTimestamp(entry.payload.timestamp || entry.timestamp) };
+          return {
+            id,
+            cwd,
+            provider: normalizeJobProvider(entry.payload.provider),
+            timestamp: cleanSessionTimestamp(entry.payload.timestamp || entry.timestamp),
+          };
         }
       }
     } catch {
@@ -773,7 +1046,7 @@ function cleanSessionTimestamp(value) {
   return typeof value === "string" && value.length <= 80 && !/[\0\r\n]/.test(value) ? value : null;
 }
 
-function listWorkspaceSessions({ workspaceId, limit, includeSummary = false }) {
+function listWorkspaceSessions({ workspaceId, provider = null, limit, includeSummary = false }) {
   let selectedWorkspace = null;
   if (workspaceId) {
     const cleanId = cleanWorkspaceId(workspaceId);
@@ -783,33 +1056,64 @@ function listWorkspaceSessions({ workspaceId, limit, includeSummary = false }) {
     }
   }
 
-  return walkSessionFiles(path.join(codexHome, "sessions"))
-    .map((file) => {
-      const meta = readSessionMeta(file);
-      if (!meta) return null;
-      const workspace = workspaceForSessionCwd(meta.cwd);
-      if (!workspace) return null;
-      if (selectedWorkspace && workspace.id !== selectedWorkspace.id) return null;
-      const stat = fs.statSync(file);
-      const session = {
-        id: meta.id,
-        workspaceId: workspace.id,
-        workspaceName: workspace.name,
-        cwd: meta.cwd,
-        timestamp: meta.timestamp,
-        updatedAt: stat.mtime.toISOString(),
-      };
-      if (includeSummary) {
-        session.summary = readSessionSummary(file);
-      }
-      return session;
-    })
-    .filter(Boolean)
-    .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
+  const sessionMap = new Map();
+  for (const file of walkSessionFiles(path.join(codexHome, "sessions"))) {
+    const meta = readSessionMeta(file);
+    if (!meta) continue;
+    const workspace = workspaceForSessionCwd(meta.cwd);
+    if (!workspace) continue;
+    const sessionProvider = normalizeJobProvider(meta.provider);
+    if (provider && sessionProvider !== provider) continue;
+    if (selectedWorkspace && workspace.id !== selectedWorkspace.id) continue;
+    const stat = fs.statSync(file);
+    const session = {
+      id: meta.id,
+      provider: sessionProvider,
+      workspaceId: workspace.id,
+      workspaceName: workspace.name,
+      cwd: meta.cwd,
+      timestamp: meta.timestamp,
+      updatedAt: stat.mtime.toISOString(),
+    };
+    if (includeSummary) {
+      session.summary = readSessionSummary(file);
+    }
+    sessionMap.set(session.id, session);
+  }
+
+  for (const job of jobs.values()) {
+    const sessionId = jobThreadId(job);
+    if (!sessionId) continue;
+    const jobProvider = normalizeJobProvider(job.provider);
+    if (provider && jobProvider !== provider) continue;
+    const workspace = workspaces.get(job.workspaceId);
+    if (!workspace) continue;
+    if (selectedWorkspace && workspace.id !== selectedWorkspace.id) continue;
+
+    const existing = sessionMap.get(sessionId);
+    if (existing) {
+      if (existing.provider !== jobProvider) continue;
+      existing.updatedAt = maxIso(existing.updatedAt, job.updatedAt || job.createdAt);
+      continue;
+    }
+
+    sessionMap.set(sessionId, {
+      id: sessionId,
+      provider: jobProvider,
+      workspaceId: workspace.id,
+      workspaceName: workspace.name,
+      cwd: null,
+      timestamp: null,
+      updatedAt: job.updatedAt || job.createdAt || null,
+    });
+  }
+
+  return [...sessionMap.values()]
+    .sort((left, right) => Date.parse(right.updatedAt || 0) - Date.parse(left.updatedAt || 0))
     .slice(0, limit);
 }
 
-function listWorkspaceThreads({ workspaceId, limit }) {
+function listWorkspaceThreads({ workspaceId, provider = null, limit }) {
   let selectedWorkspace = null;
   if (workspaceId) {
     const cleanId = cleanWorkspaceId(workspaceId);
@@ -820,10 +1124,11 @@ function listWorkspaceThreads({ workspaceId, limit }) {
   }
 
   const threadMap = new Map();
-  for (const session of listWorkspaceSessions({ workspaceId, limit: 200, includeSummary: true })) {
+  for (const session of listWorkspaceSessions({ workspaceId, provider, limit: 200, includeSummary: true })) {
     threadMap.set(session.id, {
       ...session,
       sessionId: session.id,
+      provider: session.provider,
       hasSessionFile: true,
       jobs: [],
     });
@@ -832,16 +1137,20 @@ function listWorkspaceThreads({ workspaceId, limit }) {
   for (const job of jobs.values()) {
     const sessionId = jobThreadId(job);
     if (!sessionId) continue;
+    const jobProvider = normalizeJobProvider(job.provider);
+    if (provider && jobProvider !== provider) continue;
 
     const workspace = workspaces.get(job.workspaceId);
     if (!workspace) continue;
     if (selectedWorkspace && selectedWorkspace.id !== workspace.id) continue;
 
     let thread = threadMap.get(sessionId);
+    if (thread && thread.provider !== jobProvider) continue;
     if (!thread) {
       thread = {
         id: sessionId,
         sessionId,
+        provider: jobProvider,
         workspaceId: workspace.id,
         workspaceName: workspace.name,
         cwd: null,
@@ -863,6 +1172,75 @@ function listWorkspaceThreads({ workspaceId, limit }) {
     .slice(0, limit);
 }
 
+async function threadDetailResponse(sessionId, { provider = null } = {}) {
+  const sessionsDir = path.join(codexHome, "sessions");
+  const sessionFile = findSessionFile(sessionsDir, sessionId);
+  let thread = null;
+  let messages = [];
+
+  if (sessionFile) {
+    const meta = readSessionMeta(sessionFile, sessionId);
+    const workspace = meta ? workspaceForSessionCwd(meta.cwd) : null;
+    const sessionProvider = meta ? normalizeJobProvider(meta.provider) : "codex";
+    if (workspace && (!provider || sessionProvider === provider)) {
+      const stat = fs.statSync(sessionFile);
+      thread = {
+        id: meta.id,
+        sessionId: meta.id,
+        provider: sessionProvider,
+        workspaceId: workspace.id,
+        workspaceName: workspace.name,
+        cwd: meta.cwd,
+        timestamp: meta.timestamp,
+        updatedAt: stat.mtime.toISOString(),
+        hasSessionFile: true,
+        summary: readSessionSummary(sessionFile),
+        jobs: [],
+      };
+      messages = readSessionMessages(sessionFile);
+    }
+  }
+
+  for (const job of jobs.values()) {
+    if (jobThreadId(job) !== sessionId) continue;
+    const jobProvider = normalizeJobProvider(job.provider);
+    if (provider && jobProvider !== provider) continue;
+    const workspace = workspaces.get(job.workspaceId);
+    if (!workspace) continue;
+
+    if (thread && thread.provider !== jobProvider) continue;
+    if (!thread) {
+      thread = {
+        id: sessionId,
+        sessionId,
+        provider: jobProvider,
+        workspaceId: workspace.id,
+        workspaceName: workspace.name,
+        cwd: null,
+        timestamp: null,
+        updatedAt: job.updatedAt || job.createdAt || null,
+        hasSessionFile: false,
+        jobs: [],
+      };
+    }
+
+    thread.jobs.push(job);
+    thread.updatedAt = maxIso(thread.updatedAt, job.updatedAt || job.createdAt);
+  }
+
+  if (!thread) return null;
+
+  const sortedJobs = [...thread.jobs].sort((left, right) =>
+    compareIsoDesc(left.updatedAt || left.createdAt, right.updatedAt || right.createdAt),
+  );
+
+  return {
+    thread: threadSummary(thread),
+    messages,
+    jobs: await Promise.all(sortedJobs.map((job) => toJobResponse(job, responseShape("compact")))),
+  };
+}
+
 function jobThreadId(job) {
   const sessionId = job?.sessionId || job?.resumeSessionId;
   return typeof sessionId === "string" && isSafeJobId(sessionId) ? sessionId : null;
@@ -878,6 +1256,7 @@ function threadSummary(thread) {
   return {
     id: thread.id,
     sessionId: thread.sessionId || thread.id,
+    provider: normalizeJobProvider(thread.provider),
     workspaceId: thread.workspaceId,
     workspaceName: thread.workspaceName,
     cwd: thread.cwd || null,
@@ -918,6 +1297,33 @@ function readSessionSummary(sessionFile) {
   }
 
   return { firstUserPrompt, lastAssistantAnswer };
+}
+
+function readSessionMessages(sessionFile) {
+  const messages = [];
+  for (const line of readSessionLines(sessionFile)) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line);
+      if (entry?.type !== "response_item") continue;
+      const message = entry.payload;
+      if (message?.type !== "message") continue;
+      if (!["user", "assistant"].includes(message.role)) continue;
+
+      const rawText = messageText(message);
+      const text = message.role === "user" ? userPromptSummary(rawText) : boundedThreadText(rawText);
+      if (!text) continue;
+
+      messages.push({
+        role: message.role,
+        timestamp: cleanSessionTimestamp(entry.timestamp),
+        text,
+      });
+    } catch {
+      continue;
+    }
+  }
+  return messages.slice(-120);
 }
 
 function readSessionLines(sessionFile) {
@@ -1145,13 +1551,22 @@ function startJob(job) {
   let stdout = "";
   let stderr = "";
 
-  const args = buildCodexArgs(job);
-  const child = spawn(codexBin, args, {
+  const args = buildJobArgs(job);
+  const child = spawn(job.provider === "claude" ? claudeBin : codexBin, args, {
     cwd: job.workspacePath,
     env: {
       ...process.env,
       HOME: runHome,
       CODEX_HOME: codexHome,
+      NPM_CONFIG_CACHE: npmCacheDir,
+      npm_config_cache: npmCacheDir,
+      NPM_CONFIG_LOGLEVEL: process.env.NPM_CONFIG_LOGLEVEL || "error",
+      npm_config_loglevel: process.env.npm_config_loglevel || "error",
+      NPM_CONFIG_PROGRESS: process.env.NPM_CONFIG_PROGRESS || "false",
+      npm_config_progress: process.env.npm_config_progress || "false",
+      NPM_CONFIG_UPDATE_NOTIFIER: process.env.NPM_CONFIG_UPDATE_NOTIFIER || "false",
+      npm_config_update_notifier: process.env.npm_config_update_notifier || "false",
+      BUN_INSTALL_CACHE_DIR: bunCacheDir,
       PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
     },
     stdio: ["pipe", "pipe", "pipe"],
@@ -1166,7 +1581,7 @@ function startJob(job) {
     timeoutTimer: null,
     stdoutStream,
     stderrStream,
-    sessionIdsBefore: job.resumeSessionId ? null : workspaceSessionIdSet(job.workspacePath),
+    sessionIdsBefore: job.provider === "codex" && !job.resumeSessionId ? workspaceSessionIdSet(job.workspacePath) : null,
   };
   activeChildren.set(job.id, active);
 
@@ -1212,7 +1627,11 @@ function startJob(job) {
     });
   });
 
-  child.stdin.end(job.prompt);
+  child.stdin.end(job.codexPrompt || job.prompt);
+}
+
+function buildJobArgs(job) {
+  return job.provider === "claude" ? buildClaudeArgs(job) : buildCodexArgs(job);
 }
 
 function buildCodexArgs(job) {
@@ -1243,6 +1662,19 @@ function buildCodexResumeArgs(job) {
   return args;
 }
 
+function buildClaudeArgs(job) {
+  const args = ["--print"];
+  if (dangerousMode) args.push("--dangerously-skip-permissions");
+  if (job.model) args.push("--model", job.model);
+  if (job.reasoningEffort) args.push("--effort", job.reasoningEffort);
+  if (job.resumeSessionId) {
+    args.push("--resume", job.resumeSessionId);
+  } else {
+    args.push("--session-id", job.sessionId);
+  }
+  return args;
+}
+
 function terminateChild(active) {
   if (active.child.exitCode !== null || active.child.killed) return;
   active.child.kill("SIGTERM");
@@ -1265,7 +1697,7 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
 
   const finishedAt = nowIso();
   const stderrText = cleanApiText(stderr).trim();
-  const resultText = await readTextFileBounded(job.resultPath, maxOutputBytes);
+  const resultText = job.provider === "claude" ? stdout : await readTextFileBounded(job.resultPath, maxOutputBytes);
   const cleanResult = cleanAssistantResult(resultText).trim();
 
   job.updatedAt = finishedAt;
@@ -1294,12 +1726,57 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
   } else {
     job.status = "failed";
     job.result = null;
-    job.error = stderrText || `codex exited with code ${code}${signal ? ` and signal ${signal}` : ""}`;
+    job.error = stderrText || `${job.provider === "claude" ? "claude" : "codex"} exited with code ${code}${signal ? ` and signal ${signal}` : ""}`;
   }
 
   persistJob(job);
   appendAudit("job_finished", job, { code, signal });
+  pruneRuntimeCachesIfIdle();
+  scheduleRuntimeCachePrune();
   processQueue();
+}
+
+function scheduleRuntimeCachePrune() {
+  for (const delayMs of [5000, 30000]) {
+    const timer = setTimeout(pruneRuntimeCachesIfIdle, delayMs);
+    timer.unref();
+  }
+}
+
+function pruneRuntimeCachesIfIdle() {
+  if (activeChildren.size > 0) return;
+  pruneRuntimeCaches();
+}
+
+function pruneRuntimeCaches() {
+  for (const target of runtimeCacheTargets()) {
+    removePathInsideRunHome(target);
+  }
+}
+
+function runtimeCacheTargets() {
+  return [
+    path.join(runHome, ".npm", "_cacache"),
+    path.join(runHome, ".npm", "_npx"),
+    path.join(runHome, ".npm", "_logs"),
+    path.join(runHome, ".bun", "install", "cache"),
+    npmCacheDir,
+    bunCacheDir,
+    path.join(codexHome, ".tmp"),
+  ];
+}
+
+function removePathInsideRunHome(target) {
+  const relative = path.relative(runHome, target);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return;
+  try {
+    fs.rmSync(target, { recursive: true, force: true });
+  } catch (error) {
+    appendAudit("runtime_cache_prune_failed", null, {
+      target: relative,
+      error: error.message || String(error),
+    });
+  }
 }
 
 function finishStream(stream) {
@@ -1364,9 +1841,11 @@ async function toJobResponse(job, shape = responseShape("preview")) {
   return {
     id: job.id,
     status: job.status,
+    provider: normalizeJobProvider(job.provider),
     workspaceId: job.workspaceId,
     workspaceName: job.workspaceName,
     prompt: job.prompt,
+    attachments: sanitizeAttachmentResponses(job.attachments),
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     startedAt: job.startedAt,
@@ -1394,6 +1873,18 @@ async function toJobResponse(job, shape = responseShape("preview")) {
     resumeSessionId: job.resumeSessionId || null,
     sessionId: job.sessionId || job.resumeSessionId || null,
   };
+}
+
+function sanitizeAttachmentResponses(attachments) {
+  if (!Array.isArray(attachments)) return [];
+  return attachments
+    .filter((attachment) => attachment && typeof attachment === "object")
+    .map((attachment) => ({
+      filename: cleanApiText(attachment.filename || "attachment"),
+      contentType: cleanApiText(attachment.contentType || "application/octet-stream"),
+      bytes: Number.isFinite(attachment.bytes) ? attachment.bytes : null,
+      path: cleanApiText(attachment.path || ""),
+    }));
 }
 
 async function shapeTextPayload({ file, value, byteLimit, includeFull, trim = false, slice = "prefix" }) {
@@ -1519,6 +2010,1503 @@ async function readTextFileBounded(file, byteLimit) {
     if (error.code === "ENOENT") return "";
     throw error;
   }
+}
+
+function codexThreadUiHtml() {
+  return `<!doctype html>
+<html lang="en" data-codex-thread-ui="true">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Codex Threads</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --background: 0 0% 100%;
+      --foreground: 222.2 84% 4.9%;
+      --muted: 210 40% 96.1%;
+      --muted-foreground: 215.4 16.3% 46.9%;
+      --card: 0 0% 100%;
+      --card-foreground: 222.2 84% 4.9%;
+      --popover: 0 0% 100%;
+      --popover-foreground: 222.2 84% 4.9%;
+      --primary: 222.2 47.4% 11.2%;
+      --primary-foreground: 210 40% 98%;
+      --secondary: 210 40% 96.1%;
+      --secondary-foreground: 222.2 47.4% 11.2%;
+      --accent: 210 40% 96.1%;
+      --accent-foreground: 222.2 47.4% 11.2%;
+      --destructive: 0 84.2% 60.2%;
+      --destructive-foreground: 210 40% 98%;
+      --border: 214.3 31.8% 91.4%;
+      --input: 214.3 31.8% 91.4%;
+      --ring: 222.2 84% 4.9%;
+      --radius: 10px;
+      --ok: 142.1 76.2% 36.3%;
+      --warning: 32 95% 44%;
+      --surface: 220 14% 97%;
+    }
+
+    * { box-sizing: border-box; }
+    html, body {
+      height: 100%;
+      min-height: 100%;
+      overflow: hidden;
+    }
+    body {
+      margin: 0;
+      background: hsl(var(--surface));
+      color: hsl(var(--foreground));
+      font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+    button, input, select {
+      font: inherit;
+    }
+    button {
+      border: 1px solid hsl(var(--border));
+      background: hsl(var(--background));
+      color: hsl(var(--foreground));
+      border-radius: calc(var(--radius) - 3px);
+      cursor: pointer;
+      transition: background 140ms ease, border-color 140ms ease, color 140ms ease, transform 140ms ease;
+    }
+    button:hover { background: hsl(var(--accent)); }
+    button:active { transform: translateY(1px); }
+    button:focus-visible, input:focus-visible, select:focus-visible {
+      outline: 2px solid hsl(var(--ring));
+      outline-offset: 2px;
+    }
+
+    .shell {
+      display: grid;
+      grid-template-columns: minmax(320px, 380px) minmax(0, 1fr);
+      height: 100vh;
+      min-height: 0;
+      overflow: hidden;
+    }
+    .sidebar {
+      border-right: 1px solid hsl(var(--border));
+      background: hsl(var(--background));
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 0;
+    }
+    .topbar {
+      padding: 18px;
+      border-bottom: 1px solid hsl(var(--border));
+      flex: 0 0 auto;
+    }
+    .title-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 20px;
+      line-height: 1.15;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+    .eyebrow {
+      color: hsl(var(--muted-foreground));
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+    .source-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      border: 1px solid hsl(var(--border));
+      background: hsl(var(--secondary));
+      color: hsl(var(--secondary-foreground));
+      border-radius: 999px;
+      padding: 5px 9px;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: hsl(var(--ok));
+    }
+    .dot.live {
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.45); opacity: 0.45; }
+    }
+    .refresh {
+      min-height: 36px;
+      padding: 0 13px;
+      white-space: nowrap;
+      font-weight: 600;
+    }
+    .filters {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+    }
+    .filter-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 140px;
+      gap: 8px;
+    }
+    input, select {
+      width: 100%;
+      border: 1px solid hsl(var(--input));
+      background: hsl(var(--background));
+      color: hsl(var(--foreground));
+      border-radius: calc(var(--radius) - 3px);
+      min-height: 38px;
+      padding: 0 11px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }
+    label.toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: hsl(var(--muted-foreground));
+      font-size: 12px;
+      user-select: none;
+    }
+    label.toggle input {
+      width: 15px;
+      min-height: 15px;
+      height: 15px;
+      padding: 0;
+      accent-color: hsl(var(--primary));
+    }
+    .meta-line {
+      color: hsl(var(--muted-foreground));
+      font-size: 12px;
+      margin-top: 12px;
+      min-height: 18px;
+    }
+    .thread-list {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow: auto;
+      padding: 10px;
+    }
+    .thread-row {
+      width: 100%;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      text-align: left;
+      padding: 13px;
+      margin: 0 0 8px;
+      border-color: hsl(var(--border));
+      background: hsl(var(--card));
+      border-radius: var(--radius);
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }
+    .thread-row:hover { background: hsl(var(--accent)); }
+    .thread-row.active {
+      border-color: hsl(var(--primary));
+      box-shadow: 0 0 0 1px hsl(var(--primary)), 0 12px 28px rgba(15, 23, 42, 0.08);
+    }
+    .thread-main { min-width: 0; }
+    .thread-title {
+      font-weight: 650;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .thread-sub {
+      margin-top: 4px;
+      color: hsl(var(--muted-foreground));
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .thread-count {
+      color: hsl(var(--muted-foreground));
+      font-size: 12px;
+      white-space: nowrap;
+      display: grid;
+      justify-items: end;
+      gap: 6px;
+    }
+    .content {
+      min-width: 0;
+      min-height: 0;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .detail-head {
+      padding: 18px 26px 16px;
+      border-bottom: 1px solid hsl(var(--border));
+      background: rgba(255, 255, 255, 0.88);
+      backdrop-filter: blur(14px);
+      flex: 0 0 auto;
+      z-index: 2;
+    }
+    .detail-head h2 {
+      margin: 0 0 8px;
+      font-size: 22px;
+      line-height: 1.2;
+      font-weight: 720;
+      letter-spacing: -0.02em;
+      overflow-wrap: anywhere;
+      display: -webkit-box;
+      -webkit-line-clamp: 3;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .detail-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 14px;
+      color: hsl(var(--muted-foreground));
+      font-size: 12px;
+    }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      border-radius: 999px;
+      padding: 2px 8px;
+      border: 1px solid hsl(var(--border));
+      background: hsl(var(--secondary));
+      color: hsl(var(--secondary-foreground));
+      font-size: 12px;
+      font-weight: 650;
+    }
+    .status.succeeded { background: hsl(142 76% 96%); color: hsl(var(--ok)); border-color: hsl(142 55% 84%); }
+    .status.failed, .status.timeout, .status.cancelled { background: hsl(0 86% 97%); color: hsl(var(--destructive)); border-color: hsl(0 80% 88%); }
+    .status.running, .status.queued { background: hsl(42 100% 96%); color: hsl(var(--warning)); border-color: hsl(42 88% 82%); }
+    .detail-body {
+      flex: 1 1 auto;
+      padding: 0;
+      overflow: hidden;
+      min-height: 0;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(300px, 34%);
+      gap: 0;
+      align-items: stretch;
+      height: 100%;
+      min-height: 0;
+    }
+    .section {
+      background: hsl(var(--card));
+      border: 1px solid hsl(var(--border));
+      border-radius: var(--radius);
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+      margin-bottom: 14px;
+      overflow: hidden;
+    }
+    .section h3 {
+      margin: 0;
+      padding: 12px 14px;
+      font-size: 12px;
+      letter-spacing: 0;
+      color: hsl(var(--muted-foreground));
+      border-bottom: 1px solid hsl(var(--border));
+      background: hsl(var(--muted) / 0.42);
+    }
+    .section-body { padding: 14px; }
+    .empty {
+      color: hsl(var(--muted-foreground));
+      padding: 18px 14px;
+    }
+    .message {
+      display: flex;
+      gap: 10px;
+      padding: 10px 0;
+    }
+    .message.user { justify-content: flex-end; }
+    .message.assistant { justify-content: flex-start; }
+    .role {
+      color: hsl(var(--muted-foreground));
+      font-size: 12px;
+      font-weight: 700;
+      margin-bottom: 5px;
+    }
+    .bubble {
+      max-width: min(760px, 86%);
+      border: 1px solid hsl(var(--border));
+      border-radius: 16px;
+      padding: 12px 13px;
+      background: hsl(var(--background));
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }
+    .message.user .bubble {
+      background: hsl(var(--primary));
+      color: hsl(var(--primary-foreground));
+      border-color: hsl(var(--primary));
+    }
+    .message.user .role,
+    .message.user .preview {
+      color: hsl(var(--primary-foreground) / 0.76);
+    }
+    .message-text {
+      overflow-wrap: anywhere;
+      line-height: 1.55;
+    }
+    .markdown {
+      overflow-wrap: anywhere;
+      line-height: 1.58;
+    }
+    .markdown > *:first-child { margin-top: 0; }
+    .markdown > *:last-child { margin-bottom: 0; }
+    .markdown p {
+      margin: 0 0 10px;
+    }
+    .markdown h1,
+    .markdown h2,
+    .markdown h3 {
+      margin: 16px 0 8px;
+      line-height: 1.22;
+      letter-spacing: -0.01em;
+    }
+    .markdown h1 { font-size: 20px; }
+    .markdown h2 { font-size: 17px; }
+    .markdown h3 { font-size: 15px; }
+    .markdown ul,
+    .markdown ol {
+      margin: 8px 0 12px;
+      padding-left: 22px;
+    }
+    .markdown li {
+      margin: 4px 0;
+    }
+    .markdown code {
+      border: 1px solid hsl(var(--border));
+      background: hsl(var(--muted));
+      border-radius: 5px;
+      padding: 1px 5px;
+      font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .message.user .markdown code {
+      background: hsl(var(--primary-foreground) / 0.12);
+      border-color: hsl(var(--primary-foreground) / 0.18);
+      color: inherit;
+    }
+    .markdown pre {
+      margin: 10px 0 12px;
+      padding: 12px;
+      background: hsl(222.2 47.4% 11.2%);
+      color: hsl(var(--primary-foreground));
+      border-radius: calc(var(--radius) - 2px);
+      overflow: auto;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .markdown pre code {
+      border: 0;
+      background: transparent;
+      padding: 0;
+      color: inherit;
+      font: inherit;
+    }
+    .markdown blockquote {
+      margin: 10px 0;
+      padding: 8px 12px;
+      border-left: 3px solid hsl(var(--border));
+      color: hsl(var(--muted-foreground));
+      background: hsl(var(--muted) / 0.55);
+      border-radius: 0 calc(var(--radius) - 4px) calc(var(--radius) - 4px) 0;
+    }
+    .markdown a {
+      color: hsl(221 83% 53%);
+      text-decoration: underline;
+      text-underline-offset: 3px;
+    }
+    .message.user .markdown a {
+      color: inherit;
+    }
+    .job {
+      border-bottom: 1px solid hsl(var(--border));
+      padding: 12px 0;
+    }
+    .job:last-child { border-bottom: 0; }
+    .log-tail {
+      margin-top: 8px;
+      max-height: 90px;
+      overflow: auto;
+      background: hsl(222.2 47.4% 11.2%);
+      color: hsl(var(--primary-foreground));
+      border-radius: calc(var(--radius) - 2px);
+      padding: 10px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .job-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    .job-id {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      overflow-wrap: anywhere;
+      color: hsl(var(--muted-foreground));
+    }
+    .job-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      flex: 0 0 auto;
+    }
+    .small-button {
+      min-height: 30px;
+      padding: 0 10px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .job-summary {
+      max-height: 92px;
+      overflow: hidden;
+      color: hsl(var(--muted-foreground));
+      font-size: 12px;
+      border-left: 2px solid hsl(var(--border));
+      padding-left: 10px;
+      margin-top: 8px;
+    }
+    .job-log-panel {
+      margin-top: 12px;
+      border: 1px solid hsl(var(--border));
+      border-radius: calc(var(--radius) - 2px);
+      background: hsl(var(--background));
+      overflow: hidden;
+    }
+    .job-log-section {
+      border-top: 1px solid hsl(var(--border));
+    }
+    .job-log-section:first-child {
+      border-top: 0;
+    }
+    .job-log-title {
+      padding: 9px 10px;
+      color: hsl(var(--muted-foreground));
+      background: hsl(var(--muted) / 0.48);
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.02em;
+    }
+    .job-log-body {
+      max-height: 260px;
+      overflow: auto;
+      padding: 10px;
+    }
+    .preview {
+      color: hsl(var(--muted-foreground));
+      font-size: 12px;
+      overflow-wrap: anywhere;
+      margin-top: 6px;
+    }
+    pre {
+      margin: 0;
+      padding: 12px;
+      background: hsl(222.2 47.4% 11.2%);
+      color: hsl(var(--primary-foreground));
+      border-radius: calc(var(--radius) - 2px);
+      overflow: auto;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .stat {
+      border: 1px solid hsl(var(--border));
+      background: hsl(var(--card));
+      border-radius: var(--radius);
+      padding: 12px;
+    }
+    .stat-value {
+      font-size: 20px;
+      font-weight: 720;
+      line-height: 1;
+      letter-spacing: -0.02em;
+    }
+    .stat-label {
+      color: hsl(var(--muted-foreground));
+      font-size: 12px;
+      margin-top: 6px;
+    }
+    .conversation {
+      min-width: 0;
+      min-height: 0;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid hsl(var(--border));
+      background: hsl(var(--surface));
+    }
+    .conversation-scroll {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      padding: 22px 28px;
+    }
+    .inspector {
+      height: 100%;
+      min-height: 0;
+      overflow: auto;
+      padding: 18px;
+      background: hsl(var(--background));
+    }
+    .chat-empty {
+      border: 1px dashed hsl(var(--border));
+      border-radius: var(--radius);
+      padding: 24px;
+      color: hsl(var(--muted-foreground));
+      background: hsl(var(--background));
+    }
+    .composer {
+      border: 0;
+      border-top: 1px solid hsl(var(--border));
+      background: hsl(var(--card));
+      border-radius: 0;
+      padding: 12px 18px;
+      margin: 0;
+      box-shadow: 0 -8px 28px rgba(15, 23, 42, 0.04);
+    }
+    .composer textarea {
+      width: 100%;
+      height: 72px;
+      min-height: 72px;
+      max-height: 150px;
+      resize: vertical;
+      border: 1px solid hsl(var(--input));
+      background: hsl(var(--background));
+      color: hsl(var(--foreground));
+      border-radius: calc(var(--radius) - 3px);
+      padding: 10px 11px;
+      font: inherit;
+      line-height: 1.5;
+    }
+    .composer-actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .primary-button {
+      min-height: 36px;
+      padding: 0 14px;
+      background: hsl(var(--primary));
+      color: hsl(var(--primary-foreground));
+      border-color: hsl(var(--primary));
+      font-weight: 650;
+    }
+    .primary-button:hover {
+      background: hsl(var(--primary) / 0.9);
+    }
+    .composer-status {
+      color: hsl(var(--muted-foreground));
+      font-size: 12px;
+    }
+    .split-stack {
+      display: grid;
+      gap: 10px;
+      height: 100%;
+      overflow: auto;
+      padding: 18px;
+    }
+    .hidden { display: none !important; }
+
+    @media (max-width: 900px) {
+      .shell {
+        grid-template-columns: 1fr;
+      }
+      .sidebar {
+        height: 42vh;
+        min-height: 0;
+        border-right: 0;
+        border-bottom: 1px solid hsl(var(--border));
+      }
+      .thread-list {
+        max-height: 46vh;
+      }
+      .grid {
+        grid-template-columns: 1fr;
+        overflow: auto;
+      }
+      .detail-head {
+        position: static;
+      }
+      .inspector {
+        height: auto;
+        overflow: visible;
+        border-top: 1px solid hsl(var(--border));
+      }
+      .filter-row {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <aside class="sidebar">
+      <div class="topbar">
+        <div class="title-row">
+          <div>
+            <div class="eyebrow">POC Vault</div>
+            <h1>Codex Threads</h1>
+          </div>
+          <span class="source-pill"><span class="dot"></span>${proxyBaseUrl ? "Live via cert proxy" : "Local runner"}</span>
+        </div>
+        <div class="filters">
+          <div class="filter-row">
+            <input id="searchInput" type="search" placeholder="Search threads">
+            <select id="workspaceSelect" aria-label="Workspace"></select>
+          </div>
+          <label class="toggle"><input id="hideSmokeInput" type="checkbox" checked> Hide smoke tests</label>
+        </div>
+        <div class="meta-line" id="listMeta"></div>
+        <button class="refresh" id="refreshButton" type="button">Refresh threads</button>
+      </div>
+      <div class="thread-list" id="threadList"></div>
+    </aside>
+    <section class="content">
+      <header class="detail-head">
+        <h2 id="detailTitle">Select a thread</h2>
+        <div class="detail-meta" id="detailMeta"></div>
+      </header>
+      <div class="detail-body" id="detailBody">
+        <div class="empty">No thread selected.</div>
+      </div>
+    </section>
+  </main>
+  <script>
+    (function () {
+      var state = {
+        workspaces: [],
+        threads: [],
+        selectedThreadId: null,
+        selectedWorkspace: "",
+        query: "",
+        hideSmoke: true,
+        selectedJobs: [],
+        selectedThread: null,
+        pollTimer: null,
+        threadPollInFlight: false,
+        listPollInFlight: false,
+        lastPollAt: null,
+        composerDrafts: Object.create(null)
+      };
+
+      var els = {
+        refreshButton: document.getElementById("refreshButton"),
+        searchInput: document.getElementById("searchInput"),
+        workspaceSelect: document.getElementById("workspaceSelect"),
+        hideSmokeInput: document.getElementById("hideSmokeInput"),
+        listMeta: document.getElementById("listMeta"),
+        threadList: document.getElementById("threadList"),
+        detailTitle: document.getElementById("detailTitle"),
+        detailMeta: document.getElementById("detailMeta"),
+        detailBody: document.getElementById("detailBody")
+      };
+
+      function api(path) {
+        return apiRequest(path);
+      }
+
+      function apiRequest(path, options) {
+        options = options || {};
+        var headers = options.headers || {};
+        headers.accept = headers.accept || "application/json";
+        return fetch(path, Object.assign({}, options, { headers: headers })).then(function (response) {
+          if (!response.ok) {
+            return response.json().catch(function () { return {}; }).then(function (body) {
+              throw new Error(body.error || "Request failed with HTTP " + response.status);
+            });
+          }
+          return response.json();
+        });
+      }
+
+      function formatDate(value) {
+        if (!value) return "unknown";
+        var date = new Date(value);
+        if (Number.isNaN(date.getTime())) return value;
+        return date.toLocaleString();
+      }
+
+      function shortId(value) {
+        return value ? value.slice(0, 8) : "unknown";
+      }
+
+      function statusClass(value) {
+        return "status " + (value || "unknown");
+      }
+
+      function clear(node) {
+        while (node.firstChild) node.removeChild(node.firstChild);
+      }
+
+      function captureComposerState() {
+        var textarea = document.querySelector(".composer textarea");
+        var chat = document.querySelector(".conversation-scroll");
+        var inspector = document.querySelector(".inspector");
+        var chatBottomGap = chat ? chat.scrollHeight - chat.scrollTop - chat.clientHeight : 0;
+        var inspectorBottomGap = inspector ? inspector.scrollHeight - inspector.scrollTop - inspector.clientHeight : 0;
+        var snapshot = {
+          focused: false,
+          threadId: null,
+          selectionStart: 0,
+          selectionEnd: 0,
+          chatScrollTop: chat ? chat.scrollTop : 0,
+          chatWasNearBottom: chat ? chatBottomGap < 32 : false,
+          inspectorScrollTop: inspector ? inspector.scrollTop : 0,
+          inspectorWasNearBottom: inspector ? inspectorBottomGap < 32 : false
+        };
+        if (!textarea) return snapshot;
+        if (textarea.dataset.threadId) state.composerDrafts[textarea.dataset.threadId] = textarea.value;
+        return {
+          ...snapshot,
+          focused: document.activeElement === textarea,
+          threadId: textarea.dataset.threadId || null,
+          selectionStart: textarea.selectionStart || 0,
+          selectionEnd: textarea.selectionEnd || 0
+        };
+      }
+
+      function restoreComposerState(thread, snapshot) {
+        if (!snapshot) return;
+        var chat = document.querySelector(".conversation-scroll");
+        if (chat) {
+          chat.scrollTop = snapshot.chatWasNearBottom ? chat.scrollHeight : snapshot.chatScrollTop || 0;
+        }
+        var inspector = document.querySelector(".inspector");
+        if (inspector) {
+          inspector.scrollTop = snapshot.inspectorWasNearBottom ? inspector.scrollHeight : snapshot.inspectorScrollTop || 0;
+        }
+        if (!snapshot.focused || snapshot.threadId !== thread.sessionId) return;
+        var textarea = document.querySelector(".composer textarea[data-thread-id='" + thread.sessionId + "']");
+        if (!textarea) return;
+        textarea.focus();
+        var start = Math.min(snapshot.selectionStart, textarea.value.length);
+        var end = Math.min(snapshot.selectionEnd, textarea.value.length);
+        textarea.setSelectionRange(start, end);
+      }
+
+      function el(tag, className, text) {
+        var node = document.createElement(tag);
+        if (className) node.className = className;
+        if (text !== undefined && text !== null) node.textContent = text;
+        return node;
+      }
+
+      function appendInlineMarkdown(parent, text) {
+        var tick = String.fromCharCode(96);
+        var pattern = new RegExp(
+          "(\\\\[[^\\\\]]+\\\\]\\\\(https?:\\\\/\\\\/[^\\\\s)]+\\\\)|" +
+            tick + "[^" + tick + "]+" + tick +
+            "|\\\\*\\\\*[^*]+\\\\*\\\\*|__[^_]+__|\\\\*[^*]+\\\\*|_[^_]+_)",
+          "g"
+        );
+        var last = 0;
+        var match;
+        while ((match = pattern.exec(text)) !== null) {
+          if (match.index > last) parent.appendChild(document.createTextNode(text.slice(last, match.index)));
+          var token = match[0];
+          if (token[0] === "[" && token.includes("](")) {
+            var close = token.indexOf("](");
+            var label = token.slice(1, close);
+            var href = token.slice(close + 2, -1);
+            var link = document.createElement("a");
+            link.textContent = label;
+            link.href = href;
+            link.target = "_blank";
+            link.rel = "noreferrer";
+            parent.appendChild(link);
+          } else if (token[0] === tick) {
+            parent.appendChild(el("code", "", token.slice(1, -1)));
+          } else if (token.startsWith("**") || token.startsWith("__")) {
+            var strong = document.createElement("strong");
+            strong.textContent = token.slice(2, -2);
+            parent.appendChild(strong);
+          } else {
+            var em = document.createElement("em");
+            em.textContent = token.slice(1, -1);
+            parent.appendChild(em);
+          }
+          last = pattern.lastIndex;
+        }
+        if (last < text.length) parent.appendChild(document.createTextNode(text.slice(last)));
+      }
+
+      function appendParagraph(parent, lines) {
+        if (!lines.length) return;
+        var paragraph = document.createElement("p");
+        appendInlineMarkdown(paragraph, lines.join(" "));
+        parent.appendChild(paragraph);
+        lines.length = 0;
+      }
+
+      function appendList(parent, tag, items) {
+        if (!items.length) return;
+        var list = document.createElement(tag);
+        items.forEach(function (item) {
+          var li = document.createElement("li");
+          appendInlineMarkdown(li, item);
+          list.appendChild(li);
+        });
+        parent.appendChild(list);
+        items.length = 0;
+      }
+
+      function normalizeMarkdownText(value) {
+        var tick = String.fromCharCode(96);
+        var fence = tick + tick + tick;
+        var text = String(value || "").replace(/\\r\\n/g, "\\n");
+        var output = "";
+        var cursor = 0;
+
+        while (cursor < text.length) {
+          var start = text.indexOf(fence, cursor);
+          if (start === -1) {
+            output += text.slice(cursor);
+            break;
+          }
+
+          var close = text.indexOf(fence, start + fence.length);
+          var chunk = text.slice(start + fence.length, close === -1 ? text.length : close);
+          var lang = "";
+          var content = chunk;
+          var langMatch = content.match(/^([A-Za-z0-9_-]+)(?:\\s+|$)/);
+          if (langMatch) {
+            lang = langMatch[1];
+            content = content.slice(langMatch[0].length);
+          }
+
+          output += text.slice(cursor, start);
+          output += "\\n" + fence + lang + "\\n" + content.trim() + "\\n" + fence + "\\n";
+          if (close === -1) break;
+          cursor = close + fence.length;
+        }
+
+        return output;
+      }
+
+      function markdownNode(text) {
+        var tick = String.fromCharCode(96);
+        var root = el("div", "markdown");
+        var lines = normalizeMarkdownText(text).split("\\n");
+        var paragraph = [];
+        var unordered = [];
+        var ordered = [];
+        var inCode = false;
+        var codeLines = [];
+        var codeLang = "";
+
+        function flushBlocks() {
+          appendParagraph(root, paragraph);
+          appendList(root, "ul", unordered);
+          appendList(root, "ol", ordered);
+        }
+
+        lines.forEach(function (line) {
+          var fence = line.match(new RegExp("^" + tick + tick + tick + "\\\\s*([A-Za-z0-9_-]+)?\\\\s*$"));
+          if (fence) {
+            if (inCode) {
+              var pre = document.createElement("pre");
+              var code = document.createElement("code");
+              if (codeLang) code.dataset.language = codeLang;
+              code.textContent = codeLines.join("\\n");
+              pre.appendChild(code);
+              root.appendChild(pre);
+              codeLines = [];
+              codeLang = "";
+              inCode = false;
+            } else {
+              flushBlocks();
+              inCode = true;
+              codeLang = fence[1] || "";
+            }
+            return;
+          }
+
+          if (inCode) {
+            codeLines.push(line);
+            return;
+          }
+
+          if (!line.trim()) {
+            flushBlocks();
+            return;
+          }
+
+          var heading = line.match(/^(#{1,3})\\s+(.+)$/);
+          if (heading) {
+            flushBlocks();
+            var h = document.createElement("h" + heading[1].length);
+            appendInlineMarkdown(h, heading[2].trim());
+            root.appendChild(h);
+            return;
+          }
+
+          var quote = line.match(/^>\\s?(.+)$/);
+          if (quote) {
+            flushBlocks();
+            var blockquote = document.createElement("blockquote");
+            appendInlineMarkdown(blockquote, quote[1].trim());
+            root.appendChild(blockquote);
+            return;
+          }
+
+          var bullet = line.match(/^\\s*[-*]\\s+(.+)$/);
+          if (bullet) {
+            appendParagraph(root, paragraph);
+            appendList(root, "ol", ordered);
+            unordered.push(bullet[1].trim());
+            return;
+          }
+
+          var number = line.match(/^\\s*\\d+[.)]\\s+(.+)$/);
+          if (number) {
+            appendParagraph(root, paragraph);
+            appendList(root, "ul", unordered);
+            ordered.push(number[1].trim());
+            return;
+          }
+
+          appendList(root, "ul", unordered);
+          appendList(root, "ol", ordered);
+          paragraph.push(line.trim());
+        });
+
+        if (inCode) {
+          var pre = document.createElement("pre");
+          var code = document.createElement("code");
+          code.textContent = codeLines.join("\\n");
+          pre.appendChild(code);
+          root.appendChild(pre);
+        }
+        flushBlocks();
+        return root;
+      }
+
+      function setError(error) {
+        els.detailTitle.textContent = "Could not load";
+        clear(els.detailMeta);
+        clear(els.detailBody);
+        els.detailBody.appendChild(el("div", "empty", error.message || String(error)));
+      }
+
+      function filteredThreads() {
+        var query = state.query.trim().toLowerCase();
+        return state.threads.filter(function (thread) {
+          if (state.hideSmoke && thread.isSmokeTest) return false;
+          if (!query) return true;
+          return [
+            thread.sessionId,
+            thread.workspaceName,
+            thread.lastPrompt,
+            thread.lastResult,
+            thread.lastError,
+            thread.lastJobStatus
+          ].join(" ").toLowerCase().includes(query);
+        });
+      }
+
+      function renderWorkspaces() {
+        clear(els.workspaceSelect);
+        var all = document.createElement("option");
+        all.value = "";
+        all.textContent = "All workspaces";
+        els.workspaceSelect.appendChild(all);
+        state.workspaces.forEach(function (workspace) {
+          var option = document.createElement("option");
+          option.value = workspace.id;
+          option.textContent = workspace.name;
+          els.workspaceSelect.appendChild(option);
+        });
+        els.workspaceSelect.value = state.selectedWorkspace;
+      }
+
+      function renderThreads() {
+        var previousScrollTop = els.threadList.scrollTop;
+        var threads = filteredThreads();
+        clear(els.threadList);
+        els.listMeta.textContent = threads.length + " of " + state.threads.length + " threads";
+
+        if (threads.length === 0) {
+          els.threadList.appendChild(el("div", "empty", "No matching threads."));
+          return;
+        }
+
+        threads.forEach(function (thread) {
+          var row = document.createElement("button");
+          row.type = "button";
+          row.className = "thread-row" + (thread.id === state.selectedThreadId ? " active" : "");
+          row.addEventListener("click", function () { selectThread(thread.id); });
+
+          var main = el("div", "thread-main");
+          main.appendChild(el("div", "thread-title", thread.lastPrompt || thread.lastResult || shortId(thread.sessionId)));
+          main.appendChild(el("div", "thread-sub", thread.workspaceName + " - " + formatDate(thread.updatedAt)));
+
+          var side = el("div", "thread-count");
+          side.appendChild(el("div", "", String(thread.jobCount) + " jobs"));
+          if (thread.lastJobStatus) {
+            side.appendChild(el("span", statusClass(thread.lastJobStatus), thread.lastJobStatus));
+          }
+
+          row.appendChild(main);
+          row.appendChild(side);
+          els.threadList.appendChild(row);
+        });
+        els.threadList.scrollTop = previousScrollTop;
+      }
+
+      function section(title, bodyNode) {
+        var wrapper = el("section", "section");
+        wrapper.appendChild(el("h3", "", title));
+        var body = el("div", "section-body");
+        body.appendChild(bodyNode);
+        wrapper.appendChild(body);
+        return wrapper;
+      }
+
+      function renderTextSection(title, text) {
+        return section(title, markdownNode(text || "None"));
+      }
+
+      function renderMessages(messages) {
+        var body = el("div", "");
+        if (!messages || messages.length === 0) {
+          body.appendChild(el("div", "chat-empty", "No transcript messages found."));
+          return body;
+        }
+        messages.forEach(function (message) {
+          var row = el("div", "message " + message.role);
+          var bubble = el("div", "bubble");
+          bubble.appendChild(el("div", "role", message.role === "user" ? "You" : "Codex"));
+          bubble.appendChild(markdownNode(message.text));
+          if (message.timestamp) bubble.appendChild(el("div", "preview", formatDate(message.timestamp)));
+          row.appendChild(bubble);
+          body.appendChild(row);
+        });
+        return body;
+      }
+
+      function renderJobs(jobs) {
+        if (!jobs || jobs.length === 0) return section("Jobs", el("div", "empty", "No jobs recorded for this thread."));
+        var body = el("div", "");
+        jobs.forEach(function (job) {
+          var row = el("div", "job");
+          var top = el("div", "job-top");
+          top.appendChild(el("div", "job-id", job.id));
+          var actions = el("div", "job-actions");
+          actions.appendChild(el("span", statusClass(job.status), job.status));
+          var open = el("button", "small-button", "Open logs");
+          open.type = "button";
+          actions.appendChild(open);
+          top.appendChild(actions);
+          row.appendChild(top);
+          var preview = el("div", "job-summary");
+          preview.appendChild(markdownNode(job.resultPreview || job.error || job.prompt || "No preview yet."));
+          row.appendChild(preview);
+          var tail = [job.stdoutPreview, job.stderrPreview].filter(Boolean).join("\\n").trim();
+          if (tail && !job.resultPreview) {
+            row.appendChild(el("div", "log-tail", tail));
+          }
+          var logMount = el("div", "hidden");
+          row.appendChild(logMount);
+          open.addEventListener("click", function () { toggleJobLogs(job, logMount, open); });
+          body.appendChild(row);
+        });
+        return section("Jobs", body);
+      }
+
+      function appendLogSection(parent, title, text) {
+        var value = String(text || "").trim();
+        if (!value) return;
+        var wrapper = el("div", "job-log-section");
+        wrapper.appendChild(el("div", "job-log-title", title));
+        var body = el("div", "job-log-body");
+        body.appendChild(markdownNode(value));
+        wrapper.appendChild(body);
+        parent.appendChild(wrapper);
+      }
+
+      function toggleJobLogs(job, mount, button) {
+        if (!mount.classList.contains("hidden")) {
+          mount.classList.add("hidden");
+          button.textContent = "Open logs";
+          return;
+        }
+
+        mount.classList.remove("hidden");
+        button.textContent = "Close logs";
+        if (mount.dataset.loaded === "true") return;
+
+        clear(mount);
+        mount.appendChild(el("div", "empty", "Loading logs..."));
+        api("/v1/codex/jobs/" + encodeURIComponent(job.id) + "?include=fullLogs").then(function (fullJob) {
+          clear(mount);
+          var panel = el("div", "job-log-panel");
+          appendLogSection(panel, "Result", fullJob.result || fullJob.resultPreview);
+          appendLogSection(panel, "Stdout", fullJob.stdout || fullJob.stdoutPreview);
+          appendLogSection(panel, "Stderr", fullJob.stderr || fullJob.stderrPreview || fullJob.error);
+          if (!panel.childNodes.length) {
+            panel.appendChild(el("div", "empty", "No logs captured for this job."));
+          }
+          mount.appendChild(panel);
+          mount.dataset.loaded = "true";
+        }).catch(function (error) {
+          clear(mount);
+          mount.appendChild(el("div", "empty", error.message || String(error)));
+        });
+      }
+
+      function threadPreviewMessages(thread) {
+        var messages = [];
+        if (thread.lastPrompt) {
+          messages.push({ role: "user", text: thread.lastPrompt, timestamp: thread.updatedAt });
+        }
+        if (thread.lastResult || thread.lastError) {
+          messages.push({
+            role: "assistant",
+            text: thread.lastResult || thread.lastError,
+            timestamp: thread.updatedAt
+          });
+        }
+        return messages;
+      }
+
+      function jobsToMessages(thread, jobs) {
+        var messages = [];
+        jobs
+          .slice()
+          .sort(function (left, right) {
+            return Date.parse(left.createdAt || left.updatedAt || 0) - Date.parse(right.createdAt || right.updatedAt || 0);
+          })
+          .forEach(function (job) {
+            if (job.prompt) {
+              messages.push({ role: "user", text: job.prompt, timestamp: job.createdAt || job.startedAt || job.updatedAt });
+            }
+            var answer = job.resultPreview || job.result || job.error || job.stderrPreview || job.stdoutPreview;
+            if (answer) {
+              messages.push({ role: "assistant", text: answer, timestamp: job.finishedAt || job.updatedAt, status: job.status });
+            } else if (job.status && job.status !== "succeeded") {
+              messages.push({ role: "assistant", text: "Codex is " + job.status + "...", timestamp: job.updatedAt, status: job.status });
+            }
+          });
+        return messages.length > 0 ? messages : threadPreviewMessages(thread);
+      }
+
+      function isActiveStatus(status) {
+        return status === "queued" || status === "running";
+      }
+
+      function selectedHasActiveJob() {
+        return state.selectedJobs.some(function (job) { return isActiveStatus(job.status); });
+      }
+
+      function renderConversation(thread, messages, jobs, detailNote, renderSnapshot) {
+        state.selectedThread = thread;
+        state.selectedJobs = jobs || [];
+        var grid = el("div", "grid");
+        var conversation = el("div", "conversation");
+        var scroll = el("div", "conversation-scroll");
+        if (messages && messages.length > 0) {
+          scroll.appendChild(renderMessages(messages));
+        } else {
+          scroll.appendChild(el("div", "chat-empty", "No chat messages found for this thread yet."));
+        }
+        conversation.appendChild(scroll);
+        conversation.appendChild(renderComposer(thread));
+
+        var inspector = el("aside", "inspector");
+        inspector.appendChild(renderStats(thread));
+        inspector.appendChild(section("Live status", markdownNode(liveStatusText())));
+        if (detailNote) {
+          inspector.appendChild(section("Detail status", markdownNode(detailNote)));
+        }
+        inspector.appendChild(renderJobs(jobs || []));
+
+        grid.appendChild(conversation);
+        grid.appendChild(inspector);
+        els.detailBody.appendChild(grid);
+        restoreComposerState(thread, renderSnapshot);
+      }
+
+      function liveStatusText() {
+        var cadence = selectedHasActiveJob() ? "Polling every 2s while active." : "Polling every 8s while idle.";
+        var stamp = state.lastPollAt ? " Last check " + formatDate(state.lastPollAt) + "." : "";
+        return cadence + stamp;
+      }
+
+      function renderStats(thread) {
+        var stats = el("div", "stats");
+        var jobStat = el("div", "stat");
+        jobStat.appendChild(el("div", "stat-value", String(thread.jobCount || 0)));
+        jobStat.appendChild(el("div", "stat-label", "Jobs"));
+        var activeStat = el("div", "stat");
+        activeStat.appendChild(el("div", "stat-value", String(thread.activeJobCount || 0)));
+        activeStat.appendChild(el("div", "stat-label", "Active"));
+        var sourceStat = el("div", "stat");
+        sourceStat.appendChild(el("div", "stat-value", thread.hasSessionFile ? "Yes" : "No"));
+        sourceStat.appendChild(el("div", "stat-label", "Session file"));
+        stats.appendChild(jobStat);
+        stats.appendChild(activeStat);
+        stats.appendChild(sourceStat);
+        return stats;
+      }
+
+      function renderComposer(thread) {
+        var wrapper = el("div", "composer");
+        var textarea = document.createElement("textarea");
+        textarea.dataset.threadId = thread.sessionId;
+        textarea.value = state.composerDrafts[thread.sessionId] || "";
+        textarea.placeholder = "Reply on this Codex thread...";
+        textarea.addEventListener("input", function () {
+          state.composerDrafts[thread.sessionId] = textarea.value;
+        });
+        var actions = el("div", "composer-actions");
+        var status = el("div", "composer-status", "Continues " + shortId(thread.sessionId));
+        var button = el("button", "primary-button", "Send reply");
+        button.type = "button";
+        button.addEventListener("click", function () {
+          var prompt = textarea.value.trim();
+          if (!prompt) {
+            status.textContent = "Write a reply first.";
+            return;
+          }
+          button.disabled = true;
+          status.textContent = "Sending...";
+          apiRequest("/v1/codex/jobs", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              workspaceId: thread.workspaceId,
+              provider: thread.provider || "codex",
+              prompt: prompt,
+              timeoutMs: 1800000,
+              resumeSessionId: thread.sessionId
+            })
+          }).then(function (job) {
+            textarea.value = "";
+            state.composerDrafts[thread.sessionId] = "";
+            status.textContent = "Queued job " + shortId(job.id || "");
+            var current = state.threads.find(function (item) { return item.id === thread.id; }) || thread;
+            current.lastPrompt = prompt;
+            current.lastJobId = job.id || current.lastJobId;
+            current.lastJobStatus = job.status || current.lastJobStatus || "queued";
+            current.jobCount = (current.jobCount || 0) + 1;
+            renderThreadSummaryOnly(current, "Reply queued. Refresh threads to watch status move.");
+            loadThreadJobs(current);
+            renderThreads();
+          }).catch(function (error) {
+            status.textContent = error.message || String(error);
+          }).finally(function () {
+            button.disabled = false;
+          });
+        });
+        actions.appendChild(status);
+        actions.appendChild(button);
+        wrapper.appendChild(textarea);
+        wrapper.appendChild(actions);
+        return wrapper;
+      }
+
+      function renderDetail(body) {
+        var renderSnapshot = captureComposerState();
+        var thread = body.thread;
+        els.detailTitle.textContent = thread.lastPrompt || thread.lastResult || thread.sessionId;
+        clear(els.detailMeta);
+        els.detailMeta.appendChild(el("span", "", thread.workspaceName));
+        els.detailMeta.appendChild(el("span", "", "Updated " + formatDate(thread.updatedAt)));
+        els.detailMeta.appendChild(el("span", "", thread.sessionId));
+        if (thread.lastJobStatus) els.detailMeta.appendChild(el("span", statusClass(thread.lastJobStatus), thread.lastJobStatus));
+
+        clear(els.detailBody);
+        renderConversation(thread, body.messages, body.jobs, null, renderSnapshot);
+      }
+
+      function renderThreadSummaryOnly(thread, reason) {
+        var renderSnapshot = captureComposerState();
+        state.selectedThread = thread;
+        state.selectedJobs = [];
+        els.detailTitle.textContent = thread.lastPrompt || thread.lastResult || thread.sessionId;
+        clear(els.detailMeta);
+        els.detailMeta.appendChild(el("span", "", thread.workspaceName || "Workspace"));
+        els.detailMeta.appendChild(el("span", "", "Updated " + formatDate(thread.updatedAt)));
+        els.detailMeta.appendChild(el("span", "", thread.sessionId));
+        if (thread.lastJobStatus) els.detailMeta.appendChild(el("span", statusClass(thread.lastJobStatus), thread.lastJobStatus));
+
+        clear(els.detailBody);
+        renderConversation(thread, threadPreviewMessages(thread), [], reason || "Full transcript detail is not available from this server yet.", renderSnapshot);
+      }
+
+      function renderJobDetail(job) {
+        clear(els.detailBody);
+        var stack = el("div", "split-stack");
+        stack.appendChild(renderTextSection("Prompt", job.prompt || "None"));
+        stack.appendChild(section("Result", el("pre", "", job.result || job.resultPreview || "")));
+        stack.appendChild(section("Stdout", el("pre", "", job.stdout || job.stdoutPreview || "")));
+        stack.appendChild(section("Stderr", el("pre", "", job.stderr || job.stderrPreview || "")));
+        els.detailBody.appendChild(stack);
+      }
+
+      function loadThreadJobs(thread) {
+        if (state.threadPollInFlight) return Promise.resolve();
+        state.threadPollInFlight = true;
+        return api("/v1/codex/jobs?limit=200").then(function (body) {
+          var jobs = (body.jobs || []).filter(function (job) {
+            return job.sessionId === thread.sessionId || job.resumeSessionId === thread.sessionId;
+          });
+          jobs.sort(function (left, right) {
+            return Date.parse(left.createdAt || left.updatedAt || 0) - Date.parse(right.createdAt || right.updatedAt || 0);
+          });
+          if (state.selectedThreadId !== thread.id) return;
+          state.lastPollAt = new Date().toISOString();
+          thread.jobCount = jobs.length || thread.jobCount || 0;
+          thread.activeJobCount = jobs.filter(function (job) { return isActiveStatus(job.status); }).length;
+          if (jobs.length > 0) {
+            var latest = jobs[jobs.length - 1];
+            thread.lastJobId = latest.id || thread.lastJobId;
+            thread.lastJobStatus = latest.status || thread.lastJobStatus;
+            thread.lastPrompt = latest.prompt || thread.lastPrompt;
+            thread.lastResult = latest.resultPreview || latest.result || latest.error || thread.lastResult;
+            thread.updatedAt = latest.updatedAt || latest.finishedAt || thread.updatedAt;
+          }
+          var renderSnapshot = captureComposerState();
+          clear(els.detailBody);
+          renderConversation(thread, jobsToMessages(thread, jobs), jobs, jobs.length > 0 ? null : "No jobs were found for this thread yet.", renderSnapshot);
+          renderThreads();
+        }).catch(function () {
+          if (state.selectedThreadId === thread.id) {
+            renderThreadSummaryOnly(thread, "Could not load the job history, so this is the latest thread preview.");
+          }
+        }).finally(function () {
+          state.threadPollInFlight = false;
+        });
+      }
+
+      function selectThread(id) {
+        state.selectedThreadId = id;
+        renderThreads();
+        var fallback = state.threads.find(function (thread) { return thread.id === id; });
+        if (fallback) {
+          renderThreadSummaryOnly(fallback, "Loading full transcript detail. The summary and latest job logs are usable now.");
+          loadThreadJobs(fallback);
+        } else {
+          els.detailTitle.textContent = "Loading thread";
+          clear(els.detailMeta);
+          clear(els.detailBody);
+          els.detailBody.appendChild(el("div", "empty", "Loading..."));
+        }
+        api("/v1/codex/threads/" + encodeURIComponent(id)).then(renderDetail).catch(function (error) {
+          if (fallback) {
+            renderThreadSummaryOnly(fallback, "Full transcript detail is not available here yet. The list summary and latest job logs are still usable.");
+            return;
+          }
+          setError(error);
+        });
+      }
+
+      function loadJob(id) {
+        els.detailTitle.textContent = "Job " + shortId(id);
+        clear(els.detailMeta);
+        els.detailMeta.appendChild(el("span", "", id));
+        clear(els.detailBody);
+        els.detailBody.appendChild(el("div", "empty", "Loading logs..."));
+        api("/v1/codex/jobs/" + encodeURIComponent(id) + "?include=fullLogs").then(renderJobDetail).catch(setError);
+      }
+
+      function loadThreads() {
+        if (state.listPollInFlight) return Promise.resolve();
+        state.listPollInFlight = true;
+        els.listMeta.textContent = "Loading...";
+        var params = new URLSearchParams();
+        params.set("limit", "200");
+        if (state.selectedWorkspace) params.set("workspaceId", state.selectedWorkspace);
+        return api("/v1/codex/threads?" + params.toString()).then(function (body) {
+          state.threads = body.threads || [];
+          state.lastPollAt = new Date().toISOString();
+          if (state.selectedThreadId && !state.threads.some(function (thread) { return thread.id === state.selectedThreadId; })) {
+            state.selectedThreadId = null;
+          }
+          renderThreads();
+          var threads = filteredThreads();
+          if (!state.selectedThreadId && threads.length > 0) {
+            selectThread(threads[0].id);
+          } else if (state.selectedThreadId) {
+            var current = state.threads.find(function (thread) { return thread.id === state.selectedThreadId; });
+            if (current) state.selectedThread = current;
+          }
+        }).catch(function (error) {
+          els.listMeta.textContent = error.message || String(error);
+        }).finally(function () {
+          state.listPollInFlight = false;
+        });
+      }
+
+      function loadWorkspaces() {
+        return api("/v1/codex/workspaces").then(function (body) {
+          state.workspaces = body.workspaces || [];
+          renderWorkspaces();
+        });
+      }
+
+      function pollNow() {
+        if (state.selectedThreadId && state.selectedThread) {
+          loadThreadJobs(state.selectedThread);
+        }
+        loadThreads();
+        schedulePoll();
+      }
+
+      function schedulePoll() {
+        if (state.pollTimer) clearTimeout(state.pollTimer);
+        var delay = selectedHasActiveJob() ? 2000 : 8000;
+        state.pollTimer = setTimeout(pollNow, delay);
+      }
+
+      els.refreshButton.addEventListener("click", function () {
+        if (state.selectedThread) loadThreadJobs(state.selectedThread);
+        loadThreads();
+      });
+      els.searchInput.addEventListener("input", function () {
+        state.query = els.searchInput.value;
+        renderThreads();
+      });
+      els.workspaceSelect.addEventListener("change", function () {
+        state.selectedWorkspace = els.workspaceSelect.value;
+        state.selectedThreadId = null;
+        loadThreads();
+      });
+      els.hideSmokeInput.addEventListener("change", function () {
+        state.hideSmoke = els.hideSmokeInput.checked;
+        renderThreads();
+      });
+
+      loadWorkspaces().then(loadThreads).then(schedulePoll).catch(setError);
+    })();
+  </script>
+</body>
+</html>`;
 }
 
 const server = http.createServer((req, res) => {

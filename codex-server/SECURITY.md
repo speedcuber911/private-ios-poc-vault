@@ -17,8 +17,15 @@ The trusted routes are `/v1/codex/*`. They require:
 2. exact certificate-subject allowlist
 3. backend re-check of the forwarded certificate subject
 
-The allowed subjects come from `CODEX_ALLOWED_CERT_SUBJECTS`. A fresh install
-usually starts with:
+The allowed subjects come from `CODEX_ALLOWED_CERT_SUBJECTS`. The current live
+POC Vault install should stay limited to:
+
+```text
+CN=iphone
+CN=parikshit-mac
+```
+
+A fresh generic install usually starts with its own subjects, for example:
 
 ```text
 CN=iphone

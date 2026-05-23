@@ -1,13 +1,14 @@
 # Codex API Deploy Files
 
-This directory contains the deployable files for the async Codex job service.
+This directory contains the deployable files for the async Codex/Claude job
+service.
 
 ## Files
 
 - `server.mjs`: Node HTTP service with mTLS header auth, workspace registry,
-  resumable-session metadata, persistent jobs, stdout/stderr logs, audit JSONL,
-  timeout, cancel, and FIFO worker execution.
-- `server.test.mjs`: local tests that use a fake `codex` binary.
+  provider-locked resumable-session metadata, persistent jobs, stdout/stderr
+  logs, audit JSONL, timeout, cancel, and FIFO worker execution.
+- `server.test.mjs`: local tests that use fake `codex` and `claude` binaries.
 - `codex-api.env.example`: non-secret environment file template for
   `/etc/codex-api.env`.
 - `codex-api.nginx.conf.template`: owner-specific nginx virtual host template.
@@ -28,6 +29,11 @@ The current template uses:
 ```text
 CODEX_REQUIRE_MTLS=true
 CODEX_ALLOWED_CERT_SUBJECTS=CN=iphone,CN=operator
+CODEX_BIN=/usr/bin/codex
+CLAUDE_BIN=/usr/bin/claude
+CLAUDE_CODE_USE_BEDROCK=
+AWS_REGION=
+AWS_DEFAULT_REGION=
 CODEX_DANGEROUS_MODE=true
 CODEX_MAX_CONCURRENT=1
 CODEX_DEFAULT_TIMEOUT_MS=600000
@@ -68,10 +74,29 @@ build/codex-api/codex-api.nginx.conf
 On the EC2 host, `ops/install-codex-api.sh` renders and installs those files to
 `/etc/codex-api.env` and `/etc/nginx/conf.d/codex-api.conf`.
 
-## Resumable Sessions
+## Providers And Resumable Sessions
 
-`GET /v1/codex/sessions` returns metadata only for sessions whose saved `cwd`
-is inside a registered workspace. It does not return transcript content.
+`POST /v1/codex/jobs` accepts optional `provider`. Supported values are
+`codex` and `claude`; omitted provider defaults to `codex`. All job responses
+include the persisted provider.
+
+Codex jobs keep the existing `codex exec` and `codex exec resume` path. Claude
+jobs run `CLAUDE_BIN` in the selected workspace, read the prompt from stdin, use
+`--print`, pass `--model` and `--effort` when requested, and pass either
+`--session-id <uuid>` for a fresh Claude job or `--resume <session-id>` for a
+follow-up. Claude results come from stdout.
+
+When Claude Code is run through Bedrock, set `CLAUDE_CODE_USE_BEDROCK=1` and
+the AWS region values in `/etc/codex-api.env`; the EC2 instance role supplies
+the credentials.
+
+`GET /v1/codex/jobs`, `GET /v1/codex/sessions`,
+`GET /v1/codex/threads`, and `GET /v1/codex/threads/<sessionId>` accept optional
+`provider=codex|claude` filters.
+
+`GET /v1/codex/sessions` returns metadata only: Codex session files whose saved
+`cwd` is inside a registered workspace, plus provider sessions discovered from
+persisted job metadata. It does not return transcript content.
 
 `GET /v1/codex/threads` returns safe EC2-native thread summaries by merging
 those sessions with persisted job metadata. It includes latest prompt/result
@@ -79,9 +104,22 @@ summary fields and job counts, but not raw stdout/stderr transcript streams.
 If no persisted job summary exists yet, it uses bounded first-prompt and
 latest-answer previews from the saved Codex session file.
 
+`GET /v1/codex/threads/<sessionId>` returns one thread with bounded transcript
+messages and compact job previews.
+
+`GET /v1/codex/ui` serves a no-dependency browser UI for listing threads,
+filtering by workspace/search text, reading the bounded transcript view, and
+opening full job logs only when requested.
+
+For local review in a browser that cannot present the mTLS client certificate,
+set `CODEX_PROXY_BASE_URL`, `CODEX_PROXY_CLIENT_CERT`, and
+`CODEX_PROXY_CLIENT_KEY`. In that mode, the local UI stays on localhost and the
+Node server forwards live `/v1/codex/*` GET requests with the configured cert.
+
 `POST /v1/codex/jobs` accepts optional `resumeSessionId`. The backend rejects
-unknown session ids and sessions outside the requested workspace before running
-`codex exec resume`.
+unknown session ids, provider mismatches, and sessions outside the requested
+workspace before running the provider-specific resume command. Threads are
+provider-locked; a Claude thread cannot accept a Codex follow-up and vice versa.
 
 ## Phone Transcription
 

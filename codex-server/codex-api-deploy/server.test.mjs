@@ -32,6 +32,16 @@ async function waitForServer(baseUrl) {
   throw lastError || new Error("server did not become ready");
 }
 
+async function pathExists(filePath) {
+  try {
+    await fs.stat(filePath);
+    return true;
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 async function startServer(env) {
   const port = await freePort();
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -56,6 +66,19 @@ async function startServer(env) {
       await new Promise((resolve) => child.once("exit", resolve));
     },
   };
+}
+
+async function waitForJob(baseUrl, jobId) {
+  let job;
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const response = await fetch(`${baseUrl}/v1/codex/jobs/${jobId}`);
+    assert.equal(response.status, 200);
+    job = await response.json();
+    if (["succeeded", "failed", "cancelled", "timeout"].includes(job.status)) return job;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`job ${jobId} did not finish`);
 }
 
 async function startFakeAzureSpeech() {
@@ -104,6 +127,38 @@ async function startFakeAzureSpeech() {
   };
 }
 
+async function startFakeCodexApi() {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString("utf8");
+      requests.push({ method: req.method, url: req.url, headers: req.headers, body });
+      res.writeHead(req.method === "POST" ? 202 : 200, { "content-type": "application/json" });
+      if (req.url === "/v1/codex/workspaces") {
+        res.end(JSON.stringify({ workspaces: [{ id: "scratch", name: "Scratch" }] }));
+        return;
+      }
+      res.end(JSON.stringify({ ok: true, url: req.url, body: body ? JSON.parse(body) : null }));
+    });
+  });
+
+  const port = await freePort();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", resolve);
+  });
+
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
+    requests,
+    async stop() {
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+}
+
 async function makeFakeCodex(tmpDir) {
   const fakeCodex = path.join(tmpDir, "fake-codex");
   await fs.writeFile(
@@ -119,6 +174,36 @@ async function makeFakeCodex(tmpDir) {
       "prompt=$(cat)",
       "echo \"fake stdout: $prompt\"",
       "echo \"fake stderr\" >&2",
+      "if [ -n \"$out\" ]; then printf 'clean answer: %s\\n' \"$prompt\" > \"$out\"; fi",
+      "exit 0",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  return fakeCodex;
+}
+
+async function makeCacheWritingCodex(tmpDir) {
+  const fakeCodex = path.join(tmpDir, "fake-codex-cache");
+  await fs.writeFile(
+    fakeCodex,
+    [
+      "#!/bin/sh",
+      "out=''",
+      "prev=''",
+      "for arg in \"$@\"; do",
+      "  if [ \"$prev\" = '-o' ]; then out=\"$arg\"; fi",
+      "  prev=\"$arg\"",
+      "done",
+      "prompt=$(cat)",
+      "mkdir -p \"$HOME/.npm/_cacache\" \"$HOME/.npm/_npx/tool\" \"$HOME/.npm/_logs\" \"$HOME/.bun/install/cache\" \"$NPM_CONFIG_CACHE\" \"$BUN_INSTALL_CACHE_DIR\" \"$CODEX_HOME/.tmp/plugin\"",
+      "printf cache > \"$HOME/.npm/_cacache/blob\"",
+      "printf npx > \"$HOME/.npm/_npx/tool/blob\"",
+      "printf log > \"$HOME/.npm/_logs/debug.log\"",
+      "printf bun > \"$HOME/.bun/install/cache/blob\"",
+      "printf cache > \"$NPM_CONFIG_CACHE/blob\"",
+      "printf bun > \"$BUN_INSTALL_CACHE_DIR/blob\"",
+      "printf tmp > \"$CODEX_HOME/.tmp/plugin/blob\"",
       "if [ -n \"$out\" ]; then printf 'clean answer: %s\\n' \"$prompt\" > \"$out\"; fi",
       "exit 0",
       "",
@@ -144,6 +229,25 @@ async function makeArgEchoCodex(tmpDir) {
     { mode: 0o755 },
   );
   return fakeCodex;
+}
+
+async function makeArgEchoClaude(tmpDir) {
+  const fakeClaude = path.join(tmpDir, "fake-claude-args");
+  await fs.writeFile(
+    fakeClaude,
+    [
+      "#!/bin/sh",
+      "prompt=$(cat)",
+      "printf 'claude args:'",
+      "for arg in \"$@\"; do printf ' [%s]' \"$arg\"; done",
+      "printf '\\n'",
+      "printf 'claude cwd:%s\\n' \"$(pwd -P)\"",
+      "printf 'claude prompt:%s\\n' \"$prompt\"",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  return fakeClaude;
 }
 
 async function makeSessionWritingCodex(tmpDir, sessionId) {
@@ -232,7 +336,18 @@ async function writeSessionTranscriptFile(codexHome, sessionId, cwd, { contextPr
   );
 }
 
-async function writePersistedJob({ dataDir, workspaceDir, id, stdout, stderr, result }) {
+async function writePersistedJob({
+  dataDir,
+  workspaceDir,
+  id,
+  stdout,
+  stderr,
+  result,
+  provider = "codex",
+  workspaceId = "scratch",
+  workspaceName = "Scratch",
+  sessionId = null,
+}) {
   const jobsDir = path.join(dataDir, "jobs");
   const logsDir = path.join(dataDir, "logs");
   await fs.mkdir(jobsDir, { recursive: true });
@@ -241,8 +356,9 @@ async function writePersistedJob({ dataDir, workspaceDir, id, stdout, stderr, re
   const job = {
     id,
     status: "succeeded",
-    workspaceId: "scratch",
-    workspaceName: "Scratch",
+    provider,
+    workspaceId,
+    workspaceName,
     workspacePath: workspaceDir,
     prompt: "make a very loud thing",
     createdAt: "2026-05-21T00:00:00.000Z",
@@ -262,6 +378,7 @@ async function writePersistedJob({ dataDir, workspaceDir, id, stdout, stderr, re
     model: null,
     reasoningEffort: null,
     resumeSessionId: null,
+    sessionId,
   };
 
   await fs.writeFile(job.stdoutPath, stdout);
@@ -480,6 +597,137 @@ test("backfills readable thread summaries from session transcripts and flags smo
   }
 });
 
+test("returns bounded thread detail with transcript messages and job previews", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  const dataDir = path.join(tmpDir, "data");
+  const codexHome = path.join(tmpDir, "codex-home");
+  const sessionId = "019e46a5-0000-7000-8000-000000000001";
+  const jobId = "019e46a5-0000-7000-8000-000000000002";
+  await fs.mkdir(workspaceDir, { recursive: true });
+  await writeSessionTranscriptFile(codexHome, sessionId, workspaceDir, {
+    contextPrompt: "# AGENTS.md instructions for /srv/codex-workspaces/poc-vault\n<INSTRUCTIONS>POC Vault</INSTRUCTIONS>\n<environment_context><cwd>/srv/codex-workspaces/poc-vault</cwd></environment_context>",
+    userPrompt: "Use these Codex skills for this task: human-code-review.\n\nReview this iPhone-created thread",
+    assistantAnswer: "The thread completed and wrote a concise answer.",
+  });
+  await writePersistedJob({
+    dataDir,
+    workspaceDir,
+    id: jobId,
+    stdout: "job stdout tail",
+    stderr: "",
+    result: "job answer",
+  });
+
+  const persistedJobPath = path.join(dataDir, "jobs", `${jobId}.json`);
+  const persistedJob = JSON.parse(await fs.readFile(persistedJobPath, "utf8"));
+  persistedJob.sessionId = sessionId;
+  persistedJob.prompt = "Review this iPhone-created thread";
+  await fs.writeFile(persistedJobPath, `${JSON.stringify(persistedJob, null, 2)}\n`);
+
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: dataDir,
+    CODEX_HOME: codexHome,
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_BIN: await makeFakeCodex(tmpDir),
+  });
+  try {
+    const response = await fetch(`${server.baseUrl}/v1/codex/threads/${sessionId}`);
+    assert.equal(response.status, 200);
+    const body = await response.json();
+
+    assert.equal(body.thread.id, sessionId);
+    assert.equal(body.thread.workspaceId, "scratch");
+    assert.equal(body.thread.jobCount, 1);
+    assert.deepEqual(
+      body.messages.map((message) => [message.role, message.text]),
+      [
+        ["user", "Review this iPhone-created thread"],
+        ["assistant", "The thread completed and wrote a concise answer."],
+      ],
+    );
+    assert.equal(body.jobs.length, 1);
+    assert.equal(body.jobs[0].id, jobId);
+    assert.equal(body.jobs[0].sessionId, sessionId);
+    assert.equal(body.jobs[0].logsIncluded, "compact");
+    assert.equal(body.jobs[0].resultPreview, "job answer");
+  } finally {
+    await server.stop();
+  }
+});
+
+test("serves the Codex thread web UI from the authenticated API namespace", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_HOME: path.join(tmpDir, "codex-home"),
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_BIN: await makeFakeCodex(tmpDir),
+  });
+  try {
+    const response = await fetch(`${server.baseUrl}/v1/codex/ui`);
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type"), /^text\/html/);
+    const html = await response.text();
+    assert.match(html, /data-codex-thread-ui="true"/);
+    assert.match(html, /\/v1\/codex\/threads/);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("proxies authenticated Codex routes to a configured remote API for local browser use", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  const upstream = await startFakeCodexApi();
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_HOME: path.join(tmpDir, "codex-home"),
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_BIN: await makeFakeCodex(tmpDir),
+    CODEX_PROXY_BASE_URL: upstream.baseUrl,
+  });
+  try {
+    const response = await fetch(`${server.baseUrl}/v1/codex/workspaces`);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { workspaces: [{ id: "scratch", name: "Scratch" }] });
+    assert.equal(upstream.requests.length, 1);
+    assert.equal(upstream.requests[0].url, "/v1/codex/workspaces");
+
+    const ui = await fetch(`${server.baseUrl}/v1/codex/ui`);
+    assert.equal(ui.status, 200);
+    assert.equal(upstream.requests.length, 1);
+
+    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: "poc-vault",
+        prompt: "continue this thread",
+        resumeSessionId: "019e46a5-0000-7000-8000-000000000001",
+      }),
+    });
+    assert.equal(create.status, 202);
+    assert.equal(upstream.requests.length, 2);
+    assert.equal(upstream.requests[1].method, "POST");
+    assert.equal(upstream.requests[1].url, "/v1/codex/jobs");
+    assert.deepEqual(JSON.parse(upstream.requests[1].body), {
+      workspaceId: "poc-vault",
+      prompt: "continue this thread",
+      resumeSessionId: "019e46a5-0000-7000-8000-000000000001",
+    });
+  } finally {
+    await server.stop();
+    await upstream.stop();
+  }
+});
+
 test("resumes only sessions that belong to the selected workspace", async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
   const workspaceDir = path.join(tmpDir, "scratch");
@@ -634,6 +882,110 @@ test("creates an async job in a registered workspace and persists output", async
     const jobs = await fetch(`${server.baseUrl}/v1/codex/jobs?limit=10`);
     assert.equal(jobs.status, 200);
     assert.equal((await jobs.json()).jobs[0].id, created.id);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("saves job attachments and includes their paths in the Codex prompt", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  const dataDir = path.join(tmpDir, "data");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: dataDir,
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_BIN: await makeFakeCodex(tmpDir),
+  });
+  try {
+    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: "scratch",
+        prompt: "Review this phone capture",
+        timeoutMs: 5000,
+        attachments: [
+          {
+            filename: "Screen Shot 2026.png",
+            contentType: "image/png",
+            dataBase64: Buffer.from("fake image bytes", "utf8").toString("base64"),
+          },
+        ],
+      }),
+    });
+    assert.equal(create.status, 202);
+    const created = await create.json();
+    assert.equal(created.attachments.length, 1);
+    assert.equal(created.attachments[0].filename, "Screen-Shot-2026.png");
+    assert.equal(created.attachments[0].contentType, "image/png");
+    assert.equal(created.attachments[0].bytes, 16);
+
+    let job;
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const response = await fetch(`${server.baseUrl}/v1/codex/jobs/${created.id}`);
+      assert.equal(response.status, 200);
+      job = await response.json();
+      if (job.status === "succeeded") break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    assert.equal(job.status, "succeeded");
+    assert.match(job.result, /Review this phone capture/);
+    assert.match(job.result, /Attached files/);
+    assert.match(job.result, /Screen-Shot-2026\.png/);
+    assert.equal(await fs.readFile(job.attachments[0].path, "utf8"), "fake image bytes");
+    assert.equal(job.attachments[0].path.startsWith(path.join(dataDir, "attachments", created.id)), true);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("prunes runner package caches after jobs finish", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  const runHome = path.join(tmpDir, "run-home");
+  const codexHome = path.join(runHome, ".codex");
+  await fs.mkdir(workspaceDir, { recursive: true });
+
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_RUN_HOME: runHome,
+    CODEX_HOME: codexHome,
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_BIN: await makeCacheWritingCodex(tmpDir),
+  });
+
+  try {
+    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspaceId: "scratch", prompt: "cache cleanup", timeoutMs: 5000 }),
+    });
+    assert.equal(create.status, 202);
+    const created = await create.json();
+
+    let job;
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const response = await fetch(`${server.baseUrl}/v1/codex/jobs/${created.id}`);
+      assert.equal(response.status, 200);
+      job = await response.json();
+      if (job.status === "succeeded") break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    assert.equal(job.status, "succeeded");
+    assert.equal(await pathExists(path.join(runHome, ".npm", "_cacache")), false);
+    assert.equal(await pathExists(path.join(runHome, ".npm", "_npx")), false);
+    assert.equal(await pathExists(path.join(runHome, ".npm", "_logs")), false);
+    assert.equal(await pathExists(path.join(runHome, ".bun", "install", "cache")), false);
+    assert.equal(await pathExists(path.join(runHome, ".npm-cache")), false);
+    assert.equal(await pathExists(path.join(runHome, ".bun-cache")), false);
+    assert.equal(await pathExists(path.join(codexHome, ".tmp")), false);
   } finally {
     await server.stop();
   }
@@ -801,6 +1153,187 @@ test("passes model and reasoning effort to codex exec", async () => {
 
     assert.equal(job.status, "succeeded");
     assert.match(job.stdout, /args: \[exec\].*\[-m\] \[gpt-5.4\].*\[-c\] \[model_reasoning_effort="low"\].*\[-o\]/);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("persists providers and filters jobs, sessions, and threads by provider", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  const dataDir = path.join(tmpDir, "data");
+  const codexHome = path.join(tmpDir, "codex-home");
+  const codexSessionId = "019e46b0-0000-7000-8000-000000000001";
+  await fs.mkdir(workspaceDir, { recursive: true });
+  await writeSessionFile(codexHome, codexSessionId, workspaceDir);
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: dataDir,
+    CODEX_HOME: codexHome,
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_BIN: await makeFakeCodex(tmpDir),
+    CLAUDE_BIN: await makeArgEchoClaude(tmpDir),
+  });
+  try {
+    const codexCreate = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspaceId: "scratch", prompt: "codex default", timeoutMs: 5000 }),
+    });
+    assert.equal(codexCreate.status, 202);
+    const codexJob = await codexCreate.json();
+    assert.equal(codexJob.provider, "codex");
+
+    const claudeCreate = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspaceId: "scratch", provider: "claude", prompt: "claude work", timeoutMs: 5000 }),
+    });
+    assert.equal(claudeCreate.status, 202);
+    const claudeJob = await claudeCreate.json();
+    assert.equal(claudeJob.provider, "claude");
+    assert.match(claudeJob.sessionId, /^[a-f0-9-]{36}$/);
+
+    const finishedCodexJob = await waitForJob(server.baseUrl, codexJob.id);
+    assert.equal(finishedCodexJob.status, "succeeded");
+    assert.equal(finishedCodexJob.provider, "codex");
+    const finishedClaudeJob = await waitForJob(server.baseUrl, claudeJob.id);
+    assert.equal(finishedClaudeJob.status, "succeeded");
+    assert.equal(finishedClaudeJob.provider, "claude");
+
+    const claudeJobs = await fetch(`${server.baseUrl}/v1/codex/jobs?provider=claude&limit=20`);
+    assert.equal(claudeJobs.status, 200);
+    assert.deepEqual((await claudeJobs.json()).jobs.map((job) => job.id), [claudeJob.id]);
+
+    const codexSessions = await fetch(`${server.baseUrl}/v1/codex/sessions?provider=codex&limit=20`);
+    assert.equal(codexSessions.status, 200);
+    const codexSessionBody = await codexSessions.json();
+    assert.deepEqual(codexSessionBody.sessions.map((session) => session.id), [codexSessionId]);
+    assert.equal(codexSessionBody.sessions[0].provider, "codex");
+
+    const claudeSessions = await fetch(`${server.baseUrl}/v1/codex/sessions?provider=claude&limit=20`);
+    assert.equal(claudeSessions.status, 200);
+    const claudeSessionBody = await claudeSessions.json();
+    assert.deepEqual(claudeSessionBody.sessions.map((session) => session.id), [claudeJob.sessionId]);
+    assert.equal(claudeSessionBody.sessions[0].provider, "claude");
+
+    const claudeThreads = await fetch(`${server.baseUrl}/v1/codex/threads?provider=claude&limit=20`);
+    assert.equal(claudeThreads.status, 200);
+    const claudeThreadBody = await claudeThreads.json();
+    assert.deepEqual(claudeThreadBody.threads.map((thread) => thread.sessionId), [claudeJob.sessionId]);
+    assert.equal(claudeThreadBody.threads[0].provider, "claude");
+
+    const codexThreadDetail = await fetch(`${server.baseUrl}/v1/codex/threads/${codexSessionId}?provider=codex`);
+    assert.equal(codexThreadDetail.status, 200);
+    assert.equal((await codexThreadDetail.json()).thread.provider, "codex");
+  } finally {
+    await server.stop();
+  }
+});
+
+test("runs Claude jobs with configured binary, stdin prompt, and stdout result", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  const realWorkspaceDir = await fs.realpath(workspaceDir);
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_BIN: await makeFakeCodex(tmpDir),
+    CLAUDE_BIN: await makeArgEchoClaude(tmpDir),
+  });
+  try {
+    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: "scratch",
+        provider: "claude",
+        prompt: "explain the run",
+        model: "claude-sonnet-4-5",
+        reasoningEffort: "high",
+        timeoutMs: 5000,
+      }),
+    });
+    assert.equal(create.status, 202);
+    const created = await create.json();
+    assert.equal(created.provider, "claude");
+    assert.match(created.sessionId, /^[a-f0-9-]{36}$/);
+
+    const job = await waitForJob(server.baseUrl, created.id);
+    assert.equal(job.status, "succeeded");
+    assert.equal(job.provider, "claude");
+    assert.equal(job.sessionId, created.sessionId);
+    assert.match(job.stdout, new RegExp(`claude args: .*\\[--print\\].*\\[--dangerously-skip-permissions\\].*\\[--model\\] \\[claude-sonnet-4-5\\].*\\[--effort\\] \\[high\\].*\\[--session-id\\] \\[${created.sessionId}\\]`));
+    assert.match(job.stdout, new RegExp(`claude cwd:${realWorkspaceDir}`));
+    assert.match(job.stdout, /claude prompt:explain the run/);
+    assert.equal(job.result, job.stdout.trim());
+  } finally {
+    await server.stop();
+  }
+});
+
+test("rejects provider and workspace mismatches when resuming a provider-locked thread", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const scratchDir = path.join(tmpDir, "scratch");
+  const otherDir = path.join(tmpDir, "other");
+  const dataDir = path.join(tmpDir, "data");
+  const sessionId = "019e46b1-0000-7000-8000-000000000001";
+  await fs.mkdir(scratchDir, { recursive: true });
+  await fs.mkdir(otherDir, { recursive: true });
+  await writePersistedJob({
+    dataDir,
+    workspaceDir: scratchDir,
+    id: "019e46b1-0000-7000-8000-000000000002",
+    stdout: "previous claude stdout",
+    stderr: "",
+    result: "previous claude result",
+    provider: "claude",
+    sessionId,
+  });
+
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: dataDir,
+    CODEX_WORKSPACES: JSON.stringify([
+      { id: "scratch", name: "Scratch", path: scratchDir },
+      { id: "other", name: "Other", path: otherDir },
+    ]),
+    CODEX_BIN: await makeFakeCodex(tmpDir),
+    CLAUDE_BIN: await makeArgEchoClaude(tmpDir),
+  });
+  try {
+    const wrongProvider = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspaceId: "scratch", provider: "codex", prompt: "codex follow-up", resumeSessionId: sessionId }),
+    });
+    assert.equal(wrongProvider.status, 400);
+    assert.match((await wrongProvider.json()).error, /provider/i);
+
+    const wrongWorkspace = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspaceId: "other", provider: "claude", prompt: "wrong workspace", resumeSessionId: sessionId }),
+    });
+    assert.equal(wrongWorkspace.status, 400);
+    assert.match((await wrongWorkspace.json()).error, /workspace/i);
+
+    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspaceId: "scratch", provider: "claude", prompt: "right follow-up", resumeSessionId: sessionId }),
+    });
+    assert.equal(create.status, 202);
+    const created = await create.json();
+    assert.equal(created.provider, "claude");
+    assert.equal(created.sessionId, sessionId);
+
+    const job = await waitForJob(server.baseUrl, created.id);
+    assert.equal(job.status, "succeeded");
+    assert.match(job.stdout, new RegExp(`claude args: .*\\[--print\\].*\\[--resume\\] \\[${sessionId}\\]`));
+    assert.doesNotMatch(job.stdout, /\[--session-id\]/);
   } finally {
     await server.stop();
   }

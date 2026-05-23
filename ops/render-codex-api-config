@@ -63,13 +63,19 @@ def render_env(config: dict[str, str], output: Path) -> None:
         '[{"id":"scratch","name":"Scratch","path":"/srv/codex-workspaces/scratch"},'
         '{"id":"poc-vault","name":"POC Vault","path":"/srv/codex-workspaces/poc-vault"}]'
     )
+    aws_region = env_value(config, "AWS_REGION", env_value(config, "AWS_DEFAULT_REGION", ""))
+    aws_default_region = env_value(config, "AWS_DEFAULT_REGION", aws_region)
     pairs = [
         ("CODEX_API_HOST", "127.0.0.1"),
         ("CODEX_API_PORT", "8787"),
         ("CODEX_REQUIRE_MTLS", "true"),
         ("CODEX_ALLOWED_CERT_SUBJECTS", "CN=iphone,CN=operator"),
         ("CODEX_DATA_DIR", "/var/lib/codex-api"),
-        ("CODEX_BIN", "/usr/local/bin/codex"),
+        ("CODEX_BIN", "/usr/bin/codex"),
+        ("CLAUDE_BIN", "/usr/bin/claude"),
+        ("CLAUDE_CODE_USE_BEDROCK", ""),
+        ("AWS_REGION", aws_region),
+        ("AWS_DEFAULT_REGION", aws_default_region),
         ("CODEX_RUN_HOME", "/var/lib/codex-api/run-home"),
         ("CODEX_HOME", "/var/lib/codex-api/run-home/.codex"),
         ("CODEX_DANGEROUS_MODE", "true"),

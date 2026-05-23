@@ -1,8 +1,9 @@
 # Codex Server Workspace
 
-This workspace owns the EC2-side Codex job API used by the POC Vault iPhone app.
-It lives inside `/Users/pariksj/Desktop/poc-vault/codex-server` so the iOS vault
-app and server runner can be changed together when their contract moves.
+This workspace owns the EC2-side Codex/Claude job API used by the POC Vault
+iPhone app. It lives inside `/Users/pariksj/Desktop/poc-vault/codex-server` so
+the iOS vault app and server runner can be changed together when their contract
+moves.
 
 Configured endpoint shape:
 
@@ -18,18 +19,23 @@ owner AWS account / configured region / POC Vault EC2
 
 ## What It Provides
 
-The server exposes an async job API for Codex:
+The server exposes an async job API for Codex and Claude providers:
 
 - `GET /healthz`: public process health for uptime checks.
 - `GET /v1/codex/health`: authenticated health.
 - `GET /v1/codex/workspaces`: predefined workspace registry.
-- `GET /v1/codex/sessions?workspaceId=scratch&limit=50`: resumable session
-  metadata for sessions whose saved `cwd` is inside a registered workspace.
-- `GET /v1/codex/threads?workspaceId=scratch&limit=50`: EC2-native thread
-  summaries, merging resumable sessions with latest persisted job metadata and
-  bounded prompt/result previews.
-- `GET /v1/codex/jobs?limit=50`: persistent job history.
-- `POST /v1/codex/jobs`: enqueue a Codex job.
+- `GET /v1/codex/ui`: authenticated browser UI for reviewing Codex threads.
+- `GET /v1/codex/sessions?workspaceId=scratch&provider=codex&limit=50`:
+  resumable Codex session metadata for sessions whose saved `cwd` is inside a
+  registered workspace.
+- `GET /v1/codex/threads?workspaceId=scratch&provider=codex&limit=50`:
+  EC2-native thread summaries, merging resumable sessions with latest persisted
+  job metadata and bounded prompt/result previews.
+- `GET /v1/codex/threads/<sessionId>?provider=codex`: one thread with bounded
+  transcript messages plus compact job previews.
+- `GET /v1/codex/jobs?provider=codex&limit=50`: persistent job history.
+- `POST /v1/codex/jobs`: enqueue a provider job. `provider` is optional and
+  defaults to `codex`; `claude` is also supported.
 - `GET /v1/codex/jobs/<id>`: job detail with stdout, stderr, result, and status.
 - `POST /v1/codex/jobs/<id>/cancel`: cancel queued or running jobs.
 - `POST /v1/codex/transcriptions`: transcribe phone-recorded prompt audio
@@ -41,8 +47,17 @@ the current live design.
 ## Current Auth Contract
 
 nginx and the backend both treat the client certificate subject as the operator
-identity. The intended allowlist is strict and configured with
-`CODEX_ALLOWED_CERT_SUBJECTS`. A fresh install usually starts with:
+identity. The allowlist is strict and configured with
+`CODEX_ALLOWED_CERT_SUBJECTS`.
+
+The current live POC Vault install should stay limited to:
+
+```text
+CN=iphone
+CN=parikshit-mac
+```
+
+A fresh generic install usually starts with its own subjects, for example:
 
 ```text
 CN=iphone
@@ -78,6 +93,22 @@ Runtime data lives under:
 
 The service runs as `codex-runner`. It is not root and has no sudo.
 
+Provider binaries are configured with:
+
+```text
+CODEX_BIN=/usr/bin/codex
+CLAUDE_BIN=/usr/bin/claude
+CLAUDE_CODE_USE_BEDROCK=1
+AWS_REGION=ap-south-1
+AWS_DEFAULT_REGION=ap-south-1
+```
+
+Codex jobs use the existing `codex exec` / `codex exec resume` commands. Claude
+jobs run in the selected workspace, read prompts from stdin, use non-interactive
+`--print` mode, pass `--model` / `--effort` when supplied, and use
+`--session-id <uuid>` for fresh jobs or `--resume <session-id>` for follow-ups.
+Claude job results are captured from stdout.
+
 ## Workspaces
 
 Jobs can target only the predefined workspaces in `/etc/codex-api.env`:
@@ -92,13 +123,28 @@ It is not the live nginx static root and it is not the local Mac checkout.
 
 ## Thread Summaries
 
-`GET /v1/codex/sessions` stays metadata-only. It should not return transcript
-content.
+`GET /v1/codex/sessions` stays metadata-only. It includes Codex session files
+and provider sessions discovered from persisted job metadata, but it should not
+return transcript content.
+
+`GET /v1/codex/jobs`, `/sessions`, `/threads`, and `/threads/<sessionId>` accept
+optional `provider=codex|claude` filters. Thread summaries include `provider`.
+Threads are provider-locked: a Claude thread cannot be resumed by a Codex job,
+and a Codex thread cannot be resumed by a Claude job.
 
 `GET /v1/codex/threads` can return bounded `lastPrompt` and `lastResult`
 previews so the phone UI can show readable thread history without raw
 stdout/stderr streams. Tune the preview length with
 `CODEX_THREAD_SUMMARY_CHARACTERS`.
+
+The browser review surface lives at `/v1/codex/ui`. It uses the same mTLS
+boundary as the API, lists recent threads, filters by workspace/search text,
+shows bounded transcript messages, and can open full job logs intentionally.
+
+For local browser review from a tool that cannot present a client certificate,
+run the Node service with `CODEX_PROXY_BASE_URL`, `CODEX_PROXY_CLIENT_CERT`, and
+`CODEX_PROXY_CLIENT_KEY`. The browser still talks to localhost, while the Node
+process uses the client certificate for live `/v1/codex/*` GET requests.
 
 When a thread has no persisted job summary yet, the server reads bounded
 previews from the saved Codex session JSONL file. It skips injected
@@ -247,13 +293,24 @@ curl -sS \
   "$CODEX_URL/v1/codex/jobs"
 ```
 
+Submit a Claude job:
+
+```bash
+curl -sS \
+  --cert "$CLIENT_CERT" \
+  --key "$CLIENT_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"workspaceId":"scratch","provider":"claude","prompt":"Summarize this workspace.","timeoutMs":600000}' \
+  "$CODEX_URL/v1/codex/jobs"
+```
+
 List resumable sessions without transcript content:
 
 ```bash
 curl -sS \
   --cert "$CLIENT_CERT" \
   --key "$CLIENT_KEY" \
-  "$CODEX_URL/v1/codex/sessions?workspaceId=scratch&limit=20"
+  "$CODEX_URL/v1/codex/sessions?workspaceId=scratch&provider=codex&limit=20"
 ```
 
 List EC2-native threads:
@@ -262,7 +319,7 @@ List EC2-native threads:
 curl -sS \
   --cert "$CLIENT_CERT" \
   --key "$CLIENT_KEY" \
-  "$CODEX_URL/v1/codex/threads?workspaceId=scratch&limit=20"
+  "$CODEX_URL/v1/codex/threads?workspaceId=scratch&provider=codex&limit=20"
 ```
 
 Resume a server-side session by id:
@@ -272,7 +329,7 @@ curl -sS \
   --cert "$CLIENT_CERT" \
   --key "$CLIENT_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"workspaceId":"scratch","resumeSessionId":"<session-id>","prompt":"Continue from here.","timeoutMs":600000}' \
+  -d '{"workspaceId":"scratch","provider":"codex","resumeSessionId":"<session-id>","prompt":"Continue from here.","timeoutMs":600000}' \
   "$CODEX_URL/v1/codex/jobs"
 ```
 

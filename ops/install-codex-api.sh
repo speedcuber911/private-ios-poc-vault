@@ -88,7 +88,7 @@ install -m 0644 -o root -g root "$ROOT/codex-server/codex-api-deploy/codex-api.s
 install -m 0600 -o root -g root "$TMP_RENDER_DIR/codex-api.env" "$ENV_PATH"
 install -m 0644 -o root -g root "$TMP_RENDER_DIR/codex-api.nginx.conf" "$NGINX_CONF_PATH"
 
-if [[ ! -x "${CODEX_BIN:-/usr/local/bin/codex}" && ! -x /usr/bin/codex ]]; then
+if [[ ! -x "${CODEX_BIN:-/usr/bin/codex}" && ! -x /usr/bin/codex ]]; then
   echo "WARN codex CLI was not found. Install/login Codex for ${RUNNER_USER} before running jobs." >&2
 fi
 
