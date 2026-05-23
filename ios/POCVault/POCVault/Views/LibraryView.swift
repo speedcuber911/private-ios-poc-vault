@@ -59,8 +59,8 @@ struct LibraryView: View {
                 Spacer()
                 diagnosticsLink()
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 14)
+            .padding(.horizontal, AppTheme.screenHorizontalPadding)
+            .padding(.top, AppTheme.screenTopPadding)
             .padding(.bottom, 20)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .failed(let message):
@@ -76,8 +76,8 @@ struct LibraryView: View {
 
                     diagnosticsLink()
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 14)
+                .padding(.horizontal, AppTheme.screenHorizontalPadding)
+                .padding(.top, AppTheme.screenTopPadding)
                 .padding(.bottom, 24)
             }
         case .loaded:
@@ -93,8 +93,8 @@ struct LibraryView: View {
 
                         diagnosticsLink()
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 14)
+                    .padding(.horizontal, AppTheme.screenHorizontalPadding)
+                    .padding(.top, AppTheme.screenTopPadding)
                     .padding(.bottom, 24)
                 }
             } else if viewModel.filteredEntries.isEmpty {
@@ -110,8 +110,8 @@ struct LibraryView: View {
 
                         diagnosticsLink()
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 14)
+                    .padding(.horizontal, AppTheme.screenHorizontalPadding)
+                    .padding(.top, AppTheme.screenTopPadding)
                     .padding(.bottom, 24)
                 }
             } else {
@@ -131,9 +131,9 @@ struct LibraryView: View {
 
                         diagnosticsLink()
                     }
-                    .padding(.horizontal, 20)
-                    .padding(.top, 14)
-                    .padding(.bottom, 112)
+                    .padding(.horizontal, AppTheme.screenHorizontalPadding)
+                    .padding(.top, AppTheme.screenTopPadding)
+                    .padding(.bottom, AppTheme.tabBarClearance)
                 }
             }
         }
@@ -213,14 +213,14 @@ private struct VaultHeader: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 Text("Relay")
-                    .font(.system(size: 28, weight: .semibold))
+                    .font(AppTheme.screenTitleFont)
                     .foregroundStyle(AppTheme.textPrimary)
                 HStack(spacing: 6) {
                     Image(systemName: "lock.fill")
                         .font(.system(size: 10, weight: .bold))
                         .foregroundStyle(AppTheme.accent)
                     Text(subtitle)
-                        .font(.subheadline.weight(.medium))
+                        .font(AppTheme.bodyFont)
                         .foregroundStyle(AppTheme.textTertiary)
                         .lineLimit(1)
                 }
@@ -293,7 +293,7 @@ private struct HeaderButton: View {
             Image(systemName: symbol)
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundStyle(AppTheme.textPrimary)
-                .frame(width: 36, height: 36)
+                .frame(width: AppTheme.iconButtonSize, height: AppTheme.iconButtonSize)
                 .background(AppTheme.bgSurfaceHi, in: Circle())
                 .overlay {
                     Circle()
@@ -321,9 +321,9 @@ private struct SearchBox: View {
         }
         .padding(.horizontal, 14)
         .frame(height: 44)
-        .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: AppTheme.compactRadius, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
+            RoundedRectangle(cornerRadius: AppTheme.compactRadius, style: .continuous)
                 .stroke(AppTheme.strokeStrong, lineWidth: 1)
         }
         .tint(AppTheme.accent)
@@ -336,7 +336,7 @@ private struct POCSectionHeader: View {
     var body: some View {
         HStack(alignment: .center) {
             Text("Library")
-                .font(.caption.weight(.bold))
+                .font(AppTheme.sectionLabelFont)
                 .textCase(.uppercase)
                 .foregroundStyle(AppTheme.textTertiary)
                 .tracking(1.4)
@@ -390,7 +390,7 @@ private struct POCEntryCard: View {
 
             VStack(alignment: .leading, spacing: 6) {
                 Text(entry.title)
-                    .font(.subheadline.weight(.semibold))
+                    .font(AppTheme.cardTitleFont)
                     .foregroundStyle(AppTheme.textPrimary)
                     .lineLimit(1)
 
@@ -422,12 +422,12 @@ private struct POCEntryCard: View {
         }
         .padding(.horizontal, 12)
         .frame(minHeight: 72)
-        .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: AppTheme.cardRadius, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+            RoundedRectangle(cornerRadius: AppTheme.cardRadius, style: .continuous)
                 .stroke(AppTheme.strokeSubtle, lineWidth: 1)
         }
-        .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: AppTheme.cardRadius, style: .continuous))
     }
 
     private var metaText: String {
@@ -484,18 +484,18 @@ private struct StatusCard: View {
                 .font(.system(size: 24, weight: .semibold))
                 .foregroundStyle(AppTheme.accent)
             Text(title)
-                .font(.headline.weight(.semibold))
+                .font(AppTheme.cardTitleFont)
                 .foregroundStyle(AppTheme.textPrimary)
             Text(message)
-                .font(.subheadline)
+                .font(AppTheme.bodyFont)
                 .foregroundStyle(AppTheme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: AppTheme.compactRadius, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
+            RoundedRectangle(cornerRadius: AppTheme.compactRadius, style: .continuous)
                 .stroke(AppTheme.strokeSubtle, lineWidth: 1)
         }
     }

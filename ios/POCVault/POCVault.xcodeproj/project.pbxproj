@@ -25,6 +25,8 @@
 		200000000000000000000017 /* CodexConsoleViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000020 /* CodexConsoleViewModel.swift */; };
 		200000000000000000000018 /* CodexConsoleView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000021 /* CodexConsoleView.swift */; };
 		200000000000000000000019 /* Resources/Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000022 /* Resources/Assets.xcassets */; };
+		200000000000000000000020 /* RelayCarPlayDashboard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000024 /* RelayCarPlayDashboard.swift */; };
+		200000000000000000000021 /* RelayCarPlaySceneDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000025 /* RelayCarPlaySceneDelegate.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -59,6 +61,9 @@
 		100000000000000000000020 /* CodexConsoleViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexConsoleViewModel.swift; sourceTree = "<group>"; };
 		100000000000000000000021 /* CodexConsoleView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexConsoleView.swift; sourceTree = "<group>"; };
 		100000000000000000000022 /* Resources/Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Resources/Assets.xcassets; sourceTree = "<group>"; };
+		100000000000000000000023 /* POCVault.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = POCVault.entitlements; sourceTree = "<group>"; };
+		100000000000000000000024 /* RelayCarPlayDashboard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayCarPlayDashboard.swift; sourceTree = "<group>"; };
+		100000000000000000000025 /* RelayCarPlaySceneDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayCarPlaySceneDelegate.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -92,7 +97,9 @@
 			isa = PBXGroup;
 			children = (
 				100000000000000000000005 /* Info.plist */,
+				100000000000000000000023 /* POCVault.entitlements */,
 				100000000000000000000006 /* POCVaultApp.swift */,
+				500000000000000000000010 /* CarPlay */,
 				500000000000000000000005 /* Models */,
 				500000000000000000000006 /* Security */,
 				500000000000000000000007 /* Networking */,
@@ -168,6 +175,15 @@
 				100000000000000000000021 /* CodexConsoleView.swift */,
 			);
 			path = Views;
+			sourceTree = "<group>";
+		};
+		500000000000000000000010 /* CarPlay */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000024 /* RelayCarPlayDashboard.swift */,
+				100000000000000000000025 /* RelayCarPlaySceneDelegate.swift */,
+			);
+			path = CarPlay;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -285,6 +301,8 @@
 				200000000000000000000016 /* CodexClient.swift in Sources */,
 				200000000000000000000017 /* CodexConsoleViewModel.swift in Sources */,
 				200000000000000000000018 /* CodexConsoleView.swift in Sources */,
+				200000000000000000000020 /* RelayCarPlayDashboard.swift in Sources */,
+				200000000000000000000021 /* RelayCarPlaySceneDelegate.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -414,6 +432,7 @@
 		900000000000000000000003 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = POCVault/POCVault.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = QRXV2V66Y6;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -435,6 +454,7 @@
 		900000000000000000000004 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = POCVault/POCVault.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = QRXV2V66Y6;
 				GENERATE_INFOPLIST_FILE = NO;

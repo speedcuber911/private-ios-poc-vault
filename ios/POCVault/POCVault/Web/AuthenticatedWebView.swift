@@ -42,6 +42,7 @@ struct AuthenticatedWebView: View {
         }
         .navigationBarBackButtonHidden(true)
         .toolbar(.hidden, for: .navigationBar)
+        .toolbar(.hidden, for: .tabBar)
         .statusBarHidden(false)
         .onDisappear {
             restoreChromeTask?.cancel()

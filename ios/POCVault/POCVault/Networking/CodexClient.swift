@@ -119,6 +119,14 @@ final class CodexClient: NSObject, URLSessionDelegate {
         return try decoder.decode(CodexListEnvelope<CodexWorkspace>.self, from: data).values
     }
 
+    func fetchSkills(provider: CodexProvider? = nil) async throws -> [CodexSkill] {
+        var queryItems: [URLQueryItem] = []
+        appendProvider(provider, to: &queryItems)
+
+        let data = try await perform(path: "/v1/codex/skills", queryItems: queryItems)
+        return try decoder.decode(CodexListEnvelope<CodexSkill>.self, from: data).values
+    }
+
     func fetchJobs(provider: CodexProvider? = nil, limit: Int = 50) async throws -> [CodexJob] {
         var queryItems = [
             URLQueryItem(name: "limit", value: String(limit))
@@ -363,7 +371,7 @@ private struct CodexListEnvelope<Element: Decodable>: Decodable {
         }
 
         let container = try decoder.container(keyedBy: CodexDynamicCodingKey.self)
-        for key in ["items", "data", "results", "workspaces", "jobs", "sessions", "threads"] {
+        for key in ["items", "data", "results", "workspaces", "skills", "jobs", "sessions", "threads"] {
             if let codingKey = CodexDynamicCodingKey(stringValue: key),
                let values = try? container.decode([Element].self, forKey: codingKey) {
                 self.values = values
