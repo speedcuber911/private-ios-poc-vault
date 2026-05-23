@@ -19,6 +19,21 @@ phone app and EC2 runner are tightly coupled.
 - For Codex server/API work, switch to
   `/Users/pariksj/Desktop/poc-vault/codex-server`.
 
+## Product Branding
+
+- The user-facing iOS app name is `Relay`.
+- Use `Relay` for app icons, logos, UI copy, App Store-style copy, marketing
+  text, screenshots, onboarding, and any visual design direction.
+- `POC Vault`, `POCVault`, `poc-vault`, and `com.parikshit.pocvault` are legacy
+  or internal project, module, bundle, backend, and repo names. Do not infer the
+  product brand from those names.
+- Do not design around vault-door, keyhole, safe, lockbox, or storage metaphors
+  unless the user explicitly asks for that direction.
+- Keep existing internal names stable unless the user explicitly asks for a
+  deeper rename. In particular, do not rename the bundle id, Swift module,
+  Xcode target, manifest keys, repo path, or backend workspace just to make
+  user-facing branding say `Relay`.
+
 ## Non-Negotiable Architecture Rule
 
 POCs are backend-driven. Creating, updating, or deploying a POC must not require
@@ -127,6 +142,7 @@ https://<slug>.<configured-poc-domain>/
 
 The iOS app is a vault shell, not a POC implementation surface.
 
+- User-facing name and visual identity: `Relay`.
 - Canonical physical-device bundle id: `com.parikshit.pocvault`.
 - Do not use, reintroduce, install, or document sample/example bundle ids.
 - The tests bundle id should follow the same prefix: `com.parikshit.pocvault.tests`.

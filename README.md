@@ -1,9 +1,13 @@
 # Private iOS POC Vault
 
-POC Vault is a private, iPhone-first delivery system for static AI-generated
-proofs of concept. It turns scattered local demos into a signed, authenticated
-library that can be browsed from a native iOS app and opened in a full-screen
-WebView.
+Relay is the user-facing iOS app for this private, iPhone-first delivery system
+for static AI-generated proofs of concept. The repository and backend still use
+the older POC Vault naming in several internal places, but user-facing product
+branding should be Relay.
+
+POC Vault is the internal platform name for the system that turns scattered
+local demos into a signed, authenticated library that can be browsed from a
+native iOS app and opened in a full-screen WebView.
 
 The project has three core ideas:
 
@@ -29,6 +33,20 @@ The project has three core ideas:
 The result is a repeatable loop: build a static demo, deploy it, refresh the
 iPhone library, and open it privately without changing native code.
 
+## Branding
+
+- User-facing app name: `Relay`.
+- Use `Relay` for app icons, logos, UI copy, App Store-style text, screenshots,
+  onboarding, and visual design work.
+- Treat `POC Vault`, `POCVault`, `poc-vault`, and `com.parikshit.pocvault` as
+  internal or legacy names for the repo, Xcode project, Swift module, bundle id,
+  backend workspace, and manifest/config vocabulary.
+- Do not use vault-door, keyhole, safe, lockbox, or storage metaphors for the
+  app logo or product visuals unless that direction is explicitly requested.
+- Do not rename internal identifiers just to match the Relay brand. The bundle
+  id, module, target, repo path, backend config keys, and workspace names stay
+  stable unless a deeper rename is requested.
+
 ## Architecture
 
 ```mermaid
@@ -38,7 +56,7 @@ flowchart LR
   Deploy --> Manifest["Generated manifest + signature"]
   Deploy --> VM["EC2 static root"]
   VM --> Nginx["nginx mTLS"]
-  Nginx --> App["iOS POC Vault"]
+  Nginx --> App["Relay iOS app"]
   App --> WebView["Authenticated WebView"]
   App --> CodexTab["Codex tab"]
   CodexTab --> CodexAPI["EC2 Codex job API"]
@@ -50,7 +68,7 @@ flowchart LR
 .
 ├── pocs/                 # Source metadata and static POC assets
 ├── ops/                  # Deploy, signing, verification, cert, and server scripts
-├── ios/POCVault/         # Native vault shell
+├── ios/POCVault/         # Native Relay iOS shell; legacy internal path
 ├── codex-server/         # EC2 async Codex job API
 ├── build/                # Generated manifest and signature artifacts
 ├── README.md             # Project overview and operating guide
@@ -250,7 +268,7 @@ signature sidecar.
 
 ## iOS App
 
-The iOS app has three jobs:
+The iOS app is named Relay. It has three jobs:
 
 1. load and verify the signed manifest
 2. open POCs in an authenticated full-screen `WKWebView`
