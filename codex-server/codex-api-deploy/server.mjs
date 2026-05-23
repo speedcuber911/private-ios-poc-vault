@@ -19,6 +19,7 @@ const codexBin = process.env.CODEX_BIN || "/usr/bin/codex";
 const claudeBin = process.env.CLAUDE_BIN || "/usr/bin/claude";
 const runHome = process.env.CODEX_RUN_HOME || process.env.HOME || "/home/ec2-user";
 const codexHome = process.env.CODEX_HOME || path.join(runHome, ".codex");
+const claudeHome = process.env.CLAUDE_HOME || path.join(runHome, ".claude");
 const npmCacheDir = process.env.NPM_CONFIG_CACHE || process.env.npm_config_cache || path.join(runHome, ".npm-cache");
 const bunCacheDir = process.env.BUN_INSTALL_CACHE_DIR || path.join(runHome, ".bun-cache");
 const dangerousMode = parseBooleanEnv("CODEX_DANGEROUS_MODE", true);
@@ -39,6 +40,9 @@ const maxTranscriptionAudioBytes = parseIntegerEnv(
   250 * 1024 * 1024,
 );
 const maxOutputBytes = parseIntegerEnv("CODEX_MAX_OUTPUT_BYTES", 5 * 1024 * 1024, 1, 50 * 1024 * 1024);
+const maxJobSkills = parseIntegerEnv("CODEX_MAX_JOB_SKILLS", 6, 0, 20);
+const maxSkillPromptBytes = parseIntegerEnv("CODEX_MAX_SKILL_PROMPT_BYTES", 20 * 1024, 1024, 256 * 1024);
+const maxSkillDiscoveryFiles = parseIntegerEnv("CODEX_MAX_SKILL_DISCOVERY_FILES", 600, 1, 5000);
 const responseOutputBytes = Math.min(
   parseIntegerEnv("CODEX_RESPONSE_OUTPUT_BYTES", 64 * 1024, 1, maxOutputBytes),
   maxOutputBytes,
@@ -57,6 +61,8 @@ const threadSummaryCharacters = parseIntegerEnv("CODEX_THREAD_SUMMARY_CHARACTERS
 const terminalStatuses = new Set(["succeeded", "failed", "cancelled", "timeout"]);
 const allowedReasoningEfforts = new Set(["low", "medium", "high", "xhigh"]);
 const allowedJobProviders = new Set(["codex", "claude"]);
+const allowedClaudePermissionModes = new Set(["acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"]);
+const claudeDefaultModel = cleanOptionalModel(process.env.CLAUDE_DEFAULT_MODEL || "sonnet");
 const azureSpeechEndpoint = cleanOptionalEndpoint(process.env.AZURE_SPEECH_ENDPOINT);
 const azureSpeechApiKey = cleanOptionalSecret(process.env.AZURE_SPEECH_API_KEY || process.env.AZURE_SPEECH_KEY);
 const azureSpeechApiVersion = cleanApiVersion(process.env.AZURE_SPEECH_API_VERSION || "2025-10-15");
@@ -99,6 +105,13 @@ function parseBooleanEnv(name, fallback) {
 function splitCsv(value) {
   return (value || "")
     .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function splitPathList(value) {
+  return (value || "")
+    .split(path.delimiter)
     .map((entry) => entry.trim())
     .filter(Boolean);
 }
@@ -419,6 +432,11 @@ async function routeRequest(req, res) {
     return proxyCodexRequest(req, url, res);
   }
 
+  if (req.method === "GET" && url.pathname === "/v1/codex/skills") {
+    const provider = cleanProviderFilter(url.searchParams.get("provider")) || "codex";
+    return sendJson(res, 200, { provider, skills: listProviderSkills(provider).map(publicSkill) });
+  }
+
   if (req.method === "GET" && url.pathname === "/v1/codex/workspaces") {
     return sendJson(res, 200, {
       workspaces: [...workspaces.values()].map((workspace) => ({
@@ -662,7 +680,9 @@ function createJob(body, certSubject) {
   const createdAt = nowIso();
   const timeoutMs = Math.min(Math.max(Math.trunc(requestedTimeout), 1000), maxTimeoutMs);
   const attachments = saveJobAttachments(id, body.attachments);
-  const codexPrompt = promptWithAttachments(body.prompt, attachments);
+  const selectedSkills = cleanSelectedSkills(provider, body.skills);
+  const codexPrompt = promptWithAttachments(promptWithSelectedSkills(body.prompt, provider, selectedSkills), attachments);
+  const permissionMode = cleanOptionalClaudePermissionMode(body.permissionMode);
   pruneRuntimeCachesIfIdle();
   const job = {
     id,
@@ -673,6 +693,7 @@ function createJob(body, certSubject) {
     workspacePath: workspace.path,
     prompt: body.prompt,
     codexPrompt,
+    skills: selectedSkills.map((skill) => skill.id),
     attachments,
     createdAt,
     updatedAt: createdAt,
@@ -688,8 +709,9 @@ function createJob(body, certSubject) {
     error: null,
     certSubject,
     timeoutMs,
-    model: cleanOptionalModel(body.model),
+    model: cleanProviderModel(provider, body.model),
     reasoningEffort: cleanOptionalReasoningEffort(body.reasoningEffort),
+    permissionMode: provider === "claude" ? permissionMode : null,
     resumeSessionId,
     sessionId: resumeSessionId || (provider === "claude" ? crypto.randomUUID() : null),
   };
@@ -706,6 +728,13 @@ function cleanOptionalModel(value) {
     throw Object.assign(new Error("model is invalid"), { status: 400 });
   }
   return value;
+}
+
+function cleanProviderModel(provider, value) {
+  const model = cleanOptionalModel(value);
+  if (provider !== "claude") return model;
+  if (!model) return claudeDefaultModel;
+  return model;
 }
 
 function cleanOptionalProvider(value) {
@@ -729,6 +758,180 @@ function normalizeJobProvider(value) {
   return allowedJobProviders.has(value) ? value : "codex";
 }
 
+function listProviderSkills(provider) {
+  const roots = skillRoots(provider);
+  const skills = [];
+  const seen = new Set();
+
+  for (const root of roots) {
+    for (const file of findSkillFiles(root, 0, 10, [])) {
+      const skill = parseSkillFile(provider, root, file);
+      if (!skill || seen.has(skill.id)) continue;
+      seen.add(skill.id);
+      skills.push(skill);
+      if (skills.length >= maxSkillDiscoveryFiles) return sortSkills(skills);
+    }
+  }
+
+  return sortSkills(skills);
+}
+
+function skillRoots(provider) {
+  if (provider === "claude") {
+    return uniqueExistingDirectories([
+      ...splitPathList(process.env.CLAUDE_SKILL_DIRS),
+      path.join(claudeHome, "skills"),
+      path.join(claudeHome, "plugins", "cache"),
+    ]);
+  }
+
+  return uniqueExistingDirectories([
+    ...splitPathList(process.env.CODEX_SKILL_DIRS),
+    path.join(codexHome, "skills"),
+    path.join(codexHome, "plugins", "cache"),
+    path.join(codexHome, "superpowers"),
+    path.join(runHome, ".agents", "skills"),
+  ]);
+}
+
+function uniqueExistingDirectories(entries) {
+  const result = [];
+  const seen = new Set();
+  for (const entry of entries) {
+    if (!entry) continue;
+    const resolved = path.resolve(entry);
+    if (seen.has(resolved)) continue;
+    try {
+      if (!fs.statSync(resolved).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    seen.add(resolved);
+    result.push(resolved);
+  }
+  return result;
+}
+
+function findSkillFiles(root, depth, maxDepth, files) {
+  if (files.length >= maxSkillDiscoveryFiles || depth > maxDepth) return files;
+  let entries;
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return files;
+  }
+
+  for (const entry of entries) {
+    if (files.length >= maxSkillDiscoveryFiles) break;
+    if (entry.isSymbolicLink()) continue;
+    if (entry.name === "SKILL.md" && entry.isFile()) {
+      files.push(path.join(root, entry.name));
+      continue;
+    }
+    if (!entry.isDirectory()) continue;
+    if (entry.name === "node_modules" || entry.name === ".git" || entry.name === ".cursor" || entry.name === ".windsurf") continue;
+    findSkillFiles(path.join(root, entry.name), depth + 1, maxDepth, files);
+  }
+  return files;
+}
+
+function parseSkillFile(provider, root, file) {
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+
+  const frontmatter = raw.match(/^---\s*\n([\s\S]*?)\n---\s*(?:\n|$)/);
+  const fields = frontmatter ? parseFrontmatter(frontmatter[1]) : {};
+  const name = cleanSkillIdPart(cleanSkillMetadata(fields.name) || path.basename(path.dirname(file)));
+  if (!name) return null;
+  const description = cleanSkillMetadata(fields.description) || "";
+  const plugin = pluginNameForSkill(root, file);
+  const id = plugin ? `${plugin}:${name}` : name;
+  return {
+    id,
+    name,
+    title: titleize(name),
+    provider,
+    group: plugin ? titleize(plugin) : "Personal",
+    description,
+    file,
+  };
+}
+
+function parseFrontmatter(value) {
+  const fields = {};
+  for (const line of value.split(/\r?\n/)) {
+    const match = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+    if (!match) continue;
+    fields[match[1]] = unquoteYamlScalar(match[2]);
+  }
+  return fields;
+}
+
+function unquoteYamlScalar(value) {
+  const trimmed = value.trim();
+  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function cleanSkillMetadata(value) {
+  if (typeof value !== "string") return "";
+  return cleanApiText(value).replace(/\s+/g, " ").trim().slice(0, 1000);
+}
+
+function pluginNameForSkill(root, file) {
+  if (path.basename(root) === "skills") return "";
+  if (path.basename(root) === "superpowers") return "superpowers";
+
+  const segments = file.split(path.sep).filter(Boolean);
+  const cacheIndex = segments.lastIndexOf("cache");
+  if (cacheIndex >= 0 && segments.length > cacheIndex + 2) {
+    return cleanSkillIdPart(segments[cacheIndex + 2]);
+  }
+
+  const skillsIndex = segments.lastIndexOf("skills");
+  if (skillsIndex > 0) {
+    const parent = cleanSkillIdPart(segments[skillsIndex - 1]);
+    const rootName = cleanSkillIdPart(path.basename(root));
+    if (parent && rootName && parent !== rootName) return parent;
+  }
+
+  return "";
+}
+
+function cleanSkillIdPart(value) {
+  return String(value || "")
+    .trim()
+    .replace(/[^A-Za-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function titleize(value) {
+  return String(value || "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function sortSkills(skills) {
+  return skills.sort((left, right) => left.group.localeCompare(right.group) || left.title.localeCompare(right.title) || left.id.localeCompare(right.id));
+}
+
+function publicSkill(skill) {
+  return {
+    id: skill.id,
+    name: skill.name,
+    title: skill.title,
+    provider: skill.provider,
+    group: skill.group,
+    description: skill.description,
+  };
+}
+
 function cleanOptionalReasoningEffort(value) {
   if (value === undefined || value === null || value === "") return null;
   if (typeof value !== "string") {
@@ -739,6 +942,49 @@ function cleanOptionalReasoningEffort(value) {
     throw Object.assign(new Error("reasoningEffort must be low, medium, high, or xhigh"), { status: 400 });
   }
   return normalized;
+}
+
+function cleanOptionalClaudePermissionMode(value) {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value !== "string") {
+    throw Object.assign(new Error("permissionMode is invalid"), { status: 400 });
+  }
+  const cleaned = value.trim();
+  if (!allowedClaudePermissionModes.has(cleaned)) {
+    throw Object.assign(new Error("permissionMode must be a supported Claude permission mode"), { status: 400 });
+  }
+  return cleaned;
+}
+
+function cleanSelectedSkills(provider, value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    throw Object.assign(new Error("skills must be an array of skill ids"), { status: 400 });
+  }
+  if (value.length > maxJobSkills) {
+    throw Object.assign(new Error(`skills may include at most ${maxJobSkills} entries`), { status: 400 });
+  }
+
+  const available = new Map(listProviderSkills(provider).map((skill) => [skill.id, skill]));
+  const selected = [];
+  const seen = new Set();
+  for (const entry of value) {
+    if (typeof entry !== "string") {
+      throw Object.assign(new Error("skills must contain only skill ids"), { status: 400 });
+    }
+    const id = entry.trim();
+    if (!/^[A-Za-z0-9:_-]{1,160}$/.test(id)) {
+      throw Object.assign(new Error("skill id is invalid"), { status: 400 });
+    }
+    if (seen.has(id)) continue;
+    const skill = available.get(id);
+    if (!skill) {
+      throw Object.assign(new Error(`skill is not available for ${provider}: ${id}`), { status: 400 });
+    }
+    seen.add(id);
+    selected.push(skill);
+  }
+  return selected;
 }
 
 function saveJobAttachments(jobId, attachments) {
@@ -816,6 +1062,30 @@ function promptWithAttachments(prompt, attachments) {
     .map((attachment, index) => `${index + 1}. ${attachment.filename} (${attachment.contentType}, ${attachment.bytes} bytes): ${attachment.path}`)
     .join("\n");
   return `${prompt.trimEnd()}\n\nAttached files from the phone are saved on this runner. Use these local paths when inspecting them:\n${manifest}`;
+}
+
+function promptWithSelectedSkills(prompt, provider, skills) {
+  if (!skills.length) return prompt;
+  const label = provider === "claude" ? "Claude" : "Codex";
+  const blocks = skills
+    .map((skill) => {
+      const body = boundedSkillBody(skill.file);
+      return `## ${skill.id}\n\n${body}`;
+    })
+    .join("\n\n---\n\n");
+  return `Selected ${label} skills are included below. Follow these SKILL.md instructions when they are relevant to the task.\n\n${blocks}\n\nUser task:\n${prompt}`;
+}
+
+function boundedSkillBody(file) {
+  let text;
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch {
+    return "";
+  }
+  const cleaned = cleanApiText(text).trim();
+  if (Buffer.byteLength(cleaned, "utf8") <= maxSkillPromptBytes) return cleaned;
+  return `${prefixByBytes(cleaned, maxSkillPromptBytes).trimEnd()}\n\n[Skill truncated by server prompt budget.]`;
 }
 
 function cleanOptionalSessionId(value) {
@@ -1378,7 +1648,12 @@ function isInjectedContextMessage(text) {
 }
 
 function stripSkillInstructionPrefix(text) {
-  return text.replace(/^Use these Codex skills for this task: [^.]+[.]\s*/i, "");
+  return text
+    .replace(/^Use these (Codex|Claude) skills for this task: [^.]+[.]\s*/i, "")
+    .replace(
+      /^Selected (Codex|Claude) skills are included below[.]\s*Follow these SKILL[.]md instructions when they are relevant to the task[.]\s+[\s\S]*?\s+User task:\s*/i,
+      "",
+    );
 }
 
 function boundedThreadText(value) {
@@ -1667,6 +1942,7 @@ function buildClaudeArgs(job) {
   if (dangerousMode) args.push("--dangerously-skip-permissions");
   if (job.model) args.push("--model", job.model);
   if (job.reasoningEffort) args.push("--effort", job.reasoningEffort);
+  if (job.permissionMode) args.push("--permission-mode", job.permissionMode);
   if (job.resumeSessionId) {
     args.push("--resume", job.resumeSessionId);
   } else {
@@ -1697,7 +1973,10 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
 
   const finishedAt = nowIso();
   const stderrText = cleanApiText(stderr).trim();
-  const resultText = job.provider === "claude" ? stdout : await readTextFileBounded(job.resultPath, maxOutputBytes);
+  const resultText =
+    job.provider === "claude"
+      ? await readTextFileBounded(job.stdoutPath, maxOutputBytes)
+      : await readTextFileBounded(job.resultPath, maxOutputBytes);
   const cleanResult = cleanAssistantResult(resultText).trim();
 
   job.updatedAt = finishedAt;
@@ -1870,6 +2149,8 @@ async function toJobResponse(job, shape = responseShape("preview")) {
     certSubject: job.certSubject,
     model: job.model || null,
     reasoningEffort: job.reasoningEffort || null,
+    permissionMode: job.permissionMode || null,
+    skills: Array.isArray(job.skills) ? job.skills : [],
     resumeSessionId: job.resumeSessionId || null,
     sessionId: job.sessionId || job.resumeSessionId || null,
   };

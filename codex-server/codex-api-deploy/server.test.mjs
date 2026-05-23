@@ -183,6 +183,25 @@ async function makeFakeCodex(tmpDir) {
   return fakeCodex;
 }
 
+async function makeSkill(root, dirname, { name = dirname, description = "Use when testing dynamic skills.", body = "Follow this test skill." } = {}) {
+  const skillDir = path.join(root, dirname);
+  await fs.mkdir(skillDir, { recursive: true });
+  await fs.writeFile(
+    path.join(skillDir, "SKILL.md"),
+    [
+      "---",
+      `name: ${name}`,
+      `description: ${description}`,
+      "---",
+      "",
+      `# ${name}`,
+      "",
+      body,
+      "",
+    ].join("\n"),
+  );
+}
+
 async function makeCacheWritingCodex(tmpDir) {
   const fakeCodex = path.join(tmpDir, "fake-codex-cache");
   await fs.writeFile(
@@ -728,6 +747,52 @@ test("proxies authenticated Codex routes to a configured remote API for local br
   }
 });
 
+test("lists provider-specific skills discovered from runner homes", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const codexHome = path.join(tmpDir, "codex-home");
+  const claudeHome = path.join(tmpDir, "claude-home");
+  await makeSkill(path.join(codexHome, "skills"), "codex-review", {
+    description: "Use when Codex should review a change.",
+    body: "Codex review process.",
+  });
+  await makeSkill(path.join(codexHome, "superpowers", "skills"), "brainstorming", {
+    description: "Use when exploring product direction before coding.",
+    body: "Brainstorm first.",
+  });
+  await makeSkill(path.join(claudeHome, "skills"), "claude-debug", {
+    description: "Use when Claude should debug a failure.",
+    body: "Claude debug process.",
+  });
+
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_RUN_HOME: path.join(tmpDir, "run-home"),
+    CODEX_HOME: codexHome,
+    CLAUDE_HOME: claudeHome,
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: tmpDir }]),
+    CODEX_BIN: await makeFakeCodex(tmpDir),
+  });
+
+  try {
+    const codexSkills = await fetch(`${server.baseUrl}/v1/codex/skills?provider=codex`);
+    assert.equal(codexSkills.status, 200);
+    const codexBody = await codexSkills.json();
+    assert.deepEqual(codexBody.skills.map((skill) => skill.id), ["codex-review", "superpowers:brainstorming"]);
+    assert.equal(codexBody.skills[0].provider, "codex");
+    assert.equal(codexBody.skills[0].description, "Use when Codex should review a change.");
+    assert.equal(codexBody.skills[0].path, undefined);
+
+    const claudeSkills = await fetch(`${server.baseUrl}/v1/codex/skills?provider=claude`);
+    assert.equal(claudeSkills.status, 200);
+    const claudeBody = await claudeSkills.json();
+    assert.deepEqual(claudeBody.skills.map((skill) => skill.id), ["claude-debug"]);
+    assert.equal(claudeBody.skills[0].provider, "claude");
+  } finally {
+    await server.stop();
+  }
+});
+
 test("resumes only sessions that belong to the selected workspace", async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
   const workspaceDir = path.join(tmpDir, "scratch");
@@ -882,6 +947,59 @@ test("creates an async job in a registered workspace and persists output", async
     const jobs = await fetch(`${server.baseUrl}/v1/codex/jobs?limit=10`);
     assert.equal(jobs.status, 200);
     assert.equal((await jobs.json()).jobs[0].id, created.id);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("injects selected provider skills into the runner prompt and rejects unknown skills", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  const codexHome = path.join(tmpDir, "codex-home");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  await makeSkill(path.join(codexHome, "skills"), "human-code-review", {
+    description: "Use when review comments should sound human.",
+    body: "Rewrite review comments with a natural engineering tone.",
+  });
+
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_HOME: codexHome,
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_BIN: await makeFakeCodex(tmpDir),
+  });
+
+  try {
+    const blocked = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspaceId: "scratch", prompt: "audit this", skills: ["not-installed"], timeoutMs: 5000 }),
+    });
+    assert.equal(blocked.status, 400);
+    assert.match(await blocked.text(), /skill is not available/);
+
+    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: "scratch",
+        prompt: "audit this",
+        skills: ["human-code-review"],
+        timeoutMs: 5000,
+      }),
+    });
+    assert.equal(create.status, 202);
+    const created = await create.json();
+    assert.deepEqual(created.skills, ["human-code-review"]);
+
+    const job = await waitForJob(server.baseUrl, created.id);
+    assert.equal(job.status, "succeeded");
+    assert.deepEqual(job.skills, ["human-code-review"]);
+    assert.match(job.result, /Selected Codex skills/);
+    assert.match(job.result, /human-code-review/);
+    assert.match(job.result, /Rewrite review comments with a natural engineering tone/);
+    assert.match(job.result, /User task:\naudit this/);
   } finally {
     await server.stop();
   }
@@ -1192,6 +1310,7 @@ test("persists providers and filters jobs, sessions, and threads by provider", a
     assert.equal(claudeCreate.status, 202);
     const claudeJob = await claudeCreate.json();
     assert.equal(claudeJob.provider, "claude");
+    assert.equal(claudeJob.model, "sonnet");
     assert.match(claudeJob.sessionId, /^[a-f0-9-]{36}$/);
 
     const finishedCodexJob = await waitForJob(server.baseUrl, codexJob.id);
@@ -1200,6 +1319,7 @@ test("persists providers and filters jobs, sessions, and threads by provider", a
     const finishedClaudeJob = await waitForJob(server.baseUrl, claudeJob.id);
     assert.equal(finishedClaudeJob.status, "succeeded");
     assert.equal(finishedClaudeJob.provider, "claude");
+    assert.match(finishedClaudeJob.stdout, /--model\] \[sonnet\]/);
 
     const claudeJobs = await fetch(`${server.baseUrl}/v1/codex/jobs?provider=claude&limit=20`);
     assert.equal(claudeJobs.status, 200);
@@ -1251,8 +1371,9 @@ test("runs Claude jobs with configured binary, stdin prompt, and stdout result",
         workspaceId: "scratch",
         provider: "claude",
         prompt: "explain the run",
-        model: "claude-sonnet-4-5",
+        model: "sonnet",
         reasoningEffort: "high",
+        permissionMode: "plan",
         timeoutMs: 5000,
       }),
     });
@@ -1265,7 +1386,8 @@ test("runs Claude jobs with configured binary, stdin prompt, and stdout result",
     assert.equal(job.status, "succeeded");
     assert.equal(job.provider, "claude");
     assert.equal(job.sessionId, created.sessionId);
-    assert.match(job.stdout, new RegExp(`claude args: .*\\[--print\\].*\\[--dangerously-skip-permissions\\].*\\[--model\\] \\[claude-sonnet-4-5\\].*\\[--effort\\] \\[high\\].*\\[--session-id\\] \\[${created.sessionId}\\]`));
+    assert.equal(job.permissionMode, "plan");
+    assert.match(job.stdout, new RegExp(`claude args: .*\\[--print\\].*\\[--dangerously-skip-permissions\\].*\\[--model\\] \\[sonnet\\].*\\[--effort\\] \\[high\\].*\\[--permission-mode\\] \\[plan\\].*\\[--session-id\\] \\[${created.sessionId}\\]`));
     assert.match(job.stdout, new RegExp(`claude cwd:${realWorkspaceDir}`));
     assert.match(job.stdout, /claude prompt:explain the run/);
     assert.equal(job.result, job.stdout.trim());
