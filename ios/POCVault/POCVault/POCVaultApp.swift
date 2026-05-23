@@ -23,29 +23,19 @@ struct POCVaultApp: App {
             baseURL: AppConfiguration.codexBaseURL,
             identityStore: identityStore
         )
-        let codexViewModel = CodexConsoleViewModel(
-            client: codexClient,
-            provider: .codex,
-            completionNotifier: codexNotificationService
-        )
-        let claudeViewModel = CodexConsoleViewModel(
-            client: codexClient,
-            provider: .claude,
-            completionNotifier: codexNotificationService
-        )
-        codexNotificationService.setReplyHandler { reply in
-            switch reply.provider {
-            case .codex:
-                _ = await codexViewModel.createNotificationReply(reply)
-            case .claude:
-                _ = await claudeViewModel.createNotificationReply(reply)
-            }
-        }
 
         _identityStore = StateObject(wrappedValue: identityStore)
         _libraryViewModel = StateObject(wrappedValue: LibraryViewModel(client: manifestClient))
-        _codexViewModel = StateObject(wrappedValue: codexViewModel)
-        _claudeViewModel = StateObject(wrappedValue: claudeViewModel)
+        _codexViewModel = StateObject(wrappedValue: CodexConsoleViewModel(
+            client: codexClient,
+            provider: .codex,
+            completionNotifier: codexNotificationService
+        ))
+        _claudeViewModel = StateObject(wrappedValue: CodexConsoleViewModel(
+            client: codexClient,
+            provider: .claude,
+            completionNotifier: codexNotificationService
+        ))
         self.manifestClient = manifestClient
         self.codexNotificationService = codexNotificationService
     }
@@ -164,8 +154,8 @@ private struct CodexStatusView: View {
                         }
                     }
                     .pickerStyle(.segmented)
-                    .padding(.horizontal, AppTheme.screenHorizontalPadding)
-                    .padding(.top, AppTheme.screenTopPadding)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 16)
                     .padding(.bottom, 12)
 
                     switch selectedSection {
@@ -174,29 +164,21 @@ private struct CodexStatusView: View {
                             VStack(alignment: .leading, spacing: 18) {
                                 VStack(alignment: .leading, spacing: 6) {
                                     Text("Activity")
-                                        .font(AppTheme.screenTitleFont)
+                                        .font(.title2.weight(.semibold))
                                         .foregroundStyle(AppTheme.textPrimary)
                                     Text(summaryText)
-                                        .font(AppTheme.bodyFont)
+                                        .font(.subheadline.weight(.medium))
                                         .foregroundStyle(AppTheme.textSecondary)
                                 }
 
-                                if activityItems.isEmpty {
-                                    StatusEmptyState(
-                                        symbol: "waveform.path.ecg",
-                                        title: "No recent activity",
-                                        message: "Runs from Codex and Claude will collect here after the first thread starts."
-                                    )
-                                } else {
-                                    VStack(spacing: 10) {
-                                        ForEach(Array(activityItems.prefix(24))) { activityItem in
-                                            CodexActivityRow(provider: activityItem.provider, item: activityItem.item)
-                                        }
+                                VStack(spacing: 10) {
+                                    ForEach(Array(activityItems.prefix(24))) { activityItem in
+                                        CodexActivityRow(provider: activityItem.provider, item: activityItem.item)
                                     }
                                 }
                             }
-                            .padding(.horizontal, AppTheme.screenHorizontalPadding)
-                            .padding(.bottom, AppTheme.tabBarClearance)
+                            .padding(.horizontal, 20)
+                            .padding(.bottom, 110)
                         }
                         .scrollDismissesKeyboard(.interactively)
                     case .health:
@@ -263,34 +245,6 @@ private enum StatusSection: String, CaseIterable, Identifiable {
             return "Activity"
         case .health:
             return "Health"
-        }
-    }
-}
-
-private struct StatusEmptyState: View {
-    let symbol: String
-    let title: String
-    let message: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Image(systemName: symbol)
-                .font(.title2.weight(.semibold))
-                .foregroundStyle(AppTheme.accent)
-            Text(title)
-                .font(AppTheme.cardTitleFont)
-                .foregroundStyle(AppTheme.textPrimary)
-            Text(message)
-                .font(AppTheme.bodyFont)
-                .foregroundStyle(AppTheme.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(AppTheme.cardPadding)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: AppTheme.cardRadius, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: AppTheme.cardRadius, style: .continuous)
-                .stroke(AppTheme.strokeSubtle, lineWidth: 1)
         }
     }
 }
@@ -362,9 +316,9 @@ private struct CodexActivityRow: View {
             .lineLimit(1)
         }
         .padding(14)
-        .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: AppTheme.compactRadius, style: .continuous))
+        .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: AppTheme.compactRadius, style: .continuous)
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .stroke(AppTheme.strokeSubtle, lineWidth: 1)
         }
     }
@@ -405,23 +359,6 @@ enum AppTheme {
     static let statusError = Color(red: 0.78, green: 0.45, blue: 0.43)
     static let statusInfo = Color(red: 0.58, green: 0.64, blue: 0.72)
     static let statusNeutral = Color.white.opacity(0.46)
-
-    static let screenHorizontalPadding: CGFloat = 20
-    static let screenTopPadding: CGFloat = 14
-    static let tabBarClearance: CGFloat = 126
-    static let cardPadding: CGFloat = 16
-    static let cardRadius: CGFloat = 16
-    static let compactRadius: CGFloat = 14
-    static let controlRadius: CGFloat = 12
-    static let iconButtonSize: CGFloat = 36
-    static let touchTargetSize: CGFloat = 44
-
-    static let screenTitleFont = Font.system(size: 28, weight: .semibold)
-    static let panelTitleFont = Font.title2.weight(.semibold)
-    static let sectionLabelFont = Font.caption.weight(.bold)
-    static let bodyFont = Font.subheadline.weight(.medium)
-    static let cardTitleFont = Font.subheadline.weight(.semibold)
-    static let captionFont = Font.caption.weight(.medium)
 }
 
 enum AppConfiguration {

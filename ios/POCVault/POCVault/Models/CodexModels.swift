@@ -1007,34 +1007,6 @@ enum CodexRunMode: String, CaseIterable, Identifiable, Codable {
     }
 }
 
-enum ClaudePermissionMode: String, CaseIterable, Identifiable, Codable {
-    case acceptEdits
-    case auto
-    case bypassPermissions
-    case defaultMode = "default"
-    case dontAsk
-    case plan
-
-    var id: String { rawValue }
-
-    var label: String {
-        switch self {
-        case .acceptEdits:
-            return "Accept Edits"
-        case .auto:
-            return "Auto"
-        case .bypassPermissions:
-            return "Bypass"
-        case .defaultMode:
-            return "Default"
-        case .dontAsk:
-            return "Don't Ask"
-        case .plan:
-            return "Plan"
-        }
-    }
-}
-
 enum CodexDisplayLimits {
     static let answerCharacters = 24_000
     static let promptCharacters = 12_000
@@ -1092,8 +1064,6 @@ struct CodexJob: Decodable, Hashable, Identifiable {
     let certSubject: String?
     let model: String?
     let reasoningEffort: String?
-    let permissionMode: String?
-    let skills: [String]
     let logsIncluded: String?
     let sessionId: String?
     let resumeSessionId: String?
@@ -1135,8 +1105,6 @@ struct CodexJob: Decodable, Hashable, Identifiable {
         case certSubject
         case model
         case reasoningEffort
-        case permissionMode
-        case skills
         case logsIncluded
         case sessionId
         case resumeSessionId
@@ -1196,8 +1164,6 @@ struct CodexJob: Decodable, Hashable, Identifiable {
         self.certSubject = try container.decodeLooseStringIfPresent(forKey: .certSubject)
         self.model = try container.decodeLooseStringIfPresent(forKey: .model)
         self.reasoningEffort = try container.decodeLooseStringIfPresent(forKey: .reasoningEffort)
-        self.permissionMode = try container.decodeLooseStringIfPresent(forKey: .permissionMode)
-        self.skills = (try? container.decode([String].self, forKey: .skills)) ?? []
         self.logsIncluded = try container.decodeLooseStringIfPresent(forKey: .logsIncluded)
         self.sessionId = try container.decodeLooseStringIfPresent(forKey: .sessionId)
         let resumeSessionID = try container.decodeLooseStringIfPresent(forKey: .resumeSessionId)
@@ -1352,84 +1318,6 @@ struct CodexJobAttachmentReference: Decodable, Hashable, Identifiable {
     }
 }
 
-struct CodexSkill: Decodable, Hashable, Identifiable {
-    let id: String
-    let name: String?
-    let title: String
-    let provider: CodexProvider?
-    let group: String
-    let summary: String
-
-    enum CodingKeys: String, CodingKey {
-        case id
-        case name
-        case title
-        case provider
-        case group
-        case summary
-        case description
-    }
-
-    init(
-        id: String,
-        name: String? = nil,
-        title: String? = nil,
-        provider: CodexProvider? = nil,
-        group: String = "Skills",
-        summary: String = ""
-    ) {
-        self.id = id
-        self.name = name
-        self.title = title?.trimmedNonEmpty ?? Self.titleize(name ?? id)
-        self.provider = provider
-        self.group = group.trimmedNonEmpty ?? "Skills"
-        self.summary = summary
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        let decodedID = try container.decodeLooseStringIfPresent(forKey: .id)
-        let decodedName = try container.decodeLooseStringIfPresent(forKey: .name)
-        guard let id = decodedID ?? decodedName else {
-            throw DecodingError.dataCorrupted(
-                DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Skill is missing an id.")
-            )
-        }
-
-        let title = try container.decodeLooseStringIfPresent(forKey: .title)
-        let group = try container.decodeLooseStringIfPresent(forKey: .group)
-        let summary = try container.decodeLooseStringIfPresent(forKey: .summary)
-        let description = try container.decodeLooseStringIfPresent(forKey: .description)
-
-        self.id = id
-        self.name = decodedName
-        self.title = title ?? Self.titleize(decodedName ?? id)
-        self.provider = try container.decodeIfPresent(CodexProvider.self, forKey: .provider)
-        self.group = group ?? "Skills"
-        self.summary = summary ?? description ?? ""
-    }
-
-    var searchText: String {
-        "\(id) \(name ?? "") \(title) \(group) \(summary)".lowercased()
-    }
-
-    var chipLabel: String {
-        title.trimmedNonEmpty ?? Self.titleize(name ?? id)
-    }
-
-    private static func titleize(_ value: String) -> String {
-        value
-            .replacingOccurrences(of: ":", with: " ")
-            .replacingOccurrences(of: "-", with: " ")
-            .replacingOccurrences(of: "_", with: " ")
-            .split(separator: " ")
-            .map { word in
-                word.prefix(1).uppercased() + String(word.dropFirst())
-            }
-            .joined(separator: " ")
-    }
-}
-
 struct CodexJobAttachment: Encodable, Hashable, Identifiable {
     let id: UUID
     let filename: String
@@ -1474,9 +1362,7 @@ struct CodexCreateJobRequest: Encodable {
     let timeoutMs: Int?
     let model: String?
     let reasoningEffort: String?
-    let permissionMode: ClaudePermissionMode?
     let provider: CodexProvider
-    let skills: [String]?
     let attachments: [CodexJobAttachment]?
     let resumeSessionId: String?
 
@@ -1487,8 +1373,6 @@ struct CodexCreateJobRequest: Encodable {
         model: String? = nil,
         reasoningEffort: String? = nil,
         provider: CodexProvider = .defaultProvider,
-        permissionMode: ClaudePermissionMode? = nil,
-        skills: [String] = [],
         attachments: [CodexJobAttachment] = [],
         resumeSessionId: String? = nil
     ) {
@@ -1497,9 +1381,7 @@ struct CodexCreateJobRequest: Encodable {
         self.timeoutMs = timeoutMs
         self.model = model
         self.reasoningEffort = reasoningEffort
-        self.permissionMode = permissionMode
         self.provider = provider
-        self.skills = skills.isEmpty ? nil : skills
         self.attachments = attachments.isEmpty ? nil : attachments
         self.resumeSessionId = resumeSessionId
     }

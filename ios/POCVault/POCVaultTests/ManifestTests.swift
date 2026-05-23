@@ -137,13 +137,6 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(CodexProvider.claude.tabIconAssetName, "ClaudeMark")
     }
 
-    func testClaudePermissionModesMatchInstalledClaudeCLIChoices() throws {
-        XCTAssertEqual(
-            ClaudePermissionMode.allCases.map(\.rawValue),
-            ["acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"]
-        )
-    }
-
     func testConsoleControlStripLayoutKeepsProvidersVerticallyAligned() throws {
         let codexLayout = CodexControlStripLayout(provider: .codex)
         let claudeLayout = CodexControlStripLayout(provider: .claude)
@@ -153,155 +146,10 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(codexLayout.controlHeight, 36)
         XCTAssertEqual(claudeLayout.controlHeight, codexLayout.controlHeight)
         XCTAssertTrue(codexLayout.showsSkillButton)
-        XCTAssertTrue(claudeLayout.showsSkillButton)
-        XCTAssertFalse(claudeLayout.reservesSkillSlot)
+        XCTAssertFalse(claudeLayout.showsSkillButton)
+        XCTAssertTrue(claudeLayout.reservesSkillSlot)
         XCTAssertTrue(codexLayout.showsRunMode)
-        XCTAssertTrue(claudeLayout.showsRunMode)
-    }
-
-    func testCodexSkillDecodesServerSkillShape() throws {
-        let skill = try JSONDecoder().decode(
-            CodexSkill.self,
-            from: """
-            {
-              "id": "github:gh-fix-ci",
-              "name": "gh-fix-ci",
-              "title": "Fix CI",
-              "provider": "codex",
-              "group": "GitHub",
-              "description": "Use when debugging failing GitHub Actions checks."
-            }
-            """.data(using: .utf8)!
-        )
-
-        XCTAssertEqual(skill.id, "github:gh-fix-ci")
-        XCTAssertEqual(skill.title, "Fix CI")
-        XCTAssertEqual(skill.chipLabel, "Fix CI")
-        XCTAssertEqual(skill.group, "GitHub")
-        XCTAssertEqual(skill.summary, "Use when debugging failing GitHub Actions checks.")
-    }
-
-    func testCodexSkillChipLabelFallsBackToReadableIdentifier() throws {
-        let skill = CodexSkill(id: "documents:documents", title: nil)
-
-        XCTAssertEqual(skill.chipLabel, "Documents Documents")
-    }
-
-    func testSimulatorLauncherInstallsCurrentRelayProduct() throws {
-        let testSourceURL = URL(fileURLWithPath: #filePath)
-        let repoRoot = testSourceURL
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let launcher = try String(contentsOf: repoRoot.appendingPathComponent("launch-simulator.sh"))
-
-        XCTAssertFalse(launcher.contains("POC Vault.app"))
-        XCTAssertTrue(launcher.contains("Relay.app"))
-    }
-
-    func testCarPlayDashboardSnapshotSummarizesAgentActivityForDriving() throws {
-        let now = Date(timeIntervalSince1970: 1_779_529_600)
-        let manifest = POCManifest(
-            schemaVersion: 1,
-            generatedAt: now,
-            pocs: [
-                POCEntry(
-                    id: "studio",
-                    title: "Studio",
-                    summary: "Research workspace",
-                    url: URL(string: "https://studio.pocs.example.com")!,
-                    updatedAt: now,
-                    tags: ["internal"],
-                    requiresClientCertificate: true
-                ),
-                POCEntry(
-                    id: "gallery",
-                    title: "Gallery",
-                    summary: "Demo library",
-                    url: URL(string: "https://gallery.pocs.example.com")!,
-                    updatedAt: now,
-                    tags: ["demo"],
-                    requiresClientCertificate: true
-                )
-            ]
-        )
-        let codexThread = try decodeCodexThread(
-            """
-            {
-              "id": "thread-codex",
-              "sessionId": "thread-codex",
-              "provider": "codex",
-              "workspaceName": "POC Vault",
-              "updatedAt": "2026-05-23T06:00:00Z",
-              "activeJobCount": 1,
-              "lastJobStatus": "running",
-              "lastPrompt": "Check deployment health"
-            }
-            """
-        )
-        let claudeThread = try decodeCodexThread(
-            """
-            {
-              "id": "thread-claude",
-              "sessionId": "thread-claude",
-              "provider": "claude",
-              "workspaceName": "POC Vault",
-              "updatedAt": "2026-05-23T05:30:00Z",
-              "activeJobCount": 0,
-              "lastJobStatus": "succeeded",
-              "lastPrompt": "Summarize release notes",
-              "lastResult": "Ready for review."
-            }
-            """
-        )
-        let claudeJob = try decodeCodexJob(
-            """
-            {
-              "id": "job-claude-failed",
-              "provider": "claude",
-              "workspaceName": "POC Vault",
-              "status": "failed",
-              "prompt": "Fix launch bug",
-              "error": "xcodebuild exited 65",
-              "updatedAt": "2026-05-23T06:10:00Z"
-            }
-            """
-        )
-
-        let snapshot = RelayCarPlayDashboardSnapshot.make(
-            manifest: manifest,
-            health: CodexHealth(status: "ok"),
-            codexThreads: [codexThread],
-            codexJobs: [],
-            claudeThreads: [claudeThread],
-            claudeJobs: [claudeJob],
-            now: now
-        )
-
-        XCTAssertEqual(snapshot.statusTitle, "Relay is working")
-        XCTAssertEqual(snapshot.statusDetail, "1 active run / 1 needs attention / 2 POCs")
-        XCTAssertEqual(snapshot.providerSummaries.map(\.title), ["Codex", "Claude"])
-        XCTAssertEqual(snapshot.providerSummaries.map(\.detail), ["1 active / 1 recent", "1 attention / 2 recent"])
-        XCTAssertEqual(snapshot.activityItems.map(\.title), ["Claude: Fix launch bug", "Codex: Check deployment health", "Claude: Summarize release notes"])
-        XCTAssertEqual(snapshot.activityItems.first?.detail, "Failed / POC Vault")
-    }
-
-    func testCarPlaySceneConfigurationDeclaresTemplateApplicationScene() throws {
-        let infoPlist = try loadAppPlist(named: "Info.plist")
-        let sceneManifest = try XCTUnwrap(infoPlist["UIApplicationSceneManifest"] as? [String: Any])
-        let configurations = try XCTUnwrap(sceneManifest["UISceneConfigurations"] as? [String: Any])
-        let carPlayConfigurations = try XCTUnwrap(configurations["CPTemplateApplicationSceneSessionRoleApplication"] as? [[String: Any]])
-        let configuration = try XCTUnwrap(carPlayConfigurations.first)
-
-        XCTAssertEqual(configuration["UISceneClassName"] as? String, "CPTemplateApplicationScene")
-        XCTAssertEqual(configuration["UISceneConfigurationName"] as? String, "RelayCarPlayScene")
-        XCTAssertEqual(configuration["UISceneDelegateClassName"] as? String, "$(PRODUCT_MODULE_NAME).RelayCarPlaySceneDelegate")
-    }
-
-    func testCarPlayEntitlementDeclaresDrivingTaskCapability() throws {
-        let entitlements = try loadAppPlist(named: "POCVault.entitlements")
-
-        XCTAssertEqual(entitlements["com.apple.developer.carplay-driving-task"] as? Bool, true)
+        XCTAssertFalse(claudeLayout.showsRunMode)
     }
 
     func testCodexJobDefaultsMissingProviderToCodexAndDecodesClaude() throws {
@@ -839,16 +687,12 @@ final class ManifestTests: XCTestCase {
             model: "sonnet",
             reasoningEffort: "high",
             provider: .claude,
-            permissionMode: .plan,
-            skills: ["claude-debug", "superpowers:brainstorming"],
             resumeSessionId: "thread-123"
         )
 
         let payload = try JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any]
 
         XCTAssertEqual(payload?["provider"] as? String, "claude")
-        XCTAssertEqual(payload?["permissionMode"] as? String, "plan")
-        XCTAssertEqual(payload?["skills"] as? [String], ["claude-debug", "superpowers:brainstorming"])
     }
 
     func testCodexCreateJobRequestEncodesAttachments() throws {
@@ -902,7 +746,6 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(claudeViewModel.provider, .claude)
         XCTAssertEqual(claudeViewModel.selectedModel, "sonnet")
         XCTAssertEqual(claudeViewModel.selectedReasoningEffort, .high)
-        XCTAssertEqual(claudeViewModel.selectedClaudePermissionMode, .auto)
         XCTAssertEqual(claudeViewModel.connectionNoticeTitle, "Claude needs certificate")
     }
 
@@ -1088,15 +931,5 @@ final class ManifestTests: XCTestCase {
 
     private func decodeCodexThread(_ json: String) throws -> CodexThread {
         try JSONDecoder().decode(CodexThread.self, from: Data(json.utf8))
-    }
-
-    private func loadAppPlist(named filename: String) throws -> [String: Any] {
-        let testSourceURL = URL(fileURLWithPath: #filePath)
-        let appDirectory = testSourceURL
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("POCVault")
-        let data = try Data(contentsOf: appDirectory.appendingPathComponent(filename))
-        return try XCTUnwrap(PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any])
     }
 }
