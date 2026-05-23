@@ -5,6 +5,9 @@ POC hosting, the iOS shell, and the EC2 Codex runner. It is meant to help a new
 reviewer understand what has been built without reading every Swift, Node, and
 ops file first.
 
+For a chronological account of how the repo reached this shape, read
+[docs/PROJECT_HISTORY.md](PROJECT_HISTORY.md).
+
 ## System Summary
 
 POC Vault is a private iPhone-first system for browsing static AI-generated
@@ -63,8 +66,8 @@ server from `ios/launch-simulator.sh`.
 
 ## Codex Console UX
 
-The Codex tab has moved from a job-list surface to a thread-oriented operator
-console:
+The Codex tab has moved from a job-list surface to a prompt-first,
+thread-oriented operator console:
 
 - The compose panel starts a new thread or continues a selected thread.
 - The thread feed merges EC2-native sessions with the latest persisted job
@@ -72,7 +75,8 @@ console:
 - Smoke-test threads are hidden from the main feed by default.
 - Jobs that are still starting appear as pending feed rows until a session file
   is discovered.
-- The thread picker supports search and can reveal smoke tests when needed.
+- The internal thread browser supports search and can reveal smoke tests when
+  needed, while the main screen stays focused on prompt composition and results.
 - Thread titles are derived from prompt/result/error content, with special
   handling for GitHub pull request URLs.
 - Raw job activity previews now favor the latest log tail so active failures
@@ -80,9 +84,10 @@ console:
 - Thread detail opens on a bounded latest-answer preview and can expand/load the
   latest job detail when the user wants the full answer.
 
-The compose controls support model selection, reasoning effort selection, and a
-searchable skill picker. Selected skills are applied client-side by prefixing
-the outgoing prompt; this does not change the server API contract.
+The compose controls support provider, model, effort/reasoning, attachments,
+voice transcription, and a searchable Codex skill picker. Selected skills are
+applied client-side by prefixing the outgoing prompt; this does not change the
+server API contract.
 
 ## Phone Voice Prompts
 
@@ -114,9 +119,11 @@ Current authenticated API surface:
 ```text
 GET  /v1/codex/health
 GET  /v1/codex/workspaces
-GET  /v1/codex/sessions?workspaceId=<id>&limit=<n>
-GET  /v1/codex/threads?workspaceId=<id>&limit=<n>
-GET  /v1/codex/jobs?limit=<n>
+GET  /v1/codex/ui
+GET  /v1/codex/sessions?workspaceId=<id>&provider=<provider>&limit=<n>
+GET  /v1/codex/threads?workspaceId=<id>&provider=<provider>&limit=<n>
+GET  /v1/codex/threads/<sessionId>?provider=<provider>
+GET  /v1/codex/jobs?provider=<provider>&limit=<n>
 POST /v1/codex/jobs
 GET  /v1/codex/jobs/<id>
 POST /v1/codex/jobs/<id>/cancel
@@ -133,20 +140,36 @@ Job execution behavior:
   `/var/lib/codex-api/logs`.
 - Running jobs are marked failed on service restart so they do not stay stuck.
 - Jobs run only in registered workspaces from `CODEX_WORKSPACES`.
+- Jobs support `provider=codex` and `provider=claude`; omitted provider
+  defaults to `codex`.
 - `resumeSessionId` is accepted only when the session exists in `CODEX_HOME`
-  and belongs to the selected workspace.
+  or persisted provider metadata, matches the selected provider, and belongs to
+  the selected workspace.
 - The server records the discovered session id when a new Codex session appears
-  after job completion.
+  after job completion. Fresh Claude jobs receive a generated session id before
+  execution.
 
 Thread summary behavior:
 
 - `/v1/codex/sessions` remains metadata-only.
 - `/v1/codex/threads` combines session files and persisted job metadata.
+- `/v1/codex/threads/<sessionId>` returns one bounded thread transcript plus
+  compact job previews.
+- Threads are provider-locked. A Claude thread cannot be resumed by a Codex job,
+  and a Codex thread cannot be resumed by a Claude job.
 - When no job summary exists, the server reads bounded prompt/answer previews
   from the Codex session JSONL file.
 - Injected context messages, such as AGENTS/environment preambles, are skipped
   before selecting a human-readable prompt summary.
 - Skill instruction prefixes are stripped from thread summaries.
+
+Browser review behavior:
+
+- `/v1/codex/ui` serves an authenticated no-dependency browser UI for reviewing
+  recent threads and intentionally opening full logs.
+- Local browser tooling that cannot present a client certificate can use the
+  Node proxy settings `CODEX_PROXY_BASE_URL`, `CODEX_PROXY_CLIENT_CERT`, and
+  `CODEX_PROXY_CLIENT_KEY`.
 
 Output preview behavior:
 
@@ -180,8 +203,15 @@ service-unavailable response instead of silently accepting audio.
 ## Security Model
 
 The live perimeter is certificate-based mTLS, not hardware-bound iPhone-only
-access. The Codex API subject allowlist is configured per install with
-`CODEX_ALLOWED_CERT_SUBJECTS`, for example:
+access. The current live Codex API allowlist should stay exactly:
+
+```text
+CN=iphone
+CN=parikshit-mac
+```
+
+New installs configure their own allowlist with `CODEX_ALLOWED_CERT_SUBJECTS`,
+for example:
 
 ```text
 CN=iphone

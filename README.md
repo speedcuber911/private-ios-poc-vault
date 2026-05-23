@@ -23,7 +23,7 @@ The project has three core ideas:
 | Native iOS shell | SwiftUI app loads the signed manifest, presents a private POC library, and opens demos in an authenticated `WKWebView`. |
 | One-command deploys | `ops/deploy-poc` validates, stages, signs, logs, rsyncs, and promotes POCs to the VM. |
 | Local simulator mode | Simulator builds use a local signed vault on `127.0.0.1:8787` instead of production mTLS. |
-| Remote Codex control | The Codex tab talks to an EC2-side async job API for registered workspaces. |
+| Remote agent control | The Codex tab talks to an EC2-side async Codex/Claude job API for registered workspaces. |
 | Operational hardening | Secrets stay outside git, protected routes require client certificates, and verification scripts check the live perimeter. |
 
 The result is a repeatable loop: build a static demo, deploy it, refresh the
@@ -124,10 +124,12 @@ Read [SECURITY.md](SECURITY.md) before changing operational files or pushing.
 
 | Slug | Purpose |
 | --- | --- |
+| `ai-tutor-product-expert` | Crisp market-size and TAM pitch for an AI product expert built on the AI Tutor platform. |
 | `bmw-i7-m4-acceleration` | Interactive acceleration and distance-gap comparison for BMW i7 xDrive60 and BMW M4 Competition xDrive scenarios. |
 | `india-ctc-calculator` | Mobile-first India salary reverse calculator for monthly in-hand targets. |
 | `sfs-data-readiness` | Project Leap data-readiness workbench covering asks, source systems, schemas, owners, and a 30-day plan. |
 | `sfs-leap-workbench` | Internal SFS Project Leap technical wave planning workbench. |
+| `sigiq-contributions-parikshit` | HTML presentation of contribution themes across AI Tutor, ET Studio, Internal ET Dashboard, and ET Prompt Config. |
 | `smoke-test` | Tiny static page used to verify deploy, manifest, and iOS loading. |
 
 ## Local Setup
@@ -169,7 +171,7 @@ Do not copy real values from local config into this repository.
 For a new owner or teammate installing against their own EC2/domain, start with:
 
 ```bash
-ops/init-install-config --domain-root example.com --bundle-id com.example.pocvault
+ops/init-install-config --domain-root example.com --bundle-id com.parikshit.pocvault
 ```
 
 Then follow [docs/MULTI_INSTALL.md](docs/MULTI_INSTALL.md). That flow keeps
@@ -349,9 +351,9 @@ curl -fsS http://127.0.0.1:8787/healthz
 
 ## Codex Console
 
-The iOS app includes a Codex tab for remote agent work on EC2. The server lives
-inside this repository because the phone shell and the runner API are deployed
-as one operational system.
+The iOS app includes a Codex tab for remote Codex and Claude work on EC2. The
+server lives inside this repository because the phone shell and the runner API
+are deployed as one operational system.
 
 Server workspace:
 
@@ -371,8 +373,12 @@ Current API behavior:
 - Allowed certificate subjects are configured per install with
   `CODEX_ALLOWED_CERT_SUBJECTS`.
 - Jobs are async and persisted on the VM.
-- Job history, detail logs, cancel, timeout, sessions, and thread summaries are
-  supported.
+- Job history, detail logs, cancel, timeout, sessions, thread summaries, and
+  bounded thread detail are supported.
+- Provider-aware jobs are supported. `codex` is the default provider; `claude`
+  is available when configured on the runner.
+- Threads are provider-locked, so a Codex thread is resumed by Codex and a
+  Claude thread is resumed by Claude.
 - Phone-recorded prompt audio can be transcribed through the authenticated
   Codex API when Azure Speech is configured on the server.
 - Workspaces are predefined; the phone cannot request arbitrary filesystem
@@ -391,6 +397,9 @@ For server-specific deployment and verification details, read
 For a complete implementation walkthrough across the POC host, iOS shell,
 Codex console, transcription flow, security model, and verification commands,
 read [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md).
+
+For the full project history and rationale behind the current architecture,
+read [docs/PROJECT_HISTORY.md](docs/PROJECT_HISTORY.md).
 
 ## Verification
 
