@@ -102,11 +102,6 @@ Several static demos were added to prove the deploy and manifest path:
 - `sfs-data-readiness`
 - `sfs-leap-workbench`
 
-Later local work added additional POCs:
-
-- `ai-tutor-product-expert`
-- `sigiq-contributions-parikshit`
-
 These demos all follow the same contract: source metadata in `poc.json`, static
 assets in `public/`, and generated file hashes/URLs only in the rendered
 manifest.

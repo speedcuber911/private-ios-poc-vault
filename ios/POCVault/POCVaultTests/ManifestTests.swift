@@ -399,7 +399,7 @@ final class ManifestTests: XCTestCase {
                   "updatedAt": "2026-05-20T12:05:10Z",
                   "jobCount": 0,
                   "activeJobCount": 0,
-                  "lastPrompt": "Hey parikshit can you review this PR: https://github.com/sigiq/ai-tutor/pull/967 The idea is to reduce latency",
+                  "lastPrompt": "Can you review this PR: https://github.com/example/private-app/pull/967 The idea is to reduce latency",
                   "hasSessionFile": true,
                   "isSmokeTest": false
                 }
@@ -407,9 +407,9 @@ final class ManifestTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(thread.displayTitle, "ai-tutor PR #967")
+        XCTAssertEqual(thread.displayTitle, "private-app PR #967")
         XCTAssertEqual(thread.workspaceLabel, "POC Vault")
-        XCTAssertEqual(thread.previewText, "Hey parikshit can you review this PR: https://github.com/sigiq/ai-tutor/pull/967 The idea is to reduce latency")
+        XCTAssertEqual(thread.previewText, "Can you review this PR: https://github.com/example/private-app/pull/967 The idea is to reduce latency")
     }
 
     func testCodexThreadDetailBuildsChatTranscriptFromMessages() throws {

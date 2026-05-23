@@ -12,7 +12,6 @@ phone app and EC2 runner are tightly coupled.
   POC creation or deployment.
 - Use this repository checkout as the source repo.
 - Use `ops/deploy-poc` as the deployment interface.
-- Do not route through older SigiQ deployment helpers or host scripts.
 - Never commit, print, or paste secrets from `~/.poc-vault/secrets`.
 - Read `SECURITY.md` before pushing or adding new operational files.
 - Be careful with the current worktree. POC deploys can legitimately modify

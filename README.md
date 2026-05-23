@@ -124,12 +124,10 @@ Read [SECURITY.md](SECURITY.md) before changing operational files or pushing.
 
 | Slug | Purpose |
 | --- | --- |
-| `ai-tutor-product-expert` | Crisp market-size and TAM pitch for an AI product expert built on the AI Tutor platform. |
 | `bmw-i7-m4-acceleration` | Interactive acceleration and distance-gap comparison for BMW i7 xDrive60 and BMW M4 Competition xDrive scenarios. |
 | `india-ctc-calculator` | Mobile-first India salary reverse calculator for monthly in-hand targets. |
 | `sfs-data-readiness` | Project Leap data-readiness workbench covering asks, source systems, schemas, owners, and a 30-day plan. |
 | `sfs-leap-workbench` | Internal SFS Project Leap technical wave planning workbench. |
-| `sigiq-contributions-parikshit` | HTML presentation of contribution themes across AI Tutor, ET Studio, Internal ET Dashboard, and ET Prompt Config. |
 | `smoke-test` | Tiny static page used to verify deploy, manifest, and iOS loading. |
 
 ## Local Setup
