@@ -71,7 +71,7 @@ struct POCVaultRootView: View {
                 Label("Library", systemImage: "square.grid.2x2")
             }
 
-            CodexConsoleView(viewModel: codexViewModel)
+            CodexConsoleView(viewModel: codexViewModel, identityStore: identityStore)
                 .tabItem {
                     Label {
                         Text(CodexProvider.codex.displayName)
@@ -84,7 +84,7 @@ struct POCVaultRootView: View {
                     }
                 }
 
-            CodexConsoleView(viewModel: claudeViewModel)
+            CodexConsoleView(viewModel: claudeViewModel, identityStore: identityStore)
                 .tabItem {
                     Label {
                         Text(CodexProvider.claude.displayName)
@@ -112,6 +112,20 @@ struct POCVaultRootView: View {
         .task {
             identityStore.importIdentityFromSetupEnvironmentIfNeeded()
         }
+        .task {
+            guard shouldStartAgentMonitor else { return }
+            await codexViewModel.monitorActiveWorkWhileAppIsOpen()
+        }
+        .task {
+            guard shouldStartAgentMonitor else { return }
+            await claudeViewModel.monitorActiveWorkWhileAppIsOpen()
+        }
+    }
+
+    private var shouldStartAgentMonitor: Bool {
+        CodexAgentMonitorPolicy.shouldStartAppMonitor(
+            isRunningTests: ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+        )
     }
 }
 

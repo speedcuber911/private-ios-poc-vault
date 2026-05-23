@@ -119,10 +119,44 @@ final class CodexClient: NSObject, URLSessionDelegate {
         return try decoder.decode(CodexListEnvelope<CodexWorkspace>.self, from: data).values
     }
 
-    func fetchJobs(provider: CodexProvider? = nil, limit: Int = 50) async throws -> [CodexJob] {
+    func fetchWorkspaceDirectories(path: String? = nil, query: String? = nil) async throws -> CodexWorkspaceDirectoryListing {
+        var queryItems: [URLQueryItem] = []
+        if let path = path?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty {
+            queryItems.append(URLQueryItem(name: "path", value: path))
+        }
+        if let query = query?.trimmingCharacters(in: .whitespacesAndNewlines), !query.isEmpty {
+            queryItems.append(URLQueryItem(name: "q", value: query))
+        }
+
+        let data = try await perform(path: "/v1/codex/workspace-dirs", queryItems: queryItems)
+        return try decoder.decode(CodexWorkspaceDirectoryListing.self, from: data)
+    }
+
+    func selectWorkspace(path: String) async throws -> CodexWorkspace {
+        let body = try encoder.encode(CodexSelectWorkspaceRequest(path: path))
+        let data = try await perform(path: "/v1/codex/workspaces/select", method: "POST", body: body)
+        guard !data.isEmpty else {
+            throw CodexClientError.emptyResponse
+        }
+        return try decoder.decode(CodexWorkspace.self, from: data)
+    }
+
+    func createWorkspace(parentPath: String, name: String) async throws -> CodexWorkspace {
+        let body = try encoder.encode(CodexCreateWorkspaceRequest(parentPath: parentPath, name: name))
+        let data = try await perform(path: "/v1/codex/workspaces/create", method: "POST", body: body)
+        guard !data.isEmpty else {
+            throw CodexClientError.emptyResponse
+        }
+        return try decoder.decode(CodexWorkspace.self, from: data)
+    }
+
+    func fetchJobs(provider: CodexProvider? = nil, workspaceID: String? = nil, limit: Int = 50) async throws -> [CodexJob] {
         var queryItems = [
             URLQueryItem(name: "limit", value: String(limit))
         ]
+        if let workspaceID, !workspaceID.isEmpty {
+            queryItems.append(URLQueryItem(name: "workspaceId", value: workspaceID))
+        }
         appendProvider(provider, to: &queryItems)
 
         let data = try await perform(path: "/v1/codex/jobs", queryItems: queryItems)
@@ -184,6 +218,30 @@ final class CodexClient: NSObject, URLSessionDelegate {
             throw CodexClientError.emptyResponse
         }
         return try decoder.decode(CodexJob.self, from: data)
+    }
+
+    func fetchArtifactRaw(jobID: String, artifactID: String) async throws -> Data {
+        try await perform(path: "/v1/codex/jobs/\(Self.pathComponent(jobID))/artifacts/\(Self.pathComponent(artifactID))/raw")
+    }
+
+    func resolvedArtifactURL(_ value: String?) -> URL? {
+        Self.resolvedArtifactURL(value, baseURL: baseURL)
+    }
+
+    static func resolvedArtifactURL(_ value: String?, baseURL: URL) -> URL? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return nil
+        }
+        if let absolute = URL(string: value), absolute.scheme != nil {
+            return absolute
+        }
+        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+            return URL(string: value, relativeTo: baseURL)?.absoluteURL
+        }
+        components.path = value.hasPrefix("/") ? value : "/\(value)"
+        components.query = nil
+        components.fragment = nil
+        return components.url
     }
 
     @discardableResult
@@ -351,6 +409,15 @@ final class CodexClient: NSObject, URLSessionDelegate {
             completionHandler(.performDefaultHandling, nil)
         }
     }
+}
+
+private struct CodexSelectWorkspaceRequest: Encodable {
+    let path: String
+}
+
+private struct CodexCreateWorkspaceRequest: Encodable {
+    let parentPath: String
+    let name: String
 }
 
 private struct CodexListEnvelope<Element: Decodable>: Decodable {

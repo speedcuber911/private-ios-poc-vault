@@ -224,6 +224,20 @@ private extension CodexThread {
     }
 }
 
+struct CodexAgentMonitorPolicy: Hashable {
+    static func shouldStartAppMonitor(isRunningTests: Bool) -> Bool {
+        !isRunningTests
+    }
+
+    static func shouldRefresh(
+        hasActiveJobs: Bool,
+        observedActiveJobCount: Int,
+        observedActiveThreadCount: Int
+    ) -> Bool {
+        hasActiveJobs || observedActiveJobCount > 0 || observedActiveThreadCount > 0
+    }
+}
+
 @MainActor
 final class CodexConsoleViewModel: ObservableObject {
     let provider: CodexProvider
@@ -233,9 +247,13 @@ final class CodexConsoleViewModel: ObservableObject {
     @Published private(set) var sessions: [CodexSession] = []
     @Published private(set) var threads: [CodexThread] = []
     @Published private(set) var jobs: [CodexJob] = []
+    @Published private(set) var workspaceDirectoryListing: CodexWorkspaceDirectoryListing?
     @Published private(set) var isRefreshing = false
     @Published private(set) var isCreating = false
     @Published private(set) var isTranscribing = false
+    @Published private(set) var isLoadingWorkspaceDirectories = false
+    @Published private(set) var isSelectingWorkspaceDirectory = false
+    @Published private(set) var isCreatingWorkspaceDirectory = false
     @Published private(set) var cancellingJobIDs: Set<String> = []
     @Published private(set) var lastRefreshedAt: Date?
     @Published private(set) var connectionNotice: String?
@@ -349,16 +367,21 @@ final class CodexConsoleViewModel: ObservableObject {
 
     var sessionsForSelectedWorkspace: [CodexSession] {
         guard let selectedWorkspaceID else { return sessions }
-        return sessions.filter { $0.workspaceId == nil || $0.workspaceId == selectedWorkspaceID }
+        return sessions.filter { $0.workspaceId == selectedWorkspaceID }
     }
 
     var threadsForSelectedWorkspace: [CodexThread] {
         guard let selectedWorkspaceID else { return threads }
-        return threads.filter { $0.workspaceId == nil || $0.workspaceId == selectedWorkspaceID }
+        return threads.filter { $0.workspaceId == selectedWorkspaceID }
+    }
+
+    var jobsForSelectedWorkspace: [CodexJob] {
+        guard let selectedWorkspaceID else { return jobs }
+        return jobs.filter { $0.workspaceId == selectedWorkspaceID }
     }
 
     var visibleThreads: [CodexThread] {
-        threads.filter { !$0.isSmokeTest }
+        threadsForSelectedWorkspace.filter { !$0.isSmokeTest }
     }
 
     var visibleThreadCount: Int {
@@ -366,7 +389,16 @@ final class CodexConsoleViewModel: ObservableObject {
     }
 
     var threadFeedItems: [CodexThreadFeedItem] {
-        CodexThreadFeedItem.makeFeed(threads: threads, jobs: jobs)
+        CodexThreadFeedItem.makeFeed(threads: threads, jobs: jobs, workspaceID: selectedWorkspaceID)
+    }
+
+    var composeStatusItem: CodexThreadFeedItem? {
+        CodexThreadFeedItem.composeStatusItem(
+            selectedSessionID: selectedSessionID,
+            threads: threads,
+            jobs: jobs,
+            workspaceID: selectedWorkspaceID
+        )
     }
 
     var composeWorkspaceID: String {
@@ -377,8 +409,22 @@ final class CodexConsoleViewModel: ObservableObject {
             ?? "poc-vault"
     }
 
+    var composeWorkspaceLabel: String {
+        Self.nonEmpty(selectedWorkspace?.name)
+            ?? Self.nonEmpty(selectedWorkspaceID)
+            ?? "Workspace"
+    }
+
     var hasActiveJobs: Bool {
-        jobs.contains { $0.status.isActive } || threads.contains { $0.hasActiveJobs }
+        jobsForSelectedWorkspace.contains { $0.status.isActive } || threadsForSelectedWorkspace.contains { $0.hasActiveJobs }
+    }
+
+    var shouldPollActiveWorkMonitor: Bool {
+        CodexAgentMonitorPolicy.shouldRefresh(
+            hasActiveJobs: hasActiveJobs,
+            observedActiveJobCount: observedActiveJobIDs.count,
+            observedActiveThreadCount: observedActiveThreadIDs.count
+        )
     }
 
     private var hasCachedCodexContent: Bool {
@@ -520,10 +566,6 @@ final class CodexConsoleViewModel: ObservableObject {
         let previouslyActiveJobIDs = observedActiveJobIDs.union(activeJobIDs(in: jobs))
         let previouslyActiveThreadIDs = observedActiveThreadIDs.union(activeThreadIDs(in: threads))
 
-        async let workspaceRequest = client.fetchWorkspaces()
-        async let jobRequest = client.fetchJobs(provider: provider, limit: 10)
-        async let sessionRequest = client.fetchSessions(provider: provider, limit: 50)
-        async let threadRequest = client.fetchThreads(provider: provider, limit: 50)
         await refreshHealth()
 
         var refreshErrors: [Error] = []
@@ -531,14 +573,20 @@ final class CodexConsoleViewModel: ObservableObject {
         var loadedAnyContent = false
 
         do {
-            let workspaceResponse = try await workspaceRequest
+            let workspaceResponse = try await client.fetchWorkspaces()
             workspaces = workspaceResponse
+            selectDefaultWorkspaceIfNeeded()
             loadedCoreContent = true
             loadedAnyContent = true
         } catch {
             if Self.isCancellation(error) { return }
             refreshErrors.append(error)
         }
+
+        let workspaceID = selectedWorkspaceID
+        async let jobRequest = client.fetchJobs(provider: provider, workspaceID: workspaceID, limit: 10)
+        async let sessionRequest = client.fetchSessions(provider: provider, workspaceID: workspaceID, limit: 50)
+        async let threadRequest = client.fetchThreads(provider: provider, workspaceID: workspaceID, limit: 50)
 
         do {
             let sessionResponse = try await sessionRequest
@@ -572,7 +620,6 @@ final class CodexConsoleViewModel: ObservableObject {
         }
 
         if loadedAnyContent {
-            selectDefaultWorkspaceIfNeeded()
             clearSelectedSessionIfNeeded()
             errorMessage = nil
             if loadedCoreContent {
@@ -596,7 +643,7 @@ final class CodexConsoleViewModel: ObservableObject {
     func refreshJobs() async {
         do {
             let previouslyActiveJobIDs = observedActiveJobIDs.union(activeJobIDs(in: jobs))
-            jobs = Self.sortedJobs(try await client.fetchJobs(provider: provider, limit: 10))
+            jobs = Self.sortedJobs(try await client.fetchJobs(provider: provider, workspaceID: selectedWorkspaceID, limit: 10))
             await handleCompletedJobs(jobs, previouslyActiveJobIDs: previouslyActiveJobIDs)
             errorMessage = nil
             connectionNotice = nil
@@ -616,7 +663,7 @@ final class CodexConsoleViewModel: ObservableObject {
 
     func refreshSessions() async {
         do {
-            sessions = Self.sortedSessions(try await client.fetchSessions(provider: provider, limit: 50))
+            sessions = Self.sortedSessions(try await client.fetchSessions(provider: provider, workspaceID: selectedWorkspaceID, limit: 50))
             clearSelectedSessionIfNeeded()
             errorMessage = nil
             connectionNotice = nil
@@ -637,7 +684,7 @@ final class CodexConsoleViewModel: ObservableObject {
     func refreshThreads() async {
         do {
             let previouslyActiveThreadIDs = observedActiveThreadIDs.union(activeThreadIDs(in: threads))
-            threads = Self.sortedThreads(try await client.fetchThreads(provider: provider, limit: 50))
+            threads = Self.sortedThreads(try await client.fetchThreads(provider: provider, workspaceID: selectedWorkspaceID, limit: 50))
             await handleCompletedThreads(threads, previouslyActiveThreadIDs: previouslyActiveThreadIDs)
             clearSelectedSessionIfNeeded()
             errorMessage = nil
@@ -665,9 +712,84 @@ final class CodexConsoleViewModel: ObservableObject {
         }
     }
 
+    func loadWorkspaceDirectories(path: String? = nil, query: String? = nil) async {
+        isLoadingWorkspaceDirectories = true
+        defer { isLoadingWorkspaceDirectories = false }
+
+        do {
+            let listing = try await client.fetchWorkspaceDirectories(path: path, query: query)
+            workspaceDirectoryListing = listing
+            if let workspace = listing.selectedWorkspace {
+                upsert(workspace)
+            }
+            errorMessage = nil
+            connectionNotice = nil
+        } catch {
+            guard !Self.isCancellation(error) else { return }
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func selectWorkspaceDirectory(path: String) async -> Bool {
+        let trimmedPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedPath.isEmpty else {
+            errorMessage = "Choose a folder before selecting a workspace."
+            return false
+        }
+
+        isSelectingWorkspaceDirectory = true
+        defer { isSelectingWorkspaceDirectory = false }
+
+        do {
+            let workspace = try await client.selectWorkspace(path: trimmedPath)
+            upsert(workspace)
+            selectedWorkspaceID = workspace.id
+            selectedSessionID = nil
+            await refreshWorkspaceScopedContent()
+            errorMessage = nil
+            return true
+        } catch {
+            guard !Self.isCancellation(error) else { return false }
+            errorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    func createWorkspaceDirectory(parentPath: String?, name: String) async -> Bool {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else {
+            errorMessage = "Enter a folder name."
+            return false
+        }
+
+        let trimmedParentPath = parentPath?.trimmingCharacters(in: .whitespacesAndNewlines)
+        isCreatingWorkspaceDirectory = true
+        defer { isCreatingWorkspaceDirectory = false }
+
+        do {
+            let parentPath = trimmedParentPath.flatMap(Self.nonEmpty) ?? ""
+            let workspace = try await client.createWorkspace(
+                parentPath: parentPath,
+                name: trimmedName
+            )
+            upsert(workspace)
+            selectedWorkspaceID = workspace.id
+            selectedSessionID = nil
+            workspaceDirectoryListing = try await client.fetchWorkspaceDirectories(path: workspace.path, query: nil)
+            await refreshWorkspaceScopedContent()
+            errorMessage = nil
+            connectionNotice = nil
+            return true
+        } catch {
+            guard !Self.isCancellation(error) else { return false }
+            errorMessage = error.localizedDescription
+            return false
+        }
+    }
+
     func pollJobsWhileVisible() async {
         while !Task.isCancelled {
-            if hasActiveJobs {
+            if shouldPollActiveWorkMonitor {
                 await completionNotifier.prepareForNotifications()
                 await refreshJobs()
                 await refreshSessions()
@@ -677,12 +799,25 @@ final class CodexConsoleViewModel: ObservableObject {
         }
     }
 
+    func monitorActiveWorkWhileAppIsOpen() async {
+        await bootstrapIfNeeded()
+        await pollJobsWhileVisible()
+    }
+
     func loadJob(id: String, includeFullLogs: Bool = false) async throws -> CodexJob {
         let previouslyActiveJobIDs = observedActiveJobIDs.union(activeJobIDs(in: jobs))
         let job = try await client.fetchJob(id: id, includeFullLogs: includeFullLogs)
         upsert(job)
         await handleCompletedJobs([job], previouslyActiveJobIDs: previouslyActiveJobIDs)
         return job
+    }
+
+    func resolvedArtifactURL(_ value: String?) -> URL? {
+        client.resolvedArtifactURL(value)
+    }
+
+    func fetchArtifactRaw(jobID: String, artifactID: String) async throws -> Data {
+        try await client.fetchArtifactRaw(jobID: jobID, artifactID: artifactID)
     }
 
     func loadThreadDetail(sessionID: String) async throws -> CodexThreadDetail {
@@ -840,7 +975,7 @@ final class CodexConsoleViewModel: ObservableObject {
                     prompt: prompt,
                     timeoutMs: timeoutMs,
                     model: selectedModel,
-                    reasoningEffort: effectiveReasoningEffort.rawValue,
+                    reasoningEffort: provider == .codex ? effectiveReasoningEffort.rawValue : nil,
                     provider: provider,
                     attachments: attachments,
                     resumeSessionId: resumeSessionID
@@ -856,9 +991,7 @@ final class CodexConsoleViewModel: ObservableObject {
             } else if let job = try? await client.fetchJob(id: response.id) {
                 upsert(job)
             }
-            await refreshJobs()
-            await refreshSessions()
-            await refreshThreads()
+            await refreshWorkspaceScopedContent()
             errorMessage = nil
             return response.id
         } catch {
@@ -873,6 +1006,12 @@ final class CodexConsoleViewModel: ObservableObject {
             return "Client certificate is not available yet. Unlock the phone, open Diagnostics if needed, then refresh \(provider.displayName)."
         }
         return connectedMessage
+    }
+
+    private func refreshWorkspaceScopedContent() async {
+        await refreshJobs()
+        await refreshSessions()
+        await refreshThreads()
     }
 
     private func selectDefaultWorkspaceIfNeeded() {
@@ -920,6 +1059,14 @@ final class CodexConsoleViewModel: ObservableObject {
             }
         }
         lastRefreshedAt = Date()
+    }
+
+    private func upsert(_ workspace: CodexWorkspace) {
+        if let index = workspaces.firstIndex(where: { $0.id == workspace.id }) {
+            workspaces[index] = workspace
+        } else {
+            workspaces.append(workspace)
+        }
     }
 
     private func upsert(_ thread: CodexThread) {
@@ -1011,6 +1158,11 @@ final class CodexConsoleViewModel: ObservableObject {
         guard !skills.isEmpty else { return prompt }
         let names = skills.map(\.id).joined(separator: ", ")
         return "Use these \(provider.displayName) skills for this task: \(names).\n\n\(prompt)"
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed?.isEmpty == false ? trimmed : nil
     }
 
     private var effectiveReasoningEffort: CodexReasoningEffort {

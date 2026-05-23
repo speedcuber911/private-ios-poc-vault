@@ -146,10 +146,33 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(codexLayout.controlHeight, 36)
         XCTAssertEqual(claudeLayout.controlHeight, codexLayout.controlHeight)
         XCTAssertTrue(codexLayout.showsSkillButton)
-        XCTAssertFalse(claudeLayout.showsSkillButton)
-        XCTAssertTrue(claudeLayout.reservesSkillSlot)
+        XCTAssertTrue(claudeLayout.showsSkillButton)
+        XCTAssertFalse(claudeLayout.reservesSkillSlot)
         XCTAssertTrue(codexLayout.showsRunMode)
-        XCTAssertFalse(claudeLayout.showsRunMode)
+        XCTAssertTrue(claudeLayout.showsRunMode)
+    }
+
+    func testThreadDetailLayoutKeepsActiveRunChromeOutOfChatFlow() throws {
+        let thread = try decodeCodexThread(
+            """
+            {
+              "id": "thread-active",
+              "sessionId": "thread-active",
+              "workspaceName": "POC Vault",
+              "activeJobCount": 1,
+              "lastJobId": "job-active",
+              "lastJobStatus": "running",
+              "lastPrompt": "Review and merge if all good"
+            }
+            """
+        )
+
+        let layout = CodexThreadDetailLayout(thread: thread)
+
+        XCTAssertTrue(thread.hasActiveJobs)
+        XCTAssertEqual(layout.contentSections, [.overview, .chatTranscript])
+        XCTAssertFalse(layout.showsInlineProgressCard)
+        XCTAssertTrue(layout.showsLatestRunToolbarButton)
     }
 
     func testCodexJobDefaultsMissingProviderToCodexAndDecodesClaude() throws {
@@ -190,6 +213,65 @@ final class ManifestTests: XCTestCase {
 
         XCTAssertEqual(job.displayOutput, "codex exited with code 1")
         XCTAssertTrue(job.rawActivityOutput?.contains("xcodebuild exited 65") == true)
+    }
+
+    func testCodexJobDecodesArtifactsAndDefaultsMissingArtifactsToEmpty() throws {
+        let legacyJob = try decodeCodexJob(
+            """
+            {
+              "id": "job-no-artifacts",
+              "status": "succeeded",
+              "result": "Plain answer"
+            }
+            """
+        )
+        XCTAssertTrue(legacyJob.artifacts.isEmpty)
+
+        let job = try decodeCodexJob(
+            """
+            {
+              "id": "job-artifacts",
+              "status": "succeeded",
+              "result": "Here is the app",
+              "artifacts": [
+                {
+                  "id": "artifact-001",
+                  "kind": "staticPreview",
+                  "filename": "index.html",
+                  "title": "index html",
+                  "language": "html",
+                  "contentType": "text/html; charset=utf-8",
+                  "bytes": 42,
+                  "rawURL": "/v1/codex/jobs/job-artifacts/artifacts/artifact-001/raw",
+                  "previewURL": "/v1/codex/jobs/job-artifacts/artifacts/artifact-001/preview"
+                }
+              ]
+            }
+            """
+        )
+
+        XCTAssertEqual(job.artifacts.count, 1)
+        XCTAssertEqual(job.artifacts[0].id, "artifact-001")
+        XCTAssertEqual(job.artifacts[0].kind, .staticPreview)
+        XCTAssertEqual(job.artifacts[0].filename, "index.html")
+        XCTAssertEqual(job.artifacts[0].language, "html")
+        XCTAssertEqual(job.artifacts[0].bytes, 42)
+        XCTAssertEqual(job.artifacts[0].rawURL, "/v1/codex/jobs/job-artifacts/artifacts/artifact-001/raw")
+        XCTAssertEqual(job.artifacts[0].previewURL, "/v1/codex/jobs/job-artifacts/artifacts/artifact-001/preview")
+    }
+
+    func testCodexClientResolvesArtifactURLsAgainstBaseURL() throws {
+        let baseURL = URL(string: "https://codex.pocs.conformal.live")!
+
+        XCTAssertEqual(
+            CodexClient.resolvedArtifactURL("/v1/codex/jobs/job/artifacts/artifact-001/raw", baseURL: baseURL),
+            URL(string: "https://codex.pocs.conformal.live/v1/codex/jobs/job/artifacts/artifact-001/raw")
+        )
+        XCTAssertEqual(
+            CodexClient.resolvedArtifactURL("https://codex.pocs.conformal.live/v1/codex/jobs/job/artifacts/artifact-001/raw", baseURL: baseURL),
+            URL(string: "https://codex.pocs.conformal.live/v1/codex/jobs/job/artifacts/artifact-001/raw")
+        )
+        XCTAssertNil(CodexClient.resolvedArtifactURL(nil, baseURL: baseURL))
     }
 
     func testCodexJobDisplayOutputHidesRawCodexTranscript() throws {
@@ -361,6 +443,80 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(thread.hasActiveJobs)
         XCTAssertTrue(thread.hasSessionFile)
         XCTAssertTrue(thread.isSmokeTest)
+    }
+
+    func testCodexWorkspaceDirectoryListingDecodesServerShape() throws {
+        let listing = try JSONDecoder().decode(
+            CodexWorkspaceDirectoryListing.self,
+            from: Data(
+                """
+                {
+                  "rootPath": "/Users/parikshit/Desktop",
+                  "currentPath": "/Users/parikshit/Desktop/SigiQ",
+                  "relativePath": "SigiQ",
+                  "parentPath": "/Users/parikshit/Desktop",
+                  "selectedWorkspace": {
+                    "id": "sigiq",
+                    "name": "SigiQ",
+                    "path": "/Users/parikshit/Desktop/SigiQ"
+                  },
+                  "entries": [
+                    {
+                      "name": "ai-tutor",
+                      "path": "/Users/parikshit/Desktop/SigiQ/ai-tutor",
+                      "relativePath": "SigiQ/ai-tutor",
+                      "workspaceId": "sigiq-ai-tutor",
+                      "workspaceName": "AI Tutor",
+                      "hasGit": true,
+                      "isRegistered": true
+                    },
+                    {
+                      "name": "notes",
+                      "path": "/Users/parikshit/Desktop/SigiQ/notes",
+                      "relativePath": "SigiQ/notes",
+                      "hasGit": false,
+                      "isRegistered": false
+                    }
+                  ]
+                }
+                """.utf8
+            )
+        )
+
+        XCTAssertEqual(listing.rootPath, "/Users/parikshit/Desktop")
+        XCTAssertEqual(listing.currentPath, "/Users/parikshit/Desktop/SigiQ")
+        XCTAssertEqual(listing.relativePath, "SigiQ")
+        XCTAssertEqual(listing.parentPath, "/Users/parikshit/Desktop")
+        XCTAssertEqual(listing.selectedWorkspace?.id, "sigiq")
+        XCTAssertEqual(listing.entries.count, 2)
+        XCTAssertEqual(listing.entries[0].id, "/Users/parikshit/Desktop/SigiQ/ai-tutor")
+        XCTAssertEqual(listing.entries[0].displayName, "ai-tutor")
+        XCTAssertEqual(listing.entries[0].detailText, "AI Tutor")
+        XCTAssertTrue(listing.entries[0].hasGit)
+        XCTAssertTrue(listing.entries[0].isRegistered)
+        XCTAssertEqual(listing.entries[1].detailText, "SigiQ/notes")
+        XCTAssertFalse(listing.entries[1].hasGit)
+        XCTAssertFalse(listing.entries[1].isRegistered)
+    }
+
+    func testCodexWorkspaceDirectoryListingCanNavigateUpFromEmptyParentPath() throws {
+        let listing = try JSONDecoder().decode(
+            CodexWorkspaceDirectoryListing.self,
+            from: Data(
+                """
+                {
+                  "rootPath": "/srv/codex-workspaces",
+                  "currentPath": "/srv/codex-workspaces/poc-vault",
+                  "relativePath": "poc-vault",
+                  "parentPath": "",
+                  "entries": []
+                }
+                """.utf8
+            )
+        )
+
+        XCTAssertNil(listing.parentPath)
+        XCTAssertEqual(listing.upNavigationPath, "/srv/codex-workspaces")
     }
 
     func testCodexThreadDefaultsMissingProviderToCodexAndDecodesClaude() throws {
@@ -542,6 +698,289 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(transcript.map(\.text), ["Can you check the server?", "Server is healthy."])
     }
 
+    func testCodexThreadChatTranscriptMarksThreadSummaryAsFullTextLoadable() throws {
+        let thread = try JSONDecoder().decode(
+            CodexThread.self,
+            from: Data(
+                """
+                {
+                  "id": "019e46a5-0000-7000-8000-000000000011",
+                  "sessionId": "019e46a5-0000-7000-8000-000000000011",
+                  "workspaceId": "poc-vault",
+                  "workspaceName": "POC Vault",
+                  "updatedAt": "2026-05-20T12:05:10Z",
+                  "jobCount": 1,
+                  "activeJobCount": 0,
+                  "lastJobId": "job-summary-preview",
+                  "lastJobStatus": "succeeded",
+                  "lastPrompt": "Summarize this folder.",
+                  "lastResult": "This is the saved thread summary.",
+                  "hasSessionFile": true
+                }
+                """.utf8
+            )
+        )
+
+        let transcript = CodexThreadChatItem.makeTranscript(detail: nil, thread: thread, latestJob: nil)
+
+        let answer = try XCTUnwrap(transcript.first { $0.role == .assistant })
+        XCTAssertTrue(answer.canLoadFullText)
+        XCTAssertTrue(answer.isLong)
+    }
+
+    func testCodexThreadChatTranscriptMarksServerTruncatedJobAnswerAsFullTextLoadable() throws {
+        let thread = try decodeCodexThread(
+            """
+            {
+              "id": "019e46a5-0000-7000-8000-000000000012",
+              "sessionId": "019e46a5-0000-7000-8000-000000000012",
+              "workspaceId": "poc-vault",
+              "workspaceName": "POC Vault",
+              "updatedAt": "2026-05-20T12:05:10Z",
+              "jobCount": 1,
+              "activeJobCount": 0,
+              "lastJobId": "job-truncated-answer",
+              "lastJobStatus": "succeeded",
+              "lastPrompt": "List assigned PRs",
+              "hasSessionFile": true
+            }
+            """
+        )
+        let job = try decodeCodexJob(
+            """
+            {
+              "id": "job-truncated-answer",
+              "provider": "codex",
+              "status": "succeeded",
+              "workspaceId": "poc-vault",
+              "workspaceName": "POC Vault",
+              "prompt": "List assigned PRs",
+              "result": "I found one assigned PR and this preview is not the full final answer.",
+              "resultTruncated": true,
+              "logsIncluded": "compact",
+              "completedAt": "2026-05-20T12:05:10Z"
+            }
+            """
+        )
+
+        let transcript = CodexThreadChatItem.makeTranscript(detail: nil, thread: thread, latestJob: job)
+
+        let answer = try XCTUnwrap(transcript.first { $0.role == .assistant })
+        XCTAssertEqual(answer.text, "I found one assigned PR and this preview is not the full final answer.")
+        XCTAssertTrue(answer.canLoadFullText)
+        XCTAssertTrue(answer.isLong)
+    }
+
+    func testCodexThreadChatTranscriptShowsWorkingPlaceholderForRunningFollowUp() throws {
+        let thread = try decodeCodexThread(
+            """
+            {
+              "id": "019e46a5-0000-7000-8000-000000000004",
+              "sessionId": "019e46a5-0000-7000-8000-000000000004",
+              "workspaceId": "poc-vault",
+              "workspaceName": "POC Vault",
+              "updatedAt": "2026-05-20T12:05:10Z",
+              "jobCount": 2,
+              "activeJobCount": 0,
+              "lastJobStatus": "succeeded",
+              "lastPrompt": "Review",
+              "hasSessionFile": true
+            }
+            """
+        )
+        let job = try decodeCodexJob(
+            """
+            {
+              "id": "job-running-follow-up",
+              "provider": "codex",
+              "status": "running",
+              "workspaceId": "poc-vault",
+              "workspaceName": "POC Vault",
+              "prompt": "Review",
+              "createdAt": "2026-05-20T12:05:12Z",
+              "startedAt": "2026-05-20T12:05:13Z"
+            }
+            """
+        )
+
+        let transcript = CodexThreadChatItem.makeTranscript(detail: nil, thread: thread, latestJob: job)
+
+        XCTAssertEqual(transcript.map(\.role), [.user, .status])
+        XCTAssertEqual(transcript.map(\.sourceID), ["thread-prompt", "thread-working"])
+        let workingItem = try XCTUnwrap(transcript.last)
+        XCTAssertEqual(workingItem.text, "Codex is working.")
+        XCTAssertEqual(workingItem.alignment, .leading)
+    }
+
+    func testCodexThreadChatTranscriptShowsPendingFirstRunLikeThreadChat() throws {
+        let job = try decodeCodexJob(
+            """
+            {
+              "id": "job-starting-thread",
+              "provider": "codex",
+              "status": "running",
+              "workspaceId": "poc-vault",
+              "workspaceName": "POC Vault",
+              "prompt": "Build a deployment checklist",
+              "createdAt": "2026-05-20T12:05:12Z",
+              "startedAt": "2026-05-20T12:05:13Z"
+            }
+            """
+        )
+
+        let transcript = CodexThreadChatItem.makeTranscript(detail: nil, thread: nil, latestJob: job)
+
+        XCTAssertEqual(transcript.map(\.role), [.user, .status])
+        XCTAssertEqual(transcript.first?.text, "Build a deployment checklist")
+        XCTAssertEqual(transcript.first?.alignment, .trailing)
+        XCTAssertEqual(transcript.last?.kind, .workingPlaceholder)
+        XCTAssertEqual(transcript.last?.text, "Codex is working.")
+    }
+
+    func testCodexThreadChatTranscriptDoesNotPairRunningFollowUpWithStaleThreadAnswer() throws {
+        let thread = try decodeCodexThread(
+            """
+            {
+              "id": "019e46a5-0000-7000-8000-000000000006",
+              "sessionId": "019e46a5-0000-7000-8000-000000000006",
+              "workspaceId": "poc-vault",
+              "workspaceName": "POC Vault",
+              "updatedAt": "2026-05-20T12:05:10Z",
+              "jobCount": 2,
+              "activeJobCount": 0,
+              "lastJobStatus": "succeeded",
+              "lastPrompt": "Are there any PRs assigned to me?",
+              "lastResult": "One PR is assigned to you.",
+              "hasSessionFile": true
+            }
+            """
+        )
+        let job = try decodeCodexJob(
+            """
+            {
+              "id": "job-running-review",
+              "provider": "codex",
+              "status": "running",
+              "workspaceId": "poc-vault",
+              "workspaceName": "POC Vault",
+              "prompt": "Review",
+              "createdAt": "2026-05-20T12:06:12Z",
+              "startedAt": "2026-05-20T12:06:13Z"
+            }
+            """
+        )
+
+        let transcript = CodexThreadChatItem.makeTranscript(detail: nil, thread: thread, latestJob: job)
+
+        XCTAssertEqual(transcript.map(\.role), [.user, .status])
+        XCTAssertEqual(transcript.map(\.text), ["Review", "Codex is working."])
+    }
+
+    func testCodexThreadChatTranscriptCollapsesTrailingAssistantUpdateWhileFollowUpRuns() throws {
+        let detail = try JSONDecoder().decode(
+            CodexThreadDetail.self,
+            from: Data(
+                """
+                {
+                  "thread": {
+                    "id": "019e46a5-0000-7000-8000-000000000005",
+                    "sessionId": "019e46a5-0000-7000-8000-000000000005",
+                    "workspaceId": "poc-vault",
+                    "workspaceName": "POC Vault",
+                    "updatedAt": "2026-05-20T12:06:00Z",
+                    "jobCount": 2,
+                    "activeJobCount": 1,
+                    "lastJobStatus": "running",
+                    "lastPrompt": "Review",
+                    "hasSessionFile": true
+                  },
+                  "messages": [
+                    {
+                      "role": "user",
+                      "timestamp": "2026-05-20T12:00:00Z",
+                      "text": "Are there any PRs assigned to me?"
+                    },
+                    {
+                      "role": "assistant",
+                      "timestamp": "2026-05-20T12:01:00Z",
+                      "text": "One PR is assigned to you."
+                    },
+                    {
+                      "role": "user",
+                      "timestamp": "2026-05-20T12:05:12Z",
+                      "text": "Review"
+                    },
+                    {
+                      "role": "assistant",
+                      "timestamp": "2026-05-20T12:05:20Z",
+                      "text": "I'll inspect the review target."
+                    }
+                  ],
+                  "jobs": [
+                    {
+                      "id": "job-running-follow-up",
+                      "provider": "codex",
+                      "status": "running",
+                      "workspaceId": "poc-vault",
+                      "workspaceName": "POC Vault",
+                      "prompt": "Review",
+                      "createdAt": "2026-05-20T12:05:12Z",
+                      "startedAt": "2026-05-20T12:05:13Z"
+                    }
+                  ]
+                }
+                """.utf8
+            )
+        )
+
+        let transcript = CodexThreadChatItem.makeTranscript(detail: detail, thread: nil, latestJob: detail.jobs.first)
+
+        XCTAssertEqual(transcript.map(\.role), [.user, .assistant, .user, .status])
+        XCTAssertEqual(transcript[3].kind, .progressSummary)
+        XCTAssertEqual(transcript[3].progressCount, 1)
+        XCTAssertFalse(transcript.contains { $0.kind == .workingPlaceholder })
+        XCTAssertFalse(transcript.contains { $0.role == .assistant && $0.text == "I'll inspect the review target." })
+    }
+
+    func testCodexThreadDetailRefreshPolicyPollsWhileThreadOrFollowUpIsActive() throws {
+        let idleThread = try decodeCodexThread(
+            """
+            {
+              "id": "thread-idle",
+              "sessionId": "thread-idle",
+              "workspaceName": "POC Vault",
+              "activeJobCount": 0,
+              "lastJobStatus": "succeeded"
+            }
+            """
+        )
+        let activeThread = try decodeCodexThread(
+            """
+            {
+              "id": "thread-active",
+              "sessionId": "thread-active",
+              "workspaceName": "POC Vault",
+              "activeJobCount": 1,
+              "lastJobStatus": "running"
+            }
+            """
+        )
+        let runningJob = try decodeCodexJob(
+            """
+            {
+              "id": "job-running",
+              "status": "running",
+              "workspaceName": "POC Vault"
+            }
+            """
+        )
+
+        XCTAssertTrue(CodexThreadDetailRefreshPolicy.shouldPoll(thread: activeThread, latestJob: nil, pendingFollowUpJobID: nil))
+        XCTAssertTrue(CodexThreadDetailRefreshPolicy.shouldPoll(thread: idleThread, latestJob: runningJob, pendingFollowUpJobID: nil))
+        XCTAssertTrue(CodexThreadDetailRefreshPolicy.shouldPoll(thread: idleThread, latestJob: nil, pendingFollowUpJobID: "job-running"))
+        XCTAssertFalse(CodexThreadDetailRefreshPolicy.shouldPoll(thread: idleThread, latestJob: nil, pendingFollowUpJobID: nil))
+    }
+
     func testCodexThreadFeedUsesThreadsInsteadOfDuplicateJobs() throws {
         let thread = try JSONDecoder().decode(
             CodexThread.self,
@@ -623,6 +1062,139 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(feed.first?.preview.contains("Starting on EC2") == true)
         XCTAssertEqual(feed.last?.jobID, "job-old-orphan")
         XCTAssertEqual(feed.last?.preview, "No session")
+    }
+
+    func testCodexThreadFeedPreviewStripsMarkdownFormatting() throws {
+        let thread = try decodeCodexThread(
+            """
+            {
+              "id": "thread-markdown-preview",
+              "sessionId": "thread-markdown-preview",
+              "workspaceName": "POC Vault",
+              "updatedAt": "2026-05-21T07:35:00Z",
+              "lastJobId": "job-markdown-preview",
+              "lastJobStatus": "succeeded",
+              "lastPrompt": "Explain this project.",
+              "lastResult": "## POC Vault\\n\\nThis is a **private iOS POC vault** for hosting AI-generated frontend prototypes.\\n\\n- **Backend:** EC2 VM running nginx\\n- POCs: Static files in `pocs/<slug>/public/`",
+              "jobCount": 1,
+              "hasSessionFile": true
+            }
+            """
+        )
+
+        let feed = CodexThreadFeedItem.makeFeed(threads: [thread], jobs: [])
+        let preview = try XCTUnwrap(feed.first?.preview)
+
+        XCTAssertEqual(
+            preview,
+            "POC Vault This is a private iOS POC vault for hosting AI-generated frontend prototypes. Backend: EC2 VM running nginx POCs: Static files in pocs/<slug>/public/"
+        )
+        XCTAssertFalse(preview.contains("##"))
+        XCTAssertFalse(preview.contains("**"))
+        XCTAssertFalse(preview.contains("`"))
+    }
+
+    func testCodexThreadFeedCanBeScopedToSelectedWorkspace() throws {
+        let pocThread = try decodeCodexThread(
+            """
+            {
+              "id": "thread-poc",
+              "sessionId": "thread-poc",
+              "workspaceId": "poc-vault",
+              "workspaceName": "POC Vault",
+              "updatedAt": "2026-05-21T07:35:00Z",
+              "lastJobId": "job-poc",
+              "lastJobStatus": "succeeded",
+              "lastPrompt": "Work on Relay",
+              "lastResult": "Relay is updated."
+            }
+            """
+        )
+        let sigiqThread = try decodeCodexThread(
+            """
+            {
+              "id": "thread-sigiq",
+              "sessionId": "thread-sigiq",
+              "workspaceId": "sigiq",
+              "workspaceName": "SigiQ",
+              "updatedAt": "2026-05-21T07:40:00Z",
+              "lastJobId": "job-sigiq",
+              "lastJobStatus": "running",
+              "lastPrompt": "Work on SigiQ",
+              "activeJobCount": 1
+            }
+            """
+        )
+        let sigiqJob = try decodeCodexJob(
+            """
+            {
+              "id": "job-sigiq-pending",
+              "status": "running",
+              "workspaceId": "sigiq",
+              "workspaceName": "SigiQ",
+              "prompt": "Still running in SigiQ",
+              "updatedAt": "2026-05-21T07:42:00Z"
+            }
+            """
+        )
+
+        let feed = CodexThreadFeedItem.makeFeed(
+            threads: [pocThread, sigiqThread],
+            jobs: [sigiqJob],
+            workspaceID: "poc-vault"
+        )
+
+        XCTAssertEqual(feed.compactMap(\.workspaceID), ["poc-vault"])
+        XCTAssertEqual(feed.compactMap(\.sessionID), ["thread-poc"])
+    }
+
+    func testCodexComposeStatusUsesSelectedOrActiveThreadUpdate() throws {
+        let selectedThread = try decodeCodexThread(
+            """
+            {
+              "id": "thread-selected",
+              "sessionId": "thread-selected",
+              "workspaceName": "POC Vault",
+              "updatedAt": "2026-05-21T07:30:00Z",
+              "lastJobId": "job-selected",
+              "lastJobStatus": "succeeded",
+              "lastPrompt": "Review the latest patch",
+              "lastResult": "The review is complete.",
+              "activeJobCount": 0
+            }
+            """
+        )
+        let activeThread = try decodeCodexThread(
+            """
+            {
+              "id": "thread-active",
+              "sessionId": "thread-active",
+              "workspaceName": "POC Vault",
+              "updatedAt": "2026-05-21T07:40:00Z",
+              "lastJobId": "job-active",
+              "lastJobStatus": "running",
+              "lastPrompt": "Deploy the Relay build",
+              "lastResult": "The machine is building the app.",
+              "activeJobCount": 1
+            }
+            """
+        )
+
+        let activeStatus = CodexThreadFeedItem.composeStatusItem(
+            selectedSessionID: nil,
+            threads: [selectedThread, activeThread],
+            jobs: []
+        )
+        let selectedStatus = CodexThreadFeedItem.composeStatusItem(
+            selectedSessionID: "thread-selected",
+            threads: [selectedThread, activeThread],
+            jobs: []
+        )
+
+        XCTAssertEqual(activeStatus?.sessionID, "thread-active")
+        XCTAssertEqual(activeStatus?.preview, "The machine is building the app.")
+        XCTAssertEqual(selectedStatus?.sessionID, "thread-selected")
+        XCTAssertEqual(selectedStatus?.preview, "The review is complete.")
     }
 
     func testCodexJobDecodesResumeSessionID() throws {
@@ -865,6 +1437,18 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(signals.first?.sessionID, "thread-44")
     }
 
+    func testCodexAgentMonitorPolicyContinuesPollingObservedActiveWork() throws {
+        XCTAssertTrue(CodexAgentMonitorPolicy.shouldRefresh(hasActiveJobs: true, observedActiveJobCount: 0, observedActiveThreadCount: 0))
+        XCTAssertTrue(CodexAgentMonitorPolicy.shouldRefresh(hasActiveJobs: false, observedActiveJobCount: 1, observedActiveThreadCount: 0))
+        XCTAssertTrue(CodexAgentMonitorPolicy.shouldRefresh(hasActiveJobs: false, observedActiveJobCount: 0, observedActiveThreadCount: 1))
+        XCTAssertFalse(CodexAgentMonitorPolicy.shouldRefresh(hasActiveJobs: false, observedActiveJobCount: 0, observedActiveThreadCount: 0))
+    }
+
+    func testCodexAgentMonitorPolicySkipsAppMonitorDuringUnitTests() throws {
+        XCTAssertFalse(CodexAgentMonitorPolicy.shouldStartAppMonitor(isRunningTests: true))
+        XCTAssertTrue(CodexAgentMonitorPolicy.shouldStartAppMonitor(isRunningTests: false))
+    }
+
     @MainActor
     func testCodexViewModelAppendsTranscriptionToExistingPrompt() throws {
         let viewModel = CodexConsoleViewModel(
@@ -923,6 +1507,42 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(ClientIdentityStore.isPreferredClientCertificateName(" IPHONE "))
         XCTAssertFalse(ClientIdentityStore.isPreferredClientCertificateName("parikshit-mac"))
         XCTAssertFalse(ClientIdentityStore.isPreferredClientCertificateName("client"))
+    }
+
+    func testCodexMarkdownParserBuildsBlockProseForHeadingsAndLists() throws {
+        let blocks = CodexMarkdownParser.proseBlocks(
+            from: """
+            ## POC Vault
+
+            This is a **private iOS POC vault**.
+
+            ### Architecture
+
+            - **Backend:** EC2 VM running nginx
+            - POCs: Static files in `pocs/<slug>/public/`
+            1. Render manifest
+            2. Sign manifest
+            """
+        )
+
+        XCTAssertEqual(blocks.map(\.kind), [
+            .heading(level: 2),
+            .paragraph,
+            .heading(level: 3),
+            .bullet,
+            .bullet,
+            .numbered(index: 1),
+            .numbered(index: 2)
+        ])
+        XCTAssertEqual(blocks.map(\.text), [
+            "POC Vault",
+            "This is a **private iOS POC vault**.",
+            "Architecture",
+            "**Backend:** EC2 VM running nginx",
+            "POCs: Static files in `pocs/<slug>/public/`",
+            "Render manifest",
+            "Sign manifest"
+        ])
     }
 
     private func decodeCodexJob(_ json: String) throws -> CodexJob {
