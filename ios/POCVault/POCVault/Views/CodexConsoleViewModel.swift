@@ -7,6 +7,8 @@ struct CodexCompletionSignal: Equatable {
     let body: String
     let jobID: String?
     let sessionID: String?
+    let workspaceID: String?
+    let provider: CodexProvider
 
     var notificationIdentifier: String {
         "codex-completion-\(key.replacingOccurrences(of: ":", with: "-"))"
@@ -39,7 +41,9 @@ struct CodexCompletionSignal: Equatable {
                     subject: subject(from: job.prompt, fallback: job.workspaceName ?? job.workspaceId ?? "your \(job.provider.displayName) run")
                 ),
                 jobID: job.id,
-                sessionID: job.threadSessionId
+                sessionID: job.threadSessionId,
+                workspaceID: job.workspaceId,
+                provider: job.provider
             )
         }
     }
@@ -64,7 +68,9 @@ struct CodexCompletionSignal: Equatable {
                 title: title(for: status, provider: thread.provider),
                 body: body(for: status, provider: thread.provider, subject: subject(from: thread.lastPrompt, fallback: thread.workspaceLabel)),
                 jobID: thread.lastJobId,
-                sessionID: thread.sessionId
+                sessionID: thread.sessionId,
+                workspaceID: thread.workspaceId,
+                provider: thread.provider
             )
         }
     }
@@ -127,15 +133,50 @@ struct CodexNoopCompletionNotifier: CodexCompletionNotifying {
     func sendCompletionNotification(_ signal: CodexCompletionSignal) async {}
 }
 
+struct CodexNotificationReply: Equatable {
+    let text: String
+    let sessionID: String
+    let workspaceID: String?
+    let provider: CodexProvider
+}
+
 final class CodexLocalNotificationService: NSObject, CodexCompletionNotifying, UNUserNotificationCenterDelegate {
+    private enum Constants {
+        static let categoryIdentifier = "CODEX_THREAD_COMPLETION"
+        static let replyActionIdentifier = "CODEX_THREAD_REPLY"
+    }
+
     private let center: UNUserNotificationCenter
     private var preparedAuthorization = false
     private var canSendNotifications = false
+    private var replyHandler: (@MainActor (CodexNotificationReply) async -> Void)?
 
     init(center: UNUserNotificationCenter = .current()) {
         self.center = center
         super.init()
         center.delegate = self
+        registerNotificationCategories()
+    }
+
+    func setReplyHandler(_ handler: @escaping @MainActor (CodexNotificationReply) async -> Void) {
+        replyHandler = handler
+    }
+
+    private func registerNotificationCategories() {
+        let replyAction = UNTextInputNotificationAction(
+            identifier: Constants.replyActionIdentifier,
+            title: "Reply",
+            options: [],
+            textInputButtonTitle: "Send",
+            textInputPlaceholder: "Reply to this thread"
+        )
+        let category = UNNotificationCategory(
+            identifier: Constants.categoryIdentifier,
+            actions: [replyAction],
+            intentIdentifiers: [],
+            options: []
+        )
+        center.setNotificationCategories([category])
     }
 
     func prepareForNotifications() async {
@@ -164,10 +205,13 @@ final class CodexLocalNotificationService: NSObject, CodexCompletionNotifying, U
         content.body = signal.body
         content.sound = .default
         content.threadIdentifier = signal.threadIdentifier
+        content.categoryIdentifier = Constants.categoryIdentifier
         content.userInfo = [
             "codexCompletionKey": signal.key,
             "codexJobID": signal.jobID ?? "",
-            "codexSessionID": signal.sessionID ?? ""
+            "codexSessionID": signal.sessionID ?? "",
+            "codexWorkspaceID": signal.workspaceID ?? "",
+            "codexProvider": signal.provider.rawValue
         ]
 
         let request = UNNotificationRequest(
@@ -184,6 +228,53 @@ final class CodexLocalNotificationService: NSObject, CodexCompletionNotifying, U
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
         completionHandler([.banner, .list, .sound])
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        guard response.actionIdentifier == Constants.replyActionIdentifier,
+              let textResponse = response as? UNTextInputNotificationResponse else {
+            completionHandler()
+            return
+        }
+
+        let text = textResponse.userText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else {
+            completionHandler()
+            return
+        }
+
+        let userInfo = response.notification.request.content.userInfo
+        guard let sessionID = (userInfo["codexSessionID"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !sessionID.isEmpty else {
+            completionHandler()
+            return
+        }
+
+        let workspaceID = (userInfo["codexWorkspaceID"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+        let provider = CodexProvider(rawProvider: userInfo["codexProvider"] as? String)
+        let reply = CodexNotificationReply(
+            text: text,
+            sessionID: sessionID,
+            workspaceID: workspaceID,
+            provider: provider
+        )
+
+        Task { [replyHandler] in
+            await replyHandler?(reply)
+            completionHandler()
+        }
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
     }
 }
 
@@ -230,6 +321,7 @@ final class CodexConsoleViewModel: ObservableObject {
 
     @Published private(set) var health: CodexHealth?
     @Published private(set) var workspaces: [CodexWorkspace] = []
+    @Published private(set) var availableSkills: [CodexSkill] = []
     @Published private(set) var sessions: [CodexSession] = []
     @Published private(set) var threads: [CodexThread] = []
     @Published private(set) var jobs: [CodexJob] = []
@@ -251,6 +343,7 @@ final class CodexConsoleViewModel: ObservableObject {
     @Published var selectedModel = CodexProvider.defaultProvider.defaultModel
     @Published var selectedReasoningEffort: CodexReasoningEffort = CodexProvider.defaultProvider.defaultReasoningEffort
     @Published var selectedRunMode: CodexRunMode = .quality
+    @Published var selectedClaudePermissionMode: ClaudePermissionMode = .auto
     @Published private(set) var attachments: [CodexJobAttachment] = []
     @Published private(set) var selectedSkills: [CodexSkill] = []
     @Published var errorMessage: String?
@@ -418,7 +511,7 @@ final class CodexConsoleViewModel: ObservableObject {
     }
 
     func toggleSkill(_ skill: CodexSkill) {
-        if let index = selectedSkills.firstIndex(of: skill) {
+        if let index = selectedSkills.firstIndex(where: { $0.id == skill.id }) {
             selectedSkills.remove(at: index)
         } else {
             selectedSkills.append(skill)
@@ -426,7 +519,7 @@ final class CodexConsoleViewModel: ObservableObject {
     }
 
     func removeSkill(_ skill: CodexSkill) {
-        selectedSkills.removeAll { $0 == skill }
+        selectedSkills.removeAll { $0.id == skill.id }
     }
 
     func makeAttachment(
@@ -521,6 +614,7 @@ final class CodexConsoleViewModel: ObservableObject {
         let previouslyActiveThreadIDs = observedActiveThreadIDs.union(activeThreadIDs(in: threads))
 
         async let workspaceRequest = client.fetchWorkspaces()
+        async let skillRequest = client.fetchSkills(provider: provider)
         async let jobRequest = client.fetchJobs(provider: provider, limit: 10)
         async let sessionRequest = client.fetchSessions(provider: provider, limit: 50)
         async let threadRequest = client.fetchThreads(provider: provider, limit: 50)
@@ -538,6 +632,19 @@ final class CodexConsoleViewModel: ObservableObject {
         } catch {
             if Self.isCancellation(error) { return }
             refreshErrors.append(error)
+        }
+
+        do {
+            let skillResponse = try await skillRequest
+            availableSkills = Self.sortedSkills(skillResponse)
+            selectedSkills.removeAll { skill in
+                !availableSkills.contains(where: { $0.id == skill.id })
+            }
+        } catch {
+            if Self.isCancellation(error) { return }
+            if availableSkills.isEmpty, Self.isHTTPNotFound(error) {
+                availableSkills = []
+            }
         }
 
         do {
@@ -701,11 +808,11 @@ final class CodexConsoleViewModel: ObservableObject {
             return nil
         }
         let basePrompt = trimmedPrompt.isEmpty ? "Please inspect the attached file(s)." : trimmedPrompt
-        let promptForJob = Self.prompt(basePrompt, applying: selectedSkills, provider: provider)
         let newJobID = await createJob(
             workspaceID: composeWorkspaceID,
-            prompt: promptForJob,
+            prompt: basePrompt,
             timeoutMs: timeoutMs,
+            skillIDs: selectedSkills.map(\.id),
             attachments: attachments,
             resumeSessionID: selectedSessionID
         )
@@ -735,6 +842,7 @@ final class CodexConsoleViewModel: ObservableObject {
             workspaceID: workspaceID,
             prompt: prompt,
             timeoutMs: job.timeoutMs ?? timeoutMs,
+            skillIDs: job.skills,
             resumeSessionID: job.threadSessionId
         )
     }
@@ -793,11 +901,11 @@ final class CodexConsoleViewModel: ObservableObject {
         }
 
         let basePrompt = trimmedPrompt.isEmpty ? "Please inspect the attached file(s)." : trimmedPrompt
-        let promptForJob = Self.prompt(basePrompt, applying: selectedSkills, provider: provider)
         let newJobID = await createJob(
             workspaceID: resolvedWorkspaceID,
-            prompt: promptForJob,
+            prompt: basePrompt,
             timeoutMs: timeoutMs,
+            skillIDs: selectedSkills.map(\.id),
             attachments: attachments,
             resumeSessionID: sessionID
         )
@@ -805,6 +913,19 @@ final class CodexConsoleViewModel: ObservableObject {
             selectedSkills = []
         }
         return newJobID
+    }
+
+    func createNotificationReply(_ reply: CodexNotificationReply) async -> String? {
+        guard reply.provider == provider else {
+            errorMessage = "This notification belongs to \(reply.provider.displayName)."
+            return nil
+        }
+
+        return await createFollowUpWithoutSelectedSkills(
+            prompt: reply.text,
+            sessionID: reply.sessionID,
+            workspaceID: reply.workspaceID
+        )
     }
 
     func cancel(id: String) async {
@@ -827,6 +948,7 @@ final class CodexConsoleViewModel: ObservableObject {
         workspaceID: String,
         prompt: String,
         timeoutMs: Int?,
+        skillIDs: [String] = [],
         attachments: [CodexJobAttachment] = [],
         resumeSessionID: String? = nil
     ) async -> String? {
@@ -842,6 +964,8 @@ final class CodexConsoleViewModel: ObservableObject {
                     model: selectedModel,
                     reasoningEffort: effectiveReasoningEffort.rawValue,
                     provider: provider,
+                    permissionMode: provider == .claude ? selectedClaudePermissionMode : nil,
+                    skills: skillIDs,
                     attachments: attachments,
                     resumeSessionId: resumeSessionID
                 )
@@ -866,6 +990,39 @@ final class CodexConsoleViewModel: ObservableObject {
             errorMessage = error.localizedDescription
             return nil
         }
+    }
+
+    private func createFollowUpWithoutSelectedSkills(
+        prompt: String,
+        sessionID: String,
+        workspaceID: String?
+    ) async -> String? {
+        let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedPrompt.isEmpty else {
+            errorMessage = "Add a reply before continuing this thread."
+            return nil
+        }
+
+        let resolvedWorkspaceID: String
+        if let trimmedWorkspaceID = workspaceID?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !trimmedWorkspaceID.isEmpty {
+            resolvedWorkspaceID = trimmedWorkspaceID
+        } else if let selectedThread = threads.first(where: { $0.sessionId == sessionID || $0.id == sessionID }),
+                  let threadWorkspaceID = selectedThread.workspaceId?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !threadWorkspaceID.isEmpty {
+            resolvedWorkspaceID = threadWorkspaceID
+        } else {
+            resolvedWorkspaceID = composeWorkspaceID
+        }
+
+        return await createJob(
+            workspaceID: resolvedWorkspaceID,
+            prompt: trimmedPrompt,
+            timeoutMs: timeoutMs,
+            skillIDs: [],
+            attachments: [],
+            resumeSessionID: sessionID
+        )
     }
 
     private func connectionFailureMessage(connectedMessage: String) -> String {
@@ -1007,10 +1164,16 @@ final class CodexConsoleViewModel: ObservableObject {
         }
     }
 
-    private static func prompt(_ prompt: String, applying skills: [CodexSkill], provider: CodexProvider) -> String {
-        guard !skills.isEmpty else { return prompt }
-        let names = skills.map(\.id).joined(separator: ", ")
-        return "Use these \(provider.displayName) skills for this task: \(names).\n\n\(prompt)"
+    private static func sortedSkills(_ skills: [CodexSkill]) -> [CodexSkill] {
+        skills.sorted {
+            if $0.group != $1.group {
+                return $0.group < $1.group
+            }
+            if $0.title != $1.title {
+                return $0.title < $1.title
+            }
+            return $0.id < $1.id
+        }
     }
 
     private var effectiveReasoningEffort: CodexReasoningEffort {
@@ -1020,42 +1183,4 @@ final class CodexConsoleViewModel: ObservableObject {
     private static let maxAttachmentCount = 6
     private static let maxAttachmentBytes = 8 * 1_048_576
     private static let maxAttachmentTotalBytes = 18 * 1_048_576
-}
-
-struct CodexSkill: Identifiable, Hashable {
-    let id: String
-    let title: String
-    let group: String
-    let summary: String
-
-    var searchText: String {
-        "\(id) \(title) \(group) \(summary)".lowercased()
-    }
-
-    static let all: [CodexSkill] = [
-        CodexSkill(id: "poc-vault-deploy", title: "POC deploy", group: "Library", summary: "Create, host, publish, or deploy private POCs."),
-        CodexSkill(id: "browser", title: "In-app browser", group: "Browser", summary: "Open and test local web targets in Codex."),
-        CodexSkill(id: "chrome", title: "Chrome", group: "Browser", summary: "Use logged-in Chrome sessions and existing tabs."),
-        CodexSkill(id: "computer-use", title: "Computer use", group: "Desktop", summary: "Operate local Mac apps by clicking and typing."),
-        CodexSkill(id: "github:github", title: "GitHub", group: "Code", summary: "Inspect repositories, PRs, issues, and context."),
-        CodexSkill(id: "github:gh-address-comments", title: "Address PR comments", group: "Code", summary: "Find and address GitHub review feedback."),
-        CodexSkill(id: "github:gh-fix-ci", title: "Fix CI", group: "Code", summary: "Debug failing GitHub Actions checks."),
-        CodexSkill(id: "github:yeet", title: "Publish PR", group: "Code", summary: "Commit, push, and open a draft PR."),
-        CodexSkill(id: "linear", title: "Linear", group: "Planning", summary: "Read, create, and update Linear issues."),
-        CodexSkill(id: "slack:slack", title: "Slack", group: "Comms", summary: "Read Slack context and route Slack work."),
-        CodexSkill(id: "slack:slack-outgoing-message", title: "Slack message", group: "Comms", summary: "Draft or send outbound Slack content."),
-        CodexSkill(id: "gmail:gmail", title: "Gmail", group: "Comms", summary: "Search, summarize, draft, and triage email."),
-        CodexSkill(id: "google-calendar:google-calendar", title: "Calendar", group: "Scheduling", summary: "Inspect availability and manage events."),
-        CodexSkill(id: "notion:notion-research-documentation", title: "Notion research", group: "Docs", summary: "Research Notion sources into documentation."),
-        CodexSkill(id: "documents:documents", title: "Documents", group: "Artifacts", summary: "Create and edit Word or docx artifacts."),
-        CodexSkill(id: "spreadsheets:Spreadsheets", title: "Spreadsheets", group: "Artifacts", summary: "Create, analyze, and format spreadsheet files."),
-        CodexSkill(id: "presentations:Presentations", title: "Presentations", group: "Artifacts", summary: "Build and verify slide decks."),
-        CodexSkill(id: "pdf", title: "PDF", group: "Artifacts", summary: "Read, render, create, and review PDFs."),
-        CodexSkill(id: "imagegen", title: "Image generation", group: "Media", summary: "Generate or edit raster images."),
-        CodexSkill(id: "figma", title: "Figma", group: "Design", summary: "Fetch design context and translate Figma nodes."),
-        CodexSkill(id: "frontend-skill", title: "Frontend UI", group: "Design", summary: "Build visually strong app and web UI."),
-        CodexSkill(id: "ui-ux-pro-max", title: "UI/UX research", group: "Design", summary: "Use UI and UX design intelligence."),
-        CodexSkill(id: "human-code-review", title: "Human review wording", group: "Writing", summary: "Make technical feedback sound natural."),
-        CodexSkill(id: "openai-docs", title: "OpenAI docs", group: "Research", summary: "Use current official OpenAI API documentation.")
-    ]
 }

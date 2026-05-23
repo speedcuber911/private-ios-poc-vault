@@ -61,7 +61,7 @@ xcodebuild build \
   POC_VAULT_MANIFEST_PUBLIC_KEY="$POC_VAULT_MANIFEST_PUBLIC_KEY" \
   CODE_SIGNING_ALLOWED=NO >/tmp/poc-vault-simulator-build.log
 
-APP_PATH="$ROOT/ios/POCVault/build/Debug-iphonesimulator/POC Vault.app"
+APP_PATH="$ROOT/ios/POCVault/build/Debug-iphonesimulator/Relay.app"
 xcrun simctl terminate "$SIM_ID" "$BUNDLE_ID" >/dev/null 2>&1 || true
 xcrun simctl uninstall "$SIM_ID" "$BUNDLE_ID" >/dev/null 2>&1 || true
 xcrun simctl install "$SIM_ID" "$APP_PATH"

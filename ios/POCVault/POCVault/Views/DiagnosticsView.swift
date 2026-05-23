@@ -11,8 +11,8 @@ struct DiagnosticsView: View {
     @State private var importError: String?
     @State private var isImportExpanded = false
 
-    private let contentHorizontalPadding: CGFloat = 18
-    private let cardCornerRadius: CGFloat = 14
+    private let contentHorizontalPadding: CGFloat = AppTheme.screenHorizontalPadding
+    private let cardCornerRadius: CGFloat = AppTheme.cardRadius
 
     var body: some View {
         NavigationStack {
@@ -22,19 +22,19 @@ struct DiagnosticsView: View {
                     VStack(alignment: .leading, spacing: 16) {
                         VStack(alignment: .leading, spacing: 6) {
                             Text(screenTitle)
-                                .font(.system(size: showsNavigationChrome ? 34 : 34, weight: .bold, design: .rounded))
+                                .font(AppTheme.screenTitleFont)
                                 .foregroundStyle(AppTheme.textPrimary)
                             Text(AppConfiguration.runtimeMode)
-                                .font(.subheadline.weight(.medium))
+                                .font(AppTheme.bodyFont)
                                 .foregroundStyle(AppTheme.textSecondary)
                         }
-                        .padding(.top, showsNavigationChrome ? 18 : 16)
+                        .padding(.top, AppTheme.screenTopPadding)
 
                         certificatePanel
 
                         VStack(alignment: .leading, spacing: 12) {
                             Text("Checks")
-                                .font(.headline.weight(.bold))
+                                .font(AppTheme.cardTitleFont)
                                 .foregroundStyle(AppTheme.textPrimary)
                             ForEach(checks) { check in
                                 DiagnosticRow(check: check)
@@ -45,10 +45,10 @@ struct DiagnosticsView: View {
                         .diagnosticCard(cornerRadius: cardCornerRadius)
                     }
                     .padding(.horizontal, contentHorizontalPadding)
-                    .padding(.bottom, showsNavigationChrome ? 28 : 190)
+                    .padding(.bottom, showsNavigationChrome ? 28 : AppTheme.tabBarClearance)
                 }
             }
-            .navigationTitle(showsNavigationChrome ? "Diagnostics" : "")
+            .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 if showsNavigationChrome {
@@ -213,10 +213,10 @@ struct DiagnosticsView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
-                    .font(.headline.weight(.bold))
+                    .font(AppTheme.cardTitleFont)
                     .foregroundStyle(AppTheme.textPrimary)
                 Text(detail)
-                    .font(.subheadline.weight(.medium))
+                    .font(AppTheme.bodyFont)
                     .foregroundStyle(AppTheme.textSecondary)
             }
 
@@ -236,9 +236,9 @@ struct DiagnosticsView: View {
             .foregroundStyle(AppTheme.textPrimary)
             .padding(.horizontal, 12)
             .frame(height: 42)
-            .background(AppTheme.bgSurfaceHi, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .background(AppTheme.bgSurfaceHi, in: RoundedRectangle(cornerRadius: AppTheme.controlRadius, style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                RoundedRectangle(cornerRadius: AppTheme.controlRadius, style: .continuous)
                     .stroke(AppTheme.strokeSubtle, lineWidth: 1)
             }
 
@@ -252,7 +252,7 @@ struct DiagnosticsView: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(Color.black.opacity(0.82))
-            .background(AppTheme.accent, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .background(AppTheme.accent, in: RoundedRectangle(cornerRadius: AppTheme.controlRadius, style: .continuous))
 
             if let importError {
                 Text(importError)
@@ -290,10 +290,10 @@ private struct DiagnosticRow: View {
                 .frame(width: 24, height: 24, alignment: .top)
             VStack(alignment: .leading, spacing: 3) {
                 Text(check.title)
-                    .font(.subheadline.weight(.semibold))
+                    .font(AppTheme.cardTitleFont)
                     .foregroundStyle(AppTheme.textPrimary)
                 Text(check.detail)
-                    .font(.footnote)
+                    .font(.caption.weight(.medium))
                     .foregroundStyle(AppTheme.textSecondary)
                     .lineLimit(2)
                     .truncationMode(.middle)

@@ -17,6 +17,12 @@ struct CodexConsoleView: View {
                         VStack(alignment: .leading, spacing: 20) {
                             CodexHeader(viewModel: viewModel)
 
+                            if let errorMessage = viewModel.errorMessage {
+                                CodexErrorCard(summary: CodexErrorSummary(message: errorMessage)) {
+                                    Task { await viewModel.refreshAll() }
+                                }
+                            }
+
                             CodexPromptCard(
                                 viewModel: viewModel,
                                 onCreated: { jobID in
@@ -29,22 +35,21 @@ struct CodexConsoleView: View {
                                 onOpenJob: { jobID in path.append(.job(jobID)) }
                             )
 
-                            if let errorMessage = viewModel.errorMessage {
-                                CodexErrorCard(summary: CodexErrorSummary(message: errorMessage)) {
-                                    Task { await viewModel.refreshAll() }
-                                }
-                            }
-
                             CodexThreadFeedSection(
                                 viewModel: viewModel,
                                 onOpenThread: { sessionID in path.append(.thread(sessionID)) },
                                 onOpenJob: { jobID in path.append(.job(jobID)) }
                             )
                         }
-                        .padding(.horizontal, 20)
-                        .padding(.top, 8)
-                        .padding(.bottom, 132)
+                        .padding(.horizontal, AppTheme.screenHorizontalPadding)
+                        .padding(.top, AppTheme.screenTopPadding)
+                        .padding(.bottom, 28)
                         .frame(width: proxy.size.width, alignment: .leading)
+                    }
+                    .safeAreaInset(edge: .bottom) {
+                        Color.clear
+                            .frame(height: AppTheme.tabBarClearance)
+                            .allowsHitTesting(false)
                     }
                     .scrollDismissesKeyboard(.interactively)
                 }
@@ -114,7 +119,7 @@ private struct CodexHeader: View {
                 }
 
             Text(viewModel.provider.displayName)
-                .font(.title3.weight(.semibold))
+                .font(AppTheme.screenTitleFont)
                 .foregroundStyle(CodexTheme.text)
 
             Spacer()
@@ -125,7 +130,7 @@ private struct CodexHeader: View {
                 Image(systemName: "arrow.clockwise")
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(CodexTheme.text)
-                    .frame(width: 36, height: 36)
+                    .frame(width: AppTheme.iconButtonSize, height: AppTheme.iconButtonSize)
                     .background(CodexTheme.raisedPanel, in: Circle())
                     .overlay {
                         Circle().stroke(CodexTheme.stroke, lineWidth: 1)
@@ -155,10 +160,10 @@ private struct CodexPromptCard: View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 6) {
                 Text(viewModel.selectedSessionID == nil ? "What should \(viewModel.provider.displayName) do?" : "Continue this thread")
-                    .font(.title2.weight(.semibold))
+                    .font(AppTheme.panelTitleFont)
                     .foregroundStyle(CodexTheme.text)
                 Text(contextText)
-                    .font(.subheadline.weight(.medium))
+                    .font(AppTheme.bodyFont)
                     .foregroundStyle(CodexTheme.dim)
                     .lineLimit(2)
             }
@@ -166,7 +171,7 @@ private struct CodexPromptCard: View {
             CodexControlStrip(
                 viewModel: viewModel,
                 skillCount: viewModel.selectedSkills.count,
-                showsSkillControls: viewModel.provider == .codex
+                showsSkillControls: true
             ) {
                 showingSkillPicker = true
             }
@@ -175,7 +180,7 @@ private struct CodexPromptCard: View {
                 showingThreadPicker = true
             }
 
-            if viewModel.provider == .codex && !viewModel.selectedSkills.isEmpty {
+            if !viewModel.selectedSkills.isEmpty {
                 CodexSelectedSkillStrip(viewModel: viewModel)
             }
 
@@ -196,7 +201,7 @@ private struct CodexPromptCard: View {
                     .textInputAutocapitalization(.sentences)
                     .autocorrectionDisabled()
                     .focused($promptIsFocused)
-                    .frame(minHeight: 220, maxHeight: 300)
+                    .frame(minHeight: 168, maxHeight: 260)
                     .background(Color.clear)
             }
 
@@ -237,7 +242,7 @@ private struct CodexPromptCard: View {
                                 .foregroundStyle(audioRecorder.isRecording ? Color.white : CodexTheme.text)
                         }
                     }
-                    .frame(width: 44, height: 44)
+                    .frame(width: AppTheme.touchTargetSize, height: AppTheme.touchTargetSize)
                     .background(audioRecorder.isRecording ? AppTheme.statusError : CodexTheme.raisedPanel, in: Circle())
                     .overlay {
                         Circle().stroke(CodexTheme.stroke, lineWidth: 1)
@@ -262,7 +267,7 @@ private struct CodexPromptCard: View {
                         .foregroundStyle(canCreate ? AppTheme.bgCanvas : CodexTheme.dim)
                         .padding(.horizontal, 18)
                         .frame(minWidth: 104)
-                        .frame(height: 44)
+                        .frame(height: AppTheme.touchTargetSize)
                         .background((canCreate ? CodexTheme.accent : CodexTheme.raisedPanel), in: Capsule())
                 }
                 .buttonStyle(.plain)
@@ -270,10 +275,10 @@ private struct CodexPromptCard: View {
             }
 
         }
-        .padding(18)
-        .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .padding(AppTheme.cardPadding)
+        .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: AppTheme.cardRadius, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
+            RoundedRectangle(cornerRadius: AppTheme.cardRadius, style: .continuous)
                 .stroke(CodexTheme.stroke, lineWidth: 1)
         }
         .toolbar {
@@ -806,9 +811,9 @@ struct CodexControlStripLayout: Equatable {
     let showsRunMode: Bool
 
     init(provider: CodexProvider) {
-        showsSkillButton = provider == .codex
-        reservesSkillSlot = provider != .codex
-        showsRunMode = provider == .codex
+        showsSkillButton = true
+        reservesSkillSlot = false
+        showsRunMode = true
     }
 }
 
@@ -835,7 +840,7 @@ private struct CodexControlStrip: View {
             HStack(spacing: 10) {
                 modelMenu
                 if layout.showsRunMode {
-                    modeMenu
+                    providerModeMenu
                 }
                 Spacer(minLength: 0)
             }
@@ -849,9 +854,9 @@ private struct CodexControlStrip: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(CodexTheme.raisedPanel, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background(CodexTheme.raisedPanel, in: RoundedRectangle(cornerRadius: AppTheme.compactRadius, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
+            RoundedRectangle(cornerRadius: AppTheme.compactRadius, style: .continuous)
                 .stroke(CodexTheme.stroke, lineWidth: 1)
         }
     }
@@ -864,9 +869,9 @@ private struct CodexControlStrip: View {
         Button(action: onSkillsTapped) {
             HStack(spacing: 8) {
                 Image(systemName: "sparkles")
-                    .font(.caption.weight(.bold))
+                    .font(AppTheme.sectionLabelFont)
                 Text(skillCount == 0 ? "Skills" : "\(skillCount) skills")
-                    .font(.caption.weight(.bold))
+                    .font(AppTheme.sectionLabelFont)
                     .lineLimit(1)
                 Image(systemName: "plus")
                     .font(.caption2.weight(.bold))
@@ -899,9 +904,9 @@ private struct CodexControlStrip: View {
         } label: {
             HStack(spacing: 8) {
                 Image(systemName: "cpu")
-                    .font(.caption.weight(.bold))
+                    .font(AppTheme.sectionLabelFont)
                 Text(viewModel.selectedModel)
-                    .font(.caption.weight(.bold))
+                    .font(AppTheme.sectionLabelFont)
                     .lineLimit(1)
                     .minimumScaleFactor(0.76)
                 Image(systemName: "chevron.down")
@@ -933,9 +938,9 @@ private struct CodexControlStrip: View {
         } label: {
             HStack(spacing: 8) {
                 Image(systemName: "slider.horizontal.3")
-                    .font(.caption.weight(.bold))
+                    .font(AppTheme.sectionLabelFont)
                 Text(viewModel.selectedReasoningEffort.label)
-                    .font(.caption.weight(.bold))
+                    .font(AppTheme.sectionLabelFont)
                     .lineLimit(1)
                     .minimumScaleFactor(0.82)
                 Image(systemName: "chevron.down")
@@ -968,9 +973,9 @@ private struct CodexControlStrip: View {
         } label: {
             HStack(spacing: 8) {
                 Image(systemName: viewModel.selectedRunMode == .speed ? "bolt.fill" : "dial.medium")
-                    .font(.caption.weight(.bold))
+                    .font(AppTheme.sectionLabelFont)
                 Text(viewModel.selectedRunMode.label)
-                    .font(.caption.weight(.bold))
+                    .font(AppTheme.sectionLabelFont)
                     .lineLimit(1)
                     .minimumScaleFactor(0.82)
                 Image(systemName: "chevron.down")
@@ -986,6 +991,53 @@ private struct CodexControlStrip: View {
         .accessibilityLabel("Choose Codex run mode")
         .accessibilityValue(viewModel.selectedRunMode.label)
     }
+
+    @ViewBuilder
+    private var providerModeMenu: some View {
+        if viewModel.provider == .claude {
+            claudePermissionModeMenu
+        } else {
+            modeMenu
+        }
+    }
+
+    private var claudePermissionModeMenu: some View {
+        Menu {
+            ForEach(ClaudePermissionMode.allCases) { mode in
+                Button {
+                    viewModel.selectedClaudePermissionMode = mode
+                } label: {
+                    if mode == viewModel.selectedClaudePermissionMode {
+                        Label(mode.label, systemImage: "checkmark")
+                    } else {
+                        Text(mode.label)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: viewModel.selectedClaudePermissionMode == .plan ? "doc.text.magnifyingglass" : "shield.lefthalf.filled")
+                    .font(AppTheme.sectionLabelFont)
+                Text(viewModel.selectedClaudePermissionMode.label)
+                    .font(AppTheme.sectionLabelFont)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.82)
+                Image(systemName: "chevron.down")
+                    .font(.caption2.weight(.bold))
+            }
+            .foregroundStyle(viewModel.selectedClaudePermissionMode == .bypassPermissions ? AppTheme.bgCanvas : CodexTheme.text)
+            .padding(.horizontal, 12)
+            .frame(minWidth: 118, alignment: .leading)
+            .frame(height: 36)
+            .background(
+                viewModel.selectedClaudePermissionMode == .bypassPermissions ? CodexTheme.accent : CodexTheme.raisedPanel,
+                in: Capsule()
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Choose Claude permission mode")
+        .accessibilityValue(viewModel.selectedClaudePermissionMode.label)
+    }
 }
 
 private struct CodexSelectedSkillStrip: View {
@@ -999,9 +1051,11 @@ private struct CodexSelectedSkillStrip: View {
                         viewModel.removeSkill(skill)
                     } label: {
                         HStack(spacing: 6) {
-                            Text(skill.id)
+                            Text(skill.chipLabel)
                                 .font(.caption.weight(.bold))
                                 .lineLimit(1)
+                                .minimumScaleFactor(0.82)
+                                .frame(maxWidth: 190, alignment: .leading)
                             Image(systemName: "xmark")
                                 .font(.caption2.weight(.bold))
                         }
@@ -1011,7 +1065,7 @@ private struct CodexSelectedSkillStrip: View {
                         .background(CodexTheme.accent, in: Capsule())
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("Remove \(skill.id)")
+                    .accessibilityLabel("Remove \(skill.chipLabel)")
                 }
             }
             .padding(.vertical, 2)
@@ -1050,7 +1104,7 @@ private struct CodexAttachmentMenu: View {
             Image(systemName: "paperclip")
                 .font(.system(size: 15, weight: .bold))
                 .foregroundStyle(disabled ? CodexTheme.dim : CodexTheme.text)
-                .frame(width: 44, height: 44)
+                .frame(width: AppTheme.touchTargetSize, height: AppTheme.touchTargetSize)
                 .background(CodexTheme.raisedPanel, in: Circle())
                 .overlay {
                     Circle().stroke(CodexTheme.stroke, lineWidth: 1)
@@ -1188,8 +1242,8 @@ private struct CodexSkillPickerSheet: View {
 
     private var filteredSkills: [CodexSkill] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !query.isEmpty else { return CodexSkill.all }
-        return CodexSkill.all.filter { $0.searchText.contains(query) }
+        guard !query.isEmpty else { return viewModel.availableSkills }
+        return viewModel.availableSkills.filter { $0.searchText.contains(query) }
     }
 
     private var groupedSkills: [(String, [CodexSkill])] {
@@ -1203,10 +1257,10 @@ private struct CodexSkillPickerSheet: View {
             List {
                 if filteredSkills.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("No matches")
+                        Text(viewModel.availableSkills.isEmpty ? "No \(viewModel.provider.displayName) skills found" : "No matches")
                             .font(.headline)
                             .foregroundStyle(CodexTheme.text)
-                        Text(searchText)
+                        Text(viewModel.availableSkills.isEmpty ? "Refresh after installing skills on the runner." : searchText)
                             .font(.subheadline)
                             .foregroundStyle(CodexTheme.dim)
                             .lineLimit(1)
@@ -1373,7 +1427,7 @@ private struct CodexThreadFeedRow: View {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text(item.title)
-                            .font(.subheadline.weight(.semibold))
+                            .font(AppTheme.cardTitleFont)
                             .foregroundStyle(CodexTheme.text)
                             .lineLimit(2)
                             .fixedSize(horizontal: false, vertical: true)
@@ -1392,7 +1446,7 @@ private struct CodexThreadFeedRow: View {
                     }
 
                     Text(item.preview)
-                        .font(.subheadline)
+                        .font(AppTheme.bodyFont)
                         .foregroundStyle(CodexTheme.muted)
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1423,9 +1477,9 @@ private struct CodexThreadFeedRow: View {
                     .foregroundStyle(CodexTheme.dim)
             }
             .padding(14)
-            .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: AppTheme.cardRadius, style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                RoundedRectangle(cornerRadius: AppTheme.cardRadius, style: .continuous)
                     .stroke(isSelected ? CodexTheme.accent.opacity(0.7) : CodexTheme.stroke, lineWidth: 1)
             }
         }
@@ -1476,13 +1530,13 @@ private struct CodexErrorCard: View {
 
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Request failed")
-                        .font(.subheadline.weight(.bold))
+                        .font(AppTheme.cardTitleFont)
                         .foregroundStyle(CodexTheme.text)
                     Text(summary.statusLine)
                         .font(.system(size: 12, weight: .medium, design: .monospaced))
                         .foregroundStyle(CodexTheme.muted)
                     Text(summary.summary)
-                        .font(.callout)
+                        .font(AppTheme.bodyFont)
                         .foregroundStyle(CodexTheme.text)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -1525,17 +1579,17 @@ private struct CodexErrorCard: View {
                         .padding(12)
                 }
                 .frame(maxHeight: 220)
-                .background(CodexTheme.raisedPanel, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .background(CodexTheme.raisedPanel, in: RoundedRectangle(cornerRadius: AppTheme.controlRadius, style: .continuous))
                 .overlay {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    RoundedRectangle(cornerRadius: AppTheme.controlRadius, style: .continuous)
                         .stroke(CodexTheme.stroke, lineWidth: 1)
                 }
             }
         }
         .padding(14)
-        .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: AppTheme.cardRadius, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+            RoundedRectangle(cornerRadius: AppTheme.cardRadius, style: .continuous)
                 .stroke(AppTheme.statusError.opacity(0.42), lineWidth: 1)
         }
     }
@@ -1555,10 +1609,10 @@ private struct CodexNoticeCard: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(title)
-                    .font(.subheadline.weight(.bold))
+                    .font(AppTheme.cardTitleFont)
                     .foregroundStyle(CodexTheme.text)
                 Text(message)
-                    .font(.callout)
+                    .font(AppTheme.bodyFont)
                     .foregroundStyle(CodexTheme.muted)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -1566,9 +1620,9 @@ private struct CodexNoticeCard: View {
             Spacer(minLength: 0)
         }
         .padding(14)
-        .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: AppTheme.cardRadius, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+            RoundedRectangle(cornerRadius: AppTheme.cardRadius, style: .continuous)
                 .stroke(CodexTheme.stroke, lineWidth: 1)
         }
     }
@@ -1598,17 +1652,17 @@ private struct CodexEmptyState: View {
                 .font(.title2.weight(.semibold))
                 .foregroundStyle(CodexTheme.accent)
             Text(title)
-                .font(.headline)
+                .font(AppTheme.cardTitleFont)
                 .foregroundStyle(CodexTheme.text)
             Text(message)
-                .font(.subheadline)
+                .font(AppTheme.bodyFont)
                 .foregroundStyle(CodexTheme.muted)
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .background(CodexTheme.panel, in: RoundedRectangle(cornerRadius: AppTheme.cardRadius, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+            RoundedRectangle(cornerRadius: AppTheme.cardRadius, style: .continuous)
                 .stroke(CodexTheme.stroke, lineWidth: 1)
         }
     }
@@ -2602,13 +2656,13 @@ private struct CodexThreadComposerDock: View {
                 CodexControlStrip(
                     viewModel: viewModel,
                     skillCount: viewModel.selectedSkills.count,
-                    showsSkillControls: viewModel.provider == .codex
+                    showsSkillControls: true
                 ) {
                     showingSkillPicker = true
                 }
             }
 
-            if viewModel.provider == .codex && !viewModel.selectedSkills.isEmpty {
+            if !viewModel.selectedSkills.isEmpty {
                 CodexSelectedSkillStrip(viewModel: viewModel)
             }
 
@@ -2782,7 +2836,7 @@ private struct CodexThreadComposerDock: View {
     }
 
     private var showsExpandedControls: Bool {
-        showingOptions || expandedForTyping || !attachments.isEmpty || (viewModel.provider == .codex && !viewModel.selectedSkills.isEmpty)
+        showingOptions || expandedForTyping || !attachments.isEmpty || !viewModel.selectedSkills.isEmpty
     }
 
     private var textEditorHeight: CGFloat {
@@ -2794,7 +2848,8 @@ private struct CodexThreadComposerDock: View {
             let skillText = viewModel.selectedSkills.isEmpty ? "skills" : "\(viewModel.selectedSkills.count) skills"
             return "\(viewModel.selectedRunMode.label), \(viewModel.selectedReasoningEffort.label), \(skillText)"
         }
-        return "\(viewModel.selectedModel), \(viewModel.selectedReasoningEffort.label)"
+        let skillText = viewModel.selectedSkills.isEmpty ? "skills" : "\(viewModel.selectedSkills.count) skills"
+        return "\(viewModel.selectedClaudePermissionMode.label), \(viewModel.selectedReasoningEffort.label), \(skillText)"
     }
 
     private func toggleRecording() {
