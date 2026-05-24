@@ -76,6 +76,15 @@ Live `/v1/codex/*` routes require:
 - session/thread listing should expose metadata only, not raw transcript content
 - transcription requests should require the same mTLS boundary and must keep
   Azure Speech credentials only in server-side environment files
+- Claude/Bedrock jobs must use `CLAUDE_AWS_PROFILE=sigiq` only. Do not use
+  personal/Relay/POC Vault AWS credentials, instance-role credentials, or a
+  process-wide `AWS_PROFILE` for Claude model access.
+
+Do not request, enable, approve, or troubleshoot Anthropic/Claude Bedrock model
+access in the personal/Relay/POC Vault AWS account. Any Bedrock model-access
+request, use-case form, IAM change, marketplace subscription, or console action
+for Claude requires explicit user confirmation of the exact AWS account/profile
+first.
 
 The Codex runner must not be able to read POC Vault private material:
 

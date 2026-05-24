@@ -200,6 +200,20 @@ final class CodexClient: NSObject, URLSessionDelegate {
         return try decoder.decode(CodexThreadDetail.self, from: data)
     }
 
+    func deleteThread(sessionID: String, workspaceID: String?, provider: CodexProvider? = nil) async throws {
+        var queryItems: [URLQueryItem] = []
+        if let workspaceID, !workspaceID.isEmpty {
+            queryItems.append(URLQueryItem(name: "workspaceId", value: workspaceID))
+        }
+        appendProvider(provider, to: &queryItems)
+
+        _ = try await perform(
+            path: "/v1/codex/threads/\(Self.pathComponent(sessionID))",
+            method: "DELETE",
+            queryItems: queryItems
+        )
+    }
+
     func createJob(_ request: CodexCreateJobRequest) async throws -> CodexCreateJobResponse {
         let data = try encoder.encode(request)
         let responseData = try await perform(path: "/v1/codex/jobs", method: "POST", body: data)

@@ -102,6 +102,7 @@ Provider binaries are configured with:
 CODEX_BIN=/usr/bin/codex
 CLAUDE_BIN=/usr/bin/claude
 CLAUDE_CODE_USE_BEDROCK=1
+CLAUDE_AWS_PROFILE=sigiq
 AWS_REGION=ap-south-1
 AWS_DEFAULT_REGION=ap-south-1
 ```
@@ -110,6 +111,11 @@ Codex jobs use the existing `codex exec` / `codex exec resume` commands. Claude
 jobs run in the selected workspace, read prompts from stdin, use non-interactive
 `--print` mode, pass `--model` / `--effort` when supplied, and use
 `--session-id <uuid>` for fresh jobs or `--resume <session-id>` for follow-ups.
+With Bedrock enabled, the launcher preserves the configured AWS region for
+Claude Code; set `CLAUDE_AWS_REGION` only when it should differ from
+`AWS_REGION` / `AWS_DEFAULT_REGION`. Claude jobs must use
+`CLAUDE_AWS_PROFILE=sigiq`; the launcher does not inherit a process-wide
+`AWS_PROFILE` for Claude.
 Claude job results are captured from stdout.
 
 ## Workspaces

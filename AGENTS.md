@@ -27,6 +27,24 @@ hosting, and EC2 runner are tightly coupled.
 - For Codex server/API work, switch to
   `/Users/pariksj/Desktop/poc-vault/codex-server`.
 
+## Non-Negotiable Bedrock Guardrail
+
+Claude access for Relay is allowed only through AWS Bedrock using the SigiQ AWS
+profile. Treat this as a hard security boundary, not a convenience default.
+
+- Claude jobs must use `CLAUDE_AWS_PROFILE=sigiq`.
+- Do not let Claude inherit `AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, an EC2
+  instance role, or any personal/Relay/POC Vault AWS account credentials.
+- Do not request, enable, approve, or troubleshoot Anthropic/Claude Bedrock
+  model access in the personal/Relay/POC Vault AWS account.
+- Do not submit AWS Bedrock use-case forms, model-access requests, IAM changes,
+  marketplace subscriptions, or console changes for Claude unless the user
+  explicitly confirms the exact AWS account/profile first.
+- Personal AWS may still be used for Relay infrastructure and static POC
+  deployment. That does not make it valid for Claude/Bedrock model access.
+- If Claude/Bedrock fails and the active profile/account is not clearly SigiQ,
+  stop and report the profile mismatch instead of trying to enable models.
+
 ## Product Branding
 
 - The user-facing iOS app name is `Relay`.

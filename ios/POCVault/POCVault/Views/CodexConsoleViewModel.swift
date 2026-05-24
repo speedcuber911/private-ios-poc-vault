@@ -255,6 +255,7 @@ final class CodexConsoleViewModel: ObservableObject {
     @Published private(set) var isSelectingWorkspaceDirectory = false
     @Published private(set) var isCreatingWorkspaceDirectory = false
     @Published private(set) var cancellingJobIDs: Set<String> = []
+    @Published private(set) var deletingThreadIDs: Set<String> = []
     @Published private(set) var lastRefreshedAt: Date?
     @Published private(set) var connectionNotice: String?
     @Published var selectedWorkspaceID: String? {
@@ -461,6 +462,10 @@ final class CodexConsoleViewModel: ObservableObject {
 
     func isCancelling(_ jobID: String) -> Bool {
         cancellingJobIDs.contains(jobID)
+    }
+
+    func isDeletingThread(_ sessionID: String) -> Bool {
+        deletingThreadIDs.contains(sessionID)
     }
 
     func toggleSkill(_ skill: CodexSkill) {
@@ -958,6 +963,32 @@ final class CodexConsoleViewModel: ObservableObject {
         }
     }
 
+    func deleteThread(_ thread: CodexThread) async -> Bool {
+        guard !thread.hasActiveJobs else {
+            errorMessage = "Wait for active jobs to finish before deleting this thread."
+            return false
+        }
+        return await deleteThread(sessionID: thread.sessionId, workspaceID: thread.workspaceId)
+    }
+
+    func deleteThread(sessionID: String, workspaceID: String?) async -> Bool {
+        deletingThreadIDs.insert(sessionID)
+        defer { deletingThreadIDs.remove(sessionID) }
+
+        do {
+            try await client.deleteThread(sessionID: sessionID, workspaceID: workspaceID, provider: provider)
+            removeLocalThread(sessionID: sessionID)
+            errorMessage = nil
+            connectionNotice = nil
+            lastRefreshedAt = Date()
+            return true
+        } catch {
+            guard !Self.isCancellation(error) else { return false }
+            errorMessage = error.localizedDescription
+            return false
+        }
+    }
+
     private func createJob(
         workspaceID: String,
         prompt: String,
@@ -1080,6 +1111,16 @@ final class CodexConsoleViewModel: ObservableObject {
             observedActiveThreadIDs.insert(thread.sessionId)
         }
         lastRefreshedAt = Date()
+    }
+
+    private func removeLocalThread(sessionID: String) {
+        threads.removeAll { $0.sessionId == sessionID || $0.id == sessionID }
+        sessions.removeAll { $0.id == sessionID }
+        jobs.removeAll { $0.threadSessionId == sessionID }
+        observedActiveThreadIDs.remove(sessionID)
+        if selectedSessionID == sessionID {
+            selectedSessionID = nil
+        }
     }
 
     private func handleCompletedJobs(_ loadedJobs: [CodexJob], previouslyActiveJobIDs: Set<String>) async {

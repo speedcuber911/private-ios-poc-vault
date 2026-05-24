@@ -12,7 +12,7 @@ struct DiagnosticsView: View {
     @State private var isImportExpanded = false
 
     private var contentHorizontalPadding: CGFloat {
-        showsNavigationChrome ? 18 : 20
+        showsNavigationChrome ? 16 : 16
     }
     private let cardCornerRadius: CGFloat = 14
 
@@ -20,61 +20,100 @@ struct DiagnosticsView: View {
         NavigationStack {
             ZStack {
                 AppTheme.bgCanvas.ignoresSafeArea()
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
+                VStack(spacing: 0) {
+                    if showsNavigationChrome {
+                        diagnosticsNavBar
+                            .padding(.horizontal, 16)
+                            .padding(.top, 10)
+                            .padding(.bottom, 18)
+                    }
+
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 16) {
+                            if !showsNavigationChrome {
+                                EmptyView()
+                            }
+
                         VStack(alignment: .leading, spacing: 6) {
                             Text(screenTitle)
                                 .font(titleFont)
                                 .foregroundStyle(AppTheme.textPrimary)
                             Text(AppConfiguration.runtimeMode)
-                                .font(.subheadline.weight(.medium))
+                                .font(.system(size: 14))
                                 .foregroundStyle(AppTheme.textSecondary)
                         }
                         .padding(.top, showsNavigationChrome ? 18 : 0)
 
                         certificatePanel
 
-                        VStack(alignment: .leading, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 0) {
                             Text("Checks")
-                                .font(.headline.weight(.bold))
+                                .font(.system(size: 16, weight: .medium))
                                 .foregroundStyle(AppTheme.textPrimary)
-                            ForEach(checks) { check in
+                                .padding(.bottom, 8)
+                            ForEach(Array(checks.enumerated()), id: \.element.id) { index, check in
                                 DiagnosticRow(check: check)
+                                if index < checks.count - 1 {
+                                    Rectangle()
+                                        .fill(AppTheme.strokeSubtle)
+                                        .frame(height: 0.5)
+                                        .padding(.leading, 26)
+                                }
                             }
                         }
-                        .padding(16)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 14)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .diagnosticCard(cornerRadius: cardCornerRadius)
                     }
                     .padding(.horizontal, contentHorizontalPadding)
-                    .padding(.bottom, showsNavigationChrome ? 28 : 190)
+                    .padding(.bottom, showsNavigationChrome ? 28 : 110)
+                    }
                 }
             }
-            .navigationTitle(showsNavigationChrome ? "Diagnostics" : "")
+            .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                if showsNavigationChrome {
-                    ToolbarItem(placement: .topBarLeading) {
-                        Button("Done") {
-                            dismiss()
-                        }
-                    }
-
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button {
-                            refreshChecks()
-                        } label: {
-                            Image(systemName: "arrow.clockwise")
-                        }
-                        .accessibilityLabel("Refresh diagnostics")
-                    }
-                }
-            }
-            .toolbar(showsNavigationChrome ? .visible : .hidden, for: .navigationBar)
+            .toolbar(.hidden, for: .navigationBar)
             .refreshable {
                 refreshChecks()
             }
             .onAppear(perform: refreshAndImportFromSetupEnvironmentIfNeeded)
+        }
+    }
+
+    private var diagnosticsNavBar: some View {
+        ZStack {
+            HStack {
+                Button {
+                    dismiss()
+                } label: {
+                    Text("Done")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(AppTheme.textPrimary)
+                        .padding(.horizontal, 14)
+                        .frame(height: 32)
+                        .background(AppTheme.textPrimary.opacity(0.08), in: Capsule())
+                }
+                .buttonStyle(.plain)
+
+                Spacer()
+
+                Button {
+                    refreshChecks()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .frame(width: 32, height: 32)
+                        .background(AppTheme.bgSurface, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Refresh diagnostics")
+            }
+
+            Text("Diagnostics")
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(AppTheme.textPrimary)
         }
     }
 
@@ -162,7 +201,7 @@ struct DiagnosticsView: View {
             if isSimulatorPreview {
                 certificateHeader(
                     title: "Simulator Preview",
-                    detail: "Local signed vault at 127.0.0.1",
+                    detail: "Local signed manifest at 127.0.0.1",
                     symbol: "macwindow",
                     isPassing: true
                 )
@@ -208,17 +247,17 @@ struct DiagnosticsView: View {
     private func certificateHeader(title: String, detail: String, symbol: String, isPassing: Bool) -> some View {
         HStack(alignment: .center, spacing: 12) {
             Image(systemName: symbol)
-                .font(.system(size: 18, weight: .bold))
-                .foregroundStyle(isPassing ? AppTheme.statusOK : AppTheme.statusWarn)
-                .frame(width: 34, height: 34)
-                .background((isPassing ? AppTheme.statusOK : AppTheme.statusWarn).opacity(0.16), in: Circle())
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(AppTheme.textSecondary)
+                .frame(width: 32, height: 32)
+                .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
-                    .font(.headline.weight(.bold))
+                    .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(AppTheme.textPrimary)
                 Text(detail)
-                    .font(.subheadline.weight(.medium))
+                    .font(.system(size: 12))
                     .foregroundStyle(AppTheme.textSecondary)
             }
 
@@ -234,26 +273,22 @@ struct DiagnosticsView: View {
                 prompt: Text("P12 passphrase").foregroundColor(AppTheme.textTertiary)
             )
             .textContentType(.password)
-            .font(.subheadline.weight(.medium))
+            .font(.system(size: 14))
             .foregroundStyle(AppTheme.textPrimary)
             .padding(.horizontal, 12)
             .frame(height: 42)
-            .background(AppTheme.bgSurfaceHi, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(AppTheme.strokeSubtle, lineWidth: 1)
-            }
+            .background(AppTheme.bgCanvas, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
 
             Button {
                 importDefaultCertificate()
             } label: {
                 Label("Import certificate", systemImage: "square.and.arrow.down")
-                    .font(.subheadline.weight(.bold))
+                    .font(.system(size: 14, weight: .medium))
                     .frame(maxWidth: .infinity)
                     .frame(height: 42)
             }
             .buttonStyle(.plain)
-            .foregroundStyle(Color.black.opacity(0.82))
+            .foregroundStyle(AppTheme.bgCanvas)
             .background(AppTheme.accent, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
 
             if let importError {
@@ -275,8 +310,8 @@ struct DiagnosticsView: View {
 
     private var titleFont: Font {
         showsNavigationChrome
-            ? .system(size: 34, weight: .bold, design: .rounded)
-            : .title2.weight(.semibold)
+            ? .system(size: 28, weight: .medium, design: .serif)
+            : .system(size: 20, weight: .medium, design: .serif)
     }
 }
 
@@ -293,15 +328,15 @@ private struct DiagnosticRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: check.isPassing ? "checkmark.circle.fill" : "xmark.circle.fill")
-                .font(.system(size: 17, weight: .semibold))
+                .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(check.isPassing ? AppTheme.statusOK : AppTheme.statusError)
-                .frame(width: 24, height: 24, alignment: .top)
+                .frame(width: 18, height: 18, alignment: .top)
             VStack(alignment: .leading, spacing: 3) {
                 Text(check.title)
-                    .font(.subheadline.weight(.semibold))
+                    .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(AppTheme.textPrimary)
                 Text(check.detail)
-                    .font(.footnote)
+                    .font(.system(size: 12))
                     .foregroundStyle(AppTheme.textSecondary)
                     .lineLimit(2)
                     .truncationMode(.middle)
@@ -309,7 +344,7 @@ private struct DiagnosticRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 2)
+        .padding(.vertical, 12)
     }
 }
 
@@ -318,11 +353,7 @@ private struct DiagnosticCardModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(AppTheme.strokeSubtle, lineWidth: 1)
-            }
+            .background(AppTheme.bgSurfaceHi, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
     }
 }
 

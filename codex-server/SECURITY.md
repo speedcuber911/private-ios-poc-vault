@@ -34,6 +34,24 @@ CN=operator
 
 `/healthz` is public by design and must not expose secrets.
 
+## Claude/Bedrock Boundary
+
+Claude provider jobs may use AWS Bedrock only through the SigiQ AWS profile:
+
+```text
+CLAUDE_AWS_PROFILE=sigiq
+```
+
+Do not use personal/Relay/POC Vault AWS credentials, `AWS_PROFILE`,
+`AWS_DEFAULT_PROFILE`, EC2 instance-role credentials, or inherited shell AWS
+configuration for Claude model access.
+
+Do not request, enable, approve, or troubleshoot Anthropic/Claude Bedrock model
+access in the personal/Relay/POC Vault AWS account. Any Bedrock model-access
+request, use-case form, IAM change, marketplace subscription, or console action
+for Claude requires explicit user confirmation of the exact AWS account/profile
+first.
+
 ## Never Commit
 
 - `.p12`, `.pem`, `.key`, `.crt`, `.csr`, `.mobileconfig`

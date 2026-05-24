@@ -51,6 +51,12 @@ async function startServer(env) {
       ...process.env,
       CODEX_API_HOST: "127.0.0.1",
       CODEX_API_PORT: String(port),
+      CLAUDE_CODE_USE_BEDROCK: "",
+      CLAUDE_AWS_REGION: "",
+      CLAUDE_DEFAULT_MODEL: "",
+      CLAUDE_SONNET_MODEL: "",
+      AWS_REGION: "",
+      AWS_DEFAULT_REGION: "",
       ...env,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -286,6 +292,7 @@ async function makeArgEchoClaude(tmpDir) {
       "for arg in \"$@\"; do printf ' [%s]' \"$arg\"; done",
       "printf '\\n'",
       "printf 'claude aws profile:%s\\n' \"$AWS_PROFILE\"",
+      "printf 'claude aws region:%s\\n' \"${AWS_REGION:-}\"",
       "printf 'claude aws access:%s\\n' \"${AWS_ACCESS_KEY_ID:-}\"",
       "printf 'claude cwd:%s\\n' \"$(pwd -P)\"",
       "printf 'claude prompt:%s\\n' \"$prompt\"",
@@ -713,6 +720,114 @@ test("returns bounded thread detail with transcript messages and job previews", 
     assert.equal(body.jobs[0].sessionId, sessionId);
     assert.equal(body.jobs[0].logsIncluded, "compact");
     assert.equal(body.jobs[0].resultPreview, "job answer");
+  } finally {
+    await server.stop();
+  }
+});
+
+test("deletes a workspace-scoped Codex thread transcript and persisted jobs", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  const dataDir = path.join(tmpDir, "data");
+  const codexHome = path.join(tmpDir, "codex-home");
+  const sessionId = "019e46a6-0000-7000-8000-000000000001";
+  const jobId = "019e46a6-0000-7000-8000-000000000002";
+  await fs.mkdir(workspaceDir, { recursive: true });
+  await writeSessionFile(codexHome, sessionId, workspaceDir);
+  await writePersistedJob({
+    dataDir,
+    workspaceDir,
+    id: jobId,
+    stdout: "job stdout tail",
+    stderr: "job stderr tail",
+    result: "job answer",
+    sessionId,
+  });
+
+  const sessionFile = path.join(
+    codexHome,
+    "sessions",
+    "2026",
+    "05",
+    "20",
+    `rollout-2026-05-20T00-00-00-${sessionId}.jsonl`,
+  );
+  const jobFile = path.join(dataDir, "jobs", `${jobId}.json`);
+  const stdoutFile = path.join(dataDir, "logs", `${jobId}.stdout.log`);
+  const stderrFile = path.join(dataDir, "logs", `${jobId}.stderr.log`);
+  const resultFile = path.join(dataDir, "logs", `${jobId}.answer.md`);
+
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: dataDir,
+    CODEX_HOME: codexHome,
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_BIN: await makeFakeCodex(tmpDir),
+  });
+  try {
+    const response = await fetch(`${server.baseUrl}/v1/codex/threads/${sessionId}?workspaceId=scratch`, {
+      method: "DELETE",
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      deleted: true,
+      threadId: sessionId,
+      workspaceId: "scratch",
+      deletedJobs: 1,
+      deletedSessionFile: true,
+    });
+
+    const detail = await fetch(`${server.baseUrl}/v1/codex/threads/${sessionId}`);
+    assert.equal(detail.status, 404);
+    const deletedJob = await fetch(`${server.baseUrl}/v1/codex/jobs/${jobId}`);
+    assert.equal(deletedJob.status, 404);
+
+    await assert.rejects(fs.access(sessionFile));
+    await assert.rejects(fs.access(jobFile));
+    await assert.rejects(fs.access(stdoutFile));
+    await assert.rejects(fs.access(stderrFile));
+    await assert.rejects(fs.access(resultFile));
+  } finally {
+    await server.stop();
+  }
+});
+
+test("does not delete a thread through the wrong workspace filter", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  const otherWorkspaceDir = path.join(tmpDir, "other");
+  const dataDir = path.join(tmpDir, "data");
+  const codexHome = path.join(tmpDir, "codex-home");
+  const sessionId = "019e46a7-0000-7000-8000-000000000001";
+  await fs.mkdir(workspaceDir, { recursive: true });
+  await fs.mkdir(otherWorkspaceDir, { recursive: true });
+  await writeSessionFile(codexHome, sessionId, workspaceDir);
+  const sessionFile = path.join(
+    codexHome,
+    "sessions",
+    "2026",
+    "05",
+    "20",
+    `rollout-2026-05-20T00-00-00-${sessionId}.jsonl`,
+  );
+
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: dataDir,
+    CODEX_HOME: codexHome,
+    CODEX_WORKSPACES: JSON.stringify([
+      { id: "scratch", name: "Scratch", path: workspaceDir },
+      { id: "other", name: "Other", path: otherWorkspaceDir },
+    ]),
+    CODEX_BIN: await makeFakeCodex(tmpDir),
+  });
+  try {
+    const response = await fetch(`${server.baseUrl}/v1/codex/threads/${sessionId}?workspaceId=other`, {
+      method: "DELETE",
+    });
+    assert.equal(response.status, 404);
+    assert.match((await response.json()).error, /thread not found/);
+    await fs.access(sessionFile);
   } finally {
     await server.stop();
   }
@@ -1697,6 +1812,77 @@ test("persists providers and filters jobs, sessions, and threads by provider", a
     const codexThreadDetail = await fetch(`${server.baseUrl}/v1/codex/threads/${codexSessionId}?provider=codex`);
     assert.equal(codexThreadDetail.status, 200);
     assert.equal((await codexThreadDetail.json()).thread.provider, "codex");
+  } finally {
+    await server.stop();
+  }
+});
+
+test("passes configured AWS region to Claude jobs", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CLAUDE_CODE_USE_BEDROCK: "1",
+    AWS_REGION: "ap-south-1",
+    AWS_DEFAULT_REGION: "ap-south-1",
+    CLAUDE_BIN: await makeArgEchoClaude(tmpDir),
+  });
+  try {
+    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: "scratch",
+        provider: "claude",
+        prompt: "bedrock sonnet",
+        timeoutMs: 5000,
+      }),
+    });
+    assert.equal(create.status, 202);
+    const created = await create.json();
+    assert.equal(created.model, "sonnet");
+
+    const job = await waitForJob(server.baseUrl, created.id);
+    assert.equal(job.status, "succeeded");
+    assert.match(job.stdout, /--model\] \[sonnet\]/);
+    assert.match(job.stdout, /claude aws region:ap-south-1/);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("keeps Claude jobs on the SigiQ AWS profile when the process AWS profile differs", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    AWS_PROFILE: "personal",
+    CLAUDE_BIN: await makeArgEchoClaude(tmpDir),
+  });
+  try {
+    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: "scratch",
+        provider: "claude",
+        prompt: "use sigiq bedrock",
+        timeoutMs: 5000,
+      }),
+    });
+    assert.equal(create.status, 202);
+    const created = await create.json();
+
+    const job = await waitForJob(server.baseUrl, created.id);
+    assert.equal(job.status, "succeeded");
+    assert.match(job.stdout, /claude aws profile:sigiq/);
+    assert.doesNotMatch(job.stdout, /claude aws profile:personal/);
   } finally {
     await server.stop();
   }

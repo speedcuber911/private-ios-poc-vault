@@ -188,6 +188,249 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(layout.showsLatestRunToolbarButton)
     }
 
+    func testThreadDetailComposerIsInlineAboveRootTabBar() throws {
+        let source = try String(contentsOfFile: codexConsoleSourcePath, encoding: .utf8)
+        guard
+            let detailStart = source.range(of: "private struct CodexThreadDetailView: View"),
+            let composerStart = source.range(of: "private struct CodexThreadComposerDock: View")
+        else {
+            return XCTFail("Expected thread detail and composer views in CodexConsoleView.swift")
+        }
+
+        let detailSource = String(source[detailStart.lowerBound..<composerStart.lowerBound])
+
+        XCTAssertTrue(detailSource.contains("CodexThreadComposerDock("))
+        XCTAssertTrue(detailSource.contains("replyComposerTabBarClearance"))
+        XCTAssertFalse(detailSource.contains(".safeAreaInset(edge: .bottom)"))
+    }
+
+    func testThreadDetailRendersChatTranscriptAndKeepsComposerNearTabBar() throws {
+        let source = try String(contentsOfFile: codexConsoleSourcePath, encoding: .utf8)
+        let detailSource = try sourceSnippet(
+            in: source,
+            from: "private struct CodexThreadDetailView: View",
+            to: "private struct CodexThreadDetailNavBar: View"
+        )
+
+        XCTAssertTrue(detailSource.contains("CodexThreadChatTranscriptView("))
+        XCTAssertFalse(detailSource.contains("CodexThreadResponseCard("))
+        XCTAssertTrue(detailSource.contains("private static let replyComposerTabBarClearance: CGFloat = 16"))
+    }
+
+    func testThreadDetailPullToRefreshDoesNotFetchFullLogsOrShowCancellation() throws {
+        let source = try String(contentsOfFile: codexConsoleSourcePath, encoding: .utf8)
+        let detailSource = try sourceSnippet(
+            in: source,
+            from: "private struct CodexThreadDetailView: View",
+            to: "private struct CodexThreadDetailNavBar: View"
+        )
+        let refreshSource = try sourceSnippet(
+            in: detailSource,
+            from: ".refreshable {",
+            to: ".task(id: routeIdentity)"
+        )
+        let loadThreadDetailSource = try sourceSnippet(
+            in: detailSource,
+            from: "private func loadThreadDetail() async",
+            to: "private func loadLatestJob"
+        )
+        let loadLatestJobSource = try sourceSnippet(
+            in: detailSource,
+            from: "private func loadLatestJob",
+            to: "private func selectResolvedSessionIfAvailable"
+        )
+
+        XCTAssertTrue(refreshSource.contains("await refreshThreadDetailAndLatestJob()"))
+        XCTAssertFalse(refreshSource.contains("includeFullLogs: true"))
+        XCTAssertTrue(loadThreadDetailSource.contains("CodexConsoleViewModel.isCancellation(error)"))
+        XCTAssertTrue(loadLatestJobSource.contains("CodexConsoleViewModel.isCancellation(error)"))
+    }
+
+    func testThreadDetailNavOmitsRedundantRefreshButton() throws {
+        let source = try String(contentsOfFile: codexConsoleSourcePath, encoding: .utf8)
+        let detailSource = try sourceSnippet(
+            in: source,
+            from: "private struct CodexThreadDetailView: View",
+            to: "private struct CodexThreadDetailNavBar: View"
+        )
+        let navSource = try sourceSnippet(
+            in: source,
+            from: "private struct CodexThreadDetailNavBar: View",
+            to: "private struct CodexThreadResponseCard: View"
+        )
+
+        XCTAssertFalse(detailSource.contains("onRefresh:"))
+        XCTAssertFalse(navSource.contains("let onRefresh"))
+        XCTAssertFalse(navSource.contains("Button(action: onRefresh)"))
+        XCTAssertFalse(navSource.contains("arrow.clockwise"))
+        XCTAssertTrue(navSource.contains("terminal"))
+    }
+
+    func testRootUsesNativeLiquidGlassTabView() throws {
+        let source = try String(contentsOfFile: appSourcePath, encoding: .utf8)
+
+        XCTAssertTrue(source.contains("TabView(selection: $selectedTab)"))
+        XCTAssertTrue(source.contains(".tabItem"))
+        XCTAssertFalse(source.contains("RelayTabBar"))
+        XCTAssertFalse(source.contains("safeAreaInset(edge: .bottom"))
+        XCTAssertFalse(source.contains("configureWithOpaqueBackground"))
+    }
+
+    func testCodexClaudeHomePolishUsesSharedCompactComponents() throws {
+        let source = try String(contentsOfFile: codexConsoleSourcePath, encoding: .utf8)
+
+        let screenSource = try sourceSnippet(
+            in: source,
+            from: "struct CodexConsoleView: View",
+            to: "private enum CodexRoute: Hashable"
+        )
+        XCTAssertFalse(screenSource.contains("CodexContextLine(viewModel"))
+
+        let contextSource = try sourceSnippet(
+            in: source,
+            from: "private struct CodexContextLine: View",
+            to: "private struct CodexPromptCard: View"
+        )
+        XCTAssertFalse(contextSource.contains("selectedThreadID"))
+
+        let promptSource = try sourceSnippet(
+            in: source,
+            from: "private struct CodexPromptCard: View",
+            to: "private struct CodexComposeStatusPanel: View"
+        )
+        XCTAssertTrue(promptSource.contains("attachedComposerHeader"))
+        XCTAssertTrue(promptSource.contains("largePromptEditor"))
+        XCTAssertTrue(promptSource.contains("promptEditorMinHeight"))
+        XCTAssertTrue(promptSource.contains("TextEditor("))
+        XCTAssertTrue(promptSource.contains("CodexAttachmentMenu("))
+        XCTAssertTrue(promptSource.contains("mic.fill"))
+        XCTAssertTrue(promptSource.contains("arrow.up"))
+        XCTAssertFalse(promptSource.contains("selectedThreadID"))
+
+        let previewSource = try sourceSnippet(
+            in: source,
+            from: "private struct CodexComposeStatusPanel: View",
+            to: "private struct CodexSessionSettingsSheet: View"
+        )
+        XCTAssertTrue(previewSource.contains("threadPreviewBackground"))
+        XCTAssertTrue(previewSource.contains("threadPreviewSeparator"))
+        XCTAssertTrue(previewSource.contains("statusPillBackground"))
+
+        let feedSource = try sourceSnippet(
+            in: source,
+            from: "private struct CodexThreadFeedSection: View",
+            to: "private struct CodexThreadFeedRow: View"
+        )
+        XCTAssertTrue(feedSource.contains("CodexLowThreadCountHint"))
+
+        let rowSource = try sourceSnippet(
+            in: source,
+            from: "private struct CodexThreadFeedRow: View",
+            to: "private struct CodexStatusChip: View"
+        )
+        XCTAssertTrue(rowSource.contains("exclamationmark.circle"))
+        XCTAssertTrue(rowSource.contains("AppTheme.statusWarn"))
+    }
+
+    func testPromptModuleHeaderIsIntegratedNotOvalPill() throws {
+        let source = try String(contentsOfFile: codexConsoleSourcePath, encoding: .utf8)
+        let promptSource = try sourceSnippet(
+            in: source,
+            from: "private struct CodexPromptCard: View",
+            to: "private struct CodexComposeStatusPanel: View"
+        )
+
+        XCTAssertTrue(promptSource.contains("private static let composerModuleCornerRadius: CGFloat = 14"))
+        XCTAssertTrue(promptSource.contains("private static let composerHeaderMinHeight: CGFloat = 54"))
+        XCTAssertTrue(promptSource.contains(".frame(minHeight: Self.composerHeaderMinHeight)"))
+        XCTAssertTrue(promptSource.contains(".contentShape(Rectangle())"))
+        XCTAssertFalse(promptSource.contains(".background(AppTheme.textPrimary.opacity(0.045))"))
+        XCTAssertFalse(promptSource.contains("RoundedRectangle(cornerRadius: 18, style: .continuous)"))
+    }
+
+    func testSessionSettingsUsesInlineQuickPickPills() throws {
+        let source = try String(contentsOfFile: codexConsoleSourcePath, encoding: .utf8)
+        let sheetSource = try sourceSnippet(
+            in: source,
+            from: "private struct CodexSessionSettingsSheet: View",
+            to: "private struct CodexSettingsChoiceSection"
+        )
+
+        XCTAssertTrue(sheetSource.contains("Text(\"Agent settings\")"))
+        XCTAssertTrue(sheetSource.contains("CodexSettingsChoiceSection("))
+        XCTAssertTrue(sheetSource.contains("CodexSettingsPill("))
+        XCTAssertTrue(sheetSource.contains("ForEach(viewModel.modelOptions"))
+        XCTAssertTrue(sheetSource.contains("ForEach(viewModel.reasoningEffortOptions"))
+        XCTAssertTrue(sheetSource.contains("ForEach(CodexRunMode.allCases"))
+        XCTAssertTrue(sheetSource.contains("quickSkillOptions"))
+        XCTAssertFalse(sheetSource.contains("repositoryQuickPickSection"))
+        XCTAssertFalse(sheetSource.contains("quickWorkspaceOptions"))
+        XCTAssertFalse(sheetSource.contains("title: \"Repository\""))
+        XCTAssertFalse(sheetSource.contains("Menu {"))
+        XCTAssertFalse(sheetSource.contains("CodexSettingsRowContent(symbol: \"cpu\""))
+        XCTAssertFalse(sheetSource.contains("CodexSettingsRowContent(symbol: \"slider.horizontal.3\""))
+        XCTAssertFalse(sheetSource.contains("CodexSettingsRowContent(symbol: \"sun.max\""))
+        XCTAssertFalse(source.contains("private struct CodexSettingsRowContent: View"))
+    }
+
+    func testWorkspacePickerIsTopLevelPromptHeaderControl() throws {
+        let source = try String(contentsOfFile: codexConsoleSourcePath, encoding: .utf8)
+        let promptSource = try sourceSnippet(
+            in: source,
+            from: "private struct CodexPromptCard: View",
+            to: "private struct CodexComposeStatusPanel: View"
+        )
+
+        XCTAssertTrue(promptSource.contains("@State private var showingWorkspacePicker = false"))
+        XCTAssertTrue(promptSource.contains("workspaceHeaderControl"))
+        XCTAssertTrue(promptSource.contains("agentSettingsHeaderControl"))
+        XCTAssertTrue(promptSource.contains("showingWorkspacePicker = true"))
+        XCTAssertTrue(promptSource.contains("CodexWorkspacePickerSheet(viewModel: viewModel)"))
+        XCTAssertTrue(promptSource.contains("accessibilityLabel(\"Choose repository\")"))
+        XCTAssertTrue(promptSource.contains("accessibilityLabel(\"Agent settings\")"))
+        XCTAssertFalse(promptSource.contains("Text(viewModel.composeWorkspaceLabel)\n                    .font(.system(size: 14, weight: .medium))\n                    .foregroundStyle(AppTheme.accent)\n                    .lineLimit(1)\n                Text(\"·\")"))
+    }
+
+    func testWorkspacePickerUsesBrowseFirstFilesStyleSheet() throws {
+        let source = try String(contentsOfFile: codexConsoleSourcePath, encoding: .utf8)
+        let sheetSource = try sourceSnippet(
+            in: source,
+            from: "private struct CodexWorkspacePickerSheet: View",
+            to: "private struct CodexWorkspaceLoadingRow: View"
+        )
+        let rowSource = try sourceSnippet(
+            in: source,
+            from: "private struct CodexWorkspaceDirectoryRow: View",
+            to: "private struct CodexAttachmentMenu: View"
+        )
+
+        XCTAssertTrue(sheetSource.contains("Text(\"Choose workspace\")"))
+        XCTAssertTrue(sheetSource.contains("workspaceSearchField"))
+        XCTAssertTrue(sheetSource.contains("workspaceLocationBar"))
+        XCTAssertTrue(sheetSource.contains("workspaceFolderList"))
+        XCTAssertTrue(sheetSource.contains("workspaceFooterActions"))
+        XCTAssertTrue(sheetSource.contains("Text(\"Use this folder\")"))
+        XCTAssertTrue(sheetSource.contains(".refreshable"))
+        XCTAssertTrue(sheetSource.contains("selectCurrentFolder()"))
+        XCTAssertTrue(sheetSource.contains("showingCreateFolder = true"))
+        XCTAssertTrue(sheetSource.contains("viewModel.loadWorkspaceDirectories(path: listing?.currentPath, query: currentSearchQuery)"))
+        XCTAssertFalse(sheetSource.contains("NavigationStack"))
+        XCTAssertFalse(sheetSource.contains(".navigationTitle(\"Workspace Folder\")"))
+        XCTAssertFalse(sheetSource.contains(".toolbar"))
+        XCTAssertFalse(sheetSource.contains("Refresh workspace folders"))
+        XCTAssertFalse(sheetSource.contains("Create workspace folder"))
+        XCTAssertFalse(sheetSource.contains("Label(\"Up\""))
+        XCTAssertFalse(sheetSource.contains("Label(viewModel.isSelectingWorkspaceDirectory ? \"Selecting\" : \"Select\""))
+
+        XCTAssertTrue(rowSource.contains("Button(action: onBrowse)"))
+        XCTAssertTrue(rowSource.contains("Image(systemName: \"chevron.right\")"))
+        XCTAssertTrue(rowSource.contains("Text(\"Registered\")"))
+        XCTAssertTrue(rowSource.contains("Text(\"Git\")"))
+        XCTAssertFalse(rowSource.contains("let onSelect"))
+        XCTAssertFalse(rowSource.contains("Text(\"Select\")"))
+        XCTAssertFalse(rowSource.contains("accessibilityLabel(\"Select"))
+    }
+
     func testCodexJobDefaultsMissingProviderToCodexAndDecodesClaude() throws {
         let legacyJob = try decodeCodexJob(
             """
@@ -843,6 +1086,75 @@ final class ManifestTests: XCTestCase {
         let answer = try XCTUnwrap(transcript.last { $0.role == .assistant })
         XCTAssertEqual(answer.text, "Full answer line one.\n\n- ENGG-541: action item one.\n- ENGG-542: action item two.\n- ENGG-543: action item three.")
         XCTAssertFalse(answer.canLoadFullText)
+    }
+
+    func testCodexThreadChatTranscriptAppendsCompletedFollowUpToStaleDetail() throws {
+        let detail = try JSONDecoder().decode(
+            CodexThreadDetail.self,
+            from: Data(
+                """
+                {
+                  "thread": {
+                    "id": "thread-stale-follow-up",
+                    "sessionId": "thread-stale-follow-up",
+                    "workspaceId": "poc-vault",
+                    "workspaceName": "POC Vault",
+                    "updatedAt": "2026-05-20T12:01:00Z",
+                    "jobCount": 1,
+                    "activeJobCount": 0,
+                    "lastJobId": "job-first",
+                    "lastJobStatus": "succeeded",
+                    "lastPrompt": "What can be done here?",
+                    "lastResult": "Here is what you can do.",
+                    "hasSessionFile": true
+                  },
+                  "messages": [
+                    {
+                      "role": "user",
+                      "timestamp": "2026-05-20T12:00:00Z",
+                      "text": "What can be done here?"
+                    },
+                    {
+                      "role": "assistant",
+                      "timestamp": "2026-05-20T12:01:00Z",
+                      "text": "Here is what you can do."
+                    }
+                  ],
+                  "jobs": []
+                }
+                """.utf8
+            )
+        )
+        let job = try decodeCodexJob(
+            """
+            {
+              "id": "job-follow-up",
+              "provider": "codex",
+              "status": "succeeded",
+              "workspaceId": "poc-vault",
+              "workspaceName": "POC Vault",
+              "prompt": "Anything else?",
+              "result": "Yes. You can also inspect server health.",
+              "resultTruncated": false,
+              "logsIncluded": "compact",
+              "createdAt": "2026-05-20T12:05:00Z",
+              "completedAt": "2026-05-20T12:06:00Z"
+            }
+            """
+        )
+
+        let transcript = CodexThreadChatItem.makeTranscript(detail: detail, thread: nil, latestJob: job)
+
+        XCTAssertEqual(transcript.map(\.role), [.user, .assistant, .user, .assistant])
+        XCTAssertEqual(
+            transcript.map(\.text),
+            [
+                "What can be done here?",
+                "Here is what you can do.",
+                "Anything else?",
+                "Yes. You can also inspect server health."
+            ]
+        )
     }
 
     func testCodexThreadChatTranscriptShowsWorkingPlaceholderForRunningFollowUp() throws {
@@ -1678,12 +1990,76 @@ final class ManifestTests: XCTestCase {
         ])
     }
 
+    func testCodexMarkdownParserBuildsTableBlocksForPhoneFriendlyRendering() throws {
+        let blocks = CodexMarkdownParser.proseBlocks(
+            from: """
+            ## Folder Structure
+
+            | Path | What it is |
+            |------|------------|
+            | `pocs/` | The actual prototypes (7 POCs currently) |
+            | `ops/` | Deployment tooling — deploy script, manifest renderer/signer, server provisioning, cert management, nginx config |
+
+            ## Current POCs
+            """
+        )
+
+        XCTAssertEqual(blocks.count, 3)
+        XCTAssertEqual(blocks[0].kind, .heading(level: 2))
+        if case .table(let header, let rows) = blocks[1].kind {
+            XCTAssertEqual(header, ["Path", "What it is"])
+            XCTAssertEqual(rows, [
+                ["`pocs/`", "The actual prototypes (7 POCs currently)"],
+                ["`ops/`", "Deployment tooling — deploy script, manifest renderer/signer, server provisioning, cert management, nginx config"]
+            ])
+        } else {
+            XCTFail("Expected markdown table to parse as a table block")
+        }
+        XCTAssertEqual(blocks[2].kind, .heading(level: 2))
+
+        let preview = CodexMarkdownParser.plainText(
+            from: """
+            | Path | What it is |
+            |------|------------|
+            | `pocs/` | The actual prototypes |
+            """
+        )
+        XCTAssertEqual(preview, "Path What it is pocs/ The actual prototypes")
+        XCTAssertFalse(preview.contains("|------|"))
+    }
+
     private func decodeCodexJob(_ json: String) throws -> CodexJob {
         try JSONDecoder().decode(CodexJob.self, from: Data(json.utf8))
     }
 
     private func decodeCodexThread(_ json: String) throws -> CodexThread {
         try JSONDecoder().decode(CodexThread.self, from: Data(json.utf8))
+    }
+
+    private var codexConsoleSourcePath: String {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("POCVault/Views/CodexConsoleView.swift")
+            .path
+    }
+
+    private var appSourcePath: String {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("POCVault/POCVaultApp.swift")
+            .path
+    }
+
+    private func sourceSnippet(in source: String, from startMarker: String, to endMarker: String) throws -> String {
+        guard
+            let start = source.range(of: startMarker),
+            let end = source.range(of: endMarker, range: start.upperBound..<source.endIndex)
+        else {
+            throw XCTSkip("Missing source markers: \(startMarker) -> \(endMarker)")
+        }
+        return String(source[start.lowerBound..<end.lowerBound])
     }
 
     private func assertColor(

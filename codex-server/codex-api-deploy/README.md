@@ -32,6 +32,7 @@ CODEX_ALLOWED_CERT_SUBJECTS=CN=iphone,CN=operator
 CODEX_BIN=/usr/bin/codex
 CLAUDE_BIN=/usr/bin/claude
 CLAUDE_CODE_USE_BEDROCK=
+CLAUDE_AWS_PROFILE=sigiq
 AWS_REGION=
 AWS_DEFAULT_REGION=
 CODEX_DANGEROUS_MODE=true
@@ -96,9 +97,12 @@ jobs run `CLAUDE_BIN` in the selected workspace, read the prompt from stdin, use
 `--session-id <uuid>` for a fresh Claude job or `--resume <session-id>` for a
 follow-up. Claude results come from stdout.
 
-When Claude Code is run through Bedrock, set `CLAUDE_CODE_USE_BEDROCK=1` and
-the AWS region values in `/etc/codex-api.env`; the EC2 instance role supplies
-the credentials.
+When Claude Code is run through Bedrock, set `CLAUDE_CODE_USE_BEDROCK=1`,
+`CLAUDE_AWS_PROFILE=sigiq`, and the AWS region values in `/etc/codex-api.env`.
+Claude jobs must use the SigiQ AWS profile; the launcher does not inherit a
+process-wide `AWS_PROFILE` for Claude.
+`CLAUDE_AWS_REGION` can override the Claude runner region; otherwise the
+launcher preserves `AWS_REGION` / `AWS_DEFAULT_REGION` for Claude Code.
 
 `GET /v1/codex/jobs`, `GET /v1/codex/sessions`,
 `GET /v1/codex/threads`, and `GET /v1/codex/threads/<sessionId>` accept optional

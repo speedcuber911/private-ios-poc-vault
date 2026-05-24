@@ -22,7 +22,7 @@ struct LibraryView: View {
             .refreshable {
                 await viewModel.load()
             }
-            .sheet(isPresented: $showingDiagnostics) {
+            .fullScreenCover(isPresented: $showingDiagnostics) {
                 DiagnosticsView(identityStore: identityStore, manifestClient: manifestClient)
             }
             .navigationDestination(for: POCEntry.self) { entry in
@@ -53,7 +53,7 @@ struct LibraryView: View {
                 ProgressView()
                     .controlSize(.large)
                     .tint(AppTheme.accent)
-                Text("Loading private POCs")
+                Text("Loading prototypes")
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(AppTheme.textSecondary)
                 Spacer()
@@ -87,8 +87,8 @@ struct LibraryView: View {
                         header(count: 0)
                         StatusCard(
                             symbol: "tray",
-                            title: "No POCs yet",
-                            message: "The signed manifest is valid, but it does not list any deployed POCs."
+                            title: "No prototypes yet",
+                            message: "The signed manifest is valid, but it does not list any deployed prototypes."
                         )
 
                         diagnosticsLink()
@@ -105,7 +105,7 @@ struct LibraryView: View {
                         StatusCard(
                             symbol: "magnifyingglass",
                             title: "No matches",
-                            message: "Nothing in the vault matches \(viewModel.searchText)."
+                            message: "Nothing in the library matches \(viewModel.searchText)."
                         )
 
                         diagnosticsLink()
@@ -116,22 +116,37 @@ struct LibraryView: View {
                 }
             } else {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 18) {
+                    VStack(alignment: .leading, spacing: 0) {
                         header(count: viewModel.entries.count)
+                            .padding(.horizontal, 20)
+                            .padding(.bottom, 14)
                         SearchBox(text: $viewModel.searchText)
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 14)
 
                         let recentEntries = recentEntries(from: viewModel.filteredEntries)
                         let visibleEntries = filteredEntries(from: viewModel.filteredEntries, recentEntries: recentEntries)
                         POCSectionHeader(selectedFilter: $selectedFilter)
-                        LazyVStack(spacing: 8) {
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 12)
+                        Text("Library")
+                            .font(.system(size: 12))
+                            .foregroundStyle(AppTheme.textSecondary)
+                            .padding(.horizontal, 20)
+                            .padding(.bottom, 8)
+                        LazyVStack(spacing: 0) {
                             ForEach(visibleEntries) { entry in
                                 entryLink(entry)
                             }
                         }
+                        .overlay(alignment: .top) {
+                            Rectangle()
+                                .fill(AppTheme.strokeSubtle)
+                                .frame(height: 0.5)
+                        }
 
                         diagnosticsLink()
                     }
-                    .padding(.horizontal, 20)
                     .padding(.top, 14)
                     .padding(.bottom, 112)
                 }
@@ -208,28 +223,24 @@ private struct VaultHeader: View {
     var onRefresh: () -> Void
 
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            RelayLogoMark(size: 36)
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .center, spacing: 10) {
+                RelayLogoMark(size: 30)
 
-            VStack(alignment: .leading, spacing: 4) {
                 Text("Relay")
-                    .font(.system(size: 28, weight: .semibold))
+                    .font(.system(size: 24, weight: .medium, design: .serif))
                     .foregroundStyle(AppTheme.textPrimary)
-                HStack(spacing: 6) {
-                    Image(systemName: "lock.fill")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(AppTheme.accent)
-                    Text(subtitle)
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(AppTheme.textTertiary)
-                        .lineLimit(1)
-                }
-            }
-            Spacer()
 
-            HeaderButton(symbol: "arrow.clockwise", label: "Refresh", action: onRefresh)
+                Spacer()
+
+                HeaderButton(symbol: "arrow.clockwise", label: "Refresh", action: onRefresh)
+            }
+
+            Text(subtitle)
+                .font(.system(size: 13))
+                .foregroundStyle(AppTheme.textSecondary)
+                .lineLimit(1)
         }
-        .padding(.top, 2)
     }
 
     private var subtitle: String {
@@ -237,14 +248,7 @@ private struct VaultHeader: View {
         if let count {
             parts.append("\(count) \(count == 1 ? "prototype" : "prototypes")")
         }
-        parts.append(shortTime)
-        return parts.joined(separator: " / ")
-    }
-
-    private var shortTime: String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm"
-        return formatter.string(from: Date())
+        return parts.joined(separator: " · ")
     }
 }
 
@@ -253,32 +257,14 @@ struct RelayLogoMark: View {
 
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: size * 0.24, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [
-                            Color(red: 0.12, green: 0.13, blue: 0.16),
-                            Color(red: 0.05, green: 0.06, blue: 0.07)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(AppTheme.bgSurfaceHi)
 
             Image(systemName: "terminal.fill")
-                .font(.system(size: size * 0.42, weight: .semibold))
+                .font(.system(size: 15, weight: .semibold))
                 .foregroundStyle(AppTheme.textPrimary)
-
-            Circle()
-                .fill(AppTheme.statusOK)
-                .frame(width: size * 0.18, height: size * 0.18)
-                .offset(x: size * 0.26, y: -size * 0.26)
         }
         .frame(width: size, height: size)
-        .overlay {
-            RoundedRectangle(cornerRadius: size * 0.24, style: .continuous)
-                .stroke(AppTheme.strokeStrong, lineWidth: 1)
-        }
         .accessibilityHidden(true)
     }
 }
@@ -292,13 +278,9 @@ private struct HeaderButton: View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(AppTheme.textPrimary)
-                .frame(width: 36, height: 36)
-                .background(AppTheme.bgSurfaceHi, in: Circle())
-                .overlay {
-                    Circle()
-                        .stroke(AppTheme.strokeStrong, lineWidth: 1)
-                }
+                .foregroundStyle(AppTheme.textSecondary)
+                .frame(width: 32, height: 32)
+                .background(AppTheme.bgSurface, in: Circle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel(label)
@@ -311,21 +293,18 @@ private struct SearchBox: View {
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: "magnifyingglass")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(AppTheme.textTertiary)
+                .font(.system(size: 15))
+                .foregroundStyle(AppTheme.textSecondary)
             TextField("Search prototypes", text: $text)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
+                .font(.system(size: 15))
                 .foregroundStyle(AppTheme.textPrimary)
                 .submitLabel(.search)
         }
         .padding(.horizontal, 14)
-        .frame(height: 44)
-        .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(AppTheme.strokeStrong, lineWidth: 1)
-        }
+        .padding(.vertical, 10)
+        .background(AppTheme.bgSurfaceHi, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .tint(AppTheme.accent)
     }
 }
@@ -334,41 +313,26 @@ private struct POCSectionHeader: View {
     @Binding var selectedFilter: LibraryFilter
 
     var body: some View {
-        HStack(alignment: .center) {
-            Text("Library")
-                .font(.caption.weight(.bold))
-                .textCase(.uppercase)
-                .foregroundStyle(AppTheme.textTertiary)
-                .tracking(1.4)
-
-            Spacer()
-
-            HStack(spacing: 2) {
-                ForEach(LibraryFilter.allCases) { filter in
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.18)) {
-                            selectedFilter = filter
-                        }
-                    } label: {
-                        Text(filter.rawValue)
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(selectedFilter == filter ? AppTheme.accent : AppTheme.textSecondary)
-                            .padding(.horizontal, 14)
-                            .frame(height: 30)
-                            .background {
-                                if selectedFilter == filter {
-                                    Capsule()
-                                        .fill(AppTheme.accent.opacity(0.16))
-                                }
-                            }
+        HStack(spacing: 6) {
+            ForEach(LibraryFilter.allCases) { filter in
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        selectedFilter = filter
                     }
-                    .buttonStyle(.plain)
+                } label: {
+                    Text(filter.rawValue)
+                        .font(.system(size: 13, weight: selectedFilter == filter ? .medium : .regular))
+                        .foregroundStyle(selectedFilter == filter ? AppTheme.textPrimary : AppTheme.textSecondary)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 5)
+                        .background {
+                            if selectedFilter == filter {
+                                Capsule()
+                                    .fill(AppTheme.textPrimary.opacity(0.12))
+                            }
+                        }
                 }
-            }
-            .padding(3)
-            .background(AppTheme.bgSurface, in: Capsule())
-            .overlay {
-                Capsule().stroke(AppTheme.strokeSubtle, lineWidth: 1)
+                .buttonStyle(.plain)
             }
         }
     }
@@ -382,25 +346,25 @@ private struct POCEntryCard: View {
             ZStack {
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .fill(AppTheme.bgSurfaceHi)
-                Image(systemName: "safari")
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(AppTheme.accent)
+                Image(systemName: "scope")
+                    .font(.system(size: 20))
+                    .foregroundStyle(AppTheme.textSecondary)
             }
-            .frame(width: 42, height: 42)
+            .frame(width: 40, height: 40)
 
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(entry.title)
-                    .font(.subheadline.weight(.semibold))
+                    .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(AppTheme.textPrimary)
                     .lineLimit(1)
 
                 Text(entry.detailText)
-                    .font(.caption)
+                    .font(.system(size: 12))
                     .foregroundStyle(AppTheme.textSecondary)
                     .lineLimit(1)
 
                 Text(metaText)
-                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .font(.system(size: 11))
                     .foregroundStyle(AppTheme.textTertiary)
                     .lineLimit(1)
             }
@@ -411,7 +375,7 @@ private struct POCEntryCard: View {
                 if entry.requiresClientCertificate {
                     Image(systemName: "lock.fill")
                         .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(AppTheme.accent)
+                        .foregroundStyle(AppTheme.textTertiary)
                         .accessibilityLabel("Requires client certificate")
                 }
                 Image(systemName: "chevron.right")
@@ -420,18 +384,21 @@ private struct POCEntryCard: View {
                     .accessibilityHidden(true)
             }
         }
-        .padding(.horizontal, 12)
-        .frame(minHeight: 72)
-        .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(AppTheme.strokeSubtle, lineWidth: 1)
+        .padding(.horizontal, 20)
+        .padding(.vertical, 11)
+        .frame(minHeight: 62)
+        .background(AppTheme.bgCanvas)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(AppTheme.strokeSubtle)
+                .frame(height: 0.5)
+                .padding(.leading, 72)
         }
-        .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .contentShape(Rectangle())
     }
 
     private var metaText: String {
-        "\(locationLabel) / \(relativeUpdatedAt)"
+        "\(locationLabel) · \(relativeUpdatedAt)"
     }
 
     private var locationLabel: String {
@@ -459,15 +426,15 @@ private struct DiagnosticsLinkRow: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 8) {
-                Image(systemName: "stethoscope")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(AppTheme.textTertiary)
+                Image(systemName: "list.clipboard")
+                    .font(.system(size: 15))
+                    .foregroundStyle(AppTheme.textSecondary)
                 Text("Diagnostics")
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(AppTheme.textTertiary)
+                    .font(.system(size: 14))
+                    .foregroundStyle(AppTheme.textSecondary)
             }
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 34)
+            .padding(.vertical, 14)
         }
         .buttonStyle(.plain)
     }
@@ -484,19 +451,15 @@ private struct StatusCard: View {
                 .font(.system(size: 24, weight: .semibold))
                 .foregroundStyle(AppTheme.accent)
             Text(title)
-                .font(.headline.weight(.semibold))
+                .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(AppTheme.textPrimary)
             Text(message)
-                .font(.subheadline)
+                .font(.system(size: 13))
                 .foregroundStyle(AppTheme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(AppTheme.strokeSubtle, lineWidth: 1)
-        }
+        .background(AppTheme.bgSurfaceHi, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 }

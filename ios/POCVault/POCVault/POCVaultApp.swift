@@ -59,42 +59,30 @@ struct POCVaultRootView: View {
     @ObservedObject var claudeViewModel: CodexConsoleViewModel
     @ObservedObject var identityStore: ClientIdentityStore
     let manifestClient: ManifestClient
+    @State private var selectedTab: RelayRootTab = .library
 
     var body: some View {
-        TabView {
+        TabView(selection: $selectedTab) {
             LibraryView(
                 viewModel: libraryViewModel,
                 identityStore: identityStore,
                 manifestClient: manifestClient
             )
+            .tag(RelayRootTab.library)
             .tabItem {
-                Label("Library", systemImage: "square.grid.2x2")
+                Label(RelayRootTab.library.title, systemImage: RelayRootTab.library.symbol)
             }
 
             CodexConsoleView(viewModel: codexViewModel, identityStore: identityStore)
+                .tag(RelayRootTab.codex)
                 .tabItem {
-                    Label {
-                        Text(CodexProvider.codex.displayName)
-                    } icon: {
-                        Image(CodexProvider.codex.tabIconAssetName)
-                            .renderingMode(.template)
-                            .resizable()
-                            .scaledToFit()
-                            .frame(width: 24, height: 24)
-                    }
+                    Label(RelayRootTab.codex.title, systemImage: RelayRootTab.codex.symbol)
                 }
 
             CodexConsoleView(viewModel: claudeViewModel, identityStore: identityStore)
+                .tag(RelayRootTab.claude)
                 .tabItem {
-                    Label {
-                        Text(CodexProvider.claude.displayName)
-                    } icon: {
-                        Image(CodexProvider.claude.tabIconAssetName)
-                            .renderingMode(.template)
-                            .resizable()
-                            .scaledToFit()
-                            .frame(width: 24, height: 24)
-                    }
+                    Label(RelayRootTab.claude.title, systemImage: RelayRootTab.claude.symbol)
                 }
 
             CodexStatusView(
@@ -103,9 +91,10 @@ struct POCVaultRootView: View {
                 identityStore: identityStore,
                 manifestClient: manifestClient
             )
-                .tabItem {
-                    Label("Status", systemImage: "waveform.path.ecg")
-                }
+            .tag(RelayRootTab.status)
+            .tabItem {
+                Label(RelayRootTab.status.title, systemImage: RelayRootTab.status.symbol)
+            }
         }
         .tint(AppTheme.accent)
         .preferredColorScheme(.dark)
@@ -129,6 +118,41 @@ struct POCVaultRootView: View {
     }
 }
 
+private enum RelayRootTab: String, CaseIterable, Identifiable {
+    case library
+    case codex
+    case claude
+    case status
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .library:
+            return "Library"
+        case .codex:
+            return "Codex"
+        case .claude:
+            return "Claude"
+        case .status:
+            return "Status"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .library:
+            return "square.grid.2x2"
+        case .codex:
+            return "terminal"
+        case .claude:
+            return "asterisk"
+        case .status:
+            return "waveform.path.ecg"
+        }
+    }
+}
+
 extension CodexProvider {
     var tabIconAssetName: String {
         switch self {
@@ -142,9 +166,9 @@ extension CodexProvider {
     var activityTint: Color {
         switch self {
         case .codex:
-            return AppTheme.statusInfo
+            return AppTheme.textSecondary
         case .claude:
-            return AppTheme.statusWarn
+            return AppTheme.accent
         }
     }
 }
@@ -161,37 +185,62 @@ private struct CodexStatusView: View {
             ZStack {
                 AppTheme.bgCanvas.ignoresSafeArea()
 
-                VStack(spacing: 0) {
-                    Picker("Status view", selection: $selectedSection) {
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("Status")
+                        .font(.system(size: 26, weight: .medium, design: .serif))
+                        .foregroundStyle(AppTheme.textPrimary)
+                        .padding(.horizontal, 20)
+                        .padding(.top, 16)
+                        .padding(.bottom, 16)
+
+                    HStack(spacing: 2) {
                         ForEach(StatusSection.allCases) { section in
-                            Text(section.title).tag(section)
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    selectedSection = section
+                                }
+                            } label: {
+                                Text(section.title)
+                                    .font(.system(size: 14, weight: selectedSection == section ? .medium : .regular))
+                                    .foregroundStyle(selectedSection == section ? AppTheme.textPrimary : AppTheme.textSecondary)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 8)
+                                    .background {
+                                        if selectedSection == section {
+                                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                                .fill(AppTheme.textPrimary.opacity(0.12))
+                                        }
+                                    }
+                            }
+                            .buttonStyle(.plain)
                         }
                     }
-                    .pickerStyle(.segmented)
-                    .padding(.horizontal, 20)
-                    .padding(.top, 16)
-                    .padding(.bottom, 12)
+                    .padding(3)
+                    .background(AppTheme.bgSurfaceHi, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 16)
 
                     switch selectedSection {
                     case .activity:
                         ScrollView {
-                            VStack(alignment: .leading, spacing: 18) {
-                                VStack(alignment: .leading, spacing: 6) {
-                                    Text("Activity")
-                                        .font(.title2.weight(.semibold))
-                                        .foregroundStyle(AppTheme.textPrimary)
-                                    Text(summaryText)
-                                        .font(.subheadline.weight(.medium))
-                                        .foregroundStyle(AppTheme.textSecondary)
-                                }
+                            VStack(alignment: .leading, spacing: 0) {
+                                Text(summaryText)
+                                    .font(.system(size: 13))
+                                    .foregroundStyle(AppTheme.textSecondary)
+                                    .padding(.horizontal, 20)
+                                    .padding(.bottom, 12)
 
-                                VStack(spacing: 10) {
+                                LazyVStack(spacing: 0) {
                                     ForEach(Array(activityItems.prefix(24))) { activityItem in
                                         CodexActivityRow(provider: activityItem.provider, item: activityItem.item)
                                     }
                                 }
+                                .overlay(alignment: .top) {
+                                    Rectangle()
+                                        .fill(AppTheme.strokeSubtle)
+                                        .frame(height: 0.5)
+                                }
                             }
-                            .padding(.horizontal, 20)
                             .padding(.bottom, 110)
                         }
                         .scrollDismissesKeyboard(.interactively)
@@ -229,7 +278,7 @@ private struct CodexStatusView: View {
     private var summaryText: String {
         let activeCount = activityItems.filter(\.item.isActive).count
         if activeCount == 0 {
-            return "\(activityItems.count) recent threads across Codex and Claude"
+            return "\(activityItems.count) threads · Codex and Claude"
         }
         return "\(activeCount) active · \(activityItems.count) recent"
     }
@@ -277,64 +326,68 @@ private struct CodexActivityRow: View {
     let item: CodexThreadFeedItem
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .top, spacing: 10) {
-                Image(systemName: item.isActive ? "bolt.fill" : "bubble.left.and.bubble.right")
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundStyle(statusColor)
-                    .frame(width: 26, height: 26)
-                    .background(AppTheme.bgSurfaceHi, in: Circle())
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "message")
+                .font(.system(size: 15))
+                .foregroundStyle(AppTheme.textSecondary)
+                .frame(width: 32, height: 32)
+                .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
 
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(item.title)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(AppTheme.textPrimary)
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 5) {
+                Text(item.title)
+                    .font(.system(size: 14))
+                    .foregroundStyle(AppTheme.textPrimary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
 
-                    Text(item.preview)
-                        .font(.caption.weight(.medium))
+                HStack(spacing: 7) {
+                    Text("\(item.workspaceLabel) · \(timestampText)")
+                        .font(.system(size: 11))
                         .foregroundStyle(AppTheme.textSecondary)
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                Spacer(minLength: 8)
-
-                VStack(alignment: .trailing, spacing: 6) {
                     Text(provider.displayName)
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(provider.activityTint)
+                        .font(.system(size: 11))
+                        .foregroundStyle(provider == .claude ? AppTheme.accent : AppTheme.textSecondary)
                         .padding(.horizontal, 8)
-                        .padding(.vertical, 5)
-                        .background(provider.activityTint.opacity(0.12), in: Capsule())
-
-                    Text(item.status?.label ?? "Thread")
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(statusColor)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 5)
-                        .background(statusColor.opacity(0.12), in: Capsule())
+                        .padding(.vertical, 2)
+                        .background((provider == .claude ? AppTheme.accent : AppTheme.textPrimary).opacity(provider == .claude ? 0.14 : 0.08), in: Capsule())
+                    HStack(spacing: 3) {
+                        Image(systemName: statusSymbol)
+                            .font(.system(size: 11, weight: .semibold))
+                        Text(item.status?.label ?? "Thread")
+                            .font(.system(size: 11))
+                    }
+                    .foregroundStyle(statusColor)
                 }
+                .lineLimit(1)
             }
 
-            HStack(spacing: 8) {
-                Text(item.workspaceLabel)
-                Text(item.shortID)
-                if let updatedAt = item.updatedAt {
-                    Text(Self.relativeFormatter.localizedString(for: updatedAt, relativeTo: Date()))
-                }
-            }
-            .font(.caption2.weight(.semibold))
-            .foregroundStyle(AppTheme.textTertiary)
-            .lineLimit(1)
+            Spacer(minLength: 0)
         }
-        .padding(14)
-        .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(AppTheme.strokeSubtle, lineWidth: 1)
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(AppTheme.strokeSubtle)
+                .frame(height: 0.5)
+                .padding(.leading, 62)
         }
+    }
+
+    private var statusSymbol: String {
+        guard let status = item.status else { return item.isActive ? "clock" : "checkmark" }
+        switch status {
+        case .succeeded:
+            return "checkmark"
+        case .queued, .running, .canceling:
+            return "clock"
+        default:
+            return "exclamationmark"
+        }
+    }
+
+    private var timestampText: String {
+        guard let updatedAt = item.updatedAt else { return "" }
+        return Self.relativeFormatter.localizedString(for: updatedAt, relativeTo: Date())
     }
 
     private var statusColor: Color {
@@ -359,20 +412,35 @@ private struct CodexActivityRow: View {
 }
 
 enum AppTheme {
-    static let bgCanvas = Color(red: 0.055, green: 0.055, blue: 0.058)
-    static let bgSurface = Color(red: 0.095, green: 0.096, blue: 0.102)
-    static let bgSurfaceHi = Color(red: 0.145, green: 0.146, blue: 0.154)
-    static let strokeSubtle = Color.white.opacity(0.07)
-    static let strokeStrong = Color.white.opacity(0.14)
-    static let textPrimary = Color.white.opacity(0.94)
-    static let textSecondary = Color.white.opacity(0.62)
-    static let textTertiary = Color.white.opacity(0.40)
-    static let accent = Color(red: 0.86, green: 0.86, blue: 0.82)
-    static let statusOK = Color(red: 0.58, green: 0.70, blue: 0.60)
-    static let statusWarn = Color(red: 0.74, green: 0.64, blue: 0.42)
-    static let statusError = Color(red: 0.78, green: 0.45, blue: 0.43)
-    static let statusInfo = Color(red: 0.58, green: 0.64, blue: 0.72)
-    static let statusNeutral = Color.white.opacity(0.46)
+    static let bgCanvas = Color(hex: 0x1A1917)
+    static let bgSurface = warmText.opacity(0.06)
+    static let bgSurfaceHi = Color(hex: 0x232220)
+    static let threadPreviewBackground = Color(hex: 0x272522)
+    static let strokeSubtle = warmText.opacity(0.07)
+    static let strokeStrong = warmText.opacity(0.07)
+    static let textPrimary = warmText
+    static let textSecondary = warmText.opacity(0.45)
+    static let textTertiary = warmText.opacity(0.27)
+    static let inactiveTab = warmText.opacity(0.38)
+    static let accent = Color(hex: 0xD4804A)
+    static let statusOK = Color(hex: 0x32D74B)
+    static let statusWarn = Color(hex: 0xFF9F0A)
+    static let statusError = statusWarn
+    static let statusInfo = textSecondary
+    static let statusNeutral = textTertiary
+
+    private static let warmText = Color(hex: 0xEDE8DF)
+
+}
+
+private extension Color {
+    init(hex: UInt32) {
+        self.init(
+            red: Double((hex >> 16) & 0xFF) / 255.0,
+            green: Double((hex >> 8) & 0xFF) / 255.0,
+            blue: Double(hex & 0xFF) / 255.0
+        )
+    }
 }
 
 enum AppConfiguration {

@@ -827,8 +827,8 @@ struct CodexThreadChatItem: Hashable, Identifiable {
                 treatTrailingAssistantAsProgress: isWorking,
                 finalAssistantCanLoadFullText: !isWorking && shouldOfferFullAnswer
             )
-            replaceLatestAssistantMessage(in: &items, with: latestJob)
             appendLatestPromptIfMissing(to: &items, latestJob: latestJob)
+            mergeLatestJobCompletion(in: &items, latestJob: latestJob)
             if isWorking {
                 appendWorkingPlaceholder(to: &items, providerName: workingProviderName, timestamp: workingTimestamp)
             }
@@ -979,7 +979,6 @@ struct CodexThreadChatItem: Hashable, Identifiable {
 
     private static func appendLatestPromptIfMissing(to items: inout [CodexThreadChatItem], latestJob: CodexJob?) {
         guard let latestJob,
-              latestJob.status.isActive,
               let prompt = latestJob.prompt?.trimmedNonEmpty else {
             return
         }
@@ -1010,41 +1009,70 @@ struct CodexThreadChatItem: Hashable, Identifiable {
         items.append(item)
     }
 
-    private static func replaceLatestAssistantMessage(in items: inout [CodexThreadChatItem], with latestJob: CodexJob?) {
+    private static func mergeLatestJobCompletion(in items: inout [CodexThreadChatItem], latestJob: CodexJob?) {
         guard let latestJob,
               !latestJob.status.isActive,
-              let answer = latestJob.displayOutput?.trimmedNonEmpty else {
+              let responseItem = completionItem(from: latestJob) else {
             return
         }
 
-        let canLoadFullText = canLoadFullAnswer(thread: nil, latestJob: latestJob)
-        if let index = items.lastIndex(where: { $0.role == .assistant && $0.kind == .message }) {
-            guard answer.count > items[index].text.count || items[index].canLoadFullText else {
+        guard let prompt = latestJob.prompt?.trimmedNonEmpty,
+              let promptIndex = items.lastIndex(where: { $0.role == .user && $0.text == prompt }) else {
+            appendIfMissing(responseItem, to: &items)
+            return
+        }
+
+        let responseRangeStart = items.index(after: promptIndex)
+        let responseRange = responseRangeStart..<items.endIndex
+        if let responseIndex = responseRange.last(where: { items[$0].role == responseItem.role && items[$0].kind == .message }) {
+            let previous = items[responseIndex]
+            guard responseItem.text.count > previous.text.count || previous.canLoadFullText || previous.text != responseItem.text else {
                 return
             }
-            let previous = items[index]
-            items[index] = CodexThreadChatItem(
+            items[responseIndex] = CodexThreadChatItem(
+                role: responseItem.role,
+                text: responseItem.text,
+                timestamp: responseItem.timestamp ?? previous.timestamp,
+                isError: responseItem.isError,
+                sourceID: previous.sourceID,
+                kind: responseItem.kind,
+                progressCount: responseItem.progressCount,
+                canLoadFullText: responseItem.canLoadFullText
+            )
+        } else {
+            appendIfMissing(responseItem, to: &items)
+        }
+    }
+
+    private static func completionItem(from latestJob: CodexJob) -> CodexThreadChatItem? {
+        if let answer = latestJob.displayOutput?.trimmedNonEmpty {
+            return chatItem(
                 role: .assistant,
                 text: answer,
-                timestamp: latestJob.completedAt ?? latestJob.updatedAt ?? previous.timestamp,
-                isError: false,
-                sourceID: previous.sourceID,
-                kind: .message,
-                progressCount: 0,
-                canLoadFullText: canLoadFullText
+                timestamp: latestJob.completedAt ?? latestJob.updatedAt,
+                sourceID: "thread-answer-\(latestJob.id)",
+                canLoadFullText: canLoadFullAnswer(thread: nil, latestJob: latestJob)
             )
-            return
         }
 
-        if let item = chatItem(
-            role: .assistant,
-            text: answer,
-            timestamp: latestJob.completedAt ?? latestJob.updatedAt,
-            sourceID: "thread-answer-\(latestJob.id)",
-            canLoadFullText: canLoadFullText
-        ) {
-            items.append(item)
+        if let error = latestJob.errorMessage?.trimmedNonEmpty {
+            return chatItem(
+                role: .status,
+                text: error,
+                timestamp: latestJob.completedAt ?? latestJob.updatedAt,
+                isError: true,
+                sourceID: "thread-error-\(latestJob.id)"
+            )
         }
+
+        return nil
+    }
+
+    private static func appendIfMissing(_ item: CodexThreadChatItem, to items: inout [CodexThreadChatItem]) {
+        guard !items.contains(where: { $0.role == item.role && $0.text == item.text }) else {
+            return
+        }
+        items.append(item)
     }
 
     private static func chatItem(

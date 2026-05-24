@@ -70,8 +70,10 @@ const terminalStatuses = new Set(["succeeded", "failed", "cancelled", "timeout"]
 const allowedReasoningEfforts = new Set(["low", "medium", "high", "xhigh"]);
 const allowedJobProviders = new Set(["codex", "claude"]);
 const allowedClaudePermissionModes = new Set(["acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"]);
-const claudeAwsProfile = cleanOptionalAwsProfile(process.env.CLAUDE_AWS_PROFILE || process.env.AWS_PROFILE || "sigiq");
-const claudeAwsRegion = cleanOptionalAwsProfile(process.env.CLAUDE_AWS_REGION);
+const claudeAwsProfile = cleanOptionalAwsProfile(process.env.CLAUDE_AWS_PROFILE || "sigiq");
+const claudeAwsRegion = cleanOptionalAwsProfile(
+  process.env.CLAUDE_AWS_REGION || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION,
+);
 const claudeModelAliases = {
   sonnet: process.env.CLAUDE_SONNET_MODEL || "sonnet",
   opus: process.env.CLAUDE_OPUS_MODEL || "global.anthropic.claude-opus-4-6-v1",
@@ -795,6 +797,16 @@ async function routeRequest(req, res) {
     const detail = await threadDetailResponse(sessionId, { provider });
     if (!detail) return sendError(res, 404, "thread not found");
     return sendJson(res, 200, detail);
+  }
+
+  if (threadMatch && req.method === "DELETE") {
+    const sessionId = decodeURIComponent(threadMatch[1]);
+    const workspaceId = url.searchParams.get("workspaceId");
+    const provider = cleanProviderFilter(url.searchParams.get("provider"));
+    if (!isSafeJobId(sessionId)) return sendError(res, 404, "thread not found");
+    const deleted = deleteThread(sessionId, { workspaceId, provider, certSubject: auth.subject });
+    if (!deleted) return sendError(res, 404, "thread not found");
+    return sendJson(res, 200, deleted);
   }
 
   if (req.method === "POST" && url.pathname === "/v1/codex/transcriptions") {
@@ -2221,6 +2233,106 @@ async function threadDetailResponse(sessionId, { provider = null } = {}) {
     messages,
     jobs: await Promise.all(sortedJobs.map((job) => toJobResponse(job, responseShape("compact")))),
   };
+}
+
+function deleteThread(sessionId, { workspaceId = null, provider = null, certSubject = null } = {}) {
+  const selectedWorkspace = resolveOptionalWorkspaceFilter(workspaceId);
+  const sessionsDir = path.join(codexHome, "sessions");
+  const sessionFile = findSessionFile(sessionsDir, sessionId);
+  const sessionMeta = sessionFile ? readSessionMeta(sessionFile, sessionId) : null;
+  const sessionProvider = sessionMeta ? normalizeJobProvider(sessionMeta.provider) : null;
+  const sessionWorkspace = sessionMeta ? workspaceForSessionCwd(sessionMeta.cwd) : null;
+  const sessionMatches =
+    Boolean(sessionFile && sessionMeta && sessionWorkspace) &&
+    (!provider || sessionProvider === provider) &&
+    (!selectedWorkspace || sessionWorkspace.id === selectedWorkspace.id);
+
+  const matchedJobs = [...jobs.values()].filter((job) => {
+    if (jobThreadId(job) !== sessionId) return false;
+    const jobProvider = normalizeJobProvider(job.provider);
+    if (provider && jobProvider !== provider) return false;
+    const workspace = workspaceForJob(job);
+    if (!workspace) return false;
+    if (selectedWorkspace && workspace.id !== selectedWorkspace.id) return false;
+    return true;
+  });
+
+  if (!sessionMatches && matchedJobs.length === 0) return null;
+  const activeJob = matchedJobs.find((job) => !terminalStatuses.has(job.status));
+  if (activeJob) {
+    throw Object.assign(new Error("thread has active jobs"), { status: 409 });
+  }
+
+  for (const job of matchedJobs) {
+    queuedJobIds = queuedJobIds.filter((id) => id !== job.id);
+    activeChildren.delete(job.id);
+    jobs.delete(job.id);
+    removePersistedJobFiles(job);
+  }
+
+  const deletedSessionFile = sessionMatches ? removePathInsideRoot(sessionFile, sessionsDir) : false;
+  const workspaceForAudit = selectedWorkspace || sessionWorkspace || workspaceForJob(matchedJobs[0]);
+  appendAudit(
+    "thread_deleted",
+    {
+      id: sessionId,
+      status: "deleted",
+      workspaceId: workspaceForAudit?.id || null,
+      certSubject,
+    },
+    {
+      provider,
+      deletedJobs: matchedJobs.length,
+      deletedSessionFile,
+    },
+  );
+
+  return {
+    deleted: true,
+    threadId: sessionId,
+    workspaceId: workspaceForAudit?.id || null,
+    deletedJobs: matchedJobs.length,
+    deletedSessionFile,
+  };
+}
+
+function removePersistedJobFiles(job) {
+  const paths = [
+    jobPath(job.id),
+    job.stdoutPath,
+    job.stderrPath,
+    job.resultPath,
+    path.join(attachmentsDir, job.id),
+    path.join(artifactsDir, job.id),
+  ];
+  for (const attachment of Array.isArray(job.attachments) ? job.attachments : []) {
+    paths.push(attachment?.path);
+  }
+  for (const artifact of Array.isArray(job.artifacts) ? job.artifacts : []) {
+    paths.push(artifact?.path);
+  }
+
+  for (const target of paths) {
+    removePathInsideRoot(target, dataDir);
+  }
+}
+
+function removePathInsideRoot(target, rootDir) {
+  if (typeof target !== "string" || !target || /[\0\r\n]/.test(target)) return false;
+  const root = realpathOrResolve(rootDir);
+  const resolvedTarget = realpathOrResolve(target);
+  const relative = path.relative(root, resolvedTarget);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return false;
+  try {
+    fs.rmSync(resolvedTarget, { recursive: true, force: true });
+    return true;
+  } catch (error) {
+    appendAudit("remove_path_failed", null, {
+      target: relative,
+      error: error.message || String(error),
+    });
+    return false;
+  }
 }
 
 function jobThreadId(job) {
