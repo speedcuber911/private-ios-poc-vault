@@ -1,6 +1,7 @@
 import CryptoKit
 import XCTest
 import AVFoundation
+import SwiftUI
 @testable import POCVault
 
 final class ManifestTests: XCTestCase {
@@ -137,19 +138,31 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(CodexProvider.claude.tabIconAssetName, "ClaudeMark")
     }
 
-    func testConsoleControlStripLayoutKeepsProvidersVerticallyAligned() throws {
+    func testRelayDesignTokensUseWarmRedesignPalette() throws {
+        assertColor(AppTheme.bgCanvas, red: 0x1A, green: 0x19, blue: 0x17, alpha: 1)
+        assertColor(AppTheme.bgSurface, red: 0xED, green: 0xE8, blue: 0xDF, alpha: 0.06)
+        assertColor(AppTheme.bgSurfaceHi, red: 0x23, green: 0x22, blue: 0x20, alpha: 1)
+        assertColor(AppTheme.textPrimary, red: 0xED, green: 0xE8, blue: 0xDF, alpha: 1)
+        assertColor(AppTheme.textSecondary, red: 0xED, green: 0xE8, blue: 0xDF, alpha: 0.45)
+        assertColor(AppTheme.textTertiary, red: 0xED, green: 0xE8, blue: 0xDF, alpha: 0.27)
+        assertColor(AppTheme.accent, red: 0xD4, green: 0x80, blue: 0x4A, alpha: 1)
+        assertColor(AppTheme.statusOK, red: 0x32, green: 0xD7, blue: 0x4B, alpha: 1)
+        assertColor(AppTheme.statusWarn, red: 0xFF, green: 0x9F, blue: 0x0A, alpha: 1)
+    }
+
+    func testConsoleControlStripLayoutIsRemovedFromHomeComposer() throws {
         let codexLayout = CodexControlStripLayout(provider: .codex)
         let claudeLayout = CodexControlStripLayout(provider: .claude)
 
-        XCTAssertEqual(codexLayout.visibleRowCount, 3)
+        XCTAssertEqual(codexLayout.visibleRowCount, 0)
         XCTAssertEqual(claudeLayout.visibleRowCount, codexLayout.visibleRowCount)
-        XCTAssertEqual(codexLayout.controlHeight, 36)
+        XCTAssertEqual(codexLayout.controlHeight, 0)
         XCTAssertEqual(claudeLayout.controlHeight, codexLayout.controlHeight)
-        XCTAssertTrue(codexLayout.showsSkillButton)
-        XCTAssertTrue(claudeLayout.showsSkillButton)
+        XCTAssertFalse(codexLayout.showsSkillButton)
+        XCTAssertFalse(claudeLayout.showsSkillButton)
         XCTAssertFalse(claudeLayout.reservesSkillSlot)
-        XCTAssertTrue(codexLayout.showsRunMode)
-        XCTAssertTrue(claudeLayout.showsRunMode)
+        XCTAssertFalse(codexLayout.showsRunMode)
+        XCTAssertFalse(claudeLayout.showsRunMode)
     }
 
     func testThreadDetailLayoutKeepsActiveRunChromeOutOfChatFlow() throws {
@@ -1671,5 +1684,32 @@ final class ManifestTests: XCTestCase {
 
     private func decodeCodexThread(_ json: String) throws -> CodexThread {
         try JSONDecoder().decode(CodexThread.self, from: Data(json.utf8))
+    }
+
+    private func assertColor(
+        _ color: Color,
+        red: Int,
+        green: Int,
+        blue: Int,
+        alpha: CGFloat,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let uiColor = UIColor(color)
+        var actualRed: CGFloat = 0
+        var actualGreen: CGFloat = 0
+        var actualBlue: CGFloat = 0
+        var actualAlpha: CGFloat = 0
+
+        XCTAssertTrue(
+            uiColor.getRed(&actualRed, green: &actualGreen, blue: &actualBlue, alpha: &actualAlpha),
+            "Could not resolve color components",
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(actualRed, CGFloat(red) / 255.0, accuracy: 0.003, file: file, line: line)
+        XCTAssertEqual(actualGreen, CGFloat(green) / 255.0, accuracy: 0.003, file: file, line: line)
+        XCTAssertEqual(actualBlue, CGFloat(blue) / 255.0, accuracy: 0.003, file: file, line: line)
+        XCTAssertEqual(actualAlpha, alpha, accuracy: 0.003, file: file, line: line)
     }
 }
