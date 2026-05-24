@@ -11,7 +11,9 @@ struct DiagnosticsView: View {
     @State private var importError: String?
     @State private var isImportExpanded = false
 
-    private let contentHorizontalPadding: CGFloat = 18
+    private var contentHorizontalPadding: CGFloat {
+        showsNavigationChrome ? 18 : 20
+    }
     private let cardCornerRadius: CGFloat = 14
 
     var body: some View {
@@ -22,13 +24,13 @@ struct DiagnosticsView: View {
                     VStack(alignment: .leading, spacing: 16) {
                         VStack(alignment: .leading, spacing: 6) {
                             Text(screenTitle)
-                                .font(.system(size: showsNavigationChrome ? 34 : 34, weight: .bold, design: .rounded))
+                                .font(titleFont)
                                 .foregroundStyle(AppTheme.textPrimary)
                             Text(AppConfiguration.runtimeMode)
                                 .font(.subheadline.weight(.medium))
                                 .foregroundStyle(AppTheme.textSecondary)
                         }
-                        .padding(.top, showsNavigationChrome ? 18 : 16)
+                        .padding(.top, showsNavigationChrome ? 18 : 0)
 
                         certificatePanel
 
@@ -269,6 +271,12 @@ struct DiagnosticsView: View {
 
     private var screenTitle: String {
         showsNavigationChrome ? "Diagnostics" : "Health"
+    }
+
+    private var titleFont: Font {
+        showsNavigationChrome
+            ? .system(size: 34, weight: .bold, design: .rounded)
+            : .title2.weight(.semibold)
     }
 }
 

@@ -827,8 +827,9 @@ struct CodexThreadChatItem: Hashable, Identifiable {
                 treatTrailingAssistantAsProgress: isWorking,
                 finalAssistantCanLoadFullText: !isWorking && shouldOfferFullAnswer
             )
+            replaceLatestAssistantMessage(in: &items, with: latestJob)
             appendLatestPromptIfMissing(to: &items, latestJob: latestJob)
-            if isWorking, !items.contains(where: { $0.kind == .progressSummary }) {
+            if isWorking {
                 appendWorkingPlaceholder(to: &items, providerName: workingProviderName, timestamp: workingTimestamp)
             }
             return items
@@ -1009,6 +1010,43 @@ struct CodexThreadChatItem: Hashable, Identifiable {
         items.append(item)
     }
 
+    private static func replaceLatestAssistantMessage(in items: inout [CodexThreadChatItem], with latestJob: CodexJob?) {
+        guard let latestJob,
+              !latestJob.status.isActive,
+              let answer = latestJob.displayOutput?.trimmedNonEmpty else {
+            return
+        }
+
+        let canLoadFullText = canLoadFullAnswer(thread: nil, latestJob: latestJob)
+        if let index = items.lastIndex(where: { $0.role == .assistant && $0.kind == .message }) {
+            guard answer.count > items[index].text.count || items[index].canLoadFullText else {
+                return
+            }
+            let previous = items[index]
+            items[index] = CodexThreadChatItem(
+                role: .assistant,
+                text: answer,
+                timestamp: latestJob.completedAt ?? latestJob.updatedAt ?? previous.timestamp,
+                isError: false,
+                sourceID: previous.sourceID,
+                kind: .message,
+                progressCount: 0,
+                canLoadFullText: canLoadFullText
+            )
+            return
+        }
+
+        if let item = chatItem(
+            role: .assistant,
+            text: answer,
+            timestamp: latestJob.completedAt ?? latestJob.updatedAt,
+            sourceID: "thread-answer-\(latestJob.id)",
+            canLoadFullText: canLoadFullText
+        ) {
+            items.append(item)
+        }
+    }
+
     private static func chatItem(
         role: CodexThreadMessageRole,
         text: String?,
@@ -1037,11 +1075,7 @@ struct CodexThreadChatItem: Hashable, Identifiable {
     private static func canLoadFullAnswer(thread: CodexThread?, latestJob: CodexJob?) -> Bool {
         if let latestJob {
             guard !latestJob.status.isActive else { return false }
-            if latestJob.resultTruncated || latestJob.displayOutputPreview.isTruncated {
-                return true
-            }
-            return latestJob.logsIncluded?.lowercased() == "compact"
-                && latestJob.result?.trimmedNonEmpty != nil
+            return latestJob.resultTruncated || latestJob.displayOutputPreview.isTruncated
         }
 
         return thread?.lastJobId?.trimmedNonEmpty != nil

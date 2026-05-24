@@ -18,6 +18,12 @@ struct CodexConsoleView: View {
                         VStack(alignment: .leading, spacing: 20) {
                             CodexHeader(viewModel: viewModel)
 
+                            if let errorMessage = viewModel.errorMessage {
+                                CodexErrorCard(summary: CodexErrorSummary(message: errorMessage)) {
+                                    Task { await viewModel.refreshAll() }
+                                }
+                            }
+
                             CodexPromptCard(
                                 viewModel: viewModel,
                                 onCreated: openCreatedJob,
@@ -25,12 +31,6 @@ struct CodexConsoleView: View {
                                 onOpenPendingThread: { jobID in path.append(.pendingThread(jobID)) },
                                 onOpenJob: { jobID in path.append(.job(jobID)) }
                             )
-
-                            if let errorMessage = viewModel.errorMessage {
-                                CodexErrorCard(summary: CodexErrorSummary(message: errorMessage)) {
-                                    Task { await viewModel.refreshAll() }
-                                }
-                            }
 
                             CodexThreadFeedSection(
                                 viewModel: viewModel,
@@ -189,16 +189,6 @@ private struct CodexPromptCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text(viewModel.selectedSessionID == nil ? "What should \(viewModel.provider.displayName) do?" : "Continue this thread")
-                    .font(.title2.weight(.semibold))
-                    .foregroundStyle(CodexTheme.text)
-                Text(contextText)
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(CodexTheme.dim)
-                    .lineLimit(2)
-            }
-
             CodexControlStrip(
                 viewModel: viewModel,
                 skillCount: viewModel.selectedSkills.count
@@ -225,13 +215,6 @@ private struct CodexPromptCard: View {
                     )
                     .padding(.top, 4)
                     .zIndex(1)
-                } else if viewModel.prompt.isEmpty {
-                    Text("Type a prompt for \(viewModel.provider.displayName)...")
-                        .font(.system(size: 16, weight: .medium))
-                        .foregroundStyle(CodexTheme.dim)
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 8)
-                        .allowsHitTesting(false)
                 }
 
                 TextEditor(text: $viewModel.prompt)
@@ -241,7 +224,7 @@ private struct CodexPromptCard: View {
                     .textInputAutocapitalization(.sentences)
                     .autocorrectionDisabled()
                     .focused($promptIsFocused)
-                    .frame(minHeight: 220, maxHeight: 300)
+                    .frame(minHeight: promptEditorMinHeight, maxHeight: 260)
                     .background(Color.clear)
             }
 
@@ -255,10 +238,12 @@ private struct CodexPromptCard: View {
                 .overlay(CodexTheme.stroke)
 
             HStack(spacing: 10) {
-                Text(disabledReason)
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(CodexTheme.dim)
-                    .lineLimit(1)
+                if let statusText {
+                    Text(statusText)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(CodexTheme.dim)
+                        .lineLimit(1)
+                }
 
                 Spacer()
 
@@ -383,7 +368,15 @@ private struct CodexPromptCard: View {
             && !audioRecorder.isRecording
     }
 
-    private var disabledReason: String {
+    private var promptEditorMinHeight: CGFloat {
+        let trimmedPrompt = viewModel.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedPrompt.isEmpty && viewModel.composeStatusItem == nil {
+            return 150
+        }
+        return 190
+    }
+
+    private var statusText: String? {
         if audioRecorder.isRecording {
             return "Recording"
         }
@@ -391,7 +384,7 @@ private struct CodexPromptCard: View {
             return "Transcribing"
         }
         if viewModel.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && viewModel.attachments.isEmpty {
-            return "Enter a prompt"
+            return nil
         }
         if !viewModel.attachments.isEmpty {
             return "\(viewModel.attachments.count) attached"
@@ -473,18 +466,6 @@ private struct CodexPromptCard: View {
         }
     }
 
-    private var contextText: String {
-        if let selectedThread = viewModel.selectedThread {
-            return "Continuing \(selectedThread.displayTitle) · \(selectedThread.shortID)."
-        }
-        if let selectedSession = viewModel.selectedSession {
-            return "Continuing \(selectedSession.displayTitle) · \(selectedSession.shortID)."
-        }
-        if let selectedSessionID = viewModel.selectedSessionID {
-            return "Continuing thread \(String(selectedSessionID.prefix(12)))."
-        }
-        return "Start fresh, or choose a recent thread to continue."
-    }
 }
 
 private struct CodexComposeStatusPanel: View {
@@ -740,7 +721,7 @@ private struct CodexThreadPickerSheet: View {
     @State private var showingSmokeThreads = false
 
     private var filteredThreads: [CodexThread] {
-        let threads = viewModel.threads.filter { showingSmokeThreads || !$0.isSmokeTest }
+        let threads = workspaceThreads.filter { showingSmokeThreads || !$0.isSmokeTest }
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !query.isEmpty else { return threads }
         return threads.filter { thread in
@@ -758,6 +739,10 @@ private struct CodexThreadPickerSheet: View {
         }
     }
 
+    private var workspaceThreads: [CodexThread] {
+        viewModel.threadsForSelectedWorkspace
+    }
+
     var body: some View {
         NavigationStack {
             List {
@@ -771,7 +756,7 @@ private struct CodexThreadPickerSheet: View {
                     .listRowBackground(CodexTheme.panel)
                 }
 
-                if viewModel.threads.contains(where: \.isSmokeTest) {
+                if workspaceThreads.contains(where: \.isSmokeTest) {
                     Section {
                         Toggle(isOn: $showingSmokeThreads) {
                             Text("Show smoke tests")
@@ -844,7 +829,7 @@ private struct CodexThreadPickerSheet: View {
 
     private var emptyMessage: String {
         searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? "Run a \(viewModel.provider.displayName) job on EC2 and it will appear here."
+            ? "Run a \(viewModel.provider.displayName) job in \(viewModel.composeWorkspaceLabel) and it will appear here."
             : searchText
     }
 }
@@ -940,6 +925,7 @@ private struct CodexThreadRow: View {
 
 struct CodexControlStripLayout: Equatable {
     let controlHeight: CGFloat = 36
+    let leadingColumnWidth: CGFloat = 176
     let visibleRowCount = 3
     let showsSkillButton: Bool
     let reservesSkillSlot: Bool
@@ -1038,7 +1024,7 @@ private struct CodexControlStrip: View {
             }
             .foregroundStyle(CodexTheme.text)
             .padding(.horizontal, 12)
-            .frame(maxWidth: 176, alignment: .leading)
+            .frame(width: layout.leadingColumnWidth, alignment: .leading)
             .frame(height: 36)
             .background(CodexTheme.raisedPanel, in: Capsule())
         }
@@ -1073,7 +1059,7 @@ private struct CodexControlStrip: View {
             }
             .foregroundStyle(CodexTheme.text)
             .padding(.horizontal, 12)
-            .frame(minWidth: 132, alignment: .leading)
+            .frame(width: layout.leadingColumnWidth, alignment: .leading)
             .frame(height: 36)
             .background(CodexTheme.raisedPanel, in: Capsule())
         }
@@ -1763,7 +1749,7 @@ private struct CodexThreadFeedSection: View {
         if viewModel.connectionNotice != nil && !viewModel.threadFeedItems.isEmpty {
             return "Showing last loaded threads"
         }
-        let count = viewModel.threadFeedItems.count
+        let count = viewModel.visibleThreadCount
         if count == 0 {
             return "No threads yet"
         }
@@ -2941,7 +2927,7 @@ private struct CodexThreadChatBubble: View {
                     }
                     .buttonStyle(CodexPillButtonStyle(isAccent: true))
                     .disabled(isLoadingFullAnswer)
-                } else if item.isLong {
+                } else if showsExpansionButton {
                     Button {
                         withAnimation(.easeInOut(duration: 0.18)) {
                             isExpanded.toggle()
@@ -2969,11 +2955,15 @@ private struct CodexThreadChatBubble: View {
     }
 
     private var shouldCollapse: Bool {
-        item.kind != .progressSummary && item.isLong && !isExpanded
+        item.kind != .progressSummary && item.role != .assistant && item.isLong && !isExpanded
     }
 
     private var shouldShowBody: Bool {
         item.kind != .progressSummary || isExpanded
+    }
+
+    private var showsExpansionButton: Bool {
+        item.kind == .progressSummary || (item.role != .assistant && item.isLong)
     }
 
     private var expandButtonTitle: String {

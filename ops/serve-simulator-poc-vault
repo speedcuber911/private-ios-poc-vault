@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import mimetypes
 import re
 import subprocess
@@ -30,9 +31,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
+        query = parsed.query
 
         if path == "/healthz":
             self.send_bytes(b"ok\n", "text/plain")
+            return
+        if path.startswith("/v1/codex/"):
+            self.serve_codex_fixture(path, query)
             return
         if path == "/manifest.json":
             self.send_file(self.server.manifest_dir / "manifest.json", "application/json")
@@ -44,6 +49,61 @@ class Handler(BaseHTTPRequestHandler):
             self.serve_poc(path)
             return
 
+        self.send_error(404)
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path)
+        if path == "/v1/codex/jobs":
+            self.send_json({
+                "id": "sim-job-running",
+                "job": codex_fixture_job(status="running", result=None),
+            })
+            return
+        if path == "/v1/codex/workspaces/select":
+            self.send_json(codex_fixture_workspace())
+            return
+        if path == "/v1/codex/workspaces/create":
+            self.send_json(codex_fixture_workspace(id="sim-new-workspace", name="New Workspace", path="/srv/codex-workspaces/new-workspace"))
+            return
+        self.send_error(404)
+
+    def serve_codex_fixture(self, path: str, query: str) -> None:
+        if path == "/v1/codex/health":
+            self.send_json({"ok": True, "status": "ok", "message": "Simulator Codex fixture"})
+            return
+        if path == "/v1/codex/workspaces":
+            self.send_json({"workspaces": [codex_fixture_workspace()]})
+            return
+        if path == "/v1/codex/workspace-dirs":
+            workspace = codex_fixture_workspace()
+            self.send_json({
+                "rootPath": "/srv/codex-workspaces",
+                "currentPath": workspace["path"],
+                "relativePath": "poc-vault",
+                "parentPath": "/srv/codex-workspaces",
+                "selectedWorkspace": workspace,
+                "entries": [],
+            })
+            return
+        if path == "/v1/codex/jobs":
+            self.send_json({"jobs": [codex_fixture_job()]})
+            return
+        if path == "/v1/codex/sessions":
+            self.send_json({"sessions": [codex_fixture_session()]})
+            return
+        if path == "/v1/codex/threads":
+            self.send_json({"threads": [codex_fixture_thread()]})
+            return
+        if path == "/v1/codex/threads/sim-thread-linear":
+            self.send_json(codex_fixture_thread_detail())
+            return
+        if path == "/v1/codex/jobs/sim-job-linear":
+            self.send_json(codex_fixture_job())
+            return
+        if path == "/v1/codex/jobs/sim-job-running":
+            self.send_json(codex_fixture_job(status="running", result=None))
+            return
         self.send_error(404)
 
     def serve_poc(self, path: str) -> None:
@@ -84,8 +144,107 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def send_json(self, payload: dict) -> None:
+        self.send_bytes(json.dumps(payload).encode("utf-8"), "application/json")
+
     def log_message(self, format: str, *args: object) -> None:
         sys.stderr.write("sim-vault: " + format % args + "\n")
+
+
+def codex_fixture_workspace(id: str = "poc-vault", name: str = "POC Vault", path: str = "/srv/codex-workspaces/poc-vault") -> dict:
+    return {
+        "id": id,
+        "name": name,
+        "path": path,
+        "summary": "Simulator workspace",
+        "isDefault": True,
+    }
+
+
+def codex_fixture_session() -> dict:
+    return {
+        "id": "sim-thread-linear",
+        "provider": "codex",
+        "workspaceId": "poc-vault",
+        "workspaceName": "POC Vault",
+        "cwd": "/srv/codex-workspaces/poc-vault",
+        "updatedAt": "2026-05-23T13:35:30Z",
+    }
+
+
+def codex_fixture_answer() -> str:
+    return "\n".join([
+        "I pulled issues assigned to you that were updated in the last 7 days, from May 16 to May 23, 2026. There are 3. None are still open in Linear, so these are the action items I could extract:",
+        "",
+        "- ENGG-541: Confirm the remaining LMS sync follow-up is already captured in the rollout notes.",
+        "- ENGG-542: Check whether the production deploy note needs an owner before the next release.",
+        "- ENGG-543: Keep the cleanup item closed unless a new regression appears in the mobile console.",
+        "",
+        "No active Linear ticket needs a fresh reply right now.",
+    ])
+
+
+def codex_fixture_thread() -> dict:
+    return {
+        "id": "sim-thread-linear",
+        "sessionId": "sim-thread-linear",
+        "provider": "codex",
+        "workspaceId": "poc-vault",
+        "workspaceName": "POC Vault",
+        "updatedAt": "2026-05-23T13:35:30Z",
+        "jobCount": 1,
+        "activeJobCount": 0,
+        "lastJobId": "sim-job-linear",
+        "lastJobStatus": "succeeded",
+        "lastPrompt": "List out all my linear issues for last one week and also carve out my action items from them.",
+        "lastResult": codex_fixture_answer()[:220] + "...",
+        "hasSessionFile": True,
+        "isSmokeTest": False,
+    }
+
+
+def codex_fixture_thread_detail() -> dict:
+    return {
+        "thread": codex_fixture_thread(),
+        "messages": [
+            {
+                "role": "user",
+                "timestamp": "2026-05-23T13:34:00Z",
+                "text": "List out all my linear issues for last one week and also carve out my action items from them.",
+            },
+            {
+                "role": "assistant",
+                "timestamp": "2026-05-23T13:34:20Z",
+                "text": "I am pulling Linear issues.",
+            },
+            {
+                "role": "assistant",
+                "timestamp": "2026-05-23T13:34:50Z",
+                "text": codex_fixture_answer()[:220] + "...",
+            },
+        ],
+        "jobs": [codex_fixture_job()],
+    }
+
+
+def codex_fixture_job(status: str = "succeeded", result: str | None = None) -> dict:
+    result_text = codex_fixture_answer() if result is None and status == "succeeded" else result
+    return {
+        "id": "sim-job-linear" if status == "succeeded" else "sim-job-running",
+        "provider": "codex",
+        "status": status,
+        "workspaceId": "poc-vault",
+        "workspaceName": "POC Vault",
+        "prompt": "List out all my linear issues for last one week and also carve out my action items from them.",
+        "result": result_text,
+        "resultTruncated": False,
+        "logsIncluded": "compact",
+        "sessionId": "sim-thread-linear",
+        "createdAt": "2026-05-23T13:34:00Z",
+        "startedAt": "2026-05-23T13:34:02Z",
+        "completedAt": None if status == "running" else "2026-05-23T13:35:30Z",
+        "updatedAt": "2026-05-23T13:35:30Z",
+    }
 
 
 def refresh_manifest(host: str, port: int) -> None:

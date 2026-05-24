@@ -771,6 +771,67 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(answer.isLong)
     }
 
+    func testCodexThreadChatTranscriptUsesFullLatestJobAnswerOverThreadPreview() throws {
+        let detail = try JSONDecoder().decode(
+            CodexThreadDetail.self,
+            from: Data(
+                """
+                {
+                  "thread": {
+                    "id": "thread-preview-answer",
+                    "sessionId": "thread-preview-answer",
+                    "workspaceId": "poc-vault",
+                    "workspaceName": "POC Vault",
+                    "updatedAt": "2026-05-20T12:05:10Z",
+                    "jobCount": 1,
+                    "activeJobCount": 0,
+                    "lastJobId": "job-full-answer",
+                    "lastJobStatus": "succeeded",
+                    "lastPrompt": "List assigned issues",
+                    "lastResult": "Short answer preview...",
+                    "hasSessionFile": true
+                  },
+                  "messages": [
+                    {
+                      "role": "user",
+                      "timestamp": "2026-05-20T12:00:00Z",
+                      "text": "List assigned issues"
+                    },
+                    {
+                      "role": "assistant",
+                      "timestamp": "2026-05-20T12:01:00Z",
+                      "text": "Short answer preview..."
+                    }
+                  ],
+                  "jobs": []
+                }
+                """.utf8
+            )
+        )
+        let job = try decodeCodexJob(
+            """
+            {
+              "id": "job-full-answer",
+              "provider": "codex",
+              "status": "succeeded",
+              "workspaceId": "poc-vault",
+              "workspaceName": "POC Vault",
+              "prompt": "List assigned issues",
+              "result": "Full answer line one.\\n\\n- ENGG-541: action item one.\\n- ENGG-542: action item two.\\n- ENGG-543: action item three.",
+              "resultTruncated": false,
+              "logsIncluded": "compact",
+              "completedAt": "2026-05-20T12:05:10Z"
+            }
+            """
+        )
+
+        let transcript = CodexThreadChatItem.makeTranscript(detail: detail, thread: nil, latestJob: job)
+
+        let answer = try XCTUnwrap(transcript.last { $0.role == .assistant })
+        XCTAssertEqual(answer.text, "Full answer line one.\n\n- ENGG-541: action item one.\n- ENGG-542: action item two.\n- ENGG-543: action item three.")
+        XCTAssertFalse(answer.canLoadFullText)
+    }
+
     func testCodexThreadChatTranscriptShowsWorkingPlaceholderForRunningFollowUp() throws {
         let thread = try decodeCodexThread(
             """
@@ -810,6 +871,65 @@ final class ManifestTests: XCTestCase {
         let workingItem = try XCTUnwrap(transcript.last)
         XCTAssertEqual(workingItem.text, "Codex is working.")
         XCTAssertEqual(workingItem.alignment, .leading)
+    }
+
+    func testCodexThreadChatTranscriptKeepsWorkingPlaceholderWithProgressUpdates() throws {
+        let detail = try JSONDecoder().decode(
+            CodexThreadDetail.self,
+            from: Data(
+                """
+                {
+                  "thread": {
+                    "id": "thread-progress-running",
+                    "sessionId": "thread-progress-running",
+                    "workspaceId": "poc-vault",
+                    "workspaceName": "POC Vault",
+                    "updatedAt": "2026-05-20T12:06:00Z",
+                    "jobCount": 1,
+                    "activeJobCount": 1,
+                    "lastJobId": "job-running-progress",
+                    "lastJobStatus": "running",
+                    "lastPrompt": "List issues",
+                    "hasSessionFile": true
+                  },
+                  "messages": [
+                    {
+                      "role": "user",
+                      "timestamp": "2026-05-20T12:00:00Z",
+                      "text": "List issues"
+                    },
+                    {
+                      "role": "assistant",
+                      "timestamp": "2026-05-20T12:00:10Z",
+                      "text": "I am pulling Linear issues."
+                    },
+                    {
+                      "role": "assistant",
+                      "timestamp": "2026-05-20T12:00:20Z",
+                      "text": "I am reading issue details."
+                    }
+                  ],
+                  "jobs": [
+                    {
+                      "id": "job-running-progress",
+                      "provider": "codex",
+                      "status": "running",
+                      "workspaceId": "poc-vault",
+                      "workspaceName": "POC Vault",
+                      "prompt": "List issues",
+                      "createdAt": "2026-05-20T12:00:00Z",
+                      "startedAt": "2026-05-20T12:00:02Z"
+                    }
+                  ]
+                }
+                """.utf8
+            )
+        )
+
+        let transcript = CodexThreadChatItem.makeTranscript(detail: detail, thread: nil, latestJob: detail.jobs.first)
+
+        XCTAssertEqual(transcript.map(\.kind), [.message, .progressSummary, .workingPlaceholder])
+        XCTAssertEqual(transcript.last?.text, "Codex is working.")
     }
 
     func testCodexThreadChatTranscriptShowsPendingFirstRunLikeThreadChat() throws {
@@ -935,10 +1055,10 @@ final class ManifestTests: XCTestCase {
 
         let transcript = CodexThreadChatItem.makeTranscript(detail: detail, thread: nil, latestJob: detail.jobs.first)
 
-        XCTAssertEqual(transcript.map(\.role), [.user, .assistant, .user, .status])
+        XCTAssertEqual(transcript.map(\.role), [.user, .assistant, .user, .status, .status])
         XCTAssertEqual(transcript[3].kind, .progressSummary)
         XCTAssertEqual(transcript[3].progressCount, 1)
-        XCTAssertFalse(transcript.contains { $0.kind == .workingPlaceholder })
+        XCTAssertEqual(transcript[4].kind, .workingPlaceholder)
         XCTAssertFalse(transcript.contains { $0.role == .assistant && $0.text == "I'll inspect the review target." })
     }
 
