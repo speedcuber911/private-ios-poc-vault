@@ -1027,6 +1027,51 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(answer.isLong)
     }
 
+    func testCodexThreadChatTranscriptShowsEmptySuccessfulClaudeJobAsIssue() throws {
+        let thread = try decodeCodexThread(
+            """
+            {
+              "id": "3210752c-bec9-41ad-a989-afe8380585f1",
+              "sessionId": "3210752c-bec9-41ad-a989-afe8380585f1",
+              "provider": "claude",
+              "workspaceId": "dir-yuno-claude-code",
+              "workspaceName": "yuno claude code",
+              "updatedAt": "2026-05-25T01:41:14Z",
+              "jobCount": 1,
+              "activeJobCount": 0,
+              "lastJobId": "1db799ed-2377-4b17-b47e-f84d3824f218",
+              "lastJobStatus": "succeeded",
+              "lastPrompt": "Get this done. Write me a plan first.",
+              "hasSessionFile": true
+            }
+            """
+        )
+        let job = try decodeCodexJob(
+            """
+            {
+              "id": "1db799ed-2377-4b17-b47e-f84d3824f218",
+              "provider": "claude",
+              "status": "succeeded",
+              "workspaceId": "dir-yuno-claude-code",
+              "workspaceName": "yuno claude code",
+              "prompt": "Get this done. Write me a plan first.",
+              "stdout": "\\n",
+              "result": "",
+              "completedAt": "2026-05-25T01:41:14Z"
+            }
+            """
+        )
+
+        let transcript = CodexThreadChatItem.makeTranscript(detail: nil, thread: thread, latestJob: job)
+
+        XCTAssertEqual(transcript.map(\.role), [.user, .status])
+        XCTAssertEqual(transcript.map(\.text), [
+            "Get this done. Write me a plan first.",
+            "Claude finished without producing output."
+        ])
+        XCTAssertTrue(try XCTUnwrap(transcript.last).isError)
+    }
+
     func testCodexThreadChatTranscriptUsesFullLatestJobAnswerOverThreadPreview() throws {
         let detail = try JSONDecoder().decode(
             CodexThreadDetail.self,

@@ -318,6 +318,21 @@ async function makeFailingStdoutClaude(tmpDir) {
   return fakeClaude;
 }
 
+async function makeEmptySuccessClaude(tmpDir) {
+  const fakeClaude = path.join(tmpDir, "fake-claude-empty-success");
+  await fs.writeFile(
+    fakeClaude,
+    [
+      "#!/bin/sh",
+      "printf '\\n'",
+      "exit 0",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  return fakeClaude;
+}
+
 async function makeSessionWritingCodex(tmpDir, sessionId) {
   const fakeCodex = path.join(tmpDir, "fake-codex-session");
   await fs.writeFile(
@@ -1968,6 +1983,41 @@ test("surfaces Claude stdout as the failure message when stderr is empty", async
     assert.equal(job.error, "selected model failed on bedrock");
     assert.equal(job.result, "");
     assert.match(job.stdout, /selected model failed on bedrock/);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("marks empty successful Claude output as a failed job", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_BIN: await makeFakeCodex(tmpDir),
+    CLAUDE_BIN: await makeEmptySuccessClaude(tmpDir),
+  });
+  try {
+    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: "scratch",
+        provider: "claude",
+        prompt: "write a plan",
+        model: "sonnet",
+        timeoutMs: 5000,
+      }),
+    });
+    assert.equal(create.status, 202);
+    const created = await create.json();
+    const job = await waitForJob(server.baseUrl, created.id);
+    assert.equal(job.status, "failed");
+    assert.equal(job.result, "");
+    assert.equal(job.error, "Claude exited successfully without producing output.");
+    assert.equal(job.stdout, "\n");
   } finally {
     await server.stop();
   }

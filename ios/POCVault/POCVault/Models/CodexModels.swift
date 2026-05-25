@@ -868,6 +868,26 @@ struct CodexThreadChatItem: Hashable, Identifiable {
             items.append(item)
         }
 
+        if answer == nil,
+           error == nil,
+           let latestJob,
+           !latestJob.status.isActive,
+           let item = completionItem(from: latestJob) {
+            items.append(item)
+        } else if answer == nil,
+                  error == nil,
+                  latestJob == nil,
+                  resolvedThread?.lastJobStatus == .succeeded,
+                  let item = chatItem(
+                      role: .status,
+                      text: emptyOutputMessage(provider: resolvedThread?.provider ?? CodexProvider.defaultProvider),
+                      timestamp: resolvedThread?.updatedAt,
+                      isError: true,
+                      sourceID: "thread-empty-output"
+                  ) {
+            items.append(item)
+        }
+
         if answer == nil, error == nil, isWorking {
             appendWorkingPlaceholder(to: &items, providerName: workingProviderName, timestamp: workingTimestamp)
         }
@@ -1065,7 +1085,21 @@ struct CodexThreadChatItem: Hashable, Identifiable {
             )
         }
 
+        if latestJob.status == .succeeded {
+            return chatItem(
+                role: .status,
+                text: emptyOutputMessage(provider: latestJob.provider),
+                timestamp: latestJob.completedAt ?? latestJob.updatedAt,
+                isError: true,
+                sourceID: "thread-empty-output-\(latestJob.id)"
+            )
+        }
+
         return nil
+    }
+
+    private static func emptyOutputMessage(provider: CodexProvider) -> String {
+        "\(provider.displayName) finished without producing output."
     }
 
     private static func appendIfMissing(_ item: CodexThreadChatItem, to items: inout [CodexThreadChatItem]) {

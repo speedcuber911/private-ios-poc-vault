@@ -2841,6 +2841,11 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
     job.status = "failed";
     job.result = null;
     job.error = spawnError.message;
+  } else if (code === 0 && job.provider === "claude" && !cleanResult) {
+    job.status = "failed";
+    job.result = null;
+    job.artifacts = [];
+    job.error = "Claude exited successfully without producing output.";
   } else if (code === 0) {
     job.status = "succeeded";
     job.result = cleanResult || null;
