@@ -97,15 +97,15 @@ struct LibraryView: View {
                     .padding(.top, 14)
                     .padding(.bottom, 24)
                 }
-            } else if viewModel.filteredEntries.isEmpty {
+            } else if visibleEntriesForCurrentFilter.isEmpty {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
                         header(count: viewModel.entries.count)
                         SearchBox(text: $viewModel.searchText)
                         StatusCard(
-                            symbol: "magnifyingglass",
-                            title: "No matches",
-                            message: "Nothing in the library matches \(viewModel.searchText)."
+                            symbol: emptyState.symbol,
+                            title: emptyState.title,
+                            message: emptyState.message
                         )
 
                         diagnosticsLink()
@@ -124,8 +124,6 @@ struct LibraryView: View {
                             .padding(.horizontal, 16)
                             .padding(.bottom, 14)
 
-                        let recentEntries = recentEntries(from: viewModel.filteredEntries)
-                        let visibleEntries = filteredEntries(from: viewModel.filteredEntries, recentEntries: recentEntries)
                         POCSectionHeader(selectedFilter: $selectedFilter)
                             .padding(.horizontal, 16)
                             .padding(.bottom, 12)
@@ -135,7 +133,7 @@ struct LibraryView: View {
                             .padding(.horizontal, 20)
                             .padding(.bottom, 8)
                         LazyVStack(spacing: 0) {
-                            ForEach(visibleEntries) { entry in
+                            ForEach(visibleEntriesForCurrentFilter) { entry in
                                 entryLink(entry)
                             }
                         }
@@ -188,15 +186,51 @@ struct LibraryView: View {
         return entries.filter { !recentIDs.contains($0.id) }
     }
 
+    private var visibleEntriesForCurrentFilter: [POCEntry] {
+        let recentEntries = recentEntries(from: viewModel.filteredEntries)
+        return filteredEntries(from: viewModel.filteredEntries, recentEntries: recentEntries)
+    }
+
     private func filteredEntries(from entries: [POCEntry], recentEntries: [POCEntry]) -> [POCEntry] {
         switch selectedFilter {
         case .all:
             let recentIDs = Set(recentEntries.map(\.id))
             return recentEntries + entries.filter { !recentIDs.contains($0.id) }
         case .recent:
-            return recentEntries.isEmpty ? entries : recentEntries
+            return recentEntries
         case .signed:
             return entries.filter(\.requiresClientCertificate)
+        }
+    }
+
+    private var emptyState: (symbol: String, title: String, message: String) {
+        if !viewModel.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return (
+                "magnifyingglass",
+                "No matches",
+                "Nothing in the library matches \"\(viewModel.searchText)\"."
+            )
+        }
+
+        switch selectedFilter {
+        case .all:
+            return (
+                "tray",
+                "No prototypes",
+                "The signed manifest is valid, but no prototypes are available for this view."
+            )
+        case .recent:
+            return (
+                "clock",
+                "No recent prototypes",
+                "Open a prototype and it will stay at the top of this view for quick access."
+            )
+        case .signed:
+            return (
+                "lock",
+                "No signed prototypes",
+                "No entries in the current manifest are marked as client-certificate protected."
+            )
         }
     }
 

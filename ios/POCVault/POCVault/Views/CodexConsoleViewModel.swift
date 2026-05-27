@@ -444,6 +444,10 @@ final class CodexConsoleViewModel: ObservableObject {
         connectionNotice ?? "Could not refresh Codex yet."
     }
 
+    var showsConnectionNoticeBanner: Bool {
+        connectionNotice != nil && hasCachedCodexContent
+    }
+
     var selectedSkillIDs: Set<String> {
         Set(selectedSkills.map(\.id))
     }

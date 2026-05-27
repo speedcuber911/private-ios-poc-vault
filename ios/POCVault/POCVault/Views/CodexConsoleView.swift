@@ -33,6 +33,12 @@ struct CodexConsoleView: View {
                             .padding(.bottom, 14)
                         }
 
+                        if viewModel.showsConnectionNoticeBanner {
+                            CodexConnectionNoticeBanner(viewModel: viewModel)
+                                .padding(.horizontal, 16)
+                                .padding(.bottom, 14)
+                        }
+
                         CodexPromptCard(
                             viewModel: viewModel,
                             focusNonce: focusPromptNonce,
@@ -177,6 +183,53 @@ private struct CodexHeader: View {
             .buttonStyle(.plain)
             .accessibilityLabel("\(viewModel.provider.displayName) settings")
         }
+    }
+}
+
+private struct CodexConnectionNoticeBanner: View {
+    @ObservedObject var viewModel: CodexConsoleViewModel
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "wifi.exclamationmark")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(AppTheme.statusWarn)
+                .padding(.top, 2)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(viewModel.connectionNoticeTitle)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(AppTheme.textPrimary)
+                Text(viewModel.connectionNoticeMessage)
+                    .font(.system(size: 12))
+                    .foregroundStyle(AppTheme.textSecondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 8)
+
+            Button {
+                Task { await viewModel.refreshAll() }
+            } label: {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(AppTheme.accent)
+                    .frame(width: 30, height: 30)
+                    .background(AppTheme.textPrimary.opacity(0.055), in: Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Retry connection")
+        }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 11)
+        .background(AppTheme.statusWarn.opacity(0.10), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(AppTheme.statusWarn.opacity(0.24), lineWidth: 0.5)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Connection notice")
     }
 }
 
@@ -2307,29 +2360,49 @@ private struct CodexThreadFeedRow: View {
 
     var body: some View {
         Button(action: onOpen) {
-            HStack(alignment: .center, spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
                 Image(systemName: "message")
                     .font(.system(size: 16))
                     .foregroundStyle(AppTheme.textSecondary)
                     .frame(width: 36, height: 36)
                     .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
 
-                VStack(alignment: .leading, spacing: 3) {
+                VStack(alignment: .leading, spacing: 6) {
                     Text(item.title)
                         .font(.system(size: 14, weight: .medium))
                         .foregroundStyle(CodexTheme.text)
-                        .lineLimit(1)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
 
-                    Text(timestampText)
+                    Text(item.preview)
                         .font(.system(size: 12))
                         .foregroundStyle(CodexTheme.muted)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    HStack(spacing: 7) {
+                        Text(item.workspaceLabel)
+                            .font(.system(size: 11))
+                            .foregroundStyle(CodexTheme.dim)
+                            .lineLimit(1)
+
+                        CodexThreadPreviewStatusBadge(status: item.status ?? fallbackStatus)
+
+                        if !timestampText.isEmpty {
+                            Text(timestampText)
+                                .font(.system(size: 11))
+                                .foregroundStyle(CodexTheme.dim)
+                                .lineLimit(1)
+                        }
+                    }
                 }
 
                 Spacer(minLength: 8)
 
-                Image(systemName: statusSymbol)
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(statusColor)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(AppTheme.textTertiary)
+                    .padding(.top, 12)
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 12)
@@ -2345,28 +2418,8 @@ private struct CodexThreadFeedRow: View {
         .disabled(item.jobID == nil && item.sessionID == nil)
     }
 
-    private var statusSymbol: String {
-        guard let status = item.status else { return item.isActive ? "clock" : "checkmark" }
-        switch status {
-        case .succeeded:
-            return "checkmark"
-        case .queued, .running, .canceling:
-            return "clock"
-        default:
-            return "exclamationmark.circle"
-        }
-    }
-
-    private var statusColor: Color {
-        guard let status = item.status else { return item.isActive ? AppTheme.textSecondary : AppTheme.statusOK }
-        switch status {
-        case .succeeded:
-            return AppTheme.statusOK
-        case .queued, .running, .canceling:
-            return AppTheme.textSecondary
-        default:
-            return AppTheme.statusWarn
-        }
+    private var fallbackStatus: CodexJobStatus {
+        item.isActive ? .running : .succeeded
     }
 
     private var timestampText: String {
@@ -3883,6 +3936,10 @@ private struct CodexThreadComposerDock: View {
                 }
             }
 
+            if showsExpandedControls {
+                optionsSummaryStrip
+            }
+
             HStack(alignment: .center, spacing: 14) {
                 TextField(
                     "",
@@ -3898,6 +3955,8 @@ private struct CodexThreadComposerDock: View {
                 .autocorrectionDisabled()
                 .focused($isFocused)
                 .lineLimit(1...3)
+
+                replyOptionsButton
 
                 CodexAttachmentMenu(
                     disabled: isSending || viewModel.isCreating || viewModel.isTranscribing,
@@ -3941,11 +4000,6 @@ private struct CodexThreadComposerDock: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(!canSend)
-                .contextMenu {
-                    Button("Session settings") {
-                        showingSettings = true
-                    }
-                }
             }
         }
         .padding(.horizontal, 14)
@@ -4005,6 +4059,47 @@ private struct CodexThreadComposerDock: View {
         .animation(.easeInOut(duration: 0.18), value: expandedForTyping)
     }
 
+    private var replyOptionsButton: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                showingOptions.toggle()
+            }
+        } label: {
+            Image(systemName: "slider.horizontal.3")
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(showingOptions || !viewModel.selectedSkills.isEmpty ? AppTheme.accent : AppTheme.inactiveTab)
+                .frame(width: 24, height: 28)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Reply options")
+        .accessibilityValue(optionsLabel)
+    }
+
+    private var optionsSummaryStrip: some View {
+        HStack(spacing: 8) {
+            Button {
+                showingSettings = true
+            } label: {
+                Label(optionsLabel, systemImage: "cpu")
+                    .lineLimit(1)
+            }
+            .accessibilityLabel("Agent settings")
+
+            Button {
+                showingSkillPicker = true
+            } label: {
+                Label(skillSummaryText, systemImage: "sparkles")
+                    .lineLimit(1)
+            }
+            .accessibilityLabel("Reply skills")
+
+            Spacer(minLength: 0)
+        }
+        .font(.system(size: 12, weight: .semibold))
+        .foregroundStyle(AppTheme.textSecondary)
+        .buttonStyle(.plain)
+    }
+
     private var canSend: Bool {
         sessionID != nil
             && (!replyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
@@ -4047,8 +4142,11 @@ private struct CodexThreadComposerDock: View {
     }
 
     private var optionsLabel: String {
-        let skillText = viewModel.selectedSkills.isEmpty ? "skills" : "\(viewModel.selectedSkills.count) skills"
-        return "\(viewModel.selectedRunMode.label), \(viewModel.selectedReasoningEffort.label), \(skillText)"
+        "\(viewModel.selectedModel), \(viewModel.selectedReasoningEffort.label)"
+    }
+
+    private var skillSummaryText: String {
+        viewModel.selectedSkills.isEmpty ? "Skills" : "\(viewModel.selectedSkills.count) skills"
     }
 
     private func toggleRecording() {

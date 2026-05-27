@@ -285,6 +285,8 @@ final class ManifestTests: XCTestCase {
             to: "private enum CodexRoute: Hashable"
         )
         XCTAssertFalse(screenSource.contains("CodexContextLine(viewModel"))
+        XCTAssertTrue(screenSource.contains("CodexConnectionNoticeBanner(viewModel: viewModel)"))
+        XCTAssertTrue(screenSource.contains("if viewModel.showsConnectionNoticeBanner"))
 
         let contextSource = try sourceSnippet(
             in: source,
@@ -328,8 +330,42 @@ final class ManifestTests: XCTestCase {
             from: "private struct CodexThreadFeedRow: View",
             to: "private struct CodexStatusChip: View"
         )
-        XCTAssertTrue(rowSource.contains("exclamationmark.circle"))
-        XCTAssertTrue(rowSource.contains("AppTheme.statusWarn"))
+        XCTAssertTrue(rowSource.contains("Text(item.preview)"))
+        XCTAssertTrue(rowSource.contains("CodexThreadPreviewStatusBadge(status: item.status ?? fallbackStatus)"))
+        XCTAssertFalse(rowSource.contains("\"checkmark\""))
+        XCTAssertFalse(rowSource.contains("statusSymbol"))
+    }
+
+    func testConnectionNoticeBannerOnlyShowsForCachedContent() throws {
+        let source = try String(contentsOfFile: codexConsoleSourcePath, encoding: .utf8)
+        let modelSource = try String(contentsOfFile: codexConsoleViewModelSourcePath, encoding: .utf8)
+
+        XCTAssertTrue(modelSource.contains("var showsConnectionNoticeBanner: Bool"))
+        XCTAssertTrue(modelSource.contains("connectionNotice != nil && hasCachedCodexContent"))
+        XCTAssertTrue(source.contains("private struct CodexConnectionNoticeBanner: View"))
+        XCTAssertTrue(source.contains("viewModel.connectionNoticeTitle"))
+        XCTAssertTrue(source.contains("viewModel.connectionNoticeMessage"))
+        XCTAssertTrue(source.contains("Task { await viewModel.refreshAll() }"))
+        XCTAssertTrue(source.contains("accessibilityLabel(\"Connection notice\")"))
+    }
+
+    func testLibraryRecentFilterShowsEmptyStateInsteadOfAllEntries() throws {
+        let source = try String(contentsOfFile: librarySourcePath, encoding: .utf8)
+        let filterSource = try sourceSnippet(
+            in: source,
+            from: "private func filteredEntries",
+            to: "private var emptyState"
+        )
+        let emptyStateSource = try sourceSnippet(
+            in: source,
+            from: "private var emptyState",
+            to: "private func markRecent"
+        )
+
+        XCTAssertFalse(filterSource.contains("recentEntries.isEmpty ? entries : recentEntries"))
+        XCTAssertTrue(filterSource.contains("return recentEntries"))
+        XCTAssertTrue(emptyStateSource.contains("No recent prototypes"))
+        XCTAssertTrue(emptyStateSource.contains("Nothing in the library matches"))
     }
 
     func testPromptModuleHeaderIsIntegratedNotOvalPill() throws {
@@ -371,6 +407,22 @@ final class ManifestTests: XCTestCase {
         XCTAssertFalse(sheetSource.contains("CodexSettingsRowContent(symbol: \"slider.horizontal.3\""))
         XCTAssertFalse(sheetSource.contains("CodexSettingsRowContent(symbol: \"sun.max\""))
         XCTAssertFalse(source.contains("private struct CodexSettingsRowContent: View"))
+    }
+
+    func testThreadReplyComposerExposesVisibleOptionsControl() throws {
+        let source = try String(contentsOfFile: codexConsoleSourcePath, encoding: .utf8)
+        let composerSource = try sourceSnippet(
+            in: source,
+            from: "private struct CodexThreadComposerDock: View",
+            to: "private func send() async"
+        )
+
+        XCTAssertTrue(composerSource.contains("replyOptionsButton"))
+        XCTAssertTrue(composerSource.contains("optionsSummaryStrip"))
+        XCTAssertTrue(composerSource.contains("showingSettings = true"))
+        XCTAssertTrue(composerSource.contains("showingSkillPicker = true"))
+        XCTAssertTrue(composerSource.contains("accessibilityLabel(\"Reply options\")"))
+        XCTAssertFalse(composerSource.contains(".contextMenu"))
     }
 
     func testWorkspacePickerIsTopLevelPromptHeaderControl() throws {
@@ -2259,11 +2311,27 @@ final class ManifestTests: XCTestCase {
             .path
     }
 
+    private var codexConsoleViewModelSourcePath: String {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("POCVault/Views/CodexConsoleViewModel.swift")
+            .path
+    }
+
     private var appSourcePath: String {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent("POCVault/POCVaultApp.swift")
+            .path
+    }
+
+    private var librarySourcePath: String {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("POCVault/Views/LibraryView.swift")
             .path
     }
 
