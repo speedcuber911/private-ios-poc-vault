@@ -747,6 +747,13 @@ enum CodexThreadChatAlignment: Hashable {
     case center
 }
 
+struct CodexPendingFollowUp: Hashable {
+    let jobID: String
+    let prompt: String
+    let provider: CodexProvider
+    let createdAt: Date
+}
+
 struct CodexThreadChatItem: Hashable, Identifiable {
     enum Kind: Hashable {
         case message
@@ -805,29 +812,35 @@ struct CodexThreadChatItem: Hashable, Identifiable {
     static func makeTranscript(
         detail: CodexThreadDetail?,
         thread: CodexThread?,
-        latestJob: CodexJob?
+        latestJob: CodexJob?,
+        pendingFollowUp: CodexPendingFollowUp? = nil
     ) -> [CodexThreadChatItem] {
         let resolvedThread = detail?.thread ?? thread
         let activeDetailJob = detail?.jobs.first { $0.status.isActive }
         let workingJob = latestJob?.status.isActive == true ? latestJob : activeDetailJob
-        let isWorking = workingJob != nil || resolvedThread?.hasActiveJobs == true
+        let isPendingFollowUpWorking = pendingFollowUp != nil
+            && (latestJob == nil || pendingFollowUp?.jobID != latestJob?.id || latestJob?.status.isActive == true)
+        let isWorking = workingJob != nil || isPendingFollowUpWorking || resolvedThread?.hasActiveJobs == true
         let workingProviderName = workingJob?.provider.displayName
+            ?? pendingFollowUp?.provider.displayName
             ?? resolvedThread?.provider.displayName
             ?? CodexProvider.defaultProvider.displayName
         let workingTimestamp = workingJob?.startedAt
             ?? workingJob?.createdAt
             ?? latestJob?.startedAt
             ?? latestJob?.createdAt
+            ?? pendingFollowUp?.createdAt
             ?? resolvedThread?.updatedAt
 
         if let detail, !detail.messages.isEmpty {
             let shouldOfferFullAnswer = canLoadFullAnswer(thread: resolvedThread, latestJob: latestJob)
             var items = groupedTranscript(
                 from: detail.messages,
-                treatTrailingAssistantAsProgress: isWorking,
+                treatTrailingAssistantAsProgress: isWorking && pendingFollowUp == nil,
                 finalAssistantCanLoadFullText: !isWorking && shouldOfferFullAnswer
             )
-            appendLatestPromptIfMissing(to: &items, latestJob: latestJob)
+            appendPendingFollowUpIfMissing(to: &items, pendingFollowUp: pendingFollowUp)
+            appendLatestPromptIfMissing(to: &items, latestJob: latestJob, pendingFollowUp: pendingFollowUp)
             mergeLatestJobCompletion(in: &items, latestJob: latestJob)
             if isWorking {
                 appendWorkingPlaceholder(to: &items, providerName: workingProviderName, timestamp: workingTimestamp)
@@ -836,13 +849,24 @@ struct CodexThreadChatItem: Hashable, Identifiable {
         }
 
         var items: [CodexThreadChatItem] = []
-        let prompt = latestJob?.prompt?.trimmedNonEmpty ?? resolvedThread?.lastPrompt?.trimmedNonEmpty
+        let pendingPrompt = pendingPrompt(for: pendingFollowUp, latestJob: latestJob)
+        let prompt = pendingPrompt
+            ?? latestJob?.prompt?.trimmedNonEmpty
+            ?? resolvedThread?.lastPrompt?.trimmedNonEmpty
+        let promptSourceID = pendingPrompt == nil
+            ? "thread-prompt"
+            : "pending-follow-up-\(pendingFollowUp?.jobID ?? "pending")"
         if let prompt,
-           let item = chatItem(role: .user, text: prompt, timestamp: latestJob?.createdAt ?? resolvedThread?.timestamp, sourceID: "thread-prompt") {
+           let item = chatItem(
+               role: .user,
+               text: prompt,
+               timestamp: pendingFollowUp?.createdAt ?? latestJob?.createdAt ?? resolvedThread?.timestamp,
+               sourceID: promptSourceID
+           ) {
             items.append(item)
         }
 
-        let latestJobIsActive = latestJob?.status.isActive == true
+        let latestJobIsActive = latestJob?.status.isActive == true || isPendingFollowUpWorking
         let latestJobAnswer = latestJobIsActive ? nil : latestJob?.displayOutput?.trimmedNonEmpty
         let threadAnswer = latestJobIsActive ? nil : resolvedThread?.lastResult?.trimmedNonEmpty
         let answer = latestJobAnswer ?? threadAnswer
@@ -997,9 +1021,47 @@ struct CodexThreadChatItem: Hashable, Identifiable {
         return items
     }
 
-    private static func appendLatestPromptIfMissing(to items: inout [CodexThreadChatItem], latestJob: CodexJob?) {
+    private static func appendPendingFollowUpIfMissing(
+        to items: inout [CodexThreadChatItem],
+        pendingFollowUp: CodexPendingFollowUp?
+    ) {
+        guard let pendingFollowUp,
+              let prompt = pendingFollowUp.prompt.trimmedNonEmpty else {
+            return
+        }
+        if items.contains(where: { item in
+            if item.sourceID == "pending-follow-up-\(pendingFollowUp.jobID)" {
+                return true
+            }
+            guard item.role == .user,
+                  item.text == prompt,
+                  let timestamp = item.timestamp else {
+                return false
+            }
+            return timestamp >= pendingFollowUp.createdAt.addingTimeInterval(-5)
+        }) {
+            return
+        }
+        if let item = chatItem(
+            role: .user,
+            text: prompt,
+            timestamp: pendingFollowUp.createdAt,
+            sourceID: "pending-follow-up-\(pendingFollowUp.jobID)"
+        ) {
+            items.append(item)
+        }
+    }
+
+    private static func appendLatestPromptIfMissing(
+        to items: inout [CodexThreadChatItem],
+        latestJob: CodexJob?,
+        pendingFollowUp: CodexPendingFollowUp? = nil
+    ) {
         guard let latestJob,
               let prompt = latestJob.prompt?.trimmedNonEmpty else {
+            return
+        }
+        if pendingFollowUp?.jobID == latestJob.id {
             return
         }
         if items.contains(where: { $0.role == .user && $0.text == prompt }) {
@@ -1013,6 +1075,14 @@ struct CodexThreadChatItem: Hashable, Identifiable {
         ) {
             items.append(item)
         }
+    }
+
+    private static func pendingPrompt(for pendingFollowUp: CodexPendingFollowUp?, latestJob: CodexJob?) -> String? {
+        guard let pendingFollowUp,
+              latestJob == nil || latestJob?.id == pendingFollowUp.jobID else {
+            return nil
+        }
+        return pendingFollowUp.prompt.trimmedNonEmpty
     }
 
     private static func appendWorkingPlaceholder(to items: inout [CodexThreadChatItem], providerName: String, timestamp: Date?) {

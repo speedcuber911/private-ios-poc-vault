@@ -2797,7 +2797,7 @@ private struct CodexThreadDetailView: View {
     @State private var latestJob: CodexJob?
     @State private var latestJobError: String?
     @State private var latestJobNotice: CodexLoadNotice?
-    @State private var pendingFollowUpJobID: String?
+    @State private var pendingFollowUp: CodexPendingFollowUp?
     @State private var isLoadingThreadDetail = false
     @State private var isLoadingLatestJob = false
     @State private var showingDeleteConfirmation = false
@@ -2825,11 +2825,16 @@ private struct CodexThreadDetailView: View {
         pendingFollowUpJobID ?? thread?.lastJobId ?? initialJobID
     }
 
+    private var pendingFollowUpJobID: String? {
+        pendingFollowUp?.jobID
+    }
+
     private var chatItems: [CodexThreadChatItem] {
         CodexThreadChatItem.makeTranscript(
             detail: threadDetail,
             thread: thread,
-            latestJob: latestJob
+            latestJob: latestJob,
+            pendingFollowUp: pendingFollowUp
         )
     }
 
@@ -2924,7 +2929,7 @@ private struct CodexThreadDetailView: View {
             await refreshThreadDetailAndLatestJob()
         }
         .task(id: routeIdentity) {
-            pendingFollowUpJobID = nil
+            pendingFollowUp = nil
             selectResolvedSessionIfAvailable()
             await refreshThreadDetailAndLatestJob()
         }
@@ -2986,8 +2991,13 @@ private struct CodexThreadDetailView: View {
         return true
     }
 
-    private func handleFollowUpSent(jobID: String) {
-        pendingFollowUpJobID = jobID
+    private func handleFollowUpSent(jobID: String, prompt: String) {
+        pendingFollowUp = CodexPendingFollowUp(
+            jobID: jobID,
+            prompt: prompt,
+            provider: viewModel.provider,
+            createdAt: Date()
+        )
         latestJob = submittedJob(withID: jobID)
         Task { await refreshThreadDetailAndLatestJob() }
     }
@@ -3060,7 +3070,7 @@ private struct CodexThreadDetailView: View {
             latestJob = loadedJob
             selectResolvedSessionIfAvailable()
             if pendingFollowUpJobID == loadedJob.id, !loadedJob.status.isActive {
-                pendingFollowUpJobID = nil
+                pendingFollowUp = nil
             }
             latestJobError = nil
             latestJobNotice = nil
@@ -3848,7 +3858,7 @@ private struct CodexThreadComposerDock: View {
     let sessionID: String?
     let workspaceID: String?
     @ObservedObject var viewModel: CodexConsoleViewModel
-    let onSent: (String) -> Void
+    let onSent: (String, String) -> Void
 
     @State private var replyText = ""
     @State private var isSending = false
@@ -4139,6 +4149,7 @@ private struct CodexThreadComposerDock: View {
         }
         let message = replyText
         let outgoingAttachments = attachments
+        let pendingPrompt = pendingTranscriptText(message: message, attachmentCount: outgoingAttachments.count)
         isSending = true
         defer { isSending = false }
 
@@ -4154,8 +4165,19 @@ private struct CodexThreadComposerDock: View {
             showingOptions = false
             lastSubmittedJobID = newJobID
             await viewModel.refreshThreads()
-            onSent(newJobID)
+            onSent(newJobID, pendingPrompt)
         }
+    }
+
+    private func pendingTranscriptText(message: String, attachmentCount: Int) -> String {
+        let text = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !text.isEmpty {
+            return text
+        }
+        if attachmentCount == 1 {
+            return "Sent 1 attachment."
+        }
+        return "Sent \(attachmentCount) attachments."
     }
 }
 

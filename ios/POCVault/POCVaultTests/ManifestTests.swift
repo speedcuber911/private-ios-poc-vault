@@ -1243,6 +1243,176 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(workingItem.alignment, .leading)
     }
 
+    func testCodexThreadChatTranscriptShowsPendingFollowUpBeforeJobHydrates() throws {
+        let detail = try JSONDecoder().decode(
+            CodexThreadDetail.self,
+            from: Data(
+                """
+                {
+                  "thread": {
+                    "id": "thread-pending-follow-up",
+                    "sessionId": "thread-pending-follow-up",
+                    "workspaceId": "poc-vault",
+                    "workspaceName": "POC Vault",
+                    "updatedAt": "2026-05-20T12:01:00Z",
+                    "jobCount": 1,
+                    "activeJobCount": 0,
+                    "lastJobId": "job-first",
+                    "lastJobStatus": "succeeded",
+                    "lastPrompt": "What can be done here?",
+                    "lastResult": "Here is what you can do.",
+                    "hasSessionFile": true
+                  },
+                  "messages": [
+                    {
+                      "role": "user",
+                      "timestamp": "2026-05-20T12:00:00Z",
+                      "text": "What can be done here?"
+                    },
+                    {
+                      "role": "assistant",
+                      "timestamp": "2026-05-20T12:01:00Z",
+                      "text": "Here is what you can do."
+                    }
+                  ],
+                  "jobs": []
+                }
+                """.utf8
+            )
+        )
+        let pending = CodexPendingFollowUp(
+            jobID: "job-pending-follow-up",
+            prompt: "Please check the remaining edge cases.",
+            provider: .codex,
+            createdAt: Date(timeIntervalSince1970: 1_779_278_712)
+        )
+
+        let transcript = CodexThreadChatItem.makeTranscript(
+            detail: detail,
+            thread: nil,
+            latestJob: nil,
+            pendingFollowUp: pending
+        )
+
+        XCTAssertEqual(transcript.map(\.role), [.user, .assistant, .user, .status])
+        XCTAssertEqual(
+            transcript.map(\.text),
+            [
+                "What can be done here?",
+                "Here is what you can do.",
+                "Please check the remaining edge cases.",
+                "Codex is working."
+            ]
+        )
+        XCTAssertEqual(transcript.map(\.sourceID).suffix(2), ["pending-follow-up-job-pending-follow-up", "thread-working"])
+    }
+
+    func testCodexThreadChatTranscriptKeepsPendingPromptWhenHydratedJobPromptHasSkillWrapper() throws {
+        let thread = try decodeCodexThread(
+            """
+            {
+              "id": "thread-pending-skill",
+              "sessionId": "thread-pending-skill",
+              "workspaceId": "poc-vault",
+              "workspaceName": "POC Vault",
+              "updatedAt": "2026-05-20T12:05:10Z",
+              "jobCount": 2,
+              "activeJobCount": 0,
+              "lastJobStatus": "succeeded",
+              "lastPrompt": "Previous prompt",
+              "lastResult": "Previous answer",
+              "hasSessionFile": true
+            }
+            """
+        )
+        let job = try decodeCodexJob(
+            """
+            {
+              "id": "job-pending-skill",
+              "provider": "codex",
+              "status": "running",
+              "workspaceId": "poc-vault",
+              "workspaceName": "POC Vault",
+              "prompt": "Use these Codex skills for this task: human-code-review.\\n\\nPlease check the remaining edge cases.",
+              "createdAt": "2026-05-20T12:05:12Z",
+              "startedAt": "2026-05-20T12:05:13Z"
+            }
+            """
+        )
+        let pending = CodexPendingFollowUp(
+            jobID: "job-pending-skill",
+            prompt: "Please check the remaining edge cases.",
+            provider: .codex,
+            createdAt: Date(timeIntervalSince1970: 1_779_278_712)
+        )
+
+        let transcript = CodexThreadChatItem.makeTranscript(
+            detail: nil,
+            thread: thread,
+            latestJob: job,
+            pendingFollowUp: pending
+        )
+
+        XCTAssertEqual(transcript.map(\.role), [.user, .status])
+        XCTAssertEqual(transcript.first?.text, "Please check the remaining edge cases.")
+        XCTAssertFalse(transcript.contains { $0.text.contains("Use these Codex skills") })
+    }
+
+    func testCodexThreadChatTranscriptShowsRepeatedPendingFollowUpTextAsNewTurn() throws {
+        let detail = try JSONDecoder().decode(
+            CodexThreadDetail.self,
+            from: Data(
+                """
+                {
+                  "thread": {
+                    "id": "thread-repeated-follow-up",
+                    "sessionId": "thread-repeated-follow-up",
+                    "workspaceId": "poc-vault",
+                    "workspaceName": "POC Vault",
+                    "updatedAt": "2026-05-20T12:01:00Z",
+                    "jobCount": 1,
+                    "activeJobCount": 0,
+                    "lastJobId": "job-first",
+                    "lastJobStatus": "succeeded",
+                    "lastPrompt": "Continue",
+                    "lastResult": "Here is the first continuation.",
+                    "hasSessionFile": true
+                  },
+                  "messages": [
+                    {
+                      "role": "user",
+                      "timestamp": "2026-05-20T12:00:00Z",
+                      "text": "Continue"
+                    },
+                    {
+                      "role": "assistant",
+                      "timestamp": "2026-05-20T12:01:00Z",
+                      "text": "Here is the first continuation."
+                    }
+                  ],
+                  "jobs": []
+                }
+                """.utf8
+            )
+        )
+        let pending = CodexPendingFollowUp(
+            jobID: "job-repeated-follow-up",
+            prompt: "Continue",
+            provider: .codex,
+            createdAt: Date(timeIntervalSince1970: 1_779_278_712)
+        )
+
+        let transcript = CodexThreadChatItem.makeTranscript(
+            detail: detail,
+            thread: nil,
+            latestJob: nil,
+            pendingFollowUp: pending
+        )
+
+        XCTAssertEqual(transcript.filter { $0.role == .user && $0.text == "Continue" }.count, 2)
+        XCTAssertEqual(transcript.map(\.sourceID).suffix(2), ["pending-follow-up-job-repeated-follow-up", "thread-working"])
+    }
+
     func testCodexThreadChatTranscriptKeepsWorkingPlaceholderWithProgressUpdates() throws {
         let detail = try JSONDecoder().decode(
             CodexThreadDetail.self,
