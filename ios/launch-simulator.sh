@@ -20,12 +20,42 @@ OLD_LAUNCH_LABEL="${BUNDLE_ID}.simulator"
 
 server_alive() {
   curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1 \
-    && curl -fsS "http://127.0.0.1:${PORT}/v1/codex/health" >/dev/null 2>&1
+    && curl -fsS "http://127.0.0.1:${PORT}/v1/codex/health" >/dev/null 2>&1 \
+    && curl -fsS "http://127.0.0.1:${PORT}/v1/codex/models" >/dev/null 2>&1 \
+    && curl -fsS --max-time 2 -N -X POST "http://127.0.0.1:${PORT}/v1/codex/chat" \
+      -H "Content-Type: application/json" \
+      --data '{"provider":"bedrock","model":"simulator-health","messages":[{"role":"user","content":"ping"}]}' \
+      2>/dev/null | grep -q "event: done"
+}
+
+stop_existing_simulator_server() {
+  launchctl bootout "gui/$(id -u)/${OLD_LAUNCH_LABEL}" >/dev/null 2>&1 || true
+  screen -S "$SCREEN_NAME" -X quit >/dev/null 2>&1 || true
+
+  if ! command -v lsof >/dev/null 2>&1; then
+    return
+  fi
+
+  local pids pid command_text
+  pids="$(lsof -tiTCP:"${PORT}" -sTCP:LISTEN 2>/dev/null || true)"
+  for pid in $pids; do
+    command_text="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    if [[ "$command_text" == *"${ROOT}/ops/serve-simulator-poc-vault"* ]] \
+      || [[ "$command_text" == *"ops/serve-simulator-poc-vault"* ]] \
+      || [[ "$command_text" == *"serve-simulator-poc-vault"* && "$command_text" == *"--port ${PORT}"* ]]; then
+      kill "$pid" >/dev/null 2>&1 || true
+    fi
+  done
+
+  for _ in {1..20}; do
+    pids="$(lsof -tiTCP:"${PORT}" -sTCP:LISTEN 2>/dev/null || true)"
+    [[ -z "$pids" ]] && break
+    sleep 0.1
+  done
 }
 
 if ! server_alive; then
-  launchctl bootout "gui/$(id -u)/${OLD_LAUNCH_LABEL}" >/dev/null 2>&1 || true
-  screen -S "$SCREEN_NAME" -X quit >/dev/null 2>&1 || true
+  stop_existing_simulator_server
   screen -dmS "$SCREEN_NAME" /bin/zsh -lc "exec '${ROOT}/ops/serve-simulator-poc-vault' --port '${PORT}' >'${SERVER_LOG}' 2>&1"
   for _ in {1..40}; do
     server_alive && break
@@ -68,4 +98,4 @@ xcrun simctl uninstall "$SIM_ID" "$BUNDLE_ID" >/dev/null 2>&1 || true
 xcrun simctl install "$SIM_ID" "$APP_PATH"
 xcrun simctl launch "$SIM_ID" "$BUNDLE_ID"
 
-echo "Launched POC Vault on simulator ${SIM_ID}"
+echo "Launched Relay on simulator ${SIM_ID}"

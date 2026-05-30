@@ -27,6 +27,70 @@ enum CodexClientError: Error, LocalizedError {
     }
 }
 
+struct CodexChatMessage: Codable, Hashable {
+    let role: String
+    let content: String
+}
+
+struct CodexChatRequest: Encodable {
+    let provider: String
+    let model: String
+    let threadId: String?
+    let messages: [CodexChatMessage]
+    let options: CodexModelOptions?
+}
+
+enum CodexChatEvent: Hashable {
+    case meta(threadId: String, model: String?, provider: String?)
+    case delta(String)
+    case usage(input: Int?, output: Int?)
+    case done(String?)
+    case error(String)
+}
+
+struct CodexSSELineParser {
+    private var event = ""
+    private var data = ""
+
+    mutating func ingest(_ line: String) -> [CodexChatEvent] {
+        if line.isEmpty {
+            return flush()
+        }
+
+        if line.hasPrefix("event:") {
+            let pending = flush()
+            event = String(line.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+            return pending
+        }
+
+        if line.hasPrefix("data:") {
+            let payload = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+            if data.isEmpty {
+                data = payload
+            } else {
+                data += "\n\(payload)"
+            }
+        }
+
+        return []
+    }
+
+    mutating func finish() -> [CodexChatEvent] {
+        flush()
+    }
+
+    private mutating func flush() -> [CodexChatEvent] {
+        guard !event.isEmpty else {
+            data = ""
+            return []
+        }
+        let decoded = CodexClient.decodeSSE(event: event, data: data)
+        event = ""
+        data = ""
+        return [decoded]
+    }
+}
+
 enum CodexDiagnostics {
     private static let encoder: JSONEncoder = {
         let encoder = JSONEncoder()
@@ -61,7 +125,7 @@ enum CodexDiagnostics {
     }
 }
 
-final class CodexClient: NSObject, URLSessionDelegate {
+final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
     let baseURL: URL
 
     private let identityStore: ClientIdentityStore
@@ -117,6 +181,11 @@ final class CodexClient: NSObject, URLSessionDelegate {
     func fetchWorkspaces() async throws -> [CodexWorkspace] {
         let data = try await perform(path: "/v1/codex/workspaces")
         return try decoder.decode(CodexListEnvelope<CodexWorkspace>.self, from: data).values
+    }
+
+    func fetchModels() async throws -> [CodexModelDescriptor] {
+        let data = try await perform(path: "/v1/codex/models")
+        return try decoder.decode(CodexListEnvelope<CodexModelDescriptor>.self, from: data).values
     }
 
     func fetchWorkspaceDirectories(path: String? = nil, query: String? = nil) async throws -> CodexWorkspaceDirectoryListing {
@@ -290,6 +359,75 @@ final class CodexClient: NSObject, URLSessionDelegate {
         return try decoder.decode(CodexTranscriptionResponse.self, from: responseData)
     }
 
+    func streamChat(_ body: CodexChatRequest) -> AsyncThrowingStream<CodexChatEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let url = endpoint(path: "/v1/codex/chat", queryItems: [])
+                    guard url.scheme != nil, url.host != nil else {
+                        throw CodexClientError.invalidEndpoint(url)
+                    }
+
+                    var request = URLRequest(url: url)
+                    request.httpMethod = "POST"
+                    request.timeoutInterval = 300
+                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                    request.httpBody = try encoder.encode(body)
+
+                    let (bytes, response) = try await session.bytes(for: request)
+                    guard let http = response as? HTTPURLResponse else {
+                        throw CodexClientError.emptyResponse
+                    }
+                    guard (200...299).contains(http.statusCode) else {
+                        let message = try await Self.errorMessage(from: bytes)
+                        throw CodexClientError.httpFailure(http.statusCode, message)
+                    }
+
+                    CodexDiagnostics.log("codex_stream_response_success", fields: [
+                        "path": "/v1/codex/chat",
+                        "url": url.absoluteString,
+                        "status": String(http.statusCode)
+                    ])
+
+                    var parser = CodexSSELineParser()
+                    for try await line in bytes.lines {
+                        for event in parser.ingest(line.trimmingCharacters(in: .newlines)) {
+                            continuation.yield(event)
+                            if event.isTerminalChatEvent {
+                                continuation.finish()
+                                return
+                            }
+                        }
+                    }
+                    for event in parser.finish() {
+                        continuation.yield(event)
+                        if event.isTerminalChatEvent {
+                            continuation.finish()
+                            return
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    private static func errorMessage(from bytes: URLSession.AsyncBytes) async throws -> String? {
+        var body = ""
+        for try await line in bytes.lines {
+            body += line
+            body += "\n"
+            if body.count >= 2_048 {
+                break
+            }
+        }
+        return errorMessage(from: Data(body.utf8))
+    }
+
     private func perform(
         path: String,
         method: String = "GET",
@@ -388,11 +526,74 @@ final class CodexClient: NSObject, URLSessionDelegate {
     private static func errorMessage(from data: Data) -> String? {
         guard !data.isEmpty else { return nil }
         if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            return (json["message"] as? String)
+            return sanitizedErrorMessage((json["message"] as? String)
                 ?? (json["error"] as? String)
-                ?? (json["detail"] as? String)
+                ?? (json["detail"] as? String))
         }
-        return String(data: data, encoding: .utf8)
+        return sanitizedErrorMessage(String(data: data, encoding: .utf8))
+    }
+
+    private static func sanitizedErrorMessage(_ message: String?) -> String? {
+        guard var cleaned = message?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !cleaned.isEmpty else {
+            return nil
+        }
+
+        if cleaned.localizedCaseInsensitiveContains("<html")
+            || cleaned.localizedCaseInsensitiveContains("<body")
+            || cleaned.localizedCaseInsensitiveContains("<title") {
+            cleaned = firstHTMLText(in: cleaned, tag: "title")
+                ?? firstHTMLText(in: cleaned, tag: "h1")
+                ?? "Forbidden"
+        }
+
+        cleaned = stripHTMLTags(from: cleaned)
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !cleaned.isEmpty else { return nil }
+        if cleaned.count > 240 {
+            return "\(cleaned.prefix(237))..."
+        }
+        return cleaned
+    }
+
+    private static func firstHTMLText(in html: String, tag: String) -> String? {
+        let pattern = "(?is)<\(tag)[^>]*>(.*?)</\(tag)>"
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+              match.numberOfRanges > 1,
+              let range = Range(match.range(at: 1), in: html) else {
+            return nil
+        }
+        return stripHTMLTags(from: String(html[range]))
+    }
+
+    private static func stripHTMLTags(from text: String) -> String {
+        text.replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
+    }
+
+    static func decodeSSE(event: String, data: String) -> CodexChatEvent {
+        let payloadData = Data(data.utf8)
+        let payload = (try? JSONSerialization.jsonObject(with: payloadData)) as? [String: Any] ?? [:]
+        switch event {
+        case "meta":
+            return .meta(
+                threadId: (payload["threadId"] as? String) ?? "",
+                model: payload["model"] as? String,
+                provider: payload["provider"] as? String
+            )
+        case "delta":
+            return .delta((payload["text"] as? String) ?? "")
+        case "usage":
+            return .usage(input: payload["inputTokens"] as? Int, output: payload["outputTokens"] as? Int)
+        case "done":
+            return .done(payload["stopReason"] as? String)
+        case "error":
+            return .error((payload["message"] as? String) ?? "Chat failed.")
+        default:
+            return .error("Unknown chat event: \(event)")
+        }
     }
 
     func urlSession(
@@ -400,17 +601,36 @@ final class CodexClient: NSObject, URLSessionDelegate {
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
+        handleAuthenticationChallenge(challenge, scope: "session", completionHandler: completionHandler)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        handleAuthenticationChallenge(challenge, scope: "task", completionHandler: completionHandler)
+    }
+
+    private func handleAuthenticationChallenge(
+        _ challenge: URLAuthenticationChallenge,
+        scope: String,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
         switch challenge.protectionSpace.authenticationMethod {
         case NSURLAuthenticationMethodClientCertificate:
             if let credential = identityStore.credential() {
                 CodexDiagnostics.log("codex_client_cert_challenge", fields: [
                     "host": challenge.protectionSpace.host,
+                    "scope": scope,
                     "hasCredential": "true"
                 ])
                 completionHandler(.useCredential, credential)
             } else {
                 CodexDiagnostics.log("codex_client_cert_challenge", fields: [
                     "host": challenge.protectionSpace.host,
+                    "scope": scope,
                     "hasCredential": "false"
                 ])
                 completionHandler(.performDefaultHandling, nil)
@@ -418,9 +638,21 @@ final class CodexClient: NSObject, URLSessionDelegate {
         default:
             CodexDiagnostics.log("codex_auth_challenge", fields: [
                 "host": challenge.protectionSpace.host,
-                "method": challenge.protectionSpace.authenticationMethod
+                "method": challenge.protectionSpace.authenticationMethod,
+                "scope": scope
             ])
             completionHandler(.performDefaultHandling, nil)
+        }
+    }
+}
+
+private extension CodexChatEvent {
+    var isTerminalChatEvent: Bool {
+        switch self {
+        case .done, .error:
+            return true
+        case .meta, .delta, .usage:
+            return false
         }
     }
 }
@@ -444,7 +676,7 @@ private struct CodexListEnvelope<Element: Decodable>: Decodable {
         }
 
         let container = try decoder.container(keyedBy: CodexDynamicCodingKey.self)
-        for key in ["items", "data", "results", "workspaces", "jobs", "sessions", "threads"] {
+        for key in ["items", "data", "results", "models", "workspaces", "jobs", "sessions", "threads"] {
             if let codingKey = CodexDynamicCodingKey(stringValue: key),
                let values = try? container.decode([Element].self, forKey: codingKey) {
                 self.values = values

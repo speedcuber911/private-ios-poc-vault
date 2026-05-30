@@ -184,6 +184,8 @@ struct CodexWorkspaceDirectoryEntry: Decodable, Hashable, Identifiable {
 enum CodexProvider: String, CaseIterable, Identifiable, Codable {
     case codex
     case claude
+    case bedrock
+    case azure
 
     var id: String { rawValue }
 
@@ -195,6 +197,10 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
             .lowercased()
 
         switch normalized {
+        case "bedrock":
+            self = .bedrock
+        case "azure", "azure-openai":
+            self = .azure
         case "claude", "anthropic":
             self = .claude
         case "codex", "openai", .none:
@@ -220,49 +226,92 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
             return "Codex"
         case .claude:
             return "Claude"
+        case .bedrock:
+            return "Bedrock"
+        case .azure:
+            return "Azure"
         }
     }
 
     var defaultModel: String {
-        switch self {
-        case .codex:
-            return "gpt-5.5"
-        case .claude:
-            return "sonnet"
-        }
+        ""
     }
 
     var modelOptions: [String] {
-        switch self {
-        case .codex:
-            return [
-                "gpt-5.5",
-                "gpt-5.4",
-                "gpt-5.4-mini",
-                "gpt-5.3-codex",
-                "gpt-5.3-codex-spark",
-                "gpt-5.2"
-            ]
-        case .claude:
-            return [
-                "sonnet",
-                "opus",
-                "haiku"
-            ]
-        }
+        []
     }
 
     var defaultReasoningEffort: CodexReasoningEffort {
         switch self {
         case .codex:
             return .xhigh
-        case .claude:
+        case .claude, .bedrock, .azure:
             return .high
         }
     }
 
     var reasoningEffortOptions: [CodexReasoningEffort] {
         CodexReasoningEffort.allCases
+    }
+}
+
+enum RelayInteractionMode: String, CaseIterable, Codable, Identifiable {
+    case chat
+    case task
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .chat:
+            return "Chat"
+        case .task:
+            return "Task"
+        }
+    }
+}
+
+struct CodexModelOptions: Codable, Hashable {
+    let temperature: Double?
+    let maxTokens: Int?
+}
+
+struct CodexModelDescriptor: Decodable, Hashable, Identifiable {
+    let id: String
+    let label: String
+    let provider: CodexProvider
+    let modes: [RelayInteractionMode]
+    let azureDeployment: String?
+    let defaultOptions: CodexModelOptions?
+    let effortLevels: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case label
+        case provider
+        case modes
+        case azureDeployment
+        case defaultOptions
+        case effortLevels
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(String.self, forKey: .id)
+        self.label = (try container.decodeIfPresent(String.self, forKey: .label)) ?? id
+        self.provider = try container.decode(CodexProvider.self, forKey: .provider)
+        self.modes = (try container.decodeIfPresent([RelayInteractionMode].self, forKey: .modes)) ?? []
+        self.azureDeployment = try container.decodeIfPresent(String.self, forKey: .azureDeployment)
+        self.defaultOptions = try container.decodeIfPresent(CodexModelOptions.self, forKey: .defaultOptions)
+        self.effortLevels = (try container.decodeIfPresent([String].self, forKey: .effortLevels)) ?? []
+    }
+
+    var providerBadge: String {
+        provider.displayName
+    }
+
+    func supports(_ mode: RelayInteractionMode) -> Bool {
+        modes.contains(mode)
     }
 }
 
@@ -442,6 +491,7 @@ enum CodexJobStatus: Hashable, Codable {
 
 struct CodexThread: Decodable, Hashable, Identifiable {
     let id: String
+    let mode: RelayInteractionMode
     let provider: CodexProvider
     let sessionId: String
     let workspaceId: String?
@@ -449,6 +499,7 @@ struct CodexThread: Decodable, Hashable, Identifiable {
     let cwd: String?
     let timestamp: Date?
     let updatedAt: Date?
+    let model: String?
     let jobCount: Int
     let activeJobCount: Int
     let lastJobId: String?
@@ -461,6 +512,7 @@ struct CodexThread: Decodable, Hashable, Identifiable {
 
     enum CodingKeys: String, CodingKey {
         case id
+        case mode
         case provider
         case sessionId
         case workspaceId
@@ -471,6 +523,7 @@ struct CodexThread: Decodable, Hashable, Identifiable {
         case createdAt
         case updatedAt
         case lastUsedAt
+        case model
         case jobCount
         case activeJobCount
         case lastJobId
@@ -500,6 +553,7 @@ struct CodexThread: Decodable, Hashable, Identifiable {
         let lastUsedAt = try container.decodeLossyDateIfPresent(forKey: .lastUsedAt)
 
         self.id = id
+        self.mode = (try container.decodeIfPresent(RelayInteractionMode.self, forKey: .mode)) ?? .task
         self.provider = (try container.decodeIfPresent(CodexProvider.self, forKey: .provider)) ?? .defaultProvider
         self.sessionId = sessionID?.trimmedNonEmpty ?? id
         self.workspaceId = try container.decodeLooseStringIfPresent(forKey: .workspaceId)
@@ -507,6 +561,7 @@ struct CodexThread: Decodable, Hashable, Identifiable {
         self.cwd = cwd ?? path
         self.timestamp = timestamp ?? createdAt
         self.updatedAt = updatedAt ?? lastUsedAt ?? timestamp ?? createdAt
+        self.model = try container.decodeLooseStringIfPresent(forKey: .model)
         self.jobCount = (try container.decodeIntegerIfPresent(forKey: .jobCount)) ?? 0
         self.activeJobCount = (try container.decodeIntegerIfPresent(forKey: .activeJobCount)) ?? 0
         self.lastJobId = try container.decodeLooseStringIfPresent(forKey: .lastJobId)
@@ -2234,7 +2289,7 @@ struct CodexErrorSummary: Equatable {
     }
 }
 
-private extension String {
+extension String {
     var trimmedNonEmpty: String? {
         let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed

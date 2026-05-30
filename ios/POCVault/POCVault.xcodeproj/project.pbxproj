@@ -25,6 +25,10 @@
 		200000000000000000000017 /* CodexConsoleViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000020 /* CodexConsoleViewModel.swift */; };
 		200000000000000000000018 /* CodexConsoleView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000021 /* CodexConsoleView.swift */; };
 		200000000000000000000019 /* Resources/Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000022 /* Resources/Assets.xcassets */; };
+		200000000000000000000020 /* RelayChatViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000023 /* RelayChatViewModel.swift */; };
+		200000000000000000000021 /* RelayChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000024 /* RelayChatView.swift */; };
+		200000000000000000000022 /* Resources/Fonts/DMSans.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000025 /* Resources/Fonts/DMSans.ttf */; };
+		200000000000000000000023 /* Resources/Fonts/DMMono-Regular.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000026 /* Resources/Fonts/DMMono-Regular.ttf */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -59,6 +63,10 @@
 		100000000000000000000020 /* CodexConsoleViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexConsoleViewModel.swift; sourceTree = "<group>"; };
 		100000000000000000000021 /* CodexConsoleView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexConsoleView.swift; sourceTree = "<group>"; };
 		100000000000000000000022 /* Resources/Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Resources/Assets.xcassets; sourceTree = "<group>"; };
+		100000000000000000000023 /* RelayChatViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayChatViewModel.swift; sourceTree = "<group>"; };
+		100000000000000000000024 /* RelayChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayChatView.swift; sourceTree = "<group>"; };
+		100000000000000000000025 /* Resources/Fonts/DMSans.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = Resources/Fonts/DMSans.ttf; sourceTree = "<group>"; };
+		100000000000000000000026 /* Resources/Fonts/DMMono-Regular.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "Resources/Fonts/DMMono-Regular.ttf"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -102,6 +110,8 @@
 				100000000000000000000016 /* Resources/AppIcon/AppIcon60x60@3x.png */,
 				100000000000000000000017 /* Resources/AppIcon/AppIcon1024.png */,
 				100000000000000000000022 /* Resources/Assets.xcassets */,
+				100000000000000000000025 /* Resources/Fonts/DMSans.ttf */,
+				100000000000000000000026 /* Resources/Fonts/DMMono-Regular.ttf */,
 			);
 			path = POCVault;
 			sourceTree = "<group>";
@@ -166,6 +176,8 @@
 				100000000000000000000014 /* DiagnosticsView.swift */,
 				100000000000000000000020 /* CodexConsoleViewModel.swift */,
 				100000000000000000000021 /* CodexConsoleView.swift */,
+				100000000000000000000023 /* RelayChatViewModel.swift */,
+				100000000000000000000024 /* RelayChatView.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -255,6 +267,8 @@
 				200000000000000000000013 /* Resources/AppIcon/AppIcon60x60@3x.png in Resources */,
 				200000000000000000000014 /* Resources/AppIcon/AppIcon1024.png in Resources */,
 				200000000000000000000019 /* Resources/Assets.xcassets in Resources */,
+				200000000000000000000022 /* Resources/Fonts/DMSans.ttf in Resources */,
+				200000000000000000000023 /* Resources/Fonts/DMMono-Regular.ttf in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -285,6 +299,8 @@
 				200000000000000000000016 /* CodexClient.swift in Sources */,
 				200000000000000000000017 /* CodexConsoleViewModel.swift in Sources */,
 				200000000000000000000018 /* CodexConsoleView.swift in Sources */,
+				200000000000000000000020 /* RelayChatViewModel.swift in Sources */,
+				200000000000000000000021 /* RelayChatView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
