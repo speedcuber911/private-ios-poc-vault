@@ -74,6 +74,12 @@ server from `ios/launch-simulator.sh`.
 
 ## Agent Console UX
 
+> **Update:** the operator surface has since been reworked into a chat-first design
+> with separate **Chat** and **Task** bottom tabs, streaming replies, and a
+> reimagined workspace picker. See [CHAT_REDESIGN.md](CHAT_REDESIGN.md) for the full
+> description. The notes below describe the prior single-console thread model, which
+> still backs the Status tab.
+
 The Relay agent console has moved from a job-list surface to a prompt-first,
 thread-oriented operator console:
 

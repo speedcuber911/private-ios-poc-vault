@@ -280,9 +280,12 @@ The iOS app is named Relay. It has four jobs:
 3. load and verify the signed POC manifest
 4. open POCs in an authenticated full-screen `WKWebView`
 
-The current tab layout is Library, Codex, Claude, and Status. Codex and Claude
-use provider-specific console view models and brand tab marks; Status combines
-recent provider activity with the Diagnostics health view.
+The current tab layout is **Library, Chat, Task, and Status**. Chat is the
+synchronous streaming surface (Bedrock/Azure over SSE); Task is the asynchronous
+Codex/Claude job runner; Status combines recent provider activity with the
+Diagnostics health view. See [docs/CHAT_REDESIGN.md](docs/CHAT_REDESIGN.md) for the
+chat-first redesign: streaming UX, the model-catalog de-duplication, and the
+reimagined workspace picker.
 
 The app intentionally does not know individual POCs at compile time. POC detail
 screens have no standard navigation bar above hosted pages; the shell uses a
