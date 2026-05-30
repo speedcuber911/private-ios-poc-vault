@@ -124,13 +124,160 @@ final class ManifestTests: XCTestCase {
     func testCodexProviderDefaultsAreProviderSpecific() throws {
         XCTAssertEqual(CodexProvider.defaultProvider, .codex)
         XCTAssertEqual(CodexProvider.codex.displayName, "Codex")
-        XCTAssertEqual(CodexProvider.codex.defaultModel, "gpt-5.5")
+        XCTAssertEqual(CodexProvider.codex.defaultModel, "")
+        XCTAssertEqual(CodexProvider.codex.modelOptions, [])
         XCTAssertEqual(CodexProvider.codex.defaultReasoningEffort, .xhigh)
 
         XCTAssertEqual(CodexProvider.claude.displayName, "Claude")
-        XCTAssertEqual(CodexProvider.claude.defaultModel, "sonnet")
+        XCTAssertEqual(CodexProvider.claude.defaultModel, "")
+        XCTAssertEqual(CodexProvider.claude.modelOptions, [])
         XCTAssertEqual(CodexProvider.claude.defaultReasoningEffort, .high)
         XCTAssertEqual(CodexProvider.claude.reasoningEffortOptions, CodexReasoningEffort.allCases)
+    }
+
+    func testCodexModelDescriptorAllowsOptionalEffortLevels() throws {
+        let json = """
+        {
+          "id": "gpt-4o",
+          "label": "GPT-4o (Azure)",
+          "provider": "azure",
+          "modes": ["chat"],
+          "azureDeployment": "gpt-4o",
+          "defaultOptions": { "temperature": 0.7, "maxTokens": 4096 }
+        }
+        """.data(using: .utf8)!
+
+        let model = try JSONDecoder().decode(CodexModelDescriptor.self, from: json)
+
+        XCTAssertEqual(model.id, "gpt-4o")
+        XCTAssertEqual(model.provider, .azure)
+        XCTAssertTrue(model.supports(.chat))
+        XCTAssertEqual(model.effortLevels, [])
+    }
+
+    @MainActor
+    func testRelayModelSelectionDoesNotRecurseWithEmptyCatalog() throws {
+        let suiteName = "relay-empty-models-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let client = CodexClient(
+            baseURL: try XCTUnwrap(URL(string: "http://127.0.0.1:8787")),
+            identityStore: ClientIdentityStore(defaults: defaults)
+        )
+        let viewModel = RelayChatViewModel(client: client)
+
+        viewModel.selectedModelID = nil
+        viewModel.mode = .task
+
+        XCTAssertNil(viewModel.selectedModelID)
+        XCTAssertNil(viewModel.selectedModel)
+    }
+
+    func testCodexSSEParserDecodesEventsWithoutBlankSeparators() throws {
+        var parser = CodexSSELineParser()
+        var events: [CodexChatEvent] = []
+
+        events.append(contentsOf: parser.ingest("event: meta"))
+        events.append(contentsOf: parser.ingest("data: {\"threadId\":\"thread-1\",\"model\":\"gpt-4o\",\"provider\":\"azure\"}"))
+        events.append(contentsOf: parser.ingest("event: delta"))
+        events.append(contentsOf: parser.ingest("data: {\"text\":\"hello\"}"))
+        events.append(contentsOf: parser.ingest("event: done"))
+        events.append(contentsOf: parser.ingest("data: {\"stopReason\":\"stop\"}"))
+        events.append(contentsOf: parser.finish())
+
+        XCTAssertEqual(events, [
+            .meta(threadId: "thread-1", model: "gpt-4o", provider: "azure"),
+            .delta("hello"),
+            .done("stop")
+        ])
+    }
+
+    func testCodexSSEParserFlushesFinalEventAtEOF() throws {
+        var parser = CodexSSELineParser()
+        var events: [CodexChatEvent] = []
+
+        events.append(contentsOf: parser.ingest("event: delta"))
+        events.append(contentsOf: parser.ingest("data: {\"text\":\"last token\"}"))
+        events.append(contentsOf: parser.finish())
+
+        XCTAssertEqual(events, [.delta("last token")])
+    }
+
+    func testRelayModelDiscoveryShowsLatestModelsWithoutResourceBuckets() throws {
+        let models = try decodeCodexModels(
+            """
+            [
+              { "id": "azure-gre-dev/gpt-4o", "label": "gpt-4o (Azure GRE Dev)", "provider": "azure", "modes": ["chat"], "azureDeployment": "gpt-4o" },
+              { "id": "azure-gre-prod/gpt-35-turbo", "label": "gpt-35-turbo (Azure GRE Prod)", "provider": "azure", "modes": ["chat"], "azureDeployment": "gpt-35-turbo" },
+              { "id": "azure-padhai/gpt-oss-120b", "label": "gpt-oss-120b (Azure Padhai)", "provider": "azure", "modes": ["chat"], "azureDeployment": "gpt-oss-120b" },
+              { "id": "azure-o-series-prod/gpt-5.5", "label": "gpt-5.5 (Azure O-Series Prod)", "provider": "azure", "modes": ["chat"], "azureDeployment": "gpt-5.5" },
+              { "id": "azure-padhai/gpt-5.5", "label": "gpt-5.5 (Azure Padhai)", "provider": "azure", "modes": ["chat"], "azureDeployment": "gpt-5.5" },
+              { "id": "azure-padhai/deepseek-v3.2", "label": "deepseek-v3.2 (DeepSeek-V3.2) (Azure Padhai)", "provider": "azure", "modes": ["chat"], "azureDeployment": "deepseek-v3.2" },
+              { "id": "azure-padhai/kimi-k2.6", "label": "kimi-k2.6 (Kimi-K2.6) (Azure Padhai)", "provider": "azure", "modes": ["chat"], "azureDeployment": "kimi-k2.6" },
+              { "id": "global.anthropic.claude-opus-4-7-20251101-v1:0", "label": "Claude Opus 4.7 (SigiQ Bedrock Global)", "provider": "bedrock", "modes": ["chat"] },
+              { "id": "codex-cli", "label": "Codex CLI", "provider": "codex", "modes": ["task"] }
+            ]
+            """
+        )
+
+        let sections = RelayModelDiscovery.sections(
+            from: models,
+            mode: .chat,
+            bucket: .latest,
+            searchText: ""
+        )
+
+        XCTAssertEqual(sections.map(\.title), ["Latest"])
+        XCTAssertEqual(sections[0].models.filter { $0.id.contains("gpt-5.5") }.count, 1)
+        XCTAssertEqual(sections[0].models.first?.azureDeployment, "gpt-5.5")
+        XCTAssertFalse(sections.map(\.title).contains { $0.contains("Padhai") || $0.contains("GRE") })
+        XCTAssertFalse(sections[0].models.contains { $0.id == "codex-cli" })
+        XCTAssertFalse(sections[0].models.prefix(3).contains { $0.azureDeployment == "gpt-35-turbo" || $0.azureDeployment == "gpt-oss-120b" })
+    }
+
+    func testRelayModelDiscoverySearchesFullCatalog() throws {
+        let models = try decodeCodexModels(
+            """
+            [
+              { "id": "azure-gre-dev/gpt-4o", "label": "gpt-4o (Azure GRE Dev)", "provider": "azure", "modes": ["chat"], "azureDeployment": "gpt-4o" },
+              { "id": "azure-padhai/deepseek-v3.2", "label": "deepseek-v3.2 (DeepSeek-V3.2) (Azure Padhai)", "provider": "azure", "modes": ["chat"], "azureDeployment": "deepseek-v3.2" },
+              { "id": "claude-code", "label": "Claude Code (Bedrock/SigiQ)", "provider": "claude", "modes": ["task"] }
+            ]
+            """
+        )
+
+        let sections = RelayModelDiscovery.sections(
+            from: models,
+            mode: .chat,
+            bucket: .latest,
+            searchText: "deepseek"
+        )
+
+        XCTAssertEqual(sections.map(\.title), ["Search"])
+        XCTAssertEqual(sections[0].models.map(\.id), ["azure-padhai/deepseek-v3.2"])
+    }
+
+    func testRelayModelDiscoverySearchCanFindModelsOutsideCurrentMode() throws {
+        let models = try decodeCodexModels(
+            """
+            [
+              { "id": "azure-padhai/deepseek-v3.2", "label": "deepseek-v3.2 (DeepSeek-V3.2) (Azure Padhai)", "provider": "azure", "modes": ["chat"], "azureDeployment": "deepseek-v3.2" },
+              { "id": "claude-code", "label": "Claude Code (Bedrock/SigiQ)", "provider": "claude", "modes": ["task"] }
+            ]
+            """
+        )
+
+        let sections = RelayModelDiscovery.sections(
+            from: models,
+            mode: .chat,
+            bucket: .latest,
+            searchText: "claude"
+        )
+
+        XCTAssertEqual(sections.map(\.title), ["Search"])
+        XCTAssertEqual(sections[0].models.map(\.id), ["claude-code"])
+        XCTAssertFalse(sections[0].models[0].supports(.chat))
     }
 
     func testCodexProviderTabIconsUseBrandAssets() throws {
@@ -724,6 +871,7 @@ final class ManifestTests: XCTestCase {
                   "cwd": "/srv/codex-workspaces/scratch",
                   "timestamp": "2026-05-20T12:00:00Z",
                   "updatedAt": "2026-05-20T12:05:10Z",
+                  "model": "azure-o-series-prod/gpt-5.5",
                   "jobCount": 2,
                   "activeJobCount": 1,
                   "lastJobId": "019e46a3-0000-7000-8000-000000000003",
@@ -741,6 +889,7 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(thread.id, "019e46a3-0000-7000-8000-000000000001")
         XCTAssertEqual(thread.workspaceId, "scratch")
         XCTAssertEqual(thread.workspaceName, "Scratch")
+        XCTAssertEqual(thread.model, "azure-o-series-prod/gpt-5.5")
         XCTAssertEqual(thread.jobCount, 2)
         XCTAssertEqual(thread.activeJobCount, 1)
         XCTAssertEqual(thread.lastJobId, "019e46a3-0000-7000-8000-000000000003")
@@ -2025,10 +2174,10 @@ final class ManifestTests: XCTestCase {
         )
 
         XCTAssertEqual(codexViewModel.provider, .codex)
-        XCTAssertEqual(codexViewModel.selectedModel, "gpt-5.5")
+        XCTAssertEqual(codexViewModel.selectedModel, "")
         XCTAssertEqual(codexViewModel.selectedReasoningEffort, .xhigh)
         XCTAssertEqual(claudeViewModel.provider, .claude)
-        XCTAssertEqual(claudeViewModel.selectedModel, "sonnet")
+        XCTAssertEqual(claudeViewModel.selectedModel, "")
         XCTAssertEqual(claudeViewModel.selectedReasoningEffort, .high)
         XCTAssertEqual(claudeViewModel.connectionNoticeTitle, "Claude needs certificate")
     }
@@ -2295,6 +2444,33 @@ final class ManifestTests: XCTestCase {
         XCTAssertFalse(preview.contains("|------|"))
     }
 
+    func testRelayChatUsesStructuredMarkdownRendering() throws {
+        let source = try String(contentsOfFile: relayChatSourcePath, encoding: .utf8)
+        let markdownText = try sourceSnippet(
+            in: source,
+            from: "private struct RelayMarkdownText",
+            to: "private struct RelayJobCard"
+        )
+
+        XCTAssertTrue(markdownText.contains("CodexMarkdownParser.segments"))
+        XCTAssertTrue(markdownText.contains("RelayMarkdownProse"))
+        XCTAssertFalse(markdownText.contains("RelayTextPart.parse(text)"))
+    }
+
+    func testRelayComposerDoesNotReserveExtraKeyboardGap() throws {
+        let source = try String(contentsOfFile: relayChatSourcePath, encoding: .utf8)
+        let composerSource = try sourceSnippet(
+            in: source,
+            from: "private struct RelayComposer",
+            to: "private struct RelayChatBubble"
+        )
+
+        XCTAssertTrue(composerSource.contains("ToolbarItemGroup(placement: .keyboard)"))
+        XCTAssertTrue(composerSource.contains("isFocused = false"))
+        XCTAssertFalse(composerSource.contains("keyboardAccessoryClearance"))
+        XCTAssertFalse(composerSource.contains(".padding(.bottom, isFocused ?"))
+    }
+
     private func decodeCodexJob(_ json: String) throws -> CodexJob {
         try JSONDecoder().decode(CodexJob.self, from: Data(json.utf8))
     }
@@ -2335,6 +2511,14 @@ final class ManifestTests: XCTestCase {
             .path
     }
 
+    private var relayChatSourcePath: String {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("POCVault/Views/RelayChatView.swift")
+            .path
+    }
+
     private func sourceSnippet(in source: String, from startMarker: String, to endMarker: String) throws -> String {
         guard
             let start = source.range(of: startMarker),
@@ -2343,6 +2527,10 @@ final class ManifestTests: XCTestCase {
             throw XCTSkip("Missing source markers: \(startMarker) -> \(endMarker)")
         }
         return String(source[start.lowerBound..<end.lowerBound])
+    }
+
+    private func decodeCodexModels(_ json: String) throws -> [CodexModelDescriptor] {
+        try JSONDecoder().decode([CodexModelDescriptor].self, from: Data(json.utf8))
     }
 
     private func assertColor(
