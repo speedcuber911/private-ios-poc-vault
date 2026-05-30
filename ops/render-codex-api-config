@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 from pathlib import Path
@@ -14,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path("~/.poc-vault/secrets/config.env").expanduser()
 DEFAULT_OUTPUT_DIR = ROOT / "build" / "codex-api"
 DEFAULT_TEMPLATE = ROOT / "codex-server" / "codex-api-deploy" / "codex-api.nginx.conf.template"
+DEFAULT_OPENCODE_CONFIG = Path("~/.config/opencode/opencode.jsonc").expanduser()
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -58,6 +60,224 @@ def env_value(config: dict[str, str], name: str, default: str) -> str:
     return default if value is None or value == "" else value
 
 
+def model_catalog_default(config: dict[str, str]) -> str:
+    opencode_config = Path(env_value(config, "OPENCODE_CONFIG_PATH", str(DEFAULT_OPENCODE_CONFIG))).expanduser()
+    opencode_catalog = catalog_from_opencode(opencode_config)
+    if opencode_catalog:
+        return json.dumps(opencode_catalog, separators=(",", ":"))
+
+    bedrock_chat_model = env_value(config, "BEDROCK_CHAT_MODEL", "anthropic.claude-3-5-sonnet-20241022-v2:0")
+    return json.dumps(
+        [
+            {
+                "id": bedrock_chat_model,
+                "label": "Claude Sonnet (Bedrock)",
+                "provider": "bedrock",
+                "modes": ["chat"],
+                "defaultOptions": {"temperature": 0.7, "maxTokens": 4096},
+                "effortLevels": ["low", "medium", "high"],
+            },
+            {"id": "codex-cli", "label": "Codex CLI", "provider": "codex", "modes": ["task"]},
+            {
+                "id": "claude-code",
+                "label": "Claude Code (Bedrock/SigiQ)",
+                "provider": "claude",
+                "modes": ["task"],
+                "effortLevels": ["low", "medium", "high"],
+            },
+        ],
+        separators=(",", ":"),
+    )
+
+
+def catalog_from_opencode(path: Path) -> list[dict]:
+    if not path.is_file():
+        return []
+    config = json.loads(strip_jsonc(path.read_text(encoding="utf-8")))
+    providers = config.get("provider", {})
+    if not isinstance(providers, dict):
+        return []
+
+    catalog: list[dict] = []
+    # Azure exposes the same model id (e.g. gpt-4o) across many deployments. Collapse
+    # to one visible entry per model id, keeping the highest-priority deployment, so the
+    # picker shows "gpt-4o (Azure)" once instead of one row per endpoint. The winner's
+    # full id ("<provider_id>/<model_id>") is retained so the server still routes to the
+    # right baseURL/key. Priority is set by azure_deployment_rank (prod > dev > config order).
+    azure_by_model: dict[str, dict] = {}
+    azure_rank: dict[str, tuple[int, int]] = {}
+    provider_index = 0
+    for provider_id, provider in providers.items():
+        if not isinstance(provider_id, str) or not isinstance(provider, dict):
+            continue
+        npm = provider.get("npm")
+        options = provider.get("options", {}) if isinstance(provider.get("options"), dict) else {}
+        models = provider.get("models", {}) if isinstance(provider.get("models"), dict) else {}
+
+        if npm == "@ai-sdk/openai-compatible":
+            base_url = clean_opencode_url(options.get("baseURL"))
+            api_key_file = file_ref_path(options.get("apiKey"))
+            if not base_url or not api_key_file:
+                continue
+            rank = azure_deployment_rank(provider_id, provider_index)
+            provider_index += 1
+            for model_id, model in models.items():
+                if not isinstance(model_id, str) or not isinstance(model, dict):
+                    continue
+                entry = {
+                    "id": f"{provider_id}/{model_id}",
+                    "label": f"{azure_model_label(model.get('name'), model_id)} (Azure)",
+                    "provider": "azure",
+                    "modes": ["chat"],
+                    "azureDeployment": model_id,
+                    "azureBaseURL": base_url,
+                    "azureApiKeyFile": api_key_file,
+                    "defaultOptions": {
+                        "temperature": 0.7,
+                        "maxTokens": model_output_limit(model, 4096),
+                    },
+                }
+                existing_rank = azure_rank.get(model_id)
+                if existing_rank is None or rank < existing_rank:
+                    azure_by_model[model_id] = entry
+                    azure_rank[model_id] = rank
+        elif npm == "@ai-sdk/amazon-bedrock" and provider_id == "amazon-bedrock-sigiq":
+            region = clean_opencode_token(options.get("region")) or "us-east-1"
+            for model_id, model in models.items():
+                if not isinstance(model_id, str) or not isinstance(model, dict):
+                    continue
+                entry = {
+                    "id": model_id,
+                    "label": display_name(model.get("name"), model_id),
+                    "provider": "bedrock",
+                    "modes": ["chat"],
+                    "bedrockRegion": region,
+                    "defaultOptions": {
+                        "temperature": 0.7,
+                        "maxTokens": model_output_limit(model, 4096),
+                    },
+                }
+                if model.get("reasoning"):
+                    entry["effortLevels"] = ["low", "medium", "high"]
+                catalog.append(entry)
+
+    # Surface the collapsed Azure entries first (chat picker leads with Azure), then the
+    # Bedrock entries gathered above, then the fixed task providers.
+    catalog = list(azure_by_model.values()) + catalog
+    catalog.extend(
+        [
+            {"id": "codex-cli", "label": "Codex CLI", "provider": "codex", "modes": ["task"]},
+            {
+                "id": "claude-code",
+                "label": "Claude Code (Bedrock/SigiQ)",
+                "provider": "claude",
+                "modes": ["task"],
+                "effortLevels": ["low", "medium", "high"],
+            },
+        ]
+    )
+    return catalog
+
+
+def azure_model_label(name: object, fallback: str) -> str:
+    """Base label for an Azure model, dropping any trailing '(...)' alias the OpenCode
+    name embeds so we don't render double parens once '(Azure)' is appended
+    (e.g. 'o1-mini (o4-mini)' -> 'o1-mini')."""
+    base = display_name(name, fallback)
+    return re.sub(r"\s*\([^()]*\)\s*$", "", base).strip() or fallback
+
+
+def azure_deployment_rank(provider_id: str, config_index: int) -> tuple[int, int]:
+    """Priority for choosing which deployment wins a duplicated model id.
+
+    Lower sorts first. A 'prod' deployment beats a neutral one, which beats 'dev';
+    ties fall back to the order the provider appears in opencode.jsonc.
+    """
+    name = provider_id.lower()
+    if "prod" in name:
+        tier = 0
+    elif "dev" in name:
+        tier = 2
+    else:
+        tier = 1
+    return (tier, config_index)
+
+
+def strip_jsonc(text: str) -> str:
+    result: list[str] = []
+    in_string = False
+    escape = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if in_string:
+            result.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            result.append(ch)
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            i = text.find("\n", i)
+            if i == -1:
+                break
+            result.append("\n")
+            i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            end = text.find("*/", i + 2)
+            if end == -1:
+                break
+            result.append("\n" * text[i:end + 2].count("\n"))
+            i = end + 2
+            continue
+        result.append(ch)
+        i += 1
+    return "".join(result)
+
+
+def display_name(value: object, fallback: str) -> str:
+    text = value.strip() if isinstance(value, str) else ""
+    return text or fallback
+
+
+def clean_opencode_token(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
+def clean_opencode_url(value: object) -> str:
+    text = clean_opencode_token(value).rstrip("/")
+    parsed = urlparse(text)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return text
+
+
+def file_ref_path(value: object) -> str:
+    text = clean_opencode_token(value)
+    match = re.fullmatch(r"\{file:(.+)\}", text)
+    if not match:
+        return ""
+    return str(Path(match.group(1)).expanduser())
+
+
+def model_output_limit(model: dict, fallback: int) -> int:
+    limit = model.get("limit")
+    output = limit.get("output") if isinstance(limit, dict) else None
+    return output if isinstance(output, int) and 0 < output <= 200000 else fallback
+
+
 def render_env(config: dict[str, str], output: Path) -> None:
     workspace_default = (
         '[{"id":"scratch","name":"Scratch","path":"/srv/codex-workspaces/scratch"},'
@@ -66,6 +286,7 @@ def render_env(config: dict[str, str], output: Path) -> None:
     )
     aws_region = env_value(config, "AWS_REGION", env_value(config, "AWS_DEFAULT_REGION", ""))
     aws_default_region = env_value(config, "AWS_DEFAULT_REGION", aws_region)
+    bedrock_region = env_value(config, "BEDROCK_REGION", env_value(config, "CLAUDE_AWS_REGION", aws_region or "us-east-1"))
     pairs = [
         ("CODEX_API_HOST", "127.0.0.1"),
         ("CODEX_API_PORT", "8787"),
@@ -80,6 +301,8 @@ def render_env(config: dict[str, str], output: Path) -> None:
         ("CLAUDE_SONNET_MODEL", "sonnet"),
         ("CLAUDE_OPUS_MODEL", "global.anthropic.claude-opus-4-6-v1"),
         ("CLAUDE_HAIKU_MODEL", "global.anthropic.claude-haiku-4-5-20251001-v1:0"),
+        ("BEDROCK_CHAT_MODEL", "anthropic.claude-3-5-sonnet-20241022-v2:0"),
+        ("BEDROCK_REGION", bedrock_region),
         ("AWS_REGION", aws_region),
         ("AWS_DEFAULT_REGION", aws_default_region),
         ("CODEX_RUN_HOME", "/var/lib/codex-api/run-home"),
@@ -98,6 +321,10 @@ def render_env(config: dict[str, str], output: Path) -> None:
         ("CODEX_DEFAULT_TIMEOUT_MS", "600000"),
         ("CODEX_MAX_TIMEOUT_MS", "1800000"),
         ("CODEX_WORKSPACES", workspace_default),
+        ("CODEX_MODEL_CATALOG", model_catalog_default(config)),
+        ("AZURE_OPENAI_ENDPOINT", ""),
+        ("AZURE_OPENAI_API_KEY", ""),
+        ("AZURE_OPENAI_API_VERSION", "2025-01-01-preview"),
         ("AZURE_SPEECH_ENDPOINT", ""),
         ("AZURE_SPEECH_API_KEY", ""),
         ("AZURE_SPEECH_API_VERSION", "2025-10-15"),

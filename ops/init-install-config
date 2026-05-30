@@ -158,6 +158,14 @@ CODEX_API_NGINX_CONF_PATH=/etc/nginx/conf.d/codex-api.conf
 CODEX_MTLS_DIR=/etc/codex-api/mtls
 CODEX_ALLOWED_CERT_SUBJECTS=${CODEX_ALLOWED_CERT_SUBJECTS}
 CODEX_WORKSPACES='[{"id":"scratch","name":"Scratch","path":"/srv/codex-workspaces/scratch"},{"id":"poc-vault","name":"POC Vault","path":"/srv/codex-workspaces/poc-vault"},{"id":"sigiq","name":"SigiQ","path":"/srv/codex-workspaces/sigiq"}]'
+OPENCODE_CONFIG_PATH=~/.config/opencode/opencode.jsonc
+CODEX_MODEL_CATALOG='[{"id":"anthropic.claude-3-5-sonnet-20241022-v2:0","label":"Claude Sonnet (Bedrock)","provider":"bedrock","modes":["chat"],"defaultOptions":{"temperature":0.7,"maxTokens":4096},"effortLevels":["low","medium","high"]},{"id":"codex-cli","label":"Codex CLI","provider":"codex","modes":["task"]},{"id":"claude-code","label":"Claude Code (Bedrock/SigiQ)","provider":"claude","modes":["task"],"effortLevels":["low","medium","high"]}]'
+CLAUDE_AWS_PROFILE=sigiq
+BEDROCK_CHAT_MODEL=anthropic.claude-3-5-sonnet-20241022-v2:0
+BEDROCK_REGION=us-east-1
+AZURE_OPENAI_ENDPOINT=
+AZURE_OPENAI_API_KEY=
+AZURE_OPENAI_API_VERSION=2025-01-01-preview
 
 CLIENT_CERT_DAYS=90
 CLIENT_CA_DAYS=3650

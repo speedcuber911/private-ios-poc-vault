@@ -6,12 +6,14 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import os
 import re
 import subprocess
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,11 +56,20 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
+        if path == "/v1/codex/chat":
+            self.serve_codex_chat_fixture()
+            return
         if path == "/v1/codex/jobs":
             self.send_json({
                 "id": "sim-job-running",
                 "job": codex_fixture_job(status="running", result=None),
             })
+            return
+        if path == "/v1/codex/jobs/sim-job-running/cancel":
+            self.send_json(codex_fixture_job(status="canceled", result="Simulator job canceled."))
+            return
+        if path == "/v1/codex/transcriptions":
+            self.send_json({"text": "Simulator voice transcript", "durationMs": 1200})
             return
         if path == "/v1/codex/workspaces/select":
             self.send_json(codex_fixture_workspace())
@@ -72,19 +83,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/codex/health":
             self.send_json({"ok": True, "status": "ok", "message": "Simulator Codex fixture"})
             return
+        if path == "/v1/codex/models":
+            self.send_json({"models": codex_fixture_models()})
+            return
         if path == "/v1/codex/workspaces":
-            self.send_json({"workspaces": [codex_fixture_workspace()]})
+            self.send_json({"workspaces": codex_fixture_workspaces()})
             return
         if path == "/v1/codex/workspace-dirs":
-            workspace = codex_fixture_workspace()
-            self.send_json({
-                "rootPath": "/srv/codex-workspaces",
-                "currentPath": workspace["path"],
-                "relativePath": "poc-vault",
-                "parentPath": "/srv/codex-workspaces",
-                "selectedWorkspace": workspace,
-                "entries": [],
-            })
+            self.send_json(codex_fixture_workspace_dirs(parse_qs(query).get("path", [""])[0]))
             return
         if path == "/v1/codex/jobs":
             self.send_json({"jobs": [codex_fixture_job()]})
@@ -93,10 +99,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"sessions": [codex_fixture_session()]})
             return
         if path == "/v1/codex/threads":
-            self.send_json({"threads": [codex_fixture_thread()]})
+            self.send_json({"threads": [codex_fixture_thread(), codex_fixture_chat_thread()]})
             return
         if path == "/v1/codex/threads/sim-thread-linear":
             self.send_json(codex_fixture_thread_detail())
+            return
+        if path == "/v1/codex/threads/sim-chat-thread":
+            self.send_json(codex_fixture_chat_thread_detail())
             return
         if path == "/v1/codex/jobs/sim-job-linear":
             self.send_json(codex_fixture_job())
@@ -105,6 +114,56 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(codex_fixture_job(status="running", result=None))
             return
         self.send_error(404)
+
+    def serve_codex_chat_fixture(self) -> None:
+        body = self.read_json_body()
+        provider = str(body.get("provider") or "bedrock")
+        model = str(body.get("model") or "anthropic.claude-3-5-sonnet-20241022-v2:0")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        # Paced, markdown-rich fixture so the streaming UI (typing dots -> caret -> growing
+        # text -> usage footer) is observable when screenshotting. Simulator only.
+        delta_delay = float(os.environ.get("SIM_CHAT_DELTA_DELAY", "0.28"))
+        deltas = [
+            "Connection pooling ",
+            "reuses a set of open database connections ",
+            "instead of opening a new one per request.\n\n",
+            "**Why it helps**\n",
+            "- Skips the TCP + auth handshake on every query\n",
+            "- Caps total concurrent connections to protect the DB\n",
+            "- Cuts tail latency under load\n\n",
+            "```python\n",
+            "pool = ConnectionPool(max_size=10)\n",
+            "with pool.connection() as conn:\n",
+            "    conn.execute(query)\n",
+            "```\n",
+            "The connection returns to the pool on close rather than tearing down.",
+        ]
+        events = [("meta", {"threadId": "sim-chat-thread", "model": model, "provider": provider})]
+        events += [("delta", {"text": chunk}) for chunk in deltas]
+        events += [
+            ("usage", {"inputTokens": 18, "outputTokens": 96}),
+            ("done", {"stopReason": "simulator"}),
+        ]
+        for event, payload in events:
+            self.wfile.write(f"event: {event}\n".encode("utf-8"))
+            self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode("utf-8"))
+            self.wfile.flush()
+            if event == "delta" and delta_delay > 0:
+                time.sleep(delta_delay)
+
+    def read_json_body(self) -> dict:
+        length = int(self.headers.get("Content-Length") or "0")
+        if length <= 0:
+            return {}
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return {}
 
     def serve_poc(self, path: str) -> None:
         parts = path.strip("/").split("/", 2)
@@ -161,6 +220,265 @@ def codex_fixture_workspace(id: str = "poc-vault", name: str = "POC Vault", path
     }
 
 
+_SIM_WORKSPACE_ROOT = "/srv/codex-workspaces"
+_SIM_WORKSPACES = [
+    {"id": "scratch", "name": "Scratch", "path": f"{_SIM_WORKSPACE_ROOT}/scratch", "summary": "Throwaway sandbox", "isDefault": False},
+    {"id": "poc-vault", "name": "POC Vault", "path": f"{_SIM_WORKSPACE_ROOT}/poc-vault", "summary": "POC hosting repo", "isDefault": True},
+    {"id": "sigiq", "name": "SigiQ", "path": f"{_SIM_WORKSPACE_ROOT}/sigiq", "summary": "SigiQ monorepo", "isDefault": False},
+]
+# Child directories surfaced when browsing into a workspace (keyed by workspace path).
+_SIM_WORKSPACE_CHILDREN = {
+    f"{_SIM_WORKSPACE_ROOT}/sigiq": [
+        {"name": "ai-tutor", "hasGit": True},
+        {"name": "leap-workbench", "hasGit": True},
+        {"name": "data-readiness", "hasGit": False},
+    ],
+    f"{_SIM_WORKSPACE_ROOT}/poc-vault": [
+        {"name": "pocs", "hasGit": False},
+        {"name": "ops", "hasGit": False},
+    ],
+}
+
+
+def codex_fixture_workspaces() -> list[dict]:
+    return [dict(ws) for ws in _SIM_WORKSPACES]
+
+
+def codex_fixture_workspace_dirs(path: str) -> dict:
+    current = path.strip() or _SIM_WORKSPACE_ROOT
+    registered = {ws["path"]: ws for ws in _SIM_WORKSPACES}
+    if current == _SIM_WORKSPACE_ROOT:
+        # Root lists the registered workspaces as browsable folders.
+        entries = [
+            {
+                "name": ws["name"],
+                "path": ws["path"],
+                "relativePath": ws["id"],
+                "workspaceId": ws["id"],
+                "workspaceName": ws["name"],
+                "hasGit": True,
+                "isRegistered": True,
+            }
+            for ws in _SIM_WORKSPACES
+        ]
+        parent = None
+        relative = ""
+    else:
+        children = _SIM_WORKSPACE_CHILDREN.get(current, [])
+        entries = [
+            {
+                "name": child["name"],
+                "path": f"{current}/{child['name']}",
+                "relativePath": f"{current[len(_SIM_WORKSPACE_ROOT) + 1:]}/{child['name']}",
+                "workspaceId": None,
+                "workspaceName": None,
+                "hasGit": child["hasGit"],
+                "isRegistered": False,
+            }
+            for child in children
+        ]
+        parent = _SIM_WORKSPACE_ROOT
+        relative = current[len(_SIM_WORKSPACE_ROOT) + 1:]
+    return {
+        "rootPath": _SIM_WORKSPACE_ROOT,
+        "currentPath": current,
+        "relativePath": relative,
+        "parentPath": parent,
+        "selectedWorkspace": registered.get(current),
+        "entries": entries,
+    }
+
+
+def codex_fixture_models() -> list[dict]:
+    configured = os.environ.get("CODEX_MODEL_CATALOG")
+    if configured:
+        try:
+            return public_catalog(json.loads(configured))
+        except json.JSONDecodeError:
+            pass
+
+    opencode_models = opencode_fixture_models()
+    if opencode_models:
+        return opencode_models
+
+    return [
+        {
+            "id": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "label": "Claude Sonnet (Bedrock)",
+            "provider": "bedrock",
+            "modes": ["chat"],
+            "defaultOptions": {"temperature": 0.7, "maxTokens": 4096},
+            "effortLevels": ["low", "medium", "high"],
+        },
+        {
+            "id": "gpt-4o",
+            "label": "GPT-4o (Azure)",
+            "provider": "azure",
+            "modes": ["chat"],
+            "azureDeployment": "gpt-4o",
+            "defaultOptions": {"temperature": 0.7, "maxTokens": 4096},
+        },
+        {
+            "id": "codex-cli",
+            "label": "Codex CLI",
+            "provider": "codex",
+            "modes": ["task"],
+        },
+        {
+            "id": "claude-code",
+            "label": "Claude Code (Bedrock/SigiQ)",
+            "provider": "claude",
+            "modes": ["task"],
+            "effortLevels": ["low", "medium", "high"],
+        },
+    ]
+
+
+def opencode_fixture_models() -> list[dict]:
+    config_path = Path(os.environ.get("OPENCODE_CONFIG_PATH", "~/.config/opencode/opencode.jsonc")).expanduser()
+    if not config_path.is_file():
+        return []
+    try:
+        config = json.loads(strip_jsonc(config_path.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError):
+        return []
+    providers = config.get("provider", {})
+    if not isinstance(providers, dict):
+        return []
+
+    models: list[dict] = []
+    # Mirror ops/render-codex-api-config: collapse the Azure deployment cross-product so
+    # the picker shows one "<model> (Azure)" row per model id instead of one per endpoint.
+    azure_by_model: dict[str, dict] = {}
+    azure_rank: dict[str, tuple[int, int]] = {}
+    provider_index = 0
+    for provider_id, provider in providers.items():
+        if not isinstance(provider_id, str) or not isinstance(provider, dict):
+            continue
+        npm = provider.get("npm")
+        options = provider.get("options", {}) if isinstance(provider.get("options"), dict) else {}
+        provider_models = provider.get("models", {}) if isinstance(provider.get("models"), dict) else {}
+        if npm == "@ai-sdk/openai-compatible" and options.get("baseURL"):
+            rank = azure_deployment_rank(provider_id, provider_index)
+            provider_index += 1
+            for model_id, model in provider_models.items():
+                if not isinstance(model_id, str) or not isinstance(model, dict):
+                    continue
+                entry = {
+                    "id": f"{provider_id}/{model_id}",
+                    "label": f"{azure_model_label(model.get('name'), model_id)} (Azure)",
+                    "provider": "azure",
+                    "modes": ["chat"],
+                    "azureDeployment": model_id,
+                    "defaultOptions": {"temperature": 0.7, "maxTokens": model_output_limit(model, 4096)},
+                }
+                existing_rank = azure_rank.get(model_id)
+                if existing_rank is None or rank < existing_rank:
+                    azure_by_model[model_id] = entry
+                    azure_rank[model_id] = rank
+        elif npm == "@ai-sdk/amazon-bedrock" and provider_id == "amazon-bedrock-sigiq":
+            for model_id, model in provider_models.items():
+                if not isinstance(model_id, str) or not isinstance(model, dict):
+                    continue
+                entry = {
+                    "id": model_id,
+                    "label": display_name(model.get("name"), model_id),
+                    "provider": "bedrock",
+                    "modes": ["chat"],
+                    "defaultOptions": {"temperature": 0.7, "maxTokens": model_output_limit(model, 4096)},
+                }
+                if model.get("reasoning"):
+                    entry["effortLevels"] = ["low", "medium", "high"]
+                models.append(entry)
+
+    models = list(azure_by_model.values()) + models
+    models.extend([
+        {"id": "codex-cli", "label": "Codex CLI", "provider": "codex", "modes": ["task"]},
+        {
+            "id": "claude-code",
+            "label": "Claude Code (Bedrock/SigiQ)",
+            "provider": "claude",
+            "modes": ["task"],
+            "effortLevels": ["low", "medium", "high"],
+        },
+    ])
+    return models
+
+
+def public_catalog(models: object) -> list[dict]:
+    if not isinstance(models, list):
+        return []
+    private_keys = {"azureApiKeyFile", "azureApiKeyEnv", "azureBaseURL", "bedrockRegion"}
+    return [
+        {key: value for key, value in model.items() if key not in private_keys}
+        for model in models
+        if isinstance(model, dict)
+    ]
+
+
+def strip_jsonc(text: str) -> str:
+    result: list[str] = []
+    in_string = False
+    escape = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if in_string:
+            result.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            result.append(ch)
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            i = text.find("\n", i)
+            if i == -1:
+                break
+            result.append("\n")
+            i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            end = text.find("*/", i + 2)
+            if end == -1:
+                break
+            result.append("\n" * text[i:end + 2].count("\n"))
+            i = end + 2
+            continue
+        result.append(ch)
+        i += 1
+    return "".join(result)
+
+
+def display_name(value: object, fallback: str) -> str:
+    return value.strip() if isinstance(value, str) and value.strip() else fallback
+
+
+def azure_model_label(name: object, fallback: str) -> str:
+    base = display_name(name, fallback)
+    return re.sub(r"\s*\([^()]*\)\s*$", "", base).strip() or fallback
+
+
+def azure_deployment_rank(provider_id: str, config_index: int) -> tuple[int, int]:
+    name = provider_id.lower()
+    tier = 0 if "prod" in name else 2 if "dev" in name else 1
+    return (tier, config_index)
+
+
+def model_output_limit(model: dict, fallback: int) -> int:
+    limit = model.get("limit")
+    output = limit.get("output") if isinstance(limit, dict) else None
+    return output if isinstance(output, int) and 0 < output <= 200000 else fallback
+
+
 def codex_fixture_session() -> dict:
     return {
         "id": "sim-thread-linear",
@@ -188,6 +506,7 @@ def codex_fixture_thread() -> dict:
     return {
         "id": "sim-thread-linear",
         "sessionId": "sim-thread-linear",
+        "mode": "task",
         "provider": "codex",
         "workspaceId": "poc-vault",
         "workspaceName": "POC Vault",
@@ -198,6 +517,22 @@ def codex_fixture_thread() -> dict:
         "lastJobStatus": "succeeded",
         "lastPrompt": "List out all my linear issues for last one week and also carve out my action items from them.",
         "lastResult": codex_fixture_answer()[:220] + "...",
+        "hasSessionFile": True,
+        "isSmokeTest": False,
+    }
+
+
+def codex_fixture_chat_thread() -> dict:
+    return {
+        "id": "sim-chat-thread",
+        "sessionId": "sim-chat-thread",
+        "mode": "chat",
+        "provider": "bedrock",
+        "updatedAt": "2026-05-29T09:30:00Z",
+        "jobCount": 0,
+        "activeJobCount": 0,
+        "lastPrompt": "Is simulator chat wired?",
+        "lastResult": "Simulator chat is wired.",
         "hasSessionFile": True,
         "isSmokeTest": False,
     }
@@ -224,6 +559,25 @@ def codex_fixture_thread_detail() -> dict:
             },
         ],
         "jobs": [codex_fixture_job()],
+    }
+
+
+def codex_fixture_chat_thread_detail() -> dict:
+    return {
+        "thread": codex_fixture_chat_thread(),
+        "messages": [
+            {
+                "role": "user",
+                "timestamp": "2026-05-29T09:29:50Z",
+                "text": "Is simulator chat wired?",
+            },
+            {
+                "role": "assistant",
+                "timestamp": "2026-05-29T09:30:00Z",
+                "text": "Simulator chat is wired.",
+            },
+        ],
+        "jobs": [],
     }
 
 

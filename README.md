@@ -398,11 +398,19 @@ Current API behavior:
 - `/v1/codex/*` is protected by mTLS.
 - Allowed certificate subjects are configured per install with
   `CODEX_ALLOWED_CERT_SUBJECTS`.
+- `/v1/codex/models` exposes the server-side model catalog so Relay does not
+  compile model ids into the app.
+- When `~/.config/opencode/opencode.jsonc` exists, the Codex API install config
+  renders Relay's catalog from the local OpenCode Azure/Bedrock inventory.
+- `/v1/codex/chat` streams synchronous Chat mode over SSE for Bedrock and Azure
+  catalog entries.
 - Jobs are async and persisted on the VM.
 - Job history, detail logs, cancel, timeout, sessions, thread summaries, and
   bounded thread detail are supported.
 - Provider-aware jobs are supported. `codex` is the default provider; `claude`
   is available when configured on the runner.
+- Chat mode uses `bedrock` or `azure`; Task mode continues to use the existing
+  async `codex` and `claude` job contracts.
 - Threads are provider-locked, so a Codex thread is resumed by Codex and a
   Claude thread is resumed by Claude.
 - Phone-recorded prompt audio can be transcribed through the authenticated

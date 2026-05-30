@@ -15,7 +15,8 @@ not just static demo hosting.
 - client CA private keys
 - client certificate private keys
 - manifest signing private keys
-- copied Codex auth JSON, OpenAI API keys, or Azure Speech API keys
+- copied Codex auth JSON, OpenAI API keys, Azure OpenAI API keys, or Azure
+  Speech API keys
 - passphrases
 - local config files copied from `~/.poc-vault/secrets`
 
