@@ -1,6 +1,6 @@
 import http from "node:http";
 import https from "node:https";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -69,11 +69,20 @@ const maxWorkspaceDirEntries = parseIntegerEnv("CODEX_MAX_WORKSPACE_DIR_ENTRIES"
 const terminalStatuses = new Set(["succeeded", "failed", "cancelled", "timeout"]);
 const allowedReasoningEfforts = new Set(["low", "medium", "high", "xhigh"]);
 const allowedJobProviders = new Set(["codex", "claude"]);
+const allowedChatProviders = new Set(["azure", "bedrock"]);
+const allowedThreadProviders = new Set([...allowedJobProviders, ...allowedChatProviders]);
 const allowedClaudePermissionModes = new Set(["acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"]);
-const claudeAwsProfile = cleanOptionalAwsProfile(process.env.CLAUDE_AWS_PROFILE || "sigiq");
+const claudeAwsProfile = cleanOptionalAwsProfile(process.env.CLAUDE_AWS_PROFILE);
+if (claudeAwsProfile !== "sigiq") {
+  throw new Error("Bedrock access requires CLAUDE_AWS_PROFILE=sigiq; refusing to start.");
+}
 const claudeAwsRegion = cleanOptionalAwsProfile(
   process.env.CLAUDE_AWS_REGION || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION,
 );
+const bedrockRegion = cleanOptionalAwsProfile(
+  process.env.BEDROCK_REGION || process.env.CLAUDE_AWS_REGION || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-east-1",
+);
+const bedrockRuntimeEndpoint = cleanOptionalEndpoint(process.env.BEDROCK_RUNTIME_ENDPOINT);
 const claudeModelAliases = {
   sonnet: process.env.CLAUDE_SONNET_MODEL || "sonnet",
   opus: process.env.CLAUDE_OPUS_MODEL || "global.anthropic.claude-opus-4-6-v1",
@@ -85,19 +94,26 @@ const azureSpeechApiKey = cleanOptionalSecret(process.env.AZURE_SPEECH_API_KEY |
 const azureSpeechApiVersion = cleanApiVersion(process.env.AZURE_SPEECH_API_VERSION || "2025-10-15");
 const azureSpeechModel = cleanDisplayName(process.env.AZURE_SPEECH_TRANSCRIPTION_MODEL || "mai-transcribe-1", "Azure Speech transcription model", 120);
 const azureSpeechLocales = splitCsv(process.env.AZURE_SPEECH_LOCALES || "en");
+const azureOpenAiEndpoint = cleanOptionalEndpoint(process.env.AZURE_OPENAI_ENDPOINT);
+const azureOpenAiApiKey = cleanOptionalSecret(process.env.AZURE_OPENAI_API_KEY);
+const azureOpenAiApiVersion = cleanApiVersion(process.env.AZURE_OPENAI_API_VERSION || "2025-01-01-preview");
 const proxyBaseUrl = cleanOptionalEndpoint(process.env.CODEX_PROXY_BASE_URL || process.env.CODEX_REMOTE_BASE_URL);
 const proxyClientCertPath = cleanOptionalFilePath(process.env.CODEX_PROXY_CLIENT_CERT || process.env.CODEX_REMOTE_CLIENT_CERT);
 const proxyClientKeyPath = cleanOptionalFilePath(process.env.CODEX_PROXY_CLIENT_KEY || process.env.CODEX_REMOTE_CLIENT_KEY);
+const modelCatalog = loadModelCatalog();
+const chatsDir = path.join(dataDir, "chats");
 const jobs = new Map();
 const dynamicWorkspaces = new Map();
 const activeChildren = new Map();
 let queuedJobIds = [];
+let cachedBedrockCredentials = null;
 
 fs.mkdirSync(dataDir, { recursive: true });
 fs.mkdirSync(jobsDir, { recursive: true });
 fs.mkdirSync(logsDir, { recursive: true });
 fs.mkdirSync(attachmentsDir, { recursive: true });
 fs.mkdirSync(artifactsDir, { recursive: true });
+fs.mkdirSync(chatsDir, { recursive: true });
 
 const workspaces = loadWorkspaces();
 loadPersistedJobs();
@@ -191,6 +207,145 @@ function publicWorkspace(workspace) {
     name: workspace.name,
     path: workspace.path,
   };
+}
+
+function loadModelCatalog() {
+  const configured = process.env.CODEX_MODEL_CATALOG
+    ? JSON.parse(process.env.CODEX_MODEL_CATALOG)
+    : defaultModelCatalog();
+  if (!Array.isArray(configured)) {
+    throw new Error("CODEX_MODEL_CATALOG must be a JSON array");
+  }
+  return configured.map(cleanModelDescriptor);
+}
+
+function defaultModelCatalog() {
+  const bedrockChatModel = process.env.BEDROCK_CHAT_MODEL || "anthropic.claude-3-5-sonnet-20241022-v2:0";
+  const catalog = [
+    {
+      id: bedrockChatModel,
+      label: "Claude Sonnet (Bedrock)",
+      provider: "bedrock",
+      modes: ["chat"],
+      defaultOptions: { temperature: 0.7, maxTokens: 4096 },
+      effortLevels: ["low", "medium", "high"],
+    },
+    {
+      id: "codex-cli",
+      label: "Codex CLI",
+      provider: "codex",
+      modes: ["task"],
+    },
+    {
+      id: "claude-code",
+      label: "Claude Code (Bedrock/SigiQ)",
+      provider: "claude",
+      modes: ["task"],
+      effortLevels: ["low", "medium", "high"],
+    },
+  ];
+  if (process.env.AZURE_OPENAI_DEPLOYMENT) {
+    catalog.push({
+      id: process.env.AZURE_OPENAI_DEPLOYMENT,
+      label: `${process.env.AZURE_OPENAI_DEPLOYMENT} (Azure)`,
+      provider: "azure",
+      modes: ["chat"],
+      azureDeployment: process.env.AZURE_OPENAI_DEPLOYMENT,
+      defaultOptions: { temperature: 0.7, maxTokens: 4096 },
+    });
+  }
+  return catalog;
+}
+
+function cleanModelDescriptor(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    throw new Error("CODEX_MODEL_CATALOG entries must be objects");
+  }
+  const id = cleanRequiredModelId(entry.id, "model id");
+  const provider = cleanModelProvider(entry.provider);
+  const modes = cleanModelModes(entry.modes);
+  const descriptor = {
+    id,
+    label: cleanDisplayName(entry.label || id, "model label", 120),
+    provider,
+    modes,
+  };
+  if (entry.azureDeployment !== undefined && entry.azureDeployment !== null && entry.azureDeployment !== "") {
+    descriptor.azureDeployment = cleanRequiredModelId(entry.azureDeployment, "Azure deployment");
+  }
+  if (entry.azureBaseURL !== undefined && entry.azureBaseURL !== null && entry.azureBaseURL !== "") {
+    descriptor.azureBaseURL = cleanOptionalEndpoint(entry.azureBaseURL);
+    if (!descriptor.azureBaseURL) throw new Error("Azure base URL is invalid");
+  }
+  if (entry.azureApiKeyFile !== undefined && entry.azureApiKeyFile !== null && entry.azureApiKeyFile !== "") {
+    descriptor.azureApiKeyFile = cleanOptionalFilePath(entry.azureApiKeyFile);
+    if (!descriptor.azureApiKeyFile) throw new Error("Azure API key file is invalid");
+  }
+  if (entry.azureApiKeyEnv !== undefined && entry.azureApiKeyEnv !== null && entry.azureApiKeyEnv !== "") {
+    descriptor.azureApiKeyEnv = cleanEnvironmentVariableName(entry.azureApiKeyEnv, "Azure API key environment variable");
+  }
+  if (entry.bedrockRegion !== undefined && entry.bedrockRegion !== null && entry.bedrockRegion !== "") {
+    descriptor.bedrockRegion = cleanOptionalAwsProfile(entry.bedrockRegion);
+    if (!descriptor.bedrockRegion) throw new Error("Bedrock region is invalid");
+  }
+  const defaultOptions = cleanChatOptions(entry.defaultOptions || {});
+  if (Object.keys(defaultOptions).length > 0) descriptor.defaultOptions = defaultOptions;
+  if (Array.isArray(entry.effortLevels)) {
+    descriptor.effortLevels = entry.effortLevels
+      .map((level) => (typeof level === "string" ? level.trim().toLowerCase() : ""))
+      .filter((level) => ["low", "medium", "high", "xhigh"].includes(level));
+  }
+  return descriptor;
+}
+
+function cleanModelProvider(value) {
+  if (typeof value !== "string") {
+    throw new Error("model provider is required");
+  }
+  const normalized = value.trim().toLowerCase();
+  if (!allowedThreadProviders.has(normalized)) {
+    throw new Error("model provider must be codex, claude, azure, or bedrock");
+  }
+  return normalized;
+}
+
+function cleanModelModes(value) {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error("model modes must be a non-empty array");
+  }
+  const modes = [...new Set(value.map((mode) => (typeof mode === "string" ? mode.trim().toLowerCase() : "")))].filter(
+    (mode) => mode === "chat" || mode === "task",
+  );
+  if (modes.length === 0) {
+    throw new Error("model modes must include chat or task");
+  }
+  return modes;
+}
+
+function cleanRequiredModelId(value, label) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9._:/-]{1,180}$/.test(value.trim())) {
+    throw new Error(`${label} is invalid`);
+  }
+  return value.trim();
+}
+
+function publicModelCatalog() {
+  return modelCatalog.map((model) => {
+    const {
+      azureApiKeyFile,
+      azureApiKeyEnv,
+      azureBaseURL,
+      bedrockRegion: _bedrockRegion,
+      ...publicModel
+    } = model;
+    return publicModel;
+  });
+}
+
+function findCatalogModel({ provider, model, mode }) {
+  return modelCatalog.find(
+    (entry) => entry.provider === provider && entry.id === model && entry.modes.includes(mode),
+  );
 }
 
 function browseWorkspaceForPath(workspacePath, { materialize = false } = {}) {
@@ -331,6 +486,14 @@ function cleanOptionalFilePath(value) {
     throw new Error("proxy client certificate path is invalid");
   }
   return path.resolve(text);
+}
+
+function cleanEnvironmentVariableName(value, label) {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!/^[A-Za-z_][A-Za-z0-9_]{0,120}$/.test(text)) {
+    throw new Error(`${label} is invalid`);
+  }
+  return text;
 }
 
 function cleanApiVersion(value) {
@@ -630,6 +793,20 @@ function sendError(res, status, message) {
   return sendJson(res, status, { error: message });
 }
 
+function initSse(res) {
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    "x-accel-buffering": "no",
+  });
+}
+
+function sendSse(res, event, data) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let size = 0;
@@ -735,12 +912,21 @@ async function routeRequest(req, res) {
     return sendHtml(res, 200, codexThreadUiHtml());
   }
 
+  if (req.method === "GET" && url.pathname === "/v1/codex/models") {
+    return sendJson(res, 200, { models: publicModelCatalog() });
+  }
+
+  if (req.method === "POST" && url.pathname === "/v1/codex/chat") {
+    const body = await readBody(req);
+    return handleChatRequest(req, res, body, auth.subject);
+  }
+
   if (shouldProxyCodexRequest(req, url)) {
     return proxyCodexRequest(req, url, res);
   }
 
   if (req.method === "GET" && url.pathname === "/v1/codex/skills") {
-    const provider = cleanProviderFilter(url.searchParams.get("provider")) || "codex";
+    const provider = cleanJobProviderFilter(url.searchParams.get("provider")) || "codex";
     return sendJson(res, 200, { provider, skills: listProviderSkills(provider).map(publicSkill) });
   }
 
@@ -778,21 +964,21 @@ async function routeRequest(req, res) {
   if (req.method === "GET" && url.pathname === "/v1/codex/sessions") {
     const limit = clampLimit(url.searchParams.get("limit"));
     const workspaceId = url.searchParams.get("workspaceId");
-    const provider = cleanProviderFilter(url.searchParams.get("provider"));
+    const provider = cleanThreadProviderFilter(url.searchParams.get("provider"));
     return sendJson(res, 200, { sessions: listWorkspaceSessions({ workspaceId, provider, limit }) });
   }
 
   if (req.method === "GET" && url.pathname === "/v1/codex/threads") {
     const limit = clampLimit(url.searchParams.get("limit"));
     const workspaceId = url.searchParams.get("workspaceId");
-    const provider = cleanProviderFilter(url.searchParams.get("provider"));
+    const provider = cleanThreadProviderFilter(url.searchParams.get("provider"));
     return sendJson(res, 200, { threads: listWorkspaceThreads({ workspaceId, provider, limit }) });
   }
 
   const threadMatch = url.pathname.match(/^\/v1\/codex\/threads\/([^/]+)$/);
   if (threadMatch && req.method === "GET") {
     const sessionId = decodeURIComponent(threadMatch[1]);
-    const provider = cleanProviderFilter(url.searchParams.get("provider"));
+    const provider = cleanThreadProviderFilter(url.searchParams.get("provider"));
     if (!isSafeJobId(sessionId)) return sendError(res, 404, "thread not found");
     const detail = await threadDetailResponse(sessionId, { provider });
     if (!detail) return sendError(res, 404, "thread not found");
@@ -802,7 +988,7 @@ async function routeRequest(req, res) {
   if (threadMatch && req.method === "DELETE") {
     const sessionId = decodeURIComponent(threadMatch[1]);
     const workspaceId = url.searchParams.get("workspaceId");
-    const provider = cleanProviderFilter(url.searchParams.get("provider"));
+    const provider = cleanThreadProviderFilter(url.searchParams.get("provider"));
     if (!isSafeJobId(sessionId)) return sendError(res, 404, "thread not found");
     const deleted = deleteThread(sessionId, { workspaceId, provider, certSubject: auth.subject });
     if (!deleted) return sendError(res, 404, "thread not found");
@@ -823,7 +1009,7 @@ async function routeRequest(req, res) {
   if (req.method === "GET" && url.pathname === "/v1/codex/jobs") {
     const limit = clampLimit(url.searchParams.get("limit"));
     const workspaceId = url.searchParams.get("workspaceId");
-    const provider = cleanProviderFilter(url.searchParams.get("provider"));
+    const provider = cleanJobProviderFilter(url.searchParams.get("provider"));
     const selectedWorkspace = resolveOptionalWorkspaceFilter(workspaceId);
     const selectedJobs = [...jobs.values()]
       .filter((job) => !provider || normalizeJobProvider(job.provider) === provider)
@@ -992,6 +1178,410 @@ function readRawBody(req, byteLimit) {
   });
 }
 
+async function handleChatRequest(req, res, body, certSubject) {
+  const chat = cleanChatRequest(body);
+  initSse(res);
+
+  const abortController = new AbortController();
+  req.on("close", () => abortController.abort());
+
+  const startedAt = nowIso();
+  const replyChunks = [];
+  let usage = null;
+  sendSse(res, "meta", { threadId: chat.threadId, model: chat.model, provider: chat.provider });
+
+  try {
+    if (chat.provider === "azure") {
+      usage = await streamAzureChat(res, chat, abortController.signal, replyChunks);
+    } else if (chat.provider === "bedrock") {
+      usage = await streamBedrockChat(res, chat, abortController.signal, replyChunks);
+    }
+    const finishedAt = nowIso();
+    persistChatThread({
+      ...chat,
+      assistantText: replyChunks.join(""),
+      usage,
+      certSubject,
+      createdAt: startedAt,
+      updatedAt: finishedAt,
+    });
+  } catch (error) {
+    if (!abortController.signal.aborted) {
+      sendSse(res, "error", { code: "upstream", message: error.message || String(error) });
+    }
+  } finally {
+    res.end();
+  }
+}
+
+function cleanChatRequest(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw Object.assign(new Error("request body must be a JSON object"), { status: 400 });
+  }
+  const provider = cleanChatProvider(body.provider);
+  const model = cleanRequiredModelId(body.model, "model");
+  const catalogEntry = findCatalogModel({ provider, model, mode: "chat" });
+  if (!catalogEntry) {
+    throw Object.assign(new Error("model is not available for chat with the requested provider"), { status: 400 });
+  }
+  const threadId = cleanOptionalSessionId(body.threadId) || crypto.randomUUID();
+  const existingThread = readChatThread(threadId);
+  if (existingThread && existingThread.provider !== provider) {
+    throw Object.assign(new Error("chat thread provider does not match requested provider"), { status: 400 });
+  }
+  const messages = cleanChatMessages(body.messages);
+  const options = {
+    ...(catalogEntry.defaultOptions || {}),
+    ...cleanChatOptions(body.options || {}),
+  };
+  return { provider, model, catalogEntry, threadId, messages, options };
+}
+
+function cleanChatProvider(value) {
+  if (typeof value !== "string") {
+    throw Object.assign(new Error("chat provider is required"), { status: 400 });
+  }
+  const normalized = value.trim().toLowerCase();
+  if (!allowedChatProviders.has(normalized)) {
+    throw Object.assign(new Error("chat provider must be azure or bedrock"), { status: 400 });
+  }
+  return normalized;
+}
+
+function cleanChatMessages(value) {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw Object.assign(new Error("messages must be a non-empty array"), { status: 400 });
+  }
+  if (value.length > 80) {
+    throw Object.assign(new Error("messages may include at most 80 entries"), { status: 413 });
+  }
+  return value.map((message) => {
+    if (!message || typeof message !== "object" || Array.isArray(message)) {
+      throw Object.assign(new Error("each message must be an object"), { status: 400 });
+    }
+    const role = typeof message.role === "string" ? message.role.trim().toLowerCase() : "";
+    if (!["user", "assistant", "system"].includes(role)) {
+      throw Object.assign(new Error("message role must be user, assistant, or system"), { status: 400 });
+    }
+    const content = typeof message.content === "string" ? message.content.trim() : "";
+    if (!content) {
+      throw Object.assign(new Error("message content is required"), { status: 400 });
+    }
+    if (Buffer.byteLength(content, "utf8") > maxBodyBytes) {
+      throw Object.assign(new Error("message content is too large"), { status: 413 });
+    }
+    return { role, content };
+  });
+}
+
+function cleanChatOptions(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const options = {};
+  if (value.temperature !== undefined && value.temperature !== null && value.temperature !== "") {
+    const temperature = Number(value.temperature);
+    if (!Number.isFinite(temperature) || temperature < 0 || temperature > 2) {
+      throw Object.assign(new Error("temperature must be between 0 and 2"), { status: 400 });
+    }
+    options.temperature = temperature;
+  }
+  const maxTokens = value.maxTokens ?? value.max_tokens;
+  if (maxTokens !== undefined && maxTokens !== null && maxTokens !== "") {
+    const parsed = Number(maxTokens);
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 200000) {
+      throw Object.assign(new Error("maxTokens must be a positive integer"), { status: 400 });
+    }
+    options.maxTokens = parsed;
+  }
+  return options;
+}
+
+async function streamAzureChat(res, chat, signal, replyChunks) {
+  const apiKey = azureApiKeyForModel(chat.catalogEntry);
+  if (!azureEndpointForModel(chat.catalogEntry) || !apiKey) {
+    throw Object.assign(new Error("Azure OpenAI is not configured"), { status: 503 });
+  }
+  const deployment = chat.catalogEntry.azureDeployment || chat.model;
+  const url = azureChatUrl(chat.catalogEntry, deployment);
+  const response = await fetch(url, {
+    method: "POST",
+    signal,
+    headers: {
+      "content-type": "application/json",
+      "api-key": apiKey,
+    },
+    body: JSON.stringify({
+      model: deployment,
+      messages: chat.messages,
+      stream: true,
+      temperature: chat.options.temperature ?? 0.7,
+      max_tokens: chat.options.maxTokens ?? 4096,
+    }),
+  });
+  if (!response.ok || !response.body) {
+    throw new Error(`Azure OpenAI failed with HTTP ${response.status}`);
+  }
+
+  let buffer = "";
+  for await (const chunk of response.body) {
+    buffer += Buffer.from(chunk).toString("utf8");
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) continue;
+      const payload = trimmed.slice(5).trim();
+      if (payload === "[DONE]") {
+        sendSse(res, "done", { stopReason: "stop" });
+        return null;
+      }
+      const parsed = JSON.parse(payload);
+      const text = parsed?.choices?.[0]?.delta?.content;
+      if (text) {
+        replyChunks.push(text);
+        sendSse(res, "delta", { text });
+      }
+    }
+  }
+  sendSse(res, "done", { stopReason: "stop" });
+  return null;
+}
+
+function azureEndpointForModel(catalogEntry) {
+  return catalogEntry.azureBaseURL || azureOpenAiEndpoint;
+}
+
+function azureApiKeyForModel(catalogEntry) {
+  if (catalogEntry.azureApiKeyFile) {
+    try {
+      return fs.readFileSync(catalogEntry.azureApiKeyFile, "utf8").trim();
+    } catch {
+      return null;
+    }
+  }
+  if (catalogEntry.azureApiKeyEnv) {
+    return cleanOptionalSecret(process.env[catalogEntry.azureApiKeyEnv]);
+  }
+  return azureOpenAiApiKey;
+}
+
+function azureChatUrl(catalogEntry, deployment) {
+  const endpoint = azureEndpointForModel(catalogEntry).replace(/\/+$/, "");
+  if (catalogEntry.azureBaseURL) {
+    return `${endpoint}/chat/completions`;
+  }
+  return `${endpoint}/openai/deployments/${encodeURIComponent(deployment)}/chat/completions?api-version=${encodeURIComponent(azureOpenAiApiVersion)}`;
+}
+
+async function streamBedrockChat(res, chat, signal, replyChunks) {
+  const credentials = await loadBedrockCredentials();
+  const modelPath = `/model/${encodeURIComponent(chat.model)}/converse-stream`;
+  const requestRegion = chat.catalogEntry.bedrockRegion || bedrockRegion;
+  const endpoint = bedrockRuntimeEndpoint || `https://bedrock-runtime.${requestRegion}.amazonaws.com`;
+  const url = new URL(modelPath, endpoint);
+  const body = JSON.stringify({
+    messages: chat.messages
+      .filter((message) => message.role !== "system")
+      .map((message) => ({ role: message.role === "assistant" ? "assistant" : "user", content: [{ text: message.content }] })),
+    inferenceConfig: {
+      maxTokens: chat.options.maxTokens ?? 4096,
+      temperature: chat.options.temperature ?? 0.7,
+    },
+  });
+  const headers = signAwsRequest({
+    method: "POST",
+    url,
+    body,
+    region: requestRegion,
+    service: "bedrock",
+    credentials,
+    extraHeaders: {
+      accept: "application/vnd.amazon.eventstream",
+      "content-type": "application/json",
+    },
+  });
+  const response = await fetch(url, {
+    method: "POST",
+    signal,
+    headers,
+    body,
+  });
+  if (!response.ok || !response.body) {
+    throw new Error(`Bedrock failed with HTTP ${response.status}`);
+  }
+
+  let usage = null;
+  for await (const event of decodeAwsEventStream(response.body)) {
+    const text = event?.contentBlockDelta?.delta?.text;
+    if (text) {
+      replyChunks.push(text);
+      sendSse(res, "delta", { text });
+    }
+    if (event?.metadata?.usage) {
+      usage = {
+        inputTokens: event.metadata.usage.inputTokens ?? null,
+        outputTokens: event.metadata.usage.outputTokens ?? null,
+      };
+      sendSse(res, "usage", usage);
+    }
+    if (event?.messageStop) {
+      sendSse(res, "done", { stopReason: event.messageStop.stopReason || "end_turn" });
+    }
+  }
+  return usage;
+}
+
+async function* decodeAwsEventStream(stream) {
+  let buffer = Buffer.alloc(0);
+  for await (const chunk of stream) {
+    buffer = Buffer.concat([buffer, Buffer.from(chunk)]);
+    while (buffer.length >= 16) {
+      const totalLength = buffer.readUInt32BE(0);
+      const headersLength = buffer.readUInt32BE(4);
+      if (totalLength < 16 || totalLength > 10 * 1024 * 1024) {
+        throw new Error("invalid Bedrock event stream frame");
+      }
+      if (buffer.length < totalLength) break;
+      const payloadStart = 12 + headersLength;
+      const payloadEnd = totalLength - 4;
+      const payload = buffer.subarray(payloadStart, payloadEnd).toString("utf8").trim();
+      buffer = buffer.subarray(totalLength);
+      if (!payload) continue;
+      yield JSON.parse(payload);
+    }
+  }
+}
+
+async function loadBedrockCredentials() {
+  if (cachedBedrockCredentials && (!cachedBedrockCredentials.expiresAt || cachedBedrockCredentials.expiresAt > Date.now() + 60_000)) {
+    return cachedBedrockCredentials;
+  }
+  const profile = claudeAwsProfile;
+  const fromFile = readSharedCredentialsProfile(profile);
+  if (fromFile) {
+    cachedBedrockCredentials = fromFile;
+    return fromFile;
+  }
+  const exported = await exportAwsProfileCredentials(profile);
+  cachedBedrockCredentials = exported;
+  return exported;
+}
+
+function readSharedCredentialsProfile(profile) {
+  const credentialsFile = process.env.AWS_SHARED_CREDENTIALS_FILE || path.join(runHome, ".aws", "credentials");
+  let contents = "";
+  try {
+    contents = fs.readFileSync(credentialsFile, "utf8");
+  } catch {
+    return null;
+  }
+  let current = null;
+  const sections = new Map();
+  for (const rawLine of contents.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#") || line.startsWith(";")) continue;
+    const section = line.match(/^\[([^\]]+)\]$/);
+    if (section) {
+      current = section[1].trim();
+      sections.set(current, {});
+      continue;
+    }
+    if (!current || !line.includes("=")) continue;
+    const [key, ...valueParts] = line.split("=");
+    sections.get(current)[key.trim()] = valueParts.join("=").trim();
+  }
+  const entry = sections.get(profile);
+  if (!entry?.aws_access_key_id || !entry?.aws_secret_access_key) return null;
+  return {
+    accessKeyId: entry.aws_access_key_id,
+    secretAccessKey: entry.aws_secret_access_key,
+    sessionToken: entry.aws_session_token || null,
+    expiresAt: null,
+  };
+}
+
+async function exportAwsProfileCredentials(profile) {
+  const env = { ...process.env };
+  delete env.AWS_ACCESS_KEY_ID;
+  delete env.AWS_SECRET_ACCESS_KEY;
+  delete env.AWS_SESSION_TOKEN;
+  delete env.AWS_PROFILE;
+  delete env.AWS_DEFAULT_PROFILE;
+  return new Promise((resolve, reject) => {
+    execFile("aws", ["configure", "export-credentials", "--profile", profile, "--format", "json"], { env, timeout: 10_000 }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error(`failed to export AWS credentials for profile ${profile}: ${stderr || error.message}`));
+        return;
+      }
+      try {
+        const parsed = JSON.parse(stdout);
+        if (!parsed.AccessKeyId || !parsed.SecretAccessKey) {
+          reject(new Error(`AWS profile ${profile} did not return credentials`));
+          return;
+        }
+        resolve({
+          accessKeyId: parsed.AccessKeyId,
+          secretAccessKey: parsed.SecretAccessKey,
+          sessionToken: parsed.SessionToken || null,
+          expiresAt: parsed.Expiration ? Date.parse(parsed.Expiration) : null,
+        });
+      } catch (parseError) {
+        reject(new Error(`failed to parse AWS credentials for profile ${profile}: ${parseError.message}`));
+      }
+    });
+  });
+}
+
+function signAwsRequest({ method, url, body, region, service, credentials, extraHeaders }) {
+  const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, "");
+  const dateStamp = amzDate.slice(0, 8);
+  const payloadHash = sha256Hex(body);
+  const headers = {
+    ...extraHeaders,
+    host: url.host,
+    "x-amz-content-sha256": payloadHash,
+    "x-amz-date": amzDate,
+  };
+  if (credentials.sessionToken) {
+    headers["x-amz-security-token"] = credentials.sessionToken;
+  }
+
+  const signedHeaderNames = Object.keys(headers)
+    .map((key) => key.toLowerCase())
+    .sort();
+  const canonicalHeaders = signedHeaderNames
+    .map((name) => `${name}:${String(headers[name] ?? headers[Object.keys(headers).find((key) => key.toLowerCase() === name)]).trim().replace(/\s+/g, " ")}\n`)
+    .join("");
+  const signedHeaders = signedHeaderNames.join(";");
+  const canonicalRequest = [
+    method,
+    url.pathname,
+    url.search ? url.search.slice(1) : "",
+    canonicalHeaders,
+    signedHeaders,
+    payloadHash,
+  ].join("\n");
+  const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
+  const stringToSign = ["AWS4-HMAC-SHA256", amzDate, credentialScope, sha256Hex(canonicalRequest)].join("\n");
+  const signingKey = awsSigningKey(credentials.secretAccessKey, dateStamp, region, service);
+  const signature = crypto.createHmac("sha256", signingKey).update(stringToSign).digest("hex");
+
+  return {
+    ...headers,
+    authorization: `AWS4-HMAC-SHA256 Credential=${credentials.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+  };
+}
+
+function sha256Hex(value) {
+  return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+function awsSigningKey(secretAccessKey, dateStamp, region, service) {
+  const kDate = crypto.createHmac("sha256", `AWS4${secretAccessKey}`).update(dateStamp).digest();
+  const kRegion = crypto.createHmac("sha256", kDate).update(region).digest();
+  const kService = crypto.createHmac("sha256", kRegion).update(service).digest();
+  return crypto.createHmac("sha256", kService).update("aws4_request").digest();
+}
+
 function createJob(body, certSubject) {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     throw Object.assign(new Error("request body must be a JSON object"), { status: 400 });
@@ -1117,9 +1707,21 @@ function cleanOptionalProvider(value) {
   return normalized;
 }
 
-function cleanProviderFilter(value) {
+function cleanJobProviderFilter(value) {
   if (value === undefined || value === null || value === "") return null;
   return cleanOptionalProvider(value);
+}
+
+function cleanThreadProviderFilter(value) {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value !== "string") {
+    throw Object.assign(new Error("provider is invalid"), { status: 400 });
+  }
+  const normalized = value.trim().toLowerCase();
+  if (!allowedThreadProviders.has(normalized)) {
+    throw Object.assign(new Error("provider must be codex, claude, azure, or bedrock"), { status: 400 });
+  }
+  return normalized;
 }
 
 function normalizeJobProvider(value) {
@@ -2152,6 +2754,7 @@ function listWorkspaceThreads({ workspaceId, provider = null, limit }) {
 
   return [...threadMap.values()]
     .map(threadSummary)
+    .concat(selectedWorkspace ? [] : listChatThreads({ provider, limit: 200 }))
     .sort((left, right) => compareIsoDesc(left.updatedAt, right.updatedAt))
     .slice(0, limit);
 }
@@ -2222,7 +2825,9 @@ async function threadDetailResponse(sessionId, { provider = null } = {}) {
     thread.updatedAt = maxIso(thread.updatedAt, job.updatedAt || job.createdAt);
   }
 
-  if (!thread) return null;
+  if (!thread) {
+    return chatThreadDetailResponse(sessionId, { provider });
+  }
 
   const sortedJobs = [...thread.jobs].sort((left, right) =>
     compareIsoDesc(left.updatedAt || left.createdAt, right.updatedAt || right.createdAt),
@@ -2257,7 +2862,11 @@ function deleteThread(sessionId, { workspaceId = null, provider = null, certSubj
     return true;
   });
 
-  if (!sessionMatches && matchedJobs.length === 0) return null;
+  if (!sessionMatches && matchedJobs.length === 0) {
+    const deletedChat = deleteChatThread(sessionId, { workspaceId, provider, certSubject });
+    if (deletedChat) return deletedChat;
+    return null;
+  }
   const activeJob = matchedJobs.find((job) => !terminalStatuses.has(job.status));
   if (activeJob) {
     throw Object.assign(new Error("thread has active jobs"), { status: 409 });
@@ -2340,6 +2949,149 @@ function jobThreadId(job) {
   return typeof sessionId === "string" && isSafeJobId(sessionId) ? sessionId : null;
 }
 
+function chatPath(threadId) {
+  return path.join(chatsDir, `${threadId}.json`);
+}
+
+function persistChatThread(chat) {
+  const existing = readChatThread(chat.threadId);
+  const createdAt = existing?.createdAt || chat.createdAt || nowIso();
+  const incomingMessages = chat.messages.map((message) => ({
+    role: message.role,
+    text: message.content,
+    timestamp: chat.createdAt,
+  }));
+  const assistantMessage = chat.assistantText
+    ? [{ role: "assistant", text: chat.assistantText, timestamp: chat.updatedAt }]
+    : [];
+  const baseMessages = chatMessagesStartWithExisting(incomingMessages, existing?.messages || [])
+    ? incomingMessages
+    : [...(existing?.messages || []), ...incomingMessages];
+  const thread = {
+    id: chat.threadId,
+    sessionId: chat.threadId,
+    mode: "chat",
+    provider: chat.provider,
+    model: chat.model,
+    workspaceId: null,
+    workspaceName: "Chat",
+    createdAt,
+    updatedAt: chat.updatedAt || nowIso(),
+    certSubject: chat.certSubject || existing?.certSubject || null,
+    usage: chat.usage || null,
+    messages: [...baseMessages, ...assistantMessage],
+  };
+  fs.writeFileSync(chatPath(chat.threadId), `${JSON.stringify(thread, null, 2)}\n`, "utf8");
+  appendAudit(
+    "chat_completed",
+    { id: chat.threadId, status: "succeeded", workspaceId: null, certSubject: chat.certSubject },
+    { provider: chat.provider, model: chat.model },
+  );
+}
+
+function chatMessagesStartWithExisting(incomingMessages, existingMessages) {
+  if (!existingMessages.length || incomingMessages.length < existingMessages.length) {
+    return false;
+  }
+  return existingMessages.every((message, index) => {
+    const incoming = incomingMessages[index];
+    return incoming?.role === message?.role && incoming?.text === message?.text;
+  });
+}
+
+function readChatThread(threadId) {
+  if (!isSafeJobId(threadId)) return null;
+  try {
+    const thread = JSON.parse(fs.readFileSync(chatPath(threadId), "utf8"));
+    if (!thread || typeof thread !== "object" || thread.id !== threadId) return null;
+    if (!allowedChatProviders.has(thread.provider)) return null;
+    return thread;
+  } catch {
+    return null;
+  }
+}
+
+function listChatThreads({ provider = null, limit = 200 } = {}) {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(chatsDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+    .map((entry) => readChatThread(entry.name.slice(0, -5)))
+    .filter(Boolean)
+    .filter((thread) => !provider || thread.provider === provider)
+    .map(chatThreadSummary)
+    .sort((left, right) => compareIsoDesc(left.updatedAt, right.updatedAt))
+    .slice(0, limit);
+}
+
+function chatThreadSummary(thread) {
+  const messages = Array.isArray(thread.messages) ? thread.messages : [];
+  const lastUser = [...messages].reverse().find((message) => message?.role === "user");
+  const lastAssistant = [...messages].reverse().find((message) => message?.role === "assistant");
+  return {
+    id: thread.id,
+    sessionId: thread.sessionId || thread.id,
+    mode: "chat",
+    provider: thread.provider,
+    model: thread.model || null,
+    workspaceId: null,
+    workspaceName: "Chat",
+    cwd: null,
+    timestamp: thread.createdAt || null,
+    updatedAt: thread.updatedAt || thread.createdAt || null,
+    jobCount: 0,
+    activeJobCount: 0,
+    lastJobId: null,
+    lastJobStatus: null,
+    lastPrompt: summaryText(lastUser?.text),
+    lastResult: summaryText(lastAssistant?.text),
+    lastError: null,
+    hasSessionFile: false,
+    isSmokeTest: false,
+  };
+}
+
+function chatThreadDetailResponse(threadId, { provider = null } = {}) {
+  const thread = readChatThread(threadId);
+  if (!thread) return null;
+  if (provider && thread.provider !== provider) return null;
+  return {
+    thread: chatThreadSummary(thread),
+    messages: (Array.isArray(thread.messages) ? thread.messages : []).map((message) => ({
+      role: message?.role === "assistant" ? "assistant" : message?.role === "user" ? "user" : "status",
+      timestamp: cleanSessionTimestamp(message?.timestamp) || null,
+      text: cleanApiText(message?.text || "").trim(),
+    })),
+    jobs: [],
+  };
+}
+
+function deleteChatThread(sessionId, { workspaceId = null, provider = null, certSubject = null } = {}) {
+  if (workspaceId) return null;
+  const thread = readChatThread(sessionId);
+  if (!thread) return null;
+  if (provider && thread.provider !== provider) return null;
+  const deleted = removePathInsideRoot(chatPath(sessionId), chatsDir);
+  if (!deleted) return null;
+  appendAudit(
+    "thread_deleted",
+    { id: sessionId, status: "deleted", workspaceId: null, certSubject },
+    { provider: thread.provider, deletedJobs: 0, deletedChatThread: true },
+  );
+  return {
+    deleted: true,
+    threadId: sessionId,
+    workspaceId: null,
+    deletedJobs: 0,
+    deletedSessionFile: false,
+    deletedChatThread: true,
+  };
+}
+
 function threadSummary(thread) {
   const sortedJobs = [...thread.jobs].sort((left, right) =>
     compareIsoDesc(left.updatedAt || left.createdAt, right.updatedAt || right.createdAt),
@@ -2350,6 +3102,7 @@ function threadSummary(thread) {
   return {
     id: thread.id,
     sessionId: thread.sessionId || thread.id,
+    mode: "task",
     provider: normalizeJobProvider(thread.provider),
     workspaceId: thread.workspaceId,
     workspaceName: thread.workspaceName,
@@ -2735,11 +3488,13 @@ function buildJobEnv(job) {
   };
 
   if (job.provider === "claude" && claudeAwsProfile) {
+    env.CLAUDE_AWS_PROFILE = claudeAwsProfile;
     env.AWS_PROFILE = claudeAwsProfile;
     env.AWS_SDK_LOAD_CONFIG = process.env.AWS_SDK_LOAD_CONFIG || "1";
     delete env.AWS_ACCESS_KEY_ID;
     delete env.AWS_SECRET_ACCESS_KEY;
     delete env.AWS_SESSION_TOKEN;
+    delete env.AWS_DEFAULT_PROFILE;
     if (claudeAwsRegion) {
       env.AWS_REGION = claudeAwsRegion;
       env.AWS_DEFAULT_REGION = claudeAwsRegion;

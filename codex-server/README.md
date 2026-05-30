@@ -22,6 +22,11 @@ The server exposes an async job API for Codex and Claude providers:
 
 - `GET /healthz`: public process health for uptime checks.
 - `GET /v1/codex/health`: authenticated health.
+- `GET /v1/codex/models`: authenticated model catalog for Relay Chat and
+  Task mode. The catalog is rendered from server-side config, not compiled into
+  the iOS app.
+- `POST /v1/codex/chat`: authenticated SSE chat route for synchronous
+  Bedrock/Azure model conversations.
 - `GET /v1/codex/workspaces`: configured and selected workspace registry.
 - `GET /v1/codex/workspace-dirs?path=sigiq&q=tutor`: browse/search safe
   EC2 directories under the configured workspace root.
@@ -103,9 +108,21 @@ CODEX_BIN=/usr/bin/codex
 CLAUDE_BIN=/usr/bin/claude
 CLAUDE_CODE_USE_BEDROCK=1
 CLAUDE_AWS_PROFILE=sigiq
+BEDROCK_REGION=us-east-1
 AWS_REGION=ap-south-1
 AWS_DEFAULT_REGION=ap-south-1
+AZURE_OPENAI_ENDPOINT=
+AZURE_OPENAI_API_KEY=
+AZURE_OPENAI_API_VERSION=2025-01-01-preview
+OPENCODE_CONFIG_PATH=~/.config/opencode/opencode.jsonc
+CODEX_MODEL_CATALOG='[...]'
 ```
+
+When `OPENCODE_CONFIG_PATH` exists, `ops/render-codex-api-config` renders the
+Relay model catalog from that OpenCode config. Azure entries use
+`provider/model` ids so models with the same deployment name in different Azure
+resources can all be selected. Internal routing fields and key-file paths stay
+server-side and are not returned by `/v1/codex/models`.
 
 Codex jobs use the existing `codex exec` / `codex exec resume` commands. Claude
 jobs run in the selected workspace, read prompts from stdin, use non-interactive
@@ -117,6 +134,34 @@ Claude Code; set `CLAUDE_AWS_REGION` only when it should differ from
 `CLAUDE_AWS_PROFILE=sigiq`; the launcher does not inherit a process-wide
 `AWS_PROFILE` for Claude.
 Claude job results are captured from stdout.
+
+## Relay Chat
+
+Relay discovers available models at runtime with:
+
+```text
+GET /v1/codex/models
+```
+
+Each entry declares `id`, `label`, `provider`, and supported `modes`. Chat
+mode uses providers `bedrock` and `azure`; Task mode continues to use the
+existing async job providers `codex` and `claude`.
+
+Synchronous chat streams from:
+
+```text
+POST /v1/codex/chat
+```
+
+Request bodies include `provider`, `model`, optional `threadId`, `messages`,
+and `options`. Responses are `text/event-stream` with `meta`, `delta`, `usage`,
+`done`, and `error` events. Chat threads are saved under the Codex API data
+directory and appear in `GET /v1/codex/threads` with `mode: "chat"`.
+
+Bedrock chat refuses to start unless `CLAUDE_AWS_PROFILE=sigiq` is configured,
+loads that profile explicitly, and strips ambient AWS credentials from the
+credential export path. Azure chat uses only server-side `AZURE_OPENAI_*`
+values from `/etc/codex-api.env`.
 
 ## Workspaces
 

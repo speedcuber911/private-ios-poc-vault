@@ -55,7 +55,7 @@ first.
 ## Never Commit
 
 - `.p12`, `.pem`, `.key`, `.crt`, `.csr`, `.mobileconfig`
-- OpenAI API keys or copied Codex auth JSON
+- OpenAI API keys, Azure OpenAI API keys, or copied Codex auth JSON
 - AWS credentials
 - SSH private keys
 - client CA private keys

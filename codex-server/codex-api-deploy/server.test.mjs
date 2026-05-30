@@ -52,6 +52,7 @@ async function startServer(env) {
       CODEX_API_HOST: "127.0.0.1",
       CODEX_API_PORT: String(port),
       CLAUDE_CODE_USE_BEDROCK: "",
+      CLAUDE_AWS_PROFILE: "sigiq",
       CLAUDE_AWS_REGION: "",
       CLAUDE_DEFAULT_MODEL: "",
       CLAUDE_SONNET_MODEL: "",
@@ -72,6 +73,38 @@ async function startServer(env) {
       await new Promise((resolve) => child.once("exit", resolve));
     },
   };
+}
+
+async function startServerExpectExit(env) {
+  const port = await freePort();
+  const child = spawn(process.execPath, ["server.mjs"], {
+    cwd: path.dirname(new URL(import.meta.url).pathname),
+    env: {
+      ...process.env,
+      CODEX_API_HOST: "127.0.0.1",
+      CODEX_API_PORT: String(port),
+      CODEX_REQUIRE_MTLS: "false",
+      CODEX_DATA_DIR: await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-data-")),
+      ...env,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+
+  const exit = await new Promise((resolve) => {
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+  });
+  return { ...exit, stdout, stderr };
 }
 
 async function waitForJob(baseUrl, jobId) {
@@ -158,6 +191,102 @@ async function startFakeCodexApi() {
 
   return {
     baseUrl: `http://127.0.0.1:${port}`,
+    requests,
+    async stop() {
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+}
+
+async function readSse(response) {
+  const events = [];
+  let currentEvent = "";
+  let currentData = "";
+  for await (const rawChunk of response.body) {
+    const chunk = Buffer.from(rawChunk).toString("utf8");
+    for (const line of chunk.split(/\r?\n/)) {
+      if (line === "") {
+        if (currentEvent) {
+          events.push({ event: currentEvent, data: JSON.parse(currentData || "{}") });
+        }
+        currentEvent = "";
+        currentData = "";
+      } else if (line.startsWith("event:")) {
+        currentEvent = line.slice(6).trim();
+      } else if (line.startsWith("data:")) {
+        currentData += line.slice(5).trim();
+      }
+    }
+  }
+  return events;
+}
+
+async function startFakeAzureOpenAI() {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString("utf8");
+      requests.push({ method: req.method, url: req.url, headers: req.headers, body });
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write('data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n');
+      res.write('data: {"choices":[{"delta":{"content":" from Azure"}}]}\n\n');
+      res.end("data: [DONE]\n\n");
+    });
+  });
+
+  const port = await freePort();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", resolve);
+  });
+
+  return {
+    endpoint: `http://127.0.0.1:${port}`,
+    requests,
+    async stop() {
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+}
+
+function awsEventStreamMessage(payload) {
+  const payloadBuffer = Buffer.from(JSON.stringify(payload), "utf8");
+  const totalLength = 12 + payloadBuffer.length + 4;
+  const buffer = Buffer.alloc(totalLength);
+  buffer.writeUInt32BE(totalLength, 0);
+  buffer.writeUInt32BE(0, 4);
+  buffer.writeUInt32BE(0, 8);
+  payloadBuffer.copy(buffer, 12);
+  buffer.writeUInt32BE(0, totalLength - 4);
+  return buffer;
+}
+
+async function startFakeBedrockRuntime() {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString("utf8");
+      requests.push({ method: req.method, url: req.url, headers: req.headers, body });
+      res.writeHead(200, { "content-type": "application/vnd.amazon.eventstream" });
+      res.write(awsEventStreamMessage({ contentBlockDelta: { delta: { text: "Hello" } } }));
+      res.write(awsEventStreamMessage({ contentBlockDelta: { delta: { text: " from Bedrock" } } }));
+      res.write(awsEventStreamMessage({ metadata: { usage: { inputTokens: 4, outputTokens: 6 } } }));
+      res.end(awsEventStreamMessage({ messageStop: { stopReason: "end_turn" } }));
+    });
+  });
+
+  const port = await freePort();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", resolve);
+  });
+
+  return {
+    endpoint: `http://127.0.0.1:${port}`,
     requests,
     async stop() {
       await new Promise((resolve) => server.close(resolve));
@@ -488,6 +617,9 @@ test("mTLS allowlist gates API routes while healthz remains public", async () =>
     const blocked = await fetch(`${server.baseUrl}/v1/codex/health`);
     assert.equal(blocked.status, 401);
 
+    const blockedModels = await fetch(`${server.baseUrl}/v1/codex/models`);
+    assert.equal(blockedModels.status, 401);
+
     const allowed = await fetch(`${server.baseUrl}/v1/codex/health`, {
       headers: {
         "X-SSL-Client-Verify": "SUCCESS",
@@ -495,7 +627,322 @@ test("mTLS allowlist gates API routes while healthz remains public", async () =>
       },
     });
     assert.equal(allowed.status, 200);
+
+    const allowedModels = await fetch(`${server.baseUrl}/v1/codex/models`, {
+      headers: {
+        "X-SSL-Client-Verify": "SUCCESS",
+        "X-SSL-Client-S-DN": "CN=allowed",
+      },
+    });
+    assert.equal(allowedModels.status, 200);
   } finally {
+    await server.stop();
+  }
+});
+
+test("refuses to start when Claude Bedrock profile is not SigiQ", async () => {
+  const result = await startServerExpectExit({
+    CLAUDE_AWS_PROFILE: "personal",
+  });
+
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /CLAUDE_AWS_PROFILE=sigiq/);
+});
+
+test("serves protected model catalog from server-side config", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  const catalog = [
+    {
+      id: "gpt-4o",
+      label: "GPT-4o (Azure)",
+      provider: "azure",
+      modes: ["chat"],
+      azureDeployment: "gpt-4o",
+      defaultOptions: { temperature: 0.25, maxTokens: 1234 },
+    },
+    {
+      id: "codex-cli",
+      label: "Codex CLI",
+      provider: "codex",
+      modes: ["task"],
+    },
+  ];
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_MODEL_CATALOG: JSON.stringify(catalog),
+  });
+  try {
+    const response = await fetch(`${server.baseUrl}/v1/codex/models`);
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.deepEqual(body.models, catalog);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("keeps OpenCode routing secrets out of the public model catalog", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  const apiKeyFile = path.join(tmpDir, "azure.key");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  await fs.writeFile(apiKeyFile, "super-secret-key");
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_MODEL_CATALOG: JSON.stringify([
+      {
+        id: "azure-padhai/kimi-k2.6",
+        label: "kimi-k2.6 (Azure Padhai)",
+        provider: "azure",
+        modes: ["chat"],
+        azureDeployment: "kimi-k2.6",
+        azureBaseURL: "https://padhai.example.com/openai/v1",
+        azureApiKeyFile: apiKeyFile,
+      },
+    ]),
+  });
+  try {
+    const response = await fetch(`${server.baseUrl}/v1/codex/models`);
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.deepEqual(body.models, [
+      {
+        id: "azure-padhai/kimi-k2.6",
+        label: "kimi-k2.6 (Azure Padhai)",
+        provider: "azure",
+        modes: ["chat"],
+        azureDeployment: "kimi-k2.6",
+      },
+    ]);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("streams Azure chat over SSE and exposes persisted chat thread history", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  const azure = await startFakeAzureOpenAI();
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_MODEL_CATALOG: JSON.stringify([
+      {
+        id: "gpt-4o",
+        label: "GPT-4o (Azure)",
+        provider: "azure",
+        modes: ["chat"],
+        azureDeployment: "gpt-4o",
+      },
+    ]),
+    AZURE_OPENAI_ENDPOINT: azure.endpoint,
+    AZURE_OPENAI_API_KEY: "azure-test-key",
+    AZURE_OPENAI_API_VERSION: "2025-01-01-preview",
+  });
+  try {
+    const response = await fetch(`${server.baseUrl}/v1/codex/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "text/event-stream" },
+      body: JSON.stringify({
+        provider: "azure",
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "say hello" }],
+        options: { temperature: 0.2, maxTokens: 64 },
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type") || "", /text\/event-stream/);
+    const events = await readSse(response);
+    assert.deepEqual(events.map((entry) => entry.event), ["meta", "delta", "delta", "done"]);
+    assert.match(events[0].data.threadId, /^[a-f0-9-]{36}$/);
+    assert.equal(events[0].data.provider, "azure");
+    assert.equal(events[1].data.text, "Hello");
+    assert.equal(events[2].data.text, " from Azure");
+
+    assert.equal(azure.requests.length, 1);
+    assert.match(azure.requests[0].url, /^\/openai\/deployments\/gpt-4o\/chat\/completions\?api-version=2025-01-01-preview$/);
+    assert.equal(azure.requests[0].headers["api-key"], "azure-test-key");
+    assert.deepEqual(JSON.parse(azure.requests[0].body).messages, [{ role: "user", content: "say hello" }]);
+
+    const threads = await fetch(`${server.baseUrl}/v1/codex/threads?provider=azure&limit=5`);
+    assert.equal(threads.status, 200);
+    const threadBody = await threads.json();
+    assert.equal(threadBody.threads.length, 1);
+    assert.equal(threadBody.threads[0].mode, "chat");
+    assert.equal(threadBody.threads[0].provider, "azure");
+    assert.equal(threadBody.threads[0].lastPrompt, "say hello");
+    assert.equal(threadBody.threads[0].lastResult, "Hello from Azure");
+
+    const detail = await fetch(`${server.baseUrl}/v1/codex/threads/${events[0].data.threadId}?provider=azure`);
+    assert.equal(detail.status, 200);
+    const detailBody = await detail.json();
+    assert.equal(detailBody.thread.mode, "chat");
+    assert.deepEqual(
+      detailBody.messages.map((message) => ({ role: message.role, text: message.text })),
+      [
+        { role: "user", text: "say hello" },
+        { role: "assistant", text: "Hello from Azure" },
+      ],
+    );
+
+    const followUpResponse = await fetch(`${server.baseUrl}/v1/codex/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "text/event-stream" },
+      body: JSON.stringify({
+        provider: "azure",
+        model: "gpt-4o",
+        threadId: events[0].data.threadId,
+        messages: [
+          { role: "user", content: "say hello" },
+          { role: "assistant", content: "Hello from Azure" },
+          { role: "user", content: "say it again" },
+        ],
+      }),
+    });
+    assert.equal(followUpResponse.status, 200);
+    await readSse(followUpResponse);
+    assert.deepEqual(JSON.parse(azure.requests[1].body).messages, [
+      { role: "user", content: "say hello" },
+      { role: "assistant", content: "Hello from Azure" },
+      { role: "user", content: "say it again" },
+    ]);
+
+    const followUpDetail = await fetch(`${server.baseUrl}/v1/codex/threads/${events[0].data.threadId}?provider=azure`);
+    assert.equal(followUpDetail.status, 200);
+    const followUpDetailBody = await followUpDetail.json();
+    assert.deepEqual(
+      followUpDetailBody.messages.map((message) => ({ role: message.role, text: message.text })),
+      [
+        { role: "user", text: "say hello" },
+        { role: "assistant", text: "Hello from Azure" },
+        { role: "user", text: "say it again" },
+        { role: "assistant", text: "Hello from Azure" },
+      ],
+    );
+  } finally {
+    await azure.stop();
+    await server.stop();
+  }
+});
+
+test("streams OpenCode Azure-compatible catalog entries with per-model key files", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  const apiKeyFile = path.join(tmpDir, "azure.key");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  await fs.writeFile(apiKeyFile, "opencode-azure-key\n");
+  const azure = await startFakeAzureOpenAI();
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_MODEL_CATALOG: JSON.stringify([
+      {
+        id: "azure-padhai/kimi-k2.6",
+        label: "kimi-k2.6 (Azure Padhai)",
+        provider: "azure",
+        modes: ["chat"],
+        azureDeployment: "kimi-k2.6",
+        azureBaseURL: azure.endpoint,
+        azureApiKeyFile: apiKeyFile,
+      },
+    ]),
+  });
+  try {
+    const response = await fetch(`${server.baseUrl}/v1/codex/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "text/event-stream" },
+      body: JSON.stringify({
+        provider: "azure",
+        model: "azure-padhai/kimi-k2.6",
+        messages: [{ role: "user", content: "say hello" }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const events = await readSse(response);
+    assert.deepEqual(events.map((entry) => entry.event), ["meta", "delta", "delta", "done"]);
+    assert.equal(azure.requests.length, 1);
+    assert.equal(azure.requests[0].url, "/chat/completions");
+    assert.equal(azure.requests[0].headers["api-key"], "opencode-azure-key");
+    const upstreamBody = JSON.parse(azure.requests[0].body);
+    assert.equal(upstreamBody.model, "kimi-k2.6");
+    assert.deepEqual(upstreamBody.messages, [{ role: "user", content: "say hello" }]);
+  } finally {
+    await azure.stop();
+    await server.stop();
+  }
+});
+
+test("streams Bedrock chat with SigiQ profile credentials despite ambient AWS env", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  const credentialsFile = path.join(tmpDir, "credentials");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  await fs.writeFile(
+    credentialsFile,
+    [
+      "[sigiq]",
+      "aws_access_key_id=AKIASIGIQTEST",
+      "aws_secret_access_key=sigiq-secret-test",
+      "aws_session_token=sigiq-session-token",
+      "",
+      "[personal]",
+      "aws_access_key_id=AKIAPERSONAL",
+      "aws_secret_access_key=personal-secret",
+      "",
+    ].join("\n"),
+  );
+  const bedrock = await startFakeBedrockRuntime();
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_MODEL_CATALOG: JSON.stringify([
+      {
+        id: "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        label: "Claude 3.5 Sonnet (Bedrock)",
+        provider: "bedrock",
+        modes: ["chat"],
+      },
+    ]),
+    BEDROCK_RUNTIME_ENDPOINT: bedrock.endpoint,
+    BEDROCK_REGION: "us-east-1",
+    AWS_SHARED_CREDENTIALS_FILE: credentialsFile,
+    AWS_PROFILE: "personal",
+    AWS_ACCESS_KEY_ID: "AKIAAMBIENT",
+    AWS_SECRET_ACCESS_KEY: "ambient-secret",
+  });
+  try {
+    const response = await fetch(`${server.baseUrl}/v1/codex/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "text/event-stream" },
+      body: JSON.stringify({
+        provider: "bedrock",
+        model: "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        messages: [{ role: "user", content: "say hello" }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const events = await readSse(response);
+    assert.deepEqual(events.map((entry) => entry.event), ["meta", "delta", "delta", "usage", "done"]);
+    assert.equal(events[1].data.text, "Hello");
+    assert.equal(events[2].data.text, " from Bedrock");
+
+    assert.equal(bedrock.requests.length, 1);
+    assert.match(bedrock.requests[0].url, /^\/model\/anthropic\.claude-3-5-sonnet-20241022-v2%3A0\/converse-stream$/);
+    assert.match(bedrock.requests[0].headers.authorization, /Credential=AKIASIGIQTEST\//);
+    assert.doesNotMatch(bedrock.requests[0].headers.authorization, /AKIAAMBIENT|AKIAPERSONAL/);
+    assert.equal(bedrock.requests[0].headers["x-amz-security-token"], "sigiq-session-token");
+  } finally {
+    await bedrock.stop();
     await server.stop();
   }
 });

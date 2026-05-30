@@ -33,8 +33,13 @@ CODEX_BIN=/usr/bin/codex
 CLAUDE_BIN=/usr/bin/claude
 CLAUDE_CODE_USE_BEDROCK=
 CLAUDE_AWS_PROFILE=sigiq
+BEDROCK_REGION=us-east-1
 AWS_REGION=
 AWS_DEFAULT_REGION=
+CODEX_MODEL_CATALOG='[...]'
+AZURE_OPENAI_ENDPOINT=
+AZURE_OPENAI_API_KEY=
+AZURE_OPENAI_API_VERSION=2025-01-01-preview
 CODEX_DANGEROUS_MODE=true
 CODEX_MAX_CONCURRENT=1
 CODEX_MAX_BODY_BYTES=31457280
@@ -87,6 +92,23 @@ On the EC2 host, `ops/install-codex-api.sh` renders and installs those files to
 
 ## Providers And Resumable Sessions
 
+`GET /v1/codex/models` returns the protected model catalog used by Relay. The
+catalog comes from `CODEX_MODEL_CATALOG` in `/etc/codex-api.env`; keep it
+server-side so the iOS app never ships model ids in the binary.
+
+By default, `ops/render-codex-api-config` derives `CODEX_MODEL_CATALOG` from
+`OPENCODE_CONFIG_PATH` (`~/.config/opencode/opencode.jsonc`) when that file is
+available. Azure OpenCode model ids are exposed as `provider/model` so duplicate
+deployment names from different Azure resources remain selectable in Relay. The
+public catalog omits internal routing fields such as API key file paths, Azure
+base URLs, and Bedrock regions.
+
+`POST /v1/codex/chat` streams synchronous chat as SSE. It supports `bedrock`
+and `azure` catalog entries whose `modes` include `chat`, and emits `meta`,
+`delta`, `usage`, `done`, and `error` events. Chat threads are persisted under
+the Codex API data directory and surface through `GET /v1/codex/threads` with
+`mode: "chat"`.
+
 `POST /v1/codex/jobs` accepts optional `provider`. Supported values are
 `codex` and `claude`; omitted provider defaults to `codex`. All job responses
 include the persisted provider.
@@ -103,10 +125,14 @@ Claude jobs must use the SigiQ AWS profile; the launcher does not inherit a
 process-wide `AWS_PROFILE` for Claude.
 `CLAUDE_AWS_REGION` can override the Claude runner region; otherwise the
 launcher preserves `AWS_REGION` / `AWS_DEFAULT_REGION` for Claude Code.
+Bedrock chat uses `BEDROCK_REGION` and explicitly loads the `sigiq` profile;
+Azure chat uses only `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, and
+`AZURE_OPENAI_API_VERSION` from server-side env.
 
 `GET /v1/codex/jobs`, `GET /v1/codex/sessions`,
 `GET /v1/codex/threads`, and `GET /v1/codex/threads/<sessionId>` accept optional
-`provider=codex|claude` filters.
+provider filters. Jobs remain `provider=codex|claude`; thread filters also
+accept `provider=bedrock|azure` for chat threads.
 
 `GET /v1/codex/sessions` returns metadata only: Codex session files whose saved
 `cwd` is inside a registered workspace, plus provider sessions discovered from
