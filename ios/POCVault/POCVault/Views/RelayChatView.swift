@@ -1029,229 +1029,310 @@ private struct RelayThreadDrawer: View {
     }
 }
 
+/// Unified folder browser for picking the task workspace.
+///
+/// Mental model: you are always navigating a folder tree rooted at the workspace root.
+/// Tapping a folder row drills INTO it (never dismisses). A persistent primary button
+/// selects whichever folder you are currently in. Registered workspaces also expose a
+/// per-row quick-pick so you can choose one without navigating. Create-new is inline.
 private struct RelayWorkspaceSheet: View {
     @ObservedObject var viewModel: RelayChatViewModel
     @Environment(\.dismiss) private var dismiss
-    @State private var browsing = false
     @State private var creatingName = ""
     @State private var showCreateField = false
+    @FocusState private var createFieldFocused: Bool
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(spacing: 16) {
-                    if let error = viewModel.workspaceActionError {
-                        Text(error)
-                            .font(AppTheme.uiFont(size: 12))
-                            .foregroundStyle(AppTheme.statusError)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-
-                    if browsing {
-                        browseSection
-                    } else {
-                        workspacesSection
-                    }
-                }
-                .padding(16)
+            VStack(spacing: 0) {
+                breadcrumb
+                Divider().overlay(AppTheme.glassStroke)
+                folderList
+                confirmBar
             }
             .background(AppTheme.canvasGradient.ignoresSafeArea())
-            .navigationTitle("Workspace")
+            .navigationTitle("Choose workspace")
             .navigationBarTitleDisplayMode(.inline)
-            .task {
-                #if DEBUG
-                if ProcessInfo.processInfo.environment["RELAY_UITEST_OPEN"] == "workspace-browse" {
-                    browsing = true
-                    await viewModel.loadWorkspaceDirectories()
-                }
-                #endif
-            }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button(browsing ? "Workspaces" : "Browse") {
-                        browsing.toggle()
-                        if browsing { Task { await viewModel.loadWorkspaceDirectories() } }
-                    }
-                    .font(AppTheme.uiFont(size: 14, weight: .semibold))
-                    .foregroundStyle(AppTheme.accent)
+                    Button("Done") { dismiss() }
+                        .font(AppTheme.uiFont(size: 14, weight: .semibold))
+                        .foregroundStyle(AppTheme.accent)
                 }
+            }
+            .task {
+                #if DEBUG
+                // Visual-test deep link to a starting folder, e.g. RELAY_UITEST_WS_PATH=/srv/codex-workspaces/sigiq
+                if let start = ProcessInfo.processInfo.environment["RELAY_UITEST_WS_PATH"], !start.isEmpty {
+                    await viewModel.loadWorkspaceDirectories(path: start)
+                    return
+                }
+                #endif
+                await viewModel.loadWorkspaceDirectories()
             }
             .preferredColorScheme(.dark)
         }
     }
 
-    // MARK: registered workspaces (cards)
+    private var listing: CodexWorkspaceDirectoryListing? { viewModel.directoryListing }
 
-    private var workspacesSection: some View {
-        VStack(spacing: 11) {
-            ForEach(viewModel.workspaces) { workspace in
+    // MARK: breadcrumb / current location
+
+    private var breadcrumb: some View {
+        HStack(spacing: 8) {
+            if let up = listing?.upNavigationPath {
                 Button {
                     UISelectionFeedbackGenerator().selectionChanged()
-                    viewModel.selectWorkspace(workspace)
-                    dismiss()
+                    Task { await viewModel.loadWorkspaceDirectories(path: up) }
                 } label: {
-                    RelayWorkspaceCard(
-                        icon: "folder.fill",
-                        title: workspace.name,
-                        subtitle: workspace.detailText,
-                        isDefault: workspace.isDefault,
-                        isSelected: viewModel.selectedWorkspaceID == workspace.id,
-                        trailing: nil
-                    )
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(AppTheme.accent)
+                        .frame(width: 32, height: 32)
+                        .background(AppTheme.bgSurfaceHi, in: Circle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Up one level")
             }
+
+            Image(systemName: "folder.fill")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(AppTheme.accent)
+            Text(currentLocationText)
+                .font(AppTheme.monoFont(size: 12))
+                .foregroundStyle(AppTheme.textSecondary)
+                .lineLimit(1)
+                .truncationMode(.head)
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
+    private var currentLocationText: String {
+        guard let listing else { return "…" }
+        let rel = listing.displayPath.trimmingCharacters(in: .whitespaces)
+        return rel.isEmpty ? "All workspaces" : rel
+    }
+
+    // MARK: folder list
+
+    private var folderList: some View {
+        ScrollView {
+            LazyVStack(spacing: 10) {
+                if let error = viewModel.workspaceActionError {
+                    RelayStatusBanner(text: error)
+                }
+
+                if let listing {
+                    if listing.entries.isEmpty {
+                        Text("No subfolders here.")
+                            .font(AppTheme.uiFont(size: 13))
+                            .foregroundStyle(AppTheme.textTertiary)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .padding(.top, 28)
+                    }
+                    ForEach(listing.entries) { entry in
+                        RelayFolderRow(
+                            entry: entry,
+                            isCurrentSelection: isSelected(entry),
+                            onOpen: {
+                                UISelectionFeedbackGenerator().selectionChanged()
+                                Task { await viewModel.loadWorkspaceDirectories(path: entry.path) }
+                            },
+                            onQuickPick: entry.isRegistered ? {
+                                UINotificationFeedbackGenerator().notificationOccurred(.success)
+                                Task {
+                                    await viewModel.selectBrowsedDirectory(path: entry.path)
+                                    dismiss()
+                                }
+                            } : nil
+                        )
+                    }
+                    createRow(parentPath: listing.currentPath)
+                } else if viewModel.isBrowsingDirectories {
+                    ProgressView().tint(AppTheme.accent).padding(.top, 44)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
         }
     }
 
-    // MARK: browse subfolders + create
-
-    private var browseSection: some View {
-        VStack(spacing: 11) {
-            if let listing = viewModel.directoryListing {
-                HStack(spacing: 8) {
-                    Image(systemName: "folder")
-                        .foregroundStyle(AppTheme.textSecondary)
-                    Text(listing.displayPath)
-                        .font(AppTheme.monoFont(size: 12))
-                        .foregroundStyle(AppTheme.textSecondary)
-                        .lineLimit(1)
-                    Spacer()
-                }
-                .padding(.bottom, 2)
-
-                if let up = listing.upNavigationPath {
-                    Button {
-                        Task { await viewModel.loadWorkspaceDirectories(path: up) }
-                    } label: {
-                        RelayWorkspaceCard(icon: "arrow.up.left", title: "Up one level", subtitle: nil, isDefault: false, isSelected: false, trailing: nil)
-                    }
-                    .buttonStyle(.plain)
-                }
-
-                // Use the current directory itself as the workspace.
-                Button {
-                    Task {
-                        await viewModel.selectBrowsedDirectory(path: listing.currentPath)
-                        dismiss()
-                    }
-                } label: {
-                    RelayWorkspaceCard(icon: "checkmark.circle.fill", title: "Use this folder", subtitle: listing.displayPath, isDefault: false, isSelected: false, trailing: nil)
-                }
-                .buttonStyle(.plain)
-
-                ForEach(listing.entries) { entry in
-                    Button {
-                        Task { await viewModel.loadWorkspaceDirectories(path: entry.path) }
-                    } label: {
-                        RelayWorkspaceCard(
-                            icon: entry.hasGit ? "arrow.triangle.branch" : "folder.fill",
-                            title: entry.displayName,
-                            subtitle: entry.isRegistered ? "Registered workspace" : entry.detailText,
-                            isDefault: false,
-                            isSelected: false,
-                            trailing: "chevron.right"
-                        )
-                    }
-                    .buttonStyle(.plain)
-                }
-
-                createRow(parentPath: listing.currentPath)
-            } else if viewModel.isBrowsingDirectories {
-                ProgressView().tint(AppTheme.accent).padding(.top, 40)
-            }
-        }
+    private func isSelected(_ entry: CodexWorkspaceDirectoryEntry) -> Bool {
+        if let id = entry.workspaceId { return viewModel.selectedWorkspaceID == id }
+        return false
     }
 
     @ViewBuilder private func createRow(parentPath: String) -> some View {
         if showCreateField {
             HStack(spacing: 8) {
+                Image(systemName: "folder.badge.plus")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(AppTheme.accent)
+                    .frame(width: 40, height: 40)
+                    .background(AppTheme.accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
                 TextField("New folder name", text: $creatingName)
                     .font(AppTheme.uiFont(size: 14))
                     .textFieldStyle(.plain)
                     .foregroundStyle(AppTheme.textPrimary)
-                    .padding(.horizontal, 12)
-                    .frame(height: 40)
-                    .background(AppTheme.bgSurfaceHi, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                Button {
-                    Task {
-                        await viewModel.createWorkspace(parentPath: parentPath, name: creatingName)
-                        creatingName = ""
-                        showCreateField = false
-                    }
-                } label: {
+                    .focused($createFieldFocused)
+                    .submitLabel(.done)
+                    .onSubmit { submitCreate(parentPath: parentPath) }
+                Button { submitCreate(parentPath: parentPath) } label: {
                     Image(systemName: "checkmark")
                         .font(.system(size: 15, weight: .bold))
                         .foregroundStyle(.white)
-                        .frame(width: 40, height: 40)
-                        .background(AppTheme.accentGradient, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .frame(width: 36, height: 36)
+                        .background(AppTheme.accentGradient, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
                 }
                 .buttonStyle(.plain)
                 .disabled(creatingName.trimmingCharacters(in: .whitespaces).isEmpty)
             }
+            .padding(10)
+            .background(AppTheme.bgSurfaceHi, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         } else {
             Button {
                 withAnimation { showCreateField = true }
+                createFieldFocused = true
             } label: {
-                RelayWorkspaceCard(icon: "plus", title: "New workspace", subtitle: "Create a folder here", isDefault: false, isSelected: false, trailing: nil, accent: true)
+                HStack(spacing: 13) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundStyle(AppTheme.accent)
+                        .frame(width: 40, height: 40)
+                        .background(AppTheme.accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                    Text("New folder here")
+                        .font(AppTheme.uiFont(size: 15, weight: .medium))
+                        .foregroundStyle(AppTheme.accent)
+                    Spacer()
+                }
+                .padding(.vertical, 4)
             }
             .buttonStyle(.plain)
         }
     }
-}
 
-private struct RelayWorkspaceCard: View {
-    let icon: String
-    let title: String
-    let subtitle: String?
-    let isDefault: Bool
-    let isSelected: Bool
-    let trailing: String?
-    var accent: Bool = false
+    private func submitCreate(parentPath: String) {
+        let name = creatingName
+        guard !name.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        Task {
+            await viewModel.createWorkspace(parentPath: parentPath, name: name)
+            creatingName = ""
+            showCreateField = false
+        }
+    }
 
-    var body: some View {
-        HStack(spacing: 13) {
-            Image(systemName: icon)
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(accent || isSelected ? .white : AppTheme.accent)
-                .frame(width: 40, height: 40)
-                .background(
-                    (accent || isSelected) ? AnyShapeStyle(AppTheme.accentGradient) : AnyShapeStyle(AppTheme.accent.opacity(0.14)),
-                    in: RoundedRectangle(cornerRadius: 11, style: .continuous)
-                )
+    // MARK: confirm bar
 
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
-                    Text(title)
-                        .font(AppTheme.uiFont(size: 15, weight: .semibold))
-                        .foregroundStyle(AppTheme.textPrimary)
-                    if isDefault {
-                        Text("Default")
-                            .font(AppTheme.uiFont(size: 9, weight: .bold))
-                            .foregroundStyle(AppTheme.accent)
-                            .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(AppTheme.accent.opacity(0.15), in: Capsule())
-                    }
+    private var confirmBar: some View {
+        VStack(spacing: 0) {
+            Divider().overlay(AppTheme.glassStroke)
+            Button {
+                guard let listing else { return }
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+                Task {
+                    await viewModel.selectBrowsedDirectory(path: listing.currentPath)
+                    dismiss()
                 }
-                if let subtitle, !subtitle.isEmpty {
-                    Text(subtitle)
-                        .font(AppTheme.monoFont(size: 11))
-                        .foregroundStyle(AppTheme.textSecondary)
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 16, weight: .bold))
+                    Text(confirmTitle)
+                        .font(AppTheme.uiFont(size: 16, weight: .semibold))
                         .lineLimit(1)
                 }
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .frame(height: 52)
+                .background(canConfirm ? AnyShapeStyle(AppTheme.accentGradient) : AnyShapeStyle(AppTheme.bgSurface))
+                .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+                .shadow(color: canConfirm ? AppTheme.accent.opacity(0.45) : .clear, radius: 10, y: 4)
             }
-            Spacer(minLength: 6)
-            if isSelected {
+            .buttonStyle(.plain)
+            .disabled(!canConfirm)
+            .padding(16)
+        }
+        .background(.ultraThinMaterial)
+    }
+
+    /// You can't select the synthetic root ("All workspaces") — only a real folder.
+    private var canConfirm: Bool {
+        guard let listing else { return false }
+        return listing.currentPath != listing.rootPath
+    }
+
+    private var confirmTitle: String {
+        guard let listing, canConfirm else { return "Open a folder to select it" }
+        let name = URL(fileURLWithPath: listing.currentPath).lastPathComponent
+        return "Use “\(name)” as workspace"
+    }
+}
+
+/// A single folder row in the workspace browser. The whole row drills in; registered
+/// workspaces show a quick-pick checkmark on the trailing edge.
+private struct RelayFolderRow: View {
+    let entry: CodexWorkspaceDirectoryEntry
+    let isCurrentSelection: Bool
+    let onOpen: () -> Void
+    let onQuickPick: (() -> Void)?
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Button(action: onOpen) {
+                HStack(spacing: 13) {
+                    Image(systemName: entry.hasGit ? "arrow.triangle.branch" : "folder.fill")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(isCurrentSelection ? .white : AppTheme.accent)
+                        .frame(width: 40, height: 40)
+                        .background(
+                            isCurrentSelection ? AnyShapeStyle(AppTheme.accentGradient) : AnyShapeStyle(AppTheme.accent.opacity(0.14)),
+                            in: RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        )
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 6) {
+                            Text(entry.displayName)
+                                .font(AppTheme.uiFont(size: 15, weight: .semibold))
+                                .foregroundStyle(AppTheme.textPrimary)
+                                .lineLimit(1)
+                            if entry.isRegistered {
+                                Text("Workspace")
+                                    .font(AppTheme.uiFont(size: 9, weight: .bold))
+                                    .foregroundStyle(AppTheme.accent)
+                                    .padding(.horizontal, 6).padding(.vertical, 2)
+                                    .background(AppTheme.accent.opacity(0.15), in: Capsule())
+                            }
+                        }
+                        Text(entry.hasGit ? "Git repository" : "Folder")
+                            .font(AppTheme.uiFont(size: 11))
+                            .foregroundStyle(AppTheme.textTertiary)
+                    }
+                    Spacer(minLength: 6)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isCurrentSelection {
                 Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 18))
+                    .font(.system(size: 20))
                     .foregroundStyle(AppTheme.accent)
-            } else if let trailing {
-                Image(systemName: trailing)
+            } else if let onQuickPick {
+                Button(action: onQuickPick) {
+                    Image(systemName: "circle")
+                        .font(.system(size: 20))
+                        .foregroundStyle(AppTheme.textTertiary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Select \(entry.displayName)")
+            } else {
+                Image(systemName: "chevron.right")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(AppTheme.textTertiary)
             }
         }
-        .padding(13)
+        .padding(12)
         .background {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .fill(AppTheme.bgSurfaceHi)
@@ -1259,7 +1340,7 @@ private struct RelayWorkspaceCard: View {
         }
         .overlay {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(isSelected ? AppTheme.accent.opacity(0.6) : AppTheme.glassStroke, lineWidth: isSelected ? 1.2 : 0.7)
+                .stroke(isCurrentSelection ? AppTheme.accent.opacity(0.6) : AppTheme.glassStroke, lineWidth: isCurrentSelection ? 1.2 : 0.7)
         }
     }
 }

@@ -149,27 +149,53 @@ gradient send/stop buttons, and a centered gradient-icon empty state.
 
 ---
 
-## 5. Reimagined workspace selection (Task tab)
+## 5. Workspace selection — unified folder browser (Task tab)
 
-Previously a plain checkmark list hidden behind a slider icon. Now:
+The Task tab needs you to pick which workspace folder a job runs in.
 
-- **Visible composer chip** — the active workspace shows as a chip
-  (`📁 <name> ⇕`) next to the model chip in the Task composer. Tapping it opens the
-  picker. This removes the discoverability problem.
-- **Card picker** (`RelayWorkspaceSheet` + `RelayWorkspaceCard`) — each workspace is a
-  card with a gradient folder icon, name, mono path, a **Default** badge, and a
-  selected state (accent border + checkmark).
-- **Browse** — a toggle switches to a directory browser backed by
-  `GET /v1/codex/workspace-dirs`. The root lists registered workspaces; tapping a
-  folder navigates into it; "Up one level" and "Use this folder" actions let you pick
-  any directory under the workspace root as the active workspace
-  (`POST /v1/codex/workspaces/select`).
-- **Create** — a "New workspace" action creates a folder under the current path
-  (`POST /v1/codex/workspaces/create`) and selects it.
+### Why it was redesigned
+
+The first cut had two problems that made it confusing: it split "registered
+workspaces" (a card list) from "browse" (a separate toolbar-toggled mode), and tapping
+a workspace card both **selected and dismissed** the sheet — so there was no way to
+drill into a workspace's subfolders. Selecting and navigating were conflated.
+
+### The model now
+
+One unified folder browser (`RelayWorkspaceSheet` + `RelayFolderRow`). You are always
+navigating a folder tree rooted at the workspace root; **navigating and confirming are
+separate, unambiguous actions**:
+
+- **Tap a folder row → drills in.** The whole row opens that folder
+  (`loadWorkspaceDirectories(path:)`). It never dismisses the sheet.
+- **Breadcrumb + back chevron** at the top show the current location and navigate up
+  one level (`upNavigationPath`).
+- **Persistent confirm button** at the bottom — "Use "<folder>" as workspace" —
+  selects whichever folder you are currently in (`selectBrowsedDirectory(path:)`) and
+  closes. It is disabled at the synthetic root ("All workspaces"), since the root
+  itself can't be a workspace.
+- **Per-row quick-pick.** Registered workspaces (shown as the root entries, tagged
+  **Workspace**) carry a trailing quick-pick circle so you can select one instantly
+  without navigating into it. The currently selected workspace shows a filled checkmark
+  and an accent border instead.
+- **Inline create.** "New folder here" reveals a name field and creates a folder under
+  the current path (`createWorkspace(parentPath:name:)`), then selects it.
+- Git repositories get a branch icon and a "Git repository" subtitle; plain folders get
+  a folder icon and "Folder".
+
+The active workspace is still surfaced as a **chip in the Task composer**
+(`📁 <name> ⇕`) next to the model chip; tapping it opens this browser.
+
+All selection — registered, browsed-into, or newly created — funnels through
+`POST /v1/codex/workspaces/select`, which returns the canonical workspace and sets
+`selectedWorkspaceID`, so there is a single selection path.
 
 View model support (`RelayChatViewModel`): `directoryListing`,
 `isBrowsingDirectories`, `workspaceActionError`, `loadWorkspaceDirectories(path:)`,
 `selectBrowsedDirectory(path:)`, `createWorkspace(parentPath:name:)`, `upsertWorkspace`.
+
+> A `RELAY_UITEST_WS_PATH=<dir>` DEBUG env var deep-links the browser to a starting
+> folder for headless screenshots (see §7).
 
 ### What folders are shown (EC2)
 
@@ -216,7 +242,8 @@ launch so the streaming and workspace screens can be screenshotted with
 | `RELAY_UITEST_MODEL` | Selects the first chat model whose id/label contains the value. |
 | `RELAY_UITEST_PROMPT` | Fills the prompt and sends it on launch (Chat tab only). |
 | `RELAY_UITEST_TAB` | Selects a tab: `library`/`chat`/`task`/`status`. |
-| `RELAY_UITEST_OPEN` | `workspace` opens the workspace sheet; `workspace-browse` opens it in browse mode. |
+| `RELAY_UITEST_OPEN` | `workspace` opens the workspace folder browser on the Task tab. |
+| `RELAY_UITEST_WS_PATH` | Deep-links the workspace browser to a starting folder (e.g. `/srv/codex-workspaces/sigiq`). |
 
 Pass them through the simulator child environment, e.g.:
 
@@ -276,4 +303,4 @@ certificate stored in the device keychain.
 | Tabs | `ios/POCVault/POCVault/POCVaultApp.swift` |
 | Chat UX / views | `ios/POCVault/POCVault/Views/RelayChatView.swift`, `RelayChatViewModel.swift` |
 | Theme tokens | `ios/POCVault/POCVault/POCVaultApp.swift` (`AppTheme`) |
-| Workspace picker | `RelayChatView.swift` (`RelayWorkspaceSheet`, `RelayWorkspaceCard`), `RelayChatViewModel.swift` |
+| Workspace picker | `RelayChatView.swift` (`RelayWorkspaceSheet`, `RelayFolderRow`), `RelayChatViewModel.swift` |
