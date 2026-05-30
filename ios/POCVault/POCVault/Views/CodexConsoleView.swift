@@ -750,12 +750,18 @@ private struct CodexSessionSettingsSheet: View {
         CodexSettingsChoiceSection(
             symbol: "cpu",
             title: "Model",
-            value: viewModel.selectedModel
+            value: viewModel.selectedModel.trimmedNonEmpty ?? "Server default"
         ) {
             quickPillScroll {
-                ForEach(viewModel.modelOptions, id: \.self) { model in
-                    CodexSettingsPill(title: model, isSelected: model == viewModel.selectedModel) {
-                        viewModel.selectedModel = model
+                if viewModel.modelOptions.isEmpty {
+                    CodexSettingsPill(title: "Server default", isSelected: viewModel.selectedModel.trimmedNonEmpty == nil) {
+                        viewModel.selectedModel = ""
+                    }
+                } else {
+                    ForEach(viewModel.modelOptions, id: \.self) { model in
+                        CodexSettingsPill(title: model, isSelected: model == viewModel.selectedModel) {
+                            viewModel.selectedModel = model
+                        }
                     }
                 }
             }
@@ -1508,14 +1514,22 @@ private struct CodexControlStrip: View {
 
     private var modelMenu: some View {
         Menu {
-            ForEach(viewModel.modelOptions, id: \.self) { model in
+            if viewModel.modelOptions.isEmpty {
                 Button {
-                    viewModel.selectedModel = model
+                    viewModel.selectedModel = ""
                 } label: {
-                    if model == viewModel.selectedModel {
-                        Label(model, systemImage: "checkmark")
-                    } else {
-                        Text(model)
+                    Label("Server default", systemImage: viewModel.selectedModel.trimmedNonEmpty == nil ? "checkmark" : "server.rack")
+                }
+            } else {
+                ForEach(viewModel.modelOptions, id: \.self) { model in
+                    Button {
+                        viewModel.selectedModel = model
+                    } label: {
+                        if model == viewModel.selectedModel {
+                            Label(model, systemImage: "checkmark")
+                        } else {
+                            Text(model)
+                        }
                     }
                 }
             }
@@ -1523,7 +1537,7 @@ private struct CodexControlStrip: View {
             HStack(spacing: 8) {
                 Image(systemName: "cpu")
                     .font(.caption.weight(.bold))
-                Text(viewModel.selectedModel)
+                Text(viewModel.selectedModel.trimmedNonEmpty ?? "Server default")
                     .font(.caption.weight(.bold))
                     .lineLimit(1)
                     .minimumScaleFactor(0.76)
@@ -5266,7 +5280,7 @@ enum CodexMarkdownParser {
     }
 }
 
-private enum CodexInlineMarkdown {
+enum CodexInlineMarkdown {
     static func attributed(_ value: String) -> AttributedString {
         let options = AttributedString.MarkdownParsingOptions(
             interpretedSyntax: .inlineOnlyPreservingWhitespace

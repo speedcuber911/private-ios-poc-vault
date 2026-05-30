@@ -1009,7 +1009,7 @@ final class CodexConsoleViewModel: ObservableObject {
                     workspaceId: workspaceID,
                     prompt: prompt,
                     timeoutMs: timeoutMs,
-                    model: selectedModel,
+                    model: selectedModel.trimmedNonEmpty,
                     reasoningEffort: provider == .codex ? effectiveReasoningEffort.rawValue : nil,
                     provider: provider,
                     attachments: attachments,

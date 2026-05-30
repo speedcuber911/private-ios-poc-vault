@@ -4,6 +4,8 @@ import SwiftUI
 struct POCVaultApp: App {
     @StateObject private var identityStore: ClientIdentityStore
     @StateObject private var libraryViewModel: LibraryViewModel
+    @StateObject private var relayChatViewModel: RelayChatViewModel
+    @StateObject private var relayTaskViewModel: RelayChatViewModel
     @StateObject private var codexViewModel: CodexConsoleViewModel
     @StateObject private var claudeViewModel: CodexConsoleViewModel
     private let manifestClient: ManifestClient
@@ -26,6 +28,8 @@ struct POCVaultApp: App {
 
         _identityStore = StateObject(wrappedValue: identityStore)
         _libraryViewModel = StateObject(wrappedValue: LibraryViewModel(client: manifestClient))
+        _relayChatViewModel = StateObject(wrappedValue: RelayChatViewModel(client: codexClient, lockedMode: .chat))
+        _relayTaskViewModel = StateObject(wrappedValue: RelayChatViewModel(client: codexClient, lockedMode: .task))
         _codexViewModel = StateObject(wrappedValue: CodexConsoleViewModel(
             client: codexClient,
             provider: .codex,
@@ -44,6 +48,8 @@ struct POCVaultApp: App {
         WindowGroup {
             POCVaultRootView(
                 libraryViewModel: libraryViewModel,
+                relayChatViewModel: relayChatViewModel,
+                relayTaskViewModel: relayTaskViewModel,
                 codexViewModel: codexViewModel,
                 claudeViewModel: claudeViewModel,
                 identityStore: identityStore,
@@ -55,11 +61,13 @@ struct POCVaultApp: App {
 
 struct POCVaultRootView: View {
     @ObservedObject var libraryViewModel: LibraryViewModel
+    @ObservedObject var relayChatViewModel: RelayChatViewModel
+    @ObservedObject var relayTaskViewModel: RelayChatViewModel
     @ObservedObject var codexViewModel: CodexConsoleViewModel
     @ObservedObject var claudeViewModel: CodexConsoleViewModel
     @ObservedObject var identityStore: ClientIdentityStore
     let manifestClient: ManifestClient
-    @State private var selectedTab: RelayRootTab = .library
+    @State private var selectedTab: RelayRootTab = .chat
 
     var body: some View {
         TabView(selection: $selectedTab) {
@@ -73,16 +81,16 @@ struct POCVaultRootView: View {
                 Label(RelayRootTab.library.title, systemImage: RelayRootTab.library.symbol)
             }
 
-            CodexConsoleView(viewModel: codexViewModel, identityStore: identityStore)
-                .tag(RelayRootTab.codex)
+            RelayChatView(viewModel: relayChatViewModel)
+                .tag(RelayRootTab.chat)
                 .tabItem {
-                    Label(RelayRootTab.codex.title, systemImage: RelayRootTab.codex.symbol)
+                    Label(RelayRootTab.chat.title, systemImage: RelayRootTab.chat.symbol)
                 }
 
-            CodexConsoleView(viewModel: claudeViewModel, identityStore: identityStore)
-                .tag(RelayRootTab.claude)
+            RelayChatView(viewModel: relayTaskViewModel)
+                .tag(RelayRootTab.task)
                 .tabItem {
-                    Label(RelayRootTab.claude.title, systemImage: RelayRootTab.claude.symbol)
+                    Label(RelayRootTab.task.title, systemImage: RelayRootTab.task.symbol)
                 }
 
             CodexStatusView(
@@ -101,6 +109,15 @@ struct POCVaultRootView: View {
         .task {
             identityStore.importIdentityFromSetupEnvironmentIfNeeded()
         }
+        #if DEBUG
+        .task {
+            // Visual-test deep link: RELAY_UITEST_TAB=library|chat|task|status
+            if let tab = ProcessInfo.processInfo.environment["RELAY_UITEST_TAB"],
+               let match = RelayRootTab(rawValue: tab) {
+                selectedTab = match
+            }
+        }
+        #endif
         .task {
             guard shouldStartAgentMonitor else { return }
             await codexViewModel.monitorActiveWorkWhileAppIsOpen()
@@ -120,8 +137,8 @@ struct POCVaultRootView: View {
 
 private enum RelayRootTab: String, CaseIterable, Identifiable {
     case library
-    case codex
-    case claude
+    case chat
+    case task
     case status
 
     var id: String { rawValue }
@@ -130,10 +147,10 @@ private enum RelayRootTab: String, CaseIterable, Identifiable {
         switch self {
         case .library:
             return "Library"
-        case .codex:
-            return "Codex"
-        case .claude:
-            return "Claude"
+        case .chat:
+            return "Chat"
+        case .task:
+            return "Task"
         case .status:
             return "Status"
         }
@@ -143,10 +160,10 @@ private enum RelayRootTab: String, CaseIterable, Identifiable {
         switch self {
         case .library:
             return "square.grid.2x2"
-        case .codex:
-            return "terminal"
-        case .claude:
-            return "asterisk"
+        case .chat:
+            return "message"
+        case .task:
+            return "bolt.horizontal"
         case .status:
             return "waveform.path.ecg"
         }
@@ -160,6 +177,10 @@ extension CodexProvider {
             return "ChatGPTMark"
         case .claude:
             return "ClaudeMark"
+        case .bedrock:
+            return "ClaudeMark"
+        case .azure:
+            return "ChatGPTMark"
         }
     }
 
@@ -167,7 +188,7 @@ extension CodexProvider {
         switch self {
         case .codex:
             return AppTheme.textSecondary
-        case .claude:
+        case .claude, .bedrock, .azure:
             return AppTheme.accent
         }
     }
@@ -423,6 +444,8 @@ enum AppTheme {
     static let textTertiary = warmText.opacity(0.27)
     static let inactiveTab = warmText.opacity(0.38)
     static let accent = Color(hex: 0xD4804A)
+    static let accentBright = Color(hex: 0xE8965C)
+    static let accentDeep = Color(hex: 0xB5612F)
     static let statusOK = Color(hex: 0x32D74B)
     static let statusWarn = Color(hex: 0xFF9F0A)
     static let statusError = statusWarn
@@ -431,6 +454,34 @@ enum AppTheme {
 
     private static let warmText = Color(hex: 0xEDE8DF)
 
+    // Visual-leap tokens: gradients, glass, depth.
+    static let accentGradient = LinearGradient(
+        colors: [accentBright, accentDeep],
+        startPoint: .topLeading,
+        endPoint: .bottomTrailing
+    )
+    static let canvasGradient = LinearGradient(
+        colors: [Color(hex: 0x201E1B), Color(hex: 0x161513)],
+        startPoint: .top,
+        endPoint: .bottom
+    )
+    static let userBubbleGradient = LinearGradient(
+        colors: [accentBright, accentDeep],
+        startPoint: .topLeading,
+        endPoint: .bottomTrailing
+    )
+    /// Translucent surface for glassy cards (use over .ultraThinMaterial).
+    static let glassTint = warmText.opacity(0.04)
+    static let glassStroke = warmText.opacity(0.10)
+    static let shadowColor = Color.black.opacity(0.35)
+
+    static func uiFont(size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        Font.custom("DMSans-9ptRegular", size: size).weight(weight)
+    }
+
+    static func monoFont(size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        Font.custom("DMMono-Regular", size: size).weight(weight)
+    }
 }
 
 private extension Color {
