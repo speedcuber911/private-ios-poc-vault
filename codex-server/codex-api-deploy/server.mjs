@@ -1302,6 +1302,24 @@ async function streamAzureChat(res, chat, signal, replyChunks) {
   }
   const deployment = chat.catalogEntry.azureDeployment || chat.model;
   const url = azureChatUrl(chat.catalogEntry, deployment);
+  const body = {
+    model: deployment,
+    messages: chat.messages,
+    stream: true,
+  };
+  // GPT-5.x / o-series reasoning models reject `max_tokens` (require
+  // `max_completion_tokens`) and reject a non-default `temperature`. Send the
+  // reasoning-friendly shape for those and the classic shape for everyone else.
+  const maxTokens = chat.options.maxTokens ?? 4096;
+  if (isAzureReasoningModel(deployment)) {
+    body.max_completion_tokens = maxTokens;
+    if (chat.options.temperature !== undefined && chat.options.temperature !== 1) {
+      // Only the default temperature is allowed; drop a custom value rather than 400.
+    }
+  } else {
+    body.max_tokens = maxTokens;
+    body.temperature = chat.options.temperature ?? 0.7;
+  }
   const response = await fetch(url, {
     method: "POST",
     signal,
@@ -1309,16 +1327,11 @@ async function streamAzureChat(res, chat, signal, replyChunks) {
       "content-type": "application/json",
       "api-key": apiKey,
     },
-    body: JSON.stringify({
-      model: deployment,
-      messages: chat.messages,
-      stream: true,
-      temperature: chat.options.temperature ?? 0.7,
-      max_tokens: chat.options.maxTokens ?? 4096,
-    }),
+    body: JSON.stringify(body),
   });
   if (!response.ok || !response.body) {
-    throw new Error(`Azure OpenAI failed with HTTP ${response.status}`);
+    const detail = await safeReadErrorDetail(response);
+    throw new Error(`Azure OpenAI failed with HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
   }
 
   let buffer = "";
@@ -1344,6 +1357,32 @@ async function streamAzureChat(res, chat, signal, replyChunks) {
   }
   sendSse(res, "done", { stopReason: "stop" });
   return null;
+}
+
+// GPT-5.x and o-series models on Azure are reasoning models with a stricter request
+// contract (max_completion_tokens, default temperature only). Match by deployment id.
+function isAzureReasoningModel(deployment) {
+  const id = String(deployment || "").toLowerCase();
+  return /(^|[^a-z0-9])(gpt-?5|o[134](-|$)|o-series)/.test(id) || id.includes("gpt-5") || /\bo[0-9]\b/.test(id);
+}
+
+// Best-effort extraction of an upstream error message so failures are diagnosable
+// instead of a bare status code. Never throws.
+async function safeReadErrorDetail(response) {
+  try {
+    const text = await response.text();
+    if (!text) return "";
+    try {
+      const json = JSON.parse(text);
+      const message = json?.error?.message || json?.message;
+      if (message) return String(message).slice(0, 500);
+    } catch {
+      // not JSON; fall through to raw text
+    }
+    return text.replace(/\s+/g, " ").trim().slice(0, 500);
+  } catch {
+    return "";
+  }
 }
 
 function azureEndpointForModel(catalogEntry) {
