@@ -282,6 +282,9 @@ struct CodexModelDescriptor: Decodable, Hashable, Identifiable {
     let provider: CodexProvider
     let modes: [RelayInteractionMode]
     let azureDeployment: String?
+    /// The model id/alias to send to createJob for task entries (e.g. "opus", "gpt-5-codex").
+    /// nil means "let the runner use its default".
+    let taskModel: String?
     let defaultOptions: CodexModelOptions?
     let effortLevels: [String]
 
@@ -291,6 +294,7 @@ struct CodexModelDescriptor: Decodable, Hashable, Identifiable {
         case provider
         case modes
         case azureDeployment
+        case taskModel
         case defaultOptions
         case effortLevels
     }
@@ -302,6 +306,7 @@ struct CodexModelDescriptor: Decodable, Hashable, Identifiable {
         self.provider = try container.decode(CodexProvider.self, forKey: .provider)
         self.modes = (try container.decodeIfPresent([RelayInteractionMode].self, forKey: .modes)) ?? []
         self.azureDeployment = try container.decodeIfPresent(String.self, forKey: .azureDeployment)
+        self.taskModel = try container.decodeIfPresent(String.self, forKey: .taskModel)
         self.defaultOptions = try container.decodeIfPresent(CodexModelOptions.self, forKey: .defaultOptions)
         self.effortLevels = (try container.decodeIfPresent([String].self, forKey: .effortLevels)) ?? []
     }

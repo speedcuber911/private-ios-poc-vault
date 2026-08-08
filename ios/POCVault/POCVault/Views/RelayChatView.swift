@@ -31,11 +31,14 @@ struct RelayChatView: View {
                     mode: $viewModel.mode,
                     model: viewModel.selectedModel,
                     workspaceName: viewModel.selectedWorkspace?.name,
+                    efforts: viewModel.availableEfforts,
+                    selectedEffort: viewModel.effectiveEffort,
                     showsModeToggle: viewModel.lockedMode == nil,
                     isSending: viewModel.isSending,
                     isStreaming: viewModel.isStreaming,
                     isTranscribing: viewModel.isTranscribing,
                     onPickModel: { showingModels = true },
+                    onPickEffort: { viewModel.selectEffort($0) },
                     onOptions: { showingOptions = true },
                     onVoice: { fileURL in
                         Task { await viewModel.transcribePromptAudio(fileURL: fileURL) }
@@ -58,6 +61,11 @@ struct RelayChatView: View {
                     showingOptions = true
                 }
                 #endif
+            }
+            .task {
+                // Live job polling for the Task tab; cancelled automatically when the
+                // view leaves the screen. No-op on the Chat tab.
+                await viewModel.monitorActiveJobs()
             }
             .refreshable {
                 await viewModel.refreshThreads()
@@ -231,17 +239,46 @@ private struct RelayComposer: View {
     @Binding var mode: RelayInteractionMode
     let model: CodexModelDescriptor?
     let workspaceName: String?
+    let efforts: [CodexReasoningEffort]
+    let selectedEffort: CodexReasoningEffort?
     let showsModeToggle: Bool
     let isSending: Bool
     let isStreaming: Bool
     let isTranscribing: Bool
     let onPickModel: () -> Void
+    let onPickEffort: (CodexReasoningEffort) -> Void
     let onOptions: () -> Void
     let onVoice: (URL) -> Void
     let onSend: () -> Void
     let onStop: () -> Void
     @FocusState private var isFocused: Bool
     @StateObject private var recorder = RelayPromptAudioRecorder()
+
+    private func chip(icon: String, text: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) { chipLabel(icon: icon, text: text) }
+            .buttonStyle(.plain)
+    }
+
+    private func chipLabel(icon: String, text: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(AppTheme.accent)
+            Text(text)
+                .font(AppTheme.uiFont(size: 13, weight: .medium))
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Image(systemName: "chevron.up.chevron.down")
+                .font(AppTheme.uiFont(size: 9, weight: .semibold))
+                .foregroundStyle(AppTheme.textSecondary)
+        }
+        .foregroundStyle(AppTheme.textPrimary)
+        .padding(.horizontal, 12)
+        .frame(height: 34)
+        .frame(maxWidth: 200, alignment: .leading)
+        .fixedSize(horizontal: true, vertical: false)
+        .background(AppTheme.bgSurfaceHi, in: Capsule())
+    }
 
     var body: some View {
         VStack(spacing: 10) {
@@ -269,29 +306,6 @@ private struct RelayComposer: View {
                 }
                 .buttonStyle(.plain)
 
-                if mode == .task {
-                    Button(action: onOptions) {
-                        HStack(spacing: 6) {
-                            Image(systemName: "folder.fill")
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundStyle(AppTheme.accent)
-                            Text(workspaceName ?? "Workspace")
-                                .font(AppTheme.uiFont(size: 13, weight: .medium))
-                                .lineLimit(1)
-                            Image(systemName: "chevron.up.chevron.down")
-                                .font(AppTheme.uiFont(size: 9, weight: .semibold))
-                                .foregroundStyle(AppTheme.textSecondary)
-                        }
-                        .foregroundStyle(AppTheme.textPrimary)
-                        .padding(.horizontal, 12)
-                        .frame(height: 34)
-                        .frame(maxWidth: 170, alignment: .leading)
-                        .background(AppTheme.bgSurfaceHi, in: Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityIdentifier("relay-workspace-chip")
-                }
-
                 Spacer()
 
                 if showsModeToggle {
@@ -303,6 +317,36 @@ private struct RelayComposer: View {
                     .pickerStyle(.segmented)
                     .frame(width: 132)
                 }
+            }
+
+            // Task-only controls: workspace + reasoning effort. A plain bounded row (no
+            // horizontal ScrollView, which renders unbounded inside a safeAreaInset and
+            // blanks the screen on device). Chips truncate rather than scroll.
+            if mode == .task {
+                HStack(spacing: 8) {
+                    chip(icon: "folder.fill", text: workspaceName ?? "Workspace", action: onOptions)
+                        .accessibilityIdentifier("relay-workspace-chip")
+                        .layoutPriority(1)
+
+                    if !efforts.isEmpty {
+                        Menu {
+                            ForEach(efforts) { effort in
+                                Button {
+                                    onPickEffort(effort)
+                                } label: {
+                                    Label(effort.label, systemImage: selectedEffort == effort ? "checkmark" : "")
+                                }
+                            }
+                        } label: {
+                            chipLabel(icon: "gauge.with.dots.needle.50percent",
+                                      text: (selectedEffort ?? efforts.first(where: { $0 == .high }) ?? efforts.first)?.label ?? "Effort")
+                        }
+                        .accessibilityIdentifier("relay-effort-chip")
+                    }
+
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity)
             }
 
             HStack(alignment: .bottom, spacing: 9) {
@@ -822,11 +866,25 @@ private struct RelayJobCard: View {
             }
 
             if let text = job.displayOutput?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
-                Text(text)
-                    .font(AppTheme.monoFont(size: 12))
-                    .foregroundStyle(AppTheme.textPrimary)
-                    .lineLimit(12)
-                    .textSelection(.enabled)
+                if job.status.isActive {
+                    // While running, show raw streaming logs in mono (it's progress output).
+                    Text(text)
+                        .font(AppTheme.monoFont(size: 12))
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .lineLimit(10)
+                        .textSelection(.enabled)
+                } else {
+                    // Final result: render markdown like chat replies (bold, code, lists).
+                    RelayMarkdownText(text: text, userAligned: false)
+                }
+            } else if job.status.isActive {
+                // No output yet but the job is live — show motion so it never looks frozen.
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small).tint(AppTheme.accent)
+                    Text(job.status == .queued ? "Queued…" : "Working…")
+                        .font(AppTheme.uiFont(size: 13))
+                        .foregroundStyle(AppTheme.textSecondary)
+                }
             }
 
             HStack {
@@ -891,22 +949,31 @@ private struct RelayModelPickerSheet: View {
     @State private var bucket: RelayModelPickerBucket = .latest
     @State private var searchText = ""
 
+    // Task mode has a small fixed model set, so the chat-style Latest/All bucket toggle is
+    // irrelevant noise there — show a clean provider-grouped list. Chat keeps the buckets.
+    private var isTask: Bool { viewModel.mode == .task }
+
     var body: some View {
         NavigationStack {
             List {
-                Section {
-                    Picker("Model list", selection: $bucket) {
-                        ForEach(RelayModelPickerBucket.allCases) { bucket in
-                            Text(bucket.label).tag(bucket)
+                if !isTask {
+                    Section {
+                        Picker("Model list", selection: $bucket) {
+                            ForEach(RelayModelPickerBucket.allCases) { bucket in
+                                Text(bucket.label).tag(bucket)
+                            }
                         }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                        .listRowBackground(AppTheme.bgCanvas)
                     }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
-                    .listRowBackground(AppTheme.bgCanvas)
                 }
 
-                ForEach(viewModel.modelSections(bucket: bucket, searchText: searchText)) { section in
+                let sections = isTask
+                    ? viewModel.modelSections(bucket: .all, searchText: searchText)
+                    : viewModel.modelSections(bucket: bucket, searchText: searchText)
+                ForEach(sections) { section in
                     Section(section.title) {
                         ForEach(section.models) { model in
                             RelayModelPickerRow(
@@ -924,7 +991,7 @@ private struct RelayModelPickerSheet: View {
             .searchable(text: $searchText, prompt: "Search models")
             .scrollContentBackground(.hidden)
             .background(AppTheme.bgCanvas)
-            .navigationTitle("Models")
+            .navigationTitle(isTask ? "Task model" : "Models")
             .navigationBarTitleDisplayMode(.inline)
             .preferredColorScheme(.dark)
         }
@@ -982,50 +1049,83 @@ private struct RelayThreadDrawer: View {
     var body: some View {
         NavigationStack {
             List {
-                Button {
-                    viewModel.startNewConversation()
-                    dismiss()
-                } label: {
-                    Label("New conversation", systemImage: "square.and.pencil")
-                }
-                ForEach(viewModel.visibleThreads) { thread in
+                Section {
                     Button {
-                        Task {
-                            await viewModel.openThread(thread)
-                            dismiss()
-                        }
+                        viewModel.startNewConversation()
+                        dismiss()
                     } label: {
-                        VStack(alignment: .leading, spacing: 5) {
-                            HStack {
-                                Text(thread.displayTitle)
-                                    .foregroundStyle(AppTheme.textPrimary)
-                                    .lineLimit(1)
-                                Spacer()
-                                if viewModel.lockedMode == nil {
-                                    Text(thread.mode.label)
-                                        .font(.caption2.weight(.semibold))
-                                        .foregroundStyle(AppTheme.accent)
-                                }
-                            }
-                            Text("\(thread.provider.displayName) · \(thread.workspaceLabel)")
-                                .font(.caption)
+                        Label("New conversation", systemImage: "square.and.pencil")
+                            .foregroundStyle(AppTheme.accent)
+                    }
+                    .listRowBackground(AppTheme.bgSurface)
+                }
+
+                if viewModel.visibleThreads.isEmpty {
+                    Text("No threads yet.")
+                        .font(AppTheme.uiFont(size: 13))
+                        .foregroundStyle(AppTheme.textTertiary)
+                        .listRowBackground(AppTheme.bgCanvas)
+                }
+
+                // Threads grouped per workspace folder, newest folder first.
+                ForEach(viewModel.threadsByWorkspace, id: \.workspace) { group in
+                    Section {
+                        ForEach(group.threads) { thread in
+                            threadRow(thread)
+                        }
+                    } header: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "folder.fill")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(AppTheme.accent)
+                            Text(group.workspace)
+                                .font(AppTheme.uiFont(size: 12, weight: .semibold))
                                 .foregroundStyle(AppTheme.textSecondary)
-                                .lineLimit(1)
-                            Text(thread.feedPreview)
-                                .font(.caption)
+                            Spacer()
+                            Text("\(group.threads.count)")
+                                .font(AppTheme.monoFont(size: 11))
                                 .foregroundStyle(AppTheme.textTertiary)
-                                .lineLimit(2)
                         }
                     }
                 }
             }
             .scrollContentBackground(.hidden)
             .background(AppTheme.bgCanvas)
-            .navigationTitle("Threads")
+            .navigationTitle(viewModel.lockedMode == .task ? "Task threads" : "Threads")
             .navigationBarTitleDisplayMode(.inline)
             .task { await viewModel.refreshThreads() }
             .preferredColorScheme(.dark)
         }
+    }
+
+    private func threadRow(_ thread: CodexThread) -> some View {
+        Button {
+            Task {
+                await viewModel.openThread(thread)
+                dismiss()
+            }
+        } label: {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack {
+                    Text(thread.displayTitle)
+                        .foregroundStyle(AppTheme.textPrimary)
+                        .lineLimit(1)
+                    Spacer()
+                    if thread.hasActiveJobs {
+                        Circle().fill(AppTheme.statusWarn).frame(width: 7, height: 7)
+                    } else if viewModel.lockedMode == nil {
+                        Text(thread.mode.label)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(AppTheme.accent)
+                    }
+                }
+                Text(thread.feedPreview)
+                    .font(.caption)
+                    .foregroundStyle(AppTheme.textTertiary)
+                    .lineLimit(2)
+            }
+        }
+        .listRowBackground(AppTheme.bgSurface)
     }
 }
 

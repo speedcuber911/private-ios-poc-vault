@@ -98,10 +98,12 @@ server-side so the iOS app never ships model ids in the binary.
 
 By default, `ops/render-codex-api-config` derives `CODEX_MODEL_CATALOG` from
 `OPENCODE_CONFIG_PATH` (`~/.config/opencode/opencode.jsonc`) when that file is
-available. Azure OpenCode model ids are exposed as `provider/model` so duplicate
-deployment names from different Azure resources remain selectable in Relay. The
-public catalog omits internal routing fields such as API key file paths, Azure
-base URLs, and Bedrock regions.
+available. Duplicate Azure deployments collapse to one visible entry per model id;
+the retained `provider/model` id still selects the server-side route. The renderer
+also appends Codex CLI and Claude Code Task entries. Their optional public
+`taskModel` value tells Relay which model id or alias to submit with a job, while an
+entry without it uses the runner default. The public catalog omits internal routing
+fields such as API key file paths, Azure base URLs, and Bedrock regions.
 
 `POST /v1/codex/chat` streams synchronous chat as SSE. It supports `bedrock`
 and `azure` catalog entries whose `modes` include `chat`, and emits `meta`,

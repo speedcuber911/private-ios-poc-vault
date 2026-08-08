@@ -119,10 +119,12 @@ CODEX_MODEL_CATALOG='[...]'
 ```
 
 When `OPENCODE_CONFIG_PATH` exists, `ops/render-codex-api-config` renders the
-Relay model catalog from that OpenCode config. Azure entries use
-`provider/model` ids so models with the same deployment name in different Azure
-resources can all be selected. Internal routing fields and key-file paths stay
-server-side and are not returned by `/v1/codex/models`.
+Relay model catalog from that OpenCode config. Duplicate Azure deployments collapse
+to one visible entry per model id while the winning `provider/model` id preserves
+server-side routing. The renderer also appends Codex CLI and Claude Code Task entries;
+their optional public `taskModel` value is the model id or alias Relay submits with a
+job. Internal routing fields and key-file paths stay server-side and are not returned
+by `/v1/codex/models`.
 
 Codex jobs use the existing `codex exec` / `codex exec resume` commands. Claude
 jobs run in the selected workspace, read prompts from stdin, use non-interactive
@@ -143,9 +145,9 @@ Relay discovers available models at runtime with:
 GET /v1/codex/models
 ```
 
-Each entry declares `id`, `label`, `provider`, and supported `modes`. Chat
-mode uses providers `bedrock` and `azure`; Task mode continues to use the
-existing async job providers `codex` and `claude`.
+Each entry declares `id`, `label`, `provider`, and supported `modes`. A Task entry
+can also declare `taskModel` and `effortLevels`. Chat mode uses providers `bedrock`
+and `azure`; Task mode uses the async job providers `codex` and `claude`.
 
 Synchronous chat streams from:
 
