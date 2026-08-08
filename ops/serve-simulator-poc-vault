@@ -111,7 +111,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(codex_fixture_job())
             return
         if path == "/v1/codex/jobs/sim-job-running":
-            self.send_json(codex_fixture_job(status="running", result=None))
+            self.send_json(codex_fixture_running_job_tick())
             return
         self.send_error(404)
 
@@ -318,20 +318,31 @@ def codex_fixture_models() -> list[dict]:
             "azureDeployment": "gpt-4o",
             "defaultOptions": {"temperature": 0.7, "maxTokens": 4096},
         },
-        {
-            "id": "codex-cli",
-            "label": "Codex CLI",
-            "provider": "codex",
-            "modes": ["task"],
-        },
-        {
-            "id": "claude-code",
-            "label": "Claude Code (Bedrock/SigiQ)",
-            "provider": "claude",
-            "modes": ["task"],
-            "effortLevels": ["low", "medium", "high"],
-        },
+        *_sim_task_entries(),
     ]
+
+
+def _sim_task_entries() -> list[dict]:
+    """Task-mode entries with selectable underlying models (mirrors render-codex-api-config)."""
+    codex_effort = ["low", "medium", "high", "xhigh"]
+    claude_effort = ["low", "medium", "high"]
+    codex_models = [
+        ("GPT-5.5", "gpt-5.5"),
+        ("GPT-5.4", "gpt-5.4"),
+        ("GPT-5.4-Mini", "gpt-5.4-mini"),
+        ("GPT-5.3-Codex-Spark", "gpt-5.3-codex-spark"),
+    ]
+    entries = [{"id": "codex-cli", "label": "Codex CLI", "provider": "codex", "modes": ["task"], "effortLevels": codex_effort}]
+    entries += [
+        {"id": f"codex-{tm}", "label": f"Codex · {label}", "provider": "codex", "modes": ["task"], "taskModel": tm, "effortLevels": codex_effort}
+        for label, tm in codex_models
+    ]
+    entries += [
+        {"id": "claude-code-sonnet", "label": "Claude Code · Sonnet", "provider": "claude", "modes": ["task"], "taskModel": "sonnet", "effortLevels": claude_effort},
+        {"id": "claude-code-opus", "label": "Claude Code · Opus", "provider": "claude", "modes": ["task"], "taskModel": "opus", "effortLevels": claude_effort},
+        {"id": "claude-code-haiku", "label": "Claude Code · Haiku", "provider": "claude", "modes": ["task"], "taskModel": "haiku", "effortLevels": claude_effort},
+    ]
+    return entries
 
 
 def opencode_fixture_models() -> list[dict]:
@@ -392,16 +403,7 @@ def opencode_fixture_models() -> list[dict]:
                 models.append(entry)
 
     models = list(azure_by_model.values()) + models
-    models.extend([
-        {"id": "codex-cli", "label": "Codex CLI", "provider": "codex", "modes": ["task"]},
-        {
-            "id": "claude-code",
-            "label": "Claude Code (Bedrock/SigiQ)",
-            "provider": "claude",
-            "modes": ["task"],
-            "effortLevels": ["low", "medium", "high"],
-        },
-    ])
+    models.extend(_sim_task_entries())
     return models
 
 
@@ -581,10 +583,31 @@ def codex_fixture_chat_thread_detail() -> dict:
     }
 
 
-def codex_fixture_job(status: str = "succeeded", result: str | None = None) -> dict:
+# Drives a simulated job lifecycle across poll ticks so the Task tab's live job card
+# shows queued -> running (growing logs) -> succeeded instead of a frozen card.
+_SIM_JOB_TICKS = {"n": 0}
+_SIM_JOB_STAGES = [
+    ("running", "Scanning workspace…"),
+    ("running", "Scanning workspace…\nReading recent activity…"),
+    ("running", "Scanning workspace…\nReading recent activity…\nDrafting summary…"),
+]
+
+
+def codex_fixture_running_job_tick() -> dict:
+    n = _SIM_JOB_TICKS["n"]
+    _SIM_JOB_TICKS["n"] = n + 1
+    if n < len(_SIM_JOB_STAGES):
+        status, log = _SIM_JOB_STAGES[n]
+        return codex_fixture_job(status="running", result=log, id="sim-job-running")
+    # After the running stages, complete the job (same id so the card updates in place).
+    _SIM_JOB_TICKS["n"] = 0  # reset for the next submitted job
+    return codex_fixture_job(status="succeeded", id="sim-job-running")
+
+
+def codex_fixture_job(status: str = "succeeded", result: str | None = None, id: str | None = None) -> dict:
     result_text = codex_fixture_answer() if result is None and status == "succeeded" else result
     return {
-        "id": "sim-job-linear" if status == "succeeded" else "sim-job-running",
+        "id": id or ("sim-job-linear" if status == "succeeded" else "sim-job-running"),
         "provider": "codex",
         "status": status,
         "workspaceId": "poc-vault",

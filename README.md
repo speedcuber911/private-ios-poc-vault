@@ -282,10 +282,10 @@ The iOS app is named Relay. It has four jobs:
 
 The current tab layout is **Library, Chat, Task, and Status**. Chat is the
 synchronous streaming surface (Bedrock/Azure over SSE); Task is the asynchronous
-Codex/Claude job runner; Status combines recent provider activity with the
-Diagnostics health view. See [docs/CHAT_REDESIGN.md](docs/CHAT_REDESIGN.md) for the
-chat-first redesign: streaming UX, the model-catalog de-duplication, and the
-reimagined workspace picker.
+Codex/Claude job runner with server-driven model and effort controls, live job
+polling, and workspace-grouped threads; Status combines recent provider activity
+with the Diagnostics health view. See [docs/CHAT_REDESIGN.md](docs/CHAT_REDESIGN.md)
+for the chat-first redesign and current Task behavior.
 
 The app intentionally does not know individual POCs at compile time. POC detail
 screens have no standard navigation bar above hosted pages; the shell uses a
@@ -402,7 +402,8 @@ Current API behavior:
 - Allowed certificate subjects are configured per install with
   `CODEX_ALLOWED_CERT_SUBJECTS`.
 - `/v1/codex/models` exposes the server-side model catalog so Relay does not
-  compile model ids into the app.
+  compile model ids into the app. Task entries can include a public `taskModel`
+  alias and supported effort levels.
 - When `~/.config/opencode/opencode.jsonc` exists, the Codex API install config
   renders Relay's catalog from the local OpenCode Azure/Bedrock inventory.
 - `/v1/codex/chat` streams synchronous Chat mode over SSE for Bedrock and Azure
@@ -414,8 +415,11 @@ Current API behavior:
   is available when configured on the runner.
 - Chat mode uses `bedrock` or `azure`; Task mode continues to use the existing
   async `codex` and `claude` job contracts.
+- Relay polls active Task jobs while the Task tab is visible, renders completed
+  job answers as Markdown, and groups task threads by workspace.
 - Threads are provider-locked, so a Codex thread is resumed by Codex and a
-  Claude thread is resumed by Claude.
+  Claude thread is resumed by Claude. Relay also requires the selected workspace
+  to match before sending a task `resumeSessionId`.
 - Phone-recorded prompt audio can be transcribed through the authenticated
   Codex API when Azure Speech is configured on the server.
 - Workspaces can be configured in `/etc/codex-api.env` or safely selected from

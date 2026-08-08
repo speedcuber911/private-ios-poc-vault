@@ -1,9 +1,10 @@
 # Relay Chat-First Redesign
 
 This document describes the chat-first redesign of the Relay iOS surface and the
-supporting server/ops changes: the model-catalog de-duplication, the split Chat/Task
-tabs, the streaming chat experience, and the reimagined workspace picker. It is the
-authoritative reference for what the redesign added and how to exercise it.
+supporting server/ops changes: model-catalog de-duplication, the split Chat/Task
+tabs, streaming chat, task-model and effort controls, live task progress, workspace-
+grouped threads, and the reimagined workspace picker. It is the authoritative
+reference for what the redesign added and how to exercise it.
 
 Legacy naming still applies: the repo is `poc-vault`/`POCVault` with bundle id
 `com.parikshit.pocvault`; the user-facing product is **Relay**.
@@ -17,8 +18,8 @@ Relay's operator surface is now **chat-first** with two distinct modes living on
 
 - **Chat** — synchronous, streaming replies from Bedrock/Azure models over
   `POST /v1/codex/chat` (Server-Sent Events).
-- **Task** — the existing asynchronous Codex/Claude Code job runner
-  (`POST /v1/codex/jobs`, polled for status).
+- **Task** — the asynchronous Codex/Claude Code job runner (`POST /v1/codex/jobs`),
+  with model and reasoning-effort selection plus live status polling.
 
 The four bottom tabs are: **Library · Chat · Task · Status**.
 
@@ -72,11 +73,26 @@ rows before).
 
 `RelayModelDiscovery` (`RelayChatViewModel.swift`) drives the picker sheet:
 
-- **All** bucket — groups by provider and lists the (now de-duplicated) catalog.
-- **Latest** bucket — de-dupes by `familyKey`, which now keys on the model's own
+- **Chat / All** — groups by provider and lists the (now de-duplicated) catalog.
+- **Chat / Latest** — de-dupes by `familyKey`, which now keys on the model's own
   identity (only folding away dated/version-pinned build suffixes like
   `-20251101-v1:0`), so genuinely distinct models (`gpt-5` vs `gpt-5-chat`, or two
   Opus minor versions) each survive instead of collapsing to one family row.
+- **Task** — skips the Chat-only Latest/All toggle and shows the complete, compact
+  provider-grouped task catalog.
+
+### Task catalog entries
+
+`task_catalog_entries()` adds selectable Codex CLI and Claude Code models to both
+the rendered VM catalog and simulator fixtures. A task entry can expose `taskModel`,
+the model id or alias Relay sends in `POST /v1/codex/jobs`; the server sanitizes and
+returns this public field from `GET /v1/codex/models`. Entries without `taskModel`
+continue to use the runner default.
+
+Codex task entries advertise `low`, `medium`, `high`, and `xhigh` effort levels.
+Claude task entries keep their provider-specific model aliases (`sonnet`, `opus`,
+and `haiku`) in the same server-driven catalog, so the app does not compile them into
+its native picker.
 
 ---
 
@@ -149,7 +165,27 @@ gradient send/stop buttons, and a centered gradient-icon empty state.
 
 ---
 
-## 5. Workspace selection — unified folder browser (Task tab)
+## 5. Task execution experience
+
+`RelayChatView.swift` + `RelayChatViewModel.swift` add a Task-specific control and
+progress layer without changing the asynchronous job API:
+
+- The composer shows a bounded second row for workspace and reasoning effort, avoiding
+  an unbounded horizontal scroller inside the bottom safe-area inset.
+- Changing models resets an invalid prior effort choice. Relay sends the selected
+  catalog-backed `taskModel` and effective effort when creating a job.
+- Active job cards refresh full job detail about every two seconds while the Task tab
+  is visible. Empty queued/running cards show progress; growing logs use compact
+  monospaced text; completed answers use the same structured Markdown renderer as Chat.
+- The thread drawer groups visible threads by workspace, orders groups by recent
+  activity, and marks workspaces containing active jobs.
+- A task session is resumed only when both provider and workspace match the current
+  composer selection. Switching workspace starts a new session instead of sending an
+  invalid cross-workspace `resumeSessionId`.
+- The prompt keeps interactive scroll dismissal, keyboard dismissal on Run, and the
+  keyboard-accessory dismiss action required for iPhone use.
+
+## 6. Workspace selection — unified folder browser (Task tab)
 
 The Task tab needs you to pick which workspace folder a job runs in.
 
@@ -195,7 +231,7 @@ View model support (`RelayChatViewModel`): `directoryListing`,
 `selectBrowsedDirectory(path:)`, `createWorkspace(parentPath:name:)`, `upsertWorkspace`.
 
 > A `RELAY_UITEST_WS_PATH=<dir>` DEBUG env var deep-links the browser to a starting
-> folder for headless screenshots (see §7).
+> folder for headless screenshots (see §8).
 
 ### What folders are shown (EC2)
 
@@ -211,17 +247,20 @@ root it shows **all non-hidden directories**, with two filters:
 
 ---
 
-## 6. Server contract (unchanged shape, used by the redesign)
+## 7. Server contract
 
 The redesign consumes the existing frozen endpoints:
 
-- `GET  /v1/codex/models` — public catalog (private fields like `azureBaseURL`,
-  `azureApiKeyFile`, `bedrockRegion` are stripped server-side).
+- `GET  /v1/codex/models` — public catalog, including optional `taskModel`; private
+  fields like `azureBaseURL`, `azureApiKeyFile`, and `bedrockRegion` are stripped
+  server-side.
 - `POST /v1/codex/chat` — SSE stream of `meta` → `delta`* → `usage` → `done`
   (or `error`). Cancels when the client closes the connection.
 - `GET/POST /v1/codex/workspaces`, `POST /v1/codex/workspaces/select`,
   `POST /v1/codex/workspaces/create`, `GET /v1/codex/workspace-dirs`.
-- `POST /v1/codex/jobs` and friends for Task mode (poll-only status).
+- `POST /v1/codex/jobs` and friends for Task mode (poll-only status). Relay submits
+  the catalog's task model and effective effort and only resumes a thread when its
+  provider and workspace still match.
 
 mTLS is terminated at nginx (not in-process); chat inherits it like every other
 `/v1/codex/*` route. The SigiQ Bedrock guardrail is unchanged: the server refuses to
@@ -229,7 +268,7 @@ start unless `CLAUDE_AWS_PROFILE=sigiq` and strips ambient `AWS_*` for Claude/Be
 
 ---
 
-## 7. Headless visual testing
+## 8. Headless visual testing
 
 Simulator tap automation is unavailable in this environment (idb-companion is
 deprecated in Homebrew; AppleScript taps need an accessibility grant). The app instead
@@ -241,6 +280,7 @@ launch so the streaming and workspace screens can be screenshotted with
 |---|---|
 | `RELAY_UITEST_MODEL` | Selects the first chat model whose id/label contains the value. |
 | `RELAY_UITEST_PROMPT` | Fills the prompt and sends it on launch (Chat tab only). |
+| `RELAY_UITEST_TASK_PROMPT` | Fills and submits a Task prompt so live job polling can be captured. |
 | `RELAY_UITEST_TAB` | Selects a tab: `library`/`chat`/`task`/`status`. |
 | `RELAY_UITEST_OPEN` | `workspace` opens the workspace folder browser on the Task tab. |
 | `RELAY_UITEST_WS_PATH` | Deep-links the workspace browser to a starting folder (e.g. `/srv/codex-workspaces/sigiq`). |
@@ -263,10 +303,13 @@ The simulator server (`ops/serve-simulator-poc-vault`) was enriched to support t
   return three workspaces (Scratch, POC Vault [default], SigiQ) and a path-aware
   directory listing (root lists workspaces; `sigiq` exposes `ai-tutor`,
   `leap-workbench`, `data-readiness`) so the card and browse views are exercisable.
+- Task fixtures expose the same model/effort catalog as the renderer and advance a
+  submitted job through growing running logs to a completed Markdown result across
+  successive detail polls.
 
 ---
 
-## 8. Build / run
+## 9. Build / run
 
 Simulator (no signing):
 
@@ -294,13 +337,15 @@ certificate stored in the device keychain.
 
 ---
 
-## 9. Files touched
+## 10. Files touched
 
 | Area | Files |
 |---|---|
 | Catalog dedup | `ops/render-codex-api-config`, `ops/serve-simulator-poc-vault` |
-| Sim fixtures | `ops/serve-simulator-poc-vault` (chat pacing, workspaces, dirs) |
+| Task catalog | `ops/render-codex-api-config`, `ops/serve-simulator-poc-vault`, `codex-server/codex-api-deploy/server.mjs` |
+| Sim fixtures | `ops/serve-simulator-poc-vault` (chat pacing, task polling, workspaces, dirs) |
 | Tabs | `ios/POCVault/POCVault/POCVaultApp.swift` |
 | Chat UX / views | `ios/POCVault/POCVault/Views/RelayChatView.swift`, `RelayChatViewModel.swift` |
+| Task UX / views | `ios/POCVault/POCVault/Models/CodexModels.swift`, `RelayChatView.swift`, `RelayChatViewModel.swift` |
 | Theme tokens | `ios/POCVault/POCVault/POCVaultApp.swift` (`AppTheme`) |
 | Workspace picker | `RelayChatView.swift` (`RelayWorkspaceSheet`, `RelayFolderRow`), `RelayChatViewModel.swift` |
