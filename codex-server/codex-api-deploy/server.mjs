@@ -273,6 +273,11 @@ function cleanModelDescriptor(entry) {
   if (entry.azureDeployment !== undefined && entry.azureDeployment !== null && entry.azureDeployment !== "") {
     descriptor.azureDeployment = cleanRequiredModelId(entry.azureDeployment, "Azure deployment");
   }
+  // Underlying model id/alias the app sends to createJob for task entries (e.g. "opus",
+  // "gpt-5-codex"). Public — the client needs it to select the model.
+  if (entry.taskModel !== undefined && entry.taskModel !== null && entry.taskModel !== "") {
+    descriptor.taskModel = cleanRequiredModelId(entry.taskModel, "task model");
+  }
   if (entry.azureBaseURL !== undefined && entry.azureBaseURL !== null && entry.azureBaseURL !== "") {
     descriptor.azureBaseURL = cleanOptionalEndpoint(entry.azureBaseURL);
     if (!descriptor.azureBaseURL) throw new Error("Azure base URL is invalid");

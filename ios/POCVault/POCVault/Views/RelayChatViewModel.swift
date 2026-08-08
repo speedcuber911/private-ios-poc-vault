@@ -292,8 +292,28 @@ final class RelayChatViewModel: ObservableObject {
         didSet { ensureSelectedModelSupportsMode() }
     }
     @Published var selectedWorkspaceID: String?
+    /// User-chosen reasoning effort for task jobs (nil = model default). Reset when the
+    /// selected model changes so we never send an effort the model doesn't support.
+    @Published var selectedEffort: CodexReasoningEffort?
     @Published var prompt = ""
     @Published var errorMessage: String?
+
+    /// Effort levels the selected task model exposes (from the catalog), as typed options.
+    var availableEfforts: [CodexReasoningEffort] {
+        guard let model = selectedModel else { return [] }
+        let levels = model.effortLevels.compactMap { CodexReasoningEffort(rawValue: $0.lowercased()) }
+        return levels.isEmpty ? [] : levels
+    }
+
+    /// The effort to actually send: user choice if set and valid, else the model default.
+    var effectiveEffort: CodexReasoningEffort? {
+        if let selectedEffort, availableEfforts.contains(selectedEffort) { return selectedEffort }
+        return availableEfforts.contains(.high) ? .high : availableEfforts.first
+    }
+
+    func selectEffort(_ effort: CodexReasoningEffort?) {
+        selectedEffort = effort
+    }
 
     /// Id of the assistant message currently streaming, or nil when idle. The composer
     /// flips its send button to a stop button while this is set.
@@ -304,6 +324,10 @@ final class RelayChatViewModel: ObservableObject {
     let lockedMode: RelayInteractionMode?
     private var currentThreadID: String?
     private var currentThreadProvider: CodexProvider?
+    /// Workspace the current task thread belongs to. Resuming a session in a different
+    /// workspace is rejected by the server ("session does not belong to workspace"), so we
+    /// only resume when this matches the compose workspace.
+    private var currentThreadWorkspaceID: String?
     private var streamTask: Task<Void, Never>?
 
     var isStreaming: Bool { streamingMessageID != nil }
@@ -393,8 +417,14 @@ final class RelayChatViewModel: ObservableObject {
     /// screenshotted without simulator tap automation. Compiled out of release builds.
     private func runAutoDriveIfRequested() async {
         let env = ProcessInfo.processInfo.environment
+        // Task-tab auto-drive: submit a job so the live-polling job card can be screenshotted.
+        if lockedMode == .task, let taskPrompt = env["RELAY_UITEST_TASK_PROMPT"], !taskPrompt.isEmpty {
+            prompt = taskPrompt
+            await sendCurrentPrompt()
+            return
+        }
         guard let promptText = env["RELAY_UITEST_PROMPT"], !promptText.isEmpty else { return }
-        // Only the chat surface auto-drives; skip on the task-locked tab.
+        // Chat-tab auto-drive; skip on the task-locked tab.
         guard lockedMode != .task else { return }
         if lockedMode == nil { mode = .chat }
         if let wanted = env["RELAY_UITEST_MODEL"]?.lowercased(),
@@ -418,6 +448,36 @@ final class RelayChatViewModel: ObservableObject {
         }
     }
 
+    /// True while any job shown in this conversation is still running/queued.
+    var hasActiveConversationJob: Bool {
+        messages.contains { $0.job?.status.isActive == true }
+    }
+
+    /// Long-lived poll loop started by the Task view's `.task`. While the view is on
+    /// screen and a job is active, refresh job state every ~2s and pull the running
+    /// job's latest output so its card shows live progress instead of a frozen card.
+    /// Jobs are poll-only on the server (no log stream), so this is the update channel.
+    func monitorActiveJobs() async {
+        guard lockedMode == .task else { return }
+        while !Task.isCancelled {
+            if hasActiveConversationJob {
+                await refreshActiveJobDetails()
+                await refreshThreads()
+            }
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+        }
+    }
+
+    /// Fetch full detail for each active job card so stdout/result grows live in the UI.
+    private func refreshActiveJobDetails() async {
+        let activeIDs = messages.compactMap { $0.job?.status.isActive == true ? $0.job?.id : nil }
+        for id in activeIDs {
+            if let updated = try? await client.fetchJob(id: id, includeFullLogs: false) {
+                replaceJob(updated)
+            }
+        }
+    }
+
     func sendCurrentPrompt() async {
         switch mode {
         case .chat:
@@ -432,6 +492,7 @@ final class RelayChatViewModel: ObservableObject {
             mode = nextMode
         }
         selectedModelID = model.id
+        selectedEffort = nil  // fall back to the new model's default until the user picks
     }
 
     func selectWorkspace(_ workspace: CodexWorkspace) {
@@ -494,6 +555,7 @@ final class RelayChatViewModel: ObservableObject {
     func startNewConversation() {
         currentThreadID = nil
         currentThreadProvider = nil
+        currentThreadWorkspaceID = nil
         messages = []
     }
 
@@ -503,12 +565,26 @@ final class RelayChatViewModel: ObservableObject {
         return threads.filter { $0.mode == lockedMode }
     }
 
+    /// Visible threads grouped by workspace, ordered by most-recent activity, for the
+    /// thread drawer's "threads per folder" sections. Each group keeps its newest first.
+    var threadsByWorkspace: [(workspace: String, threads: [CodexThread])] {
+        let grouped = Dictionary(grouping: visibleThreads) { $0.workspaceLabel }
+        return grouped
+            .map { (workspace: $0.key, threads: Self.sortedThreads($0.value)) }
+            .sorted { lhs, rhs in
+                let l = lhs.threads.first?.updatedAt ?? .distantPast
+                let r = rhs.threads.first?.updatedAt ?? .distantPast
+                return l > r
+            }
+    }
+
     func openThread(_ thread: CodexThread) async {
         if let lockedMode, thread.mode != lockedMode { return }
         do {
             let detail = try await client.fetchThreadDetail(sessionID: thread.sessionId, provider: thread.provider)
             currentThreadID = detail.thread.sessionId
             currentThreadProvider = detail.thread.provider
+            currentThreadWorkspaceID = detail.thread.workspaceId
             if lockedMode == nil {
                 mode = detail.thread.mode
             }
@@ -688,16 +764,20 @@ final class RelayChatViewModel: ObservableObject {
         defer { isSending = false }
 
         let provider = taskProvider(for: selectedModel)
+        let workspaceID = composeWorkspaceID
+        // Only resume the existing session if it's the same provider AND same workspace,
+        // otherwise the server rejects it ("session does not belong to workspace").
+        let resumeID = (currentThreadProvider == provider && currentThreadWorkspaceID == workspaceID) ? currentThreadID : nil
         messages.append(RelayConversationItem(role: .user, text: text, provider: provider, modelLabel: selectedModel.label))
         do {
             let created = try await client.createJob(CodexCreateJobRequest(
-                workspaceId: composeWorkspaceID,
+                workspaceId: workspaceID,
                 prompt: text,
                 timeoutMs: 1_800_000,
                 model: taskModelParameter(for: selectedModel),
-                reasoningEffort: selectedModel.effortLevels.contains("high") ? "high" : nil,
+                reasoningEffort: effectiveEffort?.rawValue,
                 provider: provider,
-                resumeSessionId: currentThreadProvider == provider ? currentThreadID : nil
+                resumeSessionId: resumeID
             ))
             let job: CodexJob
             if let createdJob = created.job {
@@ -707,6 +787,7 @@ final class RelayChatViewModel: ObservableObject {
             }
             currentThreadID = job.threadSessionId ?? job.sessionId ?? job.resumeSessionId
             currentThreadProvider = provider
+            currentThreadWorkspaceID = job.workspaceId ?? workspaceID
             messages.append(jobItem(job))
             await refreshThreads()
         } catch {
@@ -808,7 +889,10 @@ final class RelayChatViewModel: ObservableObject {
     }
 
     private func taskModelParameter(for model: CodexModelDescriptor) -> String? {
-        model.supports(.chat) ? model.id : nil
+        // Prefer an explicit task model (e.g. "opus", "gpt-5-codex") from the catalog;
+        // otherwise fall back to the chat id for dual-mode models, or the runner default.
+        if let taskModel = model.taskModel, !taskModel.isEmpty { return taskModel }
+        return model.supports(.chat) ? model.id : nil
     }
 
     private static func sortedThreads(_ threads: [CodexThread]) -> [CodexThread] {

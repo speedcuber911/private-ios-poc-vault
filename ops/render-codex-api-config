@@ -77,14 +77,7 @@ def model_catalog_default(config: dict[str, str]) -> str:
                 "defaultOptions": {"temperature": 0.7, "maxTokens": 4096},
                 "effortLevels": ["low", "medium", "high"],
             },
-            {"id": "codex-cli", "label": "Codex CLI", "provider": "codex", "modes": ["task"]},
-            {
-                "id": "claude-code",
-                "label": "Claude Code (Bedrock/SigiQ)",
-                "provider": "claude",
-                "modes": ["task"],
-                "effortLevels": ["low", "medium", "high"],
-            },
+            *task_catalog_entries(),
         ],
         separators=(",", ":"),
     )
@@ -162,21 +155,43 @@ def catalog_from_opencode(path: Path) -> list[dict]:
                 catalog.append(entry)
 
     # Surface the collapsed Azure entries first (chat picker leads with Azure), then the
-    # Bedrock entries gathered above, then the fixed task providers.
+    # Bedrock entries gathered above, then the per-model task providers.
     catalog = list(azure_by_model.values()) + catalog
-    catalog.extend(
-        [
-            {"id": "codex-cli", "label": "Codex CLI", "provider": "codex", "modes": ["task"]},
-            {
-                "id": "claude-code",
-                "label": "Claude Code (Bedrock/SigiQ)",
-                "provider": "claude",
-                "modes": ["task"],
-                "effortLevels": ["low", "medium", "high"],
-            },
-        ]
-    )
+    catalog.extend(task_catalog_entries())
     return catalog
+
+
+def task_catalog_entries() -> list[dict]:
+    """Task-mode entries with selectable underlying models.
+
+    Codex: the default CLI model plus a reasoning-oriented variant. Claude Code: Opus /
+    Sonnet / Haiku, sent as `taskModel` aliases the server resolves to SigiQ Bedrock
+    models (claudeModelAliases in server.mjs). The job runner picks the model from the
+    `model` field of the submitted job.
+    """
+    codex_effort = ["low", "medium", "high", "xhigh"]
+    claude_effort = ["low", "medium", "high"]
+    # Real Codex models the runner exposes (matches the Codex CLI model list). Sent to the
+    # job runner via `-m <taskModel>`. Codex CLI (no taskModel) uses the runner default.
+    codex_models = [
+        ("GPT-5.5", "gpt-5.5"),
+        ("GPT-5.4", "gpt-5.4"),
+        ("GPT-5.4-Mini", "gpt-5.4-mini"),
+        ("GPT-5.3-Codex-Spark", "gpt-5.3-codex-spark"),
+    ]
+    entries = [
+        {"id": "codex-cli", "label": "Codex CLI", "provider": "codex", "modes": ["task"], "effortLevels": codex_effort},
+    ]
+    entries += [
+        {"id": f"codex-{tm}", "label": f"Codex · {label}", "provider": "codex", "modes": ["task"], "taskModel": tm, "effortLevels": codex_effort}
+        for label, tm in codex_models
+    ]
+    entries += [
+        {"id": "claude-code-sonnet", "label": "Claude Code · Sonnet", "provider": "claude", "modes": ["task"], "taskModel": "sonnet", "effortLevels": claude_effort},
+        {"id": "claude-code-opus", "label": "Claude Code · Opus", "provider": "claude", "modes": ["task"], "taskModel": "opus", "effortLevels": claude_effort},
+        {"id": "claude-code-haiku", "label": "Claude Code · Haiku", "provider": "claude", "modes": ["task"], "taskModel": "haiku", "effortLevels": claude_effort},
+    ]
+    return entries
 
 
 def azure_model_label(name: object, fallback: str) -> str:
