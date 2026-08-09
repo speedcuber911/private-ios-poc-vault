@@ -66,21 +66,7 @@ def model_catalog_default(config: dict[str, str]) -> str:
     if opencode_catalog:
         return json.dumps(opencode_catalog, separators=(",", ":"))
 
-    bedrock_chat_model = env_value(config, "BEDROCK_CHAT_MODEL", "anthropic.claude-3-5-sonnet-20241022-v2:0")
-    return json.dumps(
-        [
-            {
-                "id": bedrock_chat_model,
-                "label": "Claude Sonnet (Bedrock)",
-                "provider": "bedrock",
-                "modes": ["chat"],
-                "defaultOptions": {"temperature": 0.7, "maxTokens": 4096},
-                "effortLevels": ["low", "medium", "high"],
-            },
-            *task_catalog_entries(),
-        ],
-        separators=(",", ":"),
-    )
+    return json.dumps(task_catalog_entries(), separators=(",", ":"))
 
 
 def catalog_from_opencode(path: Path) -> list[dict]:
@@ -164,32 +150,52 @@ def catalog_from_opencode(path: Path) -> list[dict]:
 def task_catalog_entries() -> list[dict]:
     """Task-mode entries with selectable underlying models.
 
-    Codex: the default CLI model plus a reasoning-oriented variant. Claude Code: Opus /
-    Sonnet / Haiku, sent as `taskModel` aliases the server resolves to SigiQ Bedrock
-    models (claudeModelAliases in server.mjs). The job runner picks the model from the
-    `model` field of the submitted job.
+    Codex: the current subscription models. Claude Code: Opus / Sonnet / Haiku aliases
+    resolved by the installed Claude CLI. The job runner picks the model from the
+    `model` field of the submitted job; Bedrock is opt-in only when a SigiQ profile is
+    explicitly configured.
     """
     codex_effort = ["low", "medium", "high", "xhigh"]
     claude_effort = ["low", "medium", "high"]
     # Real Codex models the runner exposes (matches the Codex CLI model list). Sent to the
     # job runner via `-m <taskModel>`. Codex CLI (no taskModel) uses the runner default.
     codex_models = [
-        ("GPT-5.5", "gpt-5.5"),
-        ("GPT-5.4", "gpt-5.4"),
-        ("GPT-5.4-Mini", "gpt-5.4-mini"),
-        ("GPT-5.3-Codex-Spark", "gpt-5.3-codex-spark"),
+        ("GPT-5.6 Sol", "gpt-5.6-sol"),
+        ("GPT-5.6 Terra", "gpt-5.6-terra"),
+        ("GPT-5.6 Luna", "gpt-5.6-luna"),
     ]
     entries = [
         {"id": "codex-cli", "label": "Codex CLI", "provider": "codex", "modes": ["task"], "effortLevels": codex_effort},
     ]
     entries += [
-        {"id": f"codex-{tm}", "label": f"Codex · {label}", "provider": "codex", "modes": ["task"], "taskModel": tm, "effortLevels": codex_effort}
+        {"id": f"codex-{tm}", "label": f"Codex · {label}", "provider": "codex", "modes": ["chat", "task"], "taskModel": tm, "effortLevels": codex_effort}
         for label, tm in codex_models
     ]
     entries += [
         {"id": "claude-code-sonnet", "label": "Claude Code · Sonnet", "provider": "claude", "modes": ["task"], "taskModel": "sonnet", "effortLevels": claude_effort},
         {"id": "claude-code-opus", "label": "Claude Code · Opus", "provider": "claude", "modes": ["task"], "taskModel": "opus", "effortLevels": claude_effort},
         {"id": "claude-code-haiku", "label": "Claude Code · Haiku", "provider": "claude", "modes": ["task"], "taskModel": "haiku", "effortLevels": claude_effort},
+        {"id": "cursor-agent-auto", "label": "Cursor Agent · Auto", "provider": "cursor", "modes": ["task"], "taskModel": "auto", "effortLevels": []},
+    ]
+    # Curated subset of `cursor-agent --list-models`; verified live on-box
+    # 2026-08-09 (--model passthrough smoke-tested as codex-runner). Re-verify
+    # against the installed CLI before extending.
+    cursor_models = [
+        ("cursor-agent-composer-2.5", "Composer 2.5", "composer-2.5"),
+        ("cursor-agent-gpt-5.3-codex", "Codex 5.3", "gpt-5.3-codex"),
+        ("cursor-agent-gpt-5.6-sol-high", "GPT-5.6 Sol High", "gpt-5.6-sol-high"),
+        ("cursor-agent-gpt-5.5-high", "GPT-5.5 High", "gpt-5.5-high"),
+        ("cursor-agent-gpt-5.2", "GPT-5.2", "gpt-5.2"),
+        ("cursor-agent-sonnet-5-thinking", "Sonnet 5 Thinking", "claude-sonnet-5-thinking-high"),
+        ("cursor-agent-opus-5-thinking", "Opus 5 Thinking", "claude-opus-5-thinking-high"),
+        ("cursor-agent-opus-4.8-thinking", "Opus 4.8 Thinking", "claude-opus-4-8-thinking-high"),
+        ("cursor-agent-fable-5-thinking", "Fable 5 Thinking (No ZDR)", "claude-fable-5-thinking-high"),
+        ("cursor-agent-grok-4.5", "Grok 4.5", "cursor-grok-4.5-high"),
+        ("cursor-agent-kimi-k3", "Kimi K3", "kimi-k3-high"),
+    ]
+    entries += [
+        {"id": mid, "label": f"Cursor Agent · {label}", "provider": "cursor", "modes": ["task"], "taskModel": tm, "effortLevels": []}
+        for mid, label, tm in cursor_models
     ]
     return entries
 
@@ -303,19 +309,20 @@ def render_env(config: dict[str, str], output: Path) -> None:
     aws_default_region = env_value(config, "AWS_DEFAULT_REGION", aws_region)
     bedrock_region = env_value(config, "BEDROCK_REGION", env_value(config, "CLAUDE_AWS_REGION", aws_region or "us-east-1"))
     pairs = [
-        ("CODEX_API_HOST", "127.0.0.1"),
+        ("CODEX_API_HOST", env_value(config, "CODEX_API_HOST", "127.0.0.1")),
         ("CODEX_API_PORT", "8787"),
         ("CODEX_REQUIRE_MTLS", "true"),
         ("CODEX_ALLOWED_CERT_SUBJECTS", "CN=iphone,CN=parikshit-mac"),
         ("CODEX_DATA_DIR", "/var/lib/codex-api"),
         ("CODEX_BIN", "/usr/bin/codex"),
         ("CLAUDE_BIN", "/usr/bin/claude"),
+        ("CURSOR_BIN", "/var/lib/codex-api/run-home/.local/bin/cursor-agent"),
         ("CLAUDE_CODE_USE_BEDROCK", ""),
-        ("CLAUDE_AWS_PROFILE", "sigiq"),
+        ("CLAUDE_AWS_PROFILE", ""),
         ("CLAUDE_DEFAULT_MODEL", "sonnet"),
         ("CLAUDE_SONNET_MODEL", "sonnet"),
-        ("CLAUDE_OPUS_MODEL", "global.anthropic.claude-opus-4-6-v1"),
-        ("CLAUDE_HAIKU_MODEL", "global.anthropic.claude-haiku-4-5-20251001-v1:0"),
+        ("CLAUDE_OPUS_MODEL", "opus"),
+        ("CLAUDE_HAIKU_MODEL", "haiku"),
         ("BEDROCK_CHAT_MODEL", "anthropic.claude-3-5-sonnet-20241022-v2:0"),
         ("BEDROCK_REGION", bedrock_region),
         ("AWS_REGION", aws_region),
@@ -324,6 +331,8 @@ def render_env(config: dict[str, str], output: Path) -> None:
         ("CODEX_HOME", "/var/lib/codex-api/run-home/.codex"),
         ("CODEX_DANGEROUS_MODE", "true"),
         ("CODEX_MAX_CONCURRENT", "1"),
+        ("CODEX_MAX_JOB_STREAMS", "8"),
+        ("CODEX_JOB_STREAM_HEARTBEAT_MS", "15000"),
         ("CODEX_MAX_BODY_BYTES", "31457280"),
         ("CODEX_MAX_JOB_ATTACHMENTS", "6"),
         ("CODEX_MAX_JOB_ATTACHMENT_BYTES", "8388608"),
@@ -335,6 +344,14 @@ def render_env(config: dict[str, str], output: Path) -> None:
         ("CODEX_THREAD_SUMMARY_CHARACTERS", "240"),
         ("CODEX_DEFAULT_TIMEOUT_MS", "600000"),
         ("CODEX_MAX_TIMEOUT_MS", "1800000"),
+        ("CODEX_FS_MAX_LIST_ENTRIES", "500"),
+        ("CODEX_FS_MAX_READ_BYTES", "1048576"),
+        ("CODEX_FS_MAX_FILE_BYTES", "26214400"),
+        (
+            "CODEX_FS_READ_DENYLIST",
+            ".env*,*.pem,*.key,*.p12,*.pfx,*.crt,*.csr,*.der,*.jks,*.keystore,*.mobileconfig,"
+            ".netrc,.npmrc,credentials,credentials.json,id_rsa,id_dsa,id_ecdsa,id_ed25519",
+        ),
         ("CODEX_WORKSPACES", workspace_default),
         ("CODEX_MODEL_CATALOG", model_catalog_default(config)),
         ("AZURE_OPENAI_ENDPOINT", ""),

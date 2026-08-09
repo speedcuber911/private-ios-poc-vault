@@ -8,12 +8,14 @@ if [[ -f "$CONFIG_FILE" ]]; then
 fi
 
 VAULT_DOMAIN="${VAULT_DOMAIN:-vault.pocs.example.com}"
-POC_WILDCARD_DOMAIN="${POC_WILDCARD_DOMAIN:-*.pocs.example.com}"
+POC_WILDCARD_DOMAIN="${POC_WILDCARD_DOMAIN-}"
 if [[ -z "${POC_VERIFY_HOST:-}" ]]; then
   if [[ "$POC_WILDCARD_DOMAIN" == \*.* ]]; then
     POC_VERIFY_HOST="smoke-test.${POC_WILDCARD_DOMAIN#*.}"
+    POC_VERIFY_PATH="${POC_VERIFY_PATH:-/}"
   else
-    POC_VERIFY_HOST="$POC_WILDCARD_DOMAIN"
+    POC_VERIFY_HOST="$VAULT_DOMAIN"
+    POC_VERIFY_PATH="${POC_VERIFY_PATH:-/pocs/smoke-test/}"
   fi
 fi
 MANIFEST_PATH="${MANIFEST_PATH:-/manifest.json}"
