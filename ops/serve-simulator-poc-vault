@@ -92,6 +92,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/codex/workspace-dirs":
             self.send_json(codex_fixture_workspace_dirs(parse_qs(query).get("path", [""])[0]))
             return
+        if path == "/v1/codex/fs/list":
+            self.serve_codex_fs_list(parse_qs(query))
+            return
+        if path == "/v1/codex/fs/file":
+            self.serve_codex_fs_file(parse_qs(query))
+            return
         if path == "/v1/codex/jobs":
             self.send_json({"jobs": [codex_fixture_job()]})
             return
@@ -99,7 +105,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"sessions": [codex_fixture_session()]})
             return
         if path == "/v1/codex/threads":
-            self.send_json({"threads": [codex_fixture_thread(), codex_fixture_chat_thread()]})
+            workspace_id = parse_qs(query).get("workspaceId", [""])[0]
+            threads = [codex_fixture_thread(), codex_fixture_chat_thread(), codex_fixture_scoped_chat_thread()]
+            if workspace_id:
+                # Workspace filters merge task and chat threads for that folder;
+                # legacy null-workspace chats stay global-only.
+                threads = [t for t in threads if t.get("workspaceId") == workspace_id]
+            threads.sort(key=lambda t: t.get("updatedAt") or "", reverse=True)
+            self.send_json({"threads": threads})
             return
         if path == "/v1/codex/threads/sim-thread-linear":
             self.send_json(codex_fixture_thread_detail())
@@ -107,13 +120,59 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/codex/threads/sim-chat-thread":
             self.send_json(codex_fixture_chat_thread_detail())
             return
+        if path == "/v1/codex/threads/sim-chat-thread-scoped":
+            self.send_json(codex_fixture_scoped_chat_thread_detail())
+            return
         if path == "/v1/codex/jobs/sim-job-linear":
             self.send_json(codex_fixture_job())
             return
         if path == "/v1/codex/jobs/sim-job-running":
             self.send_json(codex_fixture_running_job_tick())
             return
+        if path == "/v1/codex/jobs/sim-job-running/stream":
+            self.serve_codex_job_stream()
+            return
         self.send_error(404)
+
+    def serve_codex_job_stream(self) -> None:
+        """Canned live-job SSE fixture mirroring /v1/codex/jobs/<id>/stream:
+        status snapshot, stdout replay/live events with real byte offsets,
+        heartbeat comments, then a terminal done event."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        delay = float(os.environ.get("SIM_JOB_STREAM_DELAY", "0.35"))
+
+        def emit(event: str, payload: dict) -> None:
+            self.wfile.write(f"event: {event}\n".encode("utf-8"))
+            self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode("utf-8"))
+            self.wfile.flush()
+
+        emit("status", {
+            "id": "sim-job-running",
+            "status": "running",
+            "provider": "codex",
+            "workspaceId": "poc-vault",
+            "createdAt": "2026-05-23T13:34:00Z",
+            "startedAt": "2026-05-23T13:34:02Z",
+            "finishedAt": None,
+            "updatedAt": "2026-05-23T13:34:02Z",
+            "exitCode": None,
+            "timedOut": False,
+            "error": None,
+        })
+        offset = 0
+        for chunk in ["Scanning workspace…\n", "Reading recent activity…\n", "Drafting summary…\n"]:
+            emit("stdout", {"offset": offset, "text": chunk})
+            offset += len(chunk.encode("utf-8"))
+            self.wfile.write(b": heartbeat\n\n")
+            self.wfile.flush()
+            if delay > 0:
+                time.sleep(delay)
+        emit("done", codex_fixture_job(status="succeeded", id="sim-job-running"))
 
     def serve_codex_chat_fixture(self) -> None:
         body = self.read_json_body()
@@ -143,7 +202,9 @@ class Handler(BaseHTTPRequestHandler):
             "```\n",
             "The connection returns to the pool on close rather than tearing down.",
         ]
-        events = [("meta", {"threadId": "sim-chat-thread", "model": model, "provider": provider})]
+        workspace_id = body.get("workspaceId") or None
+        thread_id = "sim-chat-thread-scoped" if workspace_id else "sim-chat-thread"
+        events = [("meta", {"threadId": thread_id, "model": model, "provider": provider, "workspaceId": workspace_id})]
         events += [("delta", {"text": chunk}) for chunk in deltas]
         events += [
             ("usage", {"inputTokens": 18, "outputTokens": 96}),
@@ -155,6 +216,79 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             if event == "delta" and delta_delay > 0:
                 time.sleep(delta_delay)
+
+    def do_HEAD(self) -> None:
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path)
+        if path == "/v1/codex/fs/file":
+            self.serve_codex_fs_file(parse_qs(parsed.query), head_only=True)
+            return
+        self.send_error(404)
+
+    def serve_codex_fs_list(self, query: dict) -> None:
+        requested = (query.get("path", [""])[0] or "").strip()
+        listing = codex_fixture_fs_list(requested, query)
+        if listing is None:
+            self.send_json_error(404, "workspace directory was not found")
+            return
+        self.send_json(listing)
+
+    def serve_codex_fs_file(self, query: dict, head_only: bool = False) -> None:
+        requested = (query.get("path", [""])[0] or "").strip()
+        node = sim_fs_node(requested)
+        if node is None or node.get("kind") != "file":
+            self.send_json_error(404, "file was not found")
+            return
+        if node.get("denied"):
+            self.send_json_error(403, "file matches the read denylist")
+            return
+
+        content = sim_fs_content(node)
+        size = len(content)
+        mime = node.get("mime", "text/plain; charset=utf-8")
+        status = 200
+        start = 0
+        end = min(size, _SIM_FS_MAX_READ_BYTES) - 1
+        range_header = self.headers.get("Range")
+        if range_header:
+            byte_range = sim_parse_byte_range(range_header, size)
+            if byte_range is None:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                return
+            status = 206
+            start, end = byte_range
+            end = min(end, start + _SIM_FS_MAX_READ_BYTES - 1)
+        elif size > _SIM_FS_MAX_READ_BYTES:
+            status = 206
+
+        body = content[start : end + 1]
+        active = mime.startswith("text/html") or mime.startswith("image/svg")
+        disposition = "attachment" if active or not node.get("inline", True) else "inline"
+        self.send_response(status)
+        self.send_header("Content-Type", mime)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Disposition", f'{disposition}; filename="{requested.rsplit("/", 1)[-1]}"')
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(body)
+
+    def send_json_error(self, status: int, message: str) -> None:
+        payload = json.dumps({"error": message}).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
 
     def read_json_body(self) -> dict:
         length = int(self.headers.get("Content-Length") or "0")
@@ -244,6 +378,178 @@ def codex_fixture_workspaces() -> list[dict]:
     return [dict(ws) for ws in _SIM_WORKSPACES]
 
 
+# --- Read-only files API fixtures (mirrors /v1/codex/fs/* on the live server) ---
+
+_SIM_FS_MAX_READ_BYTES = 1024 * 1024
+
+# 1x1 transparent PNG so the viewer exercises a real binary image fixture.
+_SIM_FS_PNG = __import__("base64").b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+)
+
+
+def _sim_big_log() -> bytes:
+    line = b"2026-08-09T00:00:00Z simulator build log line for range testing\n"
+    target = 1536 * 1024  # 1.5 MiB so plain GET returns a 206 first window
+    return (line * (target // len(line) + 1))[:target]
+
+
+_SIM_FS_TREE = {
+    "poc-vault": {
+        "kind": "dir",
+        "children": {
+            ".env": {"kind": "file", "content": b"SIMULATOR_PLACEHOLDER=1\n", "denied": True,
+                     "mime": "text/plain; charset=utf-8", "isText": True},
+            "readme.md": {"kind": "file", "content": b"# POC Vault\n\nSimulator file fixture for the Relay browser.\n",
+                          "mime": "text/markdown; charset=utf-8", "isText": True},
+            "assets": {"kind": "dir", "children": {
+                "pixel.png": {"kind": "file", "content": _SIM_FS_PNG, "mime": "image/png", "isText": False},
+            }},
+            "logs": {"kind": "dir", "children": {
+                "build.log": {"kind": "file", "content_fn": _sim_big_log,
+                              "mime": "text/plain; charset=utf-8", "isText": True},
+            }},
+        },
+    },
+    "scratch": {"kind": "dir", "children": {
+        "notes.txt": {"kind": "file", "content": b"scratch notes\n",
+                      "mime": "text/plain; charset=utf-8", "isText": True},
+    }},
+    "sigiq": {"kind": "dir", "children": {
+        "ai-tutor": {"kind": "dir", "children": {}},
+    }},
+}
+
+
+def sim_fs_relative(requested: str) -> str | None:
+    text = (requested or "").strip().strip("/")
+    if text.startswith(_SIM_WORKSPACE_ROOT.strip("/")):
+        text = text[len(_SIM_WORKSPACE_ROOT.strip("/")):].strip("/")
+    if ".." in text.split("/"):
+        return None
+    return text
+
+
+def sim_fs_node(requested: str) -> dict | None:
+    relative = sim_fs_relative(requested)
+    if relative is None:
+        return None
+    node: dict = {"kind": "dir", "children": _SIM_FS_TREE}
+    for segment in [part for part in relative.split("/") if part]:
+        children = node.get("children", {})
+        if segment not in children:
+            return None
+        node = children[segment]
+    return node
+
+
+def sim_fs_content(node: dict) -> bytes:
+    if "content_fn" in node:
+        return node["content_fn"]()
+    return node.get("content", b"")
+
+
+def sim_parse_byte_range(value: str, size: int) -> tuple[int, int] | None:
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", value.strip())
+    if not match or (match.group(1) == "" and match.group(2) == ""):
+        return None
+    if match.group(1) == "":
+        suffix = int(match.group(2))
+        if suffix <= 0 or size == 0:
+            return None
+        return (max(0, size - suffix), size - 1)
+    start = int(match.group(1))
+    if start >= size:
+        return None
+    end = size - 1 if match.group(2) == "" else min(int(match.group(2)), size - 1)
+    if end < start:
+        return None
+    return (start, end)
+
+
+def codex_fixture_fs_list(requested: str, query: dict) -> dict | None:
+    relative = sim_fs_relative(requested)
+    node = sim_fs_node(requested)
+    if relative is None or node is None or node.get("kind") != "dir":
+        return None
+
+    registered = {ws["id"]: ws for ws in _SIM_WORKSPACES}
+    dirs = []
+    files = []
+    for name, child in sorted(node.get("children", {}).items()):
+        child_rel = f"{relative}/{name}" if relative else name
+        absolute = f"{_SIM_WORKSPACE_ROOT}/{child_rel}"
+        if child.get("kind") == "dir":
+            workspace_id = child_rel if child_rel in registered else "dir-" + child_rel.replace("/", "-")
+            workspace_name = registered.get(child_rel, {}).get("name") or child_rel.replace("/", " / ")
+            dirs.append({
+                "name": name,
+                "kind": "dir",
+                "path": child_rel,
+                "absolutePath": absolute,
+                "modifiedAt": "2026-08-09T00:00:00.000Z",
+                "workspaceId": workspace_id,
+                "workspaceName": workspace_name,
+                "hasGit": name == "ai-tutor",
+                "isRegistered": child_rel in registered,
+            })
+        else:
+            files.append({
+                "name": name,
+                "kind": "file",
+                "path": child_rel,
+                "absolutePath": absolute,
+                "size": len(sim_fs_content(child)),
+                "modifiedAt": "2026-08-09T00:00:00.000Z",
+                "mime": child.get("mime", "application/octet-stream"),
+                "isText": bool(child.get("isText")),
+                "readDenied": bool(child.get("denied")),
+            })
+
+    entries = dirs + files
+    try:
+        offset = max(0, int((query.get("offset", ["0"])[0] or "0")))
+    except ValueError:
+        offset = 0
+    try:
+        limit = max(1, int((query.get("limit", ["500"])[0] or "500")))
+    except ValueError:
+        limit = 500
+    page = entries[offset : offset + limit]
+
+    workspace = None
+    if relative:
+        ws = registered.get(relative)
+        if ws is not None:
+            workspace = {"id": ws["id"], "name": ws["name"], "path": ws["path"]}
+        else:
+            segments = relative.split("/")
+            first_name = registered.get(segments[0], {}).get("name") or segments[0]
+            workspace = {
+                "id": "dir-" + relative.replace("/", "-"),
+                "name": " / ".join([first_name, *segments[1:]]),
+                "path": f"{_SIM_WORKSPACE_ROOT}/{relative}",
+            }
+
+    parent = None
+    if relative:
+        parent_rel = "/".join(relative.split("/")[:-1])
+        parent = f"{_SIM_WORKSPACE_ROOT}/{parent_rel}" if parent_rel else _SIM_WORKSPACE_ROOT
+
+    return {
+        "rootPath": _SIM_WORKSPACE_ROOT,
+        "path": relative,
+        "absolutePath": f"{_SIM_WORKSPACE_ROOT}/{relative}" if relative else _SIM_WORKSPACE_ROOT,
+        "parentPath": parent,
+        "workspace": workspace,
+        "offset": offset,
+        "limit": limit,
+        "total": len(entries),
+        "truncated": offset + len(page) < len(entries),
+        "entries": page,
+    }
+
+
 def codex_fixture_workspace_dirs(path: str) -> dict:
     current = path.strip() or _SIM_WORKSPACE_ROOT
     registered = {ws["path"]: ws for ws in _SIM_WORKSPACES}
@@ -327,20 +633,20 @@ def _sim_task_entries() -> list[dict]:
     codex_effort = ["low", "medium", "high", "xhigh"]
     claude_effort = ["low", "medium", "high"]
     codex_models = [
-        ("GPT-5.5", "gpt-5.5"),
-        ("GPT-5.4", "gpt-5.4"),
-        ("GPT-5.4-Mini", "gpt-5.4-mini"),
-        ("GPT-5.3-Codex-Spark", "gpt-5.3-codex-spark"),
+        ("GPT-5.6 Sol", "gpt-5.6-sol"),
+        ("GPT-5.6 Terra", "gpt-5.6-terra"),
+        ("GPT-5.6 Luna", "gpt-5.6-luna"),
     ]
     entries = [{"id": "codex-cli", "label": "Codex CLI", "provider": "codex", "modes": ["task"], "effortLevels": codex_effort}]
     entries += [
-        {"id": f"codex-{tm}", "label": f"Codex · {label}", "provider": "codex", "modes": ["task"], "taskModel": tm, "effortLevels": codex_effort}
+        {"id": f"codex-{tm}", "label": f"Codex · {label}", "provider": "codex", "modes": ["chat", "task"], "taskModel": tm, "effortLevels": codex_effort}
         for label, tm in codex_models
     ]
     entries += [
         {"id": "claude-code-sonnet", "label": "Claude Code · Sonnet", "provider": "claude", "modes": ["task"], "taskModel": "sonnet", "effortLevels": claude_effort},
         {"id": "claude-code-opus", "label": "Claude Code · Opus", "provider": "claude", "modes": ["task"], "taskModel": "opus", "effortLevels": claude_effort},
         {"id": "claude-code-haiku", "label": "Claude Code · Haiku", "provider": "claude", "modes": ["task"], "taskModel": "haiku", "effortLevels": claude_effort},
+        {"id": "cursor-agent-auto", "label": "Cursor Agent · Auto", "provider": "cursor", "modes": ["task"], "taskModel": "auto", "effortLevels": []},
     ]
     return entries
 
@@ -530,6 +836,8 @@ def codex_fixture_chat_thread() -> dict:
         "sessionId": "sim-chat-thread",
         "mode": "chat",
         "provider": "bedrock",
+        "workspaceId": None,
+        "workspaceName": "Chat",
         "updatedAt": "2026-05-29T09:30:00Z",
         "jobCount": 0,
         "activeJobCount": 0,
@@ -537,6 +845,44 @@ def codex_fixture_chat_thread() -> dict:
         "lastResult": "Simulator chat is wired.",
         "hasSessionFile": True,
         "isSmokeTest": False,
+    }
+
+
+def codex_fixture_scoped_chat_thread() -> dict:
+    return {
+        "id": "sim-chat-thread-scoped",
+        "sessionId": "sim-chat-thread-scoped",
+        "mode": "chat",
+        "provider": "codex",
+        "model": "codex-gpt-5.6-sol",
+        "workspaceId": "poc-vault",
+        "workspaceName": "POC Vault",
+        "updatedAt": "2026-08-09T10:00:00Z",
+        "jobCount": 0,
+        "activeJobCount": 0,
+        "lastPrompt": "What does this folder contain?",
+        "lastResult": "This folder hosts the POC Vault static POCs and ops tooling.",
+        "hasSessionFile": False,
+        "isSmokeTest": False,
+    }
+
+
+def codex_fixture_scoped_chat_thread_detail() -> dict:
+    return {
+        "thread": codex_fixture_scoped_chat_thread(),
+        "messages": [
+            {
+                "role": "user",
+                "timestamp": "2026-08-09T09:59:50Z",
+                "text": "What does this folder contain?",
+            },
+            {
+                "role": "assistant",
+                "timestamp": "2026-08-09T10:00:00Z",
+                "text": "This folder hosts the POC Vault static POCs and ops tooling.",
+            },
+        ],
+        "jobs": [],
     }
 
 

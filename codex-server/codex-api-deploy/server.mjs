@@ -18,6 +18,7 @@ const artifactsDir = path.join(dataDir, "artifacts");
 const auditPath = path.join(dataDir, "audit.jsonl");
 const codexBin = process.env.CODEX_BIN || "/usr/bin/codex";
 const claudeBin = process.env.CLAUDE_BIN || "/usr/bin/claude";
+const cursorBin = process.env.CURSOR_BIN || path.join(process.env.CODEX_RUN_HOME || process.env.HOME || "/home/ec2-user", ".local", "bin", "cursor-agent");
 const runHome = process.env.CODEX_RUN_HOME || process.env.HOME || "/home/ec2-user";
 const codexHome = process.env.CODEX_HOME || path.join(runHome, ".codex");
 const claudeHome = process.env.CLAUDE_HOME || path.join(runHome, ".claude");
@@ -25,6 +26,8 @@ const npmCacheDir = process.env.NPM_CONFIG_CACHE || process.env.npm_config_cache
 const bunCacheDir = process.env.BUN_INSTALL_CACHE_DIR || path.join(runHome, ".bun-cache");
 const dangerousMode = parseBooleanEnv("CODEX_DANGEROUS_MODE", true);
 const maxConcurrent = parseIntegerEnv("CODEX_MAX_CONCURRENT", 1, 1, 16);
+const maxJobStreams = parseIntegerEnv("CODEX_MAX_JOB_STREAMS", 8, 1, 64);
+const jobStreamHeartbeatMs = parseIntegerEnv("CODEX_JOB_STREAM_HEARTBEAT_MS", 15000, 50, 120000);
 const maxBodyBytes = parseIntegerEnv("CODEX_MAX_BODY_BYTES", 30 * 1024 * 1024, 1, 50 * 1024 * 1024);
 const maxJobAttachments = parseIntegerEnv("CODEX_MAX_JOB_ATTACHMENTS", 6, 0, 20);
 const maxJobAttachmentBytes = parseIntegerEnv("CODEX_MAX_JOB_ATTACHMENT_BYTES", 8 * 1024 * 1024, 1, 25 * 1024 * 1024);
@@ -65,16 +68,26 @@ const workspaceBrowseRoot = realpathOrResolve(
   process.env.CODEX_WORKSPACE_BROWSE_ROOT || process.env.CODEX_WORKSPACE_ROOT || "/srv/codex-workspaces",
 );
 const maxWorkspaceDirEntries = parseIntegerEnv("CODEX_MAX_WORKSPACE_DIR_ENTRIES", 100, 1, 1000);
+const maxFsListEntries = parseIntegerEnv("CODEX_FS_MAX_LIST_ENTRIES", 500, 1, 10000);
+const maxFsReadBytes = parseIntegerEnv("CODEX_FS_MAX_READ_BYTES", 1024 * 1024, 1024, 50 * 1024 * 1024);
+const maxFsFileBytes = Math.max(
+  parseIntegerEnv("CODEX_FS_MAX_FILE_BYTES", 25 * 1024 * 1024, 1024, 500 * 1024 * 1024),
+  maxFsReadBytes,
+);
+const fsReadDenylist = splitCsv(
+  process.env.CODEX_FS_READ_DENYLIST ||
+    ".env*,*.pem,*.key,*.p12,*.pfx,*.crt,*.csr,*.der,*.jks,*.keystore,*.mobileconfig,.netrc,.npmrc,credentials,credentials.json,id_rsa,id_dsa,id_ecdsa,id_ed25519",
+).map(compileDenyPattern);
 
 const terminalStatuses = new Set(["succeeded", "failed", "cancelled", "timeout"]);
 const allowedReasoningEfforts = new Set(["low", "medium", "high", "xhigh"]);
-const allowedJobProviders = new Set(["codex", "claude"]);
-const allowedChatProviders = new Set(["azure", "bedrock"]);
+const allowedJobProviders = new Set(["codex", "claude", "cursor"]);
+const allowedChatProviders = new Set(["codex", "azure", "bedrock"]);
 const allowedThreadProviders = new Set([...allowedJobProviders, ...allowedChatProviders]);
 const allowedClaudePermissionModes = new Set(["acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"]);
 const claudeAwsProfile = cleanOptionalAwsProfile(process.env.CLAUDE_AWS_PROFILE);
-if (claudeAwsProfile !== "sigiq") {
-  throw new Error("Bedrock access requires CLAUDE_AWS_PROFILE=sigiq; refusing to start.");
+if (claudeAwsProfile && claudeAwsProfile !== "sigiq") {
+  throw new Error("Bedrock access requires CLAUDE_AWS_PROFILE=sigiq; leave it unset for direct Claude subscription auth.");
 }
 const claudeAwsRegion = cleanOptionalAwsProfile(
   process.env.CLAUDE_AWS_REGION || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION,
@@ -85,8 +98,8 @@ const bedrockRegion = cleanOptionalAwsProfile(
 const bedrockRuntimeEndpoint = cleanOptionalEndpoint(process.env.BEDROCK_RUNTIME_ENDPOINT);
 const claudeModelAliases = {
   sonnet: process.env.CLAUDE_SONNET_MODEL || "sonnet",
-  opus: process.env.CLAUDE_OPUS_MODEL || "global.anthropic.claude-opus-4-6-v1",
-  haiku: process.env.CLAUDE_HAIKU_MODEL || "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+  opus: process.env.CLAUDE_OPUS_MODEL || "opus",
+  haiku: process.env.CLAUDE_HAIKU_MODEL || "haiku",
 };
 const claudeDefaultModel = normalizeClaudeModel(cleanOptionalModel(process.env.CLAUDE_DEFAULT_MODEL || "sonnet"));
 const azureSpeechEndpoint = cleanOptionalEndpoint(process.env.AZURE_SPEECH_ENDPOINT);
@@ -105,6 +118,8 @@ const chatsDir = path.join(dataDir, "chats");
 const jobs = new Map();
 const dynamicWorkspaces = new Map();
 const activeChildren = new Map();
+const jobStreamSubscribers = new Map();
+let activeJobStreamCount = 0;
 let queuedJobIds = [];
 let cachedBedrockCredentials = null;
 
@@ -309,7 +324,7 @@ function cleanModelProvider(value) {
   }
   const normalized = value.trim().toLowerCase();
   if (!allowedThreadProviders.has(normalized)) {
-    throw new Error("model provider must be codex, claude, azure, or bedrock");
+    throw new Error("model provider must be codex, claude, cursor, azure, or bedrock");
   }
   return normalized;
 }
@@ -539,6 +554,7 @@ function workspaceDirectoryEntries(currentPath, search) {
   const stack = [{ dir: currentPath, depth: 0 }];
   const pathSearch = search.includes("/") || search.includes("\\");
   const normalizedPathSearch = search.replaceAll("\\", "/");
+  const maps = browseWorkspaceMaps();
 
   while (stack.length > 0 && results.length < maxWorkspaceDirEntries) {
     const { dir, depth } = stack.pop();
@@ -552,15 +568,15 @@ function workspaceDirectoryEntries(currentPath, search) {
     entries.sort((left, right) => right.name.localeCompare(left.name));
     for (const dirent of entries) {
       if (dirent.name.startsWith(".")) continue;
-      const entryPath = safeRealDirectory(path.join(dir, dirent.name));
-      if (!entryPath || !pathBelongsToRoot(entryPath, workspaceBrowseRoot)) continue;
+      const entryPath = resolveListedDirectory(dir, dirent);
+      if (!entryPath) continue;
       const relativePath = relativeBrowsePath(entryPath);
       const matches =
         !search ||
         dirent.name.toLowerCase().includes(search) ||
         (pathSearch && relativePath.toLowerCase().includes(normalizedPathSearch));
       if (matches) {
-        const workspace = browseWorkspaceForPath(entryPath);
+        const workspace = describeBrowseWorkspace(entryPath, maps);
         results.push({
           name: dirent.name,
           path: entryPath,
@@ -577,6 +593,436 @@ function workspaceDirectoryEntries(currentPath, search) {
   }
 
   return results.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+}
+
+// Resolves a listed dirent to a real directory path without a per-entry realpath.
+// Parent paths handed to listings are already fully resolved, so a plain directory
+// entry needs no further resolution; only symlinks are realpathed and contained.
+function resolveListedDirectory(parentPath, dirent) {
+  const candidate = path.join(parentPath, dirent.name);
+  if (dirent.isDirectory()) return candidate;
+  if (!dirent.isSymbolicLink()) return null;
+  const resolved = safeRealDirectory(candidate);
+  if (!resolved || !resolvedPathWithinRoot(resolved)) return null;
+  return resolved;
+}
+
+// Prebuilt path -> workspace and id -> workspace lookup maps so listings avoid a
+// linear registry scan per entry. Registered workspaces take precedence over
+// dynamic ones, matching resolveWorkspaceById/browseWorkspaceForPath ordering.
+function browseWorkspaceMaps() {
+  const byPath = new Map();
+  const byId = new Map();
+  for (const workspace of workspaces.values()) {
+    byPath.set(workspace.path, workspace);
+    byId.set(workspace.id, workspace);
+  }
+  for (const workspace of dynamicWorkspaces.values()) {
+    if (!byPath.has(workspace.path)) byPath.set(workspace.path, workspace);
+    if (!byId.has(workspace.id)) byId.set(workspace.id, workspace);
+  }
+  return { byPath, byId };
+}
+
+// Map-backed equivalent of browseWorkspaceForPath for already-resolved paths.
+// Never materializes dynamic workspaces; listing must not mutate the registry.
+function describeBrowseWorkspace(resolvedPath, maps) {
+  const exact = maps.byPath.get(resolvedPath);
+  if (exact) return exact;
+
+  if (!resolvedPathWithinRoot(resolvedPath) || resolvedPath === workspaceBrowseRoot) {
+    return null;
+  }
+
+  const relativePath = path.relative(workspaceBrowseRoot, resolvedPath);
+  if (!relativePath || relativePath.startsWith("..") || path.isAbsolute(relativePath)) return null;
+
+  const workspace = {
+    id: dynamicWorkspaceId(relativePath),
+    name: dynamicWorkspaceName(relativePath),
+    path: resolvedPath,
+    dynamic: true,
+  };
+  const existingById = maps.byId.get(workspace.id);
+  if (existingById) {
+    if (existingById.path === workspace.path) return existingById;
+    workspace.id = `${workspace.id}-${shortHash(relativePath)}`;
+  }
+  return workspace;
+}
+
+// Compiles one CODEX_FS_READ_DENYLIST pattern. Only `*` is a wildcard; every
+// other character matches literally and matching is case-insensitive on the
+// entry basename.
+function compileDenyPattern(pattern) {
+  const escaped = pattern
+    .split("*")
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join(".*");
+  return new RegExp(`^${escaped}$`, "i");
+}
+
+function isReadDeniedName(name) {
+  return fsReadDenylist.some((pattern) => pattern.test(name));
+}
+
+const fsTextMimeByExtension = new Map([
+  [".txt", "text/plain"],
+  [".log", "text/plain"],
+  [".text", "text/plain"],
+  [".md", "text/markdown"],
+  [".markdown", "text/markdown"],
+  [".json", "application/json"],
+  [".jsonl", "application/json"],
+  [".js", "text/javascript"],
+  [".mjs", "text/javascript"],
+  [".cjs", "text/javascript"],
+  [".jsx", "text/javascript"],
+  [".ts", "text/plain"],
+  [".tsx", "text/plain"],
+  [".css", "text/css"],
+  [".html", "text/html"],
+  [".htm", "text/html"],
+  [".svg", "image/svg+xml"],
+  [".xml", "application/xml"],
+  [".yaml", "text/plain"],
+  [".yml", "text/plain"],
+  [".toml", "text/plain"],
+  [".ini", "text/plain"],
+  [".conf", "text/plain"],
+  [".csv", "text/csv"],
+  [".tsv", "text/plain"],
+  [".sh", "text/plain"],
+  [".bash", "text/plain"],
+  [".zsh", "text/plain"],
+  [".py", "text/plain"],
+  [".rb", "text/plain"],
+  [".go", "text/plain"],
+  [".rs", "text/plain"],
+  [".java", "text/plain"],
+  [".kt", "text/plain"],
+  [".swift", "text/plain"],
+  [".c", "text/plain"],
+  [".h", "text/plain"],
+  [".cpp", "text/plain"],
+  [".hpp", "text/plain"],
+  [".m", "text/plain"],
+  [".sql", "text/plain"],
+  [".env", "text/plain"],
+  [".plist", "text/plain"],
+  [".lock", "text/plain"],
+  [".mod", "text/plain"],
+  [".sum", "text/plain"],
+]);
+
+const fsBinaryMimeByExtension = new Map([
+  [".png", "image/png"],
+  [".jpg", "image/jpeg"],
+  [".jpeg", "image/jpeg"],
+  [".gif", "image/gif"],
+  [".webp", "image/webp"],
+  [".ico", "image/x-icon"],
+  [".heic", "image/heic"],
+  [".pdf", "application/pdf"],
+  [".zip", "application/zip"],
+  [".gz", "application/gzip"],
+  [".tar", "application/x-tar"],
+  [".mp3", "audio/mpeg"],
+  [".wav", "audio/wav"],
+  [".m4a", "audio/mp4"],
+  [".mp4", "video/mp4"],
+  [".mov", "video/quicktime"],
+  [".woff", "font/woff"],
+  [".woff2", "font/woff2"],
+]);
+
+const fsTextBasenames = new Set([
+  ".gitignore",
+  ".gitattributes",
+  ".gitmodules",
+  ".editorconfig",
+  ".nvmrc",
+  ".npmrc",
+  ".netrc",
+  ".env",
+  "dockerfile",
+  "makefile",
+  "license",
+  "readme",
+  "changelog",
+  "agents.md",
+]);
+
+// Conservative extension-based MIME hint. This never sniffs content; unknown
+// extensions fall back to application/octet-stream and download disposition.
+function mimeHintForFilename(name) {
+  const lowerName = String(name || "").toLowerCase();
+  const extension = path.extname(lowerName);
+  if (extension && fsTextMimeByExtension.has(extension)) {
+    const mime = fsTextMimeByExtension.get(extension);
+    return { mime: `${mime}; charset=utf-8`, isText: true };
+  }
+  if (extension && fsBinaryMimeByExtension.has(extension)) {
+    return { mime: fsBinaryMimeByExtension.get(extension), isText: false };
+  }
+  if (fsTextBasenames.has(lowerName) || lowerName.startsWith(".env")) {
+    return { mime: "text/plain; charset=utf-8", isText: true };
+  }
+  return { mime: "application/octet-stream", isText: false };
+}
+
+function cleanFsListOffset(value) {
+  if (value === null || value === undefined || value === "") return 0;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw Object.assign(new Error("offset must be a non-negative integer"), { status: 400 });
+  }
+  return parsed;
+}
+
+function cleanFsListLimit(value) {
+  if (value === null || value === undefined || value === "") return maxFsListEntries;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw Object.assign(new Error("limit must be a positive integer"), { status: 400 });
+  }
+  return Math.min(parsed, maxFsListEntries);
+}
+
+function fsListResponse(searchParams) {
+  const resolved = resolveBrowsePath(searchParams.get("path") || "", { kind: "dir" });
+  const currentPath = resolved.path;
+  const offset = cleanFsListOffset(searchParams.get("offset"));
+  const limit = cleanFsListLimit(searchParams.get("limit"));
+  const maps = browseWorkspaceMaps();
+  const entries = collectFsEntries(currentPath, maps);
+  const page = entries.slice(offset, offset + limit);
+  const parent = currentPath === workspaceBrowseRoot ? null : path.dirname(currentPath);
+  const workspace = currentPath === workspaceBrowseRoot ? null : describeBrowseWorkspace(currentPath, maps);
+
+  return {
+    rootPath: workspaceBrowseRoot,
+    path: relativeBrowsePath(currentPath),
+    absolutePath: currentPath,
+    parentPath: parent && resolvedPathWithinRoot(parent) ? parent : null,
+    workspace: workspace ? publicWorkspace(workspace) : null,
+    offset,
+    limit,
+    total: entries.length,
+    truncated: offset + page.length < entries.length,
+    entries: page,
+  };
+}
+
+// Lists one directory: directories first, then files, each sorted by name.
+// Dotfiles are listed; secret-pattern files stay listed but carry
+// readDenied: true so the client knows the HTTP read will be refused.
+function collectFsEntries(currentPath, maps) {
+  let dirents = [];
+  try {
+    dirents = fs.readdirSync(currentPath, { withFileTypes: true });
+  } catch {
+    throw Object.assign(new Error("directory could not be read"), { status: 500 });
+  }
+
+  const dirs = [];
+  const files = [];
+  for (const dirent of dirents) {
+    const entry = fsEntryForDirent(currentPath, dirent, maps);
+    if (!entry) continue;
+    (entry.kind === "dir" ? dirs : files).push(entry);
+  }
+  const byName = (left, right) => left.name.localeCompare(right.name);
+  return [...dirs.sort(byName), ...files.sort(byName)];
+}
+
+function fsEntryForDirent(parentPath, dirent, maps) {
+  const candidate = path.join(parentPath, dirent.name);
+  let resolved = candidate;
+  let stat = null;
+  if (dirent.isSymbolicLink()) {
+    try {
+      resolved = fs.realpathSync(candidate);
+      stat = fs.statSync(resolved);
+    } catch {
+      return null;
+    }
+    if (!resolvedPathWithinRoot(resolved)) return null;
+  } else if (dirent.isDirectory() || dirent.isFile()) {
+    try {
+      stat = fs.statSync(candidate);
+    } catch {
+      return null;
+    }
+  } else {
+    return null;
+  }
+
+  const relativePath = relativeBrowsePath(resolved);
+  const modifiedAt = stat.mtime.toISOString();
+  if (stat.isDirectory()) {
+    const workspace = describeBrowseWorkspace(resolved, maps);
+    return {
+      name: dirent.name,
+      kind: "dir",
+      path: relativePath,
+      absolutePath: resolved,
+      modifiedAt,
+      workspaceId: workspace?.id || null,
+      workspaceName: workspace?.name || null,
+      hasGit: fs.existsSync(path.join(resolved, ".git")),
+      isRegistered: Boolean(workspace && workspaces.get(workspace.id)),
+    };
+  }
+  if (!stat.isFile()) return null;
+
+  const hint = mimeHintForFilename(dirent.name);
+  return {
+    name: dirent.name,
+    kind: "file",
+    path: relativePath,
+    absolutePath: resolved,
+    size: stat.size,
+    modifiedAt,
+    mime: hint.mime,
+    isText: hint.isText,
+    readDenied: isReadDeniedName(dirent.name),
+  };
+}
+
+function isTruthyQueryParam(value) {
+  return ["1", "true", "yes", "on"].includes(String(value || "").trim().toLowerCase());
+}
+
+// Single-range parser for `Range: bytes=<start>-<end>` requests. Returns null
+// for malformed or unsatisfiable ranges (caller answers 416).
+function parseByteRange(value, size) {
+  const match = /^bytes=(\d*)-(\d*)$/.exec(String(value).trim());
+  if (!match || (match[1] === "" && match[2] === "")) return null;
+  if (match[1] === "") {
+    const suffix = Number(match[2]);
+    if (!Number.isSafeInteger(suffix) || suffix <= 0 || size === 0) return null;
+    return { start: Math.max(0, size - suffix), end: size - 1 };
+  }
+  const start = Number(match[1]);
+  if (!Number.isSafeInteger(start) || start >= size) return null;
+  if (match[2] === "") return { start, end: size - 1 };
+  const end = Number(match[2]);
+  if (!Number.isSafeInteger(end) || end < start) return null;
+  return { start, end: Math.min(end, size - 1) };
+}
+
+// GET|HEAD /v1/codex/fs/file — bounded read-only file access inside the jail.
+// Guard order: jail containment, regular file, read denylist. Responses always
+// carry no-store, nosniff, and a safe content disposition. Active content
+// (HTML/SVG) downloads unless the sandboxed preview is explicitly requested.
+function serveFsFile(req, res, searchParams) {
+  const { path: filePath, stat } = resolveBrowsePath(searchParams.get("path") || "", { kind: "file" });
+  const name = path.basename(filePath);
+  if (isReadDeniedName(name)) {
+    throw Object.assign(new Error("file matches the read denylist"), { status: 403 });
+  }
+  if (stat.size > maxFsFileBytes) {
+    throw Object.assign(new Error("file exceeds the maximum readable size"), { status: 413 });
+  }
+
+  const hint = mimeHintForFilename(name);
+  const isActiveContent = hint.mime.startsWith("text/html") || hint.mime.startsWith("image/svg");
+  if (isTruthyQueryParam(searchParams.get("preview"))) {
+    return serveFsFilePreview(req, res, { filePath, stat, name, isActiveContent });
+  }
+
+  let status = 200;
+  let start = 0;
+  let end = Math.min(stat.size, maxFsReadBytes) - 1;
+  const rangeHeader = headerValue(req.headers.range);
+  if (rangeHeader) {
+    const range = parseByteRange(rangeHeader, stat.size);
+    if (!range) {
+      res.writeHead(416, {
+        "content-range": `bytes */${stat.size}`,
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+      });
+      res.end();
+      return;
+    }
+    status = 206;
+    start = range.start;
+    end = Math.min(range.end, start + maxFsReadBytes - 1);
+  } else if (stat.size > maxFsReadBytes) {
+    // Larger permitted files stream in bounded windows: the first window is
+    // served as 206 so the client knows to continue with Range requests.
+    status = 206;
+  }
+
+  const length = Math.max(0, end - start + 1);
+  const inlineSafe =
+    !isActiveContent &&
+    (hint.isText || ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(hint.mime));
+  const disposition = isTruthyQueryParam(searchParams.get("download")) || !inlineSafe ? "attachment" : "inline";
+  const headers = {
+    "content-type": hint.mime,
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    "accept-ranges": "bytes",
+    "content-length": length,
+    "content-disposition": `${disposition}; filename="${contentDispositionFilename(name)}"`,
+  };
+  if (status === 206) {
+    headers["content-range"] = `bytes ${start}-${end}/${stat.size}`;
+  }
+
+  if (req.method === "HEAD") {
+    res.writeHead(status, headers);
+    res.end();
+    return;
+  }
+
+  let body = Buffer.alloc(length);
+  if (length > 0) {
+    const fd = fs.openSync(filePath, "r");
+    try {
+      const bytesRead = fs.readSync(fd, body, 0, length, start);
+      if (bytesRead < length) {
+        body = body.subarray(0, bytesRead);
+        headers["content-length"] = body.length;
+        if (status === 206) headers["content-range"] = `bytes ${start}-${start + Math.max(0, body.length - 1)}/${stat.size}`;
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+  res.writeHead(status, headers);
+  res.end(body);
+}
+
+// Explicit sandboxed preview for HTML/SVG using the same srcdoc + CSP wrapper
+// as job artifact previews.
+function serveFsFilePreview(req, res, { filePath, stat, name, isActiveContent }) {
+  if (!isActiveContent) {
+    throw Object.assign(new Error("preview is only available for HTML and SVG files"), { status: 400 });
+  }
+  if (stat.size > maxFsReadBytes) {
+    throw Object.assign(new Error("file exceeds the preview size limit"), { status: 413 });
+  }
+  const raw = fs.readFileSync(filePath, "utf8");
+  const language = mimeHintForFilename(name).mime.startsWith("image/svg") ? "svg" : "html";
+  const html = artifactPreviewWrapper({ filename: name, title: name, kind: "file preview", language }, raw);
+  const body = Buffer.from(html, "utf8");
+  const headers = {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    "content-length": body.length,
+  };
+  if (req.method === "HEAD") {
+    res.writeHead(200, headers);
+    res.end();
+    return;
+  }
+  res.writeHead(200, headers);
+  res.end(body);
 }
 
 function selectWorkspaceDirectory(body) {
@@ -642,6 +1088,19 @@ function cleanWorkspaceDirectoryName(value) {
 }
 
 function resolveBrowseDirectory(value) {
+  return resolveBrowsePath(value, { kind: "dir" }).path;
+}
+
+// Kind-aware jail resolver shared by the directory browser and the read-only
+// files API. Every returned path is realpath-resolved and contained inside
+// workspaceBrowseRoot.
+//
+// - kind "dir" keeps the legacy workspace-dirs contract: missing or
+//   non-directory paths return 404 before the containment check runs.
+// - kind "file" rejects escapes first (including lexical `..`/absolute escapes,
+//   without disclosing whether the outside path exists), then requires a
+//   regular file.
+function resolveBrowsePath(value, { kind = "dir" } = {}) {
   if (typeof value !== "string" || /[\0\r\n]/.test(value)) {
     throw Object.assign(new Error("workspace path is invalid"), { status: 400 });
   }
@@ -649,14 +1108,49 @@ function resolveBrowseDirectory(value) {
   const candidate = trimmed
     ? path.resolve(path.isAbsolute(trimmed) ? trimmed : path.join(workspaceBrowseRoot, trimmed))
     : workspaceBrowseRoot;
-  const resolved = safeRealDirectory(candidate);
-  if (!resolved) {
+
+  let resolved = null;
+  let stat = null;
+  try {
+    resolved = fs.realpathSync(candidate);
+    stat = fs.statSync(resolved);
+  } catch {
+    resolved = null;
+    stat = null;
+  }
+
+  if (kind === "file") {
+    if (resolved && !resolvedPathWithinRoot(resolved)) {
+      throw Object.assign(new Error("path must stay inside the workspace root"), { status: 400 });
+    }
+    if (!resolved || !stat) {
+      // A missing path that is lexically outside the root gets the same escape
+      // error so probing cannot distinguish existing outside files.
+      if (!resolvedPathWithinRoot(candidate)) {
+        throw Object.assign(new Error("path must stay inside the workspace root"), { status: 400 });
+      }
+      throw Object.assign(new Error("file was not found"), { status: 404 });
+    }
+    if (!stat.isFile()) {
+      throw Object.assign(new Error("path is not a regular file"), { status: 400 });
+    }
+    return { path: resolved, stat };
+  }
+
+  if (!resolved || !stat || !stat.isDirectory()) {
     throw Object.assign(new Error("workspace directory was not found"), { status: 404 });
   }
-  if (!pathBelongsToRoot(resolved, workspaceBrowseRoot)) {
+  if (!resolvedPathWithinRoot(resolved)) {
     throw Object.assign(new Error("workspace path must stay inside the workspace root"), { status: 400 });
   }
-  return resolved;
+  return { path: resolved, stat };
+}
+
+// Fast containment check for candidates that are already realpath-resolved.
+// workspaceBrowseRoot itself is resolved once at boot, so no repeated root
+// realpath is needed on hot listing paths.
+function resolvedPathWithinRoot(resolvedPath) {
+  return resolvedPath === workspaceBrowseRoot || resolvedPath.startsWith(`${workspaceBrowseRoot}${path.sep}`);
 }
 
 function safeRealDirectory(candidate) {
@@ -956,6 +1450,14 @@ async function routeRequest(req, res) {
     );
   }
 
+  if (req.method === "GET" && url.pathname === "/v1/codex/fs/list") {
+    return sendJson(res, 200, fsListResponse(url.searchParams));
+  }
+
+  if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/v1/codex/fs/file") {
+    return serveFsFile(req, res, url.searchParams);
+  }
+
   if (req.method === "POST" && url.pathname === "/v1/codex/workspaces/select") {
     const body = await readBody(req);
     return sendJson(res, 200, publicWorkspace(selectWorkspaceDirectory(body)));
@@ -1044,6 +1546,15 @@ async function routeRequest(req, res) {
     const job = jobs.get(jobId);
     if (!job) return sendError(res, 404, "artifact not found");
     return serveJobArtifact(res, job, artifactId, mode);
+  }
+
+  const streamMatch = url.pathname.match(/^\/v1\/codex\/jobs\/([^/]+)\/stream$/);
+  if (streamMatch && req.method === "GET") {
+    const id = streamMatch[1];
+    if (!isSafeJobId(id)) return sendError(res, 404, "job not found");
+    const job = jobs.get(id);
+    if (!job) return sendError(res, 404, "job not found");
+    return streamJobEvents(req, res, job, url.searchParams);
   }
 
   const jobMatch = url.pathname.match(/^\/v1\/codex\/jobs\/([^/]+)(?:\/(cancel))?$/);
@@ -1144,6 +1655,26 @@ async function proxyCodexRequest(req, url, res) {
     }
 
     const upstream = transport.request(target, options, (upstreamRes) => {
+      const contentType = headerValue(upstreamRes.headers["content-type"]);
+      if (/text\/event-stream/i.test(contentType)) {
+        // Pipe SSE responses through instead of buffering so live streams
+        // (chat, job streaming) work in dev proxy mode.
+        res.writeHead(upstreamRes.statusCode || 502, {
+          "content-type": contentType,
+          "cache-control": upstreamRes.headers["cache-control"] || "no-cache, no-transform",
+          connection: "keep-alive",
+          "x-accel-buffering": "no",
+        });
+        upstreamRes.pipe(res);
+        res.on("close", () => upstreamRes.destroy());
+        upstreamRes.on("end", () => resolve());
+        upstreamRes.on("error", () => {
+          res.end();
+          resolve();
+        });
+        return;
+      }
+
       const chunks = [];
       upstreamRes.on("data", (chunk) => chunks.push(chunk));
       upstreamRes.on("end", () => {
@@ -1193,10 +1724,17 @@ async function handleChatRequest(req, res, body, certSubject) {
   const startedAt = nowIso();
   const replyChunks = [];
   let usage = null;
-  sendSse(res, "meta", { threadId: chat.threadId, model: chat.model, provider: chat.provider });
+  sendSse(res, "meta", {
+    threadId: chat.threadId,
+    model: chat.model,
+    provider: chat.provider,
+    workspaceId: chat.workspace?.id ?? null,
+  });
 
   try {
-    if (chat.provider === "azure") {
+    if (chat.provider === "codex") {
+      usage = await streamCodexChat(res, chat, abortController.signal, replyChunks);
+    } else if (chat.provider === "azure") {
       usage = await streamAzureChat(res, chat, abortController.signal, replyChunks);
     } else if (chat.provider === "bedrock") {
       usage = await streamBedrockChat(res, chat, abortController.signal, replyChunks);
@@ -1234,12 +1772,46 @@ function cleanChatRequest(body) {
   if (existingThread && existingThread.provider !== provider) {
     throw Object.assign(new Error("chat thread provider does not match requested provider"), { status: 400 });
   }
+  const workspace = resolveChatWorkspace(body.workspaceId, existingThread);
   const messages = cleanChatMessages(body.messages);
   const options = {
     ...(catalogEntry.defaultOptions || {}),
     ...cleanChatOptions(body.options || {}),
   };
-  return { provider, model, catalogEntry, threadId, messages, options };
+  return { provider, model, catalogEntry, threadId, workspace, messages, options };
+}
+
+// Resolves the optional chat workspaceId through the same registered/dynamic
+// registry used by jobs. Continuations inherit the stored workspace when the
+// id is omitted; a conflicting id (including one sent for a legacy
+// null-workspace chat) is rejected.
+function resolveChatWorkspace(value, existingThread) {
+  let requestedId = null;
+  if (value !== undefined && value !== null && value !== "") {
+    if (typeof value !== "string" || !/^[A-Za-z0-9._-]{1,80}$/.test(value)) {
+      throw Object.assign(new Error("workspaceId is invalid"), { status: 400 });
+    }
+    requestedId = value;
+  }
+
+  const storedId = existingThread ? existingThread.workspaceId ?? null : null;
+  if (existingThread && requestedId && requestedId !== storedId) {
+    throw Object.assign(new Error("chat thread workspace does not match requested workspaceId"), { status: 400 });
+  }
+
+  const effectiveId = requestedId || storedId;
+  if (!effectiveId) return null;
+
+  const workspace = resolveWorkspaceById(effectiveId);
+  if (workspace) {
+    return { id: workspace.id, name: workspace.name, path: workspace.path };
+  }
+  if (requestedId && !existingThread) {
+    throw Object.assign(new Error("workspaceId is not registered"), { status: 400 });
+  }
+  // The stored workspace no longer resolves (for example a removed dynamic
+  // folder). Keep the persisted identity; Codex chat falls back to scratch.
+  return { id: effectiveId, name: existingThread?.workspaceName || effectiveId, path: null };
 }
 
 function cleanChatProvider(value) {
@@ -1248,7 +1820,7 @@ function cleanChatProvider(value) {
   }
   const normalized = value.trim().toLowerCase();
   if (!allowedChatProviders.has(normalized)) {
-    throw Object.assign(new Error("chat provider must be azure or bedrock"), { status: 400 });
+    throw Object.assign(new Error("chat provider must be codex, azure, or bedrock"), { status: 400 });
   }
   return normalized;
 }
@@ -1300,6 +1872,121 @@ function cleanChatOptions(value) {
   return options;
 }
 
+async function streamCodexChat(res, chat, signal, replyChunks) {
+  // A workspace-scoped chat runs read-only in the selected folder; unscoped
+  // chats (and stored workspaces that no longer resolve) fall back to scratch.
+  const workspace =
+    (chat.workspace?.path ? chat.workspace : null) || resolveWorkspaceById("scratch") || workspaceList()[0];
+  if (!workspace) {
+    throw Object.assign(new Error("Codex chat requires a registered workspace"), { status: 503 });
+  }
+
+  const model = chat.catalogEntry.taskModel || chat.model;
+  const resultPath = path.join(chatsDir, `.codex-chat-${crypto.randomUUID()}.txt`);
+  const args = [
+    "-a",
+    "never",
+    "-s",
+    "read-only",
+    "-m",
+    model,
+    "-c",
+    'model_reasoning_effort="medium"',
+    "exec",
+    "-C",
+    workspace.path,
+    "--skip-git-repo-check",
+    "--ephemeral",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--color",
+    "never",
+    "-o",
+    resultPath,
+    "-",
+  ];
+
+  let stderr = "";
+  const child = spawn(codexBin, args, {
+    cwd: workspace.path,
+    env: buildJobEnv({ provider: "codex" }),
+    stdio: ["pipe", "ignore", "pipe"],
+  });
+
+  const stopChild = () => {
+    if (child.exitCode !== null || child.killed) return;
+    child.kill("SIGTERM");
+    const killTimer = setTimeout(() => {
+      if (child.exitCode === null) child.kill("SIGKILL");
+    }, 5000);
+    killTimer.unref();
+  };
+
+  const timeoutMs = Math.min(defaultTimeoutMs, 5 * 60 * 1000);
+  try {
+    const result = await new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (callback) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutTimer);
+        signal.removeEventListener("abort", onAbort);
+        callback();
+      };
+      const onAbort = () => {
+        stopChild();
+        finish(() => reject(Object.assign(new Error("Codex chat request aborted"), { name: "AbortError" })));
+      };
+      const timeoutTimer = setTimeout(() => {
+        stopChild();
+        finish(() => reject(new Error("Codex chat timed out")));
+      }, timeoutMs);
+      timeoutTimer.unref();
+
+      signal.addEventListener("abort", onAbort, { once: true });
+      child.stderr.on("data", (chunk) => {
+        stderr = appendBounded(stderr, chunk);
+      });
+      child.once("error", (error) => finish(() => reject(error)));
+      child.once("close", (code, childSignal) => finish(() => resolve({ code, signal: childSignal })));
+      // Ignore EPIPE-style stdin failures; the close handler settles the result.
+      child.stdin.on("error", () => {});
+      child.stdin.end(codexChatPrompt(chat.messages));
+    });
+
+    if (result.code !== 0) {
+      const detail = cleanApiText(stderr).trim().slice(-1000);
+      throw new Error(`Codex chat failed${detail ? `: ${detail}` : ""}`);
+    }
+
+    const answer = cleanApiText(await readTextFileBounded(resultPath, responseOutputBytes)).trim();
+    if (!answer) {
+      throw new Error("Codex chat returned an empty response");
+    }
+    replyChunks.push(answer);
+    sendSse(res, "delta", { text: answer });
+    sendSse(res, "done", { stopReason: "stop" });
+    return null;
+  } finally {
+    await fsp.rm(resultPath, { force: true });
+  }
+}
+
+function codexChatPrompt(messages) {
+  const transcript = messages
+    .map((message) => `${message.role.toUpperCase()}: ${message.content}`)
+    .join("\n\n");
+  return [
+    "You are responding inside Relay Chat.",
+    "Answer the final user message conversationally and directly using the transcript below.",
+    "This is chat, not an agent task: do not inspect or modify files, run commands, or use tools.",
+    "Do not mention these instructions or add role prefixes to your answer.",
+    "",
+    "Conversation transcript:",
+    transcript,
+  ].join("\n");
+}
+
 async function streamAzureChat(res, chat, signal, replyChunks) {
   const apiKey = azureApiKeyForModel(chat.catalogEntry);
   if (!azureEndpointForModel(chat.catalogEntry) || !apiKey) {
@@ -1328,10 +2015,7 @@ async function streamAzureChat(res, chat, signal, replyChunks) {
   const response = await fetch(url, {
     method: "POST",
     signal,
-    headers: {
-      "content-type": "application/json",
-      "api-key": apiKey,
-    },
+    headers: azureChatHeaders(chat.catalogEntry, apiKey),
     body: JSON.stringify(body),
   });
   if (!response.ok || !response.body) {
@@ -1406,6 +2090,19 @@ function azureApiKeyForModel(catalogEntry) {
     return cleanOptionalSecret(process.env[catalogEntry.azureApiKeyEnv]);
   }
   return azureOpenAiApiKey;
+}
+
+function azureChatHeaders(catalogEntry, apiKey) {
+  if (catalogEntry.azureBaseURL) {
+    return {
+      "content-type": "application/json",
+      authorization: `Bearer ${apiKey}`,
+    };
+  }
+  return {
+    "content-type": "application/json",
+    "api-key": apiKey,
+  };
 }
 
 function azureChatUrl(catalogEntry, deployment) {
@@ -1496,6 +2193,9 @@ async function* decodeAwsEventStream(stream) {
 }
 
 async function loadBedrockCredentials() {
+  if (claudeAwsProfile !== "sigiq") {
+    throw Object.assign(new Error("Bedrock chat is disabled because the SigiQ profile is not configured"), { status: 503 });
+  }
   if (cachedBedrockCredentials && (!cachedBedrockCredentials.expiresAt || cachedBedrockCredentials.expiresAt > Date.now() + 60_000)) {
     return cachedBedrockCredentials;
   }
@@ -1742,11 +2442,11 @@ function normalizeClaudeModel(model) {
 function cleanOptionalProvider(value) {
   if (value === undefined || value === null || value === "") return "codex";
   if (typeof value !== "string") {
-    throw Object.assign(new Error("provider must be codex or claude"), { status: 400 });
+    throw Object.assign(new Error("provider must be codex, claude, or cursor"), { status: 400 });
   }
   const normalized = value.trim().toLowerCase();
   if (!allowedJobProviders.has(normalized)) {
-    throw Object.assign(new Error("provider must be codex or claude"), { status: 400 });
+    throw Object.assign(new Error("provider must be codex, claude, or cursor"), { status: 400 });
   }
   return normalized;
 }
@@ -1763,7 +2463,7 @@ function cleanThreadProviderFilter(value) {
   }
   const normalized = value.trim().toLowerCase();
   if (!allowedThreadProviders.has(normalized)) {
-    throw Object.assign(new Error("provider must be codex, claude, azure, or bedrock"), { status: 400 });
+    throw Object.assign(new Error("provider must be codex, claude, cursor, azure, or bedrock"), { status: 400 });
   }
   return normalized;
 }
@@ -1796,6 +2496,14 @@ function skillRoots(provider) {
       ...splitPathList(process.env.CLAUDE_SKILL_DIRS),
       path.join(claudeHome, "skills"),
       path.join(claudeHome, "plugins", "cache"),
+    ]);
+  }
+
+  if (provider === "cursor") {
+    return uniqueExistingDirectories([
+      ...splitPathList(process.env.CURSOR_SKILL_DIRS),
+      path.join(runHome, ".cursor", "skills-cursor"),
+      path.join(runHome, ".cursor", "skills"),
     ]);
   }
 
@@ -2080,7 +2788,7 @@ function promptWithAttachments(prompt, attachments) {
 
 function promptWithSelectedSkills(prompt, provider, skills) {
   if (!skills.length) return prompt;
-  const label = provider === "claude" ? "Claude" : "Codex";
+  const label = provider === "claude" ? "Claude" : provider === "cursor" ? "Cursor" : "Codex";
   const blocks = skills
     .map((skill) => {
       const body = boundedSkillBody(skill.file);
@@ -2798,7 +3506,7 @@ function listWorkspaceThreads({ workspaceId, provider = null, limit }) {
 
   return [...threadMap.values()]
     .map(threadSummary)
-    .concat(selectedWorkspace ? [] : listChatThreads({ provider, limit: 200 }))
+    .concat(listChatThreads({ provider, workspace: selectedWorkspace, limit: 200 }))
     .sort((left, right) => compareIsoDesc(left.updatedAt, right.updatedAt))
     .slice(0, limit);
 }
@@ -2907,7 +3615,7 @@ function deleteThread(sessionId, { workspaceId = null, provider = null, certSubj
   });
 
   if (!sessionMatches && matchedJobs.length === 0) {
-    const deletedChat = deleteChatThread(sessionId, { workspaceId, provider, certSubject });
+    const deletedChat = deleteChatThread(sessionId, { workspace: selectedWorkspace, provider, certSubject });
     if (deletedChat) return deletedChat;
     return null;
   }
@@ -3017,8 +3725,8 @@ function persistChatThread(chat) {
     mode: "chat",
     provider: chat.provider,
     model: chat.model,
-    workspaceId: null,
-    workspaceName: "Chat",
+    workspaceId: chat.workspace?.id ?? null,
+    workspaceName: chat.workspace?.name ?? "Chat",
     createdAt,
     updatedAt: chat.updatedAt || nowIso(),
     certSubject: chat.certSubject || existing?.certSubject || null,
@@ -3028,7 +3736,7 @@ function persistChatThread(chat) {
   fs.writeFileSync(chatPath(chat.threadId), `${JSON.stringify(thread, null, 2)}\n`, "utf8");
   appendAudit(
     "chat_completed",
-    { id: chat.threadId, status: "succeeded", workspaceId: null, certSubject: chat.certSubject },
+    { id: chat.threadId, status: "succeeded", workspaceId: chat.workspace?.id ?? null, certSubject: chat.certSubject },
     { provider: chat.provider, model: chat.model },
   );
 }
@@ -3055,7 +3763,7 @@ function readChatThread(threadId) {
   }
 }
 
-function listChatThreads({ provider = null, limit = 200 } = {}) {
+function listChatThreads({ provider = null, workspace = null, limit = 200 } = {}) {
   let entries = [];
   try {
     entries = fs.readdirSync(chatsDir, { withFileTypes: true });
@@ -3067,6 +3775,9 @@ function listChatThreads({ provider = null, limit = 200 } = {}) {
     .map((entry) => readChatThread(entry.name.slice(0, -5)))
     .filter(Boolean)
     .filter((thread) => !provider || thread.provider === provider)
+    // Workspace filters return only chats scoped to that workspace. Legacy
+    // null-workspace chats stay global-only.
+    .filter((thread) => !workspace || (thread.workspaceId ?? null) === workspace.id)
     .map(chatThreadSummary)
     .sort((left, right) => compareIsoDesc(left.updatedAt, right.updatedAt))
     .slice(0, limit);
@@ -3082,8 +3793,8 @@ function chatThreadSummary(thread) {
     mode: "chat",
     provider: thread.provider,
     model: thread.model || null,
-    workspaceId: null,
-    workspaceName: "Chat",
+    workspaceId: thread.workspaceId ?? null,
+    workspaceName: thread.workspaceName || "Chat",
     cwd: null,
     timestamp: thread.createdAt || null,
     updatedAt: thread.updatedAt || thread.createdAt || null,
@@ -3114,22 +3825,24 @@ function chatThreadDetailResponse(threadId, { provider = null } = {}) {
   };
 }
 
-function deleteChatThread(sessionId, { workspaceId = null, provider = null, certSubject = null } = {}) {
-  if (workspaceId) return null;
+function deleteChatThread(sessionId, { workspace = null, provider = null, certSubject = null } = {}) {
   const thread = readChatThread(sessionId);
   if (!thread) return null;
+  // Workspace-scoped deletion touches only chats bound to that workspace;
+  // legacy null-workspace chats are deletable only without a workspace filter.
+  if (workspace && (thread.workspaceId ?? null) !== workspace.id) return null;
   if (provider && thread.provider !== provider) return null;
   const deleted = removePathInsideRoot(chatPath(sessionId), chatsDir);
   if (!deleted) return null;
   appendAudit(
     "thread_deleted",
-    { id: sessionId, status: "deleted", workspaceId: null, certSubject },
+    { id: sessionId, status: "deleted", workspaceId: thread.workspaceId ?? null, certSubject },
     { provider: thread.provider, deletedJobs: 0, deletedChatThread: true },
   );
   return {
     deleted: true,
     threadId: sessionId,
-    workspaceId: null,
+    workspaceId: thread.workspaceId ?? null,
     deletedJobs: 0,
     deletedSessionFile: false,
     deletedChatThread: true,
@@ -3400,8 +4113,7 @@ function cancelJob(job) {
     job.timedOut = false;
     job.result = null;
     job.error = "job cancelled before start";
-    persistJob(job);
-    appendAudit("job_cancelled", job);
+    touchJob(job, "job_cancelled");
     processQueue();
     return job;
   }
@@ -3414,8 +4126,7 @@ function cancelJob(job) {
   active.cancelRequested = true;
   job.updatedAt = nowIso();
   job.error = "cancellation requested";
-  persistJob(job);
-  appendAudit("job_cancel_requested", job);
+  touchJob(job, "job_cancel_requested");
   terminateChild(active);
   return job;
 }
@@ -3436,8 +4147,7 @@ function startJob(job) {
   job.updatedAt = startedAt;
   job.error = null;
   job.timedOut = false;
-  persistJob(job);
-  appendAudit("job_started", job);
+  touchJob(job, "job_started");
 
   const stdoutStream = fs.createWriteStream(job.stdoutPath, { flags: "a" });
   const stderrStream = fs.createWriteStream(job.stderrPath, { flags: "a" });
@@ -3446,7 +4156,7 @@ function startJob(job) {
 
   const args = buildJobArgs(job);
   const childEnv = buildJobEnv(job);
-  const child = spawn(job.provider === "claude" ? claudeBin : codexBin, args, {
+  const child = spawn(jobBinary(job.provider), args, {
     cwd: job.workspacePath,
     env: childEnv,
     stdio: ["pipe", "pipe", "pipe"],
@@ -3470,20 +4180,21 @@ function startJob(job) {
     job.timedOut = true;
     job.updatedAt = nowIso();
     job.error = "job timed out";
-    persistJob(job);
-    appendAudit("job_timeout_requested", job);
+    touchJob(job, "job_timeout_requested");
     terminateChild(active);
   }, job.timeoutMs);
   active.timeoutTimer.unref();
 
   child.stdout.on("data", (chunk) => {
     stdout = appendBounded(stdout, chunk);
-    stdoutStream.write(chunk);
+    // Notify live stream subscribers only after the chunk reaches the
+    // persisted log so their file reads observe the new bytes.
+    stdoutStream.write(chunk, () => notifyJobStreamData(job.id));
   });
 
   child.stderr.on("data", (chunk) => {
     stderr = appendBounded(stderr, chunk);
-    stderrStream.write(chunk);
+    stderrStream.write(chunk, () => notifyJobStreamData(job.id));
   });
 
   child.on("error", (error) => {
@@ -3507,11 +4218,27 @@ function startJob(job) {
     });
   });
 
+  // A provider binary may exit or close stdin before the prompt write lands
+  // (crash, immediate failure, or a CLI that never reads stdin). That surfaces
+  // as an EPIPE on the stdin socket which must not crash the service; the job
+  // outcome is decided by the exit code.
+  child.stdin.on("error", (error) => {
+    if (error?.code === "EPIPE") return;
+    appendAudit("job_stdin_write_failed", job, { error: error.message || String(error) });
+  });
   child.stdin.end(job.codexPrompt || job.prompt);
 }
 
 function buildJobArgs(job) {
-  return job.provider === "claude" ? buildClaudeArgs(job) : buildCodexArgs(job);
+  if (job.provider === "claude") return buildClaudeArgs(job);
+  if (job.provider === "cursor") return buildCursorArgs(job);
+  return buildCodexArgs(job);
+}
+
+function jobBinary(provider) {
+  if (provider === "claude") return claudeBin;
+  if (provider === "cursor") return cursorBin;
+  return codexBin;
 }
 
 function buildJobEnv(job) {
@@ -3531,18 +4258,40 @@ function buildJobEnv(job) {
     PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
   };
 
-  if (job.provider === "claude" && claudeAwsProfile) {
-    env.CLAUDE_AWS_PROFILE = claudeAwsProfile;
-    env.AWS_PROFILE = claudeAwsProfile;
-    env.AWS_SDK_LOAD_CONFIG = process.env.AWS_SDK_LOAD_CONFIG || "1";
+  if (job.provider === "cursor") {
+    // Direct Cursor subscription jobs never inherit ambient AWS credential or
+    // Bedrock configuration, mirroring the direct Claude scrub.
+    delete env.AWS_ACCESS_KEY_ID;
+    delete env.AWS_SECRET_ACCESS_KEY;
+    delete env.AWS_SESSION_TOKEN;
+    delete env.AWS_PROFILE;
+    delete env.AWS_DEFAULT_PROFILE;
+    delete env.AWS_REGION;
+    delete env.AWS_DEFAULT_REGION;
+    delete env.CLAUDE_CODE_USE_BEDROCK;
+    delete env.CLAUDE_AWS_PROFILE;
+  }
+
+  if (job.provider === "claude") {
     delete env.AWS_ACCESS_KEY_ID;
     delete env.AWS_SECRET_ACCESS_KEY;
     delete env.AWS_SESSION_TOKEN;
     delete env.AWS_DEFAULT_PROFILE;
-    if (claudeAwsRegion) {
-      env.AWS_REGION = claudeAwsRegion;
-      env.AWS_DEFAULT_REGION = claudeAwsRegion;
+    if (claudeAwsProfile === "sigiq") {
+      env.CLAUDE_AWS_PROFILE = claudeAwsProfile;
+      env.AWS_PROFILE = claudeAwsProfile;
+      env.AWS_SDK_LOAD_CONFIG = process.env.AWS_SDK_LOAD_CONFIG || "1";
+      if (claudeAwsRegion) {
+        env.AWS_REGION = claudeAwsRegion;
+        env.AWS_DEFAULT_REGION = claudeAwsRegion;
+      } else {
+        delete env.AWS_REGION;
+        delete env.AWS_DEFAULT_REGION;
+      }
     } else {
+      delete env.CLAUDE_AWS_PROFILE;
+      delete env.CLAUDE_CODE_USE_BEDROCK;
+      delete env.AWS_PROFILE;
       delete env.AWS_REGION;
       delete env.AWS_DEFAULT_REGION;
     }
@@ -3592,6 +4341,14 @@ function buildClaudeArgs(job) {
   return args;
 }
 
+function buildCursorArgs(job) {
+  const args = ["-p", "--force", "--trust", "--workspace", job.workspacePath, "--output-format", "json"];
+  if (job.model) args.push("--model", job.model);
+  if (job.resumeSessionId) args.push("--resume", job.resumeSessionId);
+  args.push(job.codexPrompt || job.prompt);
+  return args;
+}
+
 function terminateChild(active) {
   if (active.child.exitCode !== null || active.child.killed) return;
   active.child.kill("SIGTERM");
@@ -3600,6 +4357,269 @@ function terminateChild(active) {
       if (active.child.exitCode === null) active.child.kill("SIGKILL");
     }, 5000);
     active.killTimer.unref();
+  }
+}
+
+// Persists a job state transition, records the audit event, and pushes a
+// status notification to any live SSE stream subscribers. Every job state
+// transition (start/finish/cancel/timeout) goes through this wrapper.
+function touchJob(job, auditEvent, auditExtra = {}) {
+  persistJob(job);
+  if (auditEvent) appendAudit(auditEvent, job, auditExtra);
+  notifyJobStatusChanged(job);
+}
+
+const jobStreamChunkBytes = 64 * 1024;
+
+function cleanStreamOffset(value) {
+  if (value === null || value === undefined || value === "") return 0;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw Object.assign(new Error("stream offset must be a non-negative integer"), { status: 400 });
+  }
+  return parsed;
+}
+
+// Splits a buffer so `complete` ends on a UTF-8 code point boundary and
+// `remainder` carries the trailing bytes of an incomplete sequence into the
+// next chunk. Keeps streamed text valid UTF-8 across chunk boundaries.
+function splitUtf8Tail(buffer) {
+  let holdback = 0;
+  for (let i = buffer.length - 1; i >= 0 && i >= buffer.length - 4; i -= 1) {
+    const byte = buffer[i];
+    if ((byte & 0b11000000) === 0b10000000) continue;
+    let expected = 1;
+    if ((byte & 0b11100000) === 0b11000000) expected = 2;
+    else if ((byte & 0b11110000) === 0b11100000) expected = 3;
+    else if ((byte & 0b11111000) === 0b11110000) expected = 4;
+    const have = buffer.length - i;
+    if (have < expected) holdback = have;
+    break;
+  }
+  if (holdback === 0) return { complete: buffer, remainder: Buffer.alloc(0) };
+  return {
+    complete: buffer.subarray(0, buffer.length - holdback),
+    remainder: Buffer.from(buffer.subarray(buffer.length - holdback)),
+  };
+}
+
+function jobStatusPayload(job) {
+  return {
+    id: job.id,
+    status: job.status,
+    provider: normalizeJobProvider(job.provider),
+    workspaceId: job.workspaceId || null,
+    createdAt: job.createdAt || null,
+    startedAt: job.startedAt || null,
+    finishedAt: job.finishedAt || null,
+    updatedAt: job.updatedAt || null,
+    exitCode: job.exitCode ?? null,
+    timedOut: Boolean(job.timedOut),
+    error: cleanApiText(job.error || "").trim() || null,
+  };
+}
+
+function makeStreamChannel(name, file, offset) {
+  return { name, file, offset, remainder: Buffer.alloc(0) };
+}
+
+function safeSendSse(subscriber, event, data) {
+  if (subscriber.closed) return;
+  try {
+    sendSse(subscriber.res, event, data);
+  } catch {
+    closeJobStream(subscriber);
+  }
+}
+
+// GET /v1/codex/jobs/<id>/stream?stdoutOffset=&stderrOffset= — SSE live view
+// of one job. Emits an immediate status snapshot, replays persisted logs from
+// the requested byte offsets (bounded), follows live output, then sends a
+// terminal `done` event with the job response and closes. Safe to call at any
+// point in the job lifecycle, including after the job finished.
+async function streamJobEvents(req, res, job, searchParams) {
+  const stdoutOffset = cleanStreamOffset(searchParams.get("stdoutOffset"));
+  const stderrOffset = cleanStreamOffset(searchParams.get("stderrOffset"));
+  if (activeJobStreamCount >= maxJobStreams) {
+    return sendError(res, 503, "too many concurrent job streams");
+  }
+  activeJobStreamCount += 1;
+  initSse(res);
+
+  ensureLogPaths(job);
+  const subscriber = {
+    res,
+    job,
+    closed: false,
+    pumping: false,
+    repump: false,
+    finishing: false,
+    heartbeatTimer: null,
+    channels: [
+      makeStreamChannel("stdout", job.stdoutPath, stdoutOffset),
+      makeStreamChannel("stderr", job.stderrPath, stderrOffset),
+    ],
+  };
+
+  let subscribers = jobStreamSubscribers.get(job.id);
+  if (!subscribers) {
+    subscribers = new Set();
+    jobStreamSubscribers.set(job.id, subscribers);
+  }
+  subscribers.add(subscriber);
+
+  subscriber.heartbeatTimer = setInterval(() => {
+    if (subscriber.closed) return;
+    try {
+      subscriber.res.write(": heartbeat\n\n");
+    } catch {
+      closeJobStream(subscriber);
+      return;
+    }
+    // Opportunistically drain bytes the log stream flushed after the last
+    // data notification.
+    void pumpJobStream(subscriber);
+  }, jobStreamHeartbeatMs);
+  subscriber.heartbeatTimer.unref();
+
+  req.on("close", () => closeJobStream(subscriber));
+
+  safeSendSse(subscriber, "status", jobStatusPayload(job));
+  boundStreamReplayStart(subscriber);
+  await pumpJobStream(subscriber);
+  if (terminalStatuses.has(job.status)) {
+    await finishJobStream(subscriber);
+  }
+}
+
+// Bounds the initial replay: at most maxOutputBytes of persisted log per
+// channel. Skipped bytes are visible to the client through the first event's
+// explicit byte offset.
+function boundStreamReplayStart(subscriber) {
+  for (const channel of subscriber.channels) {
+    let size = 0;
+    try {
+      size = fs.statSync(channel.file).size;
+    } catch {
+      continue;
+    }
+    if (size - channel.offset > maxOutputBytes) {
+      channel.offset = size - maxOutputBytes;
+    }
+  }
+}
+
+async function pumpJobStream(subscriber) {
+  if (subscriber.closed) return;
+  if (subscriber.pumping) {
+    subscriber.repump = true;
+    return;
+  }
+  subscriber.pumping = true;
+  try {
+    do {
+      subscriber.repump = false;
+      for (const channel of subscriber.channels) {
+        await drainStreamChannel(subscriber, channel);
+      }
+    } while (subscriber.repump && !subscriber.closed);
+  } finally {
+    subscriber.pumping = false;
+  }
+}
+
+// Reads any new bytes for one channel from the persisted log file and emits
+// them as SSE events carrying real byte offsets.
+async function drainStreamChannel(subscriber, channel) {
+  while (!subscriber.closed) {
+    let handle;
+    try {
+      handle = await fsp.open(channel.file, "r");
+    } catch {
+      return;
+    }
+    let bytesRead = 0;
+    const buffer = Buffer.alloc(jobStreamChunkBytes);
+    try {
+      ({ bytesRead } = await handle.read(buffer, 0, jobStreamChunkBytes, channel.offset));
+    } finally {
+      await handle.close();
+    }
+    if (bytesRead <= 0 || subscriber.closed) return;
+
+    const combined = channel.remainder.length
+      ? Buffer.concat([channel.remainder, buffer.subarray(0, bytesRead)])
+      : buffer.subarray(0, bytesRead);
+    const eventOffset = channel.offset - channel.remainder.length;
+    channel.offset += bytesRead;
+    const { complete, remainder } = splitUtf8Tail(combined);
+    channel.remainder = remainder;
+    if (complete.length > 0) {
+      safeSendSse(subscriber, channel.name, { offset: eventOffset, text: complete.toString("utf8") });
+    }
+    if (bytesRead < jobStreamChunkBytes) return;
+  }
+}
+
+// Final drain plus `done` event with the terminal job response, then close.
+async function finishJobStream(subscriber) {
+  if (subscriber.finishing || subscriber.closed) return;
+  subscriber.finishing = true;
+  await pumpJobStream(subscriber);
+  if (subscriber.closed) return;
+  for (const channel of subscriber.channels) {
+    if (channel.remainder.length > 0) {
+      safeSendSse(subscriber, channel.name, {
+        offset: channel.offset - channel.remainder.length,
+        text: channel.remainder.toString("utf8"),
+      });
+      channel.remainder = Buffer.alloc(0);
+    }
+  }
+  const terminalResponse = await toJobResponse(subscriber.job, responseShape("preview"));
+  safeSendSse(subscriber, "done", terminalResponse);
+  closeJobStream(subscriber, { end: true });
+}
+
+function closeJobStream(subscriber, { end = false } = {}) {
+  if (subscriber.closed) return;
+  subscriber.closed = true;
+  clearInterval(subscriber.heartbeatTimer);
+  const subscribers = jobStreamSubscribers.get(subscriber.job.id);
+  if (subscribers) {
+    subscribers.delete(subscriber);
+    if (subscribers.size === 0) jobStreamSubscribers.delete(subscriber.job.id);
+  }
+  activeJobStreamCount = Math.max(0, activeJobStreamCount - 1);
+  if (end) {
+    try {
+      subscriber.res.end();
+    } catch {
+      // Connection already gone.
+    }
+  }
+}
+
+// Called from the child stdout/stderr handlers after each chunk is flushed to
+// the persisted log so subscribers can pick up the new bytes immediately.
+function notifyJobStreamData(jobId) {
+  const subscribers = jobStreamSubscribers.get(jobId);
+  if (!subscribers) return;
+  for (const subscriber of subscribers) {
+    void pumpJobStream(subscriber);
+  }
+}
+
+function notifyJobStatusChanged(job) {
+  const subscribers = jobStreamSubscribers.get(job.id);
+  if (!subscribers) return;
+  const terminal = terminalStatuses.has(job.status);
+  for (const subscriber of [...subscribers]) {
+    if (subscriber.closed) continue;
+    if (!subscriber.finishing) {
+      safeSendSse(subscriber, "status", jobStatusPayload(job));
+    }
+    if (terminal) void finishJobStream(subscriber);
   }
 }
 
@@ -3614,19 +4634,20 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
 
   const finishedAt = nowIso();
   const stderrText = cleanApiText(stderr).trim();
-  const resultText =
-    job.provider === "claude"
-      ? await readTextFileBounded(job.stdoutPath, maxOutputBytes)
-      : await readTextFileBounded(job.resultPath, maxOutputBytes);
-  const cleanResult = cleanAssistantResult(resultText).trim();
-  const failedOutputText = job.provider === "claude" ? cleanResult : "";
+  const stdoutResultProvider = job.provider === "claude" || job.provider === "cursor";
+  const resultText = stdoutResultProvider
+    ? await readTextFileBounded(job.stdoutPath, maxOutputBytes)
+    : await readTextFileBounded(job.resultPath, maxOutputBytes);
+  const cursorResult = job.provider === "cursor" ? parseCursorResult(resultText) : null;
+  const cleanResult = cleanAssistantResult(cursorResult?.result ?? resultText).trim();
+  const failedOutputText = stdoutResultProvider ? cleanResult : "";
 
   job.updatedAt = finishedAt;
   job.finishedAt = finishedAt;
   job.durationMs = durationMs(job.startedAt, finishedAt);
   job.exitCode = code;
   job.timedOut = active.timedOut;
-  job.sessionId ||= job.resumeSessionId || findNewWorkspaceSessionId(job, active.sessionIdsBefore);
+  job.sessionId ||= cursorResult?.sessionId || job.resumeSessionId || findNewWorkspaceSessionId(job, active.sessionIdsBefore);
 
   if (active.cancelRequested) {
     job.status = "cancelled";
@@ -3640,11 +4661,11 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
     job.status = "failed";
     job.result = null;
     job.error = spawnError.message;
-  } else if (code === 0 && job.provider === "claude" && !cleanResult) {
+  } else if (code === 0 && stdoutResultProvider && !cleanResult) {
     job.status = "failed";
     job.result = null;
     job.artifacts = [];
-    job.error = "Claude exited successfully without producing output.";
+    job.error = `${job.provider === "cursor" ? "Cursor" : "Claude"} exited successfully without producing output.`;
   } else if (code === 0) {
     job.status = "succeeded";
     job.result = cleanResult || null;
@@ -3662,14 +4683,26 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
     job.error =
       stderrText ||
       failedOutputText ||
-      `${job.provider === "claude" ? "claude" : "codex"} exited with code ${code}${signal ? ` and signal ${signal}` : ""}`;
+      `${job.provider} exited with code ${code}${signal ? ` and signal ${signal}` : ""}`;
   }
 
-  persistJob(job);
-  appendAudit("job_finished", job, { code, signal });
+  touchJob(job, "job_finished", { code, signal });
   pruneRuntimeCachesIfIdle();
   scheduleRuntimeCachePrune();
   processQueue();
+}
+
+function parseCursorResult(value) {
+  try {
+    const parsed = JSON.parse(cleanApiText(value).trim());
+    if (!parsed || parsed.type !== "result" || parsed.subtype !== "success") return null;
+    return {
+      result: typeof parsed.result === "string" ? parsed.result : "",
+      sessionId: typeof parsed.session_id === "string" && isSafeJobId(parsed.session_id) ? parsed.session_id : null,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function scheduleRuntimeCachePrune() {
@@ -3753,6 +4786,10 @@ function workspaceSessionEntries(workspacePath) {
 
 async function toJobResponse(job, shape = responseShape("preview")) {
   const workspace = workspaceForJob(job);
+  // Keep the response internally consistent if a running job finishes while
+  // asynchronous log reads are in progress. A subsequent poll will then return
+  // the terminal status together with the terminal result.
+  const status = job.status;
   const [stdout, stderr, result] = await Promise.all([
     shapeTextPayload({
       file: job.stdoutPath || path.join(logsDir, `${job.id}.stdout.log`),
@@ -3779,7 +4816,7 @@ async function toJobResponse(job, shape = responseShape("preview")) {
 
   return {
     id: job.id,
-    status: job.status,
+    status,
     provider: normalizeJobProvider(job.provider),
     workspaceId: workspace?.id || job.workspaceId,
     workspaceName: workspace?.name || job.workspaceName,
@@ -3790,7 +4827,7 @@ async function toJobResponse(job, shape = responseShape("preview")) {
     updatedAt: job.updatedAt,
     startedAt: job.startedAt,
     finishedAt: job.finishedAt,
-    durationMs: job.status === "running" && job.startedAt ? Date.now() - Date.parse(job.startedAt) : job.durationMs,
+    durationMs: status === "running" && job.startedAt ? Date.now() - Date.parse(job.startedAt) : job.durationMs,
     exitCode: job.exitCode,
     timedOut: Boolean(job.timedOut),
     logsIncluded: shape.logsIncluded,

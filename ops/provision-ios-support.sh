@@ -90,13 +90,14 @@ mkdir -p "$support_dir"
 cp "$P12_PATH" "$support_dir/client.p12"
 cp "$config_json" "$support_dir/vault-config.json"
 
-xcrun devicectl device copy to \
-  --device "$DEVICE" \
-  --source "$support_dir" \
-  --destination Documents \
-  --domain-type appDataContainer \
-  --domain-identifier "$BUNDLE_ID" \
-  --timeout 30 \
-  --remove-existing-content false
+for support_file in client.p12 vault-config.json; do
+  xcrun devicectl device copy to \
+    --device "$DEVICE" \
+    --source "$support_dir/$support_file" \
+    --destination "Documents/support/$support_file" \
+    --domain-type appDataContainer \
+    --domain-identifier "$BUNDLE_ID" \
+    --timeout 30
+done
 
 echo "Provisioned iOS support files for bundle ${BUNDLE_ID}."
