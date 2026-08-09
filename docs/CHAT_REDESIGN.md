@@ -1,5 +1,15 @@
 # Relay Chat-First Redesign
 
+> **Superseded in part (2026-08-09):** the navigation and chat-surface shell
+> described here — the four bottom tabs, mode-locked Chat/Task view models, the
+> composer workspace chip, and the `RelayWorkspaceSheet` folder browser (§1,
+> §3, §6) — is being replaced by the files-first redesign specified in
+> [FILES_REDESIGN.md](FILES_REDESIGN.md) (implementation in progress). The
+> DEBUG launch-hook table in §8 changes with it. Still accurate and carried
+> forward: the model-catalog de-duplication and task-catalog entries (§2), the
+> streaming chat internals (§4), the server contract basics (§7, which the new
+> doc extends rather than replaces), and the build/run steps (§9).
+
 This document describes the chat-first redesign of the Relay iOS surface and the
 supporting server/ops changes: model-catalog de-duplication, the split Chat/Task
 tabs, streaming chat, task-model and effort controls, live task progress, workspace-
