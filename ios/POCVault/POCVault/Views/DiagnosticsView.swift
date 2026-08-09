@@ -79,6 +79,9 @@ struct DiagnosticsView: View {
             }
             .onAppear(perform: refreshAndImportFromSetupEnvironmentIfNeeded)
         }
+        // Presented as a sheet/cover of its own: re-pin the deliberate dark-only
+        // appearance so the surface can never flash light.
+        .preferredColorScheme(.dark)
     }
 
     private var diagnosticsNavBar: some View {

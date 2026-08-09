@@ -38,6 +38,25 @@ struct CodexChatRequest: Encodable {
     let threadId: String?
     let messages: [CodexChatMessage]
     let options: CodexModelOptions?
+    /// Folder scope for workspace-scoped chat. Encoded only when non-nil (synthesized
+    /// Encodable omits nil optionals) so existing global-chat behavior is unchanged.
+    let workspaceId: String?
+
+    init(
+        provider: String,
+        model: String,
+        threadId: String?,
+        messages: [CodexChatMessage],
+        options: CodexModelOptions?,
+        workspaceId: String? = nil
+    ) {
+        self.provider = provider
+        self.model = model
+        self.threadId = threadId
+        self.messages = messages
+        self.options = options
+        self.workspaceId = workspaceId
+    }
 }
 
 enum CodexChatEvent: Hashable {
@@ -48,11 +67,19 @@ enum CodexChatEvent: Hashable {
     case error(String)
 }
 
-struct CodexSSELineParser {
+/// Incremental SSE line parser. The decode step is injected so the same accumulation
+/// logic serves both the chat stream (`CodexChatEvent`) and the job stream
+/// (`CodexJobStreamEvent`). A decode returning nil drops the event (unknown/heartbeat).
+struct CodexSSELineParser<Event> {
     private var event = ""
     private var data = ""
+    private let decode: (String, String) -> Event?
 
-    mutating func ingest(_ line: String) -> [CodexChatEvent] {
+    init(decode: @escaping (String, String) -> Event?) {
+        self.decode = decode
+    }
+
+    mutating func ingest(_ line: String) -> [Event] {
         if line.isEmpty {
             return flush()
         }
@@ -75,19 +102,27 @@ struct CodexSSELineParser {
         return []
     }
 
-    mutating func finish() -> [CodexChatEvent] {
+    mutating func finish() -> [Event] {
         flush()
     }
 
-    private mutating func flush() -> [CodexChatEvent] {
+    private mutating func flush() -> [Event] {
         guard !event.isEmpty else {
             data = ""
             return []
         }
-        let decoded = CodexClient.decodeSSE(event: event, data: data)
+        let decoded = decode(event, data)
         event = ""
         data = ""
+        guard let decoded else { return [] }
         return [decoded]
+    }
+}
+
+extension CodexSSELineParser where Event == CodexChatEvent {
+    /// Chat-stream parser with the original chat decode step.
+    init() {
+        self.init(decode: { CodexClient.decodeSSE(event: $0, data: $1) })
     }
 }
 
@@ -170,19 +205,6 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         identityStore.hasStoredIdentity
     }
 
-    func fetchHealth() async throws -> CodexHealth {
-        let data = try await perform(path: "/v1/codex/health")
-        guard !data.isEmpty else {
-            return CodexHealth(status: "ok")
-        }
-        return try decoder.decode(CodexHealth.self, from: data)
-    }
-
-    func fetchWorkspaces() async throws -> [CodexWorkspace] {
-        let data = try await perform(path: "/v1/codex/workspaces")
-        return try decoder.decode(CodexListEnvelope<CodexWorkspace>.self, from: data).values
-    }
-
     func fetchModels() async throws -> [CodexModelDescriptor] {
         let data = try await perform(path: "/v1/codex/models")
         return try decoder.decode(CodexListEnvelope<CodexModelDescriptor>.self, from: data).values
@@ -199,6 +221,62 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
 
         let data = try await perform(path: "/v1/codex/workspace-dirs", queryItems: queryItems)
         return try decoder.decode(CodexWorkspaceDirectoryListing.self, from: data)
+    }
+
+    /// Bounded listing of one directory in the workspace jail (`GET /v1/codex/fs/list`).
+    /// Returns dirs first then files, with pagination metadata (`offset`/`limit`/`total`/`truncated`).
+    func fetchDirectory(path: String? = nil, offset: Int? = nil, limit: Int? = nil) async throws -> CodexWorkspaceDirectoryListing {
+        var queryItems: [URLQueryItem] = []
+        if let path = path?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty {
+            queryItems.append(URLQueryItem(name: "path", value: path))
+        }
+        if let offset {
+            queryItems.append(URLQueryItem(name: "offset", value: String(offset)))
+        }
+        if let limit {
+            queryItems.append(URLQueryItem(name: "limit", value: String(limit)))
+        }
+
+        let data = try await perform(path: "/v1/codex/fs/list", queryItems: queryItems)
+        return try decoder.decode(CodexWorkspaceDirectoryListing.self, from: data)
+    }
+
+    /// Raw bytes of one file in the workspace jail (`GET /v1/codex/fs/file`), optionally a
+    /// byte range. `truncated` comes from the 206 status / `Content-Range` response header,
+    /// never from byte-count inference.
+    func fetchFile(
+        path: String,
+        range: ClosedRange<Int64>? = nil
+    ) async throws -> (data: Data, contentType: String?, truncated: Bool) {
+        var headers: [String: String] = [:]
+        if let range {
+            headers["Range"] = "bytes=\(range.lowerBound)-\(range.upperBound)"
+        }
+
+        let (data, response) = try await performWithResponse(
+            path: "/v1/codex/fs/file",
+            queryItems: [URLQueryItem(name: "path", value: path)],
+            accept: "*/*",
+            additionalHeaders: headers
+        )
+
+        let contentType = response.value(forHTTPHeaderField: "Content-Type")?.trimmedNonEmpty
+        let truncated = response.statusCode == 206
+            || response.value(forHTTPHeaderField: "Content-Range")?.trimmedNonEmpty != nil
+        return (data, contentType, truncated)
+    }
+
+    /// Absolute URL of the raw-file endpoint for one jail file, used when a document is
+    /// rendered by the authenticated web view (PDF/HTML) instead of fetched as bytes.
+    /// Same `/v1/codex/fs/file` route as `fetchFile`; the web view supplies the client
+    /// identity through its own certificate-challenge handler.
+    func fileWebViewURL(path: String) -> URL? {
+        let url = endpoint(
+            path: "/v1/codex/fs/file",
+            queryItems: [URLQueryItem(name: "path", value: path)]
+        )
+        guard url.scheme != nil, url.host != nil else { return nil }
+        return url
     }
 
     func selectWorkspace(path: String) async throws -> CodexWorkspace {
@@ -230,19 +308,6 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
 
         let data = try await perform(path: "/v1/codex/jobs", queryItems: queryItems)
         return try decoder.decode(CodexListEnvelope<CodexJob>.self, from: data).values
-    }
-
-    func fetchSessions(provider: CodexProvider? = nil, workspaceID: String? = nil, limit: Int = 50) async throws -> [CodexSession] {
-        var queryItems = [
-            URLQueryItem(name: "limit", value: String(limit))
-        ]
-        if let workspaceID, !workspaceID.isEmpty {
-            queryItems.append(URLQueryItem(name: "workspaceId", value: workspaceID))
-        }
-        appendProvider(provider, to: &queryItems)
-
-        let data = try await perform(path: "/v1/codex/sessions", queryItems: queryItems)
-        return try decoder.decode(CodexListEnvelope<CodexSession>.self, from: data).values
     }
 
     func fetchThreads(provider: CodexProvider? = nil, workspaceID: String? = nil, limit: Int = 50) async throws -> [CodexThread] {
@@ -301,10 +366,6 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
             throw CodexClientError.emptyResponse
         }
         return try decoder.decode(CodexJob.self, from: data)
-    }
-
-    func fetchArtifactRaw(jobID: String, artifactID: String) async throws -> Data {
-        try await perform(path: "/v1/codex/jobs/\(Self.pathComponent(jobID))/artifacts/\(Self.pathComponent(artifactID))/raw")
     }
 
     func resolvedArtifactURL(_ value: String?) -> URL? {
@@ -416,6 +477,80 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         }
     }
 
+    /// Live job SSE (`GET /v1/codex/jobs/<id>/stream`): status snapshots, stdout/stderr
+    /// chunks from the requested offsets, then the terminal `done` job. The stream finishes
+    /// after `done`; cancelling the consuming task aborts the request (mTLS handled by the
+    /// shared session delegate).
+    func streamJobEvents(
+        id: String,
+        stdoutOffset: Int64? = nil,
+        stderrOffset: Int64? = nil
+    ) -> AsyncThrowingStream<CodexJobStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    var queryItems: [URLQueryItem] = []
+                    if let stdoutOffset {
+                        queryItems.append(URLQueryItem(name: "stdoutOffset", value: String(stdoutOffset)))
+                    }
+                    if let stderrOffset {
+                        queryItems.append(URLQueryItem(name: "stderrOffset", value: String(stderrOffset)))
+                    }
+
+                    let path = "/v1/codex/jobs/\(Self.pathComponent(id))/stream"
+                    let url = endpoint(path: path, queryItems: queryItems)
+                    guard url.scheme != nil, url.host != nil else {
+                        throw CodexClientError.invalidEndpoint(url)
+                    }
+
+                    var request = URLRequest(url: url)
+                    request.httpMethod = "GET"
+                    request.timeoutInterval = 300
+                    request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+
+                    let (bytes, response) = try await session.bytes(for: request)
+                    guard let http = response as? HTTPURLResponse else {
+                        throw CodexClientError.emptyResponse
+                    }
+                    guard (200...299).contains(http.statusCode) else {
+                        let message = try await Self.errorMessage(from: bytes)
+                        throw CodexClientError.httpFailure(http.statusCode, message)
+                    }
+
+                    CodexDiagnostics.log("codex_stream_response_success", fields: [
+                        "path": path,
+                        "url": url.absoluteString,
+                        "status": String(http.statusCode)
+                    ])
+
+                    var parser = CodexSSELineParser<CodexJobStreamEvent> { event, data in
+                        CodexJobStreamEvent.decode(event: event, data: data)
+                    }
+                    for try await line in bytes.lines {
+                        for event in parser.ingest(line.trimmingCharacters(in: .newlines)) {
+                            continuation.yield(event)
+                            if case .done = event {
+                                continuation.finish()
+                                return
+                            }
+                        }
+                    }
+                    for event in parser.finish() {
+                        continuation.yield(event)
+                        if case .done = event {
+                            continuation.finish()
+                            return
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     private static func errorMessage(from bytes: URLSession.AsyncBytes) async throws -> String? {
         var body = ""
         for try await line in bytes.lines {
@@ -436,6 +571,27 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         contentType: String = "application/json",
         additionalHeaders: [String: String] = [:]
     ) async throws -> Data {
+        try await performWithResponse(
+            path: path,
+            method: method,
+            queryItems: queryItems,
+            body: body,
+            contentType: contentType,
+            additionalHeaders: additionalHeaders
+        ).data
+    }
+
+    /// Same as `perform`, but also surfaces the HTTPURLResponse so callers can read
+    /// status/headers (e.g. 206 + Content-Range on `/v1/codex/fs/file`).
+    private func performWithResponse(
+        path: String,
+        method: String = "GET",
+        queryItems: [URLQueryItem] = [],
+        body: Data? = nil,
+        contentType: String = "application/json",
+        accept: String = "application/json",
+        additionalHeaders: [String: String] = [:]
+    ) async throws -> (data: Data, response: HTTPURLResponse) {
         let url = endpoint(path: path, queryItems: queryItems)
         guard url.scheme != nil, url.host != nil else {
             throw CodexClientError.invalidEndpoint(url)
@@ -451,7 +607,7 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.timeoutInterval = 45
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(accept, forHTTPHeaderField: "Accept")
         if let body {
             request.httpBody = body
             request.setValue(contentType, forHTTPHeaderField: "Content-Type")
@@ -478,8 +634,11 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
             throw error
         }
 
-        if let httpResponse = response as? HTTPURLResponse,
-           !(200...299).contains(httpResponse.statusCode) {
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw CodexClientError.emptyResponse
+        }
+
+        if !(200...299).contains(httpResponse.statusCode) {
             CodexDiagnostics.log("codex_response_http_failure", fields: [
                 "method": method,
                 "path": path,
@@ -489,16 +648,14 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
             ])
             throw CodexClientError.httpFailure(httpResponse.statusCode, Self.errorMessage(from: data))
         }
-        if let httpResponse = response as? HTTPURLResponse {
-            CodexDiagnostics.log("codex_response_success", fields: [
-                "method": method,
-                "path": path,
-                "url": url.absoluteString,
-                "status": String(httpResponse.statusCode),
-                "bytes": String(data.count)
-            ])
-        }
-        return data
+        CodexDiagnostics.log("codex_response_success", fields: [
+            "method": method,
+            "path": path,
+            "url": url.absoluteString,
+            "status": String(httpResponse.statusCode),
+            "bytes": String(data.count)
+        ])
+        return (data, httpResponse)
     }
 
     private func endpoint(path: String, queryItems: [URLQueryItem]) -> URL {

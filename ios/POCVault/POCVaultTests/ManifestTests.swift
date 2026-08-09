@@ -69,37 +69,6 @@ final class ManifestTests: XCTestCase {
         )
     }
 
-    func testCodexErrorSummaryExtractsHttpStatusAndHtmlMessage() throws {
-        let rawMessage = """
-        Codex request failed with HTTP 404: <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN"
-        "http://www.w3.org/TR/html4/strict.dtd">
-        <html>
-        <body>
-        <h1>Error response</h1>
-        <p>Error code: 404</p>
-        <p>Message: Not Found.</p>
-        <p>Error code explanation: 404 - Nothing matches the given URI.</p>
-        </body>
-        </html>
-        """
-
-        let summary = CodexErrorSummary(message: rawMessage)
-
-        XCTAssertEqual(summary.statusCode, 404)
-        XCTAssertEqual(summary.statusLine, "HTTP 404")
-        XCTAssertEqual(summary.summary, "Not Found")
-        XCTAssertTrue(summary.rawResponse.contains("<!DOCTYPE HTML"))
-    }
-
-    func testCodexErrorSummaryUsesPlainTextWhenNoStructuredPayloadExists() throws {
-        let summary = CodexErrorSummary(message: "No Codex workspace is available.")
-
-        XCTAssertNil(summary.statusCode)
-        XCTAssertEqual(summary.statusLine, "Request failed")
-        XCTAssertEqual(summary.summary, "No Codex workspace is available.")
-        XCTAssertEqual(summary.rawResponse, "No Codex workspace is available.")
-    }
-
     func testCodexJobDisplayOutputPrefersSingleResultWhenStreamsDuplicate() throws {
         let job = try decodeCodexJob(
             """
@@ -156,7 +125,7 @@ final class ManifestTests: XCTestCase {
     }
 
     @MainActor
-    func testRelayModelSelectionDoesNotRecurseWithEmptyCatalog() throws {
+    func testRelayModelSelectionStaysEmptyWithEmptyCatalog() throws {
         let suiteName = "relay-empty-models-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -165,13 +134,13 @@ final class ManifestTests: XCTestCase {
             baseURL: try XCTUnwrap(URL(string: "http://127.0.0.1:8787")),
             identityStore: ClientIdentityStore(defaults: defaults)
         )
-        let viewModel = RelayChatViewModel(client: client)
+        let viewModel = RelayChatViewModel(client: client, workspaceID: nil, workspacePath: nil)
 
-        viewModel.selectedModelID = nil
-        viewModel.mode = .task
-
-        XCTAssertNil(viewModel.selectedModelID)
-        XCTAssertNil(viewModel.selectedModel)
+        XCTAssertNil(viewModel.selectedChoice)
+        XCTAssertTrue(viewModel.pickerSections.isEmpty)
+        XCTAssertNil(viewModel.pickerSections.defaultChoice)
+        XCTAssertTrue(viewModel.availableEfforts.isEmpty)
+        XCTAssertNil(viewModel.effectiveEffort)
     }
 
     func testCodexSSEParserDecodesEventsWithoutBlankSeparators() throws {
@@ -204,80 +173,189 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(events, [.delta("last token")])
     }
 
-    func testRelayModelDiscoveryShowsLatestModelsWithoutResourceBuckets() throws {
-        let models = try decodeCodexModels(
-            """
-            [
-              { "id": "azure-gre-dev/gpt-4o", "label": "gpt-4o (Azure GRE Dev)", "provider": "azure", "modes": ["chat"], "azureDeployment": "gpt-4o" },
-              { "id": "azure-gre-prod/gpt-35-turbo", "label": "gpt-35-turbo (Azure GRE Prod)", "provider": "azure", "modes": ["chat"], "azureDeployment": "gpt-35-turbo" },
-              { "id": "azure-padhai/gpt-oss-120b", "label": "gpt-oss-120b (Azure Padhai)", "provider": "azure", "modes": ["chat"], "azureDeployment": "gpt-oss-120b" },
-              { "id": "azure-o-series-prod/gpt-5.5", "label": "gpt-5.5 (Azure O-Series Prod)", "provider": "azure", "modes": ["chat"], "azureDeployment": "gpt-5.5" },
-              { "id": "azure-padhai/gpt-5.5", "label": "gpt-5.5 (Azure Padhai)", "provider": "azure", "modes": ["chat"], "azureDeployment": "gpt-5.5" },
-              { "id": "azure-padhai/deepseek-v3.2", "label": "deepseek-v3.2 (DeepSeek-V3.2) (Azure Padhai)", "provider": "azure", "modes": ["chat"], "azureDeployment": "deepseek-v3.2" },
-              { "id": "azure-padhai/kimi-k2.6", "label": "kimi-k2.6 (Kimi-K2.6) (Azure Padhai)", "provider": "azure", "modes": ["chat"], "azureDeployment": "kimi-k2.6" },
-              { "id": "global.anthropic.claude-opus-4-7-20251101-v1:0", "label": "Claude Opus 4.7 (SigiQ Bedrock Global)", "provider": "bedrock", "modes": ["chat"] },
-              { "id": "codex-cli", "label": "Codex CLI", "provider": "codex", "modes": ["task"] }
-            ]
-            """
-        )
+    /// The live seven-entry catalog shape: Codex dual-mode Sol/Terra/Luna, Claude Code
+    /// task trio, Cursor Auto. Agents groups by harness; chat models stay flat.
+    func testRelayModelDiscoveryGroupsAgentsByHarness() throws {
+        let models = try decodeCodexModels(liveShapeCatalogJSON)
 
-        let sections = RelayModelDiscovery.sections(
-            from: models,
-            mode: .chat,
-            bucket: .latest,
-            searchText: ""
-        )
+        let sections = RelayModelDiscovery.sections(from: models)
 
-        XCTAssertEqual(sections.map(\.title), ["Latest"])
-        XCTAssertEqual(sections[0].models.filter { $0.id.contains("gpt-5.5") }.count, 1)
-        XCTAssertEqual(sections[0].models.first?.azureDeployment, "gpt-5.5")
-        XCTAssertFalse(sections.map(\.title).contains { $0.contains("Padhai") || $0.contains("GRE") })
-        XCTAssertFalse(sections[0].models.contains { $0.id == "codex-cli" })
-        XCTAssertFalse(sections[0].models.prefix(3).contains { $0.azureDeployment == "gpt-35-turbo" || $0.azureDeployment == "gpt-oss-120b" })
+        XCTAssertEqual(sections.agents.map(\.provider), [.codex, .claude, .cursor])
+        XCTAssertEqual(sections.agents.map(\.title), ["Codex", "Claude Code", "Cursor"])
+        XCTAssertEqual(
+            sections.agents[0].choices.map(\.model.id),
+            ["codex-gpt-5.6-sol", "codex-gpt-5.6-terra", "codex-gpt-5.6-luna"]
+        )
+        XCTAssertEqual(
+            sections.agents[1].choices.map(\.shortModelLabel),
+            ["Sonnet", "Opus", "Haiku"]
+        )
+        XCTAssertTrue(sections.agents.flatMap(\.choices).allSatisfy { $0.mode == .task })
+
+        // Chat models: only the chat-capable Codex trio (no Azure advertised here).
+        XCTAssertEqual(
+            sections.chatModels.map(\.model.id),
+            ["codex-gpt-5.6-sol", "codex-gpt-5.6-terra", "codex-gpt-5.6-luna"]
+        )
+        XCTAssertTrue(sections.chatModels.allSatisfy { $0.mode == .chat })
     }
 
-    func testRelayModelDiscoverySearchesFullCatalog() throws {
-        let models = try decodeCodexModels(
+    /// A harness missing from the catalog produces no group — the client never
+    /// synthesizes providers. A single-entry harness (Cursor Auto) shows exactly one row.
+    func testRelayModelDiscoveryOmitsMissingHarnessesAndNeverSynthesizesRows() throws {
+        let withoutCursor = try decodeCodexModels(
             """
             [
-              { "id": "azure-gre-dev/gpt-4o", "label": "gpt-4o (Azure GRE Dev)", "provider": "azure", "modes": ["chat"], "azureDeployment": "gpt-4o" },
-              { "id": "azure-padhai/deepseek-v3.2", "label": "deepseek-v3.2 (DeepSeek-V3.2) (Azure Padhai)", "provider": "azure", "modes": ["chat"], "azureDeployment": "deepseek-v3.2" },
-              { "id": "claude-code", "label": "Claude Code (Bedrock/SigiQ)", "provider": "claude", "modes": ["task"] }
+              { "id": "codex-gpt-5.6-sol", "label": "Codex · GPT-5.6 Sol", "provider": "codex", "modes": ["chat", "task"], "taskModel": "gpt-5.6-sol" },
+              { "id": "claude-code-opus", "label": "Claude Code · Opus", "provider": "claude", "modes": ["task"], "taskModel": "opus" }
             ]
             """
         )
+        let trimmed = RelayModelDiscovery.sections(from: withoutCursor)
+        XCTAssertEqual(trimmed.agents.map(\.provider), [.codex, .claude])
+        XCTAssertFalse(trimmed.agents.contains { $0.provider == .cursor })
 
-        let sections = RelayModelDiscovery.sections(
-            from: models,
-            mode: .chat,
-            bucket: .latest,
-            searchText: "deepseek"
-        )
+        let full = RelayModelDiscovery.sections(from: try decodeCodexModels(liveShapeCatalogJSON))
+        let cursorGroup = try XCTUnwrap(full.agents.first { $0.provider == .cursor })
+        XCTAssertEqual(cursorGroup.choices.count, 1)
+        XCTAssertEqual(cursorGroup.choices[0].shortModelLabel, "Auto")
+        XCTAssertEqual(cursorGroup.choices[0].chipLabel, "Cursor · Auto")
 
-        XCTAssertEqual(sections.map(\.title), ["Search"])
-        XCTAssertEqual(sections[0].models.map(\.id), ["azure-padhai/deepseek-v3.2"])
+        XCTAssertTrue(RelayModelDiscovery.sections(from: []).isEmpty)
     }
 
-    func testRelayModelDiscoverySearchCanFindModelsOutsideCurrentMode() throws {
+    /// An Azure catalog entry (fixture-style) is chat-only: it lands in Chat models,
+    /// never under Agents, and its jobs would route through the Codex runner.
+    func testRelayModelDiscoveryRoutesAzureEntriesToChatModels() throws {
         let models = try decodeCodexModels(
             """
             [
-              { "id": "azure-padhai/deepseek-v3.2", "label": "deepseek-v3.2 (DeepSeek-V3.2) (Azure Padhai)", "provider": "azure", "modes": ["chat"], "azureDeployment": "deepseek-v3.2" },
-              { "id": "claude-code", "label": "Claude Code (Bedrock/SigiQ)", "provider": "claude", "modes": ["task"] }
+              { "id": "gpt-4o", "label": "GPT-4o (Azure)", "provider": "azure", "modes": ["chat"], "azureDeployment": "gpt-4o" },
+              { "id": "codex-gpt-5.6-sol", "label": "Codex · GPT-5.6 Sol", "provider": "codex", "modes": ["chat", "task"], "taskModel": "gpt-5.6-sol" }
             ]
             """
         )
 
-        let sections = RelayModelDiscovery.sections(
-            from: models,
-            mode: .chat,
-            bucket: .latest,
-            searchText: "claude"
+        let sections = RelayModelDiscovery.sections(from: models)
+
+        XCTAssertFalse(sections.agents.contains { $0.provider == .azure })
+        let azureChoice = try XCTUnwrap(sections.chatModels.first { $0.model.provider == .azure })
+        XCTAssertEqual(azureChoice.mode, .chat)
+        XCTAssertEqual(azureChoice.shortModelLabel, "GPT-4o")
+        XCTAssertEqual(azureChoice.chipLabel, "Azure · GPT-4o")
+    }
+
+    /// Task jobs are routed by harness: Cursor keeps its own runner, Azure/dual-mode
+    /// Codex descriptors run on the Codex runner, Bedrock aliases run through Claude.
+    func testRelayTaskProviderRoutingIsHarnessSpecific() throws {
+        let models = try decodeCodexModels(
+            """
+            [
+              { "id": "cursor-agent-auto", "label": "Cursor Agent · Auto", "provider": "cursor", "modes": ["task"], "taskModel": "auto" },
+              { "id": "codex-gpt-5.6-sol", "label": "Codex · GPT-5.6 Sol", "provider": "codex", "modes": ["chat", "task"], "taskModel": "gpt-5.6-sol" },
+              { "id": "claude-code-opus", "label": "Claude Code · Opus", "provider": "claude", "modes": ["task"], "taskModel": "opus" },
+              { "id": "gpt-4o", "label": "GPT-4o (Azure)", "provider": "azure", "modes": ["chat"], "azureDeployment": "gpt-4o" },
+              { "id": "bedrock-opus", "label": "Claude Opus (Bedrock)", "provider": "bedrock", "modes": ["task"] }
+            ]
+            """
         )
 
-        XCTAssertEqual(sections.map(\.title), ["Search"])
-        XCTAssertEqual(sections[0].models.map(\.id), ["claude-code"])
-        XCTAssertFalse(sections[0].models[0].supports(.chat))
+        XCTAssertEqual(RelayChatViewModel.taskProvider(for: models[0]), .cursor)
+        XCTAssertEqual(RelayChatViewModel.taskProvider(for: models[1]), .codex)
+        XCTAssertEqual(RelayChatViewModel.taskProvider(for: models[2]), .claude)
+        XCTAssertEqual(RelayChatViewModel.taskProvider(for: models[3]), .codex)
+        XCTAssertEqual(RelayChatViewModel.taskProvider(for: models[4]), .claude)
+
+        XCTAssertEqual(RelayChatViewModel.taskModelParameter(for: models[0]), "auto")
+        XCTAssertEqual(RelayChatViewModel.taskModelParameter(for: models[1]), "gpt-5.6-sol")
+        XCTAssertEqual(RelayChatViewModel.taskModelParameter(for: models[2]), "opus")
+        // Bedrock alias without a taskModel and without chat support: runner default.
+        XCTAssertNil(RelayChatViewModel.taskModelParameter(for: models[4]))
+    }
+
+    /// A dual-mode Codex model is selectable as either an agent (task) or a chat model,
+    /// with the explicit mode preserved on the selection and distinct identities.
+    @MainActor
+    func testRelayDualModeModelSelectsAsEitherChatOrTask() throws {
+        let models = try decodeCodexModels(
+            """
+            [
+              { "id": "codex-gpt-5.6-sol", "label": "Codex · GPT-5.6 Sol", "provider": "codex", "modes": ["chat", "task"], "taskModel": "gpt-5.6-sol", "effortLevels": ["low", "medium", "high", "xhigh"] }
+            ]
+            """
+        )
+        let model = try XCTUnwrap(models.first)
+        let viewModel = RelayChatViewModel(
+            client: makeOfflineCodexClient(),
+            workspaceID: "ws-alpha",
+            workspacePath: "/srv/codex-workspaces/alpha"
+        )
+
+        viewModel.selectChoice(RelayModelChoice(model: model, mode: .chat))
+        XCTAssertEqual(viewModel.selectedChoice?.mode, .chat)
+        let chatID = try XCTUnwrap(viewModel.selectedChoice?.id)
+        // Chat requests carry no reasoning effort, so chat selections expose none.
+        XCTAssertTrue(viewModel.availableEfforts.isEmpty)
+
+        viewModel.selectChoice(RelayModelChoice(model: model, mode: .task))
+        XCTAssertEqual(viewModel.selectedChoice?.mode, .task)
+        let taskID = try XCTUnwrap(viewModel.selectedChoice?.id)
+        XCTAssertEqual(viewModel.availableEfforts, [.low, .medium, .high, .xhigh])
+
+        XCTAssertNotEqual(chatID, taskID)
+    }
+
+    /// First send in an unregistered folder registers lazily; when registration fails the
+    /// composer shows an error banner and the typed prompt survives untouched.
+    @MainActor
+    func testRelayLazyWorkspaceRegistrationFailurePreservesPrompt() async throws {
+        let models = try decodeCodexModels(
+            """
+            [
+              { "id": "codex-gpt-5.6-sol", "label": "Codex · GPT-5.6 Sol", "provider": "codex", "modes": ["chat", "task"], "taskModel": "gpt-5.6-sol" }
+            ]
+            """
+        )
+        let model = try XCTUnwrap(models.first)
+        let viewModel = RelayChatViewModel(
+            client: makeOfflineCodexClient(),
+            workspaceID: nil,
+            workspacePath: "/srv/codex-workspaces/unregistered"
+        )
+
+        viewModel.selectChoice(RelayModelChoice(model: model, mode: .task))
+        viewModel.prompt = "Ship the fix"
+        await viewModel.sendCurrentPrompt()
+
+        XCTAssertEqual(viewModel.prompt, "Ship the fix", "Failed registration must not drop the draft")
+        XCTAssertNotNil(viewModel.errorMessage)
+        XCTAssertNil(viewModel.workspaceID)
+        XCTAssertFalse(viewModel.isSending)
+        XCTAssertTrue(viewModel.messages.isEmpty, "No conversation items before the folder registers")
+
+        // Chat mode in the same unregistered folder takes the same lazy path.
+        viewModel.errorMessage = nil
+        viewModel.selectChoice(RelayModelChoice(model: model, mode: .chat))
+        await viewModel.sendCurrentPrompt()
+
+        XCTAssertEqual(viewModel.prompt, "Ship the fix")
+        XCTAssertNotNil(viewModel.errorMessage)
+        XCTAssertTrue(viewModel.messages.isEmpty)
+    }
+
+    /// Live-catalog-shaped fixture used by the harness grouping tests.
+    private var liveShapeCatalogJSON: String {
+        """
+        [
+          { "id": "codex-gpt-5.6-sol", "label": "Codex · GPT-5.6 Sol", "provider": "codex", "modes": ["chat", "task"], "taskModel": "gpt-5.6-sol", "effortLevels": ["low", "medium", "high", "xhigh"] },
+          { "id": "codex-gpt-5.6-terra", "label": "Codex · GPT-5.6 Terra", "provider": "codex", "modes": ["chat", "task"], "taskModel": "gpt-5.6-terra", "effortLevels": ["low", "medium", "high", "xhigh"] },
+          { "id": "codex-gpt-5.6-luna", "label": "Codex · GPT-5.6 Luna", "provider": "codex", "modes": ["chat", "task"], "taskModel": "gpt-5.6-luna", "effortLevels": ["low", "medium", "high", "xhigh"] },
+          { "id": "claude-code-sonnet", "label": "Claude Code · Sonnet", "provider": "claude", "modes": ["task"], "taskModel": "sonnet", "effortLevels": ["low", "medium", "high"] },
+          { "id": "claude-code-opus", "label": "Claude Code · Opus", "provider": "claude", "modes": ["task"], "taskModel": "opus", "effortLevels": ["low", "medium", "high"] },
+          { "id": "claude-code-haiku", "label": "Claude Code · Haiku", "provider": "claude", "modes": ["task"], "taskModel": "haiku", "effortLevels": ["low", "medium", "high"] },
+          { "id": "cursor-agent-auto", "label": "Cursor Agent · Auto", "provider": "cursor", "modes": ["task"], "taskModel": "auto", "effortLevels": [] }
+        ]
+        """
     }
 
     func testCodexProviderTabIconsUseBrandAssets() throws {
@@ -297,203 +375,112 @@ final class ManifestTests: XCTestCase {
         assertColor(AppTheme.statusWarn, red: 0xFF, green: 0x9F, blue: 0x0A, alpha: 1)
     }
 
-    func testConsoleControlStripLayoutIsRemovedFromHomeComposer() throws {
-        let codexLayout = CodexControlStripLayout(provider: .codex)
-        let claudeLayout = CodexControlStripLayout(provider: .claude)
-
-        XCTAssertEqual(codexLayout.visibleRowCount, 0)
-        XCTAssertEqual(claudeLayout.visibleRowCount, codexLayout.visibleRowCount)
-        XCTAssertEqual(codexLayout.controlHeight, 0)
-        XCTAssertEqual(claudeLayout.controlHeight, codexLayout.controlHeight)
-        XCTAssertFalse(codexLayout.showsSkillButton)
-        XCTAssertFalse(claudeLayout.showsSkillButton)
-        XCTAssertFalse(claudeLayout.reservesSkillSlot)
-        XCTAssertFalse(codexLayout.showsRunMode)
-        XCTAssertFalse(claudeLayout.showsRunMode)
-    }
-
-    func testThreadDetailLayoutKeepsActiveRunChromeOutOfChatFlow() throws {
-        let thread = try decodeCodexThread(
-            """
-            {
-              "id": "thread-active",
-              "sessionId": "thread-active",
-              "workspaceName": "POC Vault",
-              "activeJobCount": 1,
-              "lastJobId": "job-active",
-              "lastJobStatus": "running",
-              "lastPrompt": "Review and merge if all good"
-            }
-            """
-        )
-
-        let layout = CodexThreadDetailLayout(thread: thread)
-
-        XCTAssertTrue(thread.hasActiveJobs)
-        XCTAssertEqual(layout.contentSections, [.overview, .chatTranscript])
-        XCTAssertFalse(layout.showsInlineProgressCard)
-        XCTAssertTrue(layout.showsLatestRunToolbarButton)
-    }
-
-    func testThreadDetailComposerIsInlineAboveRootTabBar() throws {
-        let source = try String(contentsOfFile: codexConsoleSourcePath, encoding: .utf8)
-        guard
-            let detailStart = source.range(of: "private struct CodexThreadDetailView: View"),
-            let composerStart = source.range(of: "private struct CodexThreadComposerDock: View")
-        else {
-            return XCTFail("Expected thread detail and composer views in CodexConsoleView.swift")
-        }
-
-        let detailSource = String(source[detailStart.lowerBound..<composerStart.lowerBound])
-
-        XCTAssertTrue(detailSource.contains("CodexThreadComposerDock("))
-        XCTAssertTrue(detailSource.contains("replyComposerTabBarClearance"))
-        XCTAssertFalse(detailSource.contains(".safeAreaInset(edge: .bottom)"))
-    }
-
-    func testThreadDetailRendersChatTranscriptAndKeepsComposerNearTabBar() throws {
-        let source = try String(contentsOfFile: codexConsoleSourcePath, encoding: .utf8)
-        let detailSource = try sourceSnippet(
-            in: source,
-            from: "private struct CodexThreadDetailView: View",
-            to: "private struct CodexThreadDetailNavBar: View"
-        )
-
-        XCTAssertTrue(detailSource.contains("CodexThreadChatTranscriptView("))
-        XCTAssertFalse(detailSource.contains("CodexThreadResponseCard("))
-        XCTAssertTrue(detailSource.contains("private static let replyComposerTabBarClearance: CGFloat = 16"))
-    }
-
-    func testThreadDetailPullToRefreshDoesNotFetchFullLogsOrShowCancellation() throws {
-        let source = try String(contentsOfFile: codexConsoleSourcePath, encoding: .utf8)
-        let detailSource = try sourceSnippet(
-            in: source,
-            from: "private struct CodexThreadDetailView: View",
-            to: "private struct CodexThreadDetailNavBar: View"
-        )
-        let refreshSource = try sourceSnippet(
-            in: detailSource,
-            from: ".refreshable {",
-            to: ".task(id: routeIdentity)"
-        )
-        let loadThreadDetailSource = try sourceSnippet(
-            in: detailSource,
-            from: "private func loadThreadDetail() async",
-            to: "private func loadLatestJob"
-        )
-        let loadLatestJobSource = try sourceSnippet(
-            in: detailSource,
-            from: "private func loadLatestJob",
-            to: "private func selectResolvedSessionIfAvailable"
-        )
-
-        XCTAssertTrue(refreshSource.contains("await refreshThreadDetailAndLatestJob()"))
-        XCTAssertFalse(refreshSource.contains("includeFullLogs: true"))
-        XCTAssertTrue(loadThreadDetailSource.contains("CodexConsoleViewModel.isCancellation(error)"))
-        XCTAssertTrue(loadLatestJobSource.contains("CodexConsoleViewModel.isCancellation(error)"))
-    }
-
-    func testThreadDetailNavOmitsRedundantRefreshButton() throws {
-        let source = try String(contentsOfFile: codexConsoleSourcePath, encoding: .utf8)
-        let detailSource = try sourceSnippet(
-            in: source,
-            from: "private struct CodexThreadDetailView: View",
-            to: "private struct CodexThreadDetailNavBar: View"
-        )
-        let navSource = try sourceSnippet(
-            in: source,
-            from: "private struct CodexThreadDetailNavBar: View",
-            to: "private struct CodexThreadResponseCard: View"
-        )
-
-        XCTAssertFalse(detailSource.contains("onRefresh:"))
-        XCTAssertFalse(navSource.contains("let onRefresh"))
-        XCTAssertFalse(navSource.contains("Button(action: onRefresh)"))
-        XCTAssertFalse(navSource.contains("arrow.clockwise"))
-        XCTAssertTrue(navSource.contains("terminal"))
-    }
-
-    func testRootUsesNativeLiquidGlassTabView() throws {
+    func testRootIsFileBrowserNavigationStack() throws {
         let source = try String(contentsOfFile: appSourcePath, encoding: .utf8)
 
-        XCTAssertTrue(source.contains("TabView(selection: $selectedTab)"))
-        XCTAssertTrue(source.contains(".tabItem"))
+        // The app root is a single NavigationStack over the file browser, routed by
+        // BrowserRoute. The old four-tab shell must be gone.
+        XCTAssertTrue(source.contains("NavigationStack(path: $browserPath)"))
+        XCTAssertTrue(source.contains(".navigationDestination(for: BrowserRoute.self)"))
+        XCTAssertTrue(source.contains("case folder(path: String)"))
+        XCTAssertTrue(source.contains("case file(entry: CodexWorkspaceDirectoryEntry)"))
+        XCTAssertTrue(source.contains("FileViewerView("))
+        XCTAssertFalse(source.contains("FileViewerPlaceholderView"))
+        XCTAssertFalse(source.contains("TabView("))
+        XCTAssertFalse(source.contains(".tabItem"))
+        XCTAssertFalse(source.contains("RelayRootTab"))
         XCTAssertFalse(source.contains("RelayTabBar"))
-        XCTAssertFalse(source.contains("safeAreaInset(edge: .bottom"))
-        XCTAssertFalse(source.contains("configureWithOpaqueBackground"))
+
+        // Library embeds its own NavigationStack, so it presents as a full-screen cover
+        // (nesting stacks is illegal); Status/Diagnostics are sheets; chat is a cover.
+        XCTAssertTrue(source.contains(".fullScreenCover(isPresented: $showingLibrary)"))
+        XCTAssertTrue(source.contains(".fullScreenCover(item: $chatLaunch)"))
+        XCTAssertTrue(source.contains(".sheet(isPresented: $showingStatus)"))
+        XCTAssertTrue(source.contains(".sheet(isPresented: $showingDiagnostics)"))
+
+        // Job monitoring runs app-wide through the session store, still policy-guarded.
+        XCTAssertTrue(source.contains("chatSessionStore.monitorActiveWorkWhileAppIsOpen()"))
+        XCTAssertTrue(source.contains("CodexAgentMonitorPolicy.shouldStartAppMonitor"))
+
+        // Deep-link hooks: the tab hook is dead; browser/chat hooks replace it.
+        XCTAssertFalse(source.contains("RELAY_UITEST_TAB"))
+        XCTAssertTrue(source.contains("RELAY_UITEST_PATH"))
+        XCTAssertTrue(source.contains("RELAY_UITEST_FILE"))
+        XCTAssertTrue(source.contains("RELAY_UITEST_CHAT"))
+        XCTAssertTrue(source.contains("RELAY_UITEST_OPEN"))
     }
 
-    func testCodexClaudeHomePolishUsesSharedCompactComponents() throws {
-        let source = try String(contentsOfFile: codexConsoleSourcePath, encoding: .utf8)
-
-        let screenSource = try sourceSnippet(
-            in: source,
-            from: "struct CodexConsoleView: View",
-            to: "private enum CodexRoute: Hashable"
+    @MainActor
+    func testRelayChatSessionStoreReusesAndEvictsLeastRecentlyUsedSessions() async throws {
+        let store = RelayChatSessionStore(
+            client: makeOfflineCodexClient(),
+            capacity: 2,
+            isPinned: { _ in false }
         )
-        XCTAssertFalse(screenSource.contains("CodexContextLine(viewModel"))
-        XCTAssertTrue(screenSource.contains("CodexConnectionNoticeBanner(viewModel: viewModel)"))
-        XCTAssertTrue(screenSource.contains("if viewModel.showsConnectionNoticeBanner"))
 
-        let contextSource = try sourceSnippet(
-            in: source,
-            from: "private struct CodexContextLine: View",
-            to: "private struct CodexPromptCard: View"
+        XCTAssertEqual(RelayChatSessionStore.canonicalKey(forFolderPath: nil), RelayChatSessionStore.rootKey)
+        XCTAssertEqual(RelayChatSessionStore.canonicalKey(forFolderPath: "  "), RelayChatSessionStore.rootKey)
+        XCTAssertEqual(
+            RelayChatSessionStore.canonicalKey(forFolderPath: "/srv/codex-workspaces/alpha/"),
+            RelayChatSessionStore.canonicalKey(forFolderPath: "/srv/codex-workspaces/alpha")
         )
-        XCTAssertFalse(contextSource.contains("selectedThreadID"))
 
-        let promptSource = try sourceSnippet(
-            in: source,
-            from: "private struct CodexPromptCard: View",
-            to: "private struct CodexComposeStatusPanel: View"
-        )
-        XCTAssertTrue(promptSource.contains("attachedComposerHeader"))
-        XCTAssertTrue(promptSource.contains("largePromptEditor"))
-        XCTAssertTrue(promptSource.contains("promptEditorMinHeight"))
-        XCTAssertTrue(promptSource.contains("TextEditor("))
-        XCTAssertTrue(promptSource.contains("CodexAttachmentMenu("))
-        XCTAssertTrue(promptSource.contains("mic.fill"))
-        XCTAssertTrue(promptSource.contains("arrow.up"))
-        XCTAssertFalse(promptSource.contains("selectedThreadID"))
+        let alpha = store.session(forFolderPath: "/srv/codex-workspaces/alpha", workspaceID: "ws-alpha")
+        let alphaAgain = store.session(forFolderPath: "/srv/codex-workspaces/alpha/", workspaceID: "ws-alpha")
+        XCTAssertTrue(alpha === alphaAgain, "Same canonical folder must reuse the cached view model")
+        XCTAssertEqual(store.cachedSessionCount, 1)
+        XCTAssertEqual(alpha.workspaceID, "ws-alpha")
+        XCTAssertEqual(alpha.workspacePath, "/srv/codex-workspaces/alpha")
+        XCTAssertEqual(alpha.folderDisplayName, "alpha")
 
-        let previewSource = try sourceSnippet(
-            in: source,
-            from: "private struct CodexComposeStatusPanel: View",
-            to: "private struct CodexSessionSettingsSheet: View"
-        )
-        XCTAssertTrue(previewSource.contains("threadPreviewBackground"))
-        XCTAssertTrue(previewSource.contains("threadPreviewSeparator"))
-        XCTAssertTrue(previewSource.contains("statusPillBackground"))
+        store.session(forFolderPath: "/srv/codex-workspaces/beta", workspaceID: "ws-beta")
+        XCTAssertEqual(store.cachedSessionCount, 2)
 
-        let feedSource = try sourceSnippet(
-            in: source,
-            from: "private struct CodexThreadFeedSection: View",
-            to: "private struct CodexThreadFeedRow: View"
-        )
-        XCTAssertTrue(feedSource.contains("CodexLowThreadCountHint"))
+        // Touch alpha so beta becomes least recently used, then exceed the cap.
+        store.session(forFolderPath: "/srv/codex-workspaces/alpha", workspaceID: "ws-alpha")
+        store.session(forFolderPath: "/srv/codex-workspaces/gamma", workspaceID: "ws-gamma")
 
-        let rowSource = try sourceSnippet(
-            in: source,
-            from: "private struct CodexThreadFeedRow: View",
-            to: "private struct CodexStatusChip: View"
-        )
-        XCTAssertTrue(rowSource.contains("Text(item.preview)"))
-        XCTAssertTrue(rowSource.contains("CodexThreadPreviewStatusBadge(status: item.status ?? fallbackStatus)"))
-        XCTAssertFalse(rowSource.contains("\"checkmark\""))
-        XCTAssertFalse(rowSource.contains("statusSymbol"))
+        XCTAssertEqual(store.cachedSessionCount, 2)
+        XCTAssertNotNil(store.cachedSession(forFolderPath: "/srv/codex-workspaces/alpha"))
+        XCTAssertNil(store.cachedSession(forFolderPath: "/srv/codex-workspaces/beta"))
+        XCTAssertNotNil(store.cachedSession(forFolderPath: "/srv/codex-workspaces/gamma"))
     }
 
-    func testConnectionNoticeBannerOnlyShowsForCachedContent() throws {
-        let source = try String(contentsOfFile: codexConsoleSourcePath, encoding: .utf8)
-        let modelSource = try String(contentsOfFile: codexConsoleViewModelSourcePath, encoding: .utf8)
+    @MainActor
+    func testRelayChatSessionStorePinsActiveSessionsDuringEviction() async throws {
+        var pinnedViewModels: Set<ObjectIdentifier> = []
+        let store = RelayChatSessionStore(
+            client: makeOfflineCodexClient(),
+            capacity: 1,
+            isPinned: { pinnedViewModels.contains(ObjectIdentifier($0)) }
+        )
 
-        XCTAssertTrue(modelSource.contains("var showsConnectionNoticeBanner: Bool"))
-        XCTAssertTrue(modelSource.contains("connectionNotice != nil && hasCachedCodexContent"))
-        XCTAssertTrue(source.contains("private struct CodexConnectionNoticeBanner: View"))
-        XCTAssertTrue(source.contains("viewModel.connectionNoticeTitle"))
-        XCTAssertTrue(source.contains("viewModel.connectionNoticeMessage"))
-        XCTAssertTrue(source.contains("Task { await viewModel.refreshAll() }"))
-        XCTAssertTrue(source.contains("accessibilityLabel(\"Connection notice\")"))
+        let pinned = store.session(forFolderPath: "/srv/codex-workspaces/streaming", workspaceID: "ws-streaming")
+        pinnedViewModels.insert(ObjectIdentifier(pinned))
+
+        store.session(forFolderPath: "/srv/codex-workspaces/idle", workspaceID: "ws-idle")
+
+        // Over capacity, but the pinned (streaming/active-job) session must survive.
+        XCTAssertEqual(store.cachedSessionCount, 2)
+        XCTAssertTrue(store.cachedSession(forFolderPath: "/srv/codex-workspaces/streaming") === pinned)
+
+        // Unpin it; the next insertion evicts the now-unpinned LRU entries down to cap.
+        pinnedViewModels.removeAll()
+        store.session(forFolderPath: "/srv/codex-workspaces/next", workspaceID: "ws-next")
+
+        XCTAssertEqual(store.cachedSessionCount, 1)
+        XCTAssertNil(store.cachedSession(forFolderPath: "/srv/codex-workspaces/streaming"))
+        XCTAssertNil(store.cachedSession(forFolderPath: "/srv/codex-workspaces/idle"))
+        XCTAssertNotNil(store.cachedSession(forFolderPath: "/srv/codex-workspaces/next"))
+    }
+
+    /// A client pointed at a closed local port: constructing view models never fires
+    /// requests, and anything fired by mistake fails fast without leaving the machine.
+    private func makeOfflineCodexClient() -> CodexClient {
+        CodexClient(
+            baseURL: URL(string: "http://127.0.0.1:9")!,
+            identityStore: ClientIdentityStore()
+        )
     }
 
     func testLibraryRecentFilterShowsEmptyStateInsteadOfAllEntries() throws {
@@ -513,121 +500,6 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(filterSource.contains("return recentEntries"))
         XCTAssertTrue(emptyStateSource.contains("No recent prototypes"))
         XCTAssertTrue(emptyStateSource.contains("Nothing in the library matches"))
-    }
-
-    func testPromptModuleHeaderIsIntegratedNotOvalPill() throws {
-        let source = try String(contentsOfFile: codexConsoleSourcePath, encoding: .utf8)
-        let promptSource = try sourceSnippet(
-            in: source,
-            from: "private struct CodexPromptCard: View",
-            to: "private struct CodexComposeStatusPanel: View"
-        )
-
-        XCTAssertTrue(promptSource.contains("private static let composerModuleCornerRadius: CGFloat = 14"))
-        XCTAssertTrue(promptSource.contains("private static let composerHeaderMinHeight: CGFloat = 54"))
-        XCTAssertTrue(promptSource.contains(".frame(minHeight: Self.composerHeaderMinHeight)"))
-        XCTAssertTrue(promptSource.contains(".contentShape(Rectangle())"))
-        XCTAssertFalse(promptSource.contains(".background(AppTheme.textPrimary.opacity(0.045))"))
-        XCTAssertFalse(promptSource.contains("RoundedRectangle(cornerRadius: 18, style: .continuous)"))
-    }
-
-    func testSessionSettingsUsesInlineQuickPickPills() throws {
-        let source = try String(contentsOfFile: codexConsoleSourcePath, encoding: .utf8)
-        let sheetSource = try sourceSnippet(
-            in: source,
-            from: "private struct CodexSessionSettingsSheet: View",
-            to: "private struct CodexSettingsChoiceSection"
-        )
-
-        XCTAssertTrue(sheetSource.contains("Text(\"Agent settings\")"))
-        XCTAssertTrue(sheetSource.contains("CodexSettingsChoiceSection("))
-        XCTAssertTrue(sheetSource.contains("CodexSettingsPill("))
-        XCTAssertTrue(sheetSource.contains("ForEach(viewModel.modelOptions"))
-        XCTAssertTrue(sheetSource.contains("ForEach(viewModel.reasoningEffortOptions"))
-        XCTAssertTrue(sheetSource.contains("ForEach(CodexRunMode.allCases"))
-        XCTAssertTrue(sheetSource.contains("quickSkillOptions"))
-        XCTAssertFalse(sheetSource.contains("repositoryQuickPickSection"))
-        XCTAssertFalse(sheetSource.contains("quickWorkspaceOptions"))
-        XCTAssertFalse(sheetSource.contains("title: \"Repository\""))
-        XCTAssertFalse(sheetSource.contains("Menu {"))
-        XCTAssertFalse(sheetSource.contains("CodexSettingsRowContent(symbol: \"cpu\""))
-        XCTAssertFalse(sheetSource.contains("CodexSettingsRowContent(symbol: \"slider.horizontal.3\""))
-        XCTAssertFalse(sheetSource.contains("CodexSettingsRowContent(symbol: \"sun.max\""))
-        XCTAssertFalse(source.contains("private struct CodexSettingsRowContent: View"))
-    }
-
-    func testThreadReplyComposerExposesVisibleOptionsControl() throws {
-        let source = try String(contentsOfFile: codexConsoleSourcePath, encoding: .utf8)
-        let composerSource = try sourceSnippet(
-            in: source,
-            from: "private struct CodexThreadComposerDock: View",
-            to: "private func send() async"
-        )
-
-        XCTAssertTrue(composerSource.contains("replyOptionsButton"))
-        XCTAssertTrue(composerSource.contains("optionsSummaryStrip"))
-        XCTAssertTrue(composerSource.contains("showingSettings = true"))
-        XCTAssertTrue(composerSource.contains("showingSkillPicker = true"))
-        XCTAssertTrue(composerSource.contains("accessibilityLabel(\"Reply options\")"))
-        XCTAssertFalse(composerSource.contains(".contextMenu"))
-    }
-
-    func testWorkspacePickerIsTopLevelPromptHeaderControl() throws {
-        let source = try String(contentsOfFile: codexConsoleSourcePath, encoding: .utf8)
-        let promptSource = try sourceSnippet(
-            in: source,
-            from: "private struct CodexPromptCard: View",
-            to: "private struct CodexComposeStatusPanel: View"
-        )
-
-        XCTAssertTrue(promptSource.contains("@State private var showingWorkspacePicker = false"))
-        XCTAssertTrue(promptSource.contains("workspaceHeaderControl"))
-        XCTAssertTrue(promptSource.contains("agentSettingsHeaderControl"))
-        XCTAssertTrue(promptSource.contains("showingWorkspacePicker = true"))
-        XCTAssertTrue(promptSource.contains("CodexWorkspacePickerSheet(viewModel: viewModel)"))
-        XCTAssertTrue(promptSource.contains("accessibilityLabel(\"Choose repository\")"))
-        XCTAssertTrue(promptSource.contains("accessibilityLabel(\"Agent settings\")"))
-        XCTAssertFalse(promptSource.contains("Text(viewModel.composeWorkspaceLabel)\n                    .font(.system(size: 14, weight: .medium))\n                    .foregroundStyle(AppTheme.accent)\n                    .lineLimit(1)\n                Text(\"·\")"))
-    }
-
-    func testWorkspacePickerUsesBrowseFirstFilesStyleSheet() throws {
-        let source = try String(contentsOfFile: codexConsoleSourcePath, encoding: .utf8)
-        let sheetSource = try sourceSnippet(
-            in: source,
-            from: "private struct CodexWorkspacePickerSheet: View",
-            to: "private struct CodexWorkspaceLoadingRow: View"
-        )
-        let rowSource = try sourceSnippet(
-            in: source,
-            from: "private struct CodexWorkspaceDirectoryRow: View",
-            to: "private struct CodexAttachmentMenu: View"
-        )
-
-        XCTAssertTrue(sheetSource.contains("Text(\"Choose workspace\")"))
-        XCTAssertTrue(sheetSource.contains("workspaceSearchField"))
-        XCTAssertTrue(sheetSource.contains("workspaceLocationBar"))
-        XCTAssertTrue(sheetSource.contains("workspaceFolderList"))
-        XCTAssertTrue(sheetSource.contains("workspaceFooterActions"))
-        XCTAssertTrue(sheetSource.contains("Text(\"Use this folder\")"))
-        XCTAssertTrue(sheetSource.contains(".refreshable"))
-        XCTAssertTrue(sheetSource.contains("selectCurrentFolder()"))
-        XCTAssertTrue(sheetSource.contains("showingCreateFolder = true"))
-        XCTAssertTrue(sheetSource.contains("viewModel.loadWorkspaceDirectories(path: listing?.currentPath, query: currentSearchQuery)"))
-        XCTAssertFalse(sheetSource.contains("NavigationStack"))
-        XCTAssertFalse(sheetSource.contains(".navigationTitle(\"Workspace Folder\")"))
-        XCTAssertFalse(sheetSource.contains(".toolbar"))
-        XCTAssertFalse(sheetSource.contains("Refresh workspace folders"))
-        XCTAssertFalse(sheetSource.contains("Create workspace folder"))
-        XCTAssertFalse(sheetSource.contains("Label(\"Up\""))
-        XCTAssertFalse(sheetSource.contains("Label(viewModel.isSelectingWorkspaceDirectory ? \"Selecting\" : \"Select\""))
-
-        XCTAssertTrue(rowSource.contains("Button(action: onBrowse)"))
-        XCTAssertTrue(rowSource.contains("Image(systemName: \"chevron.right\")"))
-        XCTAssertTrue(rowSource.contains("Text(\"Registered\")"))
-        XCTAssertTrue(rowSource.contains("Text(\"Git\")"))
-        XCTAssertFalse(rowSource.contains("let onSelect"))
-        XCTAssertFalse(rowSource.contains("Text(\"Select\")"))
-        XCTAssertFalse(rowSource.contains("accessibilityLabel(\"Select"))
     }
 
     func testCodexJobDefaultsMissingProviderToCodexAndDecodesClaude() throws {
@@ -833,31 +705,6 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(job.hasTruncatedServerOutput)
     }
 
-    func testCodexSessionDecodesServerShape() throws {
-        let session = try JSONDecoder().decode(
-            CodexSession.self,
-            from: Data(
-                """
-                {
-                  "id": "2026-05-20T12-00-00-abc123",
-                  "workspaceId": "scratch",
-                  "workspaceName": "Scratch",
-                  "cwd": "/tmp/codex-scratch",
-                  "timestamp": "2026-05-20T12:00:00Z",
-                  "updatedAt": "2026-05-20T12:05:10Z"
-                }
-                """.utf8
-            )
-        )
-
-        XCTAssertEqual(session.id, "2026-05-20T12-00-00-abc123")
-        XCTAssertEqual(session.workspaceId, "scratch")
-        XCTAssertEqual(session.workspaceName, "Scratch")
-        XCTAssertEqual(session.cwd, "/tmp/codex-scratch")
-        XCTAssertNotNil(session.timestamp)
-        XCTAssertNotNil(session.updatedAt)
-    }
-
     func testCodexThreadDecodesServerShapeAndBuildsPreviewText() throws {
         let thread = try JSONDecoder().decode(
             CodexThread.self,
@@ -1025,7 +872,7 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(thread.previewText, "Can you review this PR: https://github.com/example/private-app/pull/967 The idea is to reduce latency")
     }
 
-    func testCodexThreadDetailBuildsChatTranscriptFromMessages() throws {
+    func testCodexThreadDetailDecodesThreadMessagesAndJobs() throws {
         let detail = try JSONDecoder().decode(
             CodexThreadDetail.self,
             from: Data(
@@ -1066,780 +913,28 @@ final class ManifestTests: XCTestCase {
             )
         )
 
-        let transcript = CodexThreadChatItem.makeTranscript(detail: detail, thread: nil, latestJob: nil)
+        XCTAssertEqual(detail.thread.sessionId, "019e46a5-0000-7000-8000-000000000001")
+        XCTAssertEqual(detail.thread.workspaceId, "poc-vault")
+        XCTAssertEqual(detail.messages.map(\.role), [.user, .assistant, .user])
+        XCTAssertEqual(detail.messages.map(\.text), ["First thing I asked", "First Codex answer", "Second follow up"])
+        XCTAssertTrue(detail.jobs.isEmpty)
 
-        XCTAssertEqual(transcript.map(\.role), [.user, .assistant, .user])
-        XCTAssertEqual(transcript.map(\.text), ["First thing I asked", "First Codex answer", "Second follow up"])
-        XCTAssertEqual(transcript.first?.alignment, .trailing)
-        XCTAssertEqual(transcript[1].alignment, .leading)
-        XCTAssertEqual(transcript.first?.isLong, false)
-    }
-
-    func testCodexThreadChatTranscriptCollapsesIntermediateAssistantUpdates() throws {
-        let detail = try JSONDecoder().decode(
+        // Missing messages/jobs decode leniently to empty arrays.
+        let sparse = try JSONDecoder().decode(
             CodexThreadDetail.self,
             from: Data(
                 """
                 {
                   "thread": {
                     "id": "019e46a5-0000-7000-8000-000000000002",
-                    "sessionId": "019e46a5-0000-7000-8000-000000000002",
-                    "workspaceId": "poc-vault",
-                    "workspaceName": "POC Vault",
-                    "updatedAt": "2026-05-20T12:05:10Z",
-                    "jobCount": 1,
-                    "activeJobCount": 0,
-                    "hasSessionFile": true
-                  },
-                  "messages": [
-                    {
-                      "role": "user",
-                      "timestamp": "2026-05-20T12:00:00Z",
-                      "text": "Check my PRs"
-                    },
-                    {
-                      "role": "assistant",
-                      "timestamp": "2026-05-20T12:00:10Z",
-                      "text": "I will inspect GitHub."
-                    },
-                    {
-                      "role": "assistant",
-                      "timestamp": "2026-05-20T12:00:20Z",
-                      "text": "Retrying with supported fields."
-                    },
-                    {
-                      "role": "assistant",
-                      "timestamp": "2026-05-20T12:01:00Z",
-                      "text": "Final answer: no assigned PRs."
-                    }
-                  ],
-                  "jobs": []
+                    "sessionId": "019e46a5-0000-7000-8000-000000000002"
+                  }
                 }
                 """.utf8
             )
         )
-
-        let transcript = CodexThreadChatItem.makeTranscript(detail: detail, thread: nil, latestJob: nil)
-
-        XCTAssertEqual(transcript.map(\.role), [.user, .status, .assistant])
-        XCTAssertEqual(transcript[1].speakerLabel, "Thinking")
-        XCTAssertEqual(transcript[1].progressCount, 2)
-        XCTAssertEqual(transcript[2].text, "Final answer: no assigned PRs.")
-    }
-
-    func testCodexThreadChatTranscriptFallsBackToThreadSummary() throws {
-        let thread = try JSONDecoder().decode(
-            CodexThread.self,
-            from: Data(
-                """
-                {
-                  "id": "019e46a5-0000-7000-8000-000000000001",
-                  "sessionId": "019e46a5-0000-7000-8000-000000000001",
-                  "workspaceId": "poc-vault",
-                  "workspaceName": "POC Vault",
-                  "updatedAt": "2026-05-20T12:05:10Z",
-                  "jobCount": 1,
-                  "activeJobCount": 0,
-                  "lastJobStatus": "succeeded",
-                  "lastPrompt": "Can you check the server?",
-                  "lastResult": "Server is healthy.",
-                  "hasSessionFile": false
-                }
-                """.utf8
-            )
-        )
-
-        let transcript = CodexThreadChatItem.makeTranscript(detail: nil, thread: thread, latestJob: nil)
-
-        XCTAssertEqual(transcript.map(\.role), [.user, .assistant])
-        XCTAssertEqual(transcript.map(\.text), ["Can you check the server?", "Server is healthy."])
-    }
-
-    func testCodexThreadChatTranscriptMarksThreadSummaryAsFullTextLoadable() throws {
-        let thread = try JSONDecoder().decode(
-            CodexThread.self,
-            from: Data(
-                """
-                {
-                  "id": "019e46a5-0000-7000-8000-000000000011",
-                  "sessionId": "019e46a5-0000-7000-8000-000000000011",
-                  "workspaceId": "poc-vault",
-                  "workspaceName": "POC Vault",
-                  "updatedAt": "2026-05-20T12:05:10Z",
-                  "jobCount": 1,
-                  "activeJobCount": 0,
-                  "lastJobId": "job-summary-preview",
-                  "lastJobStatus": "succeeded",
-                  "lastPrompt": "Summarize this folder.",
-                  "lastResult": "This is the saved thread summary.",
-                  "hasSessionFile": true
-                }
-                """.utf8
-            )
-        )
-
-        let transcript = CodexThreadChatItem.makeTranscript(detail: nil, thread: thread, latestJob: nil)
-
-        let answer = try XCTUnwrap(transcript.first { $0.role == .assistant })
-        XCTAssertTrue(answer.canLoadFullText)
-        XCTAssertTrue(answer.isLong)
-    }
-
-    func testCodexThreadChatTranscriptMarksServerTruncatedJobAnswerAsFullTextLoadable() throws {
-        let thread = try decodeCodexThread(
-            """
-            {
-              "id": "019e46a5-0000-7000-8000-000000000012",
-              "sessionId": "019e46a5-0000-7000-8000-000000000012",
-              "workspaceId": "poc-vault",
-              "workspaceName": "POC Vault",
-              "updatedAt": "2026-05-20T12:05:10Z",
-              "jobCount": 1,
-              "activeJobCount": 0,
-              "lastJobId": "job-truncated-answer",
-              "lastJobStatus": "succeeded",
-              "lastPrompt": "List assigned PRs",
-              "hasSessionFile": true
-            }
-            """
-        )
-        let job = try decodeCodexJob(
-            """
-            {
-              "id": "job-truncated-answer",
-              "provider": "codex",
-              "status": "succeeded",
-              "workspaceId": "poc-vault",
-              "workspaceName": "POC Vault",
-              "prompt": "List assigned PRs",
-              "result": "I found one assigned PR and this preview is not the full final answer.",
-              "resultTruncated": true,
-              "logsIncluded": "compact",
-              "completedAt": "2026-05-20T12:05:10Z"
-            }
-            """
-        )
-
-        let transcript = CodexThreadChatItem.makeTranscript(detail: nil, thread: thread, latestJob: job)
-
-        let answer = try XCTUnwrap(transcript.first { $0.role == .assistant })
-        XCTAssertEqual(answer.text, "I found one assigned PR and this preview is not the full final answer.")
-        XCTAssertTrue(answer.canLoadFullText)
-        XCTAssertTrue(answer.isLong)
-    }
-
-    func testCodexThreadChatTranscriptShowsEmptySuccessfulClaudeJobAsIssue() throws {
-        let thread = try decodeCodexThread(
-            """
-            {
-              "id": "3210752c-bec9-41ad-a989-afe8380585f1",
-              "sessionId": "3210752c-bec9-41ad-a989-afe8380585f1",
-              "provider": "claude",
-              "workspaceId": "dir-yuno-claude-code",
-              "workspaceName": "yuno claude code",
-              "updatedAt": "2026-05-25T01:41:14Z",
-              "jobCount": 1,
-              "activeJobCount": 0,
-              "lastJobId": "1db799ed-2377-4b17-b47e-f84d3824f218",
-              "lastJobStatus": "succeeded",
-              "lastPrompt": "Get this done. Write me a plan first.",
-              "hasSessionFile": true
-            }
-            """
-        )
-        let job = try decodeCodexJob(
-            """
-            {
-              "id": "1db799ed-2377-4b17-b47e-f84d3824f218",
-              "provider": "claude",
-              "status": "succeeded",
-              "workspaceId": "dir-yuno-claude-code",
-              "workspaceName": "yuno claude code",
-              "prompt": "Get this done. Write me a plan first.",
-              "stdout": "\\n",
-              "result": "",
-              "completedAt": "2026-05-25T01:41:14Z"
-            }
-            """
-        )
-
-        let transcript = CodexThreadChatItem.makeTranscript(detail: nil, thread: thread, latestJob: job)
-
-        XCTAssertEqual(transcript.map(\.role), [.user, .status])
-        XCTAssertEqual(transcript.map(\.text), [
-            "Get this done. Write me a plan first.",
-            "Claude finished without producing output."
-        ])
-        XCTAssertTrue(try XCTUnwrap(transcript.last).isError)
-    }
-
-    func testCodexThreadChatTranscriptUsesFullLatestJobAnswerOverThreadPreview() throws {
-        let detail = try JSONDecoder().decode(
-            CodexThreadDetail.self,
-            from: Data(
-                """
-                {
-                  "thread": {
-                    "id": "thread-preview-answer",
-                    "sessionId": "thread-preview-answer",
-                    "workspaceId": "poc-vault",
-                    "workspaceName": "POC Vault",
-                    "updatedAt": "2026-05-20T12:05:10Z",
-                    "jobCount": 1,
-                    "activeJobCount": 0,
-                    "lastJobId": "job-full-answer",
-                    "lastJobStatus": "succeeded",
-                    "lastPrompt": "List assigned issues",
-                    "lastResult": "Short answer preview...",
-                    "hasSessionFile": true
-                  },
-                  "messages": [
-                    {
-                      "role": "user",
-                      "timestamp": "2026-05-20T12:00:00Z",
-                      "text": "List assigned issues"
-                    },
-                    {
-                      "role": "assistant",
-                      "timestamp": "2026-05-20T12:01:00Z",
-                      "text": "Short answer preview..."
-                    }
-                  ],
-                  "jobs": []
-                }
-                """.utf8
-            )
-        )
-        let job = try decodeCodexJob(
-            """
-            {
-              "id": "job-full-answer",
-              "provider": "codex",
-              "status": "succeeded",
-              "workspaceId": "poc-vault",
-              "workspaceName": "POC Vault",
-              "prompt": "List assigned issues",
-              "result": "Full answer line one.\\n\\n- ENGG-541: action item one.\\n- ENGG-542: action item two.\\n- ENGG-543: action item three.",
-              "resultTruncated": false,
-              "logsIncluded": "compact",
-              "completedAt": "2026-05-20T12:05:10Z"
-            }
-            """
-        )
-
-        let transcript = CodexThreadChatItem.makeTranscript(detail: detail, thread: nil, latestJob: job)
-
-        let answer = try XCTUnwrap(transcript.last { $0.role == .assistant })
-        XCTAssertEqual(answer.text, "Full answer line one.\n\n- ENGG-541: action item one.\n- ENGG-542: action item two.\n- ENGG-543: action item three.")
-        XCTAssertFalse(answer.canLoadFullText)
-    }
-
-    func testCodexThreadChatTranscriptAppendsCompletedFollowUpToStaleDetail() throws {
-        let detail = try JSONDecoder().decode(
-            CodexThreadDetail.self,
-            from: Data(
-                """
-                {
-                  "thread": {
-                    "id": "thread-stale-follow-up",
-                    "sessionId": "thread-stale-follow-up",
-                    "workspaceId": "poc-vault",
-                    "workspaceName": "POC Vault",
-                    "updatedAt": "2026-05-20T12:01:00Z",
-                    "jobCount": 1,
-                    "activeJobCount": 0,
-                    "lastJobId": "job-first",
-                    "lastJobStatus": "succeeded",
-                    "lastPrompt": "What can be done here?",
-                    "lastResult": "Here is what you can do.",
-                    "hasSessionFile": true
-                  },
-                  "messages": [
-                    {
-                      "role": "user",
-                      "timestamp": "2026-05-20T12:00:00Z",
-                      "text": "What can be done here?"
-                    },
-                    {
-                      "role": "assistant",
-                      "timestamp": "2026-05-20T12:01:00Z",
-                      "text": "Here is what you can do."
-                    }
-                  ],
-                  "jobs": []
-                }
-                """.utf8
-            )
-        )
-        let job = try decodeCodexJob(
-            """
-            {
-              "id": "job-follow-up",
-              "provider": "codex",
-              "status": "succeeded",
-              "workspaceId": "poc-vault",
-              "workspaceName": "POC Vault",
-              "prompt": "Anything else?",
-              "result": "Yes. You can also inspect server health.",
-              "resultTruncated": false,
-              "logsIncluded": "compact",
-              "createdAt": "2026-05-20T12:05:00Z",
-              "completedAt": "2026-05-20T12:06:00Z"
-            }
-            """
-        )
-
-        let transcript = CodexThreadChatItem.makeTranscript(detail: detail, thread: nil, latestJob: job)
-
-        XCTAssertEqual(transcript.map(\.role), [.user, .assistant, .user, .assistant])
-        XCTAssertEqual(
-            transcript.map(\.text),
-            [
-                "What can be done here?",
-                "Here is what you can do.",
-                "Anything else?",
-                "Yes. You can also inspect server health."
-            ]
-        )
-    }
-
-    func testCodexThreadChatTranscriptShowsWorkingPlaceholderForRunningFollowUp() throws {
-        let thread = try decodeCodexThread(
-            """
-            {
-              "id": "019e46a5-0000-7000-8000-000000000004",
-              "sessionId": "019e46a5-0000-7000-8000-000000000004",
-              "workspaceId": "poc-vault",
-              "workspaceName": "POC Vault",
-              "updatedAt": "2026-05-20T12:05:10Z",
-              "jobCount": 2,
-              "activeJobCount": 0,
-              "lastJobStatus": "succeeded",
-              "lastPrompt": "Review",
-              "hasSessionFile": true
-            }
-            """
-        )
-        let job = try decodeCodexJob(
-            """
-            {
-              "id": "job-running-follow-up",
-              "provider": "codex",
-              "status": "running",
-              "workspaceId": "poc-vault",
-              "workspaceName": "POC Vault",
-              "prompt": "Review",
-              "createdAt": "2026-05-20T12:05:12Z",
-              "startedAt": "2026-05-20T12:05:13Z"
-            }
-            """
-        )
-
-        let transcript = CodexThreadChatItem.makeTranscript(detail: nil, thread: thread, latestJob: job)
-
-        XCTAssertEqual(transcript.map(\.role), [.user, .status])
-        XCTAssertEqual(transcript.map(\.sourceID), ["thread-prompt", "thread-working"])
-        let workingItem = try XCTUnwrap(transcript.last)
-        XCTAssertEqual(workingItem.text, "Codex is working.")
-        XCTAssertEqual(workingItem.alignment, .leading)
-    }
-
-    func testCodexThreadChatTranscriptShowsPendingFollowUpBeforeJobHydrates() throws {
-        let detail = try JSONDecoder().decode(
-            CodexThreadDetail.self,
-            from: Data(
-                """
-                {
-                  "thread": {
-                    "id": "thread-pending-follow-up",
-                    "sessionId": "thread-pending-follow-up",
-                    "workspaceId": "poc-vault",
-                    "workspaceName": "POC Vault",
-                    "updatedAt": "2026-05-20T12:01:00Z",
-                    "jobCount": 1,
-                    "activeJobCount": 0,
-                    "lastJobId": "job-first",
-                    "lastJobStatus": "succeeded",
-                    "lastPrompt": "What can be done here?",
-                    "lastResult": "Here is what you can do.",
-                    "hasSessionFile": true
-                  },
-                  "messages": [
-                    {
-                      "role": "user",
-                      "timestamp": "2026-05-20T12:00:00Z",
-                      "text": "What can be done here?"
-                    },
-                    {
-                      "role": "assistant",
-                      "timestamp": "2026-05-20T12:01:00Z",
-                      "text": "Here is what you can do."
-                    }
-                  ],
-                  "jobs": []
-                }
-                """.utf8
-            )
-        )
-        let pending = CodexPendingFollowUp(
-            jobID: "job-pending-follow-up",
-            prompt: "Please check the remaining edge cases.",
-            provider: .codex,
-            createdAt: Date(timeIntervalSince1970: 1_779_278_712)
-        )
-
-        let transcript = CodexThreadChatItem.makeTranscript(
-            detail: detail,
-            thread: nil,
-            latestJob: nil,
-            pendingFollowUp: pending
-        )
-
-        XCTAssertEqual(transcript.map(\.role), [.user, .assistant, .user, .status])
-        XCTAssertEqual(
-            transcript.map(\.text),
-            [
-                "What can be done here?",
-                "Here is what you can do.",
-                "Please check the remaining edge cases.",
-                "Codex is working."
-            ]
-        )
-        XCTAssertEqual(transcript.map(\.sourceID).suffix(2), ["pending-follow-up-job-pending-follow-up", "thread-working"])
-    }
-
-    func testCodexThreadChatTranscriptKeepsPendingPromptWhenHydratedJobPromptHasSkillWrapper() throws {
-        let thread = try decodeCodexThread(
-            """
-            {
-              "id": "thread-pending-skill",
-              "sessionId": "thread-pending-skill",
-              "workspaceId": "poc-vault",
-              "workspaceName": "POC Vault",
-              "updatedAt": "2026-05-20T12:05:10Z",
-              "jobCount": 2,
-              "activeJobCount": 0,
-              "lastJobStatus": "succeeded",
-              "lastPrompt": "Previous prompt",
-              "lastResult": "Previous answer",
-              "hasSessionFile": true
-            }
-            """
-        )
-        let job = try decodeCodexJob(
-            """
-            {
-              "id": "job-pending-skill",
-              "provider": "codex",
-              "status": "running",
-              "workspaceId": "poc-vault",
-              "workspaceName": "POC Vault",
-              "prompt": "Use these Codex skills for this task: human-code-review.\\n\\nPlease check the remaining edge cases.",
-              "createdAt": "2026-05-20T12:05:12Z",
-              "startedAt": "2026-05-20T12:05:13Z"
-            }
-            """
-        )
-        let pending = CodexPendingFollowUp(
-            jobID: "job-pending-skill",
-            prompt: "Please check the remaining edge cases.",
-            provider: .codex,
-            createdAt: Date(timeIntervalSince1970: 1_779_278_712)
-        )
-
-        let transcript = CodexThreadChatItem.makeTranscript(
-            detail: nil,
-            thread: thread,
-            latestJob: job,
-            pendingFollowUp: pending
-        )
-
-        XCTAssertEqual(transcript.map(\.role), [.user, .status])
-        XCTAssertEqual(transcript.first?.text, "Please check the remaining edge cases.")
-        XCTAssertFalse(transcript.contains { $0.text.contains("Use these Codex skills") })
-    }
-
-    func testCodexThreadChatTranscriptShowsRepeatedPendingFollowUpTextAsNewTurn() throws {
-        let detail = try JSONDecoder().decode(
-            CodexThreadDetail.self,
-            from: Data(
-                """
-                {
-                  "thread": {
-                    "id": "thread-repeated-follow-up",
-                    "sessionId": "thread-repeated-follow-up",
-                    "workspaceId": "poc-vault",
-                    "workspaceName": "POC Vault",
-                    "updatedAt": "2026-05-20T12:01:00Z",
-                    "jobCount": 1,
-                    "activeJobCount": 0,
-                    "lastJobId": "job-first",
-                    "lastJobStatus": "succeeded",
-                    "lastPrompt": "Continue",
-                    "lastResult": "Here is the first continuation.",
-                    "hasSessionFile": true
-                  },
-                  "messages": [
-                    {
-                      "role": "user",
-                      "timestamp": "2026-05-20T12:00:00Z",
-                      "text": "Continue"
-                    },
-                    {
-                      "role": "assistant",
-                      "timestamp": "2026-05-20T12:01:00Z",
-                      "text": "Here is the first continuation."
-                    }
-                  ],
-                  "jobs": []
-                }
-                """.utf8
-            )
-        )
-        let pending = CodexPendingFollowUp(
-            jobID: "job-repeated-follow-up",
-            prompt: "Continue",
-            provider: .codex,
-            createdAt: Date(timeIntervalSince1970: 1_779_278_712)
-        )
-
-        let transcript = CodexThreadChatItem.makeTranscript(
-            detail: detail,
-            thread: nil,
-            latestJob: nil,
-            pendingFollowUp: pending
-        )
-
-        XCTAssertEqual(transcript.filter { $0.role == .user && $0.text == "Continue" }.count, 2)
-        XCTAssertEqual(transcript.map(\.sourceID).suffix(2), ["pending-follow-up-job-repeated-follow-up", "thread-working"])
-    }
-
-    func testCodexThreadChatTranscriptKeepsWorkingPlaceholderWithProgressUpdates() throws {
-        let detail = try JSONDecoder().decode(
-            CodexThreadDetail.self,
-            from: Data(
-                """
-                {
-                  "thread": {
-                    "id": "thread-progress-running",
-                    "sessionId": "thread-progress-running",
-                    "workspaceId": "poc-vault",
-                    "workspaceName": "POC Vault",
-                    "updatedAt": "2026-05-20T12:06:00Z",
-                    "jobCount": 1,
-                    "activeJobCount": 1,
-                    "lastJobId": "job-running-progress",
-                    "lastJobStatus": "running",
-                    "lastPrompt": "List issues",
-                    "hasSessionFile": true
-                  },
-                  "messages": [
-                    {
-                      "role": "user",
-                      "timestamp": "2026-05-20T12:00:00Z",
-                      "text": "List issues"
-                    },
-                    {
-                      "role": "assistant",
-                      "timestamp": "2026-05-20T12:00:10Z",
-                      "text": "I am pulling Linear issues."
-                    },
-                    {
-                      "role": "assistant",
-                      "timestamp": "2026-05-20T12:00:20Z",
-                      "text": "I am reading issue details."
-                    }
-                  ],
-                  "jobs": [
-                    {
-                      "id": "job-running-progress",
-                      "provider": "codex",
-                      "status": "running",
-                      "workspaceId": "poc-vault",
-                      "workspaceName": "POC Vault",
-                      "prompt": "List issues",
-                      "createdAt": "2026-05-20T12:00:00Z",
-                      "startedAt": "2026-05-20T12:00:02Z"
-                    }
-                  ]
-                }
-                """.utf8
-            )
-        )
-
-        let transcript = CodexThreadChatItem.makeTranscript(detail: detail, thread: nil, latestJob: detail.jobs.first)
-
-        XCTAssertEqual(transcript.map(\.kind), [.message, .progressSummary, .workingPlaceholder])
-        XCTAssertEqual(transcript.last?.text, "Codex is working.")
-    }
-
-    func testCodexThreadChatTranscriptShowsPendingFirstRunLikeThreadChat() throws {
-        let job = try decodeCodexJob(
-            """
-            {
-              "id": "job-starting-thread",
-              "provider": "codex",
-              "status": "running",
-              "workspaceId": "poc-vault",
-              "workspaceName": "POC Vault",
-              "prompt": "Build a deployment checklist",
-              "createdAt": "2026-05-20T12:05:12Z",
-              "startedAt": "2026-05-20T12:05:13Z"
-            }
-            """
-        )
-
-        let transcript = CodexThreadChatItem.makeTranscript(detail: nil, thread: nil, latestJob: job)
-
-        XCTAssertEqual(transcript.map(\.role), [.user, .status])
-        XCTAssertEqual(transcript.first?.text, "Build a deployment checklist")
-        XCTAssertEqual(transcript.first?.alignment, .trailing)
-        XCTAssertEqual(transcript.last?.kind, .workingPlaceholder)
-        XCTAssertEqual(transcript.last?.text, "Codex is working.")
-    }
-
-    func testCodexThreadChatTranscriptDoesNotPairRunningFollowUpWithStaleThreadAnswer() throws {
-        let thread = try decodeCodexThread(
-            """
-            {
-              "id": "019e46a5-0000-7000-8000-000000000006",
-              "sessionId": "019e46a5-0000-7000-8000-000000000006",
-              "workspaceId": "poc-vault",
-              "workspaceName": "POC Vault",
-              "updatedAt": "2026-05-20T12:05:10Z",
-              "jobCount": 2,
-              "activeJobCount": 0,
-              "lastJobStatus": "succeeded",
-              "lastPrompt": "Are there any PRs assigned to me?",
-              "lastResult": "One PR is assigned to you.",
-              "hasSessionFile": true
-            }
-            """
-        )
-        let job = try decodeCodexJob(
-            """
-            {
-              "id": "job-running-review",
-              "provider": "codex",
-              "status": "running",
-              "workspaceId": "poc-vault",
-              "workspaceName": "POC Vault",
-              "prompt": "Review",
-              "createdAt": "2026-05-20T12:06:12Z",
-              "startedAt": "2026-05-20T12:06:13Z"
-            }
-            """
-        )
-
-        let transcript = CodexThreadChatItem.makeTranscript(detail: nil, thread: thread, latestJob: job)
-
-        XCTAssertEqual(transcript.map(\.role), [.user, .status])
-        XCTAssertEqual(transcript.map(\.text), ["Review", "Codex is working."])
-    }
-
-    func testCodexThreadChatTranscriptCollapsesTrailingAssistantUpdateWhileFollowUpRuns() throws {
-        let detail = try JSONDecoder().decode(
-            CodexThreadDetail.self,
-            from: Data(
-                """
-                {
-                  "thread": {
-                    "id": "019e46a5-0000-7000-8000-000000000005",
-                    "sessionId": "019e46a5-0000-7000-8000-000000000005",
-                    "workspaceId": "poc-vault",
-                    "workspaceName": "POC Vault",
-                    "updatedAt": "2026-05-20T12:06:00Z",
-                    "jobCount": 2,
-                    "activeJobCount": 1,
-                    "lastJobStatus": "running",
-                    "lastPrompt": "Review",
-                    "hasSessionFile": true
-                  },
-                  "messages": [
-                    {
-                      "role": "user",
-                      "timestamp": "2026-05-20T12:00:00Z",
-                      "text": "Are there any PRs assigned to me?"
-                    },
-                    {
-                      "role": "assistant",
-                      "timestamp": "2026-05-20T12:01:00Z",
-                      "text": "One PR is assigned to you."
-                    },
-                    {
-                      "role": "user",
-                      "timestamp": "2026-05-20T12:05:12Z",
-                      "text": "Review"
-                    },
-                    {
-                      "role": "assistant",
-                      "timestamp": "2026-05-20T12:05:20Z",
-                      "text": "I'll inspect the review target."
-                    }
-                  ],
-                  "jobs": [
-                    {
-                      "id": "job-running-follow-up",
-                      "provider": "codex",
-                      "status": "running",
-                      "workspaceId": "poc-vault",
-                      "workspaceName": "POC Vault",
-                      "prompt": "Review",
-                      "createdAt": "2026-05-20T12:05:12Z",
-                      "startedAt": "2026-05-20T12:05:13Z"
-                    }
-                  ]
-                }
-                """.utf8
-            )
-        )
-
-        let transcript = CodexThreadChatItem.makeTranscript(detail: detail, thread: nil, latestJob: detail.jobs.first)
-
-        XCTAssertEqual(transcript.map(\.role), [.user, .assistant, .user, .status, .status])
-        XCTAssertEqual(transcript[3].kind, .progressSummary)
-        XCTAssertEqual(transcript[3].progressCount, 1)
-        XCTAssertEqual(transcript[4].kind, .workingPlaceholder)
-        XCTAssertFalse(transcript.contains { $0.role == .assistant && $0.text == "I'll inspect the review target." })
-    }
-
-    func testCodexThreadDetailRefreshPolicyPollsWhileThreadOrFollowUpIsActive() throws {
-        let idleThread = try decodeCodexThread(
-            """
-            {
-              "id": "thread-idle",
-              "sessionId": "thread-idle",
-              "workspaceName": "POC Vault",
-              "activeJobCount": 0,
-              "lastJobStatus": "succeeded"
-            }
-            """
-        )
-        let activeThread = try decodeCodexThread(
-            """
-            {
-              "id": "thread-active",
-              "sessionId": "thread-active",
-              "workspaceName": "POC Vault",
-              "activeJobCount": 1,
-              "lastJobStatus": "running"
-            }
-            """
-        )
-        let runningJob = try decodeCodexJob(
-            """
-            {
-              "id": "job-running",
-              "status": "running",
-              "workspaceName": "POC Vault"
-            }
-            """
-        )
-
-        XCTAssertTrue(CodexThreadDetailRefreshPolicy.shouldPoll(thread: activeThread, latestJob: nil, pendingFollowUpJobID: nil))
-        XCTAssertTrue(CodexThreadDetailRefreshPolicy.shouldPoll(thread: idleThread, latestJob: runningJob, pendingFollowUpJobID: nil))
-        XCTAssertTrue(CodexThreadDetailRefreshPolicy.shouldPoll(thread: idleThread, latestJob: nil, pendingFollowUpJobID: "job-running"))
-        XCTAssertFalse(CodexThreadDetailRefreshPolicy.shouldPoll(thread: idleThread, latestJob: nil, pendingFollowUpJobID: nil))
+        XCTAssertTrue(sparse.messages.isEmpty)
+        XCTAssertTrue(sparse.jobs.isEmpty)
     }
 
     func testCodexThreadFeedUsesThreadsInsteadOfDuplicateJobs() throws {
@@ -2153,49 +1248,13 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(attachments?.first?["dataBase64"] as? String, Data("phone-image".utf8).base64EncodedString())
     }
 
-    func testCodexViewModelTreatsSwiftCancellationAsNonError() throws {
-        XCTAssertTrue(CodexConsoleViewModel.isCancellation(CancellationError()))
+    func testIsCancellationTreatsSwiftCancellationAsNonError() throws {
+        XCTAssertTrue(isCancellation(CancellationError()))
     }
 
-    @MainActor
-    func testCodexViewModelUsesProviderSpecificDefaults() throws {
-        let codexViewModel = CodexConsoleViewModel(
-            client: CodexClient(
-                baseURL: URL(string: "https://codex.example.test")!,
-                identityStore: ClientIdentityStore()
-            )
-        )
-        let claudeViewModel = CodexConsoleViewModel(
-            client: CodexClient(
-                baseURL: URL(string: "https://codex.example.test")!,
-                identityStore: ClientIdentityStore()
-            ),
-            provider: .claude
-        )
-
-        XCTAssertEqual(codexViewModel.provider, .codex)
-        XCTAssertEqual(codexViewModel.selectedModel, "")
-        XCTAssertEqual(codexViewModel.selectedReasoningEffort, .xhigh)
-        XCTAssertEqual(claudeViewModel.provider, .claude)
-        XCTAssertEqual(claudeViewModel.selectedModel, "")
-        XCTAssertEqual(claudeViewModel.selectedReasoningEffort, .high)
-        XCTAssertEqual(claudeViewModel.connectionNoticeTitle, "Claude needs certificate")
-    }
-
-    func testCodexViewModelTreatsURLSessionCancellationAsNonError() throws {
-        XCTAssertTrue(CodexConsoleViewModel.isCancellation(URLError(.cancelled)))
-        XCTAssertFalse(CodexConsoleViewModel.isCancellation(URLError(.notConnectedToInternet)))
-    }
-
-    func testCodexViewModelClassifiesMissingJobAsNotFound() throws {
-        XCTAssertTrue(CodexConsoleViewModel.isHTTPNotFound(CodexClientError.httpFailure(404, "job not found")))
-        XCTAssertFalse(CodexConsoleViewModel.isHTTPNotFound(CodexClientError.httpFailure(500, "server failed")))
-    }
-
-    func testCodexViewModelClassifiesTransientConnectionFailures() throws {
-        XCTAssertTrue(CodexConsoleViewModel.isTransientConnection(URLError(.networkConnectionLost)))
-        XCTAssertTrue(CodexConsoleViewModel.isTransientConnection(URLError(.timedOut)))
-        XCTAssertFalse(CodexConsoleViewModel.isTransientConnection(CodexClientError.httpFailure(404, "job not found")))
+    func testIsCancellationTreatsURLSessionCancellationAsNonError() throws {
+        XCTAssertTrue(isCancellation(URLError(.cancelled)))
+        XCTAssertFalse(isCancellation(URLError(.notConnectedToInternet)))
     }
 
     func testCodexCompletionSignalDetectsObservedJobCompletion() throws {
@@ -2310,35 +1369,6 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(CodexAgentMonitorPolicy.shouldStartAppMonitor(isRunningTests: false))
     }
 
-    @MainActor
-    func testCodexViewModelAppendsTranscriptionToExistingPrompt() throws {
-        let viewModel = CodexConsoleViewModel(
-            client: CodexClient(
-                baseURL: URL(string: "https://codex.example.test")!,
-                identityStore: ClientIdentityStore()
-            )
-        )
-
-        viewModel.prompt = "Run the smoke test."
-        viewModel.appendTranscription("Then deploy it.")
-
-        XCTAssertEqual(viewModel.prompt, "Run the smoke test.\n\nThen deploy it.")
-    }
-
-    @MainActor
-    func testCodexViewModelUsesTranscriptionAsPromptWhenPromptIsEmpty() throws {
-        let viewModel = CodexConsoleViewModel(
-            client: CodexClient(
-                baseURL: URL(string: "https://codex.example.test")!,
-                identityStore: ClientIdentityStore()
-            )
-        )
-
-        viewModel.appendTranscription("Check the live Codex health.")
-
-        XCTAssertEqual(viewModel.prompt, "Check the live Codex health.")
-    }
-
     func testCodexPromptAudioRecordingConfigurationUsesPlainRecordSession() {
         let configuration = CodexPromptAudioRecordingConfiguration.devicePromptDefaults
 
@@ -2445,16 +1475,25 @@ final class ManifestTests: XCTestCase {
     }
 
     func testRelayChatUsesStructuredMarkdownRendering() throws {
-        let source = try String(contentsOfFile: relayChatSourcePath, encoding: .utf8)
-        let markdownText = try sourceSnippet(
-            in: source,
-            from: "private struct RelayMarkdownText",
-            to: "private struct RelayJobCard"
-        )
+        // The markdown views were promoted out of RelayChatView (revamp I3) into
+        // Rendering/RelayMarkdownViews.swift so chat and the file viewer share them.
+        let markdownSource = try String(contentsOfFile: relayMarkdownViewsSourcePath, encoding: .utf8)
+        XCTAssertTrue(markdownSource.contains("struct RelayMarkdownText"))
+        XCTAssertTrue(markdownSource.contains("struct RelayMarkdownProse"))
+        XCTAssertTrue(markdownSource.contains("struct RelayMarkdownTable"))
+        XCTAssertTrue(markdownSource.contains("struct RelayCodeBlock"))
+        XCTAssertTrue(markdownSource.contains("CodexMarkdownParser.segments"))
+        XCTAssertFalse(markdownSource.contains("private struct RelayMarkdownText"))
+        XCTAssertFalse(markdownSource.contains("RelayTextPart.parse(text)"))
 
-        XCTAssertTrue(markdownText.contains("CodexMarkdownParser.segments"))
-        XCTAssertTrue(markdownText.contains("RelayMarkdownProse"))
-        XCTAssertFalse(markdownText.contains("RelayTextPart.parse(text)"))
+        // Chat still renders through the shared entry point instead of a private copy.
+        let chatSource = try String(contentsOfFile: relayChatSourcePath, encoding: .utf8)
+        XCTAssertTrue(chatSource.contains("RelayMarkdownText(text:"))
+        XCTAssertFalse(chatSource.contains("struct RelayMarkdownText"))
+
+        // The file viewer's rendered-markdown mode consumes the same shared views.
+        let viewerSource = try String(contentsOfFile: fileViewerSourcePath, encoding: .utf8)
+        XCTAssertTrue(viewerSource.contains("RelayMarkdownText(text:"))
     }
 
     func testRelayComposerDoesNotReserveExtraKeyboardGap() throws {
@@ -2471,28 +1510,556 @@ final class ManifestTests: XCTestCase {
         XCTAssertFalse(composerSource.contains(".padding(.bottom, isFocused ?"))
     }
 
+    /// Revamp I4: the composer is harness-first. The mode toggle, workspace chip, and
+    /// the in-chat workspace browser are gone (the file browser owns folder navigation);
+    /// the picker groups Agents per harness with a flat Chat models section; the send
+    /// icon is always `arrow.up`; the keyboard-dismissal invariants survive.
+    func testRelayChatComposerIsHarnessFirstWithoutModeToggle() throws {
+        let source = try String(contentsOfFile: relayChatSourcePath, encoding: .utf8)
+
+        // Dead controls from the mode-toggle era.
+        XCTAssertFalse(source.contains("RelayWorkspaceSheet"))
+        XCTAssertFalse(source.contains("RelayFolderRow"))
+        XCTAssertFalse(source.contains("showingOptions"))
+        XCTAssertFalse(source.contains("relay-workspace-chip"))
+        XCTAssertFalse(source.contains("Picker(\"Mode\""))
+        XCTAssertFalse(source.contains("showsModeToggle"))
+        XCTAssertFalse(source.contains("RELAY_UITEST_WS_PATH"))
+        XCTAssertFalse(source.contains("play.fill"))
+        XCTAssertFalse(source.contains("threadsByWorkspace"))
+
+        // Harness-first picker: Agents submenus per harness + flat Chat models.
+        XCTAssertTrue(source.contains("Section(\"Agents\")"))
+        XCTAssertTrue(source.contains("Section(\"Chat models\")"))
+        XCTAssertTrue(source.contains("ForEach(sections.agents)"))
+        XCTAssertTrue(source.contains("Menu(harness.title)"))
+        XCTAssertTrue(source.contains("ForEach(sections.chatModels)"))
+        XCTAssertTrue(source.contains("relay-model-chip"))
+        XCTAssertTrue(source.contains("relay-effort-chip"))
+        XCTAssertTrue(source.contains("Image(systemName: \"arrow.up\")"))
+
+        // Live SSE-fed job tail with the poll-driven fallback text.
+        XCTAssertTrue(source.contains("liveTail"))
+        XCTAssertTrue(source.contains("viewModel.liveJobTails[job.id]"))
+
+        // Keyboard invariants (AGENTS.md hard requirement).
+        XCTAssertTrue(source.contains(".scrollDismissesKeyboard(.interactively)"))
+        XCTAssertTrue(source.contains("ToolbarItemGroup(placement: .keyboard)"))
+    }
+
+    // MARK: - Files API models + client contract (revamp I1)
+
+    func testCodexDirectoryEntryDecodesFileMetadata() throws {
+        let entry = try decodeDirectoryEntry(
+            """
+            {
+              "name": "README.md",
+              "kind": "file",
+              "path": "/srv/codex-workspaces/poc-vault/README.md",
+              "relativePath": "poc-vault/README.md",
+              "size": 2048,
+              "mtime": "2026-08-01T10:15:00Z",
+              "mime": "text/markdown",
+              "isText": true,
+              "readDenied": false
+            }
+            """
+        )
+
+        XCTAssertEqual(entry.kind, .file)
+        XCTAssertFalse(entry.isDirectory)
+        XCTAssertEqual(entry.size, 2_048)
+        XCTAssertNotNil(entry.mtime)
+        XCTAssertNotNil(entry.mtimeLabel)
+        XCTAssertEqual(entry.mime, "text/markdown")
+        XCTAssertEqual(entry.isText, true)
+        XCTAssertFalse(entry.readDenied)
+        XCTAssertEqual(entry.fileCategory, .markdown)
+        let sizeLabel = try XCTUnwrap(entry.sizeLabel)
+        XCTAssertFalse(sizeLabel.isEmpty)
+    }
+
+    func testCodexDirectoryEntryDefaultsLegacyEntriesToDirectories() throws {
+        let entry = try decodeDirectoryEntry(
+            """
+            {
+              "name": "notes",
+              "path": "/srv/codex-workspaces/notes",
+              "hasGit": false,
+              "isRegistered": false
+            }
+            """
+        )
+
+        XCTAssertEqual(entry.kind, .dir)
+        XCTAssertTrue(entry.isDirectory)
+        XCTAssertNil(entry.size)
+        XCTAssertNil(entry.sizeLabel)
+        XCTAssertNil(entry.mtime)
+        XCTAssertNil(entry.mtimeLabel)
+        XCTAssertNil(entry.mime)
+        XCTAssertNil(entry.isText)
+        XCTAssertFalse(entry.readDenied)
+    }
+
+    func testCodexDirectoryEntryDecodesReadDeniedSecretFiles() throws {
+        let entry = try decodeDirectoryEntry(
+            """
+            {
+              "name": ".env",
+              "kind": "file",
+              "path": "/srv/codex-workspaces/poc-vault/.env",
+              "readDenied": true
+            }
+            """
+        )
+
+        XCTAssertEqual(entry.kind, .file)
+        XCTAssertTrue(entry.readDenied)
+    }
+
+    func testCodexDirectoryListingDecodesPaginationAndTruncation() throws {
+        let listing = try JSONDecoder().decode(
+            CodexWorkspaceDirectoryListing.self,
+            from: Data(
+                """
+                {
+                  "rootPath": "/srv/codex-workspaces",
+                  "currentPath": "/srv/codex-workspaces/poc-vault",
+                  "relativePath": "poc-vault",
+                  "parentPath": "/srv/codex-workspaces",
+                  "offset": 0,
+                  "limit": 2,
+                  "total": 5,
+                  "truncated": true,
+                  "entries": [
+                    { "name": "src", "kind": "dir", "path": "/srv/codex-workspaces/poc-vault/src" },
+                    { "name": "app.js", "kind": "file", "path": "/srv/codex-workspaces/poc-vault/app.js", "size": 640 }
+                  ]
+                }
+                """.utf8
+            )
+        )
+
+        XCTAssertTrue(listing.truncated)
+        XCTAssertEqual(listing.total, 5)
+        XCTAssertEqual(listing.offset, 0)
+        XCTAssertEqual(listing.limit, 2)
+        XCTAssertEqual(listing.entries.count, 2)
+        XCTAssertTrue(listing.entries[0].isDirectory)
+        XCTAssertFalse(listing.entries[1].isDirectory)
+
+        let legacyListing = try JSONDecoder().decode(
+            CodexWorkspaceDirectoryListing.self,
+            from: Data(
+                """
+                {
+                  "rootPath": "/srv/codex-workspaces",
+                  "currentPath": "/srv/codex-workspaces",
+                  "entries": []
+                }
+                """.utf8
+            )
+        )
+
+        XCTAssertFalse(legacyListing.truncated)
+        XCTAssertNil(legacyListing.total)
+        XCTAssertNil(legacyListing.offset)
+        XCTAssertNil(legacyListing.limit)
+    }
+
+    func testCodexFileCategoryInfersViewerTypesFromMimeAndExtension() throws {
+        func category(name: String, mime: String? = nil, isText: Bool? = nil) throws -> CodexFileCategory {
+            var fields = [
+                "\"name\": \"\(name)\"",
+                "\"kind\": \"file\"",
+                "\"path\": \"/srv/codex-workspaces/poc-vault/\(name)\""
+            ]
+            if let mime {
+                fields.append("\"mime\": \"\(mime)\"")
+            }
+            if let isText {
+                fields.append("\"isText\": \(isText)")
+            }
+            return try decodeDirectoryEntry("{\(fields.joined(separator: ", "))}").fileCategory
+        }
+
+        XCTAssertEqual(try category(name: "main.swift"), .code)
+        XCTAssertEqual(try category(name: "server.mjs", mime: "text/javascript"), .code)
+        XCTAssertEqual(try category(name: "photo.PNG"), .image)
+        XCTAssertEqual(try category(name: "scan", mime: "image/jpeg"), .image)
+        XCTAssertEqual(try category(name: "report.pdf"), .pdf)
+        XCTAssertEqual(try category(name: "paper", mime: "application/pdf"), .pdf)
+        XCTAssertEqual(try category(name: "README.md"), .markdown)
+        XCTAssertEqual(try category(name: "readme", mime: "text/markdown"), .markdown)
+        XCTAssertEqual(try category(name: "readme", mime: "text/markdown; charset=utf-8"), .markdown)
+        XCTAssertEqual(try category(name: "notes.txt"), .text)
+        XCTAssertEqual(try category(name: "LICENSE", isText: true), .text)
+        XCTAssertEqual(try category(name: "blob.dat", mime: "application/octet-stream"), .binary)
+        XCTAssertEqual(try category(name: "mystery"), .binary)
+    }
+
+    // MARK: - File viewer routing + paging (revamp I3)
+
+    func testRelayFileViewerRoutesCategoriesToPresentationKinds() throws {
+        func kind(name: String, mime: String? = nil, isText: Bool? = nil, readDenied: Bool = false) throws -> RelayFileViewerKind {
+            var fields = [
+                "\"name\": \"\(name)\"",
+                "\"kind\": \"file\"",
+                "\"path\": \"/srv/codex-workspaces/poc-vault/\(name)\""
+            ]
+            if let mime {
+                fields.append("\"mime\": \"\(mime)\"")
+            }
+            if let isText {
+                fields.append("\"isText\": \(isText)")
+            }
+            if readDenied {
+                fields.append("\"readDenied\": true")
+            }
+            return try decodeDirectoryEntry("{\(fields.joined(separator: ", "))}").viewerKind
+        }
+
+        // Code and plain text share the monospaced text surface.
+        XCTAssertEqual(try kind(name: "main.swift"), .text)
+        XCTAssertEqual(try kind(name: "server.mjs", mime: "text/javascript"), .text)
+        XCTAssertEqual(try kind(name: "notes.txt"), .text)
+        XCTAssertEqual(try kind(name: "LICENSE", isText: true), .text)
+
+        // Markdown renders through the shared Relay markdown views.
+        XCTAssertEqual(try kind(name: "README.md"), .markdown)
+        XCTAssertEqual(try kind(name: "readme", mime: "text/markdown; charset=utf-8"), .markdown)
+
+        // Bitmaps get the fit-width image surface.
+        XCTAssertEqual(try kind(name: "photo.PNG"), .image)
+        XCTAssertEqual(try kind(name: "scan", mime: "image/jpeg"), .image)
+
+        // PDF and HTML render through the authenticated web view — HTML is `.code` by
+        // file category but must not fall into the mono text surface.
+        XCTAssertEqual(try kind(name: "report.pdf"), .web)
+        XCTAssertEqual(try kind(name: "paper", mime: "application/pdf"), .web)
+        XCTAssertEqual(try kind(name: "index.html"), .web)
+        XCTAssertEqual(try kind(name: "widget.htm"), .web)
+        XCTAssertEqual(try kind(name: "page", mime: "text/html; charset=utf-8"), .web)
+
+        // Unknown bytes and read-denied entries fall back to the share placeholder.
+        XCTAssertEqual(try kind(name: "blob.dat", mime: "application/octet-stream"), .binary)
+        XCTAssertEqual(try kind(name: "mystery"), .binary)
+        XCTAssertEqual(try kind(name: ".env", isText: true, readDenied: true), .binary)
+    }
+
+    @MainActor
+    func testRelayFileViewerLoadMoreRangesContinueFromLoadedBytes() throws {
+        let firstRange = FileViewerViewModel.nextRange(afterLoadedByteCount: 0)
+        XCTAssertEqual(firstRange.lowerBound, 0)
+        XCTAssertEqual(
+            firstRange.upperBound,
+            FileViewerViewModel.loadMoreChunkByteCount - 1
+        )
+
+        let continuation = FileViewerViewModel.nextRange(afterLoadedByteCount: 1_048_576)
+        XCTAssertEqual(continuation.lowerBound, 1_048_576)
+        XCTAssertEqual(
+            continuation.upperBound,
+            1_048_576 + FileViewerViewModel.loadMoreChunkByteCount - 1
+        )
+
+        let smallChunk = FileViewerViewModel.nextRange(afterLoadedByteCount: 10, chunkByteCount: 4)
+        XCTAssertEqual(smallChunk, 10...13)
+    }
+
+    @MainActor
+    func testRelayFileViewerTruncationTracksKnownSizeAndRangeResponses() throws {
+        // A known listing size is authoritative: more remains until it is reached, even
+        // though every Range response reports 206.
+        XCTAssertTrue(FileViewerViewModel.remainingBytesExist(
+            responseTruncated: true,
+            receivedByteCount: 1_048_576,
+            loadedByteCount: 1_048_576,
+            knownFileSize: 1_572_864
+        ))
+        XCTAssertFalse(FileViewerViewModel.remainingBytesExist(
+            responseTruncated: true,
+            requestedByteCount: 524_288,
+            receivedByteCount: 524_288,
+            loadedByteCount: 1_572_864,
+            knownFileSize: 1_572_864
+        ))
+
+        // Without a known size, the initial fetch trusts the 206/Content-Range signal.
+        XCTAssertTrue(FileViewerViewModel.remainingBytesExist(
+            responseTruncated: true,
+            receivedByteCount: 1_048_576,
+            loadedByteCount: 1_048_576,
+            knownFileSize: nil
+        ))
+        XCTAssertFalse(FileViewerViewModel.remainingBytesExist(
+            responseTruncated: false,
+            receivedByteCount: 2_048,
+            loadedByteCount: 2_048,
+            knownFileSize: nil
+        ))
+
+        // A short or empty Range response means EOF was reached.
+        XCTAssertFalse(FileViewerViewModel.remainingBytesExist(
+            responseTruncated: true,
+            requestedByteCount: 524_288,
+            receivedByteCount: 100,
+            loadedByteCount: 1_048_676,
+            knownFileSize: nil
+        ))
+        XCTAssertFalse(FileViewerViewModel.remainingBytesExist(
+            responseTruncated: true,
+            requestedByteCount: 524_288,
+            receivedByteCount: 0,
+            loadedByteCount: 1_048_576,
+            knownFileSize: nil
+        ))
+    }
+
+    @MainActor
+    func testRelayFileViewerChunksMonoTextWithoutAlteringContent() throws {
+        XCTAssertEqual(FileViewerViewModel.chunkedLines(""), [])
+        XCTAssertEqual(FileViewerViewModel.chunkedLines("short file\n"), ["short file\n"])
+
+        let lines = (0..<1_000).map { "line \($0)" }
+        let text = lines.joined(separator: "\n")
+        let chunks = FileViewerViewModel.chunkedLines(text, linesPerChunk: 400)
+
+        // Bounded chunks so a megabyte-scale file never lands in a single SwiftUI Text,
+        // and rejoining reproduces the exact loaded content.
+        XCTAssertEqual(chunks.count, 3)
+        XCTAssertTrue(chunks.allSatisfy { $0.split(separator: "\n", omittingEmptySubsequences: false).count <= 400 })
+        XCTAssertEqual(chunks.joined(separator: "\n"), text)
+    }
+
+    @MainActor
+    func testRelayFileViewerOnlyWebKindSkipsByteFetch() throws {
+        func makeViewModel(_ json: String) throws -> FileViewerViewModel {
+            FileViewerViewModel(
+                client: makeOfflineCodexClient(),
+                entry: try decodeDirectoryEntry(json)
+            )
+        }
+
+        let pdf = try makeViewModel(
+            """
+            { "name": "report.pdf", "kind": "file", "path": "/srv/codex-workspaces/poc-vault/report.pdf" }
+            """
+        )
+        XCTAssertEqual(pdf.kind, .web)
+        XCTAssertFalse(pdf.needsByteFetch)
+
+        let markdown = try makeViewModel(
+            """
+            { "name": "readme.md", "kind": "file", "path": "/srv/codex-workspaces/poc-vault/readme.md", "size": 4096 }
+            """
+        )
+        XCTAssertEqual(markdown.kind, .markdown)
+        XCTAssertTrue(markdown.needsByteFetch)
+        XCTAssertEqual(markdown.truncationLabel.contains("of"), true)
+
+        let unsizedLog = try makeViewModel(
+            """
+            { "name": "build.log", "kind": "file", "path": "/srv/codex-workspaces/poc-vault/build.log" }
+            """
+        )
+        XCTAssertEqual(unsizedLog.kind, .text)
+        XCTAssertTrue(unsizedLog.truncationLabel.contains("first"))
+    }
+
+    func testCodexClientBuildsWebViewURLForJailFiles() throws {
+        let client = CodexClient(
+            baseURL: URL(string: "http://127.0.0.1:8787")!,
+            identityStore: ClientIdentityStore()
+        )
+        let url = try XCTUnwrap(client.fileWebViewURL(path: "poc-vault/docs/report.pdf"))
+        XCTAssertEqual(url.scheme, "http")
+        XCTAssertEqual(url.path, "/v1/codex/fs/file")
+        XCTAssertEqual(
+            URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "path" })?.value,
+            "poc-vault/docs/report.pdf"
+        )
+    }
+
+    func testCodexProviderCursorDecodingRoundTrips() throws {
+        let models = try decodeCodexModels(
+            """
+            [
+              { "id": "cursor-auto", "label": "Cursor Agent · Auto", "provider": "cursor", "modes": ["task"] },
+              { "id": "cursor-agent-auto", "label": "Cursor Agent", "provider": "cursor-agent", "modes": ["task"] }
+            ]
+            """
+        )
+
+        XCTAssertEqual(models.count, 2)
+        XCTAssertEqual(models[0].provider, .cursor)
+        XCTAssertEqual(models[1].provider, .cursor)
+        XCTAssertTrue(models[0].supports(.task))
+        XCTAssertFalse(models[0].supports(.chat))
+        XCTAssertEqual(CodexProvider(rawProvider: "cursor-agent"), .cursor)
+
+        let encoded = try JSONEncoder().encode(CodexProvider.cursor)
+        XCTAssertEqual(String(data: encoded, encoding: .utf8), "\"cursor\"")
+    }
+
+    func testRelayModelChoiceKeepsDualModeIdentitiesDistinct() throws {
+        let models = try decodeCodexModels(
+            """
+            [
+              { "id": "gpt-5.6-sol", "label": "Codex · GPT-5.6 Sol", "provider": "codex", "modes": ["chat", "task"] }
+            ]
+            """
+        )
+        let model = try XCTUnwrap(models.first)
+
+        let chatChoice = RelayModelChoice(model: model, mode: .chat)
+        let taskChoice = RelayModelChoice(model: model, mode: .task)
+
+        XCTAssertNotEqual(chatChoice.id, taskChoice.id)
+        XCTAssertNotEqual(chatChoice, taskChoice)
+        XCTAssertTrue(chatChoice.id.contains("gpt-5.6-sol"))
+        XCTAssertTrue(taskChoice.id.contains("gpt-5.6-sol"))
+        XCTAssertEqual(chatChoice, RelayModelChoice(model: model, mode: .chat))
+        XCTAssertEqual(Set([chatChoice, taskChoice]).count, 2)
+    }
+
+    func testCodexJobStreamEventDecodesRawSSEDataLines() throws {
+        var parser = CodexSSELineParser<CodexJobStreamEvent> { event, data in
+            CodexJobStreamEvent.decode(event: event, data: data)
+        }
+        var events: [CodexJobStreamEvent] = []
+
+        events.append(contentsOf: parser.ingest("event: status"))
+        events.append(contentsOf: parser.ingest("data: {\"id\":\"job-9\",\"status\":\"running\"}"))
+        events.append(contentsOf: parser.ingest(""))
+        events.append(contentsOf: parser.ingest("event: stdout"))
+        events.append(contentsOf: parser.ingest("data: {\"offset\":0,\"text\":\"building\\n\"}"))
+        events.append(contentsOf: parser.ingest(""))
+        events.append(contentsOf: parser.ingest("event: heartbeat"))
+        events.append(contentsOf: parser.ingest("data: {}"))
+        events.append(contentsOf: parser.ingest(""))
+        events.append(contentsOf: parser.ingest("event: stderr"))
+        events.append(contentsOf: parser.ingest("data: {\"offset\":12,\"text\":\"warning\"}"))
+        events.append(contentsOf: parser.ingest(""))
+        events.append(contentsOf: parser.ingest("event: done"))
+        events.append(contentsOf: parser.ingest("data: {\"id\":\"job-9\",\"status\":\"succeeded\",\"result\":\"All done.\"}"))
+        events.append(contentsOf: parser.finish())
+
+        XCTAssertEqual(events.count, 4)
+
+        guard case .status(let statusJob) = events[0] else {
+            return XCTFail("Expected a status event, got \(events[0])")
+        }
+        XCTAssertEqual(statusJob.id, "job-9")
+        XCTAssertEqual(statusJob.status, .running)
+
+        XCTAssertEqual(events[1], .stdout(offset: 0, text: "building\n"))
+        XCTAssertEqual(events[2], .stderr(offset: 12, text: "warning"))
+
+        guard case .done(let doneJob) = events[3] else {
+            return XCTFail("Expected a done event, got \(events[3])")
+        }
+        XCTAssertEqual(doneJob.id, "job-9")
+        XCTAssertEqual(doneJob.status, .succeeded)
+        XCTAssertEqual(doneJob.result, "All done.")
+    }
+
+    func testModelCatalogDecodingNeverSurfacesProviderCredentials() throws {
+        let models = try decodeCodexModels(
+            """
+            [
+              {
+                "id": "azure-prod/gpt-5.5",
+                "label": "gpt-5.5 (Azure Prod)",
+                "provider": "azure",
+                "modes": ["chat"],
+                "azureDeployment": "gpt-5.5",
+                "azureBaseURL": "https://example.openai.azure.com/openai/v1",
+                "azureApiKeyFile": "/etc/codex-api/azure/prod.key",
+                "apiKey": "sk-should-never-surface",
+                "authToken": "should-never-surface"
+              }
+            ]
+            """
+        )
+        let model = try XCTUnwrap(models.first)
+
+        XCTAssertEqual(model.provider, .azure)
+        XCTAssertEqual(model.azureDeployment, "gpt-5.5")
+
+        // No credential-shaped stored property may exist on the client model...
+        let credentialMarkers = ["key", "secret", "token", "credential", "password"]
+        for label in Mirror(reflecting: model).children.compactMap(\.label) {
+            let lowered = label.lowercased()
+            for marker in credentialMarkers {
+                XCTAssertFalse(lowered.contains(marker), "Credential-shaped field decoded from /models: \(label)")
+            }
+        }
+
+        // ...and none of the injected credential material may be retained anywhere.
+        let dump = String(describing: model)
+        XCTAssertFalse(dump.contains("sk-should-never-surface"))
+        XCTAssertFalse(dump.contains("should-never-surface"))
+        XCTAssertFalse(dump.contains("prod.key"))
+        XCTAssertFalse(dump.contains("azureBaseURL"))
+    }
+
+    func testConfiguredURLTreatsPlaceholdersAsUnset() throws {
+        // The checked-in *.example.com build-setting defaults and un-expanded $(VAR)
+        // tokens must both lose to the in-code fallback — otherwise a default
+        // xcodebuild simulator install points at a dead host instead of the fixture.
+        XCTAssertEqual(
+            AppConfiguration.resolveConfiguredURL(
+                candidates: [nil, "https://codex.pocs.example.com"],
+                fallback: "http://127.0.0.1:8787"
+            ),
+            URL(string: "http://127.0.0.1:8787")
+        )
+        XCTAssertEqual(
+            AppConfiguration.resolveConfiguredURL(
+                candidates: ["$(POC_VAULT_CODEX_BASE_URL)", ""],
+                fallback: "http://127.0.0.1:8787"
+            ),
+            URL(string: "http://127.0.0.1:8787")
+        )
+        XCTAssertFalse(AppConfiguration.isConfiguredURLValue("https://vault.pocs.example.com/manifest.json"))
+        XCTAssertFalse(AppConfiguration.isConfiguredURLValue("https://example.com"))
+        XCTAssertFalse(AppConfiguration.isConfiguredURLValue(""))
+        XCTAssertFalse(AppConfiguration.isConfiguredURLValue("$(POC_VAULT_MANIFEST_URL)"))
+    }
+
+    func testConfiguredURLKeepsInjectionSeamForRealBuilds() throws {
+        // An owner-injected live URL still beats the fallback (device-build seam) …
+        XCTAssertEqual(
+            AppConfiguration.resolveConfiguredURL(
+                candidates: [nil, "http://127.0.0.1:8899"],
+                fallback: "http://127.0.0.1:8787"
+            ),
+            URL(string: "http://127.0.0.1:8899")
+        )
+        // … and the support-config value outranks the Info.plist value.
+        XCTAssertEqual(
+            AppConfiguration.resolveConfiguredURL(
+                candidates: ["https://relay.internal.test", "https://codex.pocs.example.com"],
+                fallback: "http://127.0.0.1:8787"
+            ),
+            URL(string: "https://relay.internal.test")
+        )
+        XCTAssertTrue(AppConfiguration.isConfiguredURLValue("https://relay.internal.test"))
+    }
+
+    private func decodeDirectoryEntry(_ json: String) throws -> CodexWorkspaceDirectoryEntry {
+        try JSONDecoder().decode(CodexWorkspaceDirectoryEntry.self, from: Data(json.utf8))
+    }
+
     private func decodeCodexJob(_ json: String) throws -> CodexJob {
         try JSONDecoder().decode(CodexJob.self, from: Data(json.utf8))
     }
 
     private func decodeCodexThread(_ json: String) throws -> CodexThread {
         try JSONDecoder().decode(CodexThread.self, from: Data(json.utf8))
-    }
-
-    private var codexConsoleSourcePath: String {
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("POCVault/Views/CodexConsoleView.swift")
-            .path
-    }
-
-    private var codexConsoleViewModelSourcePath: String {
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("POCVault/Views/CodexConsoleViewModel.swift")
-            .path
     }
 
     private var appSourcePath: String {
@@ -2516,6 +2083,22 @@ final class ManifestTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent("POCVault/Views/RelayChatView.swift")
+            .path
+    }
+
+    private var relayMarkdownViewsSourcePath: String {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("POCVault/Rendering/RelayMarkdownViews.swift")
+            .path
+    }
+
+    private var fileViewerSourcePath: String {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("POCVault/Browser/FileViewerView.swift")
             .path
     }
 

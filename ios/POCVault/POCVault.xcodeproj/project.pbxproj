@@ -22,13 +22,19 @@
 		200000000000000000000014 /* Resources/AppIcon/AppIcon1024.png in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000017 /* Resources/AppIcon/AppIcon1024.png */; };
 		200000000000000000000015 /* CodexModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000018 /* CodexModels.swift */; };
 		200000000000000000000016 /* CodexClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000019 /* CodexClient.swift */; };
-		200000000000000000000017 /* CodexConsoleViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000020 /* CodexConsoleViewModel.swift */; };
-		200000000000000000000018 /* CodexConsoleView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000021 /* CodexConsoleView.swift */; };
 		200000000000000000000019 /* Resources/Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000022 /* Resources/Assets.xcassets */; };
 		200000000000000000000020 /* RelayChatViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000023 /* RelayChatViewModel.swift */; };
 		200000000000000000000021 /* RelayChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000024 /* RelayChatView.swift */; };
 		200000000000000000000022 /* Resources/Fonts/DMSans.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000025 /* Resources/Fonts/DMSans.ttf */; };
 		200000000000000000000023 /* Resources/Fonts/DMMono-Regular.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000026 /* Resources/Fonts/DMMono-Regular.ttf */; };
+		200000000000000000000024 /* CodexMarkdown.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000027 /* CodexMarkdown.swift */; };
+		200000000000000000000025 /* CodexAppServices.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000028 /* CodexAppServices.swift */; };
+		200000000000000000000026 /* CodexPromptAudioRecordingConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000029 /* CodexPromptAudioRecordingConfiguration.swift */; };
+		200000000000000000000027 /* FileBrowserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000030 /* FileBrowserView.swift */; };
+		200000000000000000000028 /* FileBrowserViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000031 /* FileBrowserViewModel.swift */; };
+		200000000000000000000029 /* RelayChatSessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000032 /* RelayChatSessionStore.swift */; };
+		200000000000000000000030 /* FileViewerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000033 /* FileViewerView.swift */; };
+		200000000000000000000031 /* RelayMarkdownViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000034 /* RelayMarkdownViews.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -60,13 +66,19 @@
 		100000000000000000000017 /* Resources/AppIcon/AppIcon1024.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = Resources/AppIcon/AppIcon1024.png; sourceTree = "<group>"; };
 		100000000000000000000018 /* CodexModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexModels.swift; sourceTree = "<group>"; };
 		100000000000000000000019 /* CodexClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexClient.swift; sourceTree = "<group>"; };
-		100000000000000000000020 /* CodexConsoleViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexConsoleViewModel.swift; sourceTree = "<group>"; };
-		100000000000000000000021 /* CodexConsoleView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexConsoleView.swift; sourceTree = "<group>"; };
 		100000000000000000000022 /* Resources/Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Resources/Assets.xcassets; sourceTree = "<group>"; };
 		100000000000000000000023 /* RelayChatViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayChatViewModel.swift; sourceTree = "<group>"; };
 		100000000000000000000024 /* RelayChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayChatView.swift; sourceTree = "<group>"; };
 		100000000000000000000025 /* Resources/Fonts/DMSans.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = Resources/Fonts/DMSans.ttf; sourceTree = "<group>"; };
 		100000000000000000000026 /* Resources/Fonts/DMMono-Regular.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "Resources/Fonts/DMMono-Regular.ttf"; sourceTree = "<group>"; };
+		100000000000000000000027 /* CodexMarkdown.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexMarkdown.swift; sourceTree = "<group>"; };
+		100000000000000000000028 /* CodexAppServices.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexAppServices.swift; sourceTree = "<group>"; };
+		100000000000000000000029 /* CodexPromptAudioRecordingConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexPromptAudioRecordingConfiguration.swift; sourceTree = "<group>"; };
+		100000000000000000000030 /* FileBrowserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileBrowserView.swift; sourceTree = "<group>"; };
+		100000000000000000000031 /* FileBrowserViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileBrowserViewModel.swift; sourceTree = "<group>"; };
+		100000000000000000000032 /* RelayChatSessionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayChatSessionStore.swift; sourceTree = "<group>"; };
+		100000000000000000000033 /* FileViewerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileViewerView.swift; sourceTree = "<group>"; };
+		100000000000000000000034 /* RelayMarkdownViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayMarkdownViews.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -106,6 +118,10 @@
 				500000000000000000000007 /* Networking */,
 				500000000000000000000008 /* Web */,
 				500000000000000000000009 /* Views */,
+				500000000000000000000010 /* Rendering */,
+				500000000000000000000011 /* Services */,
+				500000000000000000000012 /* Audio */,
+				500000000000000000000013 /* Browser */,
 				100000000000000000000015 /* Resources/AppIcon/AppIcon60x60@2x.png */,
 				100000000000000000000016 /* Resources/AppIcon/AppIcon60x60@3x.png */,
 				100000000000000000000017 /* Resources/AppIcon/AppIcon1024.png */,
@@ -174,12 +190,46 @@
 				100000000000000000000012 /* LibraryViewModel.swift */,
 				100000000000000000000013 /* LibraryView.swift */,
 				100000000000000000000014 /* DiagnosticsView.swift */,
-				100000000000000000000020 /* CodexConsoleViewModel.swift */,
-				100000000000000000000021 /* CodexConsoleView.swift */,
 				100000000000000000000023 /* RelayChatViewModel.swift */,
 				100000000000000000000024 /* RelayChatView.swift */,
+				100000000000000000000032 /* RelayChatSessionStore.swift */,
 			);
 			path = Views;
+			sourceTree = "<group>";
+		};
+		500000000000000000000010 /* Rendering */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000027 /* CodexMarkdown.swift */,
+				100000000000000000000034 /* RelayMarkdownViews.swift */,
+			);
+			path = Rendering;
+			sourceTree = "<group>";
+		};
+		500000000000000000000011 /* Services */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000028 /* CodexAppServices.swift */,
+			);
+			path = Services;
+			sourceTree = "<group>";
+		};
+		500000000000000000000012 /* Audio */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000029 /* CodexPromptAudioRecordingConfiguration.swift */,
+			);
+			path = Audio;
+			sourceTree = "<group>";
+		};
+		500000000000000000000013 /* Browser */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000030 /* FileBrowserView.swift */,
+				100000000000000000000031 /* FileBrowserViewModel.swift */,
+				100000000000000000000033 /* FileViewerView.swift */,
+			);
+			path = Browser;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -297,10 +347,16 @@
 				200000000000000000000011 /* DiagnosticsView.swift in Sources */,
 				200000000000000000000015 /* CodexModels.swift in Sources */,
 				200000000000000000000016 /* CodexClient.swift in Sources */,
-				200000000000000000000017 /* CodexConsoleViewModel.swift in Sources */,
-				200000000000000000000018 /* CodexConsoleView.swift in Sources */,
 				200000000000000000000020 /* RelayChatViewModel.swift in Sources */,
 				200000000000000000000021 /* RelayChatView.swift in Sources */,
+				200000000000000000000024 /* CodexMarkdown.swift in Sources */,
+				200000000000000000000025 /* CodexAppServices.swift in Sources */,
+				200000000000000000000026 /* CodexPromptAudioRecordingConfiguration.swift in Sources */,
+				200000000000000000000027 /* FileBrowserView.swift in Sources */,
+				200000000000000000000028 /* FileBrowserViewModel.swift in Sources */,
+				200000000000000000000029 /* RelayChatSessionStore.swift in Sources */,
+				200000000000000000000030 /* FileViewerView.swift in Sources */,
+				200000000000000000000031 /* RelayMarkdownViews.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

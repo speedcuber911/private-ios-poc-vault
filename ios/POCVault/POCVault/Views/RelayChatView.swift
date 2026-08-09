@@ -4,9 +4,10 @@ import UIKit
 
 struct RelayChatView: View {
     @ObservedObject var viewModel: RelayChatViewModel
-    @State private var showingModels = false
+    /// Set when the chat is presented as a folder's full-screen cover; shows the
+    /// dismiss chevron in the top bar. Dismissing never cancels streams (VM-owned).
+    var onDismiss: (() -> Void)? = nil
     @State private var showingThreads = false
-    @State private var showingOptions = false
     @State private var fullLogText: String?
 
     var body: some View {
@@ -28,18 +29,15 @@ struct RelayChatView: View {
             .safeAreaInset(edge: .bottom) {
                 RelayComposer(
                     text: $viewModel.prompt,
-                    mode: $viewModel.mode,
-                    model: viewModel.selectedModel,
-                    workspaceName: viewModel.selectedWorkspace?.name,
+                    sections: viewModel.pickerSections,
+                    selectedChoice: viewModel.selectedChoice,
                     efforts: viewModel.availableEfforts,
                     selectedEffort: viewModel.effectiveEffort,
-                    showsModeToggle: viewModel.lockedMode == nil,
                     isSending: viewModel.isSending,
                     isStreaming: viewModel.isStreaming,
                     isTranscribing: viewModel.isTranscribing,
-                    onPickModel: { showingModels = true },
+                    onPickChoice: { viewModel.selectChoice($0) },
                     onPickEffort: { viewModel.selectEffort($0) },
-                    onOptions: { showingOptions = true },
                     onVoice: { fileURL in
                         Task { await viewModel.transcribePromptAudio(fileURL: fileURL) }
                     },
@@ -55,33 +53,12 @@ struct RelayChatView: View {
             }
             .task {
                 await viewModel.bootstrap()
-                #if DEBUG
-                if ProcessInfo.processInfo.environment["RELAY_UITEST_OPEN"] == "workspace",
-                   viewModel.lockedMode == .task {
-                    showingOptions = true
-                }
-                #endif
-            }
-            .task {
-                // Live job polling for the Task tab; cancelled automatically when the
-                // view leaves the screen. No-op on the Chat tab.
-                await viewModel.monitorActiveJobs()
             }
             .refreshable {
                 await viewModel.refreshThreads()
             }
-            .sheet(isPresented: $showingModels) {
-                RelayModelPickerSheet(viewModel: viewModel)
-                    .presentationDetents([.medium, .large])
-                    .presentationDragIndicator(.visible)
-            }
             .sheet(isPresented: $showingThreads) {
                 RelayThreadDrawer(viewModel: viewModel)
-                    .presentationDetents([.medium, .large])
-                    .presentationDragIndicator(.visible)
-            }
-            .sheet(isPresented: $showingOptions) {
-                RelayWorkspaceSheet(viewModel: viewModel)
                     .presentationDetents([.medium, .large])
                     .presentationDragIndicator(.visible)
             }
@@ -92,10 +69,25 @@ struct RelayChatView: View {
                 RelayFullLogSheet(text: payload.text)
             }
         }
+        // The chat opens as its own full-screen presentation; re-pin the app's
+        // deliberate dark-only appearance so the cover can never flash light.
+        .preferredColorScheme(.dark)
     }
 
     private var topBar: some View {
         HStack(spacing: 12) {
+            if let onDismiss {
+                Button(action: onDismiss) {
+                    Image(systemName: "chevron.down")
+                        .font(AppTheme.uiFont(size: 16, weight: .semibold))
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .frame(width: 36, height: 36)
+                        .background(AppTheme.bgSurfaceHi, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close chat")
+            }
+
             Button {
                 viewModel.startNewConversation()
             } label: {
@@ -113,16 +105,17 @@ struct RelayChatView: View {
                     .fill(AppTheme.accentGradient)
                     .frame(width: 30, height: 30)
                     .overlay {
-                        Image(systemName: "sparkle")
-                            .font(.system(size: 13, weight: .bold))
+                        Image(systemName: "folder.fill")
+                            .font(.system(size: 12, weight: .bold))
                             .foregroundStyle(.white)
                     }
                     .shadow(color: AppTheme.accent.opacity(0.5), radius: 6, y: 2)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(viewModel.lockedMode == .task ? "Task" : viewModel.lockedMode == .chat ? "Chat" : "Relay")
+                    Text(viewModel.folderDisplayName)
                         .font(AppTheme.uiFont(size: 22, weight: .bold))
                         .foregroundStyle(AppTheme.textPrimary)
-                    Text(viewModel.selectedModel?.label ?? "Loading models")
+                        .lineLimit(1)
+                    Text(selectedModelSubtitle)
                         .font(AppTheme.uiFont(size: 11, weight: .medium))
                         .foregroundStyle(AppTheme.textSecondary)
                         .lineLimit(1)
@@ -148,6 +141,11 @@ struct RelayChatView: View {
         .padding(.bottom, 10)
     }
 
+    private var selectedModelSubtitle: String {
+        guard let choice = viewModel.selectedChoice else { return "Loading models" }
+        return "\(choice.chipLabel) · \(choice.mode.label)"
+    }
+
     private var messageList: some View {
         ScrollViewReader { proxy in
             ScrollView {
@@ -157,12 +155,13 @@ struct RelayChatView: View {
                     }
 
                     if viewModel.messages.isEmpty && !viewModel.isSending {
-                        RelayEmptyConversation(model: viewModel.selectedModel, mode: viewModel.mode)
+                        RelayEmptyConversation(choice: viewModel.selectedChoice)
                     } else {
                         ForEach(viewModel.messages) { item in
                             if let job = item.job {
                                 RelayJobCard(
                                     job: job,
+                                    liveTail: viewModel.liveJobTails[job.id],
                                     isCancelling: viewModel.cancellingJobIDs.contains(job.id),
                                     onCancel: {
                                         Task { await viewModel.cancel(job: job) }
@@ -236,117 +235,145 @@ private struct RelayComposer: View {
     private static let normalBottomPadding: CGFloat = 8
 
     @Binding var text: String
-    @Binding var mode: RelayInteractionMode
-    let model: CodexModelDescriptor?
-    let workspaceName: String?
+    let sections: RelayModelPickerSections
+    let selectedChoice: RelayModelChoice?
     let efforts: [CodexReasoningEffort]
     let selectedEffort: CodexReasoningEffort?
-    let showsModeToggle: Bool
     let isSending: Bool
     let isStreaming: Bool
     let isTranscribing: Bool
-    let onPickModel: () -> Void
+    let onPickChoice: (RelayModelChoice) -> Void
     let onPickEffort: (CodexReasoningEffort) -> Void
-    let onOptions: () -> Void
     let onVoice: (URL) -> Void
     let onSend: () -> Void
     let onStop: () -> Void
     @FocusState private var isFocused: Bool
     @StateObject private var recorder = RelayPromptAudioRecorder()
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
-    private func chip(icon: String, text: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) { chipLabel(icon: icon, text: text) }
-            .buttonStyle(.plain)
-    }
+    /// Accessibility text sizes trade the compact pill layout for legibility: chips take
+    /// the full row and wrap instead of truncating the harness + model name.
+    private var usesAccessibilityLayout: Bool { dynamicTypeSize.isAccessibilitySize }
 
-    private func chipLabel(icon: String, text: String) -> some View {
+    private func chipLabel(icon: String, text: String, badge: String? = nil) -> some View {
         HStack(spacing: 6) {
             Image(systemName: icon)
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(AppTheme.accent)
             Text(text)
                 .font(AppTheme.uiFont(size: 13, weight: .medium))
-                .lineLimit(1)
+                .lineLimit(usesAccessibilityLayout ? 3 : 1)
+                .multilineTextAlignment(.leading)
                 .truncationMode(.tail)
+            if let badge {
+                Text(badge)
+                    .font(AppTheme.uiFont(size: 9, weight: .bold))
+                    .foregroundStyle(AppTheme.accent)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(AppTheme.accent.opacity(0.15), in: Capsule())
+                    .layoutPriority(1)
+            }
             Image(systemName: "chevron.up.chevron.down")
                 .font(AppTheme.uiFont(size: 9, weight: .semibold))
                 .foregroundStyle(AppTheme.textSecondary)
         }
         .foregroundStyle(AppTheme.textPrimary)
         .padding(.horizontal, 12)
-        .frame(height: 34)
-        .frame(maxWidth: 200, alignment: .leading)
-        .fixedSize(horizontal: true, vertical: false)
+        .padding(.vertical, 6)
+        .frame(minHeight: 34)
+        .frame(maxWidth: usesAccessibilityLayout ? .infinity : 240, alignment: .leading)
+        .fixedSize(horizontal: !usesAccessibilityLayout, vertical: false)
         .background(AppTheme.bgSurfaceHi, in: Capsule())
+    }
+
+    /// Harness-first model picker: each agent harness (Codex, Claude Code, Cursor) is a
+    /// submenu holding its own task-mode models; chat-capable models live in a flat
+    /// "Chat models" section. Both render only what the server catalog advertises.
+    private var modelPickerMenu: some View {
+        Menu {
+            if !sections.agents.isEmpty {
+                Section("Agents") {
+                    ForEach(sections.agents) { harness in
+                        Menu(harness.title) {
+                            ForEach(harness.choices) { choice in
+                                choiceButton(choice, title: choice.shortModelLabel)
+                            }
+                        }
+                    }
+                }
+            }
+            if !sections.chatModels.isEmpty {
+                Section("Chat models") {
+                    ForEach(sections.chatModels) { choice in
+                        choiceButton(choice, title: choice.chipLabel)
+                    }
+                }
+            }
+        } label: {
+            chipLabel(
+                icon: "cpu",
+                text: selectedChoice?.chipLabel ?? "Model",
+                badge: selectedChoice?.mode.label
+            )
+        }
+        .menuOrder(.fixed)
+        .accessibilityIdentifier("relay-model-chip")
+        .accessibilityLabel("Choose model")
+    }
+
+    @ViewBuilder private func choiceButton(_ choice: RelayModelChoice, title: String) -> some View {
+        Button {
+            onPickChoice(choice)
+        } label: {
+            if choice == selectedChoice {
+                Label(title, systemImage: "checkmark")
+            } else {
+                Text(title)
+            }
+        }
+    }
+
+    private var effortPickerMenu: some View {
+        Menu {
+            ForEach(efforts) { effort in
+                Button {
+                    onPickEffort(effort)
+                } label: {
+                    Label(effort.label, systemImage: selectedEffort == effort ? "checkmark" : "")
+                }
+            }
+        } label: {
+            chipLabel(
+                icon: "gauge.with.dots.needle.50percent",
+                text: (selectedEffort ?? efforts.first(where: { $0 == .high }) ?? efforts.first)?.label ?? "Effort"
+            )
+        }
+        .accessibilityIdentifier("relay-effort-chip")
     }
 
     var body: some View {
         VStack(spacing: 10) {
-            HStack(spacing: 10) {
-                Button(action: onPickModel) {
-                    HStack(spacing: 7) {
-                        Circle()
-                            .fill(AppTheme.accent)
-                            .frame(width: 7, height: 7)
-                        // Label already carries the provider (e.g. "gpt-4o (Azure)"), so no
-                        // separate provider badge here — just the name and a chevron affordance.
-                        Text(model?.label ?? "Model")
-                            .font(AppTheme.uiFont(size: 13, weight: .medium))
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                        Image(systemName: "chevron.up.chevron.down")
-                            .font(AppTheme.uiFont(size: 9, weight: .semibold))
-                            .foregroundStyle(AppTheme.textSecondary)
+            if usesAccessibilityLayout {
+                // Full-width stacked chips so harness + model stay legible at
+                // accessibility text sizes (the mode badge remains in the chip).
+                VStack(alignment: .leading, spacing: 8) {
+                    modelPickerMenu
+                    if !efforts.isEmpty {
+                        effortPickerMenu
                     }
-                    .foregroundStyle(AppTheme.textPrimary)
-                    .padding(.horizontal, 12)
-                    .frame(height: 34)
-                    .frame(maxWidth: 220, alignment: .leading)
-                    .background(AppTheme.bgSurfaceHi, in: Capsule())
                 }
-                .buttonStyle(.plain)
-
-                Spacer()
-
-                if showsModeToggle {
-                    Picker("Mode", selection: $mode) {
-                        ForEach(RelayInteractionMode.allCases) { mode in
-                            Text(mode.label).tag(mode)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .frame(width: 132)
-                }
-            }
-
-            // Task-only controls: workspace + reasoning effort. A plain bounded row (no
-            // horizontal ScrollView, which renders unbounded inside a safeAreaInset and
-            // blanks the screen on device). Chips truncate rather than scroll.
-            if mode == .task {
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
                 HStack(spacing: 8) {
-                    chip(icon: "folder.fill", text: workspaceName ?? "Workspace", action: onOptions)
-                        .accessibilityIdentifier("relay-workspace-chip")
-                        .layoutPriority(1)
+                    modelPickerMenu
 
                     if !efforts.isEmpty {
-                        Menu {
-                            ForEach(efforts) { effort in
-                                Button {
-                                    onPickEffort(effort)
-                                } label: {
-                                    Label(effort.label, systemImage: selectedEffort == effort ? "checkmark" : "")
-                                }
-                            }
-                        } label: {
-                            chipLabel(icon: "gauge.with.dots.needle.50percent",
-                                      text: (selectedEffort ?? efforts.first(where: { $0 == .high }) ?? efforts.first)?.label ?? "Effort")
-                        }
-                        .accessibilityIdentifier("relay-effort-chip")
+                        effortPickerMenu
                     }
 
                     Spacer(minLength: 0)
                 }
-                .frame(maxWidth: .infinity)
             }
 
             HStack(alignment: .bottom, spacing: 9) {
@@ -398,7 +425,7 @@ private struct RelayComposer: View {
                             Circle()
                                 .fill(canSend ? AnyShapeStyle(AppTheme.accentGradient) : AnyShapeStyle(AppTheme.bgSurface))
                                 .frame(width: 34, height: 34)
-                            Image(systemName: mode == .chat ? "arrow.up" : "play.fill")
+                            Image(systemName: "arrow.up")
                                 .font(.system(size: 15, weight: .bold))
                                 .foregroundStyle(canSend ? .white : AppTheme.textTertiary)
                         }
@@ -407,7 +434,7 @@ private struct RelayComposer: View {
                     .buttonStyle(.plain)
                     .disabled(!canSend)
                     .accessibilityIdentifier("relay-send")
-                    .accessibilityLabel(mode == .chat ? "Send" : "Run job")
+                    .accessibilityLabel("Send")
                     .transition(.scale.combined(with: .opacity))
                 }
             }
@@ -635,219 +662,15 @@ private struct RelayStreamingContent: View {
     }
 }
 
-private struct RelayMarkdownText: View {
-    let text: String
-    let userAligned: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
-                switch segment.kind {
-                case .prose:
-                    RelayMarkdownProse(
-                        text: segment.text,
-                        color: userAligned ? AppTheme.bgCanvas.opacity(0.94) : AppTheme.textPrimary,
-                        isOnAccent: userAligned
-                    )
-                case .code(let language):
-                    RelayCodeBlock(text: segment.text, language: language)
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var segments: [CodexMarkdownSegment] {
-        CodexMarkdownParser.segments(from: text)
-    }
-}
-
-private struct RelayMarkdownProse: View {
-    let text: String
-    let color: Color
-    let isOnAccent: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                switch block.kind {
-                case .heading(let level):
-                    Text(inlineMarkdown(block.text))
-                        .font(headingFont(for: level))
-                        .foregroundStyle(color)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .textSelection(.enabled)
-                        .padding(.top, level <= 2 ? 2 : 0)
-                case .paragraph:
-                    Text(inlineMarkdown(block.text))
-                        .font(AppTheme.uiFont(size: 14))
-                        .foregroundStyle(color)
-                        .lineSpacing(3)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .textSelection(.enabled)
-                case .bullet:
-                    listRow(marker: "•", text: block.text)
-                case .numbered(let index):
-                    listRow(marker: "\(index).", text: block.text)
-                case .table(let header, let rows):
-                    RelayMarkdownTable(header: header, rows: rows, color: color, isOnAccent: isOnAccent)
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var blocks: [CodexMarkdownProseBlock] {
-        CodexMarkdownParser.proseBlocks(from: text)
-    }
-
-    private func listRow(marker: String, text: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 7) {
-            Text(marker)
-                .font(AppTheme.uiFont(size: 13, weight: .semibold))
-                .foregroundStyle(color.opacity(0.78))
-                .frame(width: 22, alignment: .trailing)
-            Text(inlineMarkdown(text))
-                .font(AppTheme.uiFont(size: 14))
-                .foregroundStyle(color)
-                .lineSpacing(3)
-                .fixedSize(horizontal: false, vertical: true)
-                .textSelection(.enabled)
-        }
-    }
-
-    private func headingFont(for level: Int) -> Font {
-        switch level {
-        case 1:
-            AppTheme.uiFont(size: 19, weight: .bold)
-        case 2:
-            AppTheme.uiFont(size: 17, weight: .bold)
-        case 3:
-            AppTheme.uiFont(size: 15, weight: .semibold)
-        default:
-            AppTheme.uiFont(size: 14, weight: .semibold)
-        }
-    }
-
-    private func inlineMarkdown(_ value: String) -> AttributedString {
-        CodexInlineMarkdown.attributed(value)
-    }
-}
-
-private struct RelayMarkdownTable: View {
-    let header: [String]
-    let rows: [[String]]
-    let color: Color
-    let isOnAccent: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if !header.isEmpty {
-                tableRow(header, isHeader: true)
-            }
-
-            ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
-                if index > 0 || !header.isEmpty {
-                    Divider()
-                        .overlay(borderColor.opacity(0.72))
-                }
-                tableRow(row, isHeader: false)
-            }
-        }
-        .background(tableFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(borderColor, lineWidth: 0.75)
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .textSelection(.enabled)
-    }
-
-    private func tableRow(_ row: [String], isHeader: Bool) -> some View {
-        Group {
-            if row.count == 2 {
-                HStack(alignment: .top, spacing: 10) {
-                    tableCell(row[0], isHeader: isHeader)
-                        .frame(maxWidth: 104, alignment: .leading)
-                        .layoutPriority(0.35)
-                    tableCell(row[1], isHeader: isHeader)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .layoutPriority(1)
-                }
-            } else {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(Array(row.enumerated()), id: \.offset) { index, value in
-                        VStack(alignment: .leading, spacing: 3) {
-                            if !isHeader, header.indices.contains(index), !header[index].isEmpty {
-                                Text(CodexInlineMarkdown.attributed(header[index]))
-                                    .font(AppTheme.uiFont(size: 11, weight: .bold))
-                                    .foregroundStyle(color.opacity(0.68))
-                            }
-                            tableCell(value, isHeader: isHeader)
-                        }
-                    }
-                }
-            }
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, isHeader ? 8 : 9)
-    }
-
-    private func tableCell(_ value: String, isHeader: Bool) -> some View {
-        Text(CodexInlineMarkdown.attributed(value))
-            .font(AppTheme.uiFont(size: isHeader ? 12 : 13.5, weight: isHeader ? .semibold : .regular))
-            .foregroundStyle(isHeader ? color.opacity(0.72) : color)
-            .lineSpacing(2)
-            .fixedSize(horizontal: false, vertical: true)
-    }
-
-    private var tableFill: Color {
-        isOnAccent ? AppTheme.bgCanvas.opacity(0.13) : AppTheme.bgCanvas.opacity(0.72)
-    }
-
-    private var borderColor: Color {
-        isOnAccent ? AppTheme.bgCanvas.opacity(0.24) : AppTheme.strokeSubtle
-    }
-}
-
-private struct RelayCodeBlock: View {
-    let text: String
-    let language: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text(languageLabel)
-                    .font(AppTheme.monoFont(size: 11, weight: .semibold))
-                    .foregroundStyle(AppTheme.textSecondary)
-                Spacer()
-                Button {
-                    UIPasteboard.general.string = text
-                } label: {
-                    Image(systemName: "doc.on.doc")
-                        .font(AppTheme.monoFont(size: 12, weight: .semibold))
-                        .foregroundStyle(AppTheme.accent)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Copy code")
-            }
-            Text(text)
-                .font(AppTheme.monoFont(size: 12))
-                .foregroundStyle(AppTheme.textPrimary)
-                .textSelection(.enabled)
-                .lineLimit(24)
-        }
-        .padding(10)
-        .background(AppTheme.bgCanvas, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-    }
-
-    private var languageLabel: String {
-        language?.trimmedNonEmpty?.uppercased() ?? "Code"
-    }
-}
+// RelayMarkdownText / RelayMarkdownProse / RelayMarkdownTable / RelayCodeBlock moved to
+// Rendering/RelayMarkdownViews.swift (revamp I3) so the file viewer shares the chat's
+// markdown rendering. Call sites here are unchanged.
 
 private struct RelayJobCard: View {
     let job: CodexJob
+    /// SSE-fed stdout/stderr tail shown while the job is active; polling fills the card
+    /// via `job.displayOutput` when the stream is unavailable.
+    let liveTail: String?
     let isCancelling: Bool
     let onCancel: () -> Void
     let onFullLog: () -> Void
@@ -860,31 +683,30 @@ private struct RelayJobCard: View {
                     .font(AppTheme.uiFont(size: 12, weight: .medium))
                     .foregroundStyle(AppTheme.textSecondary)
                 Spacer()
-                Text(elapsedText)
-                    .font(AppTheme.monoFont(size: 11))
-                    .foregroundStyle(AppTheme.textTertiary)
+                // Status lives in the pill only (it used to repeat as plain text here);
+                // the trailing slot shows the run duration once the server reports one.
+                if let duration = job.durationMs {
+                    Text("\(max(1, duration / 1000))s")
+                        .font(AppTheme.monoFont(size: 11))
+                        .foregroundStyle(AppTheme.textTertiary)
+                }
             }
 
-            if let text = job.displayOutput?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
-                if job.status.isActive {
-                    // While running, show raw streaming logs in mono (it's progress output).
-                    Text(text)
-                        .font(AppTheme.monoFont(size: 12))
-                        .foregroundStyle(AppTheme.textSecondary)
-                        .lineLimit(10)
-                        .textSelection(.enabled)
+            if job.status.isActive {
+                if let tail = activeTailText {
+                    liveTailView(tail)
                 } else {
-                    // Final result: render markdown like chat replies (bold, code, lists).
-                    RelayMarkdownText(text: text, userAligned: false)
+                    // No output yet but the job is live — show motion so it never looks frozen.
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small).tint(AppTheme.accent)
+                        Text(job.status == .queued ? "Queued…" : "Working…")
+                            .font(AppTheme.uiFont(size: 13))
+                            .foregroundStyle(AppTheme.textSecondary)
+                    }
                 }
-            } else if job.status.isActive {
-                // No output yet but the job is live — show motion so it never looks frozen.
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.small).tint(AppTheme.accent)
-                    Text(job.status == .queued ? "Queued…" : "Working…")
-                        .font(AppTheme.uiFont(size: 13))
-                        .foregroundStyle(AppTheme.textSecondary)
-                }
+            } else if let text = job.displayOutput?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
+                // Final result: render markdown like chat replies (bold, code, lists).
+                RelayMarkdownText(text: text, userAligned: false)
             }
 
             HStack {
@@ -905,12 +727,42 @@ private struct RelayJobCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .stroke(AppTheme.accent.opacity(0.22), lineWidth: 0.8)
         }
+        .onChange(of: job.status.isActive) { _, isActive in
+            // Light tap when the job reaches a terminal state while the card is visible.
+            if !isActive {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            }
+        }
     }
 
-    private var elapsedText: String {
-        guard let duration = job.durationMs else { return job.status.label }
-        return "\(max(1, duration / 1000))s"
+    /// While active, prefer the SSE live tail; fall back to poll-fetched progress output.
+    private var activeTailText: String? {
+        if let tail = liveTail?.trimmedNonEmpty { return tail }
+        return job.displayOutput?.trimmedNonEmpty
     }
+
+    /// Autoscrolling mono tail: sticks to the newest output while the stream appends.
+    private func liveTailView(_ text: String) -> some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(text)
+                        .font(AppTheme.monoFont(size: 12))
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                    Color.clear.frame(height: 1).id(Self.tailAnchor)
+                }
+            }
+            .frame(maxHeight: 180)
+            .onAppear { proxy.scrollTo(Self.tailAnchor, anchor: .bottom) }
+            .onChange(of: text.count) { _, _ in
+                proxy.scrollTo(Self.tailAnchor, anchor: .bottom)
+            }
+        }
+    }
+
+    private static let tailAnchor = "relay-job-tail-anchor"
 }
 
 private struct RelayStatusPill: View {
@@ -943,105 +795,6 @@ private extension CodexJobStatus {
     }
 }
 
-private struct RelayModelPickerSheet: View {
-    @ObservedObject var viewModel: RelayChatViewModel
-    @Environment(\.dismiss) private var dismiss
-    @State private var bucket: RelayModelPickerBucket = .latest
-    @State private var searchText = ""
-
-    // Task mode has a small fixed model set, so the chat-style Latest/All bucket toggle is
-    // irrelevant noise there — show a clean provider-grouped list. Chat keeps the buckets.
-    private var isTask: Bool { viewModel.mode == .task }
-
-    var body: some View {
-        NavigationStack {
-            List {
-                if !isTask {
-                    Section {
-                        Picker("Model list", selection: $bucket) {
-                            ForEach(RelayModelPickerBucket.allCases) { bucket in
-                                Text(bucket.label).tag(bucket)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
-                        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
-                        .listRowBackground(AppTheme.bgCanvas)
-                    }
-                }
-
-                let sections = isTask
-                    ? viewModel.modelSections(bucket: .all, searchText: searchText)
-                    : viewModel.modelSections(bucket: bucket, searchText: searchText)
-                ForEach(sections) { section in
-                    Section(section.title) {
-                        ForEach(section.models) { model in
-                            RelayModelPickerRow(
-                                model: model,
-                                isSelected: viewModel.selectedModelID == model.id,
-                                isEnabled: model.supports(viewModel.mode)
-                            ) {
-                                viewModel.selectModel(model)
-                                dismiss()
-                            }
-                        }
-                    }
-                }
-            }
-            .searchable(text: $searchText, prompt: "Search models")
-            .scrollContentBackground(.hidden)
-            .background(AppTheme.bgCanvas)
-            .navigationTitle(isTask ? "Task model" : "Models")
-            .navigationBarTitleDisplayMode(.inline)
-            .preferredColorScheme(.dark)
-        }
-    }
-}
-
-private struct RelayModelPickerRow: View {
-    let model: CodexModelDescriptor
-    let isSelected: Bool
-    let isEnabled: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 12) {
-                Circle()
-                    .fill(isEnabled ? AppTheme.accent : AppTheme.textTertiary)
-                    .frame(width: 8, height: 8)
-
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(model.label)
-                        .font(AppTheme.uiFont(size: 16, weight: .semibold))
-                        .foregroundStyle(isEnabled ? AppTheme.textPrimary : AppTheme.textTertiary)
-                        .lineLimit(2)
-                    // The provider already lives in the label ("… (Azure)") and rows are
-                    // grouped by provider in the All bucket, so only surface a subtitle when
-                    // it adds information: a model that supports more than one mode.
-                    if model.modes.count > 1 {
-                        Text(model.modes.map(\.label).joined(separator: " / "))
-                            .font(AppTheme.uiFont(size: 12, weight: .medium))
-                            .foregroundStyle(AppTheme.textSecondary)
-                            .lineLimit(1)
-                    }
-                }
-
-                Spacer(minLength: 8)
-
-                if isSelected {
-                    Image(systemName: "checkmark")
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(AppTheme.accent)
-                }
-            }
-            .contentShape(Rectangle())
-        }
-        .disabled(!isEnabled)
-        .listRowBackground(AppTheme.bgSurface)
-    }
-}
-
 private struct RelayThreadDrawer: View {
     @ObservedObject var viewModel: RelayChatViewModel
     @Environment(\.dismiss) private var dismiss
@@ -1060,38 +813,31 @@ private struct RelayThreadDrawer: View {
                     .listRowBackground(AppTheme.bgSurface)
                 }
 
-                if viewModel.visibleThreads.isEmpty {
-                    Text("No threads yet.")
+                if viewModel.threads.isEmpty {
+                    // Subfolder chats keep their own histories, distinct from parent folders.
+                    Text("No threads in this folder yet. Conversations here stay scoped to \(viewModel.folderDisplayName).")
                         .font(AppTheme.uiFont(size: 13))
                         .foregroundStyle(AppTheme.textTertiary)
                         .listRowBackground(AppTheme.bgCanvas)
                 }
 
-                // Threads grouped per workspace folder, newest folder first.
-                ForEach(viewModel.threadsByWorkspace, id: \.workspace) { group in
-                    Section {
-                        ForEach(group.threads) { thread in
-                            threadRow(thread)
-                        }
-                    } header: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "folder.fill")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(AppTheme.accent)
-                            Text(group.workspace)
-                                .font(AppTheme.uiFont(size: 12, weight: .semibold))
-                                .foregroundStyle(AppTheme.textSecondary)
-                            Spacer()
-                            Text("\(group.threads.count)")
-                                .font(AppTheme.monoFont(size: 11))
-                                .foregroundStyle(AppTheme.textTertiary)
-                        }
+                // This folder's threads, both modes, flat and newest-first.
+                Section {
+                    ForEach(viewModel.threads) { thread in
+                        threadRow(thread)
+                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                Button(role: .destructive) {
+                                    Task { await viewModel.delete(thread) }
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                            }
                     }
                 }
             }
             .scrollContentBackground(.hidden)
             .background(AppTheme.bgCanvas)
-            .navigationTitle(viewModel.lockedMode == .task ? "Task threads" : "Threads")
+            .navigationTitle("Threads")
             .navigationBarTitleDisplayMode(.inline)
             .task { await viewModel.refreshThreads() }
             .preferredColorScheme(.dark)
@@ -1106,18 +852,20 @@ private struct RelayThreadDrawer: View {
             }
         } label: {
             VStack(alignment: .leading, spacing: 5) {
-                HStack {
+                HStack(spacing: 6) {
                     Text(thread.displayTitle)
                         .foregroundStyle(AppTheme.textPrimary)
                         .lineLimit(1)
                     Spacer()
                     if thread.hasActiveJobs {
                         Circle().fill(AppTheme.statusWarn).frame(width: 7, height: 7)
-                    } else if viewModel.lockedMode == nil {
-                        Text(thread.mode.label)
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(AppTheme.accent)
                     }
+                    Text(thread.mode.label)
+                        .font(AppTheme.uiFont(size: 9, weight: .bold))
+                        .foregroundStyle(AppTheme.accent)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(AppTheme.accent.opacity(0.15), in: Capsule())
                 }
                 Text(thread.feedPreview)
                     .font(.caption)
@@ -1126,322 +874,6 @@ private struct RelayThreadDrawer: View {
             }
         }
         .listRowBackground(AppTheme.bgSurface)
-    }
-}
-
-/// Unified folder browser for picking the task workspace.
-///
-/// Mental model: you are always navigating a folder tree rooted at the workspace root.
-/// Tapping a folder row drills INTO it (never dismisses). A persistent primary button
-/// selects whichever folder you are currently in. Registered workspaces also expose a
-/// per-row quick-pick so you can choose one without navigating. Create-new is inline.
-private struct RelayWorkspaceSheet: View {
-    @ObservedObject var viewModel: RelayChatViewModel
-    @Environment(\.dismiss) private var dismiss
-    @State private var creatingName = ""
-    @State private var showCreateField = false
-    @FocusState private var createFieldFocused: Bool
-
-    var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                breadcrumb
-                Divider().overlay(AppTheme.glassStroke)
-                folderList
-                confirmBar
-            }
-            .background(AppTheme.canvasGradient.ignoresSafeArea())
-            .navigationTitle("Choose workspace")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") { dismiss() }
-                        .font(AppTheme.uiFont(size: 14, weight: .semibold))
-                        .foregroundStyle(AppTheme.accent)
-                }
-            }
-            .task {
-                #if DEBUG
-                // Visual-test deep link to a starting folder, e.g. RELAY_UITEST_WS_PATH=/srv/codex-workspaces/sigiq
-                if let start = ProcessInfo.processInfo.environment["RELAY_UITEST_WS_PATH"], !start.isEmpty {
-                    await viewModel.loadWorkspaceDirectories(path: start)
-                    return
-                }
-                #endif
-                await viewModel.loadWorkspaceDirectories()
-            }
-            .preferredColorScheme(.dark)
-        }
-    }
-
-    private var listing: CodexWorkspaceDirectoryListing? { viewModel.directoryListing }
-
-    // MARK: breadcrumb / current location
-
-    private var breadcrumb: some View {
-        HStack(spacing: 8) {
-            if let up = listing?.upNavigationPath {
-                Button {
-                    UISelectionFeedbackGenerator().selectionChanged()
-                    Task { await viewModel.loadWorkspaceDirectories(path: up) }
-                } label: {
-                    Image(systemName: "chevron.left")
-                        .font(.system(size: 14, weight: .bold))
-                        .foregroundStyle(AppTheme.accent)
-                        .frame(width: 32, height: 32)
-                        .background(AppTheme.bgSurfaceHi, in: Circle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Up one level")
-            }
-
-            Image(systemName: "folder.fill")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(AppTheme.accent)
-            Text(currentLocationText)
-                .font(AppTheme.monoFont(size: 12))
-                .foregroundStyle(AppTheme.textSecondary)
-                .lineLimit(1)
-                .truncationMode(.head)
-            Spacer()
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-    }
-
-    private var currentLocationText: String {
-        guard let listing else { return "…" }
-        let rel = listing.displayPath.trimmingCharacters(in: .whitespaces)
-        return rel.isEmpty ? "All workspaces" : rel
-    }
-
-    // MARK: folder list
-
-    private var folderList: some View {
-        ScrollView {
-            LazyVStack(spacing: 10) {
-                if let error = viewModel.workspaceActionError {
-                    RelayStatusBanner(text: error)
-                }
-
-                if let listing {
-                    if listing.entries.isEmpty {
-                        Text("No subfolders here.")
-                            .font(AppTheme.uiFont(size: 13))
-                            .foregroundStyle(AppTheme.textTertiary)
-                            .frame(maxWidth: .infinity, alignment: .center)
-                            .padding(.top, 28)
-                    }
-                    ForEach(listing.entries) { entry in
-                        RelayFolderRow(
-                            entry: entry,
-                            isCurrentSelection: isSelected(entry),
-                            onOpen: {
-                                UISelectionFeedbackGenerator().selectionChanged()
-                                Task { await viewModel.loadWorkspaceDirectories(path: entry.path) }
-                            },
-                            onQuickPick: entry.isRegistered ? {
-                                UINotificationFeedbackGenerator().notificationOccurred(.success)
-                                Task {
-                                    await viewModel.selectBrowsedDirectory(path: entry.path)
-                                    dismiss()
-                                }
-                            } : nil
-                        )
-                    }
-                    createRow(parentPath: listing.currentPath)
-                } else if viewModel.isBrowsingDirectories {
-                    ProgressView().tint(AppTheme.accent).padding(.top, 44)
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-        }
-    }
-
-    private func isSelected(_ entry: CodexWorkspaceDirectoryEntry) -> Bool {
-        if let id = entry.workspaceId { return viewModel.selectedWorkspaceID == id }
-        return false
-    }
-
-    @ViewBuilder private func createRow(parentPath: String) -> some View {
-        if showCreateField {
-            HStack(spacing: 8) {
-                Image(systemName: "folder.badge.plus")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(AppTheme.accent)
-                    .frame(width: 40, height: 40)
-                    .background(AppTheme.accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-                TextField("New folder name", text: $creatingName)
-                    .font(AppTheme.uiFont(size: 14))
-                    .textFieldStyle(.plain)
-                    .foregroundStyle(AppTheme.textPrimary)
-                    .focused($createFieldFocused)
-                    .submitLabel(.done)
-                    .onSubmit { submitCreate(parentPath: parentPath) }
-                Button { submitCreate(parentPath: parentPath) } label: {
-                    Image(systemName: "checkmark")
-                        .font(.system(size: 15, weight: .bold))
-                        .foregroundStyle(.white)
-                        .frame(width: 36, height: 36)
-                        .background(AppTheme.accentGradient, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-                }
-                .buttonStyle(.plain)
-                .disabled(creatingName.trimmingCharacters(in: .whitespaces).isEmpty)
-            }
-            .padding(10)
-            .background(AppTheme.bgSurfaceHi, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        } else {
-            Button {
-                withAnimation { showCreateField = true }
-                createFieldFocused = true
-            } label: {
-                HStack(spacing: 13) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 16, weight: .bold))
-                        .foregroundStyle(AppTheme.accent)
-                        .frame(width: 40, height: 40)
-                        .background(AppTheme.accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-                    Text("New folder here")
-                        .font(AppTheme.uiFont(size: 15, weight: .medium))
-                        .foregroundStyle(AppTheme.accent)
-                    Spacer()
-                }
-                .padding(.vertical, 4)
-            }
-            .buttonStyle(.plain)
-        }
-    }
-
-    private func submitCreate(parentPath: String) {
-        let name = creatingName
-        guard !name.trimmingCharacters(in: .whitespaces).isEmpty else { return }
-        Task {
-            await viewModel.createWorkspace(parentPath: parentPath, name: name)
-            creatingName = ""
-            showCreateField = false
-        }
-    }
-
-    // MARK: confirm bar
-
-    private var confirmBar: some View {
-        VStack(spacing: 0) {
-            Divider().overlay(AppTheme.glassStroke)
-            Button {
-                guard let listing else { return }
-                UINotificationFeedbackGenerator().notificationOccurred(.success)
-                Task {
-                    await viewModel.selectBrowsedDirectory(path: listing.currentPath)
-                    dismiss()
-                }
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 16, weight: .bold))
-                    Text(confirmTitle)
-                        .font(AppTheme.uiFont(size: 16, weight: .semibold))
-                        .lineLimit(1)
-                }
-                .foregroundStyle(.white)
-                .frame(maxWidth: .infinity)
-                .frame(height: 52)
-                .background(canConfirm ? AnyShapeStyle(AppTheme.accentGradient) : AnyShapeStyle(AppTheme.bgSurface))
-                .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
-                .shadow(color: canConfirm ? AppTheme.accent.opacity(0.45) : .clear, radius: 10, y: 4)
-            }
-            .buttonStyle(.plain)
-            .disabled(!canConfirm)
-            .padding(16)
-        }
-        .background(.ultraThinMaterial)
-    }
-
-    /// You can't select the synthetic root ("All workspaces") — only a real folder.
-    private var canConfirm: Bool {
-        guard let listing else { return false }
-        return listing.currentPath != listing.rootPath
-    }
-
-    private var confirmTitle: String {
-        guard let listing, canConfirm else { return "Open a folder to select it" }
-        let name = URL(fileURLWithPath: listing.currentPath).lastPathComponent
-        return "Use “\(name)” as workspace"
-    }
-}
-
-/// A single folder row in the workspace browser. The whole row drills in; registered
-/// workspaces show a quick-pick checkmark on the trailing edge.
-private struct RelayFolderRow: View {
-    let entry: CodexWorkspaceDirectoryEntry
-    let isCurrentSelection: Bool
-    let onOpen: () -> Void
-    let onQuickPick: (() -> Void)?
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Button(action: onOpen) {
-                HStack(spacing: 13) {
-                    Image(systemName: entry.hasGit ? "arrow.triangle.branch" : "folder.fill")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(isCurrentSelection ? .white : AppTheme.accent)
-                        .frame(width: 40, height: 40)
-                        .background(
-                            isCurrentSelection ? AnyShapeStyle(AppTheme.accentGradient) : AnyShapeStyle(AppTheme.accent.opacity(0.14)),
-                            in: RoundedRectangle(cornerRadius: 11, style: .continuous)
-                        )
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack(spacing: 6) {
-                            Text(entry.displayName)
-                                .font(AppTheme.uiFont(size: 15, weight: .semibold))
-                                .foregroundStyle(AppTheme.textPrimary)
-                                .lineLimit(1)
-                            if entry.isRegistered {
-                                Text("Workspace")
-                                    .font(AppTheme.uiFont(size: 9, weight: .bold))
-                                    .foregroundStyle(AppTheme.accent)
-                                    .padding(.horizontal, 6).padding(.vertical, 2)
-                                    .background(AppTheme.accent.opacity(0.15), in: Capsule())
-                            }
-                        }
-                        Text(entry.hasGit ? "Git repository" : "Folder")
-                            .font(AppTheme.uiFont(size: 11))
-                            .foregroundStyle(AppTheme.textTertiary)
-                    }
-                    Spacer(minLength: 6)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            if isCurrentSelection {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 20))
-                    .foregroundStyle(AppTheme.accent)
-            } else if let onQuickPick {
-                Button(action: onQuickPick) {
-                    Image(systemName: "circle")
-                        .font(.system(size: 20))
-                        .foregroundStyle(AppTheme.textTertiary)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Select \(entry.displayName)")
-            } else {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(AppTheme.textTertiary)
-            }
-        }
-        .padding(12)
-        .background {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(AppTheme.bgSurfaceHi)
-                .overlay { RoundedRectangle(cornerRadius: 16, style: .continuous).fill(AppTheme.glassTint) }
-        }
-        .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(isCurrentSelection ? AppTheme.accent.opacity(0.6) : AppTheme.glassStroke, lineWidth: isCurrentSelection ? 1.2 : 0.7)
-        }
     }
 }
 
@@ -1459,12 +891,13 @@ private struct RelayStatusBanner: View {
 }
 
 private struct RelayEmptyConversation: View {
-    let model: CodexModelDescriptor?
-    let mode: RelayInteractionMode
+    let choice: RelayModelChoice?
+
+    private var isTask: Bool { choice?.mode == .task }
 
     var body: some View {
         VStack(spacing: 14) {
-            Image(systemName: mode == .chat ? "message.fill" : "terminal.fill")
+            Image(systemName: isTask ? "terminal.fill" : "message.fill")
                 .font(.system(size: 32, weight: .semibold))
                 .foregroundStyle(.white)
                 .frame(width: 78, height: 78)
@@ -1472,18 +905,18 @@ private struct RelayEmptyConversation: View {
                 .shadow(color: AppTheme.accent.opacity(0.45), radius: 16, y: 6)
 
             VStack(spacing: 6) {
-                Text(mode == .chat ? "Start a conversation" : "Run a task")
+                Text(isTask ? "Run a task" : "Start a conversation")
                     .font(AppTheme.uiFont(size: 20, weight: .semibold))
                     .foregroundStyle(AppTheme.textPrimary)
-                Text(mode == .chat
-                     ? "Stream a reply from your selected model."
-                     : "Queue a Codex or Claude job in your workspace.")
+                Text(isTask
+                     ? "Queue an agent job in this folder."
+                     : "Stream a reply scoped to this folder.")
                     .font(AppTheme.uiFont(size: 14))
                     .foregroundStyle(AppTheme.textSecondary)
                     .multilineTextAlignment(.center)
             }
 
-            if let label = model?.label {
+            if let label = choice?.chipLabel {
                 Text(label)
                     .font(AppTheme.uiFont(size: 12, weight: .medium))
                     .foregroundStyle(AppTheme.textSecondary)

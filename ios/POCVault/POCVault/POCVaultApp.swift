@@ -4,17 +4,14 @@ import SwiftUI
 struct POCVaultApp: App {
     @StateObject private var identityStore: ClientIdentityStore
     @StateObject private var libraryViewModel: LibraryViewModel
-    @StateObject private var relayChatViewModel: RelayChatViewModel
-    @StateObject private var relayTaskViewModel: RelayChatViewModel
-    @StateObject private var codexViewModel: CodexConsoleViewModel
-    @StateObject private var claudeViewModel: CodexConsoleViewModel
+    @StateObject private var chatSessionStore: RelayChatSessionStore
+    @StateObject private var statusFeedViewModel: StatusFeedViewModel
     private let manifestClient: ManifestClient
-    private let codexNotificationService: CodexLocalNotificationService
+    private let codexClient: CodexClient
 
     init() {
         let identityStore = ClientIdentityStore()
         identityStore.importIdentityFromSetupEnvironmentIfNeeded()
-        let codexNotificationService = CodexLocalNotificationService()
         let manifestClient = ManifestClient(
             manifestURL: AppConfiguration.manifestURL,
             signatureURL: AppConfiguration.signatureURL,
@@ -28,104 +25,156 @@ struct POCVaultApp: App {
 
         _identityStore = StateObject(wrappedValue: identityStore)
         _libraryViewModel = StateObject(wrappedValue: LibraryViewModel(client: manifestClient))
-        _relayChatViewModel = StateObject(wrappedValue: RelayChatViewModel(client: codexClient, lockedMode: .chat))
-        _relayTaskViewModel = StateObject(wrappedValue: RelayChatViewModel(client: codexClient, lockedMode: .task))
-        _codexViewModel = StateObject(wrappedValue: CodexConsoleViewModel(
+        _chatSessionStore = StateObject(wrappedValue: RelayChatSessionStore(
             client: codexClient,
-            provider: .codex,
-            completionNotifier: codexNotificationService
+            completionNotifier: CodexLocalNotificationService()
         ))
-        _claudeViewModel = StateObject(wrappedValue: CodexConsoleViewModel(
-            client: codexClient,
-            provider: .claude,
-            completionNotifier: codexNotificationService
-        ))
+        _statusFeedViewModel = StateObject(wrappedValue: StatusFeedViewModel(client: codexClient))
         self.manifestClient = manifestClient
-        self.codexNotificationService = codexNotificationService
+        self.codexClient = codexClient
     }
 
     var body: some Scene {
         WindowGroup {
             POCVaultRootView(
                 libraryViewModel: libraryViewModel,
-                relayChatViewModel: relayChatViewModel,
-                relayTaskViewModel: relayTaskViewModel,
-                codexViewModel: codexViewModel,
-                claudeViewModel: claudeViewModel,
+                statusFeedViewModel: statusFeedViewModel,
+                chatSessionStore: chatSessionStore,
                 identityStore: identityStore,
-                manifestClient: manifestClient
+                manifestClient: manifestClient,
+                codexClient: codexClient
             )
         }
     }
 }
 
+/// Navigation routes of the root file browser stack.
+enum BrowserRoute: Hashable {
+    case folder(path: String)
+    case file(entry: CodexWorkspaceDirectoryEntry)
+}
+
 struct POCVaultRootView: View {
     @ObservedObject var libraryViewModel: LibraryViewModel
-    @ObservedObject var relayChatViewModel: RelayChatViewModel
-    @ObservedObject var relayTaskViewModel: RelayChatViewModel
-    @ObservedObject var codexViewModel: CodexConsoleViewModel
-    @ObservedObject var claudeViewModel: CodexConsoleViewModel
+    @ObservedObject var statusFeedViewModel: StatusFeedViewModel
+    @ObservedObject var chatSessionStore: RelayChatSessionStore
     @ObservedObject var identityStore: ClientIdentityStore
     let manifestClient: ManifestClient
-    @State private var selectedTab: RelayRootTab = .chat
+    let codexClient: CodexClient
+
+    @State private var browserPath: [BrowserRoute] = []
+    @State private var chatLaunch: RelayChatLaunch?
+    @State private var showingLibrary = false
+    @State private var showingStatus = false
+    @State private var showingDiagnostics = false
 
     var body: some View {
-        TabView(selection: $selectedTab) {
+        NavigationStack(path: $browserPath) {
+            browserScreen(folderPath: nil, isRoot: true)
+                .navigationDestination(for: BrowserRoute.self) { route in
+                    switch route {
+                    case .folder(let path):
+                        browserScreen(folderPath: path, isRoot: false)
+                    case .file(let entry):
+                        FileViewerView(
+                            client: codexClient,
+                            identityStore: identityStore,
+                            entry: entry
+                        )
+                    }
+                }
+        }
+        .tint(AppTheme.accent)
+        .preferredColorScheme(.dark)
+        // Library embeds its own NavigationStack, so it must present full screen — never
+        // be pushed into the browser stack (nesting navigation stacks is illegal).
+        .fullScreenCover(isPresented: $showingLibrary) {
+            libraryCover
+        }
+        .fullScreenCover(item: $chatLaunch) { launch in
+            RelayChatView(viewModel: launch.viewModel, onDismiss: { chatLaunch = nil })
+        }
+        .sheet(isPresented: $showingStatus) {
+            CodexStatusView(
+                feedViewModel: statusFeedViewModel,
+                identityStore: identityStore,
+                manifestClient: manifestClient
+            )
+        }
+        .sheet(isPresented: $showingDiagnostics) {
+            DiagnosticsView(
+                identityStore: identityStore,
+                manifestClient: manifestClient
+            )
+        }
+        .task {
+            identityStore.importIdentityFromSetupEnvironmentIfNeeded()
+        }
+        .task {
+            // App-wide job monitor + completion notifications, owned by the session store.
+            guard shouldStartAgentMonitor else { return }
+            await chatSessionStore.monitorActiveWorkWhileAppIsOpen()
+        }
+        #if DEBUG
+        .task {
+            applyUITestHooks()
+        }
+        #endif
+    }
+
+    private func browserScreen(folderPath: String?, isRoot: Bool) -> some View {
+        FileBrowserView(
+            client: codexClient,
+            folderPath: folderPath,
+            isRoot: isRoot,
+            onOpenFolder: { path in
+                browserPath.append(.folder(path: path))
+            },
+            onOpenFile: { entry in
+                browserPath.append(.file(entry: entry))
+            },
+            onOpenChat: { path, workspaceID in
+                openChat(folderPath: path, workspaceID: workspaceID)
+            },
+            onOpenLibrary: isRoot ? { showingLibrary = true } : nil,
+            onOpenStatus: isRoot ? { showingStatus = true } : nil,
+            onOpenDiagnostics: isRoot ? { showingDiagnostics = true } : nil
+        )
+    }
+
+    private func openChat(folderPath: String?, workspaceID: String?) {
+        chatLaunch = chatSessionStore.launch(folderPath: folderPath, workspaceID: workspaceID)
+    }
+
+    private var libraryCover: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Spacer()
+                Button {
+                    showingLibrary = false
+                } label: {
+                    Image(systemName: "chevron.down")
+                        .font(AppTheme.uiFont(size: 16, weight: .semibold))
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .frame(width: 36, height: 36)
+                        .background(AppTheme.bgSurfaceHi, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close library")
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 10)
+
             LibraryView(
                 viewModel: libraryViewModel,
                 identityStore: identityStore,
                 manifestClient: manifestClient
             )
-            .tag(RelayRootTab.library)
-            .tabItem {
-                Label(RelayRootTab.library.title, systemImage: RelayRootTab.library.symbol)
-            }
-
-            RelayChatView(viewModel: relayChatViewModel)
-                .tag(RelayRootTab.chat)
-                .tabItem {
-                    Label(RelayRootTab.chat.title, systemImage: RelayRootTab.chat.symbol)
-                }
-
-            RelayChatView(viewModel: relayTaskViewModel)
-                .tag(RelayRootTab.task)
-                .tabItem {
-                    Label(RelayRootTab.task.title, systemImage: RelayRootTab.task.symbol)
-                }
-
-            CodexStatusView(
-                codexViewModel: codexViewModel,
-                claudeViewModel: claudeViewModel,
-                identityStore: identityStore,
-                manifestClient: manifestClient
-            )
-            .tag(RelayRootTab.status)
-            .tabItem {
-                Label(RelayRootTab.status.title, systemImage: RelayRootTab.status.symbol)
-            }
         }
-        .tint(AppTheme.accent)
+        .background(AppTheme.bgCanvas.ignoresSafeArea())
+        // Full-screen covers are separate presentations: re-pin the deliberate
+        // dark-only appearance so the cover can never flash light.
         .preferredColorScheme(.dark)
-        .task {
-            identityStore.importIdentityFromSetupEnvironmentIfNeeded()
-        }
-        #if DEBUG
-        .task {
-            // Visual-test deep link: RELAY_UITEST_TAB=library|chat|task|status
-            if let tab = ProcessInfo.processInfo.environment["RELAY_UITEST_TAB"],
-               let match = RelayRootTab(rawValue: tab) {
-                selectedTab = match
-            }
-        }
-        #endif
-        .task {
-            guard shouldStartAgentMonitor else { return }
-            await codexViewModel.monitorActiveWorkWhileAppIsOpen()
-        }
-        .task {
-            guard shouldStartAgentMonitor else { return }
-            await claudeViewModel.monitorActiveWorkWhileAppIsOpen()
-        }
     }
 
     private var shouldStartAgentMonitor: Bool {
@@ -133,41 +182,38 @@ struct POCVaultRootView: View {
             isRunningTests: ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
         )
     }
-}
 
-private enum RelayRootTab: String, CaseIterable, Identifiable {
-    case library
-    case chat
-    case task
-    case status
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .library:
-            return "Library"
-        case .chat:
-            return "Chat"
-        case .task:
-            return "Task"
-        case .status:
-            return "Status"
+    #if DEBUG
+    /// Visual-test deep links (compiled out of release builds):
+    /// - RELAY_UITEST_PATH=/abs/folder     push the browser to that folder
+    /// - RELAY_UITEST_FILE=/abs/file       push the file route (read-only viewer)
+    /// - RELAY_UITEST_CHAT=1               open the chat cover (for RELAY_UITEST_PATH's
+    ///   folder when set, else the root); the existing RELAY_UITEST_MODEL /
+    ///   RELAY_UITEST_PROMPT / RELAY_UITEST_TASK_PROMPT auto-drive then takes over.
+    /// - RELAY_UITEST_OPEN=library|status  present that cover/sheet
+    private func applyUITestHooks() {
+        let env = ProcessInfo.processInfo.environment
+        if let folder = env["RELAY_UITEST_PATH"]?.trimmedNonEmpty {
+            browserPath.append(.folder(path: folder))
+        }
+        if let file = env["RELAY_UITEST_FILE"]?.trimmedNonEmpty,
+           let data = try? JSONSerialization.data(withJSONObject: ["path": file, "kind": "file"]),
+           let entry = try? JSONDecoder().decode(CodexWorkspaceDirectoryEntry.self, from: data) {
+            browserPath.append(.file(entry: entry))
+        }
+        switch env["RELAY_UITEST_OPEN"] {
+        case "library":
+            showingLibrary = true
+        case "status":
+            showingStatus = true
+        default:
+            break
+        }
+        if env["RELAY_UITEST_CHAT"] == "1" {
+            openChat(folderPath: env["RELAY_UITEST_PATH"]?.trimmedNonEmpty, workspaceID: nil)
         }
     }
-
-    var symbol: String {
-        switch self {
-        case .library:
-            return "square.grid.2x2"
-        case .chat:
-            return "message"
-        case .task:
-            return "bolt.horizontal"
-        case .status:
-            return "waveform.path.ecg"
-        }
-    }
+    #endif
 }
 
 extension CodexProvider {
@@ -177,6 +223,8 @@ extension CodexProvider {
             return "ChatGPTMark"
         case .claude:
             return "ClaudeMark"
+        case .cursor:
+            return "ChatGPTMark"
         case .bedrock:
             return "ClaudeMark"
         case .azure:
@@ -188,15 +236,57 @@ extension CodexProvider {
         switch self {
         case .codex:
             return AppTheme.textSecondary
-        case .claude, .bedrock, .azure:
+        case .claude, .cursor, .bedrock, .azure:
             return AppTheme.accent
         }
     }
 }
 
+/// Lightweight app-wide activity feed for the Status sheet: fetches recent threads and
+/// jobs across every provider/workspace, replacing the retired console view models'
+/// `threadFeedItems`.
+@MainActor
+final class StatusFeedViewModel: ObservableObject {
+    @Published private(set) var threads: [CodexThread] = []
+    @Published private(set) var jobs: [CodexJob] = []
+    @Published private(set) var isRefreshing = false
+    @Published private(set) var errorMessage: String?
+
+    private let client: CodexClient
+    private var hasLoaded = false
+
+    init(client: CodexClient) {
+        self.client = client
+    }
+
+    var feedItems: [CodexThreadFeedItem] {
+        CodexThreadFeedItem.makeFeed(threads: threads, jobs: jobs)
+    }
+
+    func bootstrapIfNeeded() async {
+        guard !hasLoaded else { return }
+        await refresh()
+    }
+
+    func refresh() async {
+        isRefreshing = true
+        defer { isRefreshing = false }
+        do {
+            async let threadRequest = client.fetchThreads(provider: nil, workspaceID: nil, limit: 80)
+            async let jobRequest = client.fetchJobs(provider: nil, workspaceID: nil, limit: 30)
+            threads = try await threadRequest
+            jobs = try await jobRequest
+            errorMessage = nil
+            hasLoaded = true
+        } catch {
+            guard !isCancellation(error) else { return }
+            errorMessage = error.localizedDescription
+        }
+    }
+}
+
 private struct CodexStatusView: View {
-    @ObservedObject var codexViewModel: CodexConsoleViewModel
-    @ObservedObject var claudeViewModel: CodexConsoleViewModel
+    @ObservedObject var feedViewModel: StatusFeedViewModel
     @ObservedObject var identityStore: ClientIdentityStore
     let manifestClient: ManifestClient
     @State private var selectedSection = StatusSection.activity
@@ -245,6 +335,14 @@ private struct CodexStatusView: View {
                     case .activity:
                         ScrollView {
                             VStack(alignment: .leading, spacing: 0) {
+                                if let error = feedViewModel.errorMessage {
+                                    Text(error)
+                                        .font(.system(size: 13))
+                                        .foregroundStyle(AppTheme.statusError)
+                                        .padding(.horizontal, 20)
+                                        .padding(.bottom, 12)
+                                }
+
                                 Text(summaryText)
                                     .font(.system(size: 13))
                                     .foregroundStyle(AppTheme.textSecondary)
@@ -252,8 +350,8 @@ private struct CodexStatusView: View {
                                     .padding(.bottom, 12)
 
                                 LazyVStack(spacing: 0) {
-                                    ForEach(Array(activityItems.prefix(24))) { activityItem in
-                                        CodexActivityRow(provider: activityItem.provider, item: activityItem.item)
+                                    ForEach(Array(feedViewModel.feedItems.prefix(24))) { item in
+                                        CodexActivityRow(item: item)
                                     }
                                 }
                                 .overlay(alignment: .top) {
@@ -278,42 +376,22 @@ private struct CodexStatusView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar(.hidden, for: .navigationBar)
             .refreshable {
-                await refreshAll()
+                await feedViewModel.refresh()
             }
             .task {
-                await bootstrapAll()
+                await feedViewModel.bootstrapIfNeeded()
             }
         }
-    }
-
-    private var activityItems: [ProviderActivityItem] {
-        (
-            codexViewModel.threadFeedItems.map { ProviderActivityItem(provider: .codex, item: $0) }
-            + claudeViewModel.threadFeedItems.map { ProviderActivityItem(provider: .claude, item: $0) }
-        )
-        .sorted {
-            ($0.item.updatedAt ?? .distantPast) > ($1.item.updatedAt ?? .distantPast)
-        }
+        .preferredColorScheme(.dark)
     }
 
     private var summaryText: String {
-        let activeCount = activityItems.filter(\.item.isActive).count
+        let items = feedViewModel.feedItems
+        let activeCount = items.filter(\.isActive).count
         if activeCount == 0 {
-            return "\(activityItems.count) threads · Codex and Claude"
+            return "\(items.count) threads · all agents"
         }
-        return "\(activeCount) active · \(activityItems.count) recent"
-    }
-
-    private func bootstrapAll() async {
-        async let codexBootstrap: Void = codexViewModel.bootstrapIfNeeded()
-        async let claudeBootstrap: Void = claudeViewModel.bootstrapIfNeeded()
-        _ = await (codexBootstrap, claudeBootstrap)
-    }
-
-    private func refreshAll() async {
-        async let codexRefresh: Void = codexViewModel.refreshAll()
-        async let claudeRefresh: Void = claudeViewModel.refreshAll()
-        _ = await (codexRefresh, claudeRefresh)
+        return "\(activeCount) active · \(items.count) recent"
     }
 }
 
@@ -333,18 +411,21 @@ private enum StatusSection: String, CaseIterable, Identifiable {
     }
 }
 
-private struct ProviderActivityItem: Identifiable {
-    let provider: CodexProvider
-    let item: CodexThreadFeedItem
-
-    var id: String {
-        "\(provider.rawValue)-\(item.id)"
+private extension CodexThreadFeedItem {
+    var provider: CodexProvider {
+        switch source {
+        case .thread(let thread):
+            return thread.provider
+        case .pendingJob(let job):
+            return job.provider
+        }
     }
 }
 
 private struct CodexActivityRow: View {
-    let provider: CodexProvider
     let item: CodexThreadFeedItem
+
+    private var provider: CodexProvider { item.provider }
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -367,10 +448,10 @@ private struct CodexActivityRow: View {
                         .foregroundStyle(AppTheme.textSecondary)
                     Text(provider.displayName)
                         .font(.system(size: 11))
-                        .foregroundStyle(provider == .claude ? AppTheme.accent : AppTheme.textSecondary)
+                        .foregroundStyle(provider == .codex ? AppTheme.textSecondary : AppTheme.accent)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 2)
-                        .background((provider == .claude ? AppTheme.accent : AppTheme.textPrimary).opacity(provider == .claude ? 0.14 : 0.08), in: Capsule())
+                        .background((provider == .codex ? AppTheme.textPrimary : AppTheme.accent).opacity(provider == .codex ? 0.08 : 0.14), in: Capsule())
                     HStack(spacing: 3) {
                         Image(systemName: statusSymbol)
                             .font(.system(size: 11, weight: .semibold))
@@ -484,7 +565,7 @@ enum AppTheme {
     }
 }
 
-private extension Color {
+extension Color {
     init(hex: UInt32) {
         self.init(
             red: Double((hex >> 16) & 0xFF) / 255.0,
@@ -546,10 +627,32 @@ enum AppConfiguration {
 
     private static func configuredURL(supportValue: String?, infoKey: String, fallback: String) -> URL {
         let infoValue = Bundle.main.object(forInfoDictionaryKey: infoKey) as? String
-        let value = [supportValue, infoValue]
+        return resolveConfiguredURL(candidates: [supportValue, infoValue], fallback: fallback)
+    }
+
+    /// Picks the first genuinely configured candidate URL, else the in-code fallback.
+    /// Internal (not private) so unit tests can exercise the resolution directly.
+    static func resolveConfiguredURL(candidates: [String?], fallback: String) -> URL {
+        let value = candidates
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { !$0.isEmpty && !$0.contains("$(") } ?? fallback
+            .first(where: isConfiguredURLValue) ?? fallback
         return URL(string: value) ?? URL(string: fallback)!
+    }
+
+    /// A candidate counts as configured only when the build actually injected a URL.
+    /// Unset builds leak two placeholder shapes into Info.plist: the raw `$(VAR)` token
+    /// (build setting undefined) and the checked-in `*.example.com` default (setting
+    /// defined but never overridden). Both must lose to the in-code fallback — on the
+    /// simulator that fallback is the local fixture, and letting the example.com
+    /// placeholder win points a default xcodebuild install at a dead host. Real device
+    /// builds keep working: the owner-injected live URL is neither shape and still wins.
+    static func isConfiguredURLValue(_ value: String) -> Bool {
+        guard !value.isEmpty, !value.contains("$(") else { return false }
+        if let host = URL(string: value)?.host?.lowercased(),
+           host == "example.com" || host.hasSuffix(".example.com") {
+            return false
+        }
+        return true
     }
 
     private static func configuredPublicKey(supportValue: String?, infoKey: String) -> Data? {
