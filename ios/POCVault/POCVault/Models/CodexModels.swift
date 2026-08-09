@@ -89,6 +89,11 @@ struct CodexWorkspaceDirectoryListing: Decodable, Hashable {
     let parentPath: String?
     let selectedWorkspace: CodexWorkspace?
     let entries: [CodexWorkspaceDirectoryEntry]
+    /// True when the server bounded this listing (`/v1/codex/fs/list` pagination).
+    let truncated: Bool
+    let total: Int?
+    let offset: Int?
+    let limit: Int?
 
     enum CodingKeys: String, CodingKey {
         case rootPath
@@ -97,6 +102,10 @@ struct CodexWorkspaceDirectoryListing: Decodable, Hashable {
         case parentPath
         case selectedWorkspace
         case entries
+        case truncated
+        case total
+        case offset
+        case limit
     }
 
     init(from decoder: Decoder) throws {
@@ -107,6 +116,10 @@ struct CodexWorkspaceDirectoryListing: Decodable, Hashable {
         self.parentPath = try container.decodeLooseStringIfPresent(forKey: .parentPath)
         self.selectedWorkspace = try container.decodeIfPresent(CodexWorkspace.self, forKey: .selectedWorkspace)
         self.entries = (try? container.decodeIfPresent([CodexWorkspaceDirectoryEntry].self, forKey: .entries)) ?? []
+        self.truncated = (try? container.decodeIfPresent(Bool.self, forKey: .truncated)) ?? false
+        self.total = try? container.decodeIntegerIfPresent(forKey: .total)
+        self.offset = try? container.decodeIntegerIfPresent(forKey: .offset)
+        self.limit = try? container.decodeIntegerIfPresent(forKey: .limit)
     }
 
     var displayPath: String {
@@ -134,23 +147,52 @@ struct CodexWorkspaceDirectoryListing: Decodable, Hashable {
     }
 }
 
+/// Coarse viewer routing for file entries, inferred from the server MIME hint plus the
+/// filename extension. Drives the per-type glyph and (later) the read-only file viewer.
+enum CodexFileCategory: String, Hashable {
+    case code
+    case text
+    case markdown
+    case image
+    case pdf
+    case binary
+}
+
 struct CodexWorkspaceDirectoryEntry: Decodable, Hashable, Identifiable {
+    enum Kind: String, Codable, Hashable {
+        case dir
+        case file
+    }
+
     let name: String
+    /// Legacy `workspace-dirs` responses omit `kind`; every entry there is a directory.
+    let kind: Kind
     let path: String
     let relativePath: String?
     let workspaceId: String?
     let workspaceName: String?
     let hasGit: Bool
     let isRegistered: Bool
+    let size: Int64?
+    let mtime: Date?
+    let mime: String?
+    let isText: Bool?
+    let readDenied: Bool
 
     enum CodingKeys: String, CodingKey {
         case name
+        case kind
         case path
         case relativePath
         case workspaceId
         case workspaceName
         case hasGit
         case isRegistered
+        case size
+        case mtime
+        case mime
+        case isText
+        case readDenied
     }
 
     init(from decoder: Decoder) throws {
@@ -159,11 +201,18 @@ struct CodexWorkspaceDirectoryEntry: Decodable, Hashable, Identifiable {
         self.path = path
         self.name = try container.decodeLooseStringIfPresent(forKey: .name)
             ?? URL(fileURLWithPath: path).lastPathComponent
+        let rawKind = try container.decodeLooseStringIfPresent(forKey: .kind)?.lowercased()
+        self.kind = rawKind.flatMap(Kind.init(rawValue:)) ?? .dir
         self.relativePath = try container.decodeLooseStringIfPresent(forKey: .relativePath)
         self.workspaceId = try container.decodeLooseStringIfPresent(forKey: .workspaceId)
         self.workspaceName = try container.decodeLooseStringIfPresent(forKey: .workspaceName)
         self.hasGit = (try container.decodeIfPresent(Bool.self, forKey: .hasGit)) ?? false
         self.isRegistered = (try container.decodeIfPresent(Bool.self, forKey: .isRegistered)) ?? false
+        self.size = (try? container.decodeIntegerIfPresent(forKey: .size)).flatMap { $0.map(Int64.init) }
+        self.mtime = try? container.decodeLossyDateIfPresent(forKey: .mtime)
+        self.mime = try container.decodeLooseStringIfPresent(forKey: .mime)
+        self.isText = try? container.decodeIfPresent(Bool.self, forKey: .isText)
+        self.readDenied = (try? container.decodeIfPresent(Bool.self, forKey: .readDenied)) ?? false
     }
 
     var id: String {
@@ -179,11 +228,86 @@ struct CodexWorkspaceDirectoryEntry: Decodable, Hashable, Identifiable {
             ?? relativePath?.trimmedNonEmpty
             ?? path
     }
+
+    var isDirectory: Bool {
+        kind == .dir
+    }
+
+    /// Human-readable size for file rows ("1.2 MB"); nil for directories or unsized entries.
+    var sizeLabel: String? {
+        guard kind == .file, let size else { return nil }
+        return ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
+    }
+
+    /// Human-readable modification time; nil when the server sent none.
+    var mtimeLabel: String? {
+        guard let mtime else { return nil }
+        return Self.mtimeFormatter.string(from: mtime)
+    }
+
+    var fileCategory: CodexFileCategory {
+        // Servers send parameterized MIME values ("text/markdown; charset=utf-8"); strip
+        // the parameters so the exact-match checks below see the bare type.
+        let rawMime = mime?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let mimeValue = rawMime
+            .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)
+            .first
+            .map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+        let fileExtension = URL(fileURLWithPath: displayName).pathExtension.lowercased()
+
+        if mimeValue.hasPrefix("image/") || Self.imageExtensions.contains(fileExtension) {
+            return .image
+        }
+        if mimeValue == "application/pdf" || fileExtension == "pdf" {
+            return .pdf
+        }
+        if mimeValue == "text/markdown" || Self.markdownExtensions.contains(fileExtension) {
+            return .markdown
+        }
+        if Self.codeMimeTypes.contains(mimeValue) || Self.codeExtensions.contains(fileExtension) {
+            return .code
+        }
+        if mimeValue.hasPrefix("text/") || Self.textExtensions.contains(fileExtension) || isText == true {
+            return .text
+        }
+        return .binary
+    }
+
+    private static let imageExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tiff", "svg", "ico"
+    ]
+
+    private static let markdownExtensions: Set<String> = ["md", "markdown", "mdown"]
+
+    private static let codeExtensions: Set<String> = [
+        "swift", "m", "mm", "h", "c", "cc", "cpp", "hpp", "js", "jsx", "mjs", "cjs", "ts", "tsx",
+        "py", "rb", "go", "rs", "java", "kt", "kts", "sh", "bash", "zsh", "pl", "php", "sql",
+        "json", "yaml", "yml", "toml", "xml", "html", "htm", "css", "scss", "less", "pbxproj"
+    ]
+
+    private static let codeMimeTypes: Set<String> = [
+        "application/json", "application/javascript", "application/xml", "application/x-sh",
+        "application/x-yaml", "application/yaml", "application/toml", "text/javascript",
+        "text/html", "text/css", "text/x-python", "text/x-swift", "text/x-c"
+    ]
+
+    private static let textExtensions: Set<String> = [
+        "txt", "text", "log", "csv", "tsv", "env", "cfg", "conf", "ini", "plist", "lock",
+        "gitignore", "gitattributes", "editorconfig"
+    ]
+
+    private static let mtimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter
+    }()
 }
 
 enum CodexProvider: String, CaseIterable, Identifiable, Codable {
     case codex
     case claude
+    case cursor
     case bedrock
     case azure
 
@@ -203,6 +327,8 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
             self = .azure
         case "claude", "anthropic":
             self = .claude
+        case "cursor", "cursor-agent":
+            self = .cursor
         case "codex", "openai", .none:
             self = .codex
         default:
@@ -226,6 +352,8 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
             return "Codex"
         case .claude:
             return "Claude"
+        case .cursor:
+            return "Cursor"
         case .bedrock:
             return "Bedrock"
         case .azure:
@@ -245,7 +373,7 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .codex:
             return .xhigh
-        case .claude, .bedrock, .azure:
+        case .claude, .cursor, .bedrock, .azure:
             return .high
         }
     }
@@ -317,68 +445,6 @@ struct CodexModelDescriptor: Decodable, Hashable, Identifiable {
 
     func supports(_ mode: RelayInteractionMode) -> Bool {
         modes.contains(mode)
-    }
-}
-
-struct CodexSession: Decodable, Hashable, Identifiable {
-    let id: String
-    let provider: CodexProvider
-    let workspaceId: String?
-    let workspaceName: String?
-    let cwd: String?
-    let timestamp: Date?
-    let updatedAt: Date?
-
-    enum CodingKeys: String, CodingKey {
-        case id
-        case sessionId
-        case workspace
-        case workspaceId
-        case workspaceName
-        case cwd
-        case path
-        case timestamp
-        case createdAt
-        case updatedAt
-        case lastUsedAt
-        case provider
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        let primaryID = try container.decodeLooseStringIfPresent(forKey: .id)
-        let alternateID = try container.decodeLooseStringIfPresent(forKey: .sessionId)
-        guard let id = (primaryID ?? alternateID)?.trimmedNonEmpty else {
-            throw DecodingError.dataCorrupted(
-                DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Session is missing an id.")
-            )
-        }
-
-        let workspace = try? container.decodeIfPresent(CodexWorkspace.self, forKey: .workspace)
-        let timestamp = try container.decodeLossyDateIfPresent(forKey: .timestamp)
-        let createdAt = try container.decodeLossyDateIfPresent(forKey: .createdAt)
-        let updatedAt = try container.decodeLossyDateIfPresent(forKey: .updatedAt)
-        let lastUsedAt = try container.decodeLossyDateIfPresent(forKey: .lastUsedAt)
-        let cwd = try container.decodeLooseStringIfPresent(forKey: .cwd)
-        let path = try container.decodeLooseStringIfPresent(forKey: .path)
-
-        self.provider = (try container.decodeIfPresent(CodexProvider.self, forKey: .provider)) ?? .defaultProvider
-        self.id = id
-        self.workspaceId = (try container.decodeLooseStringIfPresent(forKey: .workspaceId))
-            ?? workspace?.id
-        self.workspaceName = (try container.decodeLooseStringIfPresent(forKey: .workspaceName))
-            ?? workspace?.name
-        self.cwd = cwd ?? path
-        self.timestamp = timestamp ?? createdAt
-        self.updatedAt = updatedAt ?? lastUsedAt ?? timestamp ?? createdAt
-    }
-
-    var displayTitle: String {
-        workspaceName?.trimmedNonEmpty ?? workspaceId?.trimmedNonEmpty ?? "\(provider.displayName) thread"
-    }
-
-    var shortID: String {
-        String(id.prefix(12))
     }
 }
 
@@ -712,41 +778,6 @@ struct CodexThreadDetail: Decodable, Hashable {
     }
 }
 
-enum CodexThreadDetailContentSection: Hashable {
-    case overview
-    case inlineProgressCard
-    case chatTranscript
-}
-
-struct CodexThreadDetailLayout: Hashable {
-    let contentSections: [CodexThreadDetailContentSection]
-    let showsInlineProgressCard: Bool
-    let showsLatestRunToolbarButton: Bool
-
-    init(thread: CodexThread?) {
-        showsInlineProgressCard = false
-        contentSections = [.overview, .chatTranscript]
-        showsLatestRunToolbarButton = thread?.lastJobId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-    }
-}
-
-struct CodexThreadDetailRefreshPolicy: Hashable {
-    static func shouldPoll(
-        thread: CodexThread?,
-        latestJob: CodexJob?,
-        pendingFollowUpJobID: String?
-    ) -> Bool {
-        if thread?.hasActiveJobs == true {
-            return true
-        }
-        if latestJob?.status.isActive == true {
-            return true
-        }
-        return pendingFollowUpJobID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            && latestJob == nil
-    }
-}
-
 enum CodexThreadMessageRole: String, Decodable, Hashable {
     case user
     case assistant
@@ -798,480 +829,6 @@ struct CodexThreadMessage: Decodable, Hashable, Identifiable {
     var id: String {
         let timestampValue = timestamp?.timeIntervalSince1970.description ?? "undated"
         return "\(role.rawValue)-\(timestampValue)-\(text)"
-    }
-}
-
-enum CodexThreadChatAlignment: Hashable {
-    case leading
-    case trailing
-    case center
-}
-
-struct CodexPendingFollowUp: Hashable {
-    let jobID: String
-    let prompt: String
-    let provider: CodexProvider
-    let createdAt: Date
-}
-
-struct CodexThreadChatItem: Hashable, Identifiable {
-    enum Kind: Hashable {
-        case message
-        case progressSummary
-        case workingPlaceholder
-    }
-
-    let role: CodexThreadMessageRole
-    let text: String
-    let timestamp: Date?
-    let isError: Bool
-    let sourceID: String
-    let kind: Kind
-    let progressCount: Int
-    let canLoadFullText: Bool
-
-    var id: String { sourceID }
-
-    var alignment: CodexThreadChatAlignment {
-        if kind == .progressSummary || kind == .workingPlaceholder {
-            return .leading
-        }
-        switch role {
-        case .user:
-            return .trailing
-        case .assistant:
-            return .leading
-        case .status:
-            return .center
-        }
-    }
-
-    var speakerLabel: String {
-        if kind == .progressSummary {
-            return "Thinking"
-        }
-        if kind == .workingPlaceholder {
-            return "Working"
-        }
-        switch role {
-        case .user:
-            return "You"
-        case .assistant:
-            return "Codex"
-        case .status:
-            return isError ? "Issue" : "Status"
-        }
-    }
-
-    var isLong: Bool {
-        kind == .progressSummary
-            || canLoadFullText
-            || (kind != .workingPlaceholder && (text.count > 420 || text.filter(\.isNewline).count > 6))
-    }
-
-    static func makeTranscript(
-        detail: CodexThreadDetail?,
-        thread: CodexThread?,
-        latestJob: CodexJob?,
-        pendingFollowUp: CodexPendingFollowUp? = nil
-    ) -> [CodexThreadChatItem] {
-        let resolvedThread = detail?.thread ?? thread
-        let activeDetailJob = detail?.jobs.first { $0.status.isActive }
-        let workingJob = latestJob?.status.isActive == true ? latestJob : activeDetailJob
-        let isPendingFollowUpWorking = pendingFollowUp != nil
-            && (latestJob == nil || pendingFollowUp?.jobID != latestJob?.id || latestJob?.status.isActive == true)
-        let isWorking = workingJob != nil || isPendingFollowUpWorking || resolvedThread?.hasActiveJobs == true
-        let workingProviderName = workingJob?.provider.displayName
-            ?? pendingFollowUp?.provider.displayName
-            ?? resolvedThread?.provider.displayName
-            ?? CodexProvider.defaultProvider.displayName
-        let workingTimestamp = workingJob?.startedAt
-            ?? workingJob?.createdAt
-            ?? latestJob?.startedAt
-            ?? latestJob?.createdAt
-            ?? pendingFollowUp?.createdAt
-            ?? resolvedThread?.updatedAt
-
-        if let detail, !detail.messages.isEmpty {
-            let shouldOfferFullAnswer = canLoadFullAnswer(thread: resolvedThread, latestJob: latestJob)
-            var items = groupedTranscript(
-                from: detail.messages,
-                treatTrailingAssistantAsProgress: isWorking && pendingFollowUp == nil,
-                finalAssistantCanLoadFullText: !isWorking && shouldOfferFullAnswer
-            )
-            appendPendingFollowUpIfMissing(to: &items, pendingFollowUp: pendingFollowUp)
-            appendLatestPromptIfMissing(to: &items, latestJob: latestJob, pendingFollowUp: pendingFollowUp)
-            mergeLatestJobCompletion(in: &items, latestJob: latestJob)
-            if isWorking {
-                appendWorkingPlaceholder(to: &items, providerName: workingProviderName, timestamp: workingTimestamp)
-            }
-            return items
-        }
-
-        var items: [CodexThreadChatItem] = []
-        let pendingPrompt = pendingPrompt(for: pendingFollowUp, latestJob: latestJob)
-        let prompt = pendingPrompt
-            ?? latestJob?.prompt?.trimmedNonEmpty
-            ?? resolvedThread?.lastPrompt?.trimmedNonEmpty
-        let promptSourceID = pendingPrompt == nil
-            ? "thread-prompt"
-            : "pending-follow-up-\(pendingFollowUp?.jobID ?? "pending")"
-        if let prompt,
-           let item = chatItem(
-               role: .user,
-               text: prompt,
-               timestamp: pendingFollowUp?.createdAt ?? latestJob?.createdAt ?? resolvedThread?.timestamp,
-               sourceID: promptSourceID
-           ) {
-            items.append(item)
-        }
-
-        let latestJobIsActive = latestJob?.status.isActive == true || isPendingFollowUpWorking
-        let latestJobAnswer = latestJobIsActive ? nil : latestJob?.displayOutput?.trimmedNonEmpty
-        let threadAnswer = latestJobIsActive ? nil : resolvedThread?.lastResult?.trimmedNonEmpty
-        let answer = latestJobAnswer ?? threadAnswer
-        let answerCanLoadFullText = latestJobAnswer != nil
-            ? canLoadFullAnswer(thread: resolvedThread, latestJob: latestJob)
-            : canLoadFullAnswer(thread: resolvedThread, latestJob: nil)
-        if let answer,
-           let item = chatItem(
-               role: .assistant,
-               text: answer,
-               timestamp: latestJob?.completedAt ?? resolvedThread?.updatedAt,
-               sourceID: "thread-answer",
-               canLoadFullText: answerCanLoadFullText
-           ) {
-            items.append(item)
-        }
-
-        let error = (latestJobIsActive ? nil : latestJob?.errorMessage?.trimmedNonEmpty)
-            ?? (latestJobIsActive ? nil : resolvedThread?.lastError?.trimmedNonEmpty)
-        if answer == nil,
-           let error,
-           let item = chatItem(role: .status, text: error, timestamp: latestJob?.completedAt ?? resolvedThread?.updatedAt, isError: true, sourceID: "thread-error") {
-            items.append(item)
-        }
-
-        if answer == nil,
-           error == nil,
-           let latestJob,
-           !latestJob.status.isActive,
-           let item = completionItem(from: latestJob) {
-            items.append(item)
-        } else if answer == nil,
-                  error == nil,
-                  latestJob == nil,
-                  resolvedThread?.lastJobStatus == .succeeded,
-                  let item = chatItem(
-                      role: .status,
-                      text: emptyOutputMessage(provider: resolvedThread?.provider ?? CodexProvider.defaultProvider),
-                      timestamp: resolvedThread?.updatedAt,
-                      isError: true,
-                      sourceID: "thread-empty-output"
-                  ) {
-            items.append(item)
-        }
-
-        if answer == nil, error == nil, isWorking {
-            appendWorkingPlaceholder(to: &items, providerName: workingProviderName, timestamp: workingTimestamp)
-        }
-
-        return items
-    }
-
-    private static func groupedTranscript(
-        from messages: [CodexThreadMessage],
-        treatTrailingAssistantAsProgress: Bool = false,
-        finalAssistantCanLoadFullText: Bool = false
-    ) -> [CodexThreadChatItem] {
-        var items: [CodexThreadChatItem] = []
-        var pendingAssistantMessages: [(offset: Int, message: CodexThreadMessage)] = []
-
-        func progressText(from messages: ArraySlice<(offset: Int, message: CodexThreadMessage)>) -> String {
-            messages
-                .enumerated()
-                .map { index, pending in
-                    let text = pending.message.text
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                        .replacingOccurrences(of: "\n\n", with: "\n")
-                    return "\(index + 1). \(text)"
-                }
-                .joined(separator: "\n\n")
-        }
-
-        func flushAssistantMessages(asProgressOnly: Bool = false) {
-            guard !pendingAssistantMessages.isEmpty else { return }
-            defer { pendingAssistantMessages.removeAll() }
-
-            if asProgressOnly {
-                let progressMessages = pendingAssistantMessages[...]
-                if let first = progressMessages.first,
-                   let item = chatItem(
-                       role: .status,
-                       text: progressText(from: progressMessages),
-                       timestamp: first.message.timestamp,
-                       sourceID: "progress-\(first.offset)-\(progressMessages.count)",
-                       kind: .progressSummary,
-                       progressCount: progressMessages.count
-                   ) {
-                    items.append(item)
-                }
-                return
-            }
-
-            if pendingAssistantMessages.count == 1,
-               let pending = pendingAssistantMessages.first,
-               let item = chatItem(
-                   role: .assistant,
-                   text: pending.message.text,
-                   timestamp: pending.message.timestamp,
-                   sourceID: "message-\(pending.offset)-\(pending.message.id)",
-                   canLoadFullText: finalAssistantCanLoadFullText
-               ) {
-                items.append(item)
-                return
-            }
-
-            let progressMessages = pendingAssistantMessages.dropLast()
-            if !progressMessages.isEmpty {
-                if let first = progressMessages.first,
-                   let item = chatItem(
-                       role: .status,
-                       text: progressText(from: progressMessages),
-                       timestamp: first.message.timestamp,
-                       sourceID: "progress-\(first.offset)-\(progressMessages.count)",
-                       kind: .progressSummary,
-                       progressCount: progressMessages.count
-                   ) {
-                    items.append(item)
-                }
-            }
-
-            if let final = pendingAssistantMessages.last,
-               let item = chatItem(
-                   role: .assistant,
-                   text: final.message.text,
-                   timestamp: final.message.timestamp,
-                   sourceID: "message-\(final.offset)-\(final.message.id)",
-                   canLoadFullText: finalAssistantCanLoadFullText
-               ) {
-                items.append(item)
-            }
-        }
-
-        for (index, message) in messages.enumerated() {
-            switch message.role {
-            case .assistant:
-                pendingAssistantMessages.append((index, message))
-            case .user, .status:
-                flushAssistantMessages()
-                if let item = chatItem(
-                    role: message.role,
-                    text: message.text,
-                    timestamp: message.timestamp,
-                    isError: false,
-                    sourceID: "message-\(index)-\(message.id)"
-                ) {
-                    items.append(item)
-                }
-            }
-        }
-
-        flushAssistantMessages(asProgressOnly: treatTrailingAssistantAsProgress)
-        return items
-    }
-
-    private static func appendPendingFollowUpIfMissing(
-        to items: inout [CodexThreadChatItem],
-        pendingFollowUp: CodexPendingFollowUp?
-    ) {
-        guard let pendingFollowUp,
-              let prompt = pendingFollowUp.prompt.trimmedNonEmpty else {
-            return
-        }
-        if items.contains(where: { item in
-            if item.sourceID == "pending-follow-up-\(pendingFollowUp.jobID)" {
-                return true
-            }
-            guard item.role == .user,
-                  item.text == prompt,
-                  let timestamp = item.timestamp else {
-                return false
-            }
-            return timestamp >= pendingFollowUp.createdAt.addingTimeInterval(-5)
-        }) {
-            return
-        }
-        if let item = chatItem(
-            role: .user,
-            text: prompt,
-            timestamp: pendingFollowUp.createdAt,
-            sourceID: "pending-follow-up-\(pendingFollowUp.jobID)"
-        ) {
-            items.append(item)
-        }
-    }
-
-    private static func appendLatestPromptIfMissing(
-        to items: inout [CodexThreadChatItem],
-        latestJob: CodexJob?,
-        pendingFollowUp: CodexPendingFollowUp? = nil
-    ) {
-        guard let latestJob,
-              let prompt = latestJob.prompt?.trimmedNonEmpty else {
-            return
-        }
-        if pendingFollowUp?.jobID == latestJob.id {
-            return
-        }
-        if items.contains(where: { $0.role == .user && $0.text == prompt }) {
-            return
-        }
-        if let item = chatItem(
-            role: .user,
-            text: prompt,
-            timestamp: latestJob.createdAt,
-            sourceID: "thread-prompt-\(latestJob.id)"
-        ) {
-            items.append(item)
-        }
-    }
-
-    private static func pendingPrompt(for pendingFollowUp: CodexPendingFollowUp?, latestJob: CodexJob?) -> String? {
-        guard let pendingFollowUp,
-              latestJob == nil || latestJob?.id == pendingFollowUp.jobID else {
-            return nil
-        }
-        return pendingFollowUp.prompt.trimmedNonEmpty
-    }
-
-    private static func appendWorkingPlaceholder(to items: inout [CodexThreadChatItem], providerName: String, timestamp: Date?) {
-        guard items.last?.sourceID != "thread-working",
-              let item = chatItem(
-                  role: .status,
-                  text: "\(providerName) is working.",
-                  timestamp: timestamp,
-                  sourceID: "thread-working",
-                  kind: .workingPlaceholder
-              ) else {
-            return
-        }
-        items.append(item)
-    }
-
-    private static func mergeLatestJobCompletion(in items: inout [CodexThreadChatItem], latestJob: CodexJob?) {
-        guard let latestJob,
-              !latestJob.status.isActive,
-              let responseItem = completionItem(from: latestJob) else {
-            return
-        }
-
-        guard let prompt = latestJob.prompt?.trimmedNonEmpty,
-              let promptIndex = items.lastIndex(where: { $0.role == .user && $0.text == prompt }) else {
-            appendIfMissing(responseItem, to: &items)
-            return
-        }
-
-        let responseRangeStart = items.index(after: promptIndex)
-        let responseRange = responseRangeStart..<items.endIndex
-        if let responseIndex = responseRange.last(where: { items[$0].role == responseItem.role && items[$0].kind == .message }) {
-            let previous = items[responseIndex]
-            guard responseItem.text.count > previous.text.count || previous.canLoadFullText || previous.text != responseItem.text else {
-                return
-            }
-            items[responseIndex] = CodexThreadChatItem(
-                role: responseItem.role,
-                text: responseItem.text,
-                timestamp: responseItem.timestamp ?? previous.timestamp,
-                isError: responseItem.isError,
-                sourceID: previous.sourceID,
-                kind: responseItem.kind,
-                progressCount: responseItem.progressCount,
-                canLoadFullText: responseItem.canLoadFullText
-            )
-        } else {
-            appendIfMissing(responseItem, to: &items)
-        }
-    }
-
-    private static func completionItem(from latestJob: CodexJob) -> CodexThreadChatItem? {
-        if let answer = latestJob.displayOutput?.trimmedNonEmpty {
-            return chatItem(
-                role: .assistant,
-                text: answer,
-                timestamp: latestJob.completedAt ?? latestJob.updatedAt,
-                sourceID: "thread-answer-\(latestJob.id)",
-                canLoadFullText: canLoadFullAnswer(thread: nil, latestJob: latestJob)
-            )
-        }
-
-        if let error = latestJob.errorMessage?.trimmedNonEmpty {
-            return chatItem(
-                role: .status,
-                text: error,
-                timestamp: latestJob.completedAt ?? latestJob.updatedAt,
-                isError: true,
-                sourceID: "thread-error-\(latestJob.id)"
-            )
-        }
-
-        if latestJob.status == .succeeded {
-            return chatItem(
-                role: .status,
-                text: emptyOutputMessage(provider: latestJob.provider),
-                timestamp: latestJob.completedAt ?? latestJob.updatedAt,
-                isError: true,
-                sourceID: "thread-empty-output-\(latestJob.id)"
-            )
-        }
-
-        return nil
-    }
-
-    private static func emptyOutputMessage(provider: CodexProvider) -> String {
-        "\(provider.displayName) finished without producing output."
-    }
-
-    private static func appendIfMissing(_ item: CodexThreadChatItem, to items: inout [CodexThreadChatItem]) {
-        guard !items.contains(where: { $0.role == item.role && $0.text == item.text }) else {
-            return
-        }
-        items.append(item)
-    }
-
-    private static func chatItem(
-        role: CodexThreadMessageRole,
-        text: String?,
-        timestamp: Date?,
-        isError: Bool = false,
-        sourceID: String,
-        kind: Kind = .message,
-        progressCount: Int = 0,
-        canLoadFullText: Bool = false
-    ) -> CodexThreadChatItem? {
-        guard let text = text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
-            return nil
-        }
-        return CodexThreadChatItem(
-            role: role,
-            text: text,
-            timestamp: timestamp,
-            isError: isError,
-            sourceID: sourceID,
-            kind: kind,
-            progressCount: progressCount,
-            canLoadFullText: canLoadFullText
-        )
-    }
-
-    private static func canLoadFullAnswer(thread: CodexThread?, latestJob: CodexJob?) -> Bool {
-        if let latestJob {
-            guard !latestJob.status.isActive else { return false }
-            return latestJob.resultTruncated || latestJob.displayOutputPreview.isTruncated
-        }
-
-        return thread?.lastJobId?.trimmedNonEmpty != nil
-            && thread?.lastResult?.trimmedNonEmpty != nil
     }
 }
 
@@ -1478,31 +1035,6 @@ enum CodexReasoningEffort: String, CaseIterable, Identifiable, Codable {
             return "High"
         case .xhigh:
             return "XHigh"
-        }
-    }
-}
-
-enum CodexRunMode: String, CaseIterable, Identifiable, Codable {
-    case quality
-    case speed
-
-    var id: String { rawValue }
-
-    var label: String {
-        switch self {
-        case .quality:
-            return "Quality"
-        case .speed:
-            return "Speed"
-        }
-    }
-
-    var effectiveReasoningEffort: CodexReasoningEffort? {
-        switch self {
-        case .quality:
-            return nil
-        case .speed:
-            return .low
         }
     }
 }
@@ -2005,47 +1537,42 @@ struct CodexCreateJobResponse: Decodable {
     }
 }
 
-struct CodexHealth: Decodable, Hashable {
-    let status: String
-    let message: String?
-    let version: String?
-    let isHealthy: Bool
+/// One server-sent event from `GET /v1/codex/jobs/<id>/stream`.
+/// `status` carries a job status snapshot, `stdout`/`stderr` carry log chunks with their
+/// byte offsets, and `done` carries the terminal full job response.
+enum CodexJobStreamEvent: Hashable {
+    case status(CodexJob)
+    case stdout(offset: Int64, text: String)
+    case stderr(offset: Int64, text: String)
+    case done(CodexJob)
 
-    enum CodingKeys: String, CodingKey {
-        case status
-        case state
-        case ok
-        case healthy
-        case message
-        case version
+    /// Decode a single SSE event name + data payload. Returns nil for unknown events
+    /// (heartbeats, future additions) and for undecodable payloads so a job stream stays
+    /// tolerant of contract growth.
+    static func decode(event: String, data: String) -> CodexJobStreamEvent? {
+        let payload = Data(data.utf8)
+        switch event.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "status":
+            guard let job = try? JSONDecoder().decode(CodexJob.self, from: payload) else { return nil }
+            return .status(job)
+        case "stdout":
+            guard let chunk = try? JSONDecoder().decode(CodexJobStreamChunk.self, from: payload) else { return nil }
+            return .stdout(offset: chunk.offset ?? 0, text: chunk.text ?? "")
+        case "stderr":
+            guard let chunk = try? JSONDecoder().decode(CodexJobStreamChunk.self, from: payload) else { return nil }
+            return .stderr(offset: chunk.offset ?? 0, text: chunk.text ?? "")
+        case "done":
+            guard let job = try? JSONDecoder().decode(CodexJob.self, from: payload) else { return nil }
+            return .done(job)
+        default:
+            return nil
+        }
     }
+}
 
-    init(status: String, message: String? = nil, version: String? = nil, isHealthy: Bool? = nil) {
-        self.status = status
-        self.message = message
-        self.version = version
-        self.isHealthy = isHealthy ?? Self.statusIsHealthy(status)
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        let statusValue = try container.decodeLooseStringIfPresent(forKey: .status)
-        let state = try container.decodeLooseStringIfPresent(forKey: .state)
-        let ok = try container.decodeIfPresent(Bool.self, forKey: .ok)
-        let healthy = try container.decodeIfPresent(Bool.self, forKey: .healthy)
-        let status = statusValue ?? state ?? "ok"
-        let explicitHealth = ok ?? healthy
-
-        self.status = status
-        self.message = try container.decodeLooseStringIfPresent(forKey: .message)
-        self.version = try container.decodeLooseStringIfPresent(forKey: .version)
-        self.isHealthy = explicitHealth ?? Self.statusIsHealthy(status)
-    }
-
-    private static func statusIsHealthy(_ status: String) -> Bool {
-        let normalized = status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ["ok", "up", "healthy", "ready", "online"].contains(normalized)
-    }
+private struct CodexJobStreamChunk: Decodable {
+    let offset: Int64?
+    let text: String?
 }
 
 private struct CodexLooseString: Decodable {
@@ -2175,123 +1702,6 @@ private enum CodexDateParser {
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter
     }()
-}
-
-struct CodexErrorSummary: Equatable {
-    let statusCode: Int?
-    let statusLine: String
-    let summary: String
-    let rawResponse: String
-
-    init(message: String) {
-        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
-        let statusCode = Self.httpStatusCode(in: trimmed)
-        let rawResponse = Self.rawResponse(from: trimmed)
-        let parsedSummary = Self.htmlMessage(from: rawResponse)
-            ?? Self.jsonMessage(from: rawResponse)
-            ?? Self.plainSummary(from: rawResponse)
-            ?? Self.plainSummary(from: trimmed)
-            ?? "Request failed"
-
-        self.statusCode = statusCode
-        self.statusLine = statusCode.map { "HTTP \($0)" } ?? "Request failed"
-        self.summary = parsedSummary
-        self.rawResponse = rawResponse.isEmpty ? trimmed : rawResponse
-    }
-
-    private static func httpStatusCode(in message: String) -> Int? {
-        guard let range = message.range(of: #"HTTP\s+(\d{3})"#, options: .regularExpression) else {
-            return nil
-        }
-        return Int(message[range].split(separator: " ").last ?? "")
-    }
-
-    private static func rawResponse(from message: String) -> String {
-        guard let range = message.range(of: ": ") else {
-            return message
-        }
-        let prefix = message[..<range.lowerBound]
-        if prefix.localizedCaseInsensitiveContains("HTTP")
-            || prefix.localizedCaseInsensitiveContains("Codex request failed") {
-            return String(message[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return message
-    }
-
-    private static func htmlMessage(from payload: String) -> String? {
-        guard payload.localizedCaseInsensitiveContains("<html")
-            || payload.localizedCaseInsensitiveContains("<p>")
-            || payload.localizedCaseInsensitiveContains("<!doctype") else {
-            return nil
-        }
-        if let message = firstCapture(in: payload, pattern: #"<p>\s*Message:\s*([^<]+)</p>"#) {
-            return normalizeSentence(message)
-        }
-        if let title = firstCapture(in: payload, pattern: #"<title>\s*([^<]+)</title>"#) {
-            return normalizeSentence(title)
-        }
-        return plainSummary(from: stripHTML(payload))
-    }
-
-    private static func jsonMessage(from payload: String) -> String? {
-        guard let data = payload.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-        for key in ["message", "error", "detail"] {
-            if let value = object[key] as? String,
-               let summary = plainSummary(from: value) {
-                return summary
-            }
-        }
-        return nil
-    }
-
-    private static func plainSummary(from value: String) -> String? {
-        let cleaned = normalizeWhitespace(value)
-        guard !cleaned.isEmpty else { return nil }
-        if cleaned.localizedCaseInsensitiveContains("Codex request failed with HTTP "),
-           let separator = cleaned.range(of: ": ") {
-            return plainSummary(from: String(cleaned[separator.upperBound...]))
-        }
-        return cleaned
-    }
-
-    private static func stripHTML(_ value: String) -> String {
-        value.replacingOccurrences(of: #"<[^>]+>"#, with: " ", options: .regularExpression)
-    }
-
-    private static func firstCapture(in value: String, pattern: String) -> String? {
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive, .dotMatchesLineSeparators]) else {
-            return nil
-        }
-        let range = NSRange(value.startIndex..<value.endIndex, in: value)
-        guard let match = regex.firstMatch(in: value, range: range),
-              match.numberOfRanges > 1,
-              let captureRange = Range(match.range(at: 1), in: value) else {
-            return nil
-        }
-        return String(value[captureRange])
-    }
-
-    private static func normalizeSentence(_ value: String) -> String {
-        var cleaned = normalizeWhitespace(value)
-        while cleaned.last == "." {
-            cleaned.removeLast()
-        }
-        return cleaned
-    }
-
-    private static func normalizeWhitespace(_ value: String) -> String {
-        value
-            .replacingOccurrences(of: "&quot;", with: "\"")
-            .replacingOccurrences(of: "&amp;", with: "&")
-            .replacingOccurrences(of: "&lt;", with: "<")
-            .replacingOccurrences(of: "&gt;", with: ">")
-            .components(separatedBy: .whitespacesAndNewlines)
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-    }
 }
 
 extension String {

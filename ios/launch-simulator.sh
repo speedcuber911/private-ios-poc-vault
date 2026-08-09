@@ -1,4 +1,32 @@
 #!/usr/bin/env bash
+#
+# Build, install, and launch Relay on an iPhone 17 Pro simulator against the local
+# fixture server (ops/serve-simulator-poc-vault).
+#
+# DEBUG visual-test hooks (compiled out of release builds). `xcrun simctl launch`
+# forwards any variable in the *caller's* environment named SIMCTL_CHILD_<NAME> to
+# the app as <NAME>, so prefix each hook with SIMCTL_CHILD_ when invoking this
+# script — no script changes needed:
+#
+#   SIMCTL_CHILD_RELAY_UITEST_PATH=/abs/folder   push the file browser to that folder
+#   SIMCTL_CHILD_RELAY_UITEST_FILE=/abs/file     push the read-only file viewer route
+#   SIMCTL_CHILD_RELAY_UITEST_CHAT=1             open the chat cover (for RELAY_UITEST_PATH's
+#                                                folder when set, else the root)
+#   SIMCTL_CHILD_RELAY_UITEST_OPEN=library|status  present the Library cover / Status sheet
+#
+#   Chat auto-drive (combine with RELAY_UITEST_CHAT=1):
+#   SIMCTL_CHILD_RELAY_UITEST_MODEL=<substr>     pick the model whose id/label contains this
+#   SIMCTL_CHILD_RELAY_UITEST_PROMPT=<text>      auto-send a chat prompt (streaming UI)
+#   SIMCTL_CHILD_RELAY_UITEST_TASK_PROMPT=<text> auto-submit a task job (job card UI)
+#
+# Example — screenshot chat streaming in the poc-vault folder:
+#   SIMCTL_CHILD_RELAY_UITEST_PATH=/srv/codex-workspaces/poc-vault \
+#   SIMCTL_CHILD_RELAY_UITEST_CHAT=1 \
+#   SIMCTL_CHILD_RELAY_UITEST_PROMPT='Explain connection pooling' \
+#   ios/launch-simulator.sh
+#
+# Fixture pacing knobs (server side): SIM_CHAT_DELTA_DELAY, SIM_JOB_STREAM_DELAY.
+#
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,7 +50,7 @@ server_alive() {
   curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1 \
     && curl -fsS "http://127.0.0.1:${PORT}/v1/codex/health" >/dev/null 2>&1 \
     && curl -fsS "http://127.0.0.1:${PORT}/v1/codex/models" >/dev/null 2>&1 \
-    && curl -fsS --max-time 2 -N -X POST "http://127.0.0.1:${PORT}/v1/codex/chat" \
+    && curl -fsS --max-time 15 -N -X POST "http://127.0.0.1:${PORT}/v1/codex/chat" \
       -H "Content-Type: application/json" \
       --data '{"provider":"bedrock","model":"simulator-health","messages":[{"role":"user","content":"ping"}]}' \
       2>/dev/null | grep -q "event: done"
@@ -56,7 +84,8 @@ stop_existing_simulator_server() {
 
 if ! server_alive; then
   stop_existing_simulator_server
-  screen -dmS "$SCREEN_NAME" /bin/zsh -lc "exec '${ROOT}/ops/serve-simulator-poc-vault' --port '${PORT}' >'${SERVER_LOG}' 2>&1"
+  # Keep health-check chat SSE fast; UI pacing can be re-enabled by exporting SIM_CHAT_DELTA_DELAY.
+  screen -dmS "$SCREEN_NAME" /bin/zsh -lc "export SIM_CHAT_DELTA_DELAY='${SIM_CHAT_DELTA_DELAY:-0}'; exec '${ROOT}/ops/serve-simulator-poc-vault' --port '${PORT}' >'${SERVER_LOG}' 2>&1"
   for _ in {1..40}; do
     server_alive && break
     sleep 0.25
@@ -79,13 +108,21 @@ fi
 
 xcrun simctl boot "$SIM_ID" >/dev/null 2>&1 || true
 xcrun simctl bootstatus "$SIM_ID" -b >/dev/null
-open -a Simulator
+SIMULATOR_APP="$(xcode-select -p)/Applications/Simulator.app"
+if [[ -d "$SIMULATOR_APP" ]]; then
+  open "$SIMULATOR_APP"
+elif [[ -d "/Applications/Simulator.app" ]]; then
+  open -a Simulator
+else
+  # Xcode beta may boot CoreSimulator without a standalone Simulator.app.
+  echo "Simulator.app not found; continuing with simctl boot/install/launch." >&2
+fi
 
 xcodebuild build \
   -project "$ROOT/ios/POCVault/POCVault.xcodeproj" \
   -target POCVault \
   -configuration Debug \
-  -sdk iphonesimulator26.5 \
+  -sdk iphonesimulator \
   -arch arm64 \
   PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
   POC_VAULT_CODEX_BASE_URL="${POC_VAULT_SIM_CODEX_BASE_URL:-http://127.0.0.1:${PORT}}" \

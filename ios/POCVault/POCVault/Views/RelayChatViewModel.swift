@@ -57,227 +57,136 @@ struct RelayConversationItem: Identifiable, Hashable {
     }
 }
 
-enum RelayModelPickerBucket: String, CaseIterable, Identifiable {
-    case latest
-    case all
+/// A selectable picker row: a server model plus the explicit interaction mode it runs in.
+/// Identity includes BOTH the model id and the mode, so a dual-mode Codex descriptor can
+/// appear as an Agents (task) row and a Chat models (chat) row without colliding.
+struct RelayModelChoice: Identifiable, Hashable {
+    let model: CodexModelDescriptor
+    let mode: RelayInteractionMode
 
-    var id: String { rawValue }
+    var id: String { "\(model.id)#\(mode.rawValue)" }
 
-    var label: String {
-        switch self {
-        case .latest:
-            return "Latest"
-        case .all:
-            return "All"
+    /// The harness name shown for Agents grouping and the composer chip ("Codex",
+    /// "Claude Code", "Cursor"). Purely presentational; rows still come only from the
+    /// server catalog.
+    static func harnessTitle(for provider: CodexProvider) -> String {
+        switch provider {
+        case .claude:
+            return "Claude Code"
+        case .codex, .cursor, .bedrock, .azure:
+            return provider.displayName
+        }
+    }
+
+    var harnessTitle: String { Self.harnessTitle(for: model.provider) }
+
+    /// The model label with any redundant harness prefix/suffix stripped, so submenu rows
+    /// read "GPT-5.6 Sol" under Codex, "Auto" under Cursor, "Sonnet" under Claude Code.
+    var shortModelLabel: String {
+        var text = model.label.trimmingCharacters(in: .whitespacesAndNewlines)
+        for alias in Self.labelAliases(for: model.provider) {
+            let lowered = text.lowercased()
+            if lowered.hasPrefix(alias.lowercased()) {
+                let stripped = String(text.dropFirst(alias.count))
+                    .trimmingCharacters(in: CharacterSet(charactersIn: " \t·:-–—"))
+                if !stripped.isEmpty {
+                    text = stripped
+                }
+                break
+            }
+            let parenthetical = "(\(alias))"
+            if lowered.hasSuffix(parenthetical.lowercased()) {
+                let stripped = String(text.dropLast(parenthetical.count))
+                    .trimmingCharacters(in: .whitespaces)
+                if !stripped.isEmpty {
+                    text = stripped
+                }
+                break
+            }
+        }
+        return text
+    }
+
+    /// Composer chip text: harness plus model, e.g. "Codex · GPT-5.6 Sol" / "Cursor · Auto".
+    var chipLabel: String {
+        "\(harnessTitle) · \(shortModelLabel)"
+    }
+
+    private static func labelAliases(for provider: CodexProvider) -> [String] {
+        switch provider {
+        case .codex:
+            return ["Codex"]
+        case .claude:
+            return ["Claude Code", "Claude"]
+        case .cursor:
+            return ["Cursor Agent", "Cursor"]
+        case .bedrock:
+            return ["Bedrock"]
+        case .azure:
+            return ["Azure OpenAI", "Azure"]
         }
     }
 }
 
-struct RelayModelSection: Identifiable, Hashable {
-    let title: String
-    let models: [CodexModelDescriptor]
+/// One harness (agent CLI) advertised by the server catalog, carrying its task-mode
+/// model choices. A harness with a single "let the harness choose" entry (Cursor Auto)
+/// simply has one choice — the client never synthesizes extra rows.
+struct RelayHarnessGroup: Identifiable, Hashable {
+    let provider: CodexProvider
+    let choices: [RelayModelChoice]
 
-    var id: String { title }
+    var id: String { provider.rawValue }
+    var title: String { RelayModelChoice.harnessTitle(for: provider) }
+}
+
+/// Harness-first picker structure: Agents (task mode, grouped per harness) and a flat
+/// Chat models list. Both are derived purely from the server catalog; a missing provider
+/// produces no group and no rows.
+struct RelayModelPickerSections: Hashable {
+    let agents: [RelayHarnessGroup]
+    let chatModels: [RelayModelChoice]
+
+    var isEmpty: Bool { agents.isEmpty && chatModels.isEmpty }
+
+    var allChoices: [RelayModelChoice] {
+        agents.flatMap(\.choices) + chatModels
+    }
+
+    /// Sensible default when nothing is selected yet: the first chat model if any
+    /// (matching the conversation-first surface), else the first agent.
+    var defaultChoice: RelayModelChoice? {
+        chatModels.first ?? agents.first?.choices.first
+    }
 }
 
 enum RelayModelDiscovery {
-    static func sections(
-        from models: [CodexModelDescriptor],
-        mode: RelayInteractionMode,
-        bucket: RelayModelPickerBucket,
-        searchText: String
-    ) -> [RelayModelSection] {
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if !query.isEmpty {
-            let results = models
-                .filter { model in model.matches(query) }
-                .sorted(by: modelSort)
-            return results.isEmpty ? [] : [RelayModelSection(title: "Search", models: results)]
+    static let agentProviderOrder: [CodexProvider] = [.codex, .claude, .cursor, .bedrock, .azure]
+    static let chatProviderOrder: [CodexProvider] = [.codex, .azure, .bedrock, .claude, .cursor]
+
+    /// Build the harness-first picker sections from the server catalog. Catalog order is
+    /// preserved within each provider (the server curates it); providers absent from the
+    /// catalog simply do not appear.
+    static func sections(from models: [CodexModelDescriptor]) -> RelayModelPickerSections {
+        let agents = agentProviderOrder.compactMap { provider -> RelayHarnessGroup? in
+            let entries = models.filter { $0.provider == provider && $0.supports(.task) }
+            guard !entries.isEmpty else { return nil }
+            return RelayHarnessGroup(
+                provider: provider,
+                choices: entries.map { RelayModelChoice(model: $0, mode: .task) }
+            )
         }
-
-        switch bucket {
-        case .latest:
-            let recommended = recommendedModels(from: models, mode: mode)
-            return recommended.isEmpty ? [] : [RelayModelSection(title: "Latest", models: recommended)]
-        case .all:
-            let grouped = Dictionary(grouping: models, by: \.provider)
-            return providerOrder(for: mode).compactMap { provider in
-                guard let entries = grouped[provider], !entries.isEmpty else { return nil }
-                return RelayModelSection(title: provider.displayName, models: entries.sorted(by: modelSort))
-            }
+        let chatModels = chatProviderOrder.flatMap { provider in
+            models
+                .filter { $0.provider == provider && $0.supports(.chat) }
+                .map { RelayModelChoice(model: $0, mode: .chat) }
         }
-    }
-
-    static func recommendedModels(
-        from models: [CodexModelDescriptor],
-        mode: RelayInteractionMode,
-        limit: Int = 10
-    ) -> [CodexModelDescriptor] {
-        let supported = models.filter { $0.supports(mode) }
-        guard mode == .chat else {
-            return supported.sorted(by: modelSort)
-        }
-
-        var bestByFamily: [String: CodexModelDescriptor] = [:]
-        for model in supported {
-            let key = familyKey(for: model)
-            guard let current = bestByFamily[key] else {
-                bestByFamily[key] = model
-                continue
-            }
-            if recommendationScore(for: model) > recommendationScore(for: current) {
-                bestByFamily[key] = model
-            }
-        }
-
-        return Array(bestByFamily.values)
-            .sorted { lhs, rhs in
-                let lhsScore = recommendationScore(for: lhs)
-                let rhsScore = recommendationScore(for: rhs)
-                if lhsScore != rhsScore {
-                    return lhsScore > rhsScore
-                }
-                return lhs.label.localizedCaseInsensitiveCompare(rhs.label) == .orderedAscending
-            }
-            .prefix(limit)
-            .map { $0 }
-    }
-
-    private static func providerOrder(for mode: RelayInteractionMode) -> [CodexProvider] {
-        switch mode {
-        case .chat:
-            return [.azure, .bedrock, .codex, .claude]
-        case .task:
-            return [.codex, .claude, .bedrock, .azure]
-        }
-    }
-
-    private static func modelSort(_ lhs: CodexModelDescriptor, _ rhs: CodexModelDescriptor) -> Bool {
-        let lhsProviderIndex = providerOrder(for: lhs.modes.contains(.task) && !lhs.modes.contains(.chat) ? .task : .chat)
-            .firstIndex(of: lhs.provider) ?? Int.max
-        let rhsProviderIndex = providerOrder(for: rhs.modes.contains(.task) && !rhs.modes.contains(.chat) ? .task : .chat)
-            .firstIndex(of: rhs.provider) ?? Int.max
-        if lhsProviderIndex != rhsProviderIndex {
-            return lhsProviderIndex < rhsProviderIndex
-        }
-        return lhs.label.localizedCaseInsensitiveCompare(rhs.label) == .orderedAscending
-    }
-
-    private static func familyKey(for model: CodexModelDescriptor) -> String {
-        // De-dupe the Latest bucket by the model's own identity, not its coarse family, so
-        // genuinely distinct models (e.g. gpt-5 vs gpt-5-chat, or two Opus minor versions)
-        // each survive. We only fold away dated build suffixes and a version-pin tail
-        // (e.g. "-20251101-v1:0"), which are the same model published twice.
-        let base = nonEmpty(model.azureDeployment)
-            ?? model.id.split(separator: "/").last.map(String.init)
-            ?? model.label
-        return base
-            .lowercased()
-            .replacingOccurrences(of: "global.anthropic.", with: "")
-            .replacingOccurrences(of: #"-\d{8}(-v\d+(:\d+)?)?$"#, with: "", options: .regularExpression)
-            .replacingOccurrences(of: #"\s*\(.*?\)"#, with: "", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private static func recommendationScore(for model: CodexModelDescriptor) -> Int {
-        let text = "\(model.id) \(model.label) \(model.azureDeployment ?? "")".lowercased()
-        var score = 0
-
-        switch model.provider {
-        case .azure:
-            score += 1_000
-        case .bedrock:
-            score += 900
-        case .codex:
-            score += 800
-        case .claude:
-            score += 790
-        }
-
-        score += familyVersionScore(in: text)
-
-        if text.contains("gpt-5") { score += 500 }
-        if text.contains("gpt-4") { score += 300 }
-        if text.contains("claude") { score += 430 }
-        if text.contains("opus") { score += 90 }
-        if text.contains("sonnet") { score += 70 }
-        if text.contains("haiku") { score += 35 }
-        if text.contains("deepseek") { score += 420 }
-        if text.contains("kimi") { score += 410 }
-        if text.contains("grok") { score += 405 }
-
-        if text.contains("mini") { score -= 80 }
-        if text.contains("nano") { score -= 140 }
-        if text.contains("turbo") { score -= 60 }
-        if text.contains("dev") { score -= 35 }
-        if text.contains("prod") { score += 25 }
-
-        return score
-    }
-
-    private static func familyVersionScore(in text: String) -> Int {
-        [
-            #"\bgpt[-_ ]?([0-9]+)(?:[.\-_ ]([0-9]+))?"#,
-            #"\bclaude(?:[-_ ][a-z]+)?[-_ ]([0-9]+)(?:[.\-_ ]([0-9]+))?"#,
-            #"\bdeepseek[-_ ]?v?([0-9]+)(?:[.\-_ ]([0-9]+))?"#,
-            #"\bkimi(?:[-_ ]k)?[-_ ]?([0-9]+)(?:[.\-_ ]([0-9]+))?"#,
-            #"\bgrok[-_ ]([0-9]+)(?:[.\-_ ]([0-9]+))?"#
-        ].reduce(0) { best, pattern in
-            max(best, bestVersionScore(matching: pattern, in: text))
-        }
-    }
-
-    private static func bestVersionScore(matching pattern: String, in text: String) -> Int {
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return 0 }
-        let matches = regex.matches(in: text, range: NSRange(text.startIndex..., in: text))
-        return matches.reduce(0) { best, match in
-            guard match.numberOfRanges >= 2,
-                  let majorRange = Range(match.range(at: 1), in: text),
-                  let major = Int(text[majorRange]) else {
-                return best
-            }
-            let minor: Int
-            if match.numberOfRanges >= 3,
-               let minorRange = Range(match.range(at: 2), in: text),
-               let parsedMinor = Int(text[minorRange]) {
-                minor = parsedMinor
-            } else {
-                minor = 0
-            }
-            let normalizedMajor = major == 35 ? 3 : major
-            let normalizedMinor = major == 35 ? 50 : minor
-            return max(best, (normalizedMajor * 100) + normalizedMinor)
-        }
-    }
-
-    private static func nonEmpty(_ value: String?) -> String? {
-        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !trimmed.isEmpty else {
-            return nil
-        }
-        return trimmed
-    }
-}
-
-private extension CodexModelDescriptor {
-    func matches(_ query: String) -> Bool {
-        let haystack = [
-            id,
-            label,
-            provider.displayName,
-            azureDeployment ?? "",
-            modes.map(\.label).joined(separator: " ")
-        ]
-            .joined(separator: " ")
-            .lowercased()
-        return haystack.contains(query)
+        return RelayModelPickerSections(agents: agents, chatModels: chatModels)
     }
 }
 
 @MainActor
 final class RelayChatViewModel: ObservableObject {
     @Published private(set) var models: [CodexModelDescriptor] = []
-    @Published private(set) var workspaces: [CodexWorkspace] = []
     @Published private(set) var threads: [CodexThread] = []
     @Published private(set) var jobs: [CodexJob] = []
     @Published private(set) var messages: [RelayConversationItem] = []
@@ -285,24 +194,86 @@ final class RelayChatViewModel: ObservableObject {
     @Published private(set) var isSending = false
     @Published private(set) var isTranscribing = false
     @Published private(set) var cancellingJobIDs: Set<String> = []
-    @Published var mode: RelayInteractionMode = .chat {
-        didSet { ensureSelectedModelSupportsMode() }
-    }
-    @Published var selectedModelID: String? {
-        didSet { ensureSelectedModelSupportsMode() }
-    }
-    @Published var selectedWorkspaceID: String?
+    /// The explicit model+mode selection. Never inferred from `supports(.task)`; the mode
+    /// travels with the choice from the picker section it was tapped in.
+    @Published private(set) var selectedChoice: RelayModelChoice?
     /// User-chosen reasoning effort for task jobs (nil = model default). Reset when the
-    /// selected model changes so we never send an effort the model doesn't support.
+    /// selected choice changes so we never send an effort the model doesn't support.
     @Published var selectedEffort: CodexReasoningEffort?
     @Published var prompt = ""
     @Published var errorMessage: String?
+    /// Live stdout/stderr tail per active job id, fed by the job SSE stream. Cleared when
+    /// the job reaches a terminal state.
+    @Published private(set) var liveJobTails: [String: String] = [:]
+
+    /// Registered workspace id for this folder, nil until the folder is registered
+    /// (lazy `POST /workspaces/select` on first send).
+    @Published private(set) var workspaceID: String?
+    /// Absolute jail path of the folder this conversation is scoped to; nil for the
+    /// workspace-root chat.
+    let workspacePath: String?
+
+    private var registeredWorkspaceName: String?
+
+    /// Id of the assistant message currently streaming, or nil when idle. The composer
+    /// flips its send button to a stop button while this is set.
+    @Published private(set) var streamingMessageID: String?
+
+    private let client: CodexClient
+    private var currentThreadID: String?
+    private var currentThreadProvider: CodexProvider?
+    /// Workspace the current thread belongs to. Resuming a session in a different
+    /// workspace is rejected by the server ("session does not belong to workspace"), so
+    /// we only resume when this matches the compose workspace.
+    private var currentThreadWorkspaceID: String?
+    private var streamTask: Task<Void, Never>?
+    /// Live job SSE consumers keyed by job id. Streams are VM-owned: dismissing the chat
+    /// cover never cancels them. When a stream errors/drops the entry clears itself and
+    /// the store's 2 s monitor loop (refreshActiveWorkIfNeeded) remains the fallback
+    /// update channel.
+    private var jobStreamTasks: [String: Task<Void, Never>] = [:]
+
+    private static let liveTailCharacterCap = 12_000
+
+    var isStreaming: Bool { streamingMessageID != nil }
+
+    init(client: CodexClient, workspaceID: String?, workspacePath: String?) {
+        self.client = client
+        self.workspaceID = workspaceID?.trimmedNonEmpty
+        self.workspacePath = workspacePath?.trimmedNonEmpty
+    }
+
+    /// Folder name for the chat top bar ("Relay" for the root chat).
+    var folderDisplayName: String {
+        if let workspacePath {
+            return URL(fileURLWithPath: workspacePath).lastPathComponent
+        }
+        return registeredWorkspaceName ?? "Relay"
+    }
+
+    /// Adopt a workspace id learned outside this VM (e.g. the browser registered the
+    /// folder after this session was created). First-writer wins; ids are stable per path.
+    func adoptWorkspaceID(_ id: String) {
+        guard workspaceID == nil, let trimmed = id.trimmedNonEmpty else { return }
+        workspaceID = trimmed
+    }
+
+    // MARK: - Model selection
+
+    var pickerSections: RelayModelPickerSections {
+        RelayModelDiscovery.sections(from: models)
+    }
+
+    func selectChoice(_ choice: RelayModelChoice) {
+        selectedChoice = choice
+        selectedEffort = nil  // fall back to the new model's default until the user picks
+    }
 
     /// Effort levels the selected task model exposes (from the catalog), as typed options.
+    /// Chat requests carry no effort, so chat-mode selections expose none.
     var availableEfforts: [CodexReasoningEffort] {
-        guard let model = selectedModel else { return [] }
-        let levels = model.effortLevels.compactMap { CodexReasoningEffort(rawValue: $0.lowercased()) }
-        return levels.isEmpty ? [] : levels
+        guard let choice = selectedChoice, choice.mode == .task else { return [] }
+        return choice.model.effortLevels.compactMap { CodexReasoningEffort(rawValue: $0.lowercased()) }
     }
 
     /// The effort to actually send: user choice if set and valid, else the model default.
@@ -315,30 +286,123 @@ final class RelayChatViewModel: ObservableObject {
         selectedEffort = effort
     }
 
-    /// Id of the assistant message currently streaming, or nil when idle. The composer
-    /// flips its send button to a stop button while this is set.
-    @Published private(set) var streamingMessageID: String?
-
-    private let client: CodexClient
-    /// When set, this view model serves a single tab (Chat or Task) and the mode never changes.
-    let lockedMode: RelayInteractionMode?
-    private var currentThreadID: String?
-    private var currentThreadProvider: CodexProvider?
-    /// Workspace the current task thread belongs to. Resuming a session in a different
-    /// workspace is rejected by the server ("session does not belong to workspace"), so we
-    /// only resume when this matches the compose workspace.
-    private var currentThreadWorkspaceID: String?
-    private var streamTask: Task<Void, Never>?
-
-    var isStreaming: Bool { streamingMessageID != nil }
-
-    init(client: CodexClient, lockedMode: RelayInteractionMode? = nil) {
-        self.client = client
-        self.lockedMode = lockedMode
-        if let lockedMode {
-            self.mode = lockedMode
+    private func ensureSelectedChoiceValid() {
+        let sections = pickerSections
+        if let selectedChoice, sections.allChoices.contains(selectedChoice) {
+            return
+        }
+        if let fallback = sections.defaultChoice {
+            selectedChoice = fallback
         }
     }
+
+    // MARK: - Bootstrap / refresh
+
+    func bootstrap() async {
+        guard !isLoading else { return }
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            models = try await client.fetchModels()
+            ensureSelectedChoiceValid()
+            await refreshThreads()
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        #if DEBUG
+        await runAutoDriveIfRequested()
+        #endif
+    }
+
+    /// Threads/jobs scoped to this folder's workspace. An unregistered folder has no
+    /// server-side history yet; the root chat sees the app-wide list.
+    func refreshThreads() async {
+        if workspacePath != nil && workspaceID == nil {
+            return
+        }
+        do {
+            threads = Self.sortedThreads(try await client.fetchThreads(provider: nil, workspaceID: workspaceID, limit: 80))
+            jobs = Self.sortedJobs(try await client.fetchJobs(provider: nil, workspaceID: workspaceID, limit: 20))
+            mergeUpdatedJobs()
+        } catch {
+            if !isCancellation(error) {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    /// True while any job shown in this conversation is still running/queued.
+    var hasActiveConversationJob: Bool {
+        messages.contains { $0.job?.status.isActive == true }
+    }
+
+    /// One pass of the app-wide monitor loop (owned by `RelayChatSessionStore`, ~2 s):
+    /// while this conversation has an active job, pull its latest detail and refresh
+    /// threads so the job card keeps showing progress — even when the chat cover is
+    /// dismissed or the job SSE stream has dropped. This polling is the fallback (and
+    /// reconciliation) channel next to `streamJobEvents`.
+    func refreshActiveWorkIfNeeded() async {
+        guard hasActiveConversationJob else { return }
+        await refreshActiveJobDetails()
+        await refreshThreads()
+    }
+
+    /// Fetch full detail for each active job card so stdout/result grows live in the UI.
+    private func refreshActiveJobDetails() async {
+        let activeIDs = messages.compactMap { $0.job?.status.isActive == true ? $0.job?.id : nil }
+        for id in activeIDs {
+            if let updated = try? await client.fetchJob(id: id, includeFullLogs: false) {
+                replaceJob(updated)
+            }
+        }
+    }
+
+    // MARK: - Sending
+
+    func sendCurrentPrompt() async {
+        guard let choice = selectedChoice else {
+            errorMessage = "No model is available."
+            return
+        }
+        switch choice.mode {
+        case .chat:
+            await sendChat(using: choice)
+        case .task:
+            await runTask(using: choice)
+        }
+    }
+
+    #if DEBUG
+    /// Headless visual-test hook. When launched with RELAY_UITEST_MODEL / RELAY_UITEST_PROMPT
+    /// (chat) or RELAY_UITEST_TASK_PROMPT (task), the app selects the matching choice and
+    /// sends the prompt on its own so the streaming UI can be screenshotted without
+    /// simulator tap automation. Compiled out of release builds.
+    private func runAutoDriveIfRequested() async {
+        let env = ProcessInfo.processInfo.environment
+        // Task auto-drive: pick the harness's model in task mode and submit a job.
+        if let taskPrompt = env["RELAY_UITEST_TASK_PROMPT"], !taskPrompt.isEmpty {
+            if let wanted = env["RELAY_UITEST_MODEL"]?.lowercased(),
+               let match = models.first(where: { $0.supports(.task) && ($0.id.lowercased().contains(wanted) || $0.label.lowercased().contains(wanted)) }) {
+                selectChoice(RelayModelChoice(model: match, mode: .task))
+            } else if let fallback = pickerSections.agents.first?.choices.first {
+                selectChoice(fallback)
+            }
+            prompt = taskPrompt
+            await sendCurrentPrompt()
+            return
+        }
+        guard let promptText = env["RELAY_UITEST_PROMPT"], !promptText.isEmpty else { return }
+        if let wanted = env["RELAY_UITEST_MODEL"]?.lowercased(),
+           let match = models.first(where: { $0.supports(.chat) && ($0.id.lowercased().contains(wanted) || $0.label.lowercased().contains(wanted)) }) {
+            selectChoice(RelayModelChoice(model: match, mode: .chat))
+        } else if let fallback = pickerSections.chatModels.first {
+            selectChoice(fallback)
+        }
+        prompt = promptText
+        await sendCurrentPrompt()
+    }
+    #endif
 
     /// Cancel an in-flight chat stream. The SSE request aborts when the underlying task is
     /// cancelled (CodexClient tears down the URLSession data task on cancellation).
@@ -355,324 +419,51 @@ final class RelayChatViewModel: ObservableObject {
         isSending = false
     }
 
-    var selectedModel: CodexModelDescriptor? {
-        if let selectedModelID,
-           let model = models.first(where: { $0.id == selectedModelID }) {
-            return model
-        }
-        return preferredModel(for: mode)
-    }
-
-    var selectedWorkspace: CodexWorkspace? {
-        guard let selectedWorkspaceID else { return nil }
-        return workspaces.first { $0.id == selectedWorkspaceID }
-    }
-
-    var composeWorkspaceID: String {
-        selectedWorkspaceID
-            ?? workspaces.first(where: { $0.id == "poc-vault" })?.id
-            ?? workspaces.first?.id
-            ?? "poc-vault"
-    }
-
-    var modelGroups: [(provider: CodexProvider, models: [CodexModelDescriptor])] {
-        let grouped = Dictionary(grouping: models, by: \.provider)
-        return providerOrder(for: mode).compactMap { provider in
-            guard let entries = grouped[provider], !entries.isEmpty else { return nil }
-            return (provider, entries.sorted { $0.label < $1.label })
-        }
-    }
-
-    func modelSections(bucket: RelayModelPickerBucket, searchText: String) -> [RelayModelSection] {
-        RelayModelDiscovery.sections(from: models, mode: mode, bucket: bucket, searchText: searchText)
-    }
-
-    func bootstrap() async {
-        guard !isLoading else { return }
-        isLoading = true
-        defer { isLoading = false }
-        async let modelRequest = client.fetchModels()
-        async let workspaceRequest = client.fetchWorkspaces()
-        async let threadRequest = client.fetchThreads(provider: nil, workspaceID: nil, limit: 80)
-        async let jobRequest = client.fetchJobs(provider: nil, workspaceID: nil, limit: 20)
+    /// Register this folder as a workspace on first use (lazy `POST /workspaces/select`).
+    /// Returns the workspace id, or nil after setting an error banner — callers must keep
+    /// the typed prompt intact on nil.
+    private func ensureWorkspaceRegistered() async -> String? {
+        if let workspaceID { return workspaceID }
+        guard let workspacePath else { return nil }
         do {
-            models = try await modelRequest
-            workspaces = try await workspaceRequest
-            threads = Self.sortedThreads(try await threadRequest)
-            jobs = Self.sortedJobs(try await jobRequest)
-            ensureSelectedWorkspace()
-            ensureSelectedModelSupportsMode()
-            errorMessage = nil
+            let workspace = try await client.selectWorkspace(path: workspacePath)
+            workspaceID = workspace.id
+            registeredWorkspaceName = workspace.name
+            return workspace.id
         } catch {
-            errorMessage = error.localizedDescription
-        }
-        #if DEBUG
-        await runAutoDriveIfRequested()
-        #endif
-    }
-
-    #if DEBUG
-    /// Headless visual-test hook. When launched with RELAY_UITEST_MODEL / RELAY_UITEST_PROMPT,
-    /// the app selects that model and sends the prompt on its own so the streaming UI can be
-    /// screenshotted without simulator tap automation. Compiled out of release builds.
-    private func runAutoDriveIfRequested() async {
-        let env = ProcessInfo.processInfo.environment
-        // Task-tab auto-drive: submit a job so the live-polling job card can be screenshotted.
-        if lockedMode == .task, let taskPrompt = env["RELAY_UITEST_TASK_PROMPT"], !taskPrompt.isEmpty {
-            prompt = taskPrompt
-            await sendCurrentPrompt()
-            return
-        }
-        guard let promptText = env["RELAY_UITEST_PROMPT"], !promptText.isEmpty else { return }
-        // Chat-tab auto-drive; skip on the task-locked tab.
-        guard lockedMode != .task else { return }
-        if lockedMode == nil { mode = .chat }
-        if let wanted = env["RELAY_UITEST_MODEL"]?.lowercased(),
-           let match = models.first(where: { $0.supports(.chat) && ($0.id.lowercased().contains(wanted) || $0.label.lowercased().contains(wanted)) }) {
-            selectModel(match)
-        }
-        prompt = promptText
-        await sendCurrentPrompt()
-    }
-    #endif
-
-    func refreshThreads() async {
-        do {
-            threads = Self.sortedThreads(try await client.fetchThreads(provider: nil, workspaceID: nil, limit: 80))
-            jobs = Self.sortedJobs(try await client.fetchJobs(provider: nil, workspaceID: nil, limit: 20))
-            mergeUpdatedJobs()
-        } catch {
-            if !CodexConsoleViewModel.isCancellation(error) {
-                errorMessage = error.localizedDescription
-            }
+            errorMessage = "Couldn't register this folder as a workspace: \(error.localizedDescription)"
+            return nil
         }
     }
 
-    /// True while any job shown in this conversation is still running/queued.
-    var hasActiveConversationJob: Bool {
-        messages.contains { $0.job?.status.isActive == true }
-    }
-
-    /// Long-lived poll loop started by the Task view's `.task`. While the view is on
-    /// screen and a job is active, refresh job state every ~2s and pull the running
-    /// job's latest output so its card shows live progress instead of a frozen card.
-    /// Jobs are poll-only on the server (no log stream), so this is the update channel.
-    func monitorActiveJobs() async {
-        guard lockedMode == .task else { return }
-        while !Task.isCancelled {
-            if hasActiveConversationJob {
-                await refreshActiveJobDetails()
-                await refreshThreads()
-            }
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
-        }
-    }
-
-    /// Fetch full detail for each active job card so stdout/result grows live in the UI.
-    private func refreshActiveJobDetails() async {
-        let activeIDs = messages.compactMap { $0.job?.status.isActive == true ? $0.job?.id : nil }
-        for id in activeIDs {
-            if let updated = try? await client.fetchJob(id: id, includeFullLogs: false) {
-                replaceJob(updated)
-            }
-        }
-    }
-
-    func sendCurrentPrompt() async {
-        switch mode {
-        case .chat:
-            await sendChat()
-        case .task:
-            await runTask()
-        }
-    }
-
-    func selectModel(_ model: CodexModelDescriptor) {
-        if !model.supports(mode), let nextMode = model.modes.first {
-            mode = nextMode
-        }
-        selectedModelID = model.id
-        selectedEffort = nil  // fall back to the new model's default until the user picks
-    }
-
-    func selectWorkspace(_ workspace: CodexWorkspace) {
-        selectedWorkspaceID = workspace.id
-    }
-
-    // MARK: - Workspace browsing / creation
-
-    @Published private(set) var directoryListing: CodexWorkspaceDirectoryListing?
-    @Published private(set) var isBrowsingDirectories = false
-    @Published var workspaceActionError: String?
-
-    /// Load the child directories under `path` (nil = workspace root) for the browse UI.
-    func loadWorkspaceDirectories(path: String? = nil) async {
-        isBrowsingDirectories = true
-        defer { isBrowsingDirectories = false }
-        do {
-            directoryListing = try await client.fetchWorkspaceDirectories(path: path, query: nil)
-            workspaceActionError = nil
-        } catch {
-            workspaceActionError = error.localizedDescription
-        }
-    }
-
-    /// Register (or reuse) the directory at `path` as a workspace and select it.
-    func selectBrowsedDirectory(path: String) async {
-        do {
-            let workspace = try await client.selectWorkspace(path: path)
-            upsertWorkspace(workspace)
-            selectedWorkspaceID = workspace.id
-            workspaceActionError = nil
-        } catch {
-            workspaceActionError = error.localizedDescription
-        }
-    }
-
-    /// Create a new workspace named `name` under `parentPath`, then select it.
-    func createWorkspace(parentPath: String, name: String) async {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        do {
-            let workspace = try await client.createWorkspace(parentPath: parentPath, name: trimmed)
-            upsertWorkspace(workspace)
-            selectedWorkspaceID = workspace.id
-            await loadWorkspaceDirectories(path: parentPath)
-            workspaceActionError = nil
-        } catch {
-            workspaceActionError = error.localizedDescription
-        }
-    }
-
-    private func upsertWorkspace(_ workspace: CodexWorkspace) {
-        if let index = workspaces.firstIndex(where: { $0.id == workspace.id }) {
-            workspaces[index] = workspace
-        } else {
-            workspaces.append(workspace)
-        }
-    }
-
-    func startNewConversation() {
-        currentThreadID = nil
-        currentThreadProvider = nil
-        currentThreadWorkspaceID = nil
-        messages = []
-    }
-
-    /// Threads scoped to this tab's mode when locked (Chat tab hides Task threads, etc).
-    var visibleThreads: [CodexThread] {
-        guard let lockedMode else { return threads }
-        return threads.filter { $0.mode == lockedMode }
-    }
-
-    /// Visible threads grouped by workspace, ordered by most-recent activity, for the
-    /// thread drawer's "threads per folder" sections. Each group keeps its newest first.
-    var threadsByWorkspace: [(workspace: String, threads: [CodexThread])] {
-        let grouped = Dictionary(grouping: visibleThreads) { $0.workspaceLabel }
-        return grouped
-            .map { (workspace: $0.key, threads: Self.sortedThreads($0.value)) }
-            .sorted { lhs, rhs in
-                let l = lhs.threads.first?.updatedAt ?? .distantPast
-                let r = rhs.threads.first?.updatedAt ?? .distantPast
-                return l > r
-            }
-    }
-
-    func openThread(_ thread: CodexThread) async {
-        if let lockedMode, thread.mode != lockedMode { return }
-        do {
-            let detail = try await client.fetchThreadDetail(sessionID: thread.sessionId, provider: thread.provider)
-            currentThreadID = detail.thread.sessionId
-            currentThreadProvider = detail.thread.provider
-            currentThreadWorkspaceID = detail.thread.workspaceId
-            if lockedMode == nil {
-                mode = detail.thread.mode
-            }
-            selectedWorkspaceID = detail.thread.workspaceId ?? selectedWorkspaceID
-            if let threadModel = detail.thread.model,
-               let model = models.first(where: { $0.id == threadModel && $0.provider == detail.thread.provider && $0.supports(mode) }) {
-                selectedModelID = model.id
-            } else if let model = models.first(where: { $0.provider == detail.thread.provider && $0.supports(mode) }) {
-                selectedModelID = model.id
-            }
-            var items = detail.messages.map { message in
-                RelayConversationItem(
-                    role: message.role == .user ? .user : message.role == .assistant ? .assistant : .status,
-                    text: message.text,
-                    timestamp: message.timestamp ?? detail.thread.updatedAt ?? Date(),
-                    provider: detail.thread.provider,
-                    modelLabel: selectedModel?.label
-                )
-            }
-            for job in detail.jobs {
-                items.append(jobItem(job))
-            }
-            messages = items.sorted { $0.timestamp < $1.timestamp }
-            errorMessage = nil
-        } catch {
-            errorMessage = error.localizedDescription
-        }
-    }
-
-    func cancel(job: CodexJob) async {
-        cancellingJobIDs.insert(job.id)
-        defer { cancellingJobIDs.remove(job.id) }
-        do {
-            if let updated = try await client.cancelJob(id: job.id) {
-                replaceJob(updated)
-            }
-            await refreshThreads()
-        } catch {
-            errorMessage = error.localizedDescription
-        }
-    }
-
-    func loadFullLog(for job: CodexJob) async -> String {
-        do {
-            let full = try await client.fetchJob(id: job.id, includeFullLogs: true)
-            replaceJob(full)
-            return full.displayOutput ?? full.stdout ?? full.stderr ?? ""
-        } catch {
-            errorMessage = error.localizedDescription
-            return error.localizedDescription
-        }
-    }
-
-    func transcribePromptAudio(fileURL: URL) async {
-        isTranscribing = true
-        defer { isTranscribing = false }
-        do {
-            let transcription = try await client.transcribeAudio(fileURL: fileURL)
-            let text = transcription.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                prompt = text
-            } else if !text.isEmpty {
-                prompt += "\n\n\(text)"
-            }
-        } catch {
-            errorMessage = error.localizedDescription
-        }
-    }
-
-    private func sendChat() async {
-        guard let selectedModel else {
-            errorMessage = "No chat model is available."
-            return
-        }
-        guard selectedModel.supports(.chat) else {
-            errorMessage = "\(selectedModel.label) is not available for Chat."
+    private func sendChat(using choice: RelayModelChoice) async {
+        let model = choice.model
+        guard model.supports(.chat) else {
+            errorMessage = "\(model.label) is not available for Chat."
             return
         }
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !isSending else { return }
-        prompt = ""
         isSending = true
+
+        // Lazy workspace registration happens BEFORE the draft is cleared, so a failure
+        // surfaces as a composer banner while the typed prompt stays put.
+        var scopeWorkspaceID: String?
+        if workspaceID != nil || workspacePath != nil {
+            guard let registered = await ensureWorkspaceRegistered() else {
+                isSending = false
+                return
+            }
+            scopeWorkspaceID = registered
+        }
+
+        prompt = ""
         errorMessage = nil
 
-        let userItem = RelayConversationItem(role: .user, text: text, provider: selectedModel.provider, modelLabel: selectedModel.label)
+        let userItem = RelayConversationItem(role: .user, text: text, provider: model.provider, modelLabel: model.label)
         let assistantID = UUID().uuidString
         messages.append(userItem)
-        messages.append(RelayConversationItem(id: assistantID, role: .assistant, text: "", provider: selectedModel.provider, modelLabel: selectedModel.label, isStreaming: true))
+        messages.append(RelayConversationItem(id: assistantID, role: .assistant, text: "", provider: model.provider, modelLabel: model.label, isStreaming: true))
         streamingMessageID = assistantID
 
         let history = messages.compactMap { item -> CodexChatMessage? in
@@ -686,12 +477,19 @@ final class RelayChatViewModel: ObservableObject {
             }
         }
 
+        // Only continue the current thread when provider AND workspace scope match;
+        // the server rejects continuations under a conflicting workspaceId.
+        let resumeThreadID = (currentThreadProvider == model.provider && currentThreadWorkspaceID == scopeWorkspaceID)
+            ? currentThreadID
+            : nil
+
         let request = CodexChatRequest(
-            provider: selectedModel.provider.rawValue,
-            model: selectedModel.id,
-            threadId: currentThreadProvider == selectedModel.provider ? currentThreadID : nil,
+            provider: model.provider.rawValue,
+            model: model.id,
+            threadId: resumeThreadID,
             messages: history,
-            options: selectedModel.defaultOptions
+            options: model.defaultOptions,
+            workspaceId: scopeWorkspaceID
         )
 
         let startedAt = Date()
@@ -706,6 +504,7 @@ final class RelayChatViewModel: ObservableObject {
                     case .meta(let threadId, _, let provider):
                         self.currentThreadID = threadId
                         self.currentThreadProvider = CodexProvider(rawProvider: provider)
+                        self.currentThreadWorkspaceID = scopeWorkspaceID
                     case .delta(let delta):
                         receivedAssistantText = true
                         self.append(delta: delta, to: assistantID)
@@ -748,33 +547,37 @@ final class RelayChatViewModel: ObservableObject {
         isSending = false
     }
 
-    private func runTask() async {
-        guard let selectedModel else {
-            errorMessage = "No task model is available."
-            return
-        }
-        guard selectedModel.supports(.task) else {
-            errorMessage = "\(selectedModel.label) is not available for Task."
+    private func runTask(using choice: RelayModelChoice) async {
+        let model = choice.model
+        guard model.supports(.task) else {
+            errorMessage = "\(model.label) is not available for Task."
             return
         }
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !isSending else { return }
-        prompt = ""
         isSending = true
         defer { isSending = false }
 
-        let provider = taskProvider(for: selectedModel)
-        let workspaceID = composeWorkspaceID
+        // Lazy registration before touching the draft: a failure banners and keeps the prompt.
+        guard let workspaceID = await ensureWorkspaceRegistered() else {
+            if workspacePath == nil {
+                errorMessage = "Open a folder to run tasks — the root chat has no workspace."
+            }
+            return
+        }
+        prompt = ""
+
+        let provider = Self.taskProvider(for: model)
         // Only resume the existing session if it's the same provider AND same workspace,
         // otherwise the server rejects it ("session does not belong to workspace").
         let resumeID = (currentThreadProvider == provider && currentThreadWorkspaceID == workspaceID) ? currentThreadID : nil
-        messages.append(RelayConversationItem(role: .user, text: text, provider: provider, modelLabel: selectedModel.label))
+        messages.append(RelayConversationItem(role: .user, text: text, provider: provider, modelLabel: model.label))
         do {
             let created = try await client.createJob(CodexCreateJobRequest(
                 workspaceId: workspaceID,
                 prompt: text,
                 timeoutMs: 1_800_000,
-                model: taskModelParameter(for: selectedModel),
+                model: Self.taskModelParameter(for: model),
                 reasoningEffort: effectiveEffort?.rawValue,
                 provider: provider,
                 resumeSessionId: resumeID
@@ -789,12 +592,162 @@ final class RelayChatViewModel: ObservableObject {
             currentThreadProvider = provider
             currentThreadWorkspaceID = job.workspaceId ?? workspaceID
             messages.append(jobItem(job))
+            attachJobStream(to: job)
             await refreshThreads()
         } catch {
             errorMessage = error.localizedDescription
             messages.append(RelayConversationItem(role: .status, text: error.localizedDescription, provider: provider))
         }
     }
+
+    // MARK: - Live job stream (SSE with polling fallback)
+
+    /// Attach the job SSE stream and mirror stdout/stderr into the live tail shown by the
+    /// job card. On `done` the terminal job replaces the card. If the stream errors or
+    /// drops, the task clears itself and the 2 s monitor polling keeps the card moving.
+    private func attachJobStream(to job: CodexJob) {
+        let jobID = job.id
+        guard job.status.isActive, jobStreamTasks[jobID] == nil else { return }
+        let task = Task { [weak self] in
+            do {
+                guard let client = self?.client else { return }
+                for try await event in client.streamJobEvents(id: jobID) {
+                    guard let self, !Task.isCancelled else { break }
+                    switch event {
+                    case .status(let updated):
+                        self.replaceJob(updated)
+                    case .stdout(_, let chunk):
+                        self.appendLiveTail(jobID: jobID, chunk)
+                    case .stderr(_, let chunk):
+                        self.appendLiveTail(jobID: jobID, chunk)
+                    case .done(let finished):
+                        self.replaceJob(finished)
+                    }
+                }
+            } catch {
+                // Stream dropped (background, network, server restart): fall back to the
+                // store-driven 2 s polling via refreshActiveWorkIfNeeded().
+            }
+            self?.jobStreamTasks[jobID] = nil
+        }
+        jobStreamTasks[jobID] = task
+    }
+
+    private func appendLiveTail(jobID: String, _ chunk: String) {
+        guard !chunk.isEmpty else { return }
+        var tail = (liveJobTails[jobID] ?? "") + chunk
+        if tail.count > Self.liveTailCharacterCap {
+            tail = String(tail.suffix(Self.liveTailCharacterCap))
+        }
+        liveJobTails[jobID] = tail
+    }
+
+    // MARK: - Threads
+
+    func startNewConversation() {
+        currentThreadID = nil
+        currentThreadProvider = nil
+        currentThreadWorkspaceID = nil
+        messages = []
+    }
+
+    func openThread(_ thread: CodexThread) async {
+        do {
+            let detail = try await client.fetchThreadDetail(sessionID: thread.sessionId, provider: thread.provider)
+            currentThreadID = detail.thread.sessionId
+            currentThreadProvider = detail.thread.provider
+            currentThreadWorkspaceID = detail.thread.workspaceId
+            // Continuation keeps the thread's explicit mode in the selection.
+            let mode = detail.thread.mode
+            let threadModel = detail.thread.model
+            if let model = models.first(where: {
+                $0.provider == detail.thread.provider
+                    && $0.supports(mode)
+                    && (threadModel == nil || $0.id == threadModel || $0.taskModel == threadModel)
+            }) {
+                selectChoice(RelayModelChoice(model: model, mode: mode))
+            } else if let model = models.first(where: { $0.provider == detail.thread.provider && $0.supports(mode) }) {
+                selectChoice(RelayModelChoice(model: model, mode: mode))
+            }
+            var items = detail.messages.map { message in
+                RelayConversationItem(
+                    role: message.role == .user ? .user : message.role == .assistant ? .assistant : .status,
+                    text: message.text,
+                    timestamp: message.timestamp ?? detail.thread.updatedAt ?? Date(),
+                    provider: detail.thread.provider,
+                    modelLabel: selectedChoice?.model.label
+                )
+            }
+            for job in detail.jobs {
+                items.append(jobItem(job))
+                attachJobStream(to: job)
+            }
+            messages = items.sorted { $0.timestamp < $1.timestamp }
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func delete(_ thread: CodexThread) async {
+        do {
+            try await client.deleteThread(
+                sessionID: thread.sessionId,
+                workspaceID: thread.workspaceId,
+                provider: thread.provider
+            )
+            threads.removeAll { $0.sessionId == thread.sessionId }
+            if currentThreadID == thread.sessionId {
+                startNewConversation()
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    // MARK: - Jobs
+
+    func cancel(job: CodexJob) async {
+        cancellingJobIDs.insert(job.id)
+        defer { cancellingJobIDs.remove(job.id) }
+        do {
+            if let updated = try await client.cancelJob(id: job.id) {
+                replaceJob(updated)
+            }
+            await refreshThreads()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func loadFullLog(for job: CodexJob) async -> String {
+        do {
+            let full = try await client.fetchJob(id: job.id, includeFullLogs: true)
+            replaceJob(full)
+            return full.displayOutput ?? full.stdout ?? full.stderr ?? ""
+        } catch {
+            errorMessage = error.localizedDescription
+            return error.localizedDescription
+        }
+    }
+
+    func transcribePromptAudio(fileURL: URL) async {
+        isTranscribing = true
+        defer { isTranscribing = false }
+        do {
+            let transcription = try await client.transcribeAudio(fileURL: fileURL)
+            let text = transcription.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                prompt = text
+            } else if !text.isEmpty {
+                prompt += "\n\n\(text)"
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    // MARK: - Internals
 
     private func append(delta: String, to id: String) {
         guard let index = messages.firstIndex(where: { $0.id == id }) else { return }
@@ -819,6 +772,9 @@ final class RelayChatViewModel: ObservableObject {
     }
 
     private func replaceJob(_ job: CodexJob) {
+        if !job.status.isActive {
+            liveJobTails[job.id] = nil
+        }
         if let index = messages.firstIndex(where: { $0.job?.id == job.id }) {
             messages[index] = jobItem(job)
         }
@@ -837,58 +793,20 @@ final class RelayChatViewModel: ObservableObject {
         }
     }
 
-    private func ensureSelectedWorkspace() {
-        if selectedWorkspaceID == nil {
-            selectedWorkspaceID = workspaces.first(where: { $0.id == "poc-vault" })?.id ?? workspaces.first?.id
-        }
-    }
-
-    private func ensureSelectedModelSupportsMode() {
-        let selected = selectedModelID.flatMap { selectedModelID in
-            models.first { $0.id == selectedModelID }
-        }
-        if selected?.supports(mode) == true {
-            return
-        }
-
-        let nextModelID = preferredModel(for: mode)?.id
-        if selectedModelID != nextModelID {
-            selectedModelID = nextModelID
-        }
-    }
-
-    private func preferredModel(for mode: RelayInteractionMode) -> CodexModelDescriptor? {
-        if let recommended = RelayModelDiscovery.recommendedModels(from: models, mode: mode, limit: 1).first {
-            return recommended
-        }
-
-        for provider in providerOrder(for: mode) {
-            if let model = models.first(where: { $0.provider == provider && $0.supports(mode) }) {
-                return model
-            }
-        }
-        return models.first { $0.supports(mode) }
-    }
-
-    private func providerOrder(for mode: RelayInteractionMode) -> [CodexProvider] {
-        switch mode {
-        case .chat:
-            return [.azure, .bedrock, .codex, .claude]
-        case .task:
-            return [.codex, .claude, .bedrock, .azure]
-        }
-    }
-
-    private func taskProvider(for model: CodexModelDescriptor) -> CodexProvider {
+    /// Which task runner executes a model's jobs. Cursor keeps its own runner; Azure
+    /// descriptors fall back to the Codex runner (they are chat-first).
+    nonisolated static func taskProvider(for model: CodexModelDescriptor) -> CodexProvider {
         switch model.provider {
         case .claude, .bedrock:
             return .claude
+        case .cursor:
+            return .cursor
         case .codex, .azure:
             return .codex
         }
     }
 
-    private func taskModelParameter(for model: CodexModelDescriptor) -> String? {
+    nonisolated static func taskModelParameter(for model: CodexModelDescriptor) -> String? {
         // Prefer an explicit task model (e.g. "opus", "gpt-5-codex") from the catalog;
         // otherwise fall back to the chat id for dual-mode models, or the runner default.
         if let taskModel = model.taskModel, !taskModel.isEmpty { return taskModel }
