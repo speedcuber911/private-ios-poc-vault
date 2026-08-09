@@ -6,7 +6,9 @@ reviewer understand what has been built without reading every Swift, Node, and
 ops file first.
 
 For a chronological account of how the repo reached this shape, read
-[docs/PROJECT_HISTORY.md](PROJECT_HISTORY.md).
+[docs/PROJECT_HISTORY.md](PROJECT_HISTORY.md). For the in-flight files-first
+redesign that supersedes parts of these notes, read
+[docs/FILES_REDESIGN.md](FILES_REDESIGN.md).
 
 ## System Summary
 
@@ -74,11 +76,17 @@ server from `ios/launch-simulator.sh`.
 
 ## Agent Console UX
 
-> **Update:** the operator surface has since been reworked into a chat-first design
-> with separate **Chat** and **Task** bottom tabs, streaming replies, and a
-> reimagined workspace picker. See [CHAT_REDESIGN.md](CHAT_REDESIGN.md) for the full
-> description. The notes below describe the prior single-console thread model, which
-> still backs the Status tab.
+> **Update:** the operator surface has been reworked twice since these notes.
+> First into a chat-first design with separate **Chat** and **Task** bottom tabs,
+> streaming replies, and a reimagined workspace picker
+> ([CHAT_REDESIGN.md](CHAT_REDESIGN.md)). That tab layout is now itself being
+> superseded by a **files-first** redesign — a file-browser root with per-folder
+> conversations and explicit chat/task model choices — specified in
+> [FILES_REDESIGN.md](FILES_REDESIGN.md) (implementation in progress as of
+> 2026-08-09). Read FILES_REDESIGN.md for the target navigation and chat
+> surface, CHAT_REDESIGN.md for the catalog de-duplication and streaming-chat
+> details that carry forward, and the notes below for the prior single-console
+> thread model, which the redesign removes.
 
 The Relay agent console has moved from a job-list surface to a prompt-first,
 thread-oriented operator console:

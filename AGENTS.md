@@ -27,23 +27,26 @@ hosting, and EC2 runner are tightly coupled.
 - For Codex server/API work, switch to
   `/Users/pariksj/Desktop/poc-vault/codex-server`.
 
-## Non-Negotiable Bedrock Guardrail
+## Non-Negotiable Provider Auth Guardrail
 
-Claude access for Relay is allowed only through AWS Bedrock using the SigiQ AWS
-profile. Treat this as a hard security boundary, not a convenience default.
+Relay uses the user's direct Codex, Claude, and Cursor subscriptions from the
+isolated `codex-runner` home on `pariksj-dev`. Do not route Claude through
+Bedrock or an AWS profile by default.
 
-- Claude jobs must use `CLAUDE_AWS_PROFILE=sigiq`.
-- Do not let Claude inherit `AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, an EC2
-  instance role, or any personal/Relay/POC Vault AWS account credentials.
+- Keep `CLAUDE_AWS_PROFILE`, `AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, and
+  `CLAUDE_CODE_USE_BEDROCK` unset for the live direct-subscription runner.
+- Strip ambient AWS credentials and instance-role settings from Claude jobs.
 - Do not request, enable, approve, or troubleshoot Anthropic/Claude Bedrock
   model access in the personal/Relay/POC Vault AWS account.
-- Do not submit AWS Bedrock use-case forms, model-access requests, IAM changes,
-  marketplace subscriptions, or console changes for Claude unless the user
-  explicitly confirms the exact AWS account/profile first.
-- Personal AWS may still be used for Relay infrastructure and static POC
-  deployment. That does not make it valid for Claude/Bedrock model access.
-- If Claude/Bedrock fails and the active profile/account is not clearly SigiQ,
-  stop and report the profile mismatch instead of trying to enable models.
+- Bedrock may be restored only after the user explicitly chooses it and
+  confirms the exact AWS account/profile. The compatibility guard permits only
+  `CLAUDE_AWS_PROFILE=sigiq`, but that profile is not part of the current live
+  arrangement.
+- Codex, Claude, and Cursor auth state must stay under the isolated runner home;
+  do not copy it into a workspace or the repository.
+- Azure OpenAI-compatible profiles use direct bearer-key files outside the repo.
+  Keep them server-side with narrow permissions and never put key material in
+  the public model catalog, iOS config, source, logs, or chat.
 
 ## Product Branding
 
