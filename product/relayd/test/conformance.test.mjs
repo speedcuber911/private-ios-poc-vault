@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import http from "node:http";
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -4993,3 +4994,152 @@ localTest("pipes text/event-stream responses through the dev proxy instead of bu
     await new Promise((resolve) => upstream.close(resolve));
   }
 });
+
+// Parses a tar stream's ustar headers and returns every entry name found.
+// Only the fixed-size header fields this suite needs are read: the name at
+// bytes 0-99 (NUL-terminated) and the octal size at bytes 124-135. Content
+// blocks are skipped by rounding the entry size up to the next 512-byte
+// boundary, exactly like a real tar reader walking the archive.
+function tarEntryNames(buffer) {
+  const names = [];
+  let offset = 0;
+  while (offset + 512 <= buffer.length) {
+    const header = buffer.subarray(offset, offset + 512);
+    if (header.every((byte) => byte === 0)) break; // end-of-archive marker
+    const name = header.subarray(0, 100).toString("utf8").replace(/\0.*$/s, "");
+    const sizeField = header.subarray(124, 136).toString("utf8").replace(/\0.*$/s, "").trim();
+    const size = sizeField ? parseInt(sizeField, 8) || 0 : 0;
+    if (name) names.push(name);
+    const contentBlocks = Math.ceil(size / 512);
+    offset += 512 + contentBlocks * 512;
+  }
+  return names;
+}
+
+localTest(
+  "GET /v1/export.tar streams a tar of the jail and excludes denylisted files",
+  "needs local workspace fixtures seeded on disk to build the tar export",
+  async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+    const browseRoot = path.join(tmpDir, "workspaces");
+    const welcomeDir = path.join(browseRoot, "welcome");
+    await fs.mkdir(welcomeDir, { recursive: true });
+    await fs.writeFile(path.join(welcomeDir, "hello.txt"), "hello\n");
+    await fs.writeFile(path.join(welcomeDir, ".env"), "SECRET=1\n");
+
+    const server = await startServer({
+      CODEX_REQUIRE_MTLS: "false",
+      CODEX_DATA_DIR: path.join(tmpDir, "data"),
+      CODEX_WORKSPACE_BROWSE_ROOT: browseRoot,
+      CODEX_WORKSPACES: JSON.stringify([{ id: "welcome", name: "Welcome", path: welcomeDir }]),
+      CODEX_BIN: await makeFakeCodex(tmpDir),
+    });
+    try {
+      const res = await fetch(`${server.baseUrl}/v1/export.tar`);
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get("content-type"), "application/x-tar");
+      assert.equal(res.headers.get("cache-control"), "no-store");
+      assert.match(res.headers.get("content-disposition") || "", /^attachment; filename="relay-workspaces\.tar"$/);
+
+      const buffer = Buffer.from(await res.arrayBuffer());
+      const listing = tarEntryNames(buffer);
+      assert.ok(listing.some((n) => n.endsWith("welcome/hello.txt")));
+      assert.ok(!listing.some((n) => n.endsWith(".env")));
+    } finally {
+      await server.stop();
+    }
+  },
+);
+
+localTest(
+  "GET /v1/export.tar refuses with 413 export_too_large when the jail exceeds the export cap",
+  "needs a local sparse fixture file to exercise the 512 MiB export cap",
+  async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+    const browseRoot = path.join(tmpDir, "workspaces");
+    const welcomeDir = path.join(browseRoot, "welcome");
+    await fs.mkdir(welcomeDir, { recursive: true });
+
+    // A sparse file reports its full logical size via stat() without
+    // consuming real disk, so the 512 MiB cap can be exercised cheaply.
+    const oversizedPath = path.join(welcomeDir, "oversized.bin");
+    const handle = await fs.open(oversizedPath, "w");
+    try {
+      await handle.truncate(512 * 1024 * 1024 + 1);
+    } finally {
+      await handle.close();
+    }
+
+    const server = await startServer({
+      CODEX_REQUIRE_MTLS: "false",
+      CODEX_DATA_DIR: path.join(tmpDir, "data"),
+      CODEX_WORKSPACE_BROWSE_ROOT: browseRoot,
+      CODEX_WORKSPACES: JSON.stringify([{ id: "welcome", name: "Welcome", path: welcomeDir }]),
+      CODEX_BIN: await makeFakeCodex(tmpDir),
+    });
+    try {
+      const res = await fetch(`${server.baseUrl}/v1/export.tar`);
+      assert.equal(res.status, 413);
+      assert.deepEqual(await res.json(), { error: "export_too_large" });
+    } finally {
+      await server.stop();
+    }
+  },
+);
+
+localTest(
+  "GET /v1/export.tar is not fooled by a filename containing a `-C` directory-change directive",
+  "needs local workspace fixtures seeded on disk, including a filename with embedded newlines, to reproduce the tar -T escape",
+  async () => {
+    // Both bsdtar and GNU tar treat a bare `-C` line inside a `-T -` file
+    // list as "change directory to the path on the next line". Since only
+    // `/` is illegal in a POSIX filename, a workspace file whose *name*
+    // contains embedded newlines can inject a `-C\n..\n<target>` directive
+    // and walk tar outside workspaceBrowseRoot. This reproduces that escape
+    // with a decoy file one directory above the jail root and asserts the
+    // export never surfaces it.
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+    const browseRoot = path.join(tmpDir, "workspaces");
+    const welcomeDir = path.join(browseRoot, "welcome");
+    await fs.mkdir(welcomeDir, { recursive: true });
+    await fs.writeFile(path.join(welcomeDir, "hello.txt"), "hello\n");
+
+    // The decoy lives one directory ABOVE the jail root (tmpDir is the
+    // parent of browseRoot) — never listed, never inside the browse root.
+    const marker = "RELAYD_TAR_ESCAPE_MARKER_9f3a1c2b";
+    const decoyName = "secret-marker.txt";
+    await fs.writeFile(path.join(tmpDir, decoyName), `${marker}\n`);
+
+    // The crafted filename: "escape" is a harmless first line, `-C` is the
+    // directive, `..` is the directory to change into (relative to
+    // workspaceBrowseRoot, i.e. up to tmpDir), and the final line is the
+    // decoy's bare name. Created with fs.writeFileSync (not a shell) since
+    // only Node's fs API — not a POSIX shell argv — can pass a raw filename
+    // containing newlines through untouched.
+    const craftedName = `escape\n-C\n..\n${decoyName}`;
+    fsSync.writeFileSync(path.join(welcomeDir, craftedName), "decoy jail file\n");
+
+    const server = await startServer({
+      CODEX_REQUIRE_MTLS: "false",
+      CODEX_DATA_DIR: path.join(tmpDir, "data"),
+      CODEX_WORKSPACE_BROWSE_ROOT: browseRoot,
+      CODEX_WORKSPACES: JSON.stringify([{ id: "welcome", name: "Welcome", path: welcomeDir }]),
+      CODEX_BIN: await makeFakeCodex(tmpDir),
+    });
+    try {
+      const res = await fetch(`${server.baseUrl}/v1/export.tar`);
+      assert.equal(res.status, 200);
+
+      const buffer = Buffer.from(await res.arrayBuffer());
+      assert.ok(!buffer.includes(marker), "marker from outside the jail must never appear in the export");
+
+      const listing = tarEntryNames(buffer);
+      assert.ok(
+        !listing.includes(decoyName),
+        `archive must not contain a top-level entry for the out-of-jail file (got: ${JSON.stringify(listing)})`,
+      );
+    } finally {
+      await server.stop();
+    }
+  },
+);

@@ -154,6 +154,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       db.prepare("DELETE FROM entitlements WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM devices WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM nodes WHERE account_id = ?").run(accountId);
+      db.prepare("DELETE FROM trial_nodes WHERE account_id = ?").run(accountId);
       if (account.email) {
         db.prepare("DELETE FROM magic_links WHERE email = ?").run(account.email);
       }
@@ -341,8 +342,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
   }
 
   // ── nodes ───────────────────────────────────────────────────────────────
-  function createNode(accountId, { kind, name, pubkey, version }) {
-    const id = randomUUID();
+  function createNode(accountId, { id = randomUUID(), kind, name, pubkey, version }) {
     db.prepare(
       `INSERT INTO nodes (id, account_id, kind, name, pubkey, version, last_seen, created_at)
        VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`,
@@ -398,6 +398,71 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       .prepare("SELECT * FROM nodes ORDER BY created_at")
       .all()
       .map(mapNode);
+  }
+
+  // ── trial nodes ─────────────────────────────────────────────────────────
+  const TRIAL_PATCH_COLUMNS = {
+    state: "state",
+    nodeId: "node_id",
+    sandboxId: "sandbox_id",
+    enrollTokenHash: "enroll_token_hash",
+    expiresAt: "expires_at",
+  };
+
+  function createTrialNode({ accountId, enrollTokenHash, expiresAt }) {
+    const id = randomUUID();
+    db.prepare(
+      "INSERT INTO trial_nodes (id, account_id, node_id, sandbox_id, enroll_token_hash, state, created_at, expires_at, updated_at) VALUES (?, ?, NULL, NULL, ?, 'creating', ?, ?, ?)",
+    ).run(id, accountId, enrollTokenHash, now(), expiresAt, now());
+    return getTrialById(id);
+  }
+
+  function getTrialById(id) {
+    return mapTrial(db.prepare("SELECT * FROM trial_nodes WHERE id = ?").get(id));
+  }
+
+  function getTrialByAccount(accountId) {
+    return mapTrial(db.prepare("SELECT * FROM trial_nodes WHERE account_id = ?").get(accountId));
+  }
+
+  function getTrialByTokenHash(hash) {
+    if (!hash) return null;
+    return mapTrial(db.prepare("SELECT * FROM trial_nodes WHERE enroll_token_hash = ?").get(hash));
+  }
+
+  function updateTrial(id, patch) {
+    const sets = [];
+    const values = [];
+    for (const [key, column] of Object.entries(TRIAL_PATCH_COLUMNS)) {
+      if (patch[key] !== undefined) {
+        sets.push(`${column} = ?`);
+        values.push(patch[key]);
+      }
+    }
+    if (sets.length > 0) {
+      sets.push("updated_at = ?");
+      values.push(now(), id);
+      db.prepare(`UPDATE trial_nodes SET ${sets.join(", ")} WHERE id = ?`).run(...values);
+    }
+    return getTrialById(id);
+  }
+
+  function listTrialsDue(nowMs) {
+    return db
+      .prepare("SELECT * FROM trial_nodes WHERE state IN ('creating','ready') AND expires_at <= ? ORDER BY expires_at")
+      .all(nowMs)
+      .map(mapTrial);
+  }
+
+  function listTrialsPastGrace(nowMs, graceMs) {
+    return db
+      .prepare("SELECT * FROM trial_nodes WHERE state = 'expired' AND expires_at + ? <= ? ORDER BY expires_at")
+      .all(graceMs, nowMs)
+      .map(mapTrial);
+  }
+
+  function countActiveTrials() {
+    return Number(db.prepare("SELECT COUNT(*) AS c FROM trial_nodes WHERE state IN ('creating','ready')").get().c);
   }
 
   // ── waitlist ────────────────────────────────────────────────────────────
@@ -703,6 +768,14 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     deleteNode,
     touchNode,
     adminListNodes,
+    createTrialNode,
+    getTrialById,
+    getTrialByAccount,
+    getTrialByTokenHash,
+    updateTrial,
+    listTrialsDue,
+    listTrialsPastGrace,
+    countActiveTrials,
     addToWaitlist,
     insertRefreshToken,
     findRefreshToken,
@@ -769,5 +842,20 @@ function mapNode(row) {
     version: row.version,
     lastSeen: row.last_seen == null ? null : Number(row.last_seen),
     createdAt: Number(row.created_at),
+  };
+}
+
+function mapTrial(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    accountId: row.account_id,
+    nodeId: row.node_id,
+    sandboxId: row.sandbox_id,
+    enrollTokenHash: row.enroll_token_hash,
+    state: row.state,
+    createdAt: Number(row.created_at),
+    expiresAt: Number(row.expires_at),
+    updatedAt: Number(row.updated_at),
   };
 }

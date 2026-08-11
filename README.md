@@ -449,6 +449,14 @@ sigiq
 For server-specific deployment and verification details, read
 [relay-server/README.md](relay-server/README.md).
 
+For the live Relay account/control-plane deployment on the shared POC EC2,
+including Route 53/nginx, SQLite backups, AWS-native CI/CD, verification, and
+rollback, read
+[docs/RELAY_POC_EC2_DEPLOYMENT.md](docs/RELAY_POC_EC2_DEPLOYMENT.md).
+The implementation timeline, exact resource inventory, failure notes, and
+next-agent continuation checklist are in
+[docs/RELAY_POC_EC2_AGENT_HANDOFF.md](docs/RELAY_POC_EC2_AGENT_HANDOFF.md).
+
 For a complete implementation walkthrough across Relay, the POC host, agent
 console, transcription flow, security model, and verification commands,
 read [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md).

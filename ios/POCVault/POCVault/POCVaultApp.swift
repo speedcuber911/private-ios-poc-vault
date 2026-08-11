@@ -7,8 +7,10 @@ struct POCVaultApp: App {
     @StateObject private var chatSessionStore: RelayChatSessionStore
     @StateObject private var statusFeedViewModel: StatusFeedViewModel
     @StateObject private var accountStore: RelayAccountStore
+    @StateObject private var nodeStore = RelayNodeStore()
     private let manifestClient: ManifestClient
     private let codexClient: CodexClient
+    private let trialClient: RelayTrialClient
 
     init() {
         let identityStore = ClientIdentityStore()
@@ -58,8 +60,9 @@ struct POCVaultApp: App {
                         accountStore: accountStore,
                         identityStore: identityStore,
                         manifestClient: manifestClient,
-                        codexClient: codexClient
+                        codexClient: CodexClient(baseURL: nodeStore.effectiveBaseURL, identityStore: identityStore)
                     )
+                    .id(nodeStore.effectiveBaseURL)
                 }
             }
             .task {

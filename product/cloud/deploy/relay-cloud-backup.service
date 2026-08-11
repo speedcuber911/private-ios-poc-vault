@@ -1,0 +1,24 @@
+[Unit]
+Description=Back up the Relay control-plane SQLite database
+After=relay-cloud.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/var/lib/relay-cloud/relay-cloud.sqlite
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=/etc/relay-cloud/env
+ExecStart=/opt/relay-cloud/current/deploy/backup-sqlite.sh
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/backups/relay-cloud

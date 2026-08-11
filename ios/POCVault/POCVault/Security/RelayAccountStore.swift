@@ -140,6 +140,8 @@ final class RelayAccountStore: ObservableObject {
         errorMessage = nil
     }
 
+    var currentSessionToken: String? { sessionToken }
+
     private func runAuthentication(
         operation: () async throws -> (RelayAccountUser, String)
     ) async {

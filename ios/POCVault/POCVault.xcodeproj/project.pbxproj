@@ -43,6 +43,11 @@
 		200000000000000000000037 /* AccountSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000040 /* AccountSettingsView.swift */; };
 		200000000000000000000038 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000042 /* PrivacyInfo.xcprivacy */; };
 		200000000000000000000039 /* AccountTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000043 /* AccountTests.swift */; };
+		200000000000000000000040 /* RelayTrialNode.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000044 /* RelayTrialNode.swift */; };
+		200000000000000000000041 /* RelayTrialPairing.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000045 /* RelayTrialPairing.swift */; };
+		200000000000000000000042 /* TrialPairingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000046 /* TrialPairingTests.swift */; };
+		200000000000000000000043 /* RelayTrialClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000047 /* RelayTrialClient.swift */; };
+		200000000000000000000044 /* RelayNodeStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000048 /* RelayNodeStore.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -96,6 +101,11 @@
 		100000000000000000000041 /* POCVault.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = POCVault.entitlements; sourceTree = "<group>"; };
 		100000000000000000000042 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		100000000000000000000043 /* AccountTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountTests.swift; sourceTree = "<group>"; };
+		100000000000000000000044 /* RelayTrialNode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayTrialNode.swift; sourceTree = "<group>"; };
+		100000000000000000000045 /* RelayTrialPairing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayTrialPairing.swift; sourceTree = "<group>"; };
+		100000000000000000000046 /* TrialPairingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrialPairingTests.swift; sourceTree = "<group>"; };
+		100000000000000000000047 /* RelayTrialClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayTrialClient.swift; sourceTree = "<group>"; };
+		100000000000000000000048 /* RelayNodeStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayNodeStore.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -156,6 +166,7 @@
 			children = (
 				100000000000000000000003 /* ManifestTests.swift */,
 				100000000000000000000043 /* AccountTests.swift */,
+				100000000000000000000046 /* TrialPairingTests.swift */,
 			);
 			path = POCVaultTests;
 			sourceTree = "<group>";
@@ -176,6 +187,8 @@
 				100000000000000000000008 /* POCManifest.swift */,
 				100000000000000000000018 /* CodexModels.swift */,
 				100000000000000000000035 /* RelayAccount.swift */,
+				100000000000000000000044 /* RelayTrialNode.swift */,
+				100000000000000000000048 /* RelayNodeStore.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -185,6 +198,7 @@
 			children = (
 				100000000000000000000009 /* ClientIdentityStore.swift */,
 				100000000000000000000037 /* RelayAccountStore.swift */,
+				100000000000000000000045 /* RelayTrialPairing.swift */,
 			);
 			path = Security;
 			sourceTree = "<group>";
@@ -195,6 +209,7 @@
 				100000000000000000000010 /* ManifestClient.swift */,
 				100000000000000000000019 /* CodexClient.swift */,
 				100000000000000000000036 /* RelayAuthClient.swift */,
+				100000000000000000000047 /* RelayTrialClient.swift */,
 			);
 			path = Networking;
 			sourceTree = "<group>";
@@ -395,6 +410,10 @@
 				200000000000000000000035 /* AuthenticationView.swift in Sources */,
 				200000000000000000000036 /* RelayOnboardingView.swift in Sources */,
 				200000000000000000000037 /* AccountSettingsView.swift in Sources */,
+				200000000000000000000040 /* RelayTrialNode.swift in Sources */,
+				200000000000000000000041 /* RelayTrialPairing.swift in Sources */,
+				200000000000000000000043 /* RelayTrialClient.swift in Sources */,
+				200000000000000000000044 /* RelayNodeStore.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -404,6 +423,7 @@
 			files = (
 				200000000000000000000002 /* ManifestTests.swift in Sources */,
 				200000000000000000000039 /* AccountTests.swift in Sources */,
+				200000000000000000000042 /* TrialPairingTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

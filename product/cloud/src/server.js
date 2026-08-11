@@ -15,7 +15,7 @@
 // authenticates relayed blobs — see pairing.js for the full rationale.
 
 import { createServer } from "node:http";
-import { timingSafeEqual } from "node:crypto";
+import { timingSafeEqual, randomBytes, createHash } from "node:crypto";
 import { createDb } from "./db.js";
 import { createRegistry } from "./registry.js";
 import { createAuth, createAppleJwksFetcher } from "./auth.js";
@@ -23,6 +23,7 @@ import { createRelayBetterAuth } from "./better-auth.js";
 import { createPairing } from "./pairing.js";
 import { createNotify, parseNodePubkey } from "./notify.js";
 import { createApnsClient, createNoopTransport } from "./apns.js";
+import { createProvisioner } from "./provisioner.js";
 
 const NODE_KINDS = new Set(["byo", "managed"]);
 
@@ -33,6 +34,7 @@ export function createApp({
   mailTransport = { send: async () => {} },
   apnsTransport = createNoopTransport(),
   now = () => Date.now(),
+  provisioner = createProvisioner(config),
 } = {}) {
   const registry = createRegistry(db, { now });
   const legacyAuth = createAuth({ registry, config, jwksFetcher, mailTransport, now });
@@ -50,9 +52,27 @@ export function createApp({
   const apns = createApnsClient({ config, transport: apnsTransport, now });
   const notify = createNotify({ registry, apns, config, now });
 
+  async function sweepTrials() {
+    if (!provisioner) return;
+    for (const trial of registry.listTrialsDue(now())) {
+      if (trial.sandboxId) {
+        try { await provisioner.pauseSandbox(trial.sandboxId); } catch {}
+      }
+      registry.updateTrial(trial.id, { state: "expired", enrollTokenHash: null });
+    }
+    for (const trial of registry.listTrialsPastGrace(now(), config.trial.graceSec * 1000)) {
+      if (trial.sandboxId) {
+        try { await provisioner.killSandbox(trial.sandboxId); } catch {}
+      }
+      if (trial.nodeId) registry.deleteNode(trial.accountId, trial.nodeId);
+      registry.updateTrial(trial.id, { state: "destroyed" });
+    }
+  }
+
   function runSweeps() {
     pairing.sweep();
     notify.sweep();
+    sweepTrials().catch((err) => console.error(`trial sweep failed: ${err?.message}`));
   }
 
   const server = createServer((req, res) => {
@@ -209,6 +229,35 @@ export function createApp({
       });
     }
 
+    // ── trial enroll (single-use token from the sandbox bootstrap) ─────────
+    if (method === "POST" && path === "/v1/trial-nodes/enroll") {
+      const body = await readJson(req, config.jsonBodyMaxBytes);
+      const token = typeof body?.token === "string" ? body.token : "";
+      const trial = token ? registry.getTrialByTokenHash(sha256Hex(token)) : null;
+      if (!trial || trial.state !== "creating") {
+        return sendJson(res, 401, { error: "invalid_enroll_token" });
+      }
+      const nodeId = typeof body?.nodeId === "string" ? body.nodeId : "";
+      if (!/^node-[0-9a-f]{16}$/.test(nodeId)) {
+        return sendJson(res, 400, { error: "invalid_node_id" });
+      }
+      if (!parseNodePubkey(body?.pubkey)) {
+        return sendJson(res, 400, { error: "invalid_pubkey" });
+      }
+      if (registry.getNode(nodeId)) {
+        return sendJson(res, 409, { error: "node_exists" });
+      }
+      registry.createNode(trial.accountId, {
+        id: nodeId,
+        kind: "trial",
+        name: "Trial machine",
+        pubkey: String(body.pubkey),
+        version: strOrNull(body?.version),
+      });
+      registry.updateTrial(trial.id, { state: "ready", nodeId, enrollTokenHash: null });
+      return sendJson(res, 200, { ok: true, sni: config.tunnel.suffix ? `${nodeId}${config.tunnel.suffix}` : nodeId });
+    }
+
     // ── admin (ops-authed) ──────────────────────────────────────────────
     if (method === "GET" && path === "/v1/admin/nodes") {
       if (!bearerMatches(req, config.adminToken)) {
@@ -327,10 +376,85 @@ export function createApp({
       }
     }
 
+    if (path === "/v1/trial-nodes" && method === "POST") {
+      if (!provisioner) return sendJson(res, 404, { error: "trial_unavailable" });
+      const body = await readJson(req, config.jsonBodyMaxBytes);
+      const pairingId = typeof body?.pairingId === "string" ? body.pairingId : "";
+      const pairingSecret = typeof body?.pairingSecret === "string" ? body.pairingSecret : "";
+      if (!/^[0-9a-f-]{36}$/.test(pairingId) || !/^[A-Za-z0-9_-]{22,128}$/.test(pairingSecret)) {
+        return sendJson(res, 400, { error: "pairing_required" });
+      }
+      // One trial per account is abuse control over actual provisioned
+      // machines: a provision that never produced a machine (state
+      // "failed") must not permanently burn the account's only trial, so
+      // only that state is retryable — every other state is legitimately
+      // spent and still 409s.
+      const existingTrial = registry.getTrialByAccount(account.id);
+      if (existingTrial && existingTrial.state !== "failed") {
+        return sendJson(res, 409, { error: "trial_already_used" });
+      }
+      if (registry.countActiveTrials() >= config.trial.maxActive) {
+        return sendJson(res, 503, { error: "trial_capacity" });
+      }
+      const enrollToken = randomBytes(32).toString("base64url");
+      const expiresAt = now() + config.trial.ttlSec * 1000;
+      // trial_nodes.account_id is UNIQUE, so a retry reuses the failed row
+      // in place rather than inserting a second one.
+      const trial = existingTrial
+        ? registry.updateTrial(existingTrial.id, {
+            state: "creating",
+            nodeId: null,
+            sandboxId: null,
+            enrollTokenHash: sha256Hex(enrollToken),
+            expiresAt,
+          })
+        : registry.createTrialNode({
+            accountId: account.id,
+            enrollTokenHash: sha256Hex(enrollToken),
+            expiresAt,
+          });
+      try {
+        const { sandboxId } = await provisioner.createSandbox({
+          envVars: {
+            RELAYD_ENROLL_URL: config.enrollBaseUrl || `http://${config.host}:${config.port}`,
+            RELAYD_ENROLL_TOKEN: enrollToken,
+            RELAYD_ENROLL_PAIRING_ID: pairingId,
+            RELAYD_ENROLL_PAIRING_SECRET: pairingSecret,
+            RELAYD_TUNNEL_HOST: config.tunnel.host,
+            RELAYD_TUNNEL_PORT: String(config.tunnel.port),
+            RELAYD_TUNNEL_SUFFIX: config.tunnel.suffix,
+          },
+          metadata: { trialId: trial.id },
+        });
+        registry.updateTrial(trial.id, { sandboxId });
+      } catch {
+        registry.updateTrial(trial.id, { state: "failed", enrollTokenHash: null });
+        return sendJson(res, 502, { error: "provision_failed" });
+      }
+      return sendJson(res, 201, { trial: publicTrial(registry.getTrialById(trial.id), config) });
+    }
+
+    if (path === "/v1/trial-nodes/current" && method === "GET") {
+      const trial = registry.getTrialByAccount(account.id);
+      if (!trial) return sendJson(res, 404, { error: "no_trial" });
+      return sendJson(res, 200, { trial: publicTrial(trial, config) });
+    }
+
+    if (path === "/v1/trial-nodes/current" && method === "DELETE") {
+      const trial = registry.getTrialByAccount(account.id);
+      if (!trial) return sendJson(res, 404, { error: "no_trial" });
+      if (trial.sandboxId && provisioner) {
+        try { await provisioner.killSandbox(trial.sandboxId); } catch {}
+      }
+      if (trial.nodeId) registry.deleteNode(account.id, trial.nodeId);
+      registry.updateTrial(trial.id, { state: "destroyed", enrollTokenHash: null });
+      return sendJson(res, 204, null);
+    }
+
     return sendJson(res, 404, { error: "not_found" });
   }
 
-  return { server, registry, auth, pairing, notify, runSweeps, db, config };
+  return { server, registry, auth, pairing, notify, runSweeps, sweepTrials, db, config, provisioner };
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
@@ -413,4 +537,19 @@ function bearerMatches(req, expectedToken) {
 
 function strOrNull(v) {
   return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+function publicTrial(trial, config) {
+  return {
+    id: trial.id,
+    state: trial.state,
+    nodeId: trial.nodeId,
+    sni: trial.nodeId && config.tunnel.suffix ? `${trial.nodeId}${config.tunnel.suffix}` : null,
+    createdAt: trial.createdAt,
+    expiresAt: trial.expiresAt,
+  };
+}
+
+function sha256Hex(value) {
+  return createHash("sha256").update(String(value)).digest("hex");
 }

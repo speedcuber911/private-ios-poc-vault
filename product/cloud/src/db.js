@@ -101,6 +101,19 @@ CREATE TABLE IF NOT EXISTS node_events (
   created_at  INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS trial_nodes (
+  id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL UNIQUE,
+  node_id TEXT,
+  sandbox_id TEXT,
+  enroll_token_hash TEXT,
+  state TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trial_state_expires ON trial_nodes (state, expires_at);
+
 CREATE INDEX IF NOT EXISTS idx_devices_account ON devices (account_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_account ON nodes (account_id);
 CREATE INDEX IF NOT EXISTS idx_node_events_created ON node_events (created_at);

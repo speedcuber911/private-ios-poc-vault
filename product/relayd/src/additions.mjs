@@ -9,11 +9,17 @@ import { sendJson, sendError, readBody, clampLimit, isSafeJobId } from "./util.m
 import { streamNodeEvents, emitEvent } from "./events.mjs";
 import { listDevices, revokeDevice, publicDevice } from "./identity.mjs";
 import { listHarnesses, getOp, listOps, publicOp, startLoginOp, startSmokeOp } from "./harness.mjs";
+import { serveExportTar } from "./fsapi.mjs";
 
 // Returns true when the request was handled.
 async function handleAdditionRoutes(req, res, url, auth) {
   if (req.method === "GET" && url.pathname === "/v1/events") {
     streamNodeEvents(req, res, url);
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/v1/export.tar") {
+    serveExportTar(req, res);
     return true;
   }
 

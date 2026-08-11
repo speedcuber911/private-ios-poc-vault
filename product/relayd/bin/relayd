@@ -2,6 +2,7 @@
 // relayd CLI — W2-MODULES. Subcommands:
 //   run [--mode <mode>]       start the node daemon (direct|tunneled|both)
 //   pair                      print a single-use pairing code + URLs
+//   enroll                    enroll with the control plane (env-driven)
 //   doctor                    config / jail / identity / provider checks
 //   status                    query the running daemon's /healthz
 //   devices list              list enrolled devices
@@ -90,6 +91,37 @@ async function cmdPair() {
   console.log("");
   console.log("The session is persisted, so the running daemon redeems it — you do");
   console.log("not need to keep this command open.");
+}
+
+// Non-interactive bootstrap for cloud-provisioned (trial) nodes: registers
+// the node identity with the control plane using a single-use enroll token,
+// then optionally runs trial device pairing if a pairing id/secret pair was
+// handed to us too. Everything sensitive (RELAYD_ENROLL_TOKEN,
+// RELAYD_ENROLL_PAIRING_SECRET) arrives via env, never argv, and is never
+// printed — only the resulting node id / sni / device id are logged.
+async function cmdEnroll() {
+  const cloudUrl = (process.env.RELAYD_ENROLL_URL || "").trim();
+  const token = (process.env.RELAYD_ENROLL_TOKEN || "").trim();
+  const pairingId = (process.env.RELAYD_ENROLL_PAIRING_ID || "").trim();
+  const pairingSecret = (process.env.RELAYD_ENROLL_PAIRING_SECRET || "").trim();
+  if (!cloudUrl || !token) {
+    fail("enroll requires RELAYD_ENROLL_URL and RELAYD_ENROLL_TOKEN");
+  }
+  if (Boolean(pairingId) !== Boolean(pairingSecret)) {
+    fail("RELAYD_ENROLL_PAIRING_ID and RELAYD_ENROLL_PAIRING_SECRET must be set together");
+  }
+  try {
+    const { enrollWithCloud } = await import("../src/enroll.mjs");
+    const { nodeId, sni } = await enrollWithCloud({ cloudUrl, token, version: "0.1.0" });
+    console.log(`enrolled ${nodeId} sni=${sni}`);
+    if (pairingId) {
+      const { runTrialPairing } = await import("../src/trialpair.mjs");
+      const { deviceId } = await runTrialPairing({ cloudUrl, pairingId, secret: pairingSecret });
+      console.log(`trial device paired: ${deviceId}`);
+    }
+  } catch (error) {
+    fail(error.message);
+  }
 }
 
 async function cmdDoctor() {
@@ -298,6 +330,7 @@ const usage = `usage: relayd <command>
                                start the node daemon (default: direct, or
                                RELAYD_LISTEN_MODE)
   pair                         print a pairing code + link (single use, 15 min)
+  enroll                       enroll with the control plane (env: RELAYD_ENROLL_URL, RELAYD_ENROLL_TOKEN[, RELAYD_ENROLL_PAIRING_ID, RELAYD_ENROLL_PAIRING_SECRET])
   doctor                       run config/jail/identity/provider checks
   status                       query the running daemon
   devices list                 list enrolled devices
@@ -310,6 +343,9 @@ switch (command) {
     break;
   case "pair":
     await cmdPair();
+    break;
+  case "enroll":
+    await cmdEnroll();
     break;
   case "doctor":
     await cmdDoctor();
