@@ -6,9 +6,11 @@
 > with a harness-first model picker, file viewer, dead console removed; full
 > suite + simulator verification green). One addition beyond this spec: the
 > model picker groups Agents **by harness** (Codex / Claude Code / Cursor),
-> each revealing its own models, instead of a flat task-capable list. Live
-> deployment to the EC2 host (the operator's on-box rollout checklist) is the
-> remaining step; until then the physical-device install may lag this spec.
+> each revealing its own models, instead of a flat task-capable list. As of
+> 2026-08-11 the checked-in server matches the live EC2 install and its files
+> API is responding behind the existing mTLS perimeter. A physical-device app
+> build/install still requires the macOS/Xcode workflow and is tracked
+> separately from the server rollout.
 
 This is the successor to [CHAT_REDESIGN.md](CHAT_REDESIGN.md). It replaces the
 four-tab, chat-first navigation model with a **files-first** design: the app
@@ -318,6 +320,10 @@ Verification follows the repo's existing discipline:
 - `ops/serve-simulator-poc-vault` gains fixtures for file listings, file bytes
   (including a >1 MiB Range case), workspace-scoped threads, the Cursor model,
   and job-stream SSE **before** the matching iOS milestone.
+- Simulator manifest signing is self-contained: when the operator key is not
+  available, the fixture server creates a mode-`0600`, simulator-only seed under
+  ignored `build/simulator/`, and `ios/launch-simulator.sh` injects its public key
+  into the Debug build. `POC_VAULT_SIM_SIGNING_KEY` can override that key.
 - S1 tests cover traversal, symlink escape, denylist, dotfiles, pagination,
   HEAD, Range, 206/416, MIME/disposition, byte limits, and the unchanged
   legacy `workspace-dirs` response.
