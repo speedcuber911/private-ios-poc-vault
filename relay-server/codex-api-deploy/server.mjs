@@ -1485,9 +1485,10 @@ async function routeRequest(req, res) {
   const threadMatch = url.pathname.match(/^\/v1\/codex\/threads\/([^/]+)$/);
   if (threadMatch && req.method === "GET") {
     const sessionId = decodeURIComponent(threadMatch[1]);
+    const workspaceId = url.searchParams.get("workspaceId");
     const provider = cleanThreadProviderFilter(url.searchParams.get("provider"));
     if (!isSafeJobId(sessionId)) return sendError(res, 404, "thread not found");
-    const detail = await threadDetailResponse(sessionId, { provider });
+    const detail = await threadDetailResponse(sessionId, { workspaceId, provider });
     if (!detail) return sendError(res, 404, "thread not found");
     return sendJson(res, 200, detail);
   }
@@ -3526,7 +3527,8 @@ function resolveOptionalWorkspaceFilter(workspaceId) {
   return workspace;
 }
 
-async function threadDetailResponse(sessionId, { provider = null } = {}) {
+async function threadDetailResponse(sessionId, { workspaceId = null, provider = null } = {}) {
+  const selectedWorkspace = resolveOptionalWorkspaceFilter(workspaceId);
   const sessionsDir = path.join(codexHome, "sessions");
   const sessionFile = findSessionFile(sessionsDir, sessionId);
   let thread = null;
@@ -3536,7 +3538,11 @@ async function threadDetailResponse(sessionId, { provider = null } = {}) {
     const meta = readSessionMeta(sessionFile, sessionId);
     const workspace = meta ? workspaceForSessionCwd(meta.cwd) : null;
     const sessionProvider = meta ? normalizeJobProvider(meta.provider) : "codex";
-    if (workspace && (!provider || sessionProvider === provider)) {
+    if (
+      workspace &&
+      (!provider || sessionProvider === provider) &&
+      (!selectedWorkspace || workspace.id === selectedWorkspace.id)
+    ) {
       const stat = fs.statSync(sessionFile);
       thread = {
         id: meta.id,
@@ -3561,6 +3567,7 @@ async function threadDetailResponse(sessionId, { provider = null } = {}) {
     if (provider && jobProvider !== provider) continue;
     const workspace = workspaceForJob(job);
     if (!workspace) continue;
+    if (selectedWorkspace && workspace.id !== selectedWorkspace.id) continue;
 
     if (thread && thread.provider !== jobProvider) continue;
     if (!thread) {
@@ -3583,7 +3590,7 @@ async function threadDetailResponse(sessionId, { provider = null } = {}) {
   }
 
   if (!thread) {
-    return chatThreadDetailResponse(sessionId, { provider });
+    return chatThreadDetailResponse(sessionId, { provider, workspace: selectedWorkspace });
   }
 
   const sortedJobs = [...thread.jobs].sort((left, right) =>
@@ -3815,10 +3822,11 @@ function chatThreadSummary(thread) {
   };
 }
 
-function chatThreadDetailResponse(threadId, { provider = null } = {}) {
+function chatThreadDetailResponse(threadId, { provider = null, workspace = null } = {}) {
   const thread = readChatThread(threadId);
   if (!thread) return null;
   if (provider && thread.provider !== provider) return null;
+  if (workspace && (thread.workspaceId ?? null) !== workspace.id) return null;
   return {
     thread: chatThreadSummary(thread),
     messages: (Array.isArray(thread.messages) ? thread.messages : []).map((message) => ({

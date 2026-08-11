@@ -973,24 +973,25 @@ struct CodexThreadFeedItem: Hashable, Identifiable {
         let visibleThreads = threads.filter {
             !$0.isSmokeTest && matchesWorkspace($0.workspaceId, selectedWorkspaceID: workspaceID)
         }
-        let threadSessionIDs = Set(visibleThreads.map(\.sessionId))
-        let threadJobIDs = Set(visibleThreads.compactMap(\.lastJobId))
+        // De-duplicate against every loaded thread, including hidden smoke-test rows. A
+        // job with no discovered thread is still real history and must remain visible
+        // after it succeeds or is cancelled, not only while active/failed.
+        let threadSessionIDs = Set(threads.map(\.sessionId))
+        let threadJobIDs = Set(threads.compactMap(\.lastJobId))
         let threadItems = visibleThreads.map { CodexThreadFeedItem(source: .thread($0)) }
-        let pendingJobItems = jobs
+        let standaloneJobItems = jobs
             .filter { job in
                 guard matchesWorkspace(job.workspaceId, selectedWorkspaceID: workspaceID) else { return false }
                 if threadJobIDs.contains(job.id) { return false }
                 if let sessionID = job.threadSessionId,
-                   threadSessionIDs.contains(sessionID),
-                   !job.status.needsAttention {
+                   threadSessionIDs.contains(sessionID) {
                     return false
                 }
-                return job.status.isActive
-                    || job.status.needsAttention
+                return true
             }
             .map { CodexThreadFeedItem(source: .pendingJob($0)) }
 
-        return (pendingJobItems + threadItems).sorted {
+        return (standaloneJobItems + threadItems).sorted {
             ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast)
         }
     }

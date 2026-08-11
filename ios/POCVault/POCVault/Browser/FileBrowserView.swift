@@ -16,6 +16,7 @@ struct FileBrowserView: View {
     private let onOpenLibrary: (() -> Void)?
     private let onOpenStatus: (() -> Void)?
     private let onOpenDiagnostics: (() -> Void)?
+    private let onOpenAccount: (() -> Void)?
 
     @State private var showingCreateFolder = false
     @State private var newFolderName = ""
@@ -29,7 +30,8 @@ struct FileBrowserView: View {
         onOpenChat: @escaping (_ folderPath: String?, _ workspaceID: String?) -> Void,
         onOpenLibrary: (() -> Void)? = nil,
         onOpenStatus: (() -> Void)? = nil,
-        onOpenDiagnostics: (() -> Void)? = nil
+        onOpenDiagnostics: (() -> Void)? = nil,
+        onOpenAccount: (() -> Void)? = nil
     ) {
         _viewModel = StateObject(wrappedValue: FileBrowserViewModel(client: client, path: folderPath))
         self.isRoot = isRoot
@@ -39,6 +41,7 @@ struct FileBrowserView: View {
         self.onOpenLibrary = onOpenLibrary
         self.onOpenStatus = onOpenStatus
         self.onOpenDiagnostics = onOpenDiagnostics
+        self.onOpenAccount = onOpenAccount
     }
 
     var body: some View {
@@ -254,6 +257,13 @@ struct FileBrowserView: View {
                             onOpenDiagnostics()
                         } label: {
                             Label("Diagnostics", systemImage: "stethoscope")
+                        }
+                    }
+                    if let onOpenAccount {
+                        Button {
+                            onOpenAccount()
+                        } label: {
+                            Label("Account & Settings", systemImage: "person.crop.circle")
                         }
                     }
                 }

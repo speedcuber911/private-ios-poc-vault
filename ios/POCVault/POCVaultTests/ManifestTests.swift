@@ -982,7 +982,7 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(feed.first?.preview, "Sent the Slack DM.")
     }
 
-    func testCodexThreadFeedShowsActiveAndFailedJobsWaitingForSessionDiscovery() throws {
+    func testCodexThreadFeedKeepsEveryStandaloneInvocationInHistory() throws {
         let activeJob = try decodeCodexJob(
             """
             {
@@ -1008,14 +1008,32 @@ final class ManifestTests: XCTestCase {
             }
             """
         )
+        let succeededOrphanJob = try decodeCodexJob(
+            """
+            {
+              "id": "job-finished-without-session",
+              "status": "succeeded",
+              "workspaceId": "scratch",
+              "workspaceName": "Scratch",
+              "prompt": "Summarize the repository",
+              "result": "Summary complete.",
+              "updatedAt": "2026-05-21T07:35:00Z"
+            }
+            """
+        )
 
-        let feed = CodexThreadFeedItem.makeFeed(threads: [], jobs: [oldOrphanJob, activeJob])
+        let feed = CodexThreadFeedItem.makeFeed(
+            threads: [],
+            jobs: [oldOrphanJob, succeededOrphanJob, activeJob]
+        )
 
-        XCTAssertEqual(feed.count, 2)
+        XCTAssertEqual(feed.count, 3)
         XCTAssertEqual(feed.first?.jobID, "job-starting")
         XCTAssertTrue(feed.first?.isPendingSession == true)
         XCTAssertEqual(feed.first?.title, "Check deployment health")
         XCTAssertTrue(feed.first?.preview.contains("Starting on EC2") == true)
+        XCTAssertEqual(feed[1].jobID, "job-finished-without-session")
+        XCTAssertEqual(feed[1].preview, "Summary complete.")
         XCTAssertEqual(feed.last?.jobID, "job-old-orphan")
         XCTAssertEqual(feed.last?.preview, "No session")
     }
@@ -1504,10 +1522,15 @@ final class ManifestTests: XCTestCase {
             to: "private struct RelayChatBubble"
         )
 
-        XCTAssertTrue(composerSource.contains("ToolbarItemGroup(placement: .keyboard)"))
+        XCTAssertFalse(composerSource.contains("ToolbarItemGroup(placement: .keyboard)"))
+        XCTAssertFalse(composerSource.contains("keyboard.chevron.compact.down"))
         XCTAssertTrue(composerSource.contains("isFocused = false"))
         XCTAssertFalse(composerSource.contains("keyboardAccessoryClearance"))
         XCTAssertFalse(composerSource.contains(".padding(.bottom, isFocused ?"))
+
+        XCTAssertTrue(source.contains("TapGesture().onEnded"))
+        XCTAssertTrue(source.contains("dismissKeyboard()"))
+        XCTAssertTrue(source.contains("#selector(UIResponder.resignFirstResponder)"))
     }
 
     /// Revamp I4: the composer is harness-first. The mode toggle, workspace chip, and
@@ -1544,7 +1567,97 @@ final class ManifestTests: XCTestCase {
 
         // Keyboard invariants (AGENTS.md hard requirement).
         XCTAssertTrue(source.contains(".scrollDismissesKeyboard(.interactively)"))
-        XCTAssertTrue(source.contains("ToolbarItemGroup(placement: .keyboard)"))
+        XCTAssertTrue(source.contains("TapGesture().onEnded"))
+        XCTAssertTrue(source.contains("dismissKeyboard()"))
+        XCTAssertFalse(source.contains("ToolbarItemGroup(placement: .keyboard)"))
+    }
+
+    func testRelayFolderHistoryIncludesStandaloneInvocationsAndFullLogSheetHasStableIdentity() throws {
+        let source = try String(contentsOfFile: relayChatSourcePath, encoding: .utf8)
+        let viewModelSource = try String(contentsOfFile: relayChatViewModelSourcePath, encoding: .utf8)
+
+        XCTAssertTrue(source.contains("ForEach(viewModel.historyItems)"))
+        XCTAssertTrue(source.contains("Section(\"This folder\")"))
+        XCTAssertFalse(source.contains("All conversations & invocations"))
+        XCTAssertTrue(source.contains("item.workspaceLabel"))
+        XCTAssertTrue(source.contains("await viewModel.openHistoryItem(item)"))
+        XCTAssertTrue(source.contains("Text(\"Threads\")"))
+        XCTAssertTrue(source.contains("Past conversations & invocations"))
+        XCTAssertTrue(source.contains(".accessibilityIdentifier(\"relay-threads\")"))
+        XCTAssertTrue(source.contains(".navigationTitle(\"Threads\")"))
+        XCTAssertFalse(source.contains("clock.arrow.circlepath"))
+        XCTAssertTrue(source.contains("@State private var fullLogRequest: RelayFullLogRequest?"))
+        XCTAssertTrue(source.contains(".sheet(item: $fullLogRequest)"))
+        XCTAssertTrue(source.contains("var id: String { job.id }"))
+        XCTAssertFalse(source.contains("fullLogText.map(RelayFullLogText.init"))
+
+        XCTAssertTrue(viewModelSource.contains("workspaceID: workspaceID, limit: 200"))
+        XCTAssertTrue(viewModelSource.contains("belongsToHistoryScope($0.workspaceId)"))
+        XCTAssertTrue(viewModelSource.contains("workspaceID: workspaceID,"))
+        XCTAssertFalse(viewModelSource.contains("client.fetchThreads(provider: nil, workspaceID: nil, limit: 200)"))
+    }
+
+    func testRelayHistoryContinuationStaysInFolderWorkspace() {
+        XCTAssertEqual(
+            RelayChatViewModel.conversationWorkspaceID(
+                currentThreadID: "thread-scratch",
+                currentThreadWorkspaceID: "scratch",
+                defaultWorkspaceID: "scratch"
+            ),
+            "scratch"
+        )
+        XCTAssertEqual(
+            RelayChatViewModel.conversationWorkspaceID(
+                currentThreadID: nil,
+                currentThreadWorkspaceID: "scratch",
+                defaultWorkspaceID: "scratch"
+            ),
+            "scratch",
+            "A standalone invocation without a session must retain its folder workspace"
+        )
+        XCTAssertNil(
+            RelayChatViewModel.conversationWorkspaceID(
+                currentThreadID: "global-chat",
+                currentThreadWorkspaceID: nil,
+                defaultWorkspaceID: "poc-vault"
+            )
+        )
+        XCTAssertEqual(
+            RelayChatViewModel.conversationWorkspaceID(
+                currentThreadID: nil,
+                currentThreadWorkspaceID: nil,
+                defaultWorkspaceID: "poc-vault"
+            ),
+            "poc-vault"
+        )
+    }
+
+    func testRelayHistoryScopeMatchesOnlyTheOriginatingFolder() {
+        XCTAssertTrue(RelayChatViewModel.isInHistoryScope(
+            itemWorkspaceID: "dir-poc-vault-docs",
+            folderWorkspaceID: "dir-poc-vault-docs",
+            isWorkspaceRoot: false
+        ))
+        XCTAssertFalse(RelayChatViewModel.isInHistoryScope(
+            itemWorkspaceID: "poc-vault",
+            folderWorkspaceID: "dir-poc-vault-docs",
+            isWorkspaceRoot: false
+        ))
+        XCTAssertFalse(RelayChatViewModel.isInHistoryScope(
+            itemWorkspaceID: nil,
+            folderWorkspaceID: nil,
+            isWorkspaceRoot: false
+        ))
+        XCTAssertTrue(RelayChatViewModel.isInHistoryScope(
+            itemWorkspaceID: nil,
+            folderWorkspaceID: nil,
+            isWorkspaceRoot: true
+        ))
+        XCTAssertFalse(RelayChatViewModel.isInHistoryScope(
+            itemWorkspaceID: "poc-vault",
+            folderWorkspaceID: nil,
+            isWorkspaceRoot: true
+        ))
     }
 
     // MARK: - Files API models + client contract (revamp I1)
@@ -2083,6 +2196,14 @@ final class ManifestTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent("POCVault/Views/RelayChatView.swift")
+            .path
+    }
+
+    private var relayChatViewModelSourcePath: String {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("POCVault/Views/RelayChatViewModel.swift")
             .path
     }
 

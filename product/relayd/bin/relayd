@@ -1,0 +1,332 @@
+#!/usr/bin/env node
+// relayd CLI — W2-MODULES. Subcommands:
+//   run [--mode <mode>]       start the node daemon (direct|tunneled|both)
+//   pair                      print a single-use pairing code + URLs
+//   doctor                    config / jail / identity / provider checks
+//   status                    query the running daemon's /healthz
+//   devices list              list enrolled devices
+//   devices revoke <id|serial> [--force]
+//
+// Everything is stdlib-only. The CLI never prints secret material: pairing
+// codes/tokens are the one deliberate exception (they ARE the credential the
+// user must transfer to the phone, single-use, 15-minute TTL).
+
+import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
+
+const [, , command, ...rest] = process.argv;
+
+function fail(message, code = 1) {
+  console.error(`relayd: ${message}`);
+  process.exit(code);
+}
+
+function ok(label, detail = "") {
+  console.log(`  [ok]   ${label}${detail ? ` — ${detail}` : ""}`);
+}
+
+function bad(label, detail = "") {
+  console.log(`  [FAIL] ${label}${detail ? ` — ${detail}` : ""}`);
+}
+
+function warn(label, detail = "") {
+  console.log(`  [warn] ${label}${detail ? ` — ${detail}` : ""}`);
+}
+
+const LISTEN_MODES = ["direct", "tunneled", "both"];
+
+// `relayd run [--mode direct|tunneled|both]` — the flag is a convenience
+// override for RELAYD_LISTEN_MODE; config.mjs remains the single source of
+// truth (and validates it).
+async function cmdRun(args) {
+  const index = args.findIndex((arg) => arg === "--mode" || arg.startsWith("--mode="));
+  if (index !== -1) {
+    const arg = args[index];
+    const value = arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : args[index + 1];
+    if (!value || !LISTEN_MODES.includes(value)) {
+      fail(`--mode must be one of ${LISTEN_MODES.join("|")}`);
+    }
+    process.env.RELAYD_LISTEN_MODE = value;
+  }
+  await import("../src/index.mjs");
+}
+
+// Mints a pairing session INTO THE SHARED STORE, so the already-running
+// daemon (a different process) can redeem the printed code. Prints the code,
+// the link the phone opens, and the address the phone POSTs /v1/pair to.
+// The pairing code/token is the one deliberate secret this CLI prints — it IS
+// the credential the user carries to the phone. No key material is ever shown.
+async function cmdPair() {
+  const config = await import("../src/config.mjs");
+  const identity = await import("../src/identity.mjs");
+  const pairing = await import("../src/pairing.mjs");
+  identity.initIdentity();
+  const session = pairing.createPairingSession();
+  const presented = pairing.pairingPresentation(session);
+  console.log("Pairing code (single use, expires in 15 minutes):");
+  console.log("");
+  console.log(`    ${presented.code}`);
+  console.log("");
+  console.log(`  Pair at: ${presented.pairUrl}`);
+  console.log(`  Link:    ${presented.url}`);
+  console.log(`  otpauth: ${presented.otpauthUrl}`);
+  console.log(`  Expires: ${presented.expiresAt}`);
+  console.log("");
+  // TODO(W2-followup): ASCII QR of the link. A correct pure-JS QR encoder
+  // (Reed-Solomon ECC + masking) exceeds the budget for this pass; the code
+  // and link above carry the identical payload.
+  console.log("  (QR rendering not yet implemented — enter the code or open the link.)");
+  console.log("");
+  if (!presented.pairListenerEnabled) {
+    console.log("WARNING: RELAYD_PAIRING_ENABLED=false — the daemon serves no");
+    console.log("pairing listener, so this code cannot be redeemed. Enable it and");
+    console.log("restart relayd.");
+  } else if (presented.pairListenerLoopbackOnly) {
+    console.log(`NOTE: the pairing listener is bound to ${config.pairingHost} (loopback), so the`);
+    console.log("phone cannot reach it directly. Expose it through the gateway or an");
+    console.log("SSH tunnel, or set RELAYD_PAIRING_HOST / RELAYD_PAIRING_ADVERTISE.");
+  }
+  console.log("");
+  console.log("The session is persisted, so the running daemon redeems it — you do");
+  console.log("not need to keep this command open.");
+}
+
+async function cmdDoctor() {
+  let failures = 0;
+  console.log("relayd doctor");
+
+  // Node runtime.
+  const major = Number(process.versions.node.split(".")[0]);
+  if (major >= 22) ok("node runtime", `v${process.versions.node}`);
+  else {
+    bad("node runtime", `v${process.versions.node} (need >= 22 for node:sqlite)`);
+    failures += 1;
+  }
+
+  // Config (evaluating it validates every env knob and creates the data dirs).
+  let config = null;
+  try {
+    config = await import("../src/config.mjs");
+    ok("config", `dataDir=${config.dataDir}`);
+  } catch (error) {
+    bad("config", error.message);
+    failures += 1;
+  }
+
+  if (config) {
+    // Listen mode. Tunneled mode needs a broker endpoint and an initialized
+    // identity; direct mode needs neither.
+    ok("listen mode", config.listenMode);
+    if (config.listensDirect) ok("direct listener", `http://${config.host}:${config.port}`);
+    if (config.listensTunneled) {
+      if (config.tunnelHost) {
+        const identityModule = await import("../src/identity.mjs");
+        const nodeId = identityModule.readNodeId(identityModule.identityPaths());
+        const sni = config.tunnelSni || (nodeId ? `${nodeId}${config.tunnelSuffix}` : `<node-id>${config.tunnelSuffix}`);
+        ok("tunnel broker", `${config.tunnelHost}:${config.tunnelPort} sni=${sni}`);
+        if (!nodeId) {
+          bad("tunnel identity", "node identity is not initialized (run `relayd pair` once)");
+          failures += 1;
+        }
+      } else {
+        bad("tunnel broker", "RELAYD_TUNNEL_HOST is required for tunneled listen mode");
+        failures += 1;
+      }
+    }
+
+    // Pairing listener: the onboarding path. A disabled listener means every
+    // code `relayd pair` prints is unredeemable, which is a hard failure.
+    if (config.pairingEnabled) {
+      ok("pairing listener", `${config.pairingEndpointUrl()}${config.pairingIsLoopbackOnly() ? " (loopback only)" : ""}`);
+      if (config.pairingIsLoopbackOnly()) {
+        warn("pairing reachability", "bound to loopback — expose via the gateway or set RELAYD_PAIRING_HOST/ADVERTISE");
+      }
+    } else {
+      bad("pairing listener", "RELAYD_PAIRING_ENABLED=false — `relayd pair` codes cannot be redeemed");
+      failures += 1;
+    }
+
+    // Client-cert allowlist. Empty + auto-allow off + mTLS on = every device
+    // 403s forever, which is the other half of the onboarding dead end.
+    if (config.requireMtls && config.allowedCertSubjects.size === 0 && !config.pairingAutoAllow) {
+      bad(
+        "cert subject allowlist",
+        "empty with RELAYD_PAIRING_AUTOALLOW=false and mTLS required — no device can ever be authorized",
+      );
+      failures += 1;
+    } else {
+      ok(
+        "cert subject allowlist",
+        `${config.allowedCertSubjects.size} subject(s), autoallow=${config.pairingAutoAllow}`,
+      );
+    }
+
+    // Data dir writable.
+    try {
+      const probe = path.join(config.dataDir, `.doctor-${process.pid}`);
+      fs.writeFileSync(probe, "ok");
+      fs.rmSync(probe);
+      ok("data dir writable", config.dataDir);
+    } catch (error) {
+      bad("data dir writable", error.message);
+      failures += 1;
+    }
+
+    // Workspace jail sanity: root exists and realpath-resolves to itself.
+    try {
+      const real = fs.realpathSync(config.workspaceBrowseRoot);
+      if (real === config.workspaceBrowseRoot) ok("workspace jail root", real);
+      else warn("workspace jail root", `configured ${config.workspaceBrowseRoot} resolves to ${real}`);
+    } catch (error) {
+      bad("workspace jail root", `${config.workspaceBrowseRoot}: ${error.message}`);
+      failures += 1;
+    }
+
+    // Store backend.
+    try {
+      const { store, storeKind } = await import("../src/store.mjs");
+      store.listDevices();
+      ok("store", storeKind);
+    } catch (error) {
+      bad("store", error.message);
+      failures += 1;
+    }
+
+    // Identity / openssl.
+    try {
+      const identity = await import("../src/identity.mjs");
+      const version = identity.opensslVersion();
+      if (version) ok("openssl", version);
+      else {
+        bad("openssl", "binary not found (required for pairing/cert issuance)");
+        failures += 1;
+      }
+      const status = identity.identityStatus();
+      if (status.hasCa && status.hasIdentityKey) {
+        ok("identity", `nodeId=${status.nodeId} devices=${status.deviceCount} revoked=${status.revokedCount}`);
+      } else {
+        warn("identity", "not initialized yet (run `relayd pair` once to create it)");
+      }
+    } catch (error) {
+      bad("identity", error.message);
+      failures += 1;
+    }
+
+    // Provider CLIs (informational — a missing harness is not a failure).
+    try {
+      const harness = await import("../src/harness.mjs");
+      for (const entry of harness.listHarnesses()) {
+        if (entry.installed) ok(`harness ${entry.provider}`, entry.version || "installed");
+        else warn(`harness ${entry.provider}`, "not installed");
+      }
+    } catch (error) {
+      bad("harness detection", error.message);
+      failures += 1;
+    }
+  }
+
+  console.log(failures === 0 ? "doctor: all checks passed" : `doctor: ${failures} check(s) FAILED`);
+  process.exit(failures === 0 ? 0 : 1);
+}
+
+async function cmdStatus() {
+  let config;
+  try {
+    config = await import("../src/config.mjs");
+  } catch (error) {
+    fail(`config error: ${error.message}`);
+    return;
+  }
+  const url = `http://${config.host}:${config.port}/healthz`;
+  const payload = await new Promise((resolve) => {
+    const request = http.get(url, { timeout: 3000 }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    });
+    request.on("error", () => resolve(null));
+    request.on("timeout", () => {
+      request.destroy();
+      resolve(null);
+    });
+  });
+  if (payload === null) {
+    console.log(`relayd: not running (no response from ${url})`);
+    process.exit(1);
+  }
+  console.log(payload);
+}
+
+async function cmdDevices(args) {
+  const identity = await import("../src/identity.mjs");
+  const sub = args[0];
+  if (sub === "list" || sub === undefined) {
+    const devices = identity.listDevices();
+    if (devices.length === 0) {
+      console.log("no devices enrolled");
+      return;
+    }
+    for (const device of devices) {
+      console.log(
+        `${device.id}  serial=${device.certSerial}  ${device.revoked ? "REVOKED" : "active "}  ${device.platform}  ${device.name}`,
+      );
+    }
+    return;
+  }
+  if (sub === "revoke") {
+    const target = args[1];
+    if (!target) fail("usage: relayd devices revoke <device-id|cert-serial> [--force]");
+    const force = args.includes("--force");
+    const devices = (await import("../src/store.mjs")).store.listDevices();
+    const device = devices.find((entry) => entry.id === target || entry.certSerial === target.toUpperCase());
+    if (!device) fail(`no device matches ${target}`, 1);
+    try {
+      const result = identity.revokeDevice(device.id, { force });
+      console.log(`revoked ${device.id} (serial ${device.certSerial}) at ${result.revokedAt}`);
+    } catch (error) {
+      fail(error.message, 1);
+    }
+    return;
+  }
+  fail(`unknown devices subcommand: ${sub}`);
+}
+
+const usage = `usage: relayd <command>
+
+  run [--mode direct|tunneled|both]
+                               start the node daemon (default: direct, or
+                               RELAYD_LISTEN_MODE)
+  pair                         print a pairing code + link (single use, 15 min)
+  doctor                       run config/jail/identity/provider checks
+  status                       query the running daemon
+  devices list                 list enrolled devices
+  devices revoke <id|serial>   revoke a device certificate [--force]
+`;
+
+switch (command) {
+  case "run":
+    await cmdRun(rest);
+    break;
+  case "pair":
+    await cmdPair();
+    break;
+  case "doctor":
+    await cmdDoctor();
+    break;
+  case "status":
+    await cmdStatus();
+    break;
+  case "devices":
+    await cmdDevices(rest);
+    break;
+  case undefined:
+  case "help":
+  case "--help":
+  case "-h":
+    console.log(usage);
+    break;
+  default:
+    console.error(usage);
+    fail(`unknown command: ${command}`);
+}

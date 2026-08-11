@@ -323,8 +323,15 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         return try decoder.decode(CodexListEnvelope<CodexThread>.self, from: data).values
     }
 
-    func fetchThreadDetail(sessionID: String, provider: CodexProvider? = nil) async throws -> CodexThreadDetail {
+    func fetchThreadDetail(
+        sessionID: String,
+        workspaceID: String? = nil,
+        provider: CodexProvider? = nil
+    ) async throws -> CodexThreadDetail {
         var queryItems: [URLQueryItem] = []
+        if let workspaceID, !workspaceID.isEmpty {
+            queryItems.append(URLQueryItem(name: "workspaceId", value: workspaceID))
+        }
         appendProvider(provider, to: &queryItems)
 
         let data = try await perform(path: "/v1/codex/threads/\(Self.pathComponent(sessionID))", queryItems: queryItems)

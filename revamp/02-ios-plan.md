@@ -1,5 +1,11 @@
 # Track I — iOS Plan
 
+> **Status (2026-08-11): implemented.** This document retains the original
+> baseline and milestone plan for traceability. The resulting current behavior
+> is summarized in [../docs/FILES_REDESIGN.md](../docs/FILES_REDESIGN.md),
+> including the visible Threads row, stable full-log sheet, and outside-tap
+> keyboard dismissal without a custom accessory.
+
 All work in `ios/POCVault`. **Mechanical constraint:** classic pbxproj (objectVersion 56, not folder-synced) — every added/removed file needs 4 hand edits (PBXBuildFile, PBXFileReference, group child, Sources phase), continuing the existing `1000…/2000…` ID convention. Build after every registration. Net change across milestones: +8 files, −2 files.
 
 Updated 2026-08-09 for the live `pariksj-dev` backend at
@@ -110,18 +116,26 @@ Toolbar: Copy path, Share, toggles. Add `.file` handling to `BrowserRoute`. Test
      (workspace now constant). After task creation, attach
      `client.streamJobEvents(id:)`, append stdout/stderr live, and retain 2 s
      polling as fallback when the stream errors.
-   - Threads: `fetchThreads(workspaceID:)`; drawer = this folder's threads, both modes, flat recency list with mode badges (drop `threadsByWorkspace` grouping); keep DELETE.
+   - Threads: fetch up to 200 workspace-scoped threads and jobs; a visible row
+     below the header opens this folder's combined, flat recency list with mode
+     badges. Include standalone invocations, de-duplicate jobs represented by a
+     thread, and keep DELETE for resumable threads.
    - Keep the already-added `.cursor → .cursor` task mapping. Effort remains
      model-driven via `effortLevels` and is hidden when empty.
    - `RelayModelDiscovery.sections` returns Agents/Chat models choices. Codex
      Sol/Terra/Luna appear in both; Claude/Cursor only in Agents; Azure only in
      Chat models; Bedrock appears only if the server actually advertises it.
 2. `RelayChatView.swift`:
-   - Top bar: folder name + model label, dismiss chevron, threads button.
+   - Top bar: folder name + model label and dismiss chevron; place the large,
+     labelled Threads row immediately below it so history is discoverable.
    - `RelayComposer`: remove mode toggle + workspace chip; effort menu moves beside the model chip, shown only when `availableEfforts` non-empty; send icon `arrow.up` always.
    - Delete `RelayWorkspaceSheet` + `RelayFolderRow` + `showingOptions` sheet + `RELAY_UITEST_OPEN=workspace` (superseded by browser + `RELAY_UITEST_PATH`).
    - `RelayJobCard`: live autoscrolling mono tail while active (SSE-fed); keep cancel/full-log.
-   - Preserve keyboard-accessory Done + `.scrollDismissesKeyboard(.interactively)` (AGENTS.md hard requirement).
+   - Preserve `.scrollDismissesKeyboard(.interactively)`, Send/Run dismissal,
+     and outside-tap dismissal on non-editor content. Do not add a custom
+     keyboard accessory or let the outside-tap gesture intercept composer taps.
+   - Present `View full log` from a request object with stable identity; load
+     inside the sheet so asynchronous fetching cannot immediately dismiss it.
 3. First send in an unregistered folder: lazy `selectWorkspace(path:)`; failure → composer error banner, prompt text preserved.
 4. Tests: rewrite the two RelayChatView source-text tests (markdown one repoints to `Rendering/RelayMarkdownViews.swift`); delete workspace-sheet assertions; add units proving a dual-mode Codex model can select either chat or task, plus Cursor task and Azure chat routing.
 

@@ -1,0 +1,48 @@
+# relayd systemd unit — W2-MODULES installer template.
+# Installed to /etc/systemd/system/relayd.service by install.sh.
+# Configuration lives in /etc/relayd/relayd.env (root:relay 0640). Values there
+# are single-quoted (KEY='value') so the same file is valid for this
+# EnvironmentFile= and for `. /etc/relayd/relayd.env` in a shell — both strip
+# exactly one layer of matching single quotes.
+#
+# Listen mode comes from that env file (see relayd.config.example.json):
+#   RELAYD_LISTEN_MODE=direct    (default) plain listener behind a gateway
+#   RELAYD_LISTEN_MODE=tunneled  dial out to RELAYD_TUNNEL_HOST, TLS on-node
+#   RELAYD_LISTEN_MODE=both      both listeners at once
+# Tunneled mode additionally needs RELAYD_TUNNEL_HOST (+ optional
+# RELAYD_TUNNEL_PORT / RELAYD_TUNNEL_SUFFIX / RELAYD_TUNNEL_SNI) and an
+# initialized node identity; relayd exits non-zero at startup if either is
+# missing, so Restart=on-failure will surface it in the journal.
+
+[Unit]
+Description=Relay node daemon (relayd)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=relay
+Group=relay
+EnvironmentFile=/etc/relayd/relayd.env
+ExecStart=/opt/relayd/node/bin/node /opt/relayd/app/bin/relayd run
+Restart=on-failure
+RestartSec=3
+# relayd closes the tunnel and stops accepting on SIGTERM; bound the wait.
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# Hardening: relayd only needs its data dir, the workspace jail, and the
+# runner home. Everything else is read-only or invisible.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/relayd /srv/relay-workspaces /home/relay
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

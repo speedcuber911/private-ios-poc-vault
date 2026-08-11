@@ -1,0 +1,199 @@
+// relayd catalog.mjs — extracted verbatim from relay-server/codex-api-deploy/server.mjs (W2-CORE, behavior-preserving).
+import http from "node:http";
+import https from "node:https";
+import { execFile, spawn } from "node:child_process";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import path from "node:path";
+
+import { allowedThreadProviders, bedrockRegion, cleanDisplayName, cleanOptionalEndpoint, cleanOptionalFilePath, cleanEnvironmentVariableName, cleanOptionalAwsProfile } from "./config.mjs";
+
+const modelCatalog = loadModelCatalog();
+
+function loadModelCatalog() {
+  const configured = process.env.CODEX_MODEL_CATALOG
+    ? JSON.parse(process.env.CODEX_MODEL_CATALOG)
+    : defaultModelCatalog();
+  if (!Array.isArray(configured)) {
+    throw new Error("CODEX_MODEL_CATALOG must be a JSON array");
+  }
+  return configured.map(cleanModelDescriptor);
+}
+
+
+function defaultModelCatalog() {
+  const bedrockChatModel = process.env.BEDROCK_CHAT_MODEL || "anthropic.claude-3-5-sonnet-20241022-v2:0";
+  const catalog = [
+    {
+      id: bedrockChatModel,
+      label: "Claude Sonnet (Bedrock)",
+      provider: "bedrock",
+      modes: ["chat"],
+      defaultOptions: { temperature: 0.7, maxTokens: 4096 },
+      effortLevels: ["low", "medium", "high"],
+    },
+    {
+      id: "codex-cli",
+      label: "Codex CLI",
+      provider: "codex",
+      modes: ["task"],
+    },
+    {
+      id: "claude-code",
+      label: "Claude Code (Bedrock/SigiQ)",
+      provider: "claude",
+      modes: ["task"],
+      effortLevels: ["low", "medium", "high"],
+    },
+  ];
+  if (process.env.AZURE_OPENAI_DEPLOYMENT) {
+    catalog.push({
+      id: process.env.AZURE_OPENAI_DEPLOYMENT,
+      label: `${process.env.AZURE_OPENAI_DEPLOYMENT} (Azure)`,
+      provider: "azure",
+      modes: ["chat"],
+      azureDeployment: process.env.AZURE_OPENAI_DEPLOYMENT,
+      defaultOptions: { temperature: 0.7, maxTokens: 4096 },
+    });
+  }
+  return catalog;
+}
+
+
+function cleanModelDescriptor(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    throw new Error("CODEX_MODEL_CATALOG entries must be objects");
+  }
+  const id = cleanRequiredModelId(entry.id, "model id");
+  const provider = cleanModelProvider(entry.provider);
+  const modes = cleanModelModes(entry.modes);
+  const descriptor = {
+    id,
+    label: cleanDisplayName(entry.label || id, "model label", 120),
+    provider,
+    modes,
+  };
+  if (entry.azureDeployment !== undefined && entry.azureDeployment !== null && entry.azureDeployment !== "") {
+    descriptor.azureDeployment = cleanRequiredModelId(entry.azureDeployment, "Azure deployment");
+  }
+  // Underlying model id/alias the app sends to createJob for task entries (e.g. "opus",
+  // "gpt-5-codex"). Public — the client needs it to select the model.
+  if (entry.taskModel !== undefined && entry.taskModel !== null && entry.taskModel !== "") {
+    descriptor.taskModel = cleanRequiredModelId(entry.taskModel, "task model");
+  }
+  if (entry.azureBaseURL !== undefined && entry.azureBaseURL !== null && entry.azureBaseURL !== "") {
+    descriptor.azureBaseURL = cleanOptionalEndpoint(entry.azureBaseURL);
+    if (!descriptor.azureBaseURL) throw new Error("Azure base URL is invalid");
+  }
+  if (entry.azureApiKeyFile !== undefined && entry.azureApiKeyFile !== null && entry.azureApiKeyFile !== "") {
+    descriptor.azureApiKeyFile = cleanOptionalFilePath(entry.azureApiKeyFile);
+    if (!descriptor.azureApiKeyFile) throw new Error("Azure API key file is invalid");
+  }
+  if (entry.azureApiKeyEnv !== undefined && entry.azureApiKeyEnv !== null && entry.azureApiKeyEnv !== "") {
+    descriptor.azureApiKeyEnv = cleanEnvironmentVariableName(entry.azureApiKeyEnv, "Azure API key environment variable");
+  }
+  if (entry.bedrockRegion !== undefined && entry.bedrockRegion !== null && entry.bedrockRegion !== "") {
+    descriptor.bedrockRegion = cleanOptionalAwsProfile(entry.bedrockRegion);
+    if (!descriptor.bedrockRegion) throw new Error("Bedrock region is invalid");
+  }
+  const defaultOptions = cleanChatOptions(entry.defaultOptions || {});
+  if (Object.keys(defaultOptions).length > 0) descriptor.defaultOptions = defaultOptions;
+  if (Array.isArray(entry.effortLevels)) {
+    descriptor.effortLevels = entry.effortLevels
+      .map((level) => (typeof level === "string" ? level.trim().toLowerCase() : ""))
+      .filter((level) => ["low", "medium", "high", "xhigh"].includes(level));
+  }
+  return descriptor;
+}
+
+
+function cleanModelProvider(value) {
+  if (typeof value !== "string") {
+    throw new Error("model provider is required");
+  }
+  const normalized = value.trim().toLowerCase();
+  if (!allowedThreadProviders.has(normalized)) {
+    throw new Error("model provider must be codex, claude, cursor, azure, or bedrock");
+  }
+  return normalized;
+}
+
+
+function cleanModelModes(value) {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error("model modes must be a non-empty array");
+  }
+  const modes = [...new Set(value.map((mode) => (typeof mode === "string" ? mode.trim().toLowerCase() : "")))].filter(
+    (mode) => mode === "chat" || mode === "task",
+  );
+  if (modes.length === 0) {
+    throw new Error("model modes must include chat or task");
+  }
+  return modes;
+}
+
+
+function cleanRequiredModelId(value, label) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9._:/-]{1,180}$/.test(value.trim())) {
+    throw new Error(`${label} is invalid`);
+  }
+  return value.trim();
+}
+
+
+function publicModelCatalog() {
+  return modelCatalog.map((model) => {
+    const {
+      azureApiKeyFile,
+      azureApiKeyEnv,
+      azureBaseURL,
+      bedrockRegion: _bedrockRegion,
+      ...publicModel
+    } = model;
+    return publicModel;
+  });
+}
+
+
+function findCatalogModel({ provider, model, mode }) {
+  return modelCatalog.find(
+    (entry) => entry.provider === provider && entry.id === model && entry.modes.includes(mode),
+  );
+}
+
+
+function cleanChatOptions(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const options = {};
+  if (value.temperature !== undefined && value.temperature !== null && value.temperature !== "") {
+    const temperature = Number(value.temperature);
+    if (!Number.isFinite(temperature) || temperature < 0 || temperature > 2) {
+      throw Object.assign(new Error("temperature must be between 0 and 2"), { status: 400 });
+    }
+    options.temperature = temperature;
+  }
+  const maxTokens = value.maxTokens ?? value.max_tokens;
+  if (maxTokens !== undefined && maxTokens !== null && maxTokens !== "") {
+    const parsed = Number(maxTokens);
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 200000) {
+      throw Object.assign(new Error("maxTokens must be a positive integer"), { status: 400 });
+    }
+    options.maxTokens = parsed;
+  }
+  return options;
+}
+
+
+export {
+  modelCatalog,
+  loadModelCatalog,
+  defaultModelCatalog,
+  cleanModelDescriptor,
+  cleanModelProvider,
+  cleanModelModes,
+  cleanRequiredModelId,
+  publicModelCatalog,
+  findCatalogModel,
+  cleanChatOptions,
+};

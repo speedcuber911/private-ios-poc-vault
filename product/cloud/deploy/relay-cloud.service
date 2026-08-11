@@ -1,0 +1,27 @@
+[Unit]
+Description=Relay Server account and control-plane service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=relaycloud
+Group=relaycloud
+WorkingDirectory=/opt/relay-cloud/current
+EnvironmentFile=/etc/relay-cloud/env
+ExecStart=/usr/bin/node src/main.js
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/relay-cloud
+
+[Install]
+WantedBy=multi-user.target
