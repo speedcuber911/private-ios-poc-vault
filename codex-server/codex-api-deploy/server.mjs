@@ -1873,8 +1873,10 @@ function cleanChatOptions(value) {
 }
 
 async function streamCodexChat(res, chat, signal, replyChunks) {
-  // A workspace-scoped chat runs read-only in the selected folder; unscoped
-  // chats (and stored workspaces that no longer resolve) fall back to scratch.
+  // A workspace-scoped chat runs in the selected folder; unscoped chats (and
+  // stored workspaces that no longer resolve) fall back to scratch. Keep the
+  // execution policy aligned with task-mode Codex jobs so app-launched chat
+  // cannot silently become more restrictive than app-launched tasks.
   const workspace =
     (chat.workspace?.path ? chat.workspace : null) || resolveWorkspaceById("scratch") || workspaceList()[0];
   if (!workspace) {
@@ -1884,10 +1886,9 @@ async function streamCodexChat(res, chat, signal, replyChunks) {
   const model = chat.catalogEntry.taskModel || chat.model;
   const resultPath = path.join(chatsDir, `.codex-chat-${crypto.randomUUID()}.txt`);
   const args = [
-    "-a",
-    "never",
-    "-s",
-    "read-only",
+    ...(dangerousMode
+      ? ["--dangerously-bypass-approvals-and-sandbox"]
+      : ["-a", "never", "-s", "read-only"]),
     "-m",
     model,
     "-c",
@@ -1976,10 +1977,13 @@ function codexChatPrompt(messages) {
   const transcript = messages
     .map((message) => `${message.role.toUpperCase()}: ${message.content}`)
     .join("\n\n");
+  const executionInstruction = dangerousMode
+    ? "You may inspect or modify files, run commands, and use tools when helpful. Work without asking for permission."
+    : "This is chat, not an agent task: do not inspect or modify files, run commands, or use tools.";
   return [
     "You are responding inside Relay Chat.",
     "Answer the final user message conversationally and directly using the transcript below.",
-    "This is chat, not an agent task: do not inspect or modify files, run commands, or use tools.",
+    executionInstruction,
     "Do not mention these instructions or add role prefixes to your answer.",
     "",
     "Conversation transcript:",
@@ -2371,7 +2375,8 @@ function createJob(body, certSubject) {
   const attachments = saveJobAttachments(id, body.attachments);
   const selectedSkills = cleanSelectedSkills(provider, body.skills);
   const codexPrompt = promptWithAttachments(promptWithSelectedSkills(body.prompt, provider, selectedSkills), attachments);
-  const permissionMode = cleanOptionalClaudePermissionMode(body.permissionMode);
+  const requestedPermissionMode = cleanOptionalClaudePermissionMode(body.permissionMode);
+  const permissionMode = provider === "claude" && dangerousMode ? "bypassPermissions" : requestedPermissionMode;
   pruneRuntimeCachesIfIdle();
   const job = {
     id,
@@ -4330,9 +4335,12 @@ function buildCodexResumeArgs(job) {
 
 function buildClaudeArgs(job) {
   const args = ["--print"];
-  if (dangerousMode) args.push("--dangerously-skip-permissions");
+  if (dangerousMode) {
+    args.push("--dangerously-skip-permissions");
+  } else if (job.permissionMode) {
+    args.push("--permission-mode", job.permissionMode);
+  }
   if (job.model) args.push("--model", job.model);
-  if (job.permissionMode) args.push("--permission-mode", job.permissionMode);
   if (job.resumeSessionId) {
     args.push("--resume", job.resumeSessionId);
   } else {

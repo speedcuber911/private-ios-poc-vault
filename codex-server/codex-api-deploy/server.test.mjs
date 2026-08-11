@@ -2470,10 +2470,11 @@ test("runs Claude jobs with configured binary, stdin prompt, and stdout result",
     assert.equal(job.status, "succeeded");
     assert.equal(job.provider, "claude");
     assert.equal(job.sessionId, created.sessionId);
-    assert.equal(job.permissionMode, "plan");
+    assert.equal(job.permissionMode, "bypassPermissions");
     assert.equal(job.model, "sonnet");
     assert.equal(job.reasoningEffort, null);
-    assert.match(job.stdout, new RegExp(`claude args: .*\\[--print\\].*\\[--dangerously-skip-permissions\\].*\\[--model\\] \\[sonnet\\].*\\[--permission-mode\\] \\[plan\\].*\\[--session-id\\] \\[${created.sessionId}\\]`));
+    assert.match(job.stdout, new RegExp(`claude args: .*\\[--print\\].*\\[--dangerously-skip-permissions\\].*\\[--model\\] \\[sonnet\\].*\\[--session-id\\] \\[${created.sessionId}\\]`));
+    assert.doesNotMatch(job.stdout, /--permission-mode/);
     assert.doesNotMatch(job.stdout, /--effort/);
     assert.match(job.stdout, /claude aws profile:sigiq/);
     assert.match(job.stdout, /claude aws access:\n/);
@@ -3066,10 +3067,14 @@ test("keeps the legacy workspace-dirs response shape byte-identical (golden)", a
 
 async function makeCwdEchoCodex(tmpDir) {
   const fakeCodex = path.join(tmpDir, "fake-codex-cwd");
+  const argsPath = path.join(tmpDir, "fake-codex-cwd-args.txt");
+  const promptPath = path.join(tmpDir, "fake-codex-cwd-prompt.txt");
   await fs.writeFile(
     fakeCodex,
     [
       "#!/bin/sh",
+      `: > '${argsPath}'`,
+      `for arg in "$@"; do printf '%s\\n' "$arg" >> '${argsPath}'; done`,
       "out=''",
       "cdir=''",
       "prev=''",
@@ -3078,14 +3083,14 @@ async function makeCwdEchoCodex(tmpDir) {
       "  if [ \"$prev\" = '-C' ]; then cdir=\"$arg\"; fi",
       "  prev=\"$arg\"",
       "done",
-      "cat >/dev/null",
+      `cat > '${promptPath}'`,
       "if [ -n \"$out\" ]; then printf 'cwd=%s cdir=%s' \"$(pwd -P)\" \"$cdir\" > \"$out\"; fi",
       "exit 0",
       "",
     ].join("\n"),
     { mode: 0o755 },
   );
-  return fakeCodex;
+  return { fakeCodex, argsPath, promptPath };
 }
 
 test("scopes chat threads to workspaces with inheritance and mismatch rejection", async () => {
@@ -3306,13 +3311,14 @@ test("keeps legacy null-workspace chats global-only and preserves scoped deletio
   }
 });
 
-test("runs Codex chat read-only in the selected workspace instead of scratch", async () => {
+test("runs Codex chat unrestricted in the selected workspace instead of scratch", async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
   const browseRoot = path.join(tmpDir, "workspaces");
   const scratchDir = path.join(browseRoot, "scratch");
   const projectDir = path.join(browseRoot, "project-a");
   await fs.mkdir(scratchDir, { recursive: true });
   await fs.mkdir(projectDir, { recursive: true });
+  const { fakeCodex, argsPath, promptPath } = await makeCwdEchoCodex(tmpDir);
   const server = await startServer({
     CODEX_REQUIRE_MTLS: "false",
     CODEX_DATA_DIR: path.join(tmpDir, "data"),
@@ -3321,7 +3327,7 @@ test("runs Codex chat read-only in the selected workspace instead of scratch", a
       { id: "scratch", name: "Scratch", path: scratchDir },
       { id: "project-a", name: "Project A", path: projectDir },
     ]),
-    CODEX_BIN: await makeCwdEchoCodex(tmpDir),
+    CODEX_BIN: fakeCodex,
     CODEX_MODEL_CATALOG: JSON.stringify([
       { id: "codex-gpt-5.6-sol", label: "Codex · GPT-5.6 Sol", provider: "codex", modes: ["chat", "task"], taskModel: "gpt-5.6-sol" },
     ]),
@@ -3345,6 +3351,12 @@ test("runs Codex chat read-only in the selected workspace instead of scratch", a
     const scopedEvents = await readSse(scoped);
     const scopedDelta = scopedEvents.find((event) => event.event === "delta");
     assert.equal(scopedDelta.data.text, `cwd=${realProject} cdir=${realProject}`);
+    const scopedArgs = await fs.readFile(argsPath, "utf8");
+    assert.match(scopedArgs, /^--dangerously-bypass-approvals-and-sandbox$/m);
+    assert.doesNotMatch(scopedArgs, /^read-only$/m);
+    const scopedPrompt = await fs.readFile(promptPath, "utf8");
+    assert.match(scopedPrompt, /You may inspect or modify files, run commands, and use tools when helpful/);
+    assert.doesNotMatch(scopedPrompt, /do not inspect or modify files/);
 
     const unscoped = await fetch(`${server.baseUrl}/v1/codex/chat`, {
       method: "POST",
@@ -3357,6 +3369,9 @@ test("runs Codex chat read-only in the selected workspace instead of scratch", a
     });
     const unscopedDelta = (await readSse(unscoped)).find((event) => event.event === "delta");
     assert.equal(unscopedDelta.data.text, `cwd=${realScratch} cdir=${realScratch}`);
+    const unscopedArgs = await fs.readFile(argsPath, "utf8");
+    assert.match(unscopedArgs, /^--dangerously-bypass-approvals-and-sandbox$/m);
+    assert.doesNotMatch(unscopedArgs, /^read-only$/m);
   } finally {
     await server.stop();
   }

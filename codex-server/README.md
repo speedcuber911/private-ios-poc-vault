@@ -185,9 +185,11 @@ inherits the stored workspace; a conflicting id is rejected. Workspace-scoped
 chats appear alongside task threads when `/v1/codex/threads?workspaceId=...`
 is used; legacy chats without a workspace remain global-only.
 
-Codex chat runs ephemerally with a read-only sandbox in the selected workspace
-folder, falling back to the registered scratch workspace when no workspace is
-given. Azure chat is context-only: selecting a workspace scopes the saved
+Codex chat runs ephemerally in the selected workspace folder, falling back to
+the registered scratch workspace when no workspace is given. With
+`CODEX_DANGEROUS_MODE=true`, it uses full filesystem/tool access without
+approval prompts; when the setting is disabled, it falls back to a read-only
+sandbox. Azure chat is context-only: selecting a workspace scopes the saved
 thread but does not give the Azure model any filesystem access.
 OpenAI-compatible Azure catalog entries load keys only from server-side
 files and send them as bearer credentials. Bedrock chat remains disabled unless
