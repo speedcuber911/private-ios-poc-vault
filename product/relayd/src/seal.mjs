@@ -5,8 +5,24 @@
 // manifests and session transcripts are sealed on the laptop before they are
 // committed to a git branch, so GitHub only ever stores ciphertext.
 //
-// CANONICAL COPY. product/cli/src/seal.mjs is a byte-identical vendored copy;
-// product/cli/test/seal-vendor.test.mjs fails if the two files diverge.
+// CANONICAL COPY. A later task will vendor a byte-identical copy of this file
+// into product/cli/src/seal.mjs, guarded by a drift test at
+// product/cli/test/seal-vendor.test.mjs that will fail if the two files
+// diverge.
+//
+// Errors thrown (Error#message — callers match against these exact strings,
+// so do not change them without auditing every caller):
+//   seal_bad_public_key  - recipientPublicB64 does not decode to a canonical
+//                           base64 encoding of a 32-byte X25519 public key.
+//   seal_bad_input       - sealed is neither a Buffer nor an ArrayBuffer view.
+//   seal_bad_magic       - sealed is too short to hold the magic, or the
+//                           leading bytes don't match it.
+//   seal_truncated       - sealed is shorter than header + auth tag allows.
+//   seal_bad_private_key - privateKeyPem does not parse as a private key, or
+//                           parses to a key type other than x25519.
+//   seal_decrypt_failed  - AEAD authentication failed: wrong recipient key,
+//                           tampered ciphertext, or any other decrypt error
+//                           (the underlying cause is attached as .cause).
 import crypto from "node:crypto";
 
 const SEAL_MAGIC = Buffer.from("RLYSEAL1", "utf8");
@@ -32,6 +48,27 @@ function publicKeyToRaw(keyObject) {
   return keyObject.export({ type: "spki", format: "der" }).subarray(X25519_SPKI_PREFIX.length);
 }
 
+function loadPrivateKey(privateKeyPem) {
+  let privateKey;
+  try {
+    privateKey = crypto.createPrivateKey(privateKeyPem);
+  } catch (err) {
+    throw new Error("seal_bad_private_key", { cause: err });
+  }
+  if (privateKey.asymmetricKeyType !== "x25519") {
+    throw new Error("seal_bad_private_key");
+  }
+  return privateKey;
+}
+
+function normalizeToBuffer(input) {
+  if (Buffer.isBuffer(input)) return input;
+  if (ArrayBuffer.isView(input)) {
+    return Buffer.from(input.buffer, input.byteOffset, input.byteLength);
+  }
+  throw new Error("seal_bad_input");
+}
+
 function deriveKey(sharedSecret, ephemeralPublicRaw, recipientPublicRaw) {
   const info = Buffer.concat([KDF_INFO_LABEL, ephemeralPublicRaw, recipientPublicRaw]);
   return Buffer.from(crypto.hkdfSync("sha256", sharedSecret, SEAL_MAGIC, info, 32));
@@ -47,6 +84,9 @@ function generateEncKeyPair() {
 
 function sealTo(recipientPublicB64, plaintext) {
   const recipientPublicRaw = Buffer.from(String(recipientPublicB64), "base64");
+  if (recipientPublicRaw.toString("base64") !== String(recipientPublicB64)) {
+    throw new Error("seal_bad_public_key");
+  }
   const recipientPublicKey = rawToPublicKey(recipientPublicRaw);
   const ephemeral = crypto.generateKeyPairSync("x25519");
   const ephemeralPublicRaw = publicKeyToRaw(ephemeral.publicKey);
@@ -64,7 +104,8 @@ function sealTo(recipientPublicB64, plaintext) {
 }
 
 function openSealed(privateKeyPem, sealed) {
-  if (!Buffer.isBuffer(sealed) || sealed.length < SEAL_MAGIC.length ||
+  sealed = normalizeToBuffer(sealed);
+  if (sealed.length < SEAL_MAGIC.length ||
       !sealed.subarray(0, SEAL_MAGIC.length).equals(SEAL_MAGIC)) {
     throw new Error("seal_bad_magic");
   }
@@ -75,7 +116,7 @@ function openSealed(privateKeyPem, sealed) {
   const ciphertext = sealed.subarray(HEADER_BYTES, sealed.length - TAG_BYTES);
   const tag = sealed.subarray(sealed.length - TAG_BYTES);
 
-  const privateKey = crypto.createPrivateKey(privateKeyPem);
+  const privateKey = loadPrivateKey(privateKeyPem);
   const recipientPublicRaw = publicKeyToRaw(crypto.createPublicKey(privateKey));
 
   try {
@@ -87,8 +128,8 @@ function openSealed(privateKeyPem, sealed) {
     const decipher = crypto.createDecipheriv("aes-256-gcm", key, nonce);
     decipher.setAuthTag(tag);
     return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-  } catch {
-    throw new Error("seal_decrypt_failed");
+  } catch (err) {
+    throw new Error("seal_decrypt_failed", { cause: err });
   }
 }
 
