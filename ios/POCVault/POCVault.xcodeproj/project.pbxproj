@@ -536,7 +536,7 @@
 				POC_VAULT_MANIFEST_PUBLIC_KEY = "";
 				POC_VAULT_MANIFEST_URL = "https://vault.pocs.example.com/manifest.json";
 				POC_VAULT_SIGNATURE_URL = "https://vault.pocs.example.com/manifest.sig.json";
-				RELAY_AUTH_BASE_URL = "http://127.0.0.1:8790";
+				RELAY_AUTH_BASE_URL = "https://api.pocs.example.com";
 				PRODUCT_BUNDLE_IDENTIFIER = com.parikshit.pocvault;
 				PRODUCT_MODULE_NAME = POCVault;
 				PRODUCT_NAME = Relay;
