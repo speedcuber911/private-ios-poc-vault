@@ -29,29 +29,34 @@ struct AuthenticationView: View {
         ZStack {
             AppTheme.canvasGradient.ignoresSafeArea()
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 0) {
-                    brand
-                    fields
-                        .padding(.top, 44)
+            // Centered in the available height (with extra bottom padding so the block
+            // sits just above optical center) and scrollable once the keyboard shrinks it.
+            GeometryReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        brand
+                        fields
+                            .padding(.top, 44)
 
-                    if let error = accountStore.errorMessage {
-                        errorBanner(error)
-                            .padding(.top, 18)
+                        if let error = accountStore.errorMessage {
+                            errorBanner(error)
+                                .padding(.top, 18)
+                        }
+
+                        actions
+                            .padding(.top, 30)
+                        modeSwitch
+                            .padding(.top, 22)
                     }
-
-                    actions
-                        .padding(.top, 30)
-                    modeSwitch
-                        .padding(.top, 22)
+                    .frame(maxWidth: 520)
+                    .padding(.horizontal, 26)
+                    .padding(.top, 40)
+                    .padding(.bottom, 108)
+                    .frame(maxWidth: .infinity)
+                    .frame(minHeight: proxy.size.height, alignment: .center)
                 }
-                .frame(maxWidth: 520)
-                .padding(.horizontal, 26)
-                .padding(.top, 72)
-                .padding(.bottom, 40)
-                .frame(maxWidth: .infinity)
+                .scrollDismissesKeyboard(.interactively)
             }
-            .scrollDismissesKeyboard(.interactively)
         }
         .preferredColorScheme(.dark)
     }
@@ -153,7 +158,10 @@ struct AuthenticationView: View {
             } onCompletion: { result in
                 handleAppleCompletion(result)
             }
-            .signInWithAppleButtonStyle(.whiteOutline)
+            // Black-on-dark keeps Apple's button quieter than the ember CTA; the white
+            // variants outrank the brand's own primary action on this canvas.
+            .signInWithAppleButtonStyle(.black)
+            .overlay(Capsule().stroke(AppTheme.hairlineStrong, lineWidth: 1))
             .frame(height: 50)
             .clipShape(Capsule())
             .disabled(accountStore.isWorking)
