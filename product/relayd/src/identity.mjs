@@ -21,6 +21,7 @@ import { dataDir } from "./config.mjs";
 import { appendAudit } from "./audit.mjs";
 import { nowIso } from "./util.mjs";
 import { store } from "./store.mjs";
+import { generateEncKeyPair } from "./seal.mjs";
 
 const identityDir = process.env.RELAYD_IDENTITY_DIR || path.join(dataDir, "identity");
 
@@ -62,6 +63,8 @@ function identityPaths(baseDir = identityDir) {
     nodeNamePath: path.join(baseDir, "node-name"),
     identityKeyPath: path.join(baseDir, "node-identity.key.pem"),
     identityPubPath: path.join(baseDir, "node-identity.pub.pem"),
+    encKeyPath: path.join(baseDir, "node-enc.key.pem"),
+    encPubPath: path.join(baseDir, "node-enc.pub.b64"),
     caDir: path.join(baseDir, "ca"),
     caKeyPath: path.join(baseDir, "ca", "ca.key.pem"),
     caCertPath: path.join(baseDir, "ca", "ca.cert.pem"),
@@ -107,6 +110,12 @@ function initIdentity({ baseDir = identityDir } = {}) {
     writePrivate(paths.identityPubPath, publicKey.export({ type: "spki", format: "pem" }));
   }
 
+  if (!fs.existsSync(paths.encKeyPath) || !fs.existsSync(paths.encPubPath)) {
+    const encryption = generateEncKeyPair();
+    writePrivate(paths.encKeyPath, encryption.privateKeyPem);
+    writePrivate(paths.encPubPath, `${encryption.publicKeyB64}\n`);
+  }
+
   const nodeId = readNodeId(paths);
   if (!fs.existsSync(paths.caKeyPath)) {
     runOpenssl(["ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", paths.caKeyPath]);
@@ -146,6 +155,22 @@ function readNodeName(paths = identityPaths()) {
   }
 }
 
+function readEncPublicKeyB64(paths = identityPaths()) {
+  try {
+    return fs.readFileSync(paths.encPubPath, "utf8").trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function readEncPrivateKeyPem(paths = identityPaths()) {
+  try {
+    return fs.readFileSync(paths.encKeyPath, "utf8") || null;
+  } catch {
+    return null;
+  }
+}
+
 function getCaPem(baseDir = identityDir) {
   const paths = identityPaths(baseDir);
   return fs.readFileSync(paths.caCertPath, "utf8");
@@ -159,6 +184,7 @@ function identityStatus({ baseDir = identityDir } = {}) {
     nodeId: readNodeId(paths),
     nodeName: readNodeName(paths),
     hasIdentityKey: fs.existsSync(paths.identityKeyPath),
+    hasEncKey: fs.existsSync(paths.encKeyPath),
     hasCa: fs.existsSync(paths.caKeyPath) && fs.existsSync(paths.caCertPath),
     deviceCount: store.listDevices().length,
     revokedCount: store.listRevocations().length,
@@ -390,6 +416,8 @@ export {
   identityStatus,
   readNodeId,
   readNodeName,
+  readEncPublicKeyB64,
+  readEncPrivateKeyPem,
   getCaPem,
   issueDeviceCert,
   publicDevice,
