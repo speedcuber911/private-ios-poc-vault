@@ -97,6 +97,10 @@ if ! server_alive; then
   exit 1
 fi
 
+if [[ -z "$POC_VAULT_MANIFEST_PUBLIC_KEY" ]]; then
+  POC_VAULT_MANIFEST_PUBLIC_KEY="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["publicKey"])' "$ROOT/build/simulator/manifest.sig.json")"
+fi
+
 SIM_ID="${1:-}"
 if [[ -z "$SIM_ID" ]]; then
   SIM_ID="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone 17 Pro/ {print $2; exit}')"
