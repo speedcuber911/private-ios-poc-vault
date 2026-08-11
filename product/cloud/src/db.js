@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   kind        TEXT NOT NULL,
   name        TEXT,
   pubkey      TEXT NOT NULL,
+  enc_pubkey  TEXT,
   version     TEXT,
   last_seen   INTEGER,
   created_at  INTEGER NOT NULL
@@ -113,6 +114,22 @@ CREATE TABLE IF NOT EXISTS trial_nodes (
   updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_trial_state_expires ON trial_nodes (state, expires_at);
+
+-- Sandboxes Relay believes are still alive but can no longer reach through
+-- trial_nodes. Two ways in: account deletion drops the trial row while the
+-- provisioner is unreachable, and the reaper hits its destroy point with the
+-- trial feature's kill switch (E2B_API_URL) unset. Without this table both
+-- cases lose the sandbox id forever, leaving a microVM holding the user's
+-- files with nothing left that could ever name it. Rows carry no user data —
+-- just the ids needed to finish the job later — and are cleared as soon as
+-- the destroy succeeds.
+CREATE TABLE IF NOT EXISTS sandbox_orphans (
+  sandbox_id  TEXT PRIMARY KEY,
+  trial_id    TEXT,
+  account_id  TEXT,
+  reason      TEXT NOT NULL,
+  created_at  INTEGER NOT NULL
+);
 
 CREATE INDEX IF NOT EXISTS idx_devices_account ON devices (account_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_account ON nodes (account_id);

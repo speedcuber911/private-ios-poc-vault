@@ -38,7 +38,17 @@ export function createApp({
 } = {}) {
   const registry = createRegistry(db, { now });
   const legacyAuth = createAuth({ registry, config, jwksFetcher, mailTransport, now });
-  const betterAuth = createRelayBetterAuth({ db, registry, config });
+  const betterAuth = createRelayBetterAuth({
+    db,
+    registry,
+    config,
+    // Deleting the account drops the trial_nodes row, after which nothing can
+    // map the account back to its microVM — so the sandbox has to go first.
+    // releaseSandbox never throws, so a dead Cube host degrades to a recorded
+    // orphan instead of an account that cannot be deleted.
+    beforeAccountDelete: (accountId) =>
+      releaseSandbox(registry.getTrialByAccount(accountId), "account_deleted"),
+  });
   const auth = {
     ...legacyAuth,
     betterAuth: betterAuth.auth,
@@ -52,20 +62,94 @@ export function createApp({
   const apns = createApnsClient({ config, transport: apnsTransport, now });
   const notify = createNotify({ registry, apns, config, now });
 
-  async function sweepTrials() {
-    if (!provisioner) return;
-    for (const trial of registry.listTrialsDue(now())) {
-      if (trial.sandboxId) {
-        try { await provisioner.pauseSandbox(trial.sandboxId); } catch {}
+  // Destroys a trial's sandbox, or records it for reconciliation when it
+  // cannot be destroyed right now (no provisioner configured, or the Cube host
+  // refused/timed out). Never throws: every caller — account deletion and the
+  // reaper — has control-plane work that MUST still happen even when the
+  // sandbox half fails, and an unreachable host must never be able to make an
+  // account undeletable or stall a sweep pass.
+  async function releaseSandbox(trial, reason) {
+    if (!trial?.sandboxId) return;
+    if (provisioner) {
+      try {
+        await provisioner.killSandbox(trial.sandboxId);
+        registry.clearSandboxOrphan(trial.sandboxId);
+        return;
+      } catch (err) {
+        console.error(`sandbox destroy failed (${reason}): ${err?.message}`);
       }
-      registry.updateTrial(trial.id, { state: "expired", enrollTokenHash: null });
     }
-    for (const trial of registry.listTrialsPastGrace(now(), config.trial.graceSec * 1000)) {
-      if (trial.sandboxId) {
-        try { await provisioner.killSandbox(trial.sandboxId); } catch {}
+    registry.recordSandboxOrphan({
+      sandboxId: trial.sandboxId,
+      trialId: trial.id,
+      accountId: trial.accountId,
+      reason,
+    });
+  }
+
+  // Second chance at sandboxes an earlier pass could not destroy. Cheap and
+  // bounded; a no-op while the trial feature is switched off, which is exactly
+  // when the backlog accumulates.
+  async function reconcileSandboxOrphans() {
+    if (!provisioner) return;
+    for (const orphan of registry.listSandboxOrphans()) {
+      try {
+        await provisioner.killSandbox(orphan.sandboxId);
+        registry.clearSandboxOrphan(orphan.sandboxId);
+      } catch (err) {
+        console.error(`orphan reconcile failed: ${err?.message}`);
       }
-      if (trial.nodeId) registry.deleteNode(trial.accountId, trial.nodeId);
-      registry.updateTrial(trial.id, { state: "destroyed" });
+    }
+  }
+
+  // Guard against overlapping passes. runSweeps fires this without awaiting on
+  // a 60 s timer, so a pass slowed by an unresponsive provisioner would
+  // otherwise be re-entered by the next tick and double-issue pause/kill/
+  // deleteNode against the same rows.
+  let trialSweepInFlight = false;
+
+  async function sweepTrials() {
+    if (trialSweepInFlight) return;
+    trialSweepInFlight = true;
+    try {
+      // Lifecycle enforcement is deliberately NOT gated on the provisioner.
+      // `E2B_API_URL` is the kill switch for CREATING trials (POST
+      // /v1/trial-nodes still 404s without it); if unsetting it also switched
+      // off the reaper, every trial already in the wild would stop expiring —
+      // node rows staying live and users keeping access indefinitely, which is
+      // the opposite of what reaching for a kill switch means. Expiring access
+      // is pure control-plane work and always runs. Only the sandbox-destroying
+      // half needs the provisioner, and what it cannot destroy is recorded as
+      // an orphan rather than silently forgotten.
+      //
+      // Each row is isolated: one trial's failure must not abort the pass and
+      // strand every trial behind it.
+      for (const trial of registry.listTrialsDue(now())) {
+        try {
+          if (trial.sandboxId && provisioner) {
+            try { await provisioner.pauseSandbox(trial.sandboxId); } catch {}
+          }
+          // Access expires whether or not the machine could be paused. The row
+          // keeps its sandbox id, so the grace-point destroy can still find it.
+          registry.updateTrial(trial.id, { state: "expired", enrollTokenHash: null });
+        } catch (err) {
+          console.error(`trial expire failed for ${trial.id}: ${err?.message}`);
+        }
+      }
+
+      for (const trial of registry.listTrialsPastGrace(now(), config.trial.graceSec * 1000)) {
+        try {
+          await releaseSandbox(trial, "trial_past_grace");
+          if (trial.nodeId) registry.deleteNode(trial.accountId, trial.nodeId);
+          registry.updateTrial(trial.id, { state: "destroyed" });
+        } catch (err) {
+          console.error(`trial destroy failed for ${trial.id}: ${err?.message}`);
+        }
+      }
+
+      await reconcileSandboxOrphans();
+    } finally {
+      trialSweepInFlight = false;
     }
   }
 
@@ -244,15 +328,16 @@ export function createApp({
       if (!parseNodePubkey(body?.pubkey)) {
         return sendJson(res, 400, { error: "invalid_pubkey" });
       }
+      const encPubkey = strOrNull(body?.encPubkey);
+      if (encPubkey !== null && Buffer.from(encPubkey, "base64").length !== 32) {
+        return sendJson(res, 400, { error: "invalid_enc_pubkey" });
+      }
       if (registry.getNode(nodeId)) {
         return sendJson(res, 409, { error: "node_exists" });
       }
       registry.createNode(trial.accountId, {
-        id: nodeId,
-        kind: "trial",
-        name: "Trial machine",
-        pubkey: String(body.pubkey),
-        version: strOrNull(body?.version),
+        id: nodeId, kind: "trial", name: "Trial machine",
+        pubkey: String(body.pubkey), encPubkey, version: strOrNull(body?.version),
       });
       registry.updateTrial(trial.id, { state: "ready", nodeId, enrollTokenHash: null });
       return sendJson(res, 200, { ok: true, sni: config.tunnel.suffix ? `${nodeId}${config.tunnel.suffix}` : nodeId });
@@ -339,12 +424,16 @@ export function createApp({
       if (!parseNodePubkey(body.pubkey)) {
         return sendJson(res, 400, { error: "invalid_pubkey" });
       }
-      // Entitlement gate.
+      // Entitlement gate. Trial nodes are excluded from the count: the trial
+      // machine is granted by the cloud (the enroll route creates it bypassing
+      // this gate entirely), so counting it against `nodes.max` would 403 every
+      // trial user who tries to register their own box — the exact upgrade path
+      // the trial is meant to lead to.
       const max = Number.parseInt(
         registry.getEntitlement(account.id, "nodes.max") ?? "0",
         10,
       );
-      if (registry.countNodes(account.id) >= max) {
+      if (registry.countNodes(account.id, { includeTrial: false }) >= max) {
         return sendJson(res, 403, {
           error: "entitlement_limit",
           feature: "nodes.max",
@@ -414,8 +503,12 @@ export function createApp({
             expiresAt,
           });
       try {
-        const { sandboxId } = await provisioner.createSandbox({
+        const created = await provisioner.createSandbox({
           envVars: {
+            // main.js refuses to start when E2B_API_URL is set without
+            // ENROLL_BASE_URL, so in production this fallback is unreachable.
+            // It exists for the in-process test app, where the sandbox is a
+            // mock and host:port is the right answer.
             RELAYD_ENROLL_URL: config.enrollBaseUrl || `http://${config.host}:${config.port}`,
             RELAYD_ENROLL_TOKEN: enrollToken,
             RELAYD_ENROLL_PAIRING_ID: pairingId,
@@ -426,26 +519,33 @@ export function createApp({
           },
           metadata: { trialId: trial.id },
         });
+        // A create that yields no usable id is a hard failure, not something to
+        // record as nothing: updateTrial's `!== undefined` filter would skip an
+        // undefined sandboxId silently, and the reaper only acts on trials that
+        // have one — so the machine would run untouched until its platform
+        // timeout. `metadata.trialId` is set on the sandbox, so a
+        // Cube-list-vs-`trial_nodes` reconciliation sweep is the backstop for
+        // the remaining window between create returning and this write.
+        const sandboxId = typeof created?.sandboxId === "string" ? created.sandboxId : "";
+        if (!sandboxId) throw new Error("provisioner_missing_sandbox_id");
         registry.updateTrial(trial.id, { sandboxId });
       } catch {
         registry.updateTrial(trial.id, { state: "failed", enrollTokenHash: null });
         return sendJson(res, 502, { error: "provision_failed" });
       }
-      return sendJson(res, 201, { trial: publicTrial(registry.getTrialById(trial.id), config) });
+      return sendJson(res, 201, { trial: publicTrial(registry.getTrialById(trial.id), config, registry) });
     }
 
     if (path === "/v1/trial-nodes/current" && method === "GET") {
       const trial = registry.getTrialByAccount(account.id);
       if (!trial) return sendJson(res, 404, { error: "no_trial" });
-      return sendJson(res, 200, { trial: publicTrial(trial, config) });
+      return sendJson(res, 200, { trial: publicTrial(trial, config, registry) });
     }
 
     if (path === "/v1/trial-nodes/current" && method === "DELETE") {
       const trial = registry.getTrialByAccount(account.id);
       if (!trial) return sendJson(res, 404, { error: "no_trial" });
-      if (trial.sandboxId && provisioner) {
-        try { await provisioner.killSandbox(trial.sandboxId); } catch {}
-      }
+      await releaseSandbox(trial, "user_deleted_trial");
       if (trial.nodeId) registry.deleteNode(account.id, trial.nodeId);
       registry.updateTrial(trial.id, { state: "destroyed", enrollTokenHash: null });
       return sendJson(res, 204, null);
@@ -539,11 +639,13 @@ function strOrNull(v) {
   return typeof v === "string" && v.length > 0 ? v : null;
 }
 
-function publicTrial(trial, config) {
+function publicTrial(trial, config, registry) {
+  const node = trial.nodeId ? registry.getNode(trial.nodeId) : null;
   return {
     id: trial.id,
     state: trial.state,
     nodeId: trial.nodeId,
+    nodeEncPubkey: node?.encPubkey ?? null,
     sni: trial.nodeId && config.tunnel.suffix ? `${trial.nodeId}${config.tunnel.suffix}` : null,
     createdAt: trial.createdAt,
     expiresAt: trial.expiresAt,
