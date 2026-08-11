@@ -970,11 +970,35 @@ def codex_fixture_job(status: str = "succeeded", result: str | None = None, id: 
     }
 
 
+def simulator_signing_key(manifest_dir: Path) -> Path:
+    configured = os.environ.get("POC_VAULT_SIM_SIGNING_KEY", "").strip()
+    if configured:
+        key_path = Path(configured).expanduser()
+        if not key_path.is_file():
+            raise FileNotFoundError(f"simulator signing key not found: {key_path}")
+        return key_path
+
+    operator_key = Path("~/.poc-vault/secrets/signing/manifest-ed25519.key").expanduser()
+    if operator_key.is_file():
+        return operator_key
+
+    # A simulator fixture must not depend on production operator secrets. Keep a
+    # simulator-only Ed25519 seed under ignored build output and let the launcher
+    # inject its public key into the Debug build.
+    key_path = manifest_dir / "manifest-ed25519.key"
+    if not key_path.exists():
+        descriptor = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="ascii") as key_file:
+            key_file.write(f"{os.urandom(32).hex()}\n")
+    return key_path
+
+
 def refresh_manifest(host: str, port: int) -> None:
     manifest_dir = ROOT / "build" / "simulator"
     manifest_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = manifest_dir / "manifest.json"
     signature_path = manifest_dir / "manifest.sig.json"
+    signing_key = simulator_signing_key(manifest_dir)
     base_url = f"http://{host}:{port}/pocs/{{slug}}"
 
     subprocess.run(
@@ -996,6 +1020,8 @@ def refresh_manifest(host: str, port: int) -> None:
             sys.executable,
             str(ROOT / "ops" / "sign-manifest.py"),
             str(manifest_path),
+            "--key",
+            str(signing_key),
             "-o",
             str(signature_path),
         ],
