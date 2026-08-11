@@ -363,16 +363,53 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(CodexProvider.claude.tabIconAssetName, "ClaudeMark")
     }
 
-    func testRelayDesignTokensUseWarmRedesignPalette() throws {
-        assertColor(AppTheme.bgCanvas, red: 0x1A, green: 0x19, blue: 0x17, alpha: 1)
-        assertColor(AppTheme.bgSurface, red: 0xED, green: 0xE8, blue: 0xDF, alpha: 0.06)
-        assertColor(AppTheme.bgSurfaceHi, red: 0x23, green: 0x22, blue: 0x20, alpha: 1)
+    func testRelayDesignTokensUseEditorialEmberPalette() throws {
+        assertColor(AppTheme.canvasTop, red: 0x1E, green: 0x1B, blue: 0x17, alpha: 1)
+        assertColor(AppTheme.canvasBottom, red: 0x15, green: 0x13, blue: 0x10, alpha: 1)
+        assertColor(AppTheme.bgCanvas, red: 0x1A, green: 0x18, blue: 0x15, alpha: 1)
         assertColor(AppTheme.textPrimary, red: 0xED, green: 0xE8, blue: 0xDF, alpha: 1)
-        assertColor(AppTheme.textSecondary, red: 0xED, green: 0xE8, blue: 0xDF, alpha: 0.45)
-        assertColor(AppTheme.textTertiary, red: 0xED, green: 0xE8, blue: 0xDF, alpha: 0.27)
+        assertColor(AppTheme.textSecondary, red: 0xED, green: 0xE8, blue: 0xDF, alpha: 0.55)
+        assertColor(AppTheme.textTertiary, red: 0xED, green: 0xE8, blue: 0xDF, alpha: 0.38)
+        assertColor(AppTheme.textFaint, red: 0xED, green: 0xE8, blue: 0xDF, alpha: 0.25)
+        assertColor(AppTheme.hairline, red: 0xED, green: 0xE8, blue: 0xDF, alpha: 0.10)
+        assertColor(AppTheme.hairlineStrong, red: 0xED, green: 0xE8, blue: 0xDF, alpha: 0.16)
         assertColor(AppTheme.accent, red: 0xD4, green: 0x80, blue: 0x4A, alpha: 1)
-        assertColor(AppTheme.statusOK, red: 0x32, green: 0xD7, blue: 0x4B, alpha: 1)
-        assertColor(AppTheme.statusWarn, red: 0xFF, green: 0x9F, blue: 0x0A, alpha: 1)
+        assertColor(AppTheme.accentBright, red: 0xE8, green: 0x96, blue: 0x5C, alpha: 1)
+        assertColor(AppTheme.accentDeep, red: 0xC9, green: 0x6F, blue: 0x35, alpha: 1)
+        assertColor(AppTheme.onEmber, red: 0x1C, green: 0x12, blue: 0x07, alpha: 1)
+        assertColor(AppTheme.statusWarn, red: 0xE0, green: 0xB2, blue: 0x5C, alpha: 1)
+        assertColor(AppTheme.statusError, red: 0xD9, green: 0x77, blue: 0x6B, alpha: 1)
+    }
+
+    /// Editorial Ember rule 5: status is a small-caps word, never a colored dot, and
+    /// success renders in cream rather than green. Guards against reintroducing the
+    /// blob-pill/indicator-dot pattern the redesign removed.
+    func testStatusIndicatorsStayTypographic() throws {
+        for path in [appSourcePath, relayChatSourcePath, fileBrowserSourcePath, diagnosticsSourcePath] {
+            let source = try String(contentsOfFile: path, encoding: .utf8)
+            let file = URL(fileURLWithPath: path).lastPathComponent
+
+            // The retired green/amber status tokens are gone from AppTheme entirely.
+            XCTAssertFalse(source.contains("statusOK"), "\(file) still references statusOK")
+            XCTAssertFalse(source.contains("statusNeutral"), "\(file) still references statusNeutral")
+            XCTAssertFalse(source.contains("statusInfo"), "\(file) still references statusInfo")
+
+            // No status shape: a filled circle tinted by a status color is the exact
+            // pattern the redesign replaced with RelayCapsLabel.
+            XCTAssertFalse(
+                source.contains("Circle().fill(AppTheme.status"),
+                "\(file) renders a colored status dot"
+            )
+            XCTAssertFalse(
+                source.contains("checkmark.circle.fill"),
+                "\(file) renders a status glyph instead of a status word"
+            )
+        }
+
+        // Job status renders as a ticking typographic label.
+        let chatSource = try String(contentsOfFile: relayChatSourcePath, encoding: .utf8)
+        XCTAssertTrue(chatSource.contains("RelayCapsLabel"))
+        XCTAssertTrue(chatSource.contains("TimelineView"))
     }
 
     func testRootIsFileBrowserNavigationStack() throws {
@@ -1582,8 +1619,11 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(source.contains("item.workspaceLabel"))
         XCTAssertTrue(source.contains("await viewModel.openHistoryItem(item)"))
         XCTAssertTrue(source.contains("Text(\"Threads\")"))
-        XCTAssertTrue(source.contains("Past conversations & invocations"))
+        // The explanatory subtitle was dropped by the Editorial Ember copy rule; the
+        // row is still reachable and labeled for VoiceOver.
+        XCTAssertFalse(source.contains("Past conversations & invocations"))
         XCTAssertTrue(source.contains(".accessibilityIdentifier(\"relay-threads\")"))
+        XCTAssertTrue(source.contains("conversations and invocations"))
         XCTAssertTrue(source.contains(".navigationTitle(\"Threads\")"))
         XCTAssertFalse(source.contains("clock.arrow.circlepath"))
         XCTAssertTrue(source.contains("@State private var fullLogRequest: RelayFullLogRequest?"))
@@ -2196,6 +2236,22 @@ final class ManifestTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent("POCVault/Views/RelayChatView.swift")
+            .path
+    }
+
+    private var fileBrowserSourcePath: String {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("POCVault/Browser/FileBrowserView.swift")
+            .path
+    }
+
+    private var diagnosticsSourcePath: String {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("POCVault/Views/DiagnosticsView.swift")
             .path
     }
 
