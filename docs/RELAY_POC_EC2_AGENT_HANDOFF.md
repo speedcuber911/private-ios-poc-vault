@@ -451,7 +451,9 @@ This workspace had an active concurrent trial/iOS session. While the
 deployment was being verified, that session created checkpoint commit
 `ca12db16df7438341bf617868d0713e1af3a91ae`. It included the deployment files
 and initial deployment docs together with its trial, broker, relayd, and iOS
-checkpoint. Follow-up commits `cdb6e87` and `d4d89b1` fixed the trial iOS target.
+checkpoint. Concurrent commit `cdb6e87` immediately preceded that checkpoint
+and corrected the Debug-device auth setting; follow-up `d4d89b1` wired the
+remaining trial flow files into the Xcode target.
 
 That combined checkpoint is historical fact; do not rewrite it or attribute
 the trial/iOS code to this deployment task. Use the file inventory in this
