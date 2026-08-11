@@ -32,7 +32,8 @@ test("the wrong recipient cannot open a sealed blob", () => {
   const recipient = generateEncKeyPair();
   const stranger = generateEncKeyPair();
   const sealed = sealTo(recipient.publicKeyB64, Buffer.from("secret", "utf8"));
-  assert.throws(() => openSealed(stranger.privateKeyPem, sealed), /seal_decrypt_failed/);
+  assert.throws(() => openSealed(stranger.privateKeyPem, sealed),
+    (e) => e.message === "seal_decrypt_failed" && e.cause instanceof Error);
 });
 
 test("tampering with any byte of the blob is detected", () => {
@@ -71,7 +72,16 @@ const RECIP_PEM = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VuBCIEIBERERERERER
 const SEALED_HEX = "524c595345414c310faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f2033333333333333333333333315e6f96ff6516ef5f9864d7e33bd639339573d6da63608b07ac57634214debf19e9826dd3a28164f583736b7d8b9c62d22";
 
 test("known-answer vector pins the wire format and the KDF", () => {
-  assert.equal(openSealed(RECIP_PEM, Buffer.from(SEALED_HEX, "hex")).toString("utf8"),
+  const sealed = Buffer.from(SEALED_HEX, "hex");
+  // Guard the fixture itself: a truncated or corrupted hex literal above
+  // must fail loudly right here, as an obvious fixture problem, instead of
+  // surfacing later as a confusing decrypt failure that looks like a crypto
+  // regression.
+  assert.equal(sealed.length, 101, "known-answer fixture must decode to exactly 101 bytes");
+  assert.ok(sealed.subarray(0, SEAL_MAGIC.length).equals(SEAL_MAGIC),
+    "known-answer fixture must start with the seal magic");
+
+  assert.equal(openSealed(RECIP_PEM, sealed).toString("utf8"),
     "relay handoff known-answer vector");
 });
 
@@ -84,8 +94,10 @@ test("a malformed or wrong-type private key is rejected before touching the seal
   const recipient = generateEncKeyPair();
   const sealed = sealTo(recipient.publicKeyB64, Buffer.from("secret", "utf8"));
 
-  assert.throws(() => openSealed("not a pem at all", sealed), /seal_bad_private_key/);
-  assert.throws(() => openSealed("", sealed), /seal_bad_private_key/);
+  assert.throws(() => openSealed("not a pem at all", sealed),
+    (e) => e.message === "seal_bad_private_key" && e.cause instanceof Error);
+  assert.throws(() => openSealed("", sealed),
+    (e) => e.message === "seal_bad_private_key" && e.cause instanceof Error);
 
   const { privateKey: ed25519Key } = crypto.generateKeyPairSync("ed25519");
   const ed25519Pem = ed25519Key.export({ type: "pkcs8", format: "pem" });
@@ -96,7 +108,13 @@ test("a Uint8Array view of a valid blob opens correctly", () => {
   const recipient = generateEncKeyPair();
   const plaintext = Buffer.from("view me", "utf8");
   const sealed = sealTo(recipient.publicKeyB64, plaintext);
-  const view = new Uint8Array(sealed);
+  // Build the view at a non-zero byteOffset into a larger backing buffer so
+  // this test cannot pass by accident: normalizing with something like
+  // Buffer.from(input.buffer) (dropping byteOffset/byteLength) would read
+  // from the start of `backing` instead of the sealed slice and fail.
+  const backing = new Uint8Array(7 + sealed.length);
+  backing.set(sealed, 7);
+  const view = new Uint8Array(backing.buffer, 7, sealed.length);
   assert.deepEqual(openSealed(recipient.privateKeyPem, view), plaintext);
 });
 
@@ -106,22 +124,37 @@ test("a genuine non-buffer input is rejected as seal_bad_input", () => {
   assert.throws(() => openSealed(recipient.privateKeyPem, null), /seal_bad_input/);
 });
 
+// Fixed fixture (not randomly generated) so it deterministically contains
+// both "+" and "/": a randomly generated key has a measured ~27% chance of
+// containing neither, which would silently turn the url-safe variant below
+// into a no-op.
+const CANONICAL_PUBLIC_KEY_B64 = "D0+e1jCPrC5UvQ+oMWuxPa8VbAoDPFGm7qFK/wYUKQE=";
+
 test("sealTo requires the canonical base64 encoding of the recipient public key", () => {
-  const recipient = generateEncKeyPair();
-  const raw = Buffer.from(recipient.publicKeyB64, "base64");
+  const raw = Buffer.from(CANONICAL_PUBLIC_KEY_B64, "base64");
+  assert.equal(raw.length, 32);
 
-  const urlSafe = recipient.publicKeyB64.replace(/\+/g, "-").replace(/\//g, "_");
-  const whitespace = `${recipient.publicKeyB64}\n`;
-  const invalidChar = `!${recipient.publicKeyB64.slice(1)}`;
+  const urlSafe = CANONICAL_PUBLIC_KEY_B64.replace(/\+/g, "-").replace(/\//g, "_");
+  const whitespace = `${CANONICAL_PUBLIC_KEY_B64}\n`;
+  const invalidChar = `!${CANONICAL_PUBLIC_KEY_B64.slice(1)}`;
+  // The trailing pre-"=" character encodes 4 real data bits followed by 2
+  // padding bits that a canonical encoder always sets to zero. Bumping that
+  // character to the next one in its 4-character alphabet group flips only
+  // the (discarded) padding bits, so it decodes to the exact same 32 bytes
+  // while being a different, non-canonical string — a regex character-class
+  // check (e.g. /^[A-Za-z0-9+/]{43}=$/) would wrongly accept it; only a real
+  // encode/decode round-trip catches it.
+  const aliasedTrailingChar = "D0+e1jCPrC5UvQ+oMWuxPa8VbAoDPFGm7qFK/wYUKQF=";
+  assert.notEqual(aliasedTrailingChar, CANONICAL_PUBLIC_KEY_B64);
+  assert.deepEqual(Buffer.from(aliasedTrailingChar, "base64"), raw,
+    "the aliased encoding must decode to the identical 32 bytes");
 
-  for (const variant of [urlSafe, whitespace, invalidChar]) {
-    if (variant === recipient.publicKeyB64) continue;
+  for (const variant of [urlSafe, whitespace, invalidChar, aliasedTrailingChar]) {
     assert.throws(() => sealTo(variant, Buffer.from("x")), /seal_bad_public_key/,
       `non-canonical encoding must be rejected: ${JSON.stringify(variant)}`);
   }
 
-  // sanity check the fixture actually still decodes to the same 32 bytes,
-  // otherwise the test above would be pinning the wrong thing
+  // sanity check the url-safe variant actually still decodes to the same 32
+  // bytes, otherwise the loop above would be pinning the wrong thing
   assert.equal(Buffer.from(urlSafe.replace(/-/g, "+").replace(/_/g, "/"), "base64").length, 32);
-  assert.equal(raw.length, 32);
 });

@@ -5,9 +5,9 @@
 // manifests and session transcripts are sealed on the laptop before they are
 // committed to a git branch, so GitHub only ever stores ciphertext.
 //
-// CANONICAL COPY. A later task will vendor a byte-identical copy of this file
-// into product/cli/src/seal.mjs, guarded by a drift test at
-// product/cli/test/seal-vendor.test.mjs that will fail if the two files
+// CANONICAL COPY. product/cli/src/seal.mjs vendors a byte-identical copy of
+// this file, guarded by a drift test at
+// product/cli/test/seal-vendor.test.mjs that fails if the two files
 // diverge.
 //
 // Errors thrown (Error#message — callers match against these exact strings,
