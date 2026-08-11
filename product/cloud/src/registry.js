@@ -184,6 +184,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       if (account.email) {
         db.prepare("DELETE FROM magic_links WHERE email = ?").run(account.email);
       }
+      db.prepare("DELETE FROM device_codes WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM accounts WHERE id = ?").run(accountId);
       db.exec("COMMIT");
       return true;
@@ -676,6 +677,40 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     db.prepare("UPDATE magic_links SET used_at = ? WHERE id = ?").run(now(), id);
   }
 
+  // ── device codes (CLI login) ────────────────────────────────────────────
+  function createDeviceCode({ deviceCodeHash, userCode, expiresAt }) {
+    const id = randomUUID();
+    db.prepare(
+      "INSERT INTO device_codes (id, device_code_hash, user_code, expires_at, created_at) VALUES (?, ?, ?, ?, ?)",
+    ).run(id, deviceCodeHash, userCode, expiresAt, now());
+    return mapDeviceCode(db.prepare("SELECT * FROM device_codes WHERE id = ?").get(id));
+  }
+
+  function getDeviceCodeByHash(hash) {
+    if (!hash) return null;
+    return mapDeviceCode(db.prepare("SELECT * FROM device_codes WHERE device_code_hash = ?").get(hash));
+  }
+
+  function getDeviceCodeByUserCode(userCode) {
+    if (!userCode) return null;
+    return mapDeviceCode(db.prepare("SELECT * FROM device_codes WHERE user_code = ?").get(userCode));
+  }
+
+  function approveDeviceCode(id, accountId) {
+    db.prepare("UPDATE device_codes SET account_id = ?, approved_at = ? WHERE id = ?").run(accountId, now(), id);
+    return mapDeviceCode(db.prepare("SELECT * FROM device_codes WHERE id = ?").get(id));
+  }
+
+  function consumeDeviceCode(id) {
+    const result = db.prepare("UPDATE device_codes SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL")
+      .run(now(), id);
+    return result.changes > 0;
+  }
+
+  function sweepDeviceCodes(nowMs) {
+    db.prepare("DELETE FROM device_codes WHERE expires_at <= ?").run(nowMs);
+  }
+
   // ── pairing sessions (protocol v2) ──────────────────────────────────────
   //
   // The cloud stores sha256(authToken) — never a pairing secret, which it is
@@ -869,6 +904,12 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     insertMagicLink,
     findMagicLink,
     markMagicLinkUsed,
+    createDeviceCode,
+    getDeviceCodeByHash,
+    getDeviceCodeByUserCode,
+    approveDeviceCode,
+    consumeDeviceCode,
+    sweepDeviceCodes,
     insertPairingSession,
     getPairingSession,
     setPairingBlob,
@@ -923,6 +964,19 @@ function mapNode(row) {
     version: row.version,
     lastSeen: row.last_seen == null ? null : Number(row.last_seen),
     createdAt: Number(row.created_at),
+  };
+}
+
+function mapDeviceCode(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    userCode: row.user_code,
+    accountId: row.account_id ?? null,
+    approvedAt: row.approved_at ?? null,
+    consumedAt: row.consumed_at ?? null,
+    expiresAt: row.expires_at,
+    createdAt: row.created_at,
   };
 }
 

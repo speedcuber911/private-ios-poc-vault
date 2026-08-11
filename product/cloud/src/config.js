@@ -1,7 +1,16 @@
 // Relay Cloud configuration. All values come from the environment; nothing is
 // read from disk here. No secrets are ever echoed back in logs or responses.
 
+// Margin between Relay's own destroy point (ttl + grace) and the sandbox-level
+// auto-kill we hand the platform. The reaper runs every 60 s, so an hour is
+// ample for it to act first; in the normal case Relay destroys the sandbox and
+// the platform timer never fires at all.
+const SANDBOX_TIMEOUT_MARGIN_SEC = 3600;
+
 export function loadConfig(env = process.env) {
+  const trialTtlSec = intFrom(env.TRIAL_TTL_SEC, 7 * 24 * 3600);
+  const trialGraceSec = intFrom(env.TRIAL_GRACE_SEC, 3 * 24 * 3600);
+
   return {
     port: intFrom(env.PORT, 8790),
     host: env.HOST || "127.0.0.1",
@@ -34,6 +43,11 @@ export function loadConfig(env = process.env) {
     // Magic link
     magicLinkBaseUrl: env.MAGIC_LINK_BASE_URL || "https://<domain>/auth/confirm",
     magicLinkTtlSec: intFrom(env.MAGIC_LINK_TTL_SEC, 15 * 60),
+
+    // Device-code login (CLI, no browser)
+    deviceCodeTtlSec: intFrom(env.DEVICE_CODE_TTL_SEC, 900),
+    deviceCodePollIntervalSec: intFrom(env.DEVICE_CODE_POLL_INTERVAL_SEC, 5),
+    deviceLoginUrl: env.DEVICE_LOGIN_URL || "https://relay.example/cli-login",
 
     // Pairing rendezvous
     pairingTtlSec: intFrom(env.PAIRING_TTL_SEC, 15 * 60),
@@ -69,10 +83,40 @@ export function loadConfig(env = process.env) {
       templateId: env.TRIAL_TEMPLATE_ID || "",
     },
     trial: {
-      ttlSec: intFrom(env.TRIAL_TTL_SEC, 7 * 24 * 3600),
-      graceSec: intFrom(env.TRIAL_GRACE_SEC, 3 * 24 * 3600),
+      ttlSec: trialTtlSec,
+      graceSec: trialGraceSec,
       maxActive: intFrom(env.TRIAL_MAX_ACTIVE, 20),
-      sandboxTimeoutMs: intFrom(env.TRIAL_SANDBOX_TIMEOUT_MS, 3600 * 1000),
+
+      // Sandbox-level auto-kill handed to the platform at create time, in
+      // SECONDS — the unit of the E2B/Cube `timeout` field (verified against
+      // the Cube source: CubeAPI forwards the field unconverted and CubeMaster
+      // builds `context.WithTimeout(ctx, timeout * time.Second)`).
+      //
+      // DERIVED from the trial lifecycle on purpose. It used to be an
+      // independent 1-hour constant, which is wrong by 168x against a 7-day
+      // trial: this value is the backstop that destroys a machine whose row
+      // lost track of its sandbox id, so it has to OUTLIVE Relay's own destroy
+      // point (ttl + grace) rather than race it. Too short and it kills live
+      // trials an hour after signup; too long and it stops being a backstop at
+      // all.
+      //
+      // The `_SEC` suffix is load-bearing — the previous `_MS` name is what
+      // let a millisecond value reach a seconds field and ask for ~41 days.
+      // Clamped to a positive floor because Cube treats 0/absent as its own
+      // 60-second default, which would silently cap every trial at one minute.
+      sandboxTimeoutSec: Math.max(
+        60,
+        intFrom(
+          env.TRIAL_SANDBOX_TIMEOUT_SEC,
+          trialTtlSec + trialGraceSec + SANDBOX_TIMEOUT_MARGIN_SEC,
+        ),
+      ),
+
+      // Wall-clock bound on every provisioner HTTP call. Node's fetch has no
+      // default timeout, so without this a hung Cube host leaves
+      // POST /v1/trial-nodes pending forever and — worse — stalls the reaper
+      // mid-pass, silently stopping all later expiry work.
+      provisionerTimeoutMs: intFrom(env.TRIAL_PROVISIONER_TIMEOUT_MS, 30_000),
     },
     tunnel: {
       host: env.TUNNEL_HOST || "",

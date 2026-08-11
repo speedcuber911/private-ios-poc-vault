@@ -131,6 +131,19 @@ CREATE TABLE IF NOT EXISTS sandbox_orphans (
   created_at  INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS device_codes (
+  id TEXT PRIMARY KEY,
+  device_code_hash TEXT NOT NULL,
+  user_code TEXT NOT NULL,
+  account_id TEXT,
+  approved_at INTEGER,
+  consumed_at INTEGER,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_device_codes_expires ON device_codes (expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_device_codes_user_code ON device_codes (user_code);
+
 CREATE INDEX IF NOT EXISTS idx_devices_account ON devices (account_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_account ON nodes (account_id);
 CREATE INDEX IF NOT EXISTS idx_node_events_created ON node_events (created_at);
