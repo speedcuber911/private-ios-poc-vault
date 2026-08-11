@@ -15,10 +15,10 @@ publicly healthy in the user's non-Cut AWS account.
 - Target: `poc-ec2`, instance `i-0ce97c38c7fd74825`.
 - Public API: `https://relay.ai-rocket-experiments.com`.
 - Current deployed CodeCommit revision:
-  `a70fd243790fda142531196fb878dfd7a3443d06`.
-- CodePipeline execution `990ba90a-626c-4582-a03f-020f3f0327e9` succeeded.
+  `97ac329a20377af3212444973d9946c171cb7f0a`.
+- CodePipeline execution `6f86db2d-a8ca-4fe8-bdfe-24fd7dc32da6` succeeded.
 - CodeBuild execution
-  `relay-cloud-deploy:cf436ed5-579c-46dc-83be-504dfa1255ea` succeeded.
+  `relay-cloud-deploy:56d30cf0-94d5-4216-a24f-425ac0f88d50` succeeded.
 - The service, SQLite database, online backup timer, nginx route, public TLS,
   Route 53 record, dedicated CodeCommit repository, and AWS-native CI/CD path
   are live.
@@ -222,6 +222,7 @@ The initial CodeCommit history is:
 a45af2b Deploy Relay cloud control plane
 ec47863 Fix SSM deploy shell compatibility
 a70fd24 Harden Relay cloud database permissions
+97ac329 Fix pipeline artifact retention prefix
 ```
 
 Future agents should clone that repository into a clean temporary directory,
@@ -312,13 +313,31 @@ The service recovered normally. Any scripted restart check must use
 `curl --retry-connrefused` or an explicit readiness loop; a one-shot immediate
 curl is not a valid failure signal.
 
+### 8. Artifact lifecycle prefix correction
+
+The final documentation audit found that CodePipeline stores temporary
+artifacts below `relay-cloud-deploy/`, while the first CloudFormation lifecycle
+rule targeted `codepipeline/`. The rule was corrected in source and in the live
+stack. CloudFormation reached `UPDATE_COMPLETE`, and a live bucket read showed
+`PipelineArtifactRetention` enabled for `relay-cloud-deploy/` with 30-day
+expiration. Revision `97ac329` passed the complete pipeline and became the
+final deployed release.
+
+The Git HTTPS push for this one-file change returned 403 even though STS still
+confirmed the correct identity and earlier pushes had succeeded. The change
+was therefore published with `aws codecommit put-file`, an explicit parent
+commit of `a70fd243...`, and the checked-in file content, producing
+`97ac329...`. Treat the Git failure as unresolved/transient: verify the
+credential helper and branch head before the next push, and never guess a
+parent commit for a CodeCommit API write.
+
 ## Final verification evidence
 
 ### Build and pipeline
 
 ```text
 CodePipeline status: Succeeded
-deployed revision: a70fd243790fda142531196fb878dfd7a3443d06
+deployed revision: 97ac329a20377af3212444973d9946c171cb7f0a
 CodeBuild Node: 22
 cloud tests: 59 pass, 0 fail
 ```
@@ -330,7 +349,7 @@ passed.
 ### Runtime and database
 
 ```text
-release=a70fd243790fda142531196fb878dfd7a3443d06
+release=97ac329a20377af3212444973d9946c171cb7f0a
 service=active
 service_enabled=enabled
 listener=127.0.0.1:8790
@@ -426,25 +445,23 @@ migrations, fixture tests, data reconciliation, cutover, rollback, and new
 backup procedures. Do not point Relay at the existing PostgreSQL service and
 call the migration complete.
 
-## Dirty-worktree boundary
+## Commit and concurrent-work boundary
 
-At handoff time the branch contained unrelated in-progress changes under iOS,
-broker, relayd, trial planning, and cloud trial source/tests. Those files were
-not authored by this deployment task and must not be swept into its commit.
+This workspace had an active concurrent trial/iOS session. While the
+deployment was being verified, that session created checkpoint commit
+`ca12db16df7438341bf617868d0713e1af3a91ae`. It included the deployment files
+and initial deployment docs together with its trial, broker, relayd, and iOS
+checkpoint. Follow-up commits `cdb6e87` and `d4d89b1` fixed the trial iOS target.
 
-The deployment commit should contain only:
+That combined checkpoint is historical fact; do not rewrite it or attribute
+the trial/iOS code to this deployment task. Use the file inventory in this
+document to identify the deployment-owned portion. The final release and
+documentation corrections were validated after that checkpoint.
 
-- the deployment/runtime files listed above;
-- `README.md` documentation links;
-- `docs/RELAY_POC_EC2_DEPLOYMENT.md`;
-- this handoff;
-- the deployment-specific hunks in `product/cloud/README.md` and
-  `product/STATUS.md`;
-- the current-deployment additions in `product/DEPLOY.md`.
-
-When staging `product/cloud/README.md` and `product/STATUS.md`, preserve the
-other worker's trial-sandbox documentation in the working tree and do not
-claim it as part of the deployment commit.
+At the final documentation commit, the only unrelated worktree entry still
+visible was untracked `.claude/settings.json`; it was intentionally left
+untouched and uncommitted. Future agents must re-run `git status --short`
+because another session can change the branch at any time.
 
 ## How the next agent should start
 
