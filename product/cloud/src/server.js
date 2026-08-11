@@ -156,6 +156,7 @@ export function createApp({
   function runSweeps() {
     pairing.sweep();
     notify.sweep();
+    registry.sweepDeviceCodes(now());
     sweepTrials().catch((err) => console.error(`trial sweep failed: ${err?.message}`));
   }
 
@@ -216,6 +217,40 @@ export function createApp({
       const session = auth.confirmMagicLink(body?.token);
       if (!session) return sendJson(res, 401, { error: "invalid_or_expired_link" });
       return sendJson(res, 200, session);
+    }
+
+    // ── device-code login (CLI, no browser) ─────────────────────────────
+    //
+    // Unauthenticated by construction — the CLI has no session yet, which is
+    // the entire point of the flow. /device/approve, which mints the
+    // session, lives below the session-auth boundary because only a
+    // signed-in human may approve a pending code.
+    if (method === "POST" && path === "/v1/auth/device/start") {
+      const deviceCode = randomBytes(32).toString("base64url");
+      const record = registry.createDeviceCode({
+        deviceCodeHash: sha256Hex(deviceCode),
+        userCode: mintUserCode(),
+        expiresAt: now() + config.deviceCodeTtlSec * 1000,
+      });
+      return sendJson(res, 201, {
+        deviceCode,
+        userCode: record.userCode,
+        verificationUri: config.deviceLoginUrl,
+        interval: config.deviceCodePollIntervalSec,
+        expiresIn: config.deviceCodeTtlSec,
+      });
+    }
+
+    if (method === "POST" && path === "/v1/auth/device/token") {
+      const body = await readJson(req, config.jsonBodyMaxBytes);
+      const record = registry.getDeviceCodeByHash(sha256Hex(strOrNull(body?.deviceCode) || ""));
+      if (!record || record.consumedAt !== null) return sendJson(res, 400, { error: "invalid_grant" });
+      if (record.expiresAt <= now()) return sendJson(res, 400, { error: "expired_token" });
+      if (record.accountId === null) return sendJson(res, 400, { error: "authorization_pending" });
+      if (!registry.consumeDeviceCode(record.id)) return sendJson(res, 400, { error: "invalid_grant" });
+      const account = registry.getAccount(record.accountId);
+      if (!account) return sendJson(res, 400, { error: "invalid_grant" });
+      return sendJson(res, 200, auth.issueSession(account));
     }
 
     // ── waitlist (public) ───────────────────────────────────────────────
@@ -364,6 +399,17 @@ export function createApp({
     // ── session-authed registry endpoints ───────────────────────────────
     const account = await auth.authenticate(req);
     if (!account) return sendJson(res, 401, { error: "unauthorized" });
+
+    if (method === "POST" && path === "/v1/auth/device/approve") {
+      const body = await readJson(req, config.jsonBodyMaxBytes);
+      const userCode = normalizeUserCode(body?.userCode);
+      const record = userCode ? registry.getDeviceCodeByUserCode(userCode) : null;
+      if (!record || record.consumedAt !== null || record.expiresAt <= now()) {
+        return sendJson(res, 404, { error: "unknown_user_code" });
+      }
+      registry.approveDeviceCode(record.id, account.id);
+      return sendJson(res, 200, { ok: true });
+    }
 
     if (method === "GET" && path === "/v1/account") {
       return sendJson(res, 200, {
@@ -654,4 +700,24 @@ function publicTrial(trial, config, registry) {
 
 function sha256Hex(value) {
   return createHash("sha256").update(String(value)).digest("hex");
+}
+
+// No vowels — no accidental words; no 0/O/1/I — no misreads over a phone or
+// a squinted-at terminal.
+const USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ23456789";
+
+function mintUserCode() {
+  const bytes = randomBytes(8);
+  let code = "";
+  for (const byte of bytes) code += USER_CODE_ALPHABET[byte % USER_CODE_ALPHABET.length];
+  return `${code.slice(0, 4)}-${code.slice(4)}`;
+}
+
+// Matching is case-insensitive and ignores the dash: accept whatever the
+// user typed, normalize it to the canonical ABCD-EFGH shape stored in the
+// registry.
+function normalizeUserCode(value) {
+  const cleaned = String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (cleaned.length !== 8) return null;
+  return `${cleaned.slice(0, 4)}-${cleaned.slice(4)}`;
 }
