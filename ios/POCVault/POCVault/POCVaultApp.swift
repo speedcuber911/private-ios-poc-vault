@@ -648,9 +648,14 @@ struct RelayPrimaryButtonStyle: ButtonStyle {
             .background(
                 isEnabled
                     ? AnyShapeStyle(AppTheme.accentGradient)
-                    : AnyShapeStyle(AppTheme.textPrimary.opacity(0.08)),
+                    : AnyShapeStyle(AppTheme.textPrimary.opacity(0.04)),
                 in: Capsule()
             )
+            .overlay {
+                if !isEnabled {
+                    Capsule().stroke(AppTheme.hairline, lineWidth: 1)
+                }
+            }
             .shadow(color: isEnabled ? AppTheme.emberShadow : .clear, radius: 20, y: 6)
             .opacity(configuration.isPressed ? 0.85 : 1)
     }

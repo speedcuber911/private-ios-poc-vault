@@ -247,6 +247,7 @@ struct FileBrowserView: View {
                 onOpenChat(viewModel.path, viewModel.listing?.selectedWorkspace?.id)
             } label: {
                 Image(systemName: "apple.terminal")
+                    .foregroundStyle(AppTheme.accent)
             }
             .accessibilityLabel("Open chat for this folder")
             .accessibilityIdentifier("relay-open-chat")
@@ -293,7 +294,9 @@ struct FileBrowserView: View {
                     }
                 }
             } label: {
-                Image(systemName: "ellipsis.circle")
+                // Cream, not ember: the chat action is this screen's one earned accent.
+                Image(systemName: "ellipsis")
+                    .foregroundStyle(AppTheme.textSecondary)
             }
             .accessibilityLabel("Folder options")
         }
