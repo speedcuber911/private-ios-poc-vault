@@ -23,7 +23,7 @@ Every task's requirements implicitly include this section.
 - **No force-push, ever.** `git push <remote> <branch>` only.
 - **Cloud long-polls must return in < 300 s** (nginx `proxy_read_timeout`); the cap in this plan is 25 s.
 - **iOS:** `AppTheme` has no success/OK color by design. A "ready" state renders in `AppTheme.textSecondary`. Never introduce `statusOK`/`statusInfo`/`statusNeutral`, `Circle().fill(AppTheme.status…)`, or `checkmark.circle.fill` — `ManifestTests.testStatusIndicatorsStayTypographic()` scans source text for those strings.
-- **Every new Swift file needs four `project.pbxproj` edits** (PBXFileReference, PBXBuildFile, PBXGroup membership, Sources build phase). Next free IDs: file refs from `100000000000000000000051`, build files from `200000000000000000000047`.
+- **Every new Swift file needs four `project.pbxproj` edits** (PBXFileReference, PBXBuildFile, PBXGroup membership, Sources build phase). Next free IDs: file refs from `100000000000000000000052`, build files from `200000000000000000000048`. (`…051`/`…047` are taken by `TrialStatusBanner.swift`.) **Re-check the highest id in use before assigning** — parallel work lands new files.
 - **Commit after every task.** Conventional-commit subjects (`feat:`, `test:`, `docs:`).
 
 ---
@@ -5652,29 +5652,10 @@ final class HandoffTests: XCTestCase {
         XCTAssertEqual(index.sessions[0].title, "Fix auth")
     }
 
-    // MARK: - Design rules
-
-    func testHandoffCardNeverRendersADotOrGlyphForStatus() throws {
-        let source = try String(contentsOfFile: handoffCardSourcePath, encoding: .utf8)
-        XCTAssertFalse(source.contains("Circle().fill(AppTheme.status"), "handoff card renders a colored status dot")
-        XCTAssertFalse(source.contains("checkmark.circle.fill"), "handoff card renders a status glyph")
-        XCTAssertFalse(source.contains("statusOK"))
-        XCTAssertFalse(source.contains("statusInfo"))
-        XCTAssertFalse(source.contains("statusNeutral"))
-    }
-
     // MARK: - Helpers
 
     private func decodeCard(_ json: String) throws -> RelayHandoffCard {
         try JSONDecoder.relayTestDecoder().decode(RelayHandoffCard.self, from: Data(json.utf8))
-    }
-
-    private var handoffCardSourcePath: String {
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("POCVault/Views/RelayHandoffCardView.swift")
-            .path
     }
 }
 ```
@@ -5711,8 +5692,8 @@ extension ISO8601DateFormatter {
 
 Run:
 ```bash
-xcodebuild test -project ios/POCVault/POCVault.xcodeproj -scheme POCVault \
-  -destination 'platform=iOS Simulator,name=iPhone 16' 2>&1 | tail -30
+set -o pipefail; xcodebuild test -project ios/POCVault/POCVault.xcodeproj -scheme POCVault \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' 2>&1 | tail -30
 ```
 Expected: FAIL — `cannot find 'RelayHandoffCard' in scope`.
 
@@ -5893,10 +5874,10 @@ In `ios/POCVault/POCVault.xcodeproj/project.pbxproj` add, for `RelayHandoff.swif
 
 Run:
 ```bash
-xcodebuild test -project ios/POCVault/POCVault.xcodeproj -scheme POCVault \
-  -destination 'platform=iOS Simulator,name=iPhone 16' 2>&1 | tail -30
+set -o pipefail; xcodebuild test -project ios/POCVault/POCVault.xcodeproj -scheme POCVault \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' 2>&1 | tail -30
 ```
-Expected: PASS — the design-rule test will still fail until Task 23 creates the view file; comment that single test out and restore it in Task 23, or run Task 23 first.
+Expected: PASS — the 5 decode tests plus the existing suite. (The design-rule source scan lives in Task 23, which is where the file it scans gets created; nothing is disabled here.)
 
 - [ ] **Step 7: Commit**
 
@@ -5948,11 +5929,30 @@ Append to `ios/POCVault/POCVaultTests/HandoffTests.swift`:
         XCTAssertTrue(viewModel.handoffs.isEmpty, "a failed refresh must not fabricate rows")
     }
 
+    // MARK: - Design rules (the file these scan is created by this task)
+
     func testCardViewSourceUsesTheEditorialEmberIdiom() throws {
         let source = try String(contentsOfFile: handoffCardSourcePath, encoding: .utf8)
         XCTAssertTrue(source.contains("RelayCapsLabel"), "status and badges use the caps-label primitive")
         XCTAssertTrue(source.contains("AppTheme.monoFont"), "the branch renders in the mono face")
         XCTAssertTrue(source.contains("AppTheme.textSecondary"), "a ready state uses cream, not a success color")
+    }
+
+    func testHandoffCardNeverRendersADotOrGlyphForStatus() throws {
+        let source = try String(contentsOfFile: handoffCardSourcePath, encoding: .utf8)
+        XCTAssertFalse(source.contains("Circle().fill(AppTheme.status"), "handoff card renders a colored status dot")
+        XCTAssertFalse(source.contains("checkmark.circle.fill"), "handoff card renders a status glyph")
+        XCTAssertFalse(source.contains("statusOK"))
+        XCTAssertFalse(source.contains("statusInfo"))
+        XCTAssertFalse(source.contains("statusNeutral"))
+    }
+
+    private var handoffCardSourcePath: String {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("POCVault/Views/RelayHandoffCardView.swift")
+            .path
     }
 
     private func makeOfflineCodexClient() -> CodexClient {
@@ -6193,8 +6193,8 @@ Add `RelayHandoffCardView.swift` with file ref `100000000000000000000053`, build
 
 Run:
 ```bash
-xcodebuild test -project ios/POCVault/POCVault.xcodeproj -scheme POCVault \
-  -destination 'platform=iOS Simulator,name=iPhone 16' 2>&1 | tail -30
+set -o pipefail; xcodebuild test -project ios/POCVault/POCVault.xcodeproj -scheme POCVault \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' 2>&1 | tail -30
 ```
 Expected: PASS — the existing tests plus the new handoff tests, including both source-scan design guards.
 
@@ -6438,8 +6438,8 @@ Add `RelayPushService.swift` to the project: file ref `100000000000000000000054`
 
 Run:
 ```bash
-xcodebuild test -project ios/POCVault/POCVault.xcodeproj -scheme POCVault \
-  -destination 'platform=iOS Simulator,name=iPhone 16' 2>&1 | tail -30
+set -o pipefail; xcodebuild test -project ios/POCVault/POCVault.xcodeproj -scheme POCVault \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' 2>&1 | tail -30
 ```
 Expected: PASS — all existing tests plus the 5 push-routing tests. (Push registration itself cannot be exercised on the simulator; only the pure routing and encoding functions are asserted.)
 
@@ -6493,7 +6493,7 @@ cd ../cloud      && node --test test/*.test.mjs
 cd ../relayd     && node --test test/*.test.mjs
 cd ../broker     && go vet ./... && go build ./... && go test -count=1 ./...
 cd ../.. && xcodebuild test -project ios/POCVault/POCVault.xcodeproj -scheme POCVault \
-  -destination 'platform=iOS Simulator,name=iPhone 16'
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
 ```
 
 Put the real pass/fail counts in STATUS.md. If a suite fails, fix it before writing the numbers down — never record an aspirational count.
