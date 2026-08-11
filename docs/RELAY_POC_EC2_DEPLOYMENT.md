@@ -25,7 +25,7 @@ account selected by the `default` CLI profile.
 | CI/CD source | CodeCommit repository `relay-cloud`, branch `main` |
 | CI/CD pipeline | CodePipeline `relay-cloud-deploy` |
 | Pipeline stack | CloudFormation `relay-cloud-cicd` |
-| Current release | `a70fd243790fda142531196fb878dfd7a3443d06` |
+| Current release | `97ac329a20377af3212444973d9946c171cb7f0a` |
 | Pre-deploy recovery point | EBS snapshot `snap-0027cd41761bc9dd7` |
 
 The public IP is intentionally not persisted in this document. Route 53 and
