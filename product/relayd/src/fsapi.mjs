@@ -389,6 +389,106 @@ function serveFsFilePreview(req, res, { filePath, stat, name, isActiveContent })
 }
 
 
+// GET /v1/export.tar — mTLS-authed streaming tar export of the whole jail
+// (every readable file under workspaceBrowseRoot). Bytes are never handed to
+// `tar` via a wildcard: the entry list is built with the same jail-safe walk
+// fs/list uses (fsEntryForDirent — symlink escapes dropped, containment
+// enforced) and secret-denylisted files are excluded before `tar` ever sees
+// them, so the archive can never surface what fs/file would refuse to serve.
+// Bounded by maxExportBytes: the total is pre-computed from stat() sizes and
+// checked BEFORE any header is written, so an oversized jail is refused
+// cleanly with 413 instead of dying partway through a stream.
+
+const maxExportBytes = 512 * 1024 * 1024;
+
+// Recursively walks the jail collecting file entries (never directories) for
+// the export list. Resilient to a single unreadable subdirectory: that
+// branch is skipped rather than failing the whole export, since (unlike
+// fs/list, which is asked for one specific directory) this walk covers
+// everything under the root and one bad permission bit should not block the
+// rest of the archive.
+
+function collectExportEntries(rootPath, maps) {
+  let dirents;
+  try {
+    dirents = fs.readdirSync(rootPath, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const entries = [];
+  for (const dirent of dirents) {
+    const entry = fsEntryForDirent(rootPath, dirent, maps);
+    if (!entry) continue;
+    if (entry.kind === "dir") {
+      entries.push(...collectExportEntries(entry.absolutePath, maps));
+      continue;
+    }
+    if (entry.kind === "file" && !entry.readDenied) {
+      entries.push(entry);
+    }
+  }
+  return entries;
+}
+
+
+function serveExportTar(req, res) {
+  const maps = browseWorkspaceMaps();
+  const entries = collectExportEntries(workspaceBrowseRoot, maps);
+  const totalBytes = entries.reduce((sum, entry) => sum + entry.size, 0);
+  if (totalBytes > maxExportBytes) {
+    throw Object.assign(new Error("export_too_large"), { status: 413 });
+  }
+
+  res.writeHead(200, {
+    "content-type": "application/x-tar",
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    "content-disposition": 'attachment; filename="relay-workspaces.tar"',
+  });
+
+  // Paths are handed to `tar` over stdin (`-T -`), NUL-separated, rather than
+  // as argv entries: an export of a large jail can list far more files than
+  // fit under a platform's ARG_MAX, and stdin has no such ceiling. NUL
+  // separation (`--null`) is required, not just preferred: both bsdtar and
+  // GNU tar treat a bare `-C` line in a `-T` list as a "change directory"
+  // directive, and workspace filenames are attacker-controlled — a filename
+  // containing embedded newlines (only `/` is illegal in a POSIX filename)
+  // can inject a fake `-C\n..\n<target>` directive into a newline-joined
+  // list and walk tar outside workspaceBrowseRoot. `--null` disables that
+  // directive parsing entirely (documented behavior for both tar
+  // implementations) as well as the newline ambiguity, so it is the fix, not
+  // a hardening extra.
+  //
+  // `--null` is necessary but NOT sufficient on its own: a list field that is
+  // literally `..` still escapes `-C` on both tar implementations. What makes
+  // this safe is that every field comes from `entry.path`, built by
+  // relativeBrowsePath/resolvedPathWithinRoot from an already root-contained
+  // realpath. If this list ever accepts a less-trusted path source, that
+  // containment — not `--null` — is the invariant that must be re-established.
+  const child = spawn("tar", ["-cf", "-", "-C", workspaceBrowseRoot, "--null", "-T", "-"], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  child.stderr.resume();
+  child.on("error", () => {
+    if (!res.writableEnded) res.end();
+  });
+  res.on("close", () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+  });
+  // `tar` may exit (or never start reading stdin) before the file list is
+  // fully written — a spawn failure or an empty jail both close the pipe
+  // early. That surfaces as EPIPE on the stdin socket, which must not crash
+  // the daemon; the child's own "error"/"close" handling above decides the
+  // response outcome. Mirrors the same guard around job stdin in jobs.mjs.
+  child.stdin.on("error", (error) => {
+    if (error?.code !== "EPIPE") console.error(`export.tar: stdin write failed: ${error.message || error}`);
+  });
+  child.stdout.pipe(res);
+  child.stdin.end(entries.map((entry) => entry.path).join("\0") + "\0");
+}
+
+
 export {
   isReadDeniedName,
   fsTextMimeByExtension,
@@ -404,4 +504,7 @@ export {
   parseByteRange,
   serveFsFile,
   serveFsFilePreview,
+  maxExportBytes,
+  collectExportEntries,
+  serveExportTar,
 };

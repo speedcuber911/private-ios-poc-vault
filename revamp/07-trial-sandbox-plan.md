@@ -6,6 +6,78 @@
 > self-hosted Cube sandbox. Placeholders are genericized per repo policy;
 > live endpoints and credentials stay in the operator's secrets manager.
 
+## Implementation status (added 2026-08-11, audited against `product/`)
+
+Built, tested (see `product/STATUS.md` "Trial sandbox" section for the full
+item-by-item table and current test counts):
+
+- relay-cloud: provisioner (`src/provisioner.js`), config (`src/config.js`),
+  `trial_nodes` table + registry API (`src/db.js`, `src/registry.js`), routes
+  `POST /v1/trial-nodes`, `GET/DELETE /v1/trial-nodes/current`,
+  `POST /v1/trial-nodes/enroll`, and the pause/destroy reaper (`sweepTrials`
+  in `src/server.js`, folded into the existing sweep timer).
+- relay-broker: dynamic node registry (`internal/registry`), wired in as an
+  opt-in fallback lookup behind `-registry-url`/`-registry-token-file`
+  (closes §Dependencies item 1 below, as an opt-in rather than the default).
+- relayd: `enroll` CLI/module (`src/enroll.mjs`) for identity bootstrap +
+  single-use-token registration, and trial pairing (`src/trialpair.mjs`, see
+  delta below). `product/trial/` holds the Cube/E2B template (Dockerfile,
+  `start.sh` init without systemd, `e2b.toml`, `build.sh`).
+
+Already satisfied by pre-existing code (§Dependencies item 2 needs no work):
+
+- **Node reconnect with backoff** — `relayd/src/tunnel.mjs` already ships a
+  supervisor that reconnects with decorrelated exponential backoff and jitter
+  (`computeBackoffDelay`, `scheduleReconnect` at :462, states
+  `connecting → registered | reconnecting → stopped`), wired from
+  `src/index.mjs` via `RELAYD_TUNNEL_BACKOFF_MS`/`_MAX_MS`. A broker restart
+  therefore does not strand a trial node.
+- **Workspace export** — `GET /v1/export.tar` is implemented
+  (`relayd/src/fsapi.mjs:392`, routed in `src/additions.mjs`): mTLS-authed,
+  jail-contained, denylist-filtered, 512 MiB cap → 413 `export_too_large`.
+
+Pending:
+
+- **iOS**: fork-screen option, provisioning progress states, trial
+  badge/countdown, expiry/export/upsell screens (§Dependencies item 5). The
+  shared groundwork has landed — `POCVault/Models/RelayTrialNode.swift` and
+  `POCVault/Security/RelayTrialPairing.swift`, whose derivations are locked to
+  the Node implementation by cross-checked fixtures in
+  `POCVaultTests/TrialPairingTests.swift` — but no user-facing screens exist yet.
+- The in-app export button that consumes `/v1/export.tar`, and the post-M3
+  live-migration path — not built.
+- Load testing the Cube host capacity (§Open questions 1), the
+  reconciliation sweep comparing Cube's sandbox list to `trial_nodes`
+  (§Failure handling), and template build/boot/egress-preset verification
+  against a real Cube host (§Testing) — none of these have been run.
+- The T-24h expiry warning push — blocked on live APNs, which `cloud/main.js`
+  still wires to a no-op transport.
+
+**Delta from this plan: the trial pairing credential mechanism.** §Components
+says "server-mediated pairing" without specifying how the device gets its
+certificate. The implementation (`relayd/src/trialpair.mjs`) cannot reuse the
+BYO flow's zero-knowledge CSR exchange (`relayd/API.md` §2.3) because iOS has
+no CSR stack today. Instead: the phone posts a small JSON blob
+(`{deviceName, platform}`, no CSR) as the cloud-rendezvous device-blob; the
+**node** mints the EC keypair, issues the certificate from its own CA, and
+packages key+cert+CA as a passphrase-protected PKCS#12, delivered back
+through the same cloud rendezvous as the node-blob. The passphrase is
+`hmac-sha256(secret, "relay-trial-p12-v1")`, derivable by both peers from the
+pairing secret the same way `authToken`/`macKey` are derived in the BYO flow
+— so the cloud, which is told only `authToken`, never learns the passphrase
+either. Both blobs are still MAC-tagged and verified exactly as in BYO
+pairing.
+
+This is an explicit, scoped trust delta, not a weakening of the general
+model: on the trial tier the cloud *already* mediates sandbox creation and,
+via `RELAYD_ENROLL_PAIRING_SECRET`, transports the pairing secret itself into
+the sandbox it just created — the operator-hosted trust this plan's own
+§Security section states plainly to the user ("Trial machines run on Relay
+infrastructure"). BYO must never receive a secret from the cloud this way;
+`trialpair.mjs` is therefore a module separate from the BYO `pairing.mjs`,
+reachable only through `relayd enroll` when trial pairing env vars are
+present.
+
 ## Decision summary (owner-resolved 2026-08-11)
 
 1. **Scope:** every new signup instantly gets a sandbox as their starter

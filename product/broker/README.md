@@ -30,6 +30,8 @@ internal/mux/       length-prefixed stream multiplexer (net.Conn streams)
 internal/sni/       ClientHello peek + SNI parse, bytes preserved for replay
 internal/tunnelauth/ ed25519 challenge/response node registration
 internal/broker/    routing core: registry, tunnel sessions, splice
+internal/registry/  HTTP resolver against relay-cloud's tunnel-registry hook
+                     (dynamic fallback lookup, TTL-cached)
 internal/certs/     in-memory PKI fixtures (node CA, device CA, ed25519 identity)
 internal/relayd/    fake node: tunnel client + HTTPS-over-mux + SSE endpoint
 e2e/                end-to-end tests (the exit gate)
@@ -146,6 +148,46 @@ From `go test -v ./e2e/` (real run, 2026-08-09):
 - **Mux proof:** two SSE streams + a healthz ran concurrently over one
   tunnel TCP connection, all incremental, all complete.
 
+## Dynamic node registry (relay-cloud-backed)
+
+The spike's registry is the in-memory `-node id=path/to/pub.pem` flag map
+(`Broker.RegisterNode`). `internal/registry` adds an HTTP-backed fallback that
+is consulted only when a node id misses that static map
+(`Broker.SetFallbackLookup`; the fallback runs outside the broker's mutex
+because it makes a network call):
+
+```
+GET <registry-url>/v1/tunnel/nodes/<node-id>
+Authorization: Bearer <registry-token>
+
+200 → {"nodeId": "...", "accountId": "...", "kind": "...", "pubkey": "<SPKI PEM or base64 raw ed25519>"}
+404 → unknown node (negative-cached)
+```
+
+This is the same hook documented in `cloud/README.md` §Broker contract —
+`internal/registry.Resolver` is the broker-side client for it. Enable it with:
+
+```sh
+go run ./cmd/broker -registry-url http://127.0.0.1:8790 \
+    -registry-token-file /path/to/broker-token
+```
+
+Results are cached in-process — 60 s TTL for a resolved key, 10 s TTL for a
+miss (`registry.Config.PositiveTTL`/`NegativeTTL`) — so a reconnect storm or a
+repeated probe against an unknown id cannot hammer the cloud. A resolver
+built with no URL (`-registry-url` omitted) is inert: every lookup misses
+immediately, so static-only deployments are unaffected. `Resolver.Lookup`
+satisfies `tunnelauth.VerifyFunc`, the same signature the static registry
+uses, so the tunnel-auth handshake code does not know or care which registry
+answered.
+
+Still open: the static `-node` flags remain the broker's *primary* registry
+(checked first, see `lookupKey`); there is no push channel from the cloud to
+invalidate a positive cache entry early (a revoked/deleted node stays
+resolvable for up to 60 s — see Production deltas #2 below); and `main.go`
+does not default `-registry-url`/`-registry-token-file` from an env var for
+systemd deploys.
+
 ## Production deltas (spike → M2 hardening)
 
 Deliberately out of scope here, required before beta:
@@ -155,10 +197,15 @@ Deliberately out of scope here, required before beta:
    and corporate proxies pass it; the mux framing rides inside unchanged.
    Let's Encrypt is needed **only** for the broker's own tunnel endpoint —
    the data path stays pinned-node-CA and needs no public PKI.
-2. **Registry backed by the control plane.** The in-memory `node_id →
-   pubkey` map becomes the `nodes` table (04 §4.2); registration consults it
-   and updates `last_seen`; SNI ids become unguessable node ids minted at
-   enrollment.
+2. **Registry backed by the control plane — landed as an opt-in fallback.**
+   `internal/registry` + `-registry-url`/`-registry-token-file` (see §Dynamic
+   node registry above) resolve unknown node ids against the cloud's `nodes`
+   table. The static `-node` flag map is still the broker's *default and
+   primary* registry; making the dynamic registry the sole/default source,
+   updating `last_seen` on connect, and pushing early cache invalidation on
+   revocation are the remaining pieces of this item. SNI ids are already
+   unguessable node ids minted at enrollment (relayd `identity.mjs`),
+   independent of this item.
 3. **Reconnection/backoff + heartbeat enforcement.** The spike dials once
    and PINGs without policing PONGs. Production: exponential backoff with
    jitter on the node, server-side idle/last-pong timeouts, and route

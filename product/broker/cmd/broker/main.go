@@ -20,6 +20,7 @@ import (
 
 	"relay.example/broker/internal/broker"
 	"relay.example/broker/internal/certs"
+	"relay.example/broker/internal/registry"
 )
 
 type nodeFlags []string
@@ -33,6 +34,8 @@ func main() {
 	suffix := flag.String("suffix", ".tun.test", "SNI suffix routed by this broker")
 	var nodes nodeFlags
 	flag.Var(&nodes, "node", "node registration as <node-id>=<path to ed25519 public key PEM> (repeatable)")
+	registryURL := flag.String("registry-url", "", "control-plane base URL for dynamic node lookup (e.g. http://127.0.0.1:8790)")
+	registryTokenFile := flag.String("registry-token-file", "", "file containing the broker bearer token for -registry-url")
 	flag.Parse()
 
 	b := broker.New(*suffix, log.Printf)
@@ -52,6 +55,24 @@ func main() {
 		}
 		b.RegisterNode(id, pub)
 		log.Printf("registered node %q", id)
+	}
+
+	if *registryURL != "" {
+		if *registryTokenFile == "" {
+			fmt.Fprintln(os.Stderr, "-registry-url requires -registry-token-file")
+			os.Exit(2)
+		}
+		tokenBytes, err := os.ReadFile(*registryTokenFile)
+		if err != nil {
+			log.Fatalf("read registry token: %v", err)
+		}
+		resolver := registry.NewResolver(registry.Config{
+			URL:   *registryURL,
+			Token: strings.TrimSpace(string(tokenBytes)),
+			Logf:  log.Printf,
+		})
+		b.SetFallbackLookup(resolver.Lookup)
+		log.Printf("dynamic registry enabled: %s", *registryURL)
 	}
 
 	pl, err := net.Listen("tcp", *passthroughAddr)

@@ -1,0 +1,270 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Relay cloud CodeCommit to CodeBuild to SSM deployment pipeline
+
+Parameters:
+  RepositoryName:
+    Type: String
+    Default: relay-cloud
+  BranchName:
+    Type: String
+    Default: main
+  TargetInstanceId:
+    Type: AWS::EC2::Instance::Id
+  TargetInstanceRoleName:
+    Type: String
+    Default: poc-ec2-instance
+  RelayDomain:
+    Type: String
+  BackupBucketName:
+    Type: String
+
+Resources:
+  Repository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      RepositoryDescription: Relay account and control-plane service
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub relay-cloud-cicd-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ReleaseRetention
+            Status: Enabled
+            Prefix: releases/
+            ExpirationInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7
+          - Id: PipelineArtifactRetention
+            Status: Enabled
+            Prefix: relay-cloud-deploy/
+            ExpirationInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: relay-cloud-codepipeline
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: relay-cloud-pipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codecommit:CancelUploadArchive
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:UploadArchive
+                Resource: !GetAtt Repository.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketVersioning
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub ${ArtifactBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt BuildProject.Arn
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: relay-cloud-codebuild-deploy
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: relay-cloud-build-deploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource: !Sub ${ArtifactBucket.Arn}/*
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${TargetInstanceId}
+              - Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommandInvocations
+                Resource: '*'
+
+  TargetReadPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: relay-cloud-cicd-release-read
+      Roles:
+        - !Ref TargetInstanceRoleName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: s3:GetObject
+            Resource: !Sub ${ArtifactBucket.Arn}/releases/*
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: relay-cloud-deploy
+      ServiceRole: !GetAtt BuildRole.Arn
+      TimeoutInMinutes: 30
+      QueuedTimeoutInMinutes: 120
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: deploy/buildspec.deploy.yml
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        ImagePullCredentialsType: CODEBUILD
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: TARGET_INSTANCE_ID
+            Value: !Ref TargetInstanceId
+          - Name: RELEASE_BUCKET
+            Value: !Ref ArtifactBucket
+          - Name: PUBLIC_BASE_URL
+            Value: !Sub https://${RelayDomain}
+          - Name: BACKUP_S3_URI
+            Value: !Sub s3://${BackupBucketName}/relay-cloud
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: relay-cloud-deploy
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              Configuration:
+                RepositoryName: !GetAtt Repository.Name
+                BranchName: !Ref BranchName
+                PollForSourceChanges: false
+              Namespace: SourceVariables
+              OutputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+        - Name: TestAndDeploy
+          Actions:
+            - Name: TestAndDeploy
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref BuildProject
+                EnvironmentVariables: '[{"name":"DEPLOY_SHA","value":"#{SourceVariables.CommitId}","type":"PLAINTEXT"}]'
+              InputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+
+  PipelineEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: relay-cloud-codecommit-events
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-relay-cloud-pipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
+
+  SourceEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: relay-cloud-main-updated
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - CodeCommit Repository State Change
+        resources:
+          - !GetAtt Repository.Arn
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - !Ref BranchName
+      Targets:
+        - Arn: !Sub arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
+          Id: RelayCloudPipeline
+          RoleArn: !GetAtt PipelineEventRole.Arn
+
+Outputs:
+  RepositoryCloneUrlHttp:
+    Value: !GetAtt Repository.CloneUrlHttp
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+  PipelineName:
+    Value: !Ref Pipeline

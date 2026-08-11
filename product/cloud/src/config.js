@@ -61,6 +61,29 @@ export function loadConfig(env = process.env) {
     // Entitlement defaults granted to every new account.
     defaultMaxNodes: intFrom(env.DEFAULT_MAX_NODES, 1),
 
+    // Trial sandboxes (Cube / E2B protocol). An empty apiUrl disables the
+    // whole trial feature — routes 404 and the fork screen hides the option.
+    e2b: {
+      apiUrl: (env.E2B_API_URL || "").replace(/\/+$/, ""),
+      apiKey: env.E2B_API_KEY || "",
+      templateId: env.TRIAL_TEMPLATE_ID || "",
+    },
+    trial: {
+      ttlSec: intFrom(env.TRIAL_TTL_SEC, 7 * 24 * 3600),
+      graceSec: intFrom(env.TRIAL_GRACE_SEC, 3 * 24 * 3600),
+      maxActive: intFrom(env.TRIAL_MAX_ACTIVE, 20),
+      sandboxTimeoutMs: intFrom(env.TRIAL_SANDBOX_TIMEOUT_MS, 3600 * 1000),
+    },
+    tunnel: {
+      host: env.TUNNEL_HOST || "",
+      port: intFrom(env.TUNNEL_PORT, 80),
+      suffix: env.TUNNEL_SUFFIX || "",
+    },
+
+    // Public cloud URL the trial sandbox reaches to enroll. Empty in tests,
+    // where the fallback (host:port) is used instead.
+    enrollBaseUrl: env.ENROLL_BASE_URL || "",
+
     // General request body cap for JSON endpoints.
     jsonBodyMaxBytes: intFrom(env.JSON_BODY_MAX_BYTES, 32 * 1024),
   };

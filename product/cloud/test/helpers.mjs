@@ -106,6 +106,7 @@ export async function startTestApp(overrides = {}) {
     mailTransport: mail,
     apnsTransport,
     now,
+    provisioner: overrides.provisioner,
   });
 
   await app.auth.ready;
@@ -147,8 +148,10 @@ export async function api(baseUrl, method, path, { body, headers = {}, raw } = {
 }
 
 // Convenience: sign in via Apple and return { sessionToken, refreshToken, accountId }.
-export async function signIn(t) {
-  const token = t.idp.mintIdentityToken();
+// Pass { sub, email } to mint a distinct identity (e.g. a second account in
+// the same test) — both default inside makeAppleIdp().mintIdentityToken.
+export async function signIn(t, { sub, email } = {}) {
+  const token = t.idp.mintIdentityToken({ sub, email });
   const res = await api(t.baseUrl, "POST", "/v1/auth/apple", {
     body: { identityToken: token },
   });

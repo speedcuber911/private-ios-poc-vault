@@ -1,6 +1,6 @@
 # Relay product/ — Completeness Status vs revamp/06-tech-execution.md (W0–W3)
 
-> Audit date: 2026-08-09. Item-by-item comparison of `product/` against the
+> Audit date: 2026-08-11. Item-by-item comparison of `product/` against the
 > W0–W3 checklists. Evidence paths are relative to `product/`. All hostnames
 > genericized (`<domain>`, `<node-id>`). Test results below are from actual
 > runs on this date (commands in §Test evidence).
@@ -56,12 +56,43 @@ piece of the checklist item is absent; **missing** — no implementation in
 |---|---|---|---|
 | Auth: Sign in with Apple (server-side token verify), email magic link (SES), session JWT + refresh | partial | `cloud/src/{auth,jwt}.js`, `cloud/test/auth.test.mjs` | SIWA JWKS/RS256 verify (iss/aud/exp), magic-link issue/confirm (hashed single-use tokens), HS256 session + rotating single-use refresh — all tested. SES/SMTP mail transport is an interface only; `main.js` drops mail silently |
 | Registry: accounts, devices (APNs token, platform, cert serials), nodes (kind, pubkey, last_seen, version), entitlements, waitlist | done | `cloud/src/registry.js`, `cloud/test/registry.test.mjs` | Cross-account isolation tested; node create is entitlement-gated (`nodes.max`) and validates ed25519 pubkeys |
-| Broker from W1 productionized: registry-backed routes, node-connect auth, metrics, connection draining | partial | cloud side: `GET /v1/tunnel/nodes/:nodeId` hook (`cloud/src/server.js`, README §Broker contract) | The registry hook exists with timing-safe token auth and a written broker contract. The Go broker does NOT call it (still in-memory `-node` flags); no metrics; no draining |
+| Broker from W1 productionized: registry-backed routes, node-connect auth, metrics, connection draining | partial | cloud side: `GET /v1/tunnel/nodes/:nodeId` hook (`cloud/src/server.js`, README §Broker contract); broker side: `broker/internal/registry`, `-registry-url`/`-registry-token-file` in `broker/cmd/broker/main.go` | The registry hook now has a caller — `broker/internal/registry.Resolver` (60 s positive / 10 s negative TTL cache), wired in via `Broker.SetFallbackLookup`, opt-in with `-registry-url -registry-token-file`. Still no metrics, no connection draining, and the static `-node` flag map remains the broker's primary/default registry — dynamic lookup only fires on a miss |
 | Pairing rendezvous: short-lived sessions relaying opaque CSR/cert blobs | done | `cloud/src/pairing.js`, `cloud/test/pairing.test.mjs` | Hashed secrets, both blob directions, 64 KiB bounds, 15-min TTL + sweep; cloud never parses blobs. Client sides (relayd + iOS) not yet consuming it |
 | Notify: signed node-event ingest (no content), APNs fanout (silent/mutable/Live Activity), 7-day retention | partial | `cloud/src/{notify,apns}.js`, `cloud/test/notify.test.mjs` | ed25519 raw-body verify, tamper/wrong-key rejection, silent-vs-mutable classification per event type, ES256 provider JWT, 7-day sweep — tested against a mock transport. Live APNs HTTP/2 never exercised; no `410 Unregistered` cleanup; Live Activity channel not implemented |
-| Domains + DNS: product domain, `api.`, `get.`, `*.tun.`, `www.` | missing | genericized guidance in `cloud/README.md` §Deploy | Live infra intentionally out of scope this run |
+| Live control-plane deployment + CI/CD | done | `cloud/deploy/{relay-cloud-cicd.yml,buildspec.deploy.yml,cicd-deploy.sh,install.sh,relay-cloud.service}`, `../docs/RELAY_POC_EC2_DEPLOYMENT.md` | Public HTTPS control plane on shared `poc-ec2`; loopback-only 8790, immutable SHA releases, CodeCommit/EventBridge/CodePipeline/CodeBuild/SSM delivery, public health gate, and rollback. The successful 2026-08-11 pipeline deployed the exact tested SHA |
+| Domains + DNS: product domain, `api.`, `get.`, `*.tun.`, `www.` | partial | `relay.ai-rocket-experiments.com`, `cloud/deploy/relay-cloud.nginx.conf.template`, `../docs/RELAY_POC_EC2_DEPLOYMENT.md` | Control-plane Route 53 record, nginx TLS vhost, Let's Encrypt certificate, and public health are live. Product `get`, `www`, and tunnel wildcard/broker ingress are not deployed |
 | Web v0: landing, docs, account page (login, node list, waitlist) | missing | — | Nothing in `product/` |
-| Ops: S3 pg_dump nightly, external uptime checks, Sentry, structured logs | partial | `cloud/README.md` (backup cron, uptime-check note), systemd/compose units | SQLite backup line documented (Postgres later; DAL is the seam). No IaC (Terraform/CDK), no Sentry, no structured logging (bare console.error), no uptime automation |
+| Ops: database backups, release automation, external uptime checks, Sentry, structured logs | partial | `cloud/deploy/{backup-sqlite.sh,verify-backup.sh,relay-cloud-backup.service,relay-cloud-backup.timer,relay-cloud-cicd.yml}`, `../docs/RELAY_POC_EC2_DEPLOYMENT.md` | Nightly integrity-checked SQLite backup to private versioned/encrypted S3 and AWS-native CI/CD are live. The database remains SQLite by design; external uptime alerting, Sentry, and structured logging are still open |
+
+---
+
+## Trial sandbox — revamp/07-trial-sandbox-plan.md
+
+> Added 2026-08-11. Land-status of the instant-trial-machine feature
+> described in [`revamp/07-trial-sandbox-plan.md`](../revamp/07-trial-sandbox-plan.md),
+> audited the same way as W0–W3 above; extends (does not replace) the W1/W3
+> rows for the broker and control plane.
+
+| Item | Status | Evidence | Note |
+|---|---|---|---|
+| relay-cloud provisioner (E2B/Cube-protocol client): `createSandbox`/`killSandbox`/`pauseSandbox` | done | `cloud/src/provisioner.js`, `cloud/test/provisioner.test.mjs` | Backend-agnostic — only `E2B_API_URL`/`E2B_API_KEY` change to point at hosted e2b later. `createProvisioner` returns `null` when `E2B_API_URL` is unset, which is how the whole trial surface feature-flags off (`POST /v1/trial-nodes` then 404s `trial_unavailable`) |
+| Trial config (`e2b`, `trial`, `tunnel` groups) | done | `cloud/src/config.js` | `E2B_API_URL/KEY`, `TRIAL_TEMPLATE_ID`, `TRIAL_TTL_SEC` (default 7d), `TRIAL_GRACE_SEC` (default 3d), `TRIAL_MAX_ACTIVE` (default 20), `TRIAL_SANDBOX_TIMEOUT_MS` (default 1h), `TUNNEL_HOST/PORT/SUFFIX`, `ENROLL_BASE_URL` |
+| `trial_nodes` table + registry API | done | `cloud/src/db.js`, `cloud/src/registry.js`, `cloud/test/trial-registry.test.mjs` | One row per account (`UNIQUE account_id`); states `creating\|ready\|expired\|destroyed\|failed`; 8 functions (`createTrialNode`, `getTrialById`, `getTrialByAccount`, `getTrialByTokenHash`, `updateTrial`, `listTrialsDue`, `listTrialsPastGrace`, `countActiveTrials`); `createNode` now takes an optional explicit `id` (used so the trial node's id matches what the sandbox minted) |
+| Cloud HTTP routes: `POST /v1/trial-nodes`, `GET/DELETE /v1/trial-nodes/current`, `POST /v1/trial-nodes/enroll` | done | `cloud/src/server.js`, `cloud/test/trial-api.test.mjs`, `cloud/test/trial-enroll.test.mjs` | Create is session-authed, entitlement/cap-gated (409 `trial_already_used`, 503 `trial_capacity`), mints a single-use enroll token and calls the provisioner; enroll is token-authed (401 `invalid_enroll_token`), burns the token, and registers the node under a new `trial` node kind |
+| Reaper (pause at TTL expiry, destroy after grace) | done | `cloud/src/server.js` (`sweepTrials`), `cloud/test/trial-reaper.test.mjs` | Wired into the existing 60 s `runSweeps()` timer alongside the pairing/notify sweeps; state-driven off `expires_at`, so a crash mid-pass is safe to re-run |
+| Broker dynamic node registry (control-plane-backed fallback lookup) | done | `broker/internal/registry`, `broker/cmd/broker/main.go` (`-registry-url`, `-registry-token-file`), `broker/internal/broker/broker.go` (`SetFallbackLookup`) | HTTP resolver against the cloud's `GET /v1/tunnel/nodes/:id` hook; 60 s positive / 10 s negative TTL cache; consulted only when a node id misses the static `-node` flag registry, which remains primary. Closes the long-standing "the Go broker does NOT call the registry hook" gap **for nodes opted into it** — the broker still needs `-registry-url` passed at deploy time |
+| relayd `enroll` (identity bootstrap + single-use token registration with the control plane) | done | `relayd/src/enroll.mjs`, `relayd/bin/relayd` (`enroll` subcommand), `relayd/test/enroll.test.mjs` | Idempotent — a second call with a fresh token reuses the same node identity/id. Wired into the CLI, env-driven (`RELAYD_ENROLL_URL`, `RELAYD_ENROLL_TOKEN`), no secrets on argv or in output |
+| Trial pairing (server-mediated; node mints the device cert) | done | `relayd/src/trialpair.mjs`, invoked from `relayd enroll` when `RELAYD_ENROLL_PAIRING_ID`/`_SECRET` are set, `relayd/test/trialpair.test.mjs` | Documented protocol delta from the BYO zero-knowledge CSR flow (`relayd/API.md` §2.3) — see `revamp/07-trial-sandbox-plan.md` "Implementation status" for the rationale |
+| Trial sandbox template (Cube/E2B) | done (never booted against a live Cube host in this audit) | `product/trial/{Dockerfile,start.sh,e2b.toml,build.sh,README.md}` | No systemd — `start.sh` runs `relayd enroll` once (marker file gates re-runs), scrubs the enroll/pairing env vars, then execs `relayd run --mode tunneled`. Template build/boot/egress-preset verification against a real Cube host is still open (plan §Testing) |
+| iOS: fork-screen "Try instantly", provisioning progress states, trial badge/countdown | partial | `ios/POCVault/POCVault/Models/RelayTrialNode.swift`, `ios/POCVault/POCVault/Security/RelayTrialPairing.swift`, `ios/POCVault/POCVaultTests/TrialPairingTests.swift` | Shared groundwork only: the `RelayTrialNode` decodable (matches `publicTrial` in `cloud/src/server.js`) and `RelayTrialPairing` (authToken/macKey/blobTag/p12Passphrase — bit-for-bit the same derivation as `relayd/src/trialpair.mjs`, cross-checked by fixtures in the test file). No fork-screen UI, view model, or networking call site references either type yet |
+
+### Test evidence (trial sandbox, 2026-08-11)
+
+| Suite | Command | Result |
+|---|---|---|
+| cloud (full suite, incl. trial test files + provisioner) | `cd product/cloud && node --test test/*.test.mjs` | **59 pass / 0 fail** locally and in CodeBuild before the 2026-08-11 deployment |
+| relayd (full suite, incl. `enroll.test.mjs` + `trialpair.test.mjs`) | `cd product/relayd && node --test test/*.test.mjs` | **156 pass / 0 fail** (~68 s) |
+| broker (incl. new `internal/registry` package) | `cd product/broker && go vet ./... && go build ./... && go test -count=1 ./...` | **all packages ok** |
 
 ---
 
@@ -85,12 +116,12 @@ piece of the checklist item is absent; **missing** — no implementation in
 5. TOML config + one-shot `/etc/codex-api.env` migration in `config.mjs`.
 6. relayd→cloud signed event client (`POST /v1/node-events` with the node identity key) — cloud ingest is ready and tested.
 7. Harness `install` action (`POST /v1/harness/:provider/install` per API.md §2.5).
-8. Cloud-rendezvous pairing path from relayd (headless enroll-code flow for `install.sh`, per cloud README "stubbed" list) — defines the pairing-session creation auth for installers.
+8. Cloud-rendezvous pairing path from relayd for **BYO** installs (headless enroll-code flow for `install.sh`, per cloud README "stubbed" list) — defines the pairing-session creation auth for installers. *(Partially addressed for the trial tier only: `relayd/src/trialpair.mjs` now consumes the same cloud rendezvous endpoints, but via a node-mints-the-certificate PKCS#12 delta that is deliberately trial-only — see `revamp/07-trial-sandbox-plan.md` "Implementation status". The general BYO headless enroll-code flow for `install.sh` is still not built.)*
 9. Flip the store default to SQLite after a soak (JSON remains the migration source), or make `install.sh` set `RELAYD_STORE=sqlite` for fresh installs.
 10. Execute `install.sh` on a fresh VM end-to-end; then enroll the personal box as node #1 (direct mode) — dogfood gate. *(live deploy; intentionally out of scope this run)*
 11. **iOS W4** (intentionally out of scope this run): NodeStore, Secure-Enclave identity + CSR + pairing client + per-node CA pinning (U2 prototype in week 1), multi-node plumbing, onboarding screens, push/NSE/Live Activity, Sign in with Apple, on-device transcription, settings, keep 79 XCTests green.
 
 ### Remaining for M2 (hardening; noted for continuity)
-12. Broker production deltas: `wss://` tunnel transport, registry-hook integration with the cloud (`/v1/tunnel/nodes/:id`), flow control, per-node/per-IP limits, metrics, connection draining.
+12. Broker production deltas: `wss://` tunnel transport, flow control, per-node/per-IP limits, metrics, connection draining. *(Registry-hook integration with the cloud landed — `broker/internal/registry` + `-registry-url`/`-registry-token-file`, opt-in via flag as a fallback behind the still-default `-node` static registry.)*
 13. Live credentials + transports: real APNs `.p8` over HTTP/2 (+`410` token cleanup, Live Activity channel), SES wiring for magic links, real SIWA service config. *(real keys intentionally out of scope this run)*
-14. Infra: domains/DNS (`api.`, `get.`, `*.tun.`, `www.` on `<domain>`), IaC (VPC/SG/EC2/Route53/S3/SSM), web v0 (landing/docs/account), Sentry + structured logs + uptime checks, Postgres cutover decision behind the existing DAL seam.
+14. Complete the remaining infra surfaces: `get`, `*.tun`, and `www` DNS/ingress, web v0 (landing/docs/account), external uptime alerting, Sentry, and structured logs. The control-plane DNS/TLS plus CodeCommit/CodeBuild/CodePipeline/SSM delivery and S3 SQLite backups are live; VPC/EC2 remain pre-existing infrastructure. Keep the Postgres cutover behind the existing DAL seam until the adapter and migration are tested.

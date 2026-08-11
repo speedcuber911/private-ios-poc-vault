@@ -37,6 +37,7 @@ type Broker struct {
 	mu       sync.Mutex
 	registry map[string]ed25519.PublicKey
 	tunnels  map[string]*mux.Session
+	fallback func(string) (ed25519.PublicKey, bool)
 }
 
 // New creates a broker routing SNI names of the form `<node-id><suffix>`.
@@ -60,11 +61,26 @@ func (b *Broker) RegisterNode(nodeID string, pub ed25519.PublicKey) {
 	b.registry[nodeID] = pub
 }
 
-func (b *Broker) lookupKey(nodeID string) (ed25519.PublicKey, bool) {
+// SetFallbackLookup installs a dynamic resolver consulted when a node id is
+// not in the static registry (production: the control-plane registry hook).
+func (b *Broker) SetFallbackLookup(fn func(string) (ed25519.PublicKey, bool)) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.fallback = fn
+}
+
+func (b *Broker) lookupKey(nodeID string) (ed25519.PublicKey, bool) {
+	b.mu.Lock()
 	pub, ok := b.registry[nodeID]
-	return pub, ok
+	fallback := b.fallback
+	b.mu.Unlock()
+	if ok {
+		return pub, true
+	}
+	if fallback != nil {
+		return fallback(nodeID) // network call — must run outside the lock
+	}
+	return nil, false
 }
 
 func (b *Broker) session(nodeID string) *mux.Session {

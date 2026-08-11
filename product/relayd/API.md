@@ -916,6 +916,43 @@ slots have been read the session is closed and the blobs are deleted rather
 than lingering for the rest of the TTL; blobs are capped at 64 KiB (413) and a
 per-account cap bounds live sessions (429 `too_many_pairing_sessions`).
 
+#### Trial pairing (trial tier only — the node mints the certificate)
+
+`relayd/src/trialpair.mjs` (`runTrialPairing`) is a **documented delta** from
+the CSR flow above, used only for cloud-provisioned trial sandboxes (see
+`revamp/07-trial-sandbox-plan.md` "Implementation status" for the full
+rationale). iOS has no CSR stack yet, so instead of the phone generating a
+keypair and sending a CSR:
+
+1. The phone posts a small JSON device-blob — `{"deviceName", "platform"}`,
+   **no CSR** — to `POST /v1/pairing/sessions/:id/device-blob`, MAC-tagged
+   exactly as in the BYO flow above.
+2. The node (inside `relayd enroll`, below) polls
+   `GET /v1/pairing/sessions/:id/device-blob` until it appears, verifies the
+   tag, then **mints the EC keypair itself**, issues the certificate against
+   its own CA (`identity.mjs`'s `issueDeviceCert`), and packages
+   key+cert+CA-pem into a **passphrase-protected PKCS#12** via `openssl
+   pkcs12 -export`.
+3. The passphrase is `hex(hmac-sha256(key = secret, msg =
+   "relay-trial-p12-v1"))` — derivable by both peers from the same pairing
+   `secret` that derives `authToken`/`macKey` above, so the cloud (which
+   holds only `authToken`) cannot compute it either.
+4. The p12 bytes are posted as the node-blob (`POST .../node-blob`,
+   MAC-tagged with the same `blobTag`/`NODE_SLOT` scheme as BYO), and the
+   temporary key/CSR/cert/CA/p12 files are removed from `tmp/` whether
+   pairing succeeds or fails.
+
+The device private key still never transits any channel except embedded
+inside the passphrase-protected p12 — but on this tier it is the **node**,
+not the phone, that generated it, and the cloud transported the pairing
+secret into the sandbox as part of provisioning
+(`RELAYD_ENROLL_PAIRING_ID`/`RELAYD_ENROLL_PAIRING_SECRET` env vars, cleared
+before the daemon starts — see `product/trial/start.sh`). This is acceptable
+only because trial sandboxes already run on operator infrastructure; **BYO
+installs must never receive a secret from the cloud this way**, which is why
+this lives in a module separate from `pairing.mjs` and is reachable only
+through `relayd enroll`.
+
 #### CLI contract
 
 `relayd pair` prints, on stdout:
@@ -935,6 +972,36 @@ The code/token pair is the one deliberate secret the CLI prints — it *is* the
 credential the user carries to the phone, single-use with a 15-minute TTL. No
 key material is ever printed. The session is redeemable by the already-running
 daemon, so the command does not need to stay open.
+
+#### `relayd enroll` — trial node bootstrap
+
+Non-interactive, env-driven (never argv, never printed): initializes the node
+identity if missing (idempotent — repeat calls reuse the same node id), then
+registers its public key with the control plane using a single-use enroll
+token.
+
+```
+RELAYD_ENROLL_URL              required — cloud base URL
+RELAYD_ENROLL_TOKEN            required — single-use token minted by
+                                POST /v1/trial-nodes
+RELAYD_ENROLL_PAIRING_ID       optional — triggers trial pairing (above)
+                                after enrollment succeeds; must be set
+                                together with RELAYD_ENROLL_PAIRING_SECRET
+RELAYD_ENROLL_PAIRING_SECRET   optional — the pairing secret; both this and
+                                the id are wiped from the environment by
+                                product/trial/start.sh before the daemon
+                                (`relayd run --mode tunneled`) execs
+```
+
+`relayd enroll` calls `POST /v1/trial-nodes/enroll` with
+`{token, nodeId, pubkey, version}`; a 200 response carries `{ok, sni}`. The
+cloud verifies the token against `trial_nodes.enroll_token_hash` (401
+`invalid_enroll_token` if it does not match or the trial is not in the
+`creating` state), validates the node id shape and pubkey (400), rejects a
+duplicate node id (409 `node_exists`), then registers the node under the
+`trial` kind and burns the token. The CLI prints only `enrolled <nodeId>
+sni=<sni>` (and, if pairing ran, `trial device paired: <deviceId>`) — no
+secret material is ever logged.
 
 ### 2.4 Device list / revoke
 

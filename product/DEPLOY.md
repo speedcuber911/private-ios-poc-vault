@@ -1,13 +1,43 @@
 # Relay — live infrastructure notes (control plane + broker)
 
-> Hostnames and IPs are genericized here (`<router-ip>`, `<router-host>`,
-> `<node-id>`). Live values are recorded outside the repo. Measurements below
-> are from an actual run over the public internet on 2026-08-09, not localhost.
+> Updated 2026-08-11. The current public control plane and the earlier broker
+> spike are separate deployments. Router hostnames and IPs remain genericized
+> below; the shared-POC control-plane record is documented explicitly.
 
-## What is deployed
+## Current public control plane (2026-08-11)
+
+`product/cloud` is live at
+`https://relay.ai-rocket-experiments.com` on the existing `poc-ec2` host in
+`ap-south-1`. nginx owns public 80/443 and proxies this host to
+`127.0.0.1:8790`; the security group does not expose 8790.
+
+The service runs as `relaycloud` from immutable commit-addressed releases with
+a dedicated checksum-verified Node 22 runtime. Its SQLite database is on the
+encrypted EBS-backed `/var/lib/relay-cloud` path. A systemd timer creates
+validated online backups in a private versioned S3 bucket.
+
+The AWS-native delivery path is:
+
+```text
+CodeCommit main -> EventBridge -> CodePipeline -> CodeBuild tests
+  -> versioned S3 artifact -> SSM install on poc-ec2
+  -> local and public health gates
+```
+
+The pipeline, repository, build project, artifact bucket, and least-privilege
+roles are managed by the `relay-cloud-cicd` CloudFormation stack. The current
+verified release and complete rollback/verification record are in
+[`../docs/RELAY_POC_EC2_DEPLOYMENT.md`](../docs/RELAY_POC_EC2_DEPLOYMENT.md).
+
+The deployment preserved the existing `nginx`, `postgresql`, `flux-gateway`,
+`flux`, and `miq` services and their listeners. It did not rebuild the iOS app,
+migrate the personal agent runner, or move the raw tunnel broker.
+
+## Broker spike on `relay-router` (2026-08-09)
 
 A single EC2 host (`relay-router`, ap-south-1, Ubuntu 24.04 x86_64) runs both
-control-plane processes as systemd units. It is deliberately separate from the
+spike processes as systemd units. This is the measured tunnel testbed, not the
+current public control-plane deployment. It is deliberately separate from the
 personal agent box, which is untouched.
 
 | Unit | Binds | Runs as | Source |
@@ -148,11 +178,13 @@ encoding while callers present RFC 2253, so a device that had just paired was
 immediately locked out — a 403 that no unit test could see, because each side
 was internally consistent.
 
-## Not yet done
+## Still not done
 
-- The broker still registers nodes from command-line flags; it does not call the
-  cloud registry hook, which exists and is tested on the cloud side.
+- The broker's cloud-registry resolver exists as an opt-in fallback, but the
+  live spike still needs an intentional rollout with its registry URL/token;
+  its static `-node` map remains the default.
 - No `wss://` transport, flow control, metrics, or connection draining.
-- Control plane is loopback-only: no domain, no TLS front, no public exposure.
+- The public control plane is live, but real SES/APNs/Sign in with Apple
+  credentials and end-to-end iPhone account flows still need live validation.
 - No phone on a cellular network has traversed this path yet, and no
   Wi-Fi↔cellular handoff has been measured.

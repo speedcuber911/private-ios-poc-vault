@@ -22,3 +22,5 @@ ios/POCVault/.build/
 ios/POCVault/Package.resolved
 !ops/config.example.env
 .superpowers/
+__pycache__/
+*.pyc
