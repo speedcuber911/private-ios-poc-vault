@@ -605,20 +605,6 @@ enum AppTheme {
 
     private static let ink = Color(hex: 0xEDE8DF)
 
-    // LEGACY tokens — remaining call sites migrate screen-by-screen; deleted in the
-    // final cleanup task. Do not add new uses.
-    static let bgSurface = ink.opacity(0.06)
-    static let bgSurfaceHi = Color(hex: 0x232220)
-    static let threadPreviewBackground = Color(hex: 0x272522)
-    static let strokeSubtle = hairline
-    static let strokeStrong = hairlineStrong
-    static let inactiveTab = ink.opacity(0.38)
-    static let statusOK = ink.opacity(0.55)
-    static let statusInfo = ink.opacity(0.55)
-    static let statusNeutral = ink.opacity(0.38)
-    static let glassTint = ink.opacity(0.04)
-    static let glassStroke = ink.opacity(0.10)
-
     static func uiFont(size: CGFloat, weight: Font.Weight = .regular) -> Font {
         Font.custom("DMSans-9ptRegular", size: size).weight(weight)
     }
