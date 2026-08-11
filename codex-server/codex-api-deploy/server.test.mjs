@@ -42,13 +42,33 @@ async function pathExists(filePath) {
   }
 }
 
+function cleanTestProcessEnv() {
+  return Object.fromEntries(
+    Object.entries(process.env).filter(([name]) =>
+      !/^(?:AWS_|AZURE_|BEDROCK_|BUN_|CLAUDE_|CODEX_|CURSOR_|NPM_CONFIG_|npm_config_)/.test(name),
+    ),
+  );
+}
+
+async function isolatedRunnerEnv() {
+  const runHome = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-home-"));
+  return {
+    CODEX_RUN_HOME: runHome,
+    CODEX_HOME: path.join(runHome, ".codex"),
+    CLAUDE_HOME: path.join(runHome, ".claude"),
+    NPM_CONFIG_CACHE: path.join(runHome, ".npm-cache"),
+    BUN_INSTALL_CACHE_DIR: path.join(runHome, ".bun-cache"),
+  };
+}
+
 async function startServer(env) {
   const port = await freePort();
   const baseUrl = `http://127.0.0.1:${port}`;
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: path.dirname(new URL(import.meta.url).pathname),
     env: {
-      ...process.env,
+      ...cleanTestProcessEnv(),
+      ...(await isolatedRunnerEnv()),
       CODEX_API_HOST: "127.0.0.1",
       CODEX_API_PORT: String(port),
       CLAUDE_CODE_USE_BEDROCK: "",
@@ -80,7 +100,8 @@ async function startServerExpectExit(env) {
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: path.dirname(new URL(import.meta.url).pathname),
     env: {
-      ...process.env,
+      ...cleanTestProcessEnv(),
+      ...(await isolatedRunnerEnv()),
       CODEX_API_HOST: "127.0.0.1",
       CODEX_API_PORT: String(port),
       CODEX_REQUIRE_MTLS: "false",
