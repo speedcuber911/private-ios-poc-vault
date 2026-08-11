@@ -14,11 +14,6 @@ struct RelayChatView: View {
         NavigationStack {
             ZStack {
                 AppTheme.canvasGradient.ignoresSafeArea()
-                AppTheme.accent.opacity(0.06)
-                    .blur(radius: 80)
-                    .frame(height: 200)
-                    .frame(maxHeight: .infinity, alignment: .top)
-                    .ignoresSafeArea()
 
                 VStack(spacing: 0) {
                     topBar
@@ -86,7 +81,6 @@ struct RelayChatView: View {
                         .font(AppTheme.uiFont(size: 16, weight: .semibold))
                         .foregroundStyle(AppTheme.textSecondary)
                         .frame(width: 36, height: 36)
-                        .background(AppTheme.bgSurfaceHi, in: Circle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Close chat")
@@ -99,30 +93,21 @@ struct RelayChatView: View {
                     .font(AppTheme.uiFont(size: 16, weight: .semibold))
                     .foregroundStyle(AppTheme.textSecondary)
                     .frame(width: 36, height: 36)
-                    .background(AppTheme.bgSurfaceHi, in: Circle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("New conversation")
 
-            HStack(spacing: 9) {
-                Circle()
-                    .fill(AppTheme.accentGradient)
-                    .frame(width: 30, height: 30)
-                    .overlay {
-                        Image(systemName: "folder.fill")
-                            .font(.system(size: 12, weight: .bold))
-                            .foregroundStyle(.white)
-                    }
-                    .shadow(color: AppTheme.accent.opacity(0.5), radius: 6, y: 2)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(viewModel.folderDisplayName)
-                        .font(AppTheme.uiFont(size: 22, weight: .bold))
-                        .foregroundStyle(AppTheme.textPrimary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(viewModel.folderDisplayName)
+                    .font(AppTheme.serifFont(size: 24))
+                    .foregroundStyle(AppTheme.textPrimary)
+                    .lineLimit(1)
+                if let path = viewModel.folderPathLabel {
+                    Text(path)
+                        .font(AppTheme.monoFont(size: 10))
+                        .foregroundStyle(AppTheme.textTertiary)
                         .lineLimit(1)
-                    Text(selectedModelSubtitle)
-                        .font(AppTheme.uiFont(size: 11, weight: .medium))
-                        .foregroundStyle(AppTheme.textSecondary)
-                        .lineLimit(1)
+                        .truncationMode(.head)
                 }
             }
 
@@ -137,53 +122,36 @@ struct RelayChatView: View {
         Button {
             showingThreads = true
         } label: {
-            HStack(spacing: 11) {
-                Image(systemName: "bubble.left.and.bubble.right.fill")
-                    .font(AppTheme.uiFont(size: 15, weight: .semibold))
-                    .foregroundStyle(AppTheme.accent)
-                    .frame(width: 32, height: 32)
-                    .background(AppTheme.accent.opacity(0.14), in: Circle())
+            HStack(spacing: 10) {
+                Image(systemName: "bubble.left.and.bubble.right")
+                    .font(AppTheme.uiFont(size: 14, weight: .medium))
+                    .foregroundStyle(AppTheme.textSecondary)
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Threads")
-                        .font(AppTheme.uiFont(size: 14, weight: .bold))
-                        .foregroundStyle(AppTheme.textPrimary)
-                    Text("Past conversations & invocations")
-                        .font(AppTheme.uiFont(size: 11, weight: .medium))
-                        .foregroundStyle(AppTheme.textSecondary)
-                }
+                Text("Threads")
+                    .font(AppTheme.uiFont(size: 14, weight: .medium))
+                    .foregroundStyle(AppTheme.textPrimary)
 
                 Spacer()
 
                 Text("\(viewModel.historyItems.count)")
-                    .font(AppTheme.monoFont(size: 11, weight: .semibold))
-                    .foregroundStyle(AppTheme.textSecondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(AppTheme.bgCanvas, in: Capsule())
+                    .font(AppTheme.monoFont(size: 11))
+                    .foregroundStyle(AppTheme.textTertiary)
 
                 Image(systemName: "chevron.right")
-                    .font(AppTheme.uiFont(size: 11, weight: .bold))
-                    .foregroundStyle(AppTheme.textTertiary)
+                    .font(AppTheme.uiFont(size: 11, weight: .semibold))
+                    .foregroundStyle(AppTheme.textFaint)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-            .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(AppTheme.textTertiary.opacity(0.55), lineWidth: 1)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .overlay(alignment: .bottom) {
+                Rectangle()
+                    .fill(AppTheme.hairline)
+                    .frame(height: 1)
             }
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Threads, \(viewModel.historyItems.count) conversations and invocations")
         .accessibilityIdentifier("relay-threads")
-        .padding(.horizontal, 16)
-        .padding(.bottom, 8)
-    }
-
-    private var selectedModelSubtitle: String {
-        guard let choice = viewModel.selectedChoice else { return "Loading models" }
-        return "\(choice.chipLabel) · \(choice.mode.label)"
     }
 
     private func dismissKeyboard() {
@@ -273,7 +241,7 @@ struct RelayChatView: View {
                     .foregroundStyle(AppTheme.textPrimary)
                     .frame(width: 38, height: 38)
                     .background(.ultraThinMaterial, in: Circle())
-                    .overlay { Circle().stroke(AppTheme.glassStroke, lineWidth: 0.6) }
+                    .overlay { Circle().stroke(AppTheme.hairline, lineWidth: 0.6) }
                     .shadow(color: AppTheme.shadowColor, radius: 8, y: 3)
             }
             .buttonStyle(.plain)
@@ -316,7 +284,9 @@ private struct RelayComposer: View {
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(AppTheme.accent)
             Text(text)
-                .font(AppTheme.uiFont(size: 13, weight: .medium))
+                .font(AppTheme.uiFont(size: 11, weight: .semibold))
+                .tracking(0.8)
+                .textCase(.uppercase)
                 .lineLimit(usesAccessibilityLayout ? 3 : 1)
                 .multilineTextAlignment(.leading)
                 .truncationMode(.tail)
@@ -339,7 +309,7 @@ private struct RelayComposer: View {
         .frame(minHeight: 34)
         .frame(maxWidth: usesAccessibilityLayout ? .infinity : 240, alignment: .leading)
         .fixedSize(horizontal: !usesAccessibilityLayout, vertical: false)
-        .background(AppTheme.bgSurfaceHi, in: Capsule())
+        .overlay(Capsule().stroke(AppTheme.hairlineStrong, lineWidth: 1))
     }
 
     /// Harness-first model picker: each agent harness (Codex, Claude Code, Cursor) is a
@@ -478,13 +448,12 @@ private struct RelayComposer: View {
                     } label: {
                         ZStack {
                             Circle()
-                                .fill(canSend ? AnyShapeStyle(AppTheme.accentGradient) : AnyShapeStyle(AppTheme.bgSurface))
+                                .fill(canSend ? AnyShapeStyle(AppTheme.accentGradient) : AnyShapeStyle(AppTheme.textPrimary.opacity(0.08)))
                                 .frame(width: 34, height: 34)
                             Image(systemName: "arrow.up")
                                 .font(.system(size: 15, weight: .bold))
                                 .foregroundStyle(canSend ? .white : AppTheme.textTertiary)
                         }
-                        .shadow(color: canSend ? AppTheme.accent.opacity(0.5) : .clear, radius: 6, y: 2)
                     }
                     .buttonStyle(.plain)
                     .disabled(!canSend)
@@ -496,23 +465,14 @@ private struct RelayComposer: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
             .background {
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .fill(.ultraThinMaterial)
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 18, style: .continuous)
-                            .fill(AppTheme.glassTint)
-                    }
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 18, style: .continuous)
-                            .stroke(AppTheme.glassStroke, lineWidth: 0.7)
-                    }
+                Capsule().stroke(AppTheme.hairlineStrong, lineWidth: 1)
             }
             .animation(.spring(response: 0.3, dampingFraction: 0.7), value: isStreaming)
         }
         .padding(.horizontal, 12)
         .padding(.top, 10)
         .padding(.bottom, Self.normalBottomPadding)
-        .background(AppTheme.bgCanvas)
+        .background(AppTheme.canvasBottom)
         .animation(.easeOut(duration: 0.18), value: isFocused)
     }
 
@@ -543,49 +503,20 @@ private struct RelayChatBubble: View {
     var body: some View {
         HStack(alignment: .bottom, spacing: 8) {
             if isUser { Spacer(minLength: 44) }
-            if !isUser { avatar }
 
-            VStack(alignment: .leading, spacing: 7) {
-                HStack(spacing: 6) {
-                    Text(label)
-                        .font(AppTheme.uiFont(size: 11, weight: .semibold))
-                        .foregroundStyle(metaColor)
-                    if let model = item.modelLabel, !isUser {
-                        Text(model)
-                            .font(AppTheme.uiFont(size: 11))
-                            .foregroundStyle(AppTheme.textTertiary)
-                            .lineLimit(1)
-                    }
-                    if showCopied {
-                        Text("Copied")
-                            .font(AppTheme.uiFont(size: 10, weight: .semibold))
-                            .foregroundStyle(AppTheme.statusOK)
-                            .transition(.opacity)
-                    }
-                }
-
-                if showWaitingDots {
-                    RelayTypingDots()
-                        .padding(.vertical, 2)
+            Group {
+                if isUser {
+                    messageColumn
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 11)
+                        .background(AppTheme.userBubbleGradient)
+                        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                        .shadow(color: AppTheme.shadowColor.opacity(0.4), radius: 10, y: 4)
                 } else {
-                    RelayStreamingContent(text: item.text, isStreaming: item.isStreaming, userAligned: isUser)
-                }
-
-                if let footer = footerText {
-                    Text(footer)
-                        .font(AppTheme.monoFont(size: 10))
-                        .foregroundStyle(isUser ? AppTheme.bgCanvas.opacity(0.6) : AppTheme.textTertiary)
+                    messageColumn
+                        .padding(.vertical, 2)
                 }
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 11)
-            .background(bubbleBackground)
-            .overlay {
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .stroke(bubbleStroke, lineWidth: 0.6)
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-            .shadow(color: AppTheme.shadowColor.opacity(isUser ? 0.4 : 0.25), radius: isUser ? 10 : 6, x: 0, y: 4)
             .contextMenu {
                 Button {
                     UIPasteboard.general.string = item.text
@@ -597,27 +528,39 @@ private struct RelayChatBubble: View {
         }
     }
 
-    @ViewBuilder private var bubbleBackground: some View {
-        if isUser {
-            AppTheme.userBubbleGradient
-        } else {
-            ZStack {
-                AppTheme.bgSurfaceHi
-                AppTheme.glassTint
+    private var messageColumn: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 6) {
+                RelayCapsLabel(
+                    text: bylineText,
+                    color: isUser ? AppTheme.onEmber.opacity(0.7) : AppTheme.accent
+                )
+                if showCopied {
+                    RelayCapsLabel(text: "Copied", color: AppTheme.textSecondary, size: 9)
+                        .transition(.opacity)
+                }
+            }
+
+            if showWaitingDots {
+                RelayTypingDots()
+                    .padding(.vertical, 2)
+            } else {
+                RelayStreamingContent(text: item.text, isStreaming: item.isStreaming, userAligned: isUser)
+            }
+
+            if let footer = footerText {
+                Text(footer)
+                    .font(AppTheme.monoFont(size: 10))
+                    .foregroundStyle(isUser ? AppTheme.onEmber.opacity(0.7) : AppTheme.textTertiary)
             }
         }
     }
 
-    private var avatar: some View {
-        Circle()
-            .fill(AppTheme.accentGradient)
-            .frame(width: 26, height: 26)
-            .overlay {
-                Image(systemName: "sparkle")
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundStyle(.white)
-            }
-            .shadow(color: AppTheme.accent.opacity(0.5), radius: 5, x: 0, y: 2)
+    private var bylineText: String {
+        if isUser { return "You" }
+        let provider = item.provider?.displayName ?? "Relay"
+        if let model = item.modelLabel { return "\(provider) · \(model)" }
+        return provider
     }
 
     private func flashCopied() {
@@ -645,9 +588,6 @@ private struct RelayChatBubble: View {
     }
 
     private var isUser: Bool { item.role == .user }
-    private var label: String { isUser ? "You" : item.provider?.displayName ?? "Relay" }
-    private var metaColor: Color { isUser ? AppTheme.bgCanvas.opacity(0.78) : AppTheme.accent }
-    private var bubbleStroke: Color { isUser ? Color.white.opacity(0.14) : AppTheme.glassStroke }
 }
 
 /// Animated three-dot "thinking" indicator shown before the first token arrives.
@@ -658,8 +598,8 @@ private struct RelayTypingDots: View {
         HStack(spacing: 5) {
             ForEach(0..<3, id: \.self) { i in
                 Circle()
-                    .fill(AppTheme.accent)
-                    .frame(width: 7, height: 7)
+                    .fill(AppTheme.textTertiary)
+                    .frame(width: 5, height: 5)
                     .scaleEffect(scale(for: i))
                     .opacity(0.5 + 0.5 * scale(for: i))
             }
@@ -720,10 +660,8 @@ private struct RelayJobCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
-                RelayStatusPill(status: job.status)
-                Text(job.provider.displayName)
-                    .font(AppTheme.uiFont(size: 12, weight: .medium))
-                    .foregroundStyle(AppTheme.textSecondary)
+                RelayStatusPill(status: job.status, startedAt: job.startedAt ?? job.createdAt)
+                RelayCapsLabel(text: job.provider.displayName, color: AppTheme.textTertiary)
                 Spacer()
                 // Status lives in the pill only (it used to repeat as plain text here);
                 // the trailing slot shows the run duration once the server reports one.
@@ -764,10 +702,9 @@ private struct RelayJobCard: View {
             .font(AppTheme.uiFont(size: 13, weight: .medium))
         }
         .padding(14)
-        .background(AppTheme.bgSurfaceHi, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(AppTheme.accent.opacity(0.22), lineWidth: 0.8)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(job.status.isActive ? AppTheme.accent.opacity(0.35) : AppTheme.hairline, lineWidth: 1)
         }
         .onChange(of: job.status.isActive) { _, isActive in
             // Light tap when the job reaches a terminal state while the card is visible.
@@ -809,14 +746,25 @@ private struct RelayJobCard: View {
 
 private struct RelayStatusPill: View {
     let status: CodexJobStatus
+    let startedAt: Date?
 
     var body: some View {
-        Text(status.label)
-            .font(AppTheme.uiFont(size: 11, weight: .semibold))
-            .foregroundStyle(status.relayTint)
-            .padding(.horizontal, 9)
-            .padding(.vertical, 4)
-            .background(status.relayTint.opacity(0.12), in: Capsule())
+        if status.isActive, let startedAt {
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                RelayCapsLabel(
+                    text: "\(status.label) · \(elapsedLabel(to: context.date))",
+                    color: AppTheme.accentBright
+                )
+            }
+        } else {
+            RelayCapsLabel(text: status.label, color: status.relayTint)
+        }
+    }
+
+    private func elapsedLabel(to now: Date) -> String {
+        guard let startedAt else { return "" }
+        let seconds = max(0, Int(now.timeIntervalSince(startedAt)))
+        return String(format: "%d:%02d", seconds / 60, seconds % 60)
     }
 }
 
@@ -824,15 +772,13 @@ private extension CodexJobStatus {
     var relayTint: Color {
         switch self {
         case .queued, .running, .canceling:
-            return AppTheme.statusWarn
+            return AppTheme.accentBright
         case .succeeded:
-            return AppTheme.statusOK
+            return AppTheme.textSecondary
         case .failed:
             return AppTheme.statusError
-        case .canceled, .timeout:
-            return AppTheme.statusNeutral
-        case .unknown:
-            return AppTheme.statusInfo
+        case .canceled, .timeout, .unknown:
+            return AppTheme.textTertiary
         }
     }
 }
@@ -852,7 +798,7 @@ private struct RelayThreadDrawer: View {
                         Label("New conversation", systemImage: "square.and.pencil")
                             .foregroundStyle(AppTheme.accent)
                     }
-                    .listRowBackground(AppTheme.bgSurface)
+                    .listRowBackground(Color.clear)
                 }
 
                 if viewModel.historyItems.isEmpty {
@@ -901,14 +847,9 @@ private struct RelayThreadDrawer: View {
                         .lineLimit(1)
                     Spacer()
                     if item.isActive {
-                        Circle().fill(AppTheme.statusWarn).frame(width: 7, height: 7)
+                        RelayCapsLabel(text: "Active", color: AppTheme.accentBright, size: 9)
                     }
-                    Text(historyModeLabel(item))
-                        .font(AppTheme.uiFont(size: 9, weight: .bold))
-                        .foregroundStyle(AppTheme.accent)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(AppTheme.accent.opacity(0.15), in: Capsule())
+                    RelayCapsLabel(text: historyModeLabel(item), color: AppTheme.accent, size: 9)
                 }
                 Text(item.preview)
                     .font(.caption)
@@ -919,7 +860,7 @@ private struct RelayThreadDrawer: View {
                     .foregroundStyle(AppTheme.textTertiary)
             }
         }
-        .listRowBackground(AppTheme.bgSurface)
+        .listRowBackground(Color.clear)
     }
 
     private func historyModeLabel(_ item: CodexThreadFeedItem) -> String {
@@ -955,7 +896,10 @@ private struct RelayStatusBanner: View {
             .foregroundStyle(AppTheme.statusError)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(12)
-            .background(AppTheme.statusError.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(AppTheme.statusError.opacity(0.3), lineWidth: 1)
+            }
     }
 }
 
@@ -967,15 +911,12 @@ private struct RelayEmptyConversation: View {
     var body: some View {
         VStack(spacing: 14) {
             Image(systemName: isTask ? "terminal.fill" : "message.fill")
-                .font(.system(size: 32, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(width: 78, height: 78)
-                .background(AppTheme.accentGradient, in: Circle())
-                .shadow(color: AppTheme.accent.opacity(0.45), radius: 16, y: 6)
+                .font(.system(size: 30, weight: .medium))
+                .foregroundStyle(AppTheme.accentGradient)
 
             VStack(spacing: 6) {
                 Text(isTask ? "Run a task" : "Start a conversation")
-                    .font(AppTheme.uiFont(size: 20, weight: .semibold))
+                    .font(AppTheme.serifFont(size: 24))
                     .foregroundStyle(AppTheme.textPrimary)
                 Text(isTask
                      ? "Queue an agent job in this folder."
@@ -991,7 +932,7 @@ private struct RelayEmptyConversation: View {
                     .foregroundStyle(AppTheme.textSecondary)
                     .padding(.horizontal, 12)
                     .frame(height: 30)
-                    .background(AppTheme.bgSurfaceHi, in: Capsule())
+                    .overlay(Capsule().stroke(AppTheme.hairlineStrong, lineWidth: 1))
             }
         }
         .frame(maxWidth: .infinity, minHeight: 320, alignment: .center)

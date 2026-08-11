@@ -28,12 +28,10 @@ struct RelayOnboardingView: View {
             VStack(spacing: 18) {
                 HStack {
                     Text("Relay")
-                        .font(.system(size: 24, weight: .medium, design: .serif))
+                        .font(AppTheme.serifFont(size: 24))
                         .foregroundStyle(AppTheme.textPrimary)
                     Spacer()
-                    Text("\(page + 1) of \(pages.count)")
-                        .font(AppTheme.uiFont(size: 12, weight: .semibold))
-                        .foregroundStyle(AppTheme.textTertiary)
+                    RelayCapsLabel(text: "\(page + 1) of \(pages.count)")
                 }
                 .padding(.horizontal, 22)
                 .padding(.top, 16)
@@ -43,16 +41,10 @@ struct RelayOnboardingView: View {
                         VStack(spacing: 24) {
                             Spacer()
                             Image(systemName: item.icon)
-                                .font(.system(size: 54, weight: .medium))
+                                .font(.system(size: 48, weight: .medium))
                                 .foregroundStyle(AppTheme.accentGradient)
-                                .frame(width: 116, height: 116)
-                                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 34))
-                                .overlay {
-                                    RoundedRectangle(cornerRadius: 34)
-                                        .stroke(AppTheme.glassStroke, lineWidth: 1)
-                                }
                             Text(item.title)
-                                .font(.system(size: 31, weight: .medium, design: .serif))
+                                .font(AppTheme.serifFont(size: 31))
                                 .foregroundStyle(AppTheme.textPrimary)
                                 .multilineTextAlignment(.center)
                             Text(item.detail)
@@ -66,7 +58,7 @@ struct RelayOnboardingView: View {
                         .tag(index)
                     }
                 }
-                .tabViewStyle(.page(indexDisplayMode: .always))
+                .tabViewStyle(.page(indexDisplayMode: .never))
 
                 Button {
                     if page < pages.count - 1 {
@@ -76,13 +68,8 @@ struct RelayOnboardingView: View {
                     }
                 } label: {
                     Text(page == pages.count - 1 ? "Enter Relay" : "Continue")
-                        .font(AppTheme.uiFont(size: 16, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 52)
-                        .background(AppTheme.accentGradient, in: RoundedRectangle(cornerRadius: 13))
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(RelayPrimaryButtonStyle())
                 .padding(.horizontal, 22)
                 .padding(.bottom, 20)
                 .accessibilityIdentifier("relay-onboarding-continue")
