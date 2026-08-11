@@ -102,3 +102,143 @@ test("summaryPrompt never fabricates content it was not given", () => {
   assert.match(prompt, /Fix the auth redirect/);
   assert.ok(!prompt.includes("undefined"), "empty fields are omitted, not stringified");
 });
+
+test("summaryPrompt never emits 'undefined' or 'null' when repo/branch are missing", () => {
+  const prompt = summaryPrompt(manifest({ repo: undefined, branch: undefined }));
+  assert.ok(!prompt.includes("undefined"), "missing repo/branch must not stringify to 'undefined'");
+  assert.ok(!prompt.includes("null"), "missing repo/branch must not stringify to 'null'");
+});
+
+test("importSession rejects a sessionId that path-traverses outside runHome (claude branch)", () => {
+  const { runHome, codexHome } = homes();
+  const evilId = "../".repeat(20) + "private/tmp/RELAYD-PWNED-DEMO";
+  const sessionBytes = Buffer.from(`${JSON.stringify({ type: "user", cwd: FROM_CWD })}\n`, "utf8");
+
+  assert.throws(
+    () => importSession({
+      manifest: manifest({ sessionId: evilId }),
+      sessionBytes, runHome, codexHome, worktreePath: TO_CWD,
+    }),
+    /unsafe_session_id/,
+  );
+  assert.ok(!fs.existsSync("/private/tmp/RELAYD-PWNED-DEMO"), "no file escapes the jail");
+});
+
+test("importSession rejects a sessionId that path-traverses outside codexHome (codex branch)", () => {
+  const { runHome, codexHome } = homes();
+  const evilId = "../".repeat(20) + "private/tmp/RELAYD-PWNED-DEMO-CODEX";
+  const rollout = Buffer.from(`${JSON.stringify({ record: "rollout", cwd: FROM_CWD })}\n`, "utf8");
+
+  assert.throws(
+    () => importSession({
+      manifest: manifest({ harness: "codex", sessionFormat: "codex-rollout", sessionId: evilId }),
+      sessionBytes: rollout, runHome, codexHome, worktreePath: TO_CWD,
+    }),
+    /unsafe_session_id/,
+  );
+  assert.ok(!fs.existsSync("/private/tmp/RELAYD-PWNED-DEMO-CODEX"), "no file escapes the jail");
+});
+
+test("importSession rejects an absolute-path sessionId", () => {
+  const { runHome, codexHome } = homes();
+  const sessionBytes = Buffer.from(`${JSON.stringify({ type: "user", cwd: FROM_CWD })}\n`, "utf8");
+  assert.throws(
+    () => importSession({
+      manifest: manifest({ sessionId: "/etc/RELAYD-PWNED-ABS" }),
+      sessionBytes, runHome, codexHome, worktreePath: TO_CWD,
+    }),
+    /unsafe_session_id/,
+  );
+  assert.ok(!fs.existsSync("/etc/RELAYD-PWNED-ABS"), "no file escapes the jail");
+});
+
+test("importSession rejects a sessionId containing a forward slash", () => {
+  const { runHome, codexHome } = homes();
+  const sessionBytes = Buffer.from(`${JSON.stringify({ type: "user", cwd: FROM_CWD })}\n`, "utf8");
+  assert.throws(
+    () => importSession({
+      manifest: manifest({ sessionId: "abc/def" }),
+      sessionBytes, runHome, codexHome, worktreePath: TO_CWD,
+    }),
+    /unsafe_session_id/,
+  );
+});
+
+test("importSession rejects a sessionId that is exactly '..'", () => {
+  const { runHome, codexHome } = homes();
+  const sessionBytes = Buffer.from(`${JSON.stringify({ type: "user", cwd: FROM_CWD })}\n`, "utf8");
+  assert.throws(
+    () => importSession({
+      manifest: manifest({ sessionId: ".." }),
+      sessionBytes, runHome, codexHome, worktreePath: TO_CWD,
+    }),
+    /unsafe_session_id/,
+  );
+});
+
+test("rewriteClaudeSession does not corrupt sibling paths that share a prefix", () => {
+  const text = JSON.stringify({
+    old: `${FROM_CWD}-old`,
+    ground: `${FROM_CWD}ground`,
+    exact: FROM_CWD,
+  });
+  const rewritten = rewriteClaudeSession(text, { fromCwd: FROM_CWD, toCwd: TO_CWD });
+  const parsed = JSON.parse(rewritten);
+
+  assert.equal(parsed.old, `${FROM_CWD}-old`, "sibling with a dash suffix must be left alone");
+  assert.equal(parsed.ground, `${FROM_CWD}ground`, "sibling with a continuation suffix must be left alone");
+  assert.equal(parsed.exact, TO_CWD, "an exact match must still be rewritten");
+});
+
+test("rewriteClaudeSession still rewrites all legitimate boundary cases and stays valid JSON", () => {
+  const text = JSON.stringify({
+    subpath: `${FROM_CWD}/src/a.ts`,
+    end: FROM_CWD,
+    quoted: `prefix ${FROM_CWD}" suffix`,
+  });
+  const rewritten = rewriteClaudeSession(text, { fromCwd: FROM_CWD, toCwd: TO_CWD });
+  assert.doesNotThrow(() => JSON.parse(rewritten), "output must still parse as JSON");
+  const parsed = JSON.parse(rewritten);
+
+  assert.equal(parsed.subpath, `${TO_CWD}/src/a.ts`);
+  assert.equal(parsed.end, TO_CWD);
+  assert.equal(parsed.quoted, `prefix ${TO_CWD}" suffix`);
+});
+
+test("rewriteClaudeSession escapes regex metacharacters in fromCwd", () => {
+  const metaFrom = "/Users/dev/code/relay+old.checkout";
+  const text = JSON.stringify({
+    exact: metaFrom,
+    sub: `${metaFrom}/file.ts`,
+    sibling: `${metaFrom}-sibling`,
+  });
+  const rewritten = rewriteClaudeSession(text, { fromCwd: metaFrom, toCwd: TO_CWD });
+  const parsed = JSON.parse(rewritten);
+
+  assert.equal(parsed.exact, TO_CWD);
+  assert.equal(parsed.sub, `${TO_CWD}/file.ts`);
+  assert.equal(parsed.sibling, `${metaFrom}-sibling`, "sibling must survive even with metacharacters in fromCwd");
+});
+
+test("staged directories (not just the leaf file) are 0700", () => {
+  const { runHome, codexHome } = homes();
+  const sessionBytes = Buffer.from(`${JSON.stringify({ type: "user", cwd: FROM_CWD })}\n`, "utf8");
+  importSession({ manifest: manifest(), sessionBytes, runHome, codexHome, worktreePath: TO_CWD });
+
+  const projectDir = path.join(runHome, ".claude", "projects", claudeProjectSlug(TO_CWD));
+  let dir = projectDir;
+  while (dir.startsWith(runHome) && dir !== runHome) {
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700, `${dir} must be 0700`);
+    dir = path.dirname(dir);
+  }
+});
+
+test("an unrecognized harness degrades to claude observably", () => {
+  const { runHome, codexHome } = homes();
+  const result = importSession({
+    manifest: manifest({ harness: "some-future-harness", sessionFormat: "none", sessionId: null }),
+    sessionBytes: null, runHome, codexHome, worktreePath: TO_CWD,
+  });
+  assert.equal(result.provider, "claude", "unrecognized harnesses fall back to claude");
+  assert.equal(result.requestedHarness, "some-future-harness", "the originally-requested harness is still visible");
+});
