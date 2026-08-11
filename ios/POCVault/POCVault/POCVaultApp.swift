@@ -40,6 +40,7 @@ struct POCVaultApp: App {
         _accountStore = StateObject(wrappedValue: accountStore)
         self.manifestClient = manifestClient
         self.codexClient = codexClient
+        self.trialClient = RelayTrialClient(baseURL: AppConfiguration.authBaseURL)
     }
 
     var body: some Scene {
@@ -51,7 +52,12 @@ struct POCVaultApp: App {
                 case .signedOut:
                     AuthenticationView(accountStore: accountStore)
                 case .onboarding:
-                    RelayOnboardingView(accountStore: accountStore)
+                    RelayOnboardingView(
+                        accountStore: accountStore,
+                        nodeStore: nodeStore,
+                        identityStore: identityStore,
+                        trialClient: trialClient
+                    )
                 case .ready:
                     POCVaultRootView(
                         libraryViewModel: libraryViewModel,
