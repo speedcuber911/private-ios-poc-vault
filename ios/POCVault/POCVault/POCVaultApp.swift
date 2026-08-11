@@ -220,7 +220,6 @@ struct POCVaultRootView: View {
                         .font(AppTheme.uiFont(size: 16, weight: .semibold))
                         .foregroundStyle(AppTheme.textSecondary)
                         .frame(width: 36, height: 36)
-                        .background(AppTheme.bgSurfaceHi, in: Circle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Close library")
@@ -363,37 +362,33 @@ private struct CodexStatusView: View {
 
                 VStack(alignment: .leading, spacing: 0) {
                     Text("Status")
-                        .font(.system(size: 26, weight: .medium, design: .serif))
+                        .font(AppTheme.serifFont(size: 28))
                         .foregroundStyle(AppTheme.textPrimary)
                         .padding(.horizontal, 20)
                         .padding(.top, 16)
                         .padding(.bottom, 16)
 
-                    HStack(spacing: 2) {
+                    HStack(spacing: 18) {
                         ForEach(StatusSection.allCases) { section in
                             Button {
                                 withAnimation(.easeInOut(duration: 0.18)) {
                                     selectedSection = section
                                 }
                             } label: {
-                                Text(section.title)
-                                    .font(.system(size: 14, weight: selectedSection == section ? .medium : .regular))
-                                    .foregroundStyle(selectedSection == section ? AppTheme.textPrimary : AppTheme.textSecondary)
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 8)
-                                    .background {
-                                        if selectedSection == section {
-                                            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                                .fill(AppTheme.textPrimary.opacity(0.12))
-                                        }
-                                    }
+                                VStack(spacing: 5) {
+                                    Text(section.title)
+                                        .font(.system(size: 14, weight: selectedSection == section ? .medium : .regular))
+                                        .foregroundStyle(selectedSection == section ? AppTheme.textPrimary : AppTheme.textTertiary)
+                                    Rectangle()
+                                        .fill(selectedSection == section ? AppTheme.accent : Color.clear)
+                                        .frame(height: 2)
+                                }
+                                .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
                         }
                     }
-                    .padding(3)
-                    .background(AppTheme.bgSurfaceHi, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    .padding(.horizontal, 16)
+                    .padding(.horizontal, 20)
                     .padding(.bottom, 16)
 
                     switch selectedSection {
@@ -421,7 +416,7 @@ private struct CodexStatusView: View {
                                 }
                                 .overlay(alignment: .top) {
                                     Rectangle()
-                                        .fill(AppTheme.strokeSubtle)
+                                        .fill(AppTheme.hairline)
                                         .frame(height: 0.5)
                                 }
                             }
@@ -498,7 +493,7 @@ private struct CodexActivityRow: View {
                 .font(.system(size: 15))
                 .foregroundStyle(AppTheme.textSecondary)
                 .frame(width: 32, height: 32)
-                .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .background(AppTheme.textPrimary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
 
             VStack(alignment: .leading, spacing: 5) {
                 Text(item.title)
@@ -511,19 +506,16 @@ private struct CodexActivityRow: View {
                     Text("\(item.workspaceLabel) · \(timestampText)")
                         .font(.system(size: 11))
                         .foregroundStyle(AppTheme.textSecondary)
-                    Text(provider.displayName)
-                        .font(.system(size: 11))
-                        .foregroundStyle(provider == .codex ? AppTheme.textSecondary : AppTheme.accent)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 2)
-                        .background((provider == .codex ? AppTheme.textPrimary : AppTheme.accent).opacity(provider == .codex ? 0.08 : 0.14), in: Capsule())
-                    HStack(spacing: 3) {
-                        Image(systemName: statusSymbol)
-                            .font(.system(size: 11, weight: .semibold))
-                        Text(item.status?.label ?? "Thread")
-                            .font(.system(size: 11))
-                    }
-                    .foregroundStyle(statusColor)
+                    RelayCapsLabel(
+                        text: provider.displayName,
+                        color: provider == .codex ? AppTheme.textTertiary : AppTheme.accent,
+                        size: 9
+                    )
+                    RelayCapsLabel(
+                        text: item.status?.label ?? "Thread",
+                        color: statusColor,
+                        size: 9
+                    )
                 }
                 .lineLimit(1)
             }
@@ -534,21 +526,9 @@ private struct CodexActivityRow: View {
         .padding(.vertical, 12)
         .overlay(alignment: .bottom) {
             Rectangle()
-                .fill(AppTheme.strokeSubtle)
+                .fill(AppTheme.hairline)
                 .frame(height: 0.5)
                 .padding(.leading, 62)
-        }
-    }
-
-    private var statusSymbol: String {
-        guard let status = item.status else { return item.isActive ? "clock" : "checkmark" }
-        switch status {
-        case .succeeded:
-            return "checkmark"
-        case .queued, .running, .canceling:
-            return "clock"
-        default:
-            return "exclamationmark"
         }
     }
 
@@ -558,16 +538,16 @@ private struct CodexActivityRow: View {
     }
 
     private var statusColor: Color {
-        guard let status = item.status else { return AppTheme.statusInfo }
+        guard let status = item.status else { return AppTheme.textTertiary }
         switch status {
         case .queued, .running, .canceling:
-            return AppTheme.statusWarn
+            return AppTheme.accentBright
         case .succeeded:
-            return AppTheme.statusOK
+            return AppTheme.textSecondary
         case .failed, .timeout:
             return AppTheme.statusError
         case .canceled, .unknown:
-            return AppTheme.statusNeutral
+            return AppTheme.textTertiary
         }
     }
 
@@ -578,48 +558,66 @@ private struct CodexActivityRow: View {
     }()
 }
 
+/// Editorial Ember design language — see docs/superpowers/specs/2026-08-11-editorial-ember-design.md.
+/// Serif for identity, sans for function; one surface with hairlines; ember only where
+/// attention belongs; status is typographic, never a dot.
 enum AppTheme {
-    static let bgCanvas = Color(hex: 0x1A1917)
-    static let bgSurface = warmText.opacity(0.06)
-    static let bgSurfaceHi = Color(hex: 0x232220)
-    static let threadPreviewBackground = Color(hex: 0x272522)
-    static let strokeSubtle = warmText.opacity(0.07)
-    static let strokeStrong = warmText.opacity(0.07)
-    static let textPrimary = warmText
-    static let textSecondary = warmText.opacity(0.45)
-    static let textTertiary = warmText.opacity(0.27)
-    static let inactiveTab = warmText.opacity(0.38)
+    // Canvas
+    static let canvasTop = Color(hex: 0x1E1B17)
+    static let canvasBottom = Color(hex: 0x151310)
+    /// Solid canvas for sheets and fills that cannot take the gradient.
+    static let bgCanvas = Color(hex: 0x1A1815)
+    static let canvasGradient = LinearGradient(
+        colors: [canvasTop, canvasBottom],
+        startPoint: .top,
+        endPoint: .bottom
+    )
+
+    // Ink — cream at four opacity steps. Success/neutral status text uses these.
+    static let textPrimary = ink
+    static let textSecondary = ink.opacity(0.55)
+    static let textTertiary = ink.opacity(0.38)
+    static let textFaint = ink.opacity(0.25)
+
+    // Structure — hairlines instead of boxes.
+    static let hairline = ink.opacity(0.10)
+    static let hairlineStrong = ink.opacity(0.16)
+
+    // Ember — the primary action, the user's own words, live activity. Nothing else.
     static let accent = Color(hex: 0xD4804A)
     static let accentBright = Color(hex: 0xE8965C)
-    static let accentDeep = Color(hex: 0xB5612F)
-    static let statusOK = Color(hex: 0x32D74B)
-    static let statusWarn = Color(hex: 0xFF9F0A)
-    static let statusError = statusWarn
-    static let statusInfo = textSecondary
-    static let statusNeutral = textTertiary
-
-    private static let warmText = Color(hex: 0xEDE8DF)
-
-    // Visual-leap tokens: gradients, glass, depth.
+    static let accentDeep = Color(hex: 0xC96F35)
+    static let onEmber = Color(hex: 0x1C1207)
     static let accentGradient = LinearGradient(
         colors: [accentBright, accentDeep],
         startPoint: .topLeading,
         endPoint: .bottomTrailing
     )
-    static let canvasGradient = LinearGradient(
-        colors: [Color(hex: 0x201E1B), Color(hex: 0x161513)],
-        startPoint: .top,
-        endPoint: .bottom
-    )
-    static let userBubbleGradient = LinearGradient(
-        colors: [accentBright, accentDeep],
-        startPoint: .topLeading,
-        endPoint: .bottomTrailing
-    )
-    /// Translucent surface for glassy cards (use over .ultraThinMaterial).
-    static let glassTint = warmText.opacity(0.04)
-    static let glassStroke = warmText.opacity(0.10)
+    static let userBubbleGradient = accentGradient
+
+    // Status text colors (words, not shapes). Success stays cream on purpose.
+    static let statusWarn = Color(hex: 0xE0B25C)
+    static let statusError = Color(hex: 0xD9776B)
+
+    // Depth
     static let shadowColor = Color.black.opacity(0.35)
+    static let emberShadow = accentDeep.opacity(0.25)
+
+    private static let ink = Color(hex: 0xEDE8DF)
+
+    // LEGACY tokens — remaining call sites migrate screen-by-screen; deleted in the
+    // final cleanup task. Do not add new uses.
+    static let bgSurface = ink.opacity(0.06)
+    static let bgSurfaceHi = Color(hex: 0x232220)
+    static let threadPreviewBackground = Color(hex: 0x272522)
+    static let strokeSubtle = hairline
+    static let strokeStrong = hairlineStrong
+    static let inactiveTab = ink.opacity(0.38)
+    static let statusOK = ink.opacity(0.55)
+    static let statusInfo = ink.opacity(0.55)
+    static let statusNeutral = ink.opacity(0.38)
+    static let glassTint = ink.opacity(0.04)
+    static let glassStroke = ink.opacity(0.10)
 
     static func uiFont(size: CGFloat, weight: Font.Weight = .regular) -> Font {
         Font.custom("DMSans-9ptRegular", size: size).weight(weight)
@@ -627,6 +625,62 @@ enum AppTheme {
 
     static func monoFont(size: CGFloat, weight: Font.Weight = .regular) -> Font {
         Font.custom("DMMono-Regular", size: size).weight(weight)
+    }
+
+    /// New York serif — screen titles, wordmark, folder/chat headers only.
+    static func serifFont(size: CGFloat, weight: Font.Weight = .medium) -> Font {
+        .system(size: size, weight: weight, design: .serif)
+    }
+}
+
+/// Small-caps letterspaced label — the only rendering for status words, bylines,
+/// and section labels (spec rule 5: status is typographic, never a dot).
+struct RelayCapsLabel: View {
+    let text: String
+    var color: Color = AppTheme.textTertiary
+    var size: CGFloat = 10
+
+    var body: some View {
+        Text(text.uppercased())
+            .font(AppTheme.uiFont(size: size, weight: .semibold))
+            .tracking(1.1)
+            .foregroundStyle(color)
+    }
+}
+
+/// Primary action: full-chroma ember pill, one per screen at most.
+/// Disabled state desaturates to cream — never dimmed ember (spec rule 3).
+struct RelayPrimaryButtonStyle: ButtonStyle {
+    var isEnabled = true
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(AppTheme.uiFont(size: 16, weight: .semibold))
+            .foregroundStyle(isEnabled ? AppTheme.onEmber : AppTheme.textTertiary)
+            .frame(maxWidth: .infinity)
+            .frame(height: 50)
+            .background(
+                isEnabled
+                    ? AnyShapeStyle(AppTheme.accentGradient)
+                    : AnyShapeStyle(AppTheme.textPrimary.opacity(0.08)),
+                in: Capsule()
+            )
+            .shadow(color: isEnabled ? AppTheme.emberShadow : .clear, radius: 20, y: 6)
+            .opacity(configuration.isPressed ? 0.85 : 1)
+    }
+}
+
+/// Secondary action: hairline outline pill, cream text.
+struct RelayOutlineButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(AppTheme.uiFont(size: 15, weight: .medium))
+            .foregroundStyle(AppTheme.textPrimary)
+            .frame(maxWidth: .infinity)
+            .frame(height: 50)
+            .overlay(Capsule().stroke(AppTheme.hairlineStrong, lineWidth: 1))
+            .contentShape(Capsule())
+            .opacity(configuration.isPressed ? 0.7 : 1)
     }
 }
 

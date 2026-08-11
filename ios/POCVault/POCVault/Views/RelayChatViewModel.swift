@@ -267,6 +267,11 @@ final class RelayChatViewModel: ObservableObject {
         return registeredWorkspaceName ?? "Relay"
     }
 
+    /// Full jail path shown under the chat header; nil for the root chat.
+    var folderPathLabel: String? {
+        workspacePath
+    }
+
     /// Adopt a workspace id learned outside this VM (e.g. the browser registered the
     /// folder after this session was created). First-writer wins; ids are stable per path.
     func adoptWorkspaceID(_ id: String) {

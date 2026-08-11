@@ -19,19 +19,37 @@ struct AuthenticationView: View {
         var id: String { rawValue }
     }
 
+    @FocusState private var focusedField: Field?
+
+    private enum Field: Hashable {
+        case username, email, password
+    }
+
     var body: some View {
         ZStack {
             AppTheme.canvasGradient.ignoresSafeArea()
 
             ScrollView {
-                VStack(spacing: 28) {
+                VStack(alignment: .leading, spacing: 0) {
                     brand
-                    authCard
+                    fields
+                        .padding(.top, 44)
+
+                    if let error = accountStore.errorMessage {
+                        errorBanner(error)
+                            .padding(.top, 18)
+                    }
+
+                    actions
+                        .padding(.top, 30)
+                    modeSwitch
+                        .padding(.top, 22)
                 }
                 .frame(maxWidth: 520)
-                .padding(.horizontal, 22)
-                .padding(.top, 52)
-                .padding(.bottom, 36)
+                .padding(.horizontal, 26)
+                .padding(.top, 72)
+                .padding(.bottom, 40)
+                .frame(maxWidth: .infinity)
             }
             .scrollDismissesKeyboard(.interactively)
         }
@@ -39,40 +57,93 @@ struct AuthenticationView: View {
     }
 
     private var brand: some View {
-        VStack(spacing: 14) {
+        VStack(alignment: .leading, spacing: 18) {
             Image(systemName: "point.3.connected.trianglepath.dotted")
-                .font(.system(size: 31, weight: .medium))
+                .font(.system(size: 34, weight: .medium))
                 .foregroundStyle(AppTheme.accentGradient)
-                .frame(width: 68, height: 68)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 20, style: .continuous)
-                        .stroke(AppTheme.glassStroke, lineWidth: 1)
-                }
 
-            Text("Relay")
-                .font(.system(size: 38, weight: .medium, design: .serif))
-                .foregroundStyle(AppTheme.textPrimary)
-
-            Text("Your secure control surface for remote agent work.")
-                .font(AppTheme.uiFont(size: 15))
-                .foregroundStyle(AppTheme.textSecondary)
-                .multilineTextAlignment(.center)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Relay")
+                    .font(AppTheme.serifFont(size: 40))
+                    .foregroundStyle(AppTheme.textPrimary)
+                Text("Your agents, within reach.")
+                    .font(AppTheme.serifFont(size: 15, weight: .regular).italic())
+                    .foregroundStyle(AppTheme.textSecondary)
+            }
         }
     }
 
-    private var authCard: some View {
-        VStack(spacing: 20) {
-            Picker("Authentication mode", selection: $mode) {
-                ForEach(Mode.allCases) { item in
-                    Text(item.rawValue).tag(item)
+    private var fields: some View {
+        VStack(spacing: 22) {
+            underlineField(
+                title: "Username",
+                text: $username,
+                field: .username,
+                contentType: .username,
+                keyboard: .asciiCapable
+            )
+
+            if mode == .createAccount {
+                underlineField(
+                    title: "Email",
+                    text: $email,
+                    field: .email,
+                    contentType: .emailAddress,
+                    keyboard: .emailAddress
+                )
+            }
+
+            VStack(spacing: 10) {
+                SecureField("Password", text: $password)
+                    .textContentType(mode == .signIn ? .password : .newPassword)
+                    .submitLabel(.go)
+                    .onSubmit(submitCredentials)
+                    .focused($focusedField, equals: .password)
+                    .font(AppTheme.uiFont(size: 16))
+                    .foregroundStyle(AppTheme.textPrimary)
+                    .accessibilityIdentifier("relay-password")
+                Rectangle()
+                    .fill(focusedField == .password ? AppTheme.accent : AppTheme.hairlineStrong)
+                    .frame(height: 1)
+            }
+        }
+    }
+
+    private func underlineField(
+        title: String,
+        text: Binding<String>,
+        field: Field,
+        contentType: UITextContentType,
+        keyboard: UIKeyboardType
+    ) -> some View {
+        VStack(spacing: 10) {
+            TextField(title, text: text)
+                .textContentType(contentType)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(keyboard)
+                .focused($focusedField, equals: field)
+                .font(AppTheme.uiFont(size: 16))
+                .foregroundStyle(AppTheme.textPrimary)
+                .accessibilityIdentifier("relay-\(title.lowercased())")
+            Rectangle()
+                .fill(focusedField == field ? AppTheme.accent : AppTheme.hairlineStrong)
+                .frame(height: 1)
+        }
+    }
+
+    private var actions: some View {
+        VStack(spacing: 12) {
+            Button(action: submitCredentials) {
+                if accountStore.isWorking {
+                    ProgressView().tint(AppTheme.onEmber)
+                } else {
+                    Text(mode.rawValue)
                 }
             }
-            .pickerStyle(.segmented)
-            .onChange(of: mode) { _, _ in
-                accountStore.dismissError()
-                password = ""
-            }
+            .buttonStyle(RelayPrimaryButtonStyle(isEnabled: credentialsAreValid && !accountStore.isWorking))
+            .disabled(!credentialsAreValid || accountStore.isWorking)
+            .accessibilityIdentifier("relay-credential-submit")
 
             SignInWithAppleButton(.continue) { request in
                 let nonce = Self.randomNonce()
@@ -82,101 +153,41 @@ struct AuthenticationView: View {
             } onCompletion: { result in
                 handleAppleCompletion(result)
             }
-            .signInWithAppleButtonStyle(.white)
+            .signInWithAppleButtonStyle(.whiteOutline)
             .frame(height: 50)
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .clipShape(Capsule())
             .disabled(accountStore.isWorking)
             .accessibilityIdentifier("relay-sign-in-with-apple")
-
-            HStack(spacing: 12) {
-                Rectangle().fill(AppTheme.strokeSubtle).frame(height: 1)
-                Text("or")
-                    .font(AppTheme.uiFont(size: 12, weight: .semibold))
-                    .foregroundStyle(AppTheme.textTertiary)
-                Rectangle().fill(AppTheme.strokeSubtle).frame(height: 1)
-            }
-
-            VStack(spacing: 12) {
-                authField(
-                    title: "Username",
-                    text: $username,
-                    contentType: .username,
-                    keyboard: .asciiCapable
-                )
-
-                if mode == .createAccount {
-                    authField(
-                        title: "Email",
-                        text: $email,
-                        contentType: .emailAddress,
-                        keyboard: .emailAddress
-                    )
-                }
-
-                SecureField("Password", text: $password)
-                    .textContentType(mode == .signIn ? .password : .newPassword)
-                    .submitLabel(.go)
-                    .onSubmit(submitCredentials)
-                    .authFieldStyle()
-                    .accessibilityIdentifier("relay-password")
-            }
-
-            if let error = accountStore.errorMessage {
-                Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(AppTheme.uiFont(size: 13))
-                    .foregroundStyle(AppTheme.statusError)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(12)
-                    .background(AppTheme.statusError.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))
-            }
-
-            Button(action: submitCredentials) {
-                Group {
-                    if accountStore.isWorking {
-                        ProgressView().tint(.white)
-                    } else {
-                        Text(mode.rawValue)
-                            .font(AppTheme.uiFont(size: 16, weight: .semibold))
-                    }
-                }
-                .frame(maxWidth: .infinity)
-                .frame(height: 50)
-                .foregroundStyle(.white)
-                .background(AppTheme.accentGradient, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-            }
-            .buttonStyle(.plain)
-            .disabled(!credentialsAreValid || accountStore.isWorking)
-            .opacity(credentialsAreValid ? 1 : 0.48)
-            .accessibilityIdentifier("relay-credential-submit")
-
-            Text(mode == .createAccount
-                 ? "Your password is handled by Better Auth on the Relay server."
-                 : "Sign in is required before Relay can access your workspaces.")
-                .font(AppTheme.uiFont(size: 12))
-                .foregroundStyle(AppTheme.textTertiary)
-                .multilineTextAlignment(.center)
-        }
-        .padding(20)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .stroke(AppTheme.glassStroke, lineWidth: 1)
         }
     }
 
-    private func authField(
-        title: String,
-        text: Binding<String>,
-        contentType: UITextContentType,
-        keyboard: UIKeyboardType
-    ) -> some View {
-        TextField(title, text: text)
-            .textContentType(contentType)
-            .textInputAutocapitalization(.never)
-            .autocorrectionDisabled()
-            .keyboardType(keyboard)
-            .authFieldStyle()
-            .accessibilityIdentifier("relay-\(title.lowercased())")
+    private var modeSwitch: some View {
+        HStack(spacing: 6) {
+            Text(mode == .signIn ? "New here?" : "Already have an account?")
+                .font(AppTheme.uiFont(size: 13))
+                .foregroundStyle(AppTheme.textTertiary)
+            Button(mode == .signIn ? "Create an account" : "Sign in") {
+                mode = mode == .signIn ? .createAccount : .signIn
+                accountStore.dismissError()
+                password = ""
+            }
+            .font(AppTheme.uiFont(size: 13, weight: .semibold))
+            .foregroundStyle(AppTheme.accent)
+            .buttonStyle(.plain)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func errorBanner(_ text: String) -> some View {
+        Text(text)
+            .font(AppTheme.uiFont(size: 13))
+            .foregroundStyle(AppTheme.statusError)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(AppTheme.statusError.opacity(0.3), lineWidth: 1)
+            }
     }
 
     private var credentialsAreValid: Bool {
@@ -249,20 +260,5 @@ struct AuthenticationView: View {
 
     private static func sha256(_ value: String) -> String {
         SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
-    }
-}
-
-private extension View {
-    func authFieldStyle() -> some View {
-        self
-            .font(AppTheme.uiFont(size: 16))
-            .foregroundStyle(AppTheme.textPrimary)
-            .padding(.horizontal, 14)
-            .frame(height: 50)
-            .background(AppTheme.bgSurfaceHi, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(AppTheme.strokeSubtle, lineWidth: 1)
-            }
     }
 }

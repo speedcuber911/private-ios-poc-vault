@@ -60,6 +60,7 @@ struct AccountSettingsView: View {
             }
             .scrollContentBackground(.hidden)
             .background(AppTheme.bgCanvas)
+            .tint(AppTheme.accent)
             .navigationTitle("Account & Settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

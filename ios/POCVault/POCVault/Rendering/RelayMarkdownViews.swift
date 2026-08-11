@@ -18,7 +18,7 @@ struct RelayMarkdownText: View {
                 case .prose:
                     RelayMarkdownProse(
                         text: segment.text,
-                        color: userAligned ? AppTheme.bgCanvas.opacity(0.94) : AppTheme.textPrimary,
+                        color: userAligned ? AppTheme.onEmber : AppTheme.textPrimary,
                         isOnAccent: userAligned
                     )
                 case .code(let language):
@@ -174,11 +174,11 @@ struct RelayMarkdownTable: View {
     }
 
     private var tableFill: Color {
-        isOnAccent ? AppTheme.bgCanvas.opacity(0.13) : AppTheme.bgCanvas.opacity(0.72)
+        isOnAccent ? AppTheme.onEmber.opacity(0.10) : Color.clear
     }
 
     private var borderColor: Color {
-        isOnAccent ? AppTheme.bgCanvas.opacity(0.24) : AppTheme.strokeSubtle
+        isOnAccent ? AppTheme.bgCanvas.opacity(0.24) : AppTheme.hairline
     }
 }
 
@@ -216,7 +216,7 @@ struct RelayCodeBlock: View {
             }
         }
         .padding(10)
-        .background(AppTheme.bgCanvas, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .background(AppTheme.textPrimary.opacity(0.05), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     private var codeText: some View {

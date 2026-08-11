@@ -49,8 +49,8 @@ struct FileBrowserView: View {
             AppTheme.canvasGradient.ignoresSafeArea()
             listContent
         }
-        .navigationTitle(viewModel.folderName)
-        .navigationBarTitleDisplayMode(isRoot ? .large : .inline)
+        .navigationTitle(isRoot ? "" : viewModel.folderName)
+        .navigationBarTitleDisplayMode(.inline)
         .toolbar { toolbarContent }
         .searchable(text: $viewModel.searchText, prompt: "Search folders")
         .refreshable {
@@ -84,6 +84,22 @@ struct FileBrowserView: View {
     private var listContent: some View {
         ScrollView {
             LazyVStack(spacing: 0) {
+                if isRoot {
+                    VStack(alignment: .leading, spacing: 6) {
+                        RelayCapsLabel(
+                            text: viewModel.errorMessage == nil ? "Connected · mTLS" : "Offline",
+                            color: viewModel.errorMessage == nil ? AppTheme.textTertiary : AppTheme.statusError
+                        )
+                        Text("Workspaces")
+                            .font(AppTheme.serifFont(size: 32))
+                            .foregroundStyle(AppTheme.textPrimary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 6)
+                    .padding(.bottom, 14)
+                }
+
                 if let error = viewModel.errorMessage {
                     FileBrowserErrorBanner(text: error)
                         .padding(.horizontal, 16)
@@ -104,7 +120,7 @@ struct FileBrowserView: View {
                     }
                     .overlay(alignment: .top) {
                         Rectangle()
-                            .fill(AppTheme.strokeSubtle)
+                            .fill(AppTheme.hairline)
                             .frame(height: 0.5)
                     }
                 }
@@ -169,7 +185,7 @@ struct FileBrowserView: View {
                 .font(.system(size: 30, weight: .medium))
                 .foregroundStyle(AppTheme.textTertiary)
             Text(viewModel.isShowingSearchResults ? "No matches" : "Empty folder")
-                .font(AppTheme.uiFont(size: 16, weight: .semibold))
+                .font(AppTheme.serifFont(size: 20))
                 .foregroundStyle(AppTheme.textPrimary)
             Text(viewModel.isShowingSearchResults
                  ? "No folders match \u{201C}\(viewModel.searchText)\u{201D}."
@@ -208,7 +224,7 @@ struct FileBrowserView: View {
         .padding(.vertical, 16)
         .overlay(alignment: .top) {
             Rectangle()
-                .fill(AppTheme.strokeSubtle)
+                .fill(AppTheme.hairline)
                 .frame(height: 0.5)
         }
     }
@@ -217,6 +233,15 @@ struct FileBrowserView: View {
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
+        if !isRoot {
+            ToolbarItem(placement: .principal) {
+                Text(viewModel.folderName)
+                    .font(AppTheme.serifFont(size: 17))
+                    .foregroundStyle(AppTheme.textPrimary)
+                    .lineLimit(1)
+            }
+        }
+
         ToolbarItem(placement: .topBarTrailing) {
             Button {
                 onOpenChat(viewModel.path, viewModel.listing?.selectedWorkspace?.id)
@@ -293,12 +318,12 @@ private struct FileBrowserRow: View {
     var body: some View {
         HStack(spacing: 13) {
             Image(systemName: entry.browserGlyph)
-                .font(.system(size: 16, weight: .semibold))
+                .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(entry.isDirectory ? AppTheme.accent : AppTheme.textSecondary)
-                .frame(width: 40, height: 40)
+                .frame(width: 32, height: 32)
                 .background(
-                    (entry.isDirectory ? AppTheme.accent.opacity(0.14) : AppTheme.bgSurface),
-                    in: RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    (entry.isDirectory ? AppTheme.accent.opacity(0.12) : AppTheme.textPrimary.opacity(0.06)),
+                    in: RoundedRectangle(cornerRadius: 9, style: .continuous)
                 )
 
             VStack(alignment: .leading, spacing: 3) {
@@ -326,36 +351,31 @@ private struct FileBrowserRow: View {
             if entry.isDirectory {
                 Image(systemName: "chevron.right")
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(AppTheme.textTertiary)
+                    .foregroundStyle(AppTheme.textFaint)
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 20)
+        .padding(.vertical, 13)
         .contentShape(Rectangle())
         .opacity(entry.readDenied ? 0.4 : 1)
         .overlay(alignment: .bottom) {
             Rectangle()
-                .fill(AppTheme.strokeSubtle)
+                .fill(AppTheme.hairline)
                 .frame(height: 0.5)
-                .padding(.leading, 69)
+                .padding(.leading, 64)
         }
     }
 
     private var nameText: some View {
         Text(entry.displayName)
-            .font(AppTheme.uiFont(size: 15, weight: .semibold))
+            .font(AppTheme.uiFont(size: 15, weight: .medium))
             .foregroundStyle(AppTheme.textPrimary)
     }
 
     @ViewBuilder
     private var workspaceBadge: some View {
         if entry.isRegistered {
-            Text("Workspace")
-                .font(AppTheme.uiFont(size: 9, weight: .bold))
-                .foregroundStyle(AppTheme.accent)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(AppTheme.accent.opacity(0.15), in: Capsule())
+            RelayCapsLabel(text: "Workspace", color: AppTheme.accent, size: 9)
         }
     }
 
@@ -380,7 +400,10 @@ private struct FileBrowserErrorBanner: View {
             .foregroundStyle(AppTheme.statusError)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(12)
-            .background(AppTheme.statusError.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(AppTheme.statusError.opacity(0.3), lineWidth: 1)
+            }
     }
 }
 
