@@ -103,9 +103,28 @@ function ensureNodeEventSchema(db) {
   `);
 }
 
+// Non-destructive guard for existing databases that predate the node
+// encryption key column. Follows the same idiom as ensureNodeEventSchema: a
+// database provisioned from an earlier schema must gain the column on open
+// rather than fail closed on first use. db.js stays the canonical home for
+// the core tables.
+function ensureNodeEncColumn(db) {
+  let columns = [];
+  try {
+    columns = db.prepare("PRAGMA table_info(nodes)").all();
+  } catch {
+    return;
+  }
+  if (columns.length === 0) return;
+  if (!columns.some((column) => column.name === "enc_pubkey")) {
+    db.exec("ALTER TABLE nodes ADD COLUMN enc_pubkey TEXT");
+  }
+}
+
 export function createRegistry(db, { now = () => Date.now() } = {}) {
   ensureAuthSchema(db);
   ensureNodeEventSchema(db);
+  ensureNodeEncColumn(db);
 
   // ── accounts ────────────────────────────────────────────────────────────
   function createAccount({ id = randomUUID(), appleSub = null, email = null }) {
@@ -134,6 +153,13 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
   // Hard-delete every control-plane row associated with an account. Better
   // Auth separately removes credentials, provider accounts, and sessions.
   // The transaction prevents a half-deleted account from remaining usable.
+  //
+  // Dropping the trial_nodes row is the point of no return for that account's
+  // sandbox: nothing afterwards can map the account back to a live microVM.
+  // The caller must therefore have destroyed it (or recorded it via
+  // recordSandboxOrphan) BEFORE calling this — see the deleteUser hook in
+  // better-auth.js. sandbox_orphans is deliberately NOT cleared here: those
+  // rows exist precisely to outlive the account they came from.
   function deleteAccount(accountId) {
     const account = getAccount(accountId);
     if (!account) return false;
@@ -342,11 +368,10 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
   }
 
   // ── nodes ───────────────────────────────────────────────────────────────
-  function createNode(accountId, { id = randomUUID(), kind, name, pubkey, version }) {
+  function createNode(accountId, { id = randomUUID(), kind, name, pubkey, encPubkey = null, version = null } = {}) {
     db.prepare(
-      `INSERT INTO nodes (id, account_id, kind, name, pubkey, version, last_seen, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`,
-    ).run(id, accountId, kind, name ?? null, pubkey, version ?? null, now());
+      "INSERT INTO nodes (id, account_id, kind, name, pubkey, enc_pubkey, version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(id, accountId, kind, name ?? null, pubkey, encPubkey, version, now());
     return getNode(id);
   }
 
@@ -362,10 +387,23 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       .map(mapNode);
   }
 
-  function countNodes(accountId) {
-    const row = db
-      .prepare("SELECT COUNT(*) AS n FROM nodes WHERE account_id = ?")
-      .get(accountId);
+  // `includeTrial: false` counts only the nodes that consume the account's
+  // `nodes.max` entitlement. A trial node is granted by the cloud (the trial
+  // enroll route creates it bypassing the gate entirely), not registered by
+  // the user, so counting it would make `POST /v1/nodes` 403
+  // `entitlement_limit` against the default limit of 1 for the whole 7+3 day
+  // trial — closing off the "Upgrade to BYO" path the trial exists to funnel
+  // people into, at exactly the moment they want to take it.
+  function countNodes(accountId, { includeTrial = true } = {}) {
+    const row = includeTrial
+      ? db
+          .prepare("SELECT COUNT(*) AS n FROM nodes WHERE account_id = ?")
+          .get(accountId)
+      : db
+          .prepare(
+            "SELECT COUNT(*) AS n FROM nodes WHERE account_id = ? AND kind != 'trial'",
+          )
+          .get(accountId);
     return Number(row.n);
   }
 
@@ -463,6 +501,45 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
 
   function countActiveTrials() {
     return Number(db.prepare("SELECT COUNT(*) AS c FROM trial_nodes WHERE state IN ('creating','ready')").get().c);
+  }
+
+  // ── sandbox orphans ─────────────────────────────────────────────────────
+  //
+  // A sandbox we still believe is running but can no longer destroy right now.
+  // Recorded instead of being forgotten, so an unreachable Cube host degrades
+  // into "we owe this a destroy" rather than "a microVM holds this user's
+  // files forever". Keyed on sandbox id so repeated failures collapse to one
+  // row and the first-seen reason/timestamp survives.
+  function recordSandboxOrphan({ sandboxId, trialId = null, accountId = null, reason }) {
+    if (!sandboxId) return false;
+    const result = db
+      .prepare(
+        `INSERT OR IGNORE INTO sandbox_orphans (sandbox_id, trial_id, account_id, reason, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(sandboxId, trialId, accountId, String(reason || "unknown"), now());
+    return Number(result.changes) > 0;
+  }
+
+  function listSandboxOrphans(limit = 100) {
+    return db
+      .prepare("SELECT * FROM sandbox_orphans ORDER BY created_at LIMIT ?")
+      .all(limit)
+      .map((row) => ({
+        sandboxId: row.sandbox_id,
+        trialId: row.trial_id,
+        accountId: row.account_id,
+        reason: row.reason,
+        createdAt: Number(row.created_at),
+      }));
+  }
+
+  function clearSandboxOrphan(sandboxId) {
+    if (!sandboxId) return false;
+    const result = db
+      .prepare("DELETE FROM sandbox_orphans WHERE sandbox_id = ?")
+      .run(sandboxId);
+    return Number(result.changes) > 0;
   }
 
   // ── waitlist ────────────────────────────────────────────────────────────
@@ -776,6 +853,9 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     listTrialsDue,
     listTrialsPastGrace,
     countActiveTrials,
+    recordSandboxOrphan,
+    listSandboxOrphans,
+    clearSandboxOrphan,
     addToWaitlist,
     insertRefreshToken,
     findRefreshToken,
@@ -839,6 +919,7 @@ function mapNode(row) {
     kind: row.kind,
     name: row.name,
     pubkey: row.pubkey,
+    encPubkey: row.enc_pubkey ?? null,
     version: row.version,
     lastSeen: row.last_seen == null ? null : Number(row.last_seen),
     createdAt: Number(row.created_at),

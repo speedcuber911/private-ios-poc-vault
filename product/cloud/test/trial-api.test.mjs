@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { startTestApp, api, signIn, authed } from "./helpers.mjs";
 
-function makeFakeProvisioner() {
+export function makeFakeProvisioner() {
   const created = [];
   return {
     created,
