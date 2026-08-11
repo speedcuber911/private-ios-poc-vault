@@ -1,13 +1,14 @@
-# Codex Server Agent Contract
+# Relay Server Agent Contract
 
-This workspace owns the personal EC2 Codex job API. It now lives inside
-`/Users/pariksj/Desktop/poc-vault/codex-server` because the Relay iOS app and
-remote runner are tightly coupled.
+This workspace owns the personal Relay backend for EC2 agent jobs. It lives
+inside `/Users/pariksj/Desktop/poc-vault/relay-server` because the Relay iOS app
+and remote runner are tightly coupled. The `/v1/codex/*` route name is retained
+as a compatibility contract for existing clients.
 
 ## Working Rules
 
-- Work from `/Users/pariksj/Desktop/poc-vault/codex-server`.
-- Keep server files under `codex-server/`; do not mix them into POC static
+- Work from `/Users/pariksj/Desktop/poc-vault/relay-server`.
+- Keep server files under `relay-server/`; do not mix them into POC static
   deploy directories.
 - Do not commit or print secrets from `~/.poc-vault/secrets`.
 - Keep `/v1/codex/*` mTLS-only.
@@ -65,7 +66,7 @@ Runtime data:
 Before saying the server work is complete, run local verification:
 
 ```bash
-cd /Users/pariksj/Desktop/poc-vault/codex-server/codex-api-deploy
+cd /Users/pariksj/Desktop/poc-vault/relay-server/codex-api-deploy
 node --check server.mjs
 node --test server.test.mjs
 ```

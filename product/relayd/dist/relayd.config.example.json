@@ -1,0 +1,72 @@
+{
+  "_env_file_quoting": "In /etc/relayd/relayd.env, single-quote every value: KEY='value'. systemd's EnvironmentFile parser and a shell's `.` both strip exactly one layer of matching single quotes, so single-quoting is the only form that survives both. Unquoted or double-quoted values (notably the CODEX_WORKSPACES JSON) lose their inner quotes when the file is sourced.",
+  "_comment": "relayd example configuration. relayd is configured through environment variables (see /etc/relayd/relayd.env on a systemd install); this file documents the supported knobs and their defaults. Values here are PLACEHOLDERS — never commit real hostnames, subjects, or keys.",
+  "server": {
+    "RELAYD_LISTEN_MODE": "direct",
+    "RELAYD_LISTEN_MODE_options": ["direct", "tunneled", "both"],
+    "RELAYD_LISTEN_MODE_comment": "direct = plain HTTP listener behind a TLS-terminating gateway that forwards X-SSL-Client-Verify / X-SSL-Client-S-DN; tunneled = the same router served through the broker with TLS terminated on this node (the forwarded-subject headers are then derived from the peer certificate and any client-supplied ones are dropped); both = run the two side by side.",
+    "CODEX_API_HOST": "127.0.0.1",
+    "CODEX_API_PORT": 8787,
+    "CODEX_REQUIRE_MTLS": true,
+    "RELAYD_ALLOWED_CERT_SUBJECTS": "[\"CN=<device-subject-1>,OU=Devices,O=Relay\",\"CN=<device-subject-2>,OU=Devices,O=Relay\"]",
+    "RELAYD_ALLOWED_CERT_SUBJECTS_comment": "Allowed client-certificate subject DNs. PREFERRED FORM: a JSON array of complete DNs. An RFC 2253 DN contains commas (CN=device,OU=Devices,O=Relay), so the legacy comma-separated form below can only express single-RDN subjects — a multi-RDN DN written that way is shredded into fragments and the device 403s forever. A newline-separated value is also accepted. RELAYD_ALLOWED_CERT_SUBJECTS wins when non-empty.",
+    "CODEX_ALLOWED_CERT_SUBJECTS": "CN=<device-subject-1>,CN=<device-subject-2>",
+    "CODEX_ALLOWED_CERT_SUBJECTS_comment": "Legacy name and legacy comma-separated format, still honored when RELAYD_ALLOWED_CERT_SUBJECTS is empty. SINGLE-RDN SUBJECTS ONLY — use the JSON form above for anything realistic."
+  },
+  "pairing": {
+    "_comment": "Onboarding. `relayd pair` persists a single-use 15-minute session into the store and exits; the DAEMON serves POST /v1/pair on its own listener and redeems it. That listener is never the mTLS data listener — relayd refuses to start if the two ports collide.",
+    "RELAYD_PAIRING_ENABLED": true,
+    "RELAYD_PAIRING_HOST": "127.0.0.1",
+    "RELAYD_PAIRING_HOST_comment": "Defaults to 127.0.0.1, INDEPENDENTLY of CODEX_API_HOST. This listener is plain HTTP, needs no client certificate and mints device certificates, and the gateway that terminates TLS for the data port is not in front of it — so moving it off loopback is an explicit opt-in you make here, never a side effect of exposing the data listener.",
+    "RELAYD_PAIRING_PORT": 8788,
+    "RELAYD_PAIRING_PORT_comment": "Unset (or 0) = the kernel assigns a free port at bind time, which the daemon logs and records in <CODEX_DATA_DIR>/pairing/listener.json so `relayd pair` prints the right URL. relayd never claims a port you did not give it (it used to default to CODEX_API_PORT + 1 and kill a co-located daemon with EADDRINUSE). Set it — as dist/install.sh does — when the address must be stable for a gateway or an SSH tunnel. Must differ from CODEX_API_PORT.",
+    "RELAYD_PAIRING_ADVERTISE": "https://pair.<domain>",
+    "RELAYD_PAIRING_ADVERTISE_comment": "Optional public base URL that `relayd pair` prints as the address the phone should reach; unset means derive it from the bind address.",
+    "RELAYD_PAIRING_AUTOALLOW": true,
+    "RELAYD_PAIRING_AUTOALLOW_comment": "Add the subject of the certificate this node just minted in a successful pairing to the client-cert allowlist, appended to <CODEX_DATA_DIR>/allowed-cert-subjects.json (0600) and audited as cert_subject_allowlisted. With this false a freshly paired device receives a valid certificate and is then 403'd until an operator edits the allowlist and restarts."
+  },
+  "storage": {
+    "CODEX_DATA_DIR": "/var/lib/relayd",
+    "RELAYD_STORE": "json",
+    "RELAYD_STORE_options": ["json", "sqlite"],
+    "RELAYD_SQLITE_PATH": "/var/lib/relayd/relayd.sqlite"
+  },
+  "workspaces": {
+    "CODEX_WORKSPACE_BROWSE_ROOT": "/srv/relay-workspaces",
+    "CODEX_WORKSPACES": "[{\"id\":\"welcome\",\"name\":\"Welcome\",\"path\":\"/srv/relay-workspaces/welcome\"}]"
+  },
+  "identity": {
+    "RELAYD_IDENTITY_DIR": "/var/lib/relayd/identity",
+    "RELAYD_NODE_NAME": "<node-name>",
+    "RELAYD_PAIR_LINK_BASE": "https://get.<domain>/pair"
+  },
+  "providers": {
+    "CODEX_BIN": "/usr/local/bin/codex",
+    "CLAUDE_BIN": "/usr/local/bin/claude",
+    "CURSOR_BIN": "/home/relay/.local/bin/cursor-agent",
+    "CODEX_RUN_HOME": "/home/relay"
+  },
+  "jobs": {
+    "CODEX_MAX_CONCURRENT": 1,
+    "CODEX_DEFAULT_TIMEOUT_MS": 600000,
+    "CODEX_MAX_TIMEOUT_MS": 1800000,
+    "CODEX_DANGEROUS_MODE": true,
+    "RELAYD_WORKTREE_MODE": false
+  },
+  "events": {
+    "RELAYD_EVENTS_RETENTION": 10000
+  },
+  "tunnel": {
+    "_comment": "Tunneled listen mode. Only read when RELAYD_LISTEN_MODE is tunneled or both; the broker endpoint is assigned at enrollment. Placeholders only.",
+    "RELAYD_TUNNEL_HOST": "broker.<domain>",
+    "RELAYD_TUNNEL_PORT": 443,
+    "RELAYD_TUNNEL_SUFFIX": ".tun.<domain>",
+    "RELAYD_TUNNEL_SUFFIX_comment": "The node dials out and is reached at <node-id><suffix>; that name is the SNI the broker routes on and the SAN the node TLS server certificate is issued for (created automatically from the node CA).",
+    "RELAYD_TUNNEL_SNI": "<node-id>.tun.<domain>",
+    "RELAYD_TUNNEL_SNI_comment": "Optional explicit override; leave unset to use <node-id> + RELAYD_TUNNEL_SUFFIX.",
+    "RELAYD_TUNNEL_HEARTBEAT_MS": 15000,
+    "RELAYD_TUNNEL_BACKOFF_MS": 1000,
+    "RELAYD_TUNNEL_BACKOFF_MAX_MS": 30000,
+    "RELAYD_TUNNEL_BACKOFF_comment": "Reconnect backoff: base doubles per attempt, jittered to 50-100% of the delay, capped at max, reset on a successful registration."
+  }
+}

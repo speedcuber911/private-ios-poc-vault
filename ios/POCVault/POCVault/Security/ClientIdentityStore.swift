@@ -8,6 +8,7 @@ enum ClientIdentityStoreError: Error, LocalizedError {
     case p12ContainsNoIdentity
     case keychainAddFailed(OSStatus)
     case keychainReadFailed(OSStatus)
+    case keychainDeleteFailed(OSStatus)
 
     var errorDescription: String? {
         switch self {
@@ -21,6 +22,8 @@ enum ClientIdentityStoreError: Error, LocalizedError {
             return "The client identity could not be saved to Keychain. OSStatus \(status)."
         case .keychainReadFailed(let status):
             return "The client identity could not be read from Keychain. OSStatus \(status)."
+        case .keychainDeleteFailed(let status):
+            return "The client identity could not be removed from Keychain. OSStatus \(status)."
         }
     }
 }
@@ -191,6 +194,20 @@ final class ClientIdentityStore: ObservableObject {
 
     var hasStoredIdentity: Bool {
         identity() != nil
+    }
+
+    func deleteStoredIdentity() throws {
+        if let persistentRef = defaults.data(forKey: persistentRefKey) {
+            let status = SecItemDelete([
+                kSecValuePersistentRef as String: persistentRef
+            ] as CFDictionary)
+            guard status == errSecSuccess || status == errSecItemNotFound else {
+                throw ClientIdentityStoreError.keychainDeleteFailed(status)
+            }
+        }
+        defaults.removeObject(forKey: persistentRefKey)
+        cachedIdentity = nil
+        lastImportedCertificateName = nil
     }
 
     private func recoverExistingPreferredIdentity() -> SecIdentity? {

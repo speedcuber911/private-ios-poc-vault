@@ -1,0 +1,18 @@
+{
+  "name": "relay-cloud",
+  "version": "0.1.0",
+  "description": "Relay control plane: Better Auth accounts, pairing rendezvous, notifications, and tunnel registry.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "start": "node src/main.js",
+    "test": "node --test 'test/*.test.mjs'"
+  },
+  "dependencies": {
+    "better-auth": "1.6.26",
+    "jose": "6.2.8"
+  }
+}

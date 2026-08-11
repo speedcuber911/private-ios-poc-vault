@@ -1,15 +1,18 @@
 # Relay Revamp — EC2 Files Browser + Per-Folder Agent Chat
 
-> Updated 2026-08-09 for the current `pariksj-dev` deployment. Server detail
+> Updated 2026-08-11 for the current `pariksj-dev` deployment. The files-first
+> navigation, folder conversations, visible Threads history, and revised
+> keyboard behavior are implemented. Server detail
 > lives in [01-server-plan.md](01-server-plan.md) and
 > [02-ios-plan.md](02-ios-plan.md).
 
 ## Why
 
-Relay currently exposes Library, Chat, Task, and Status as separate areas. The
-target mental model is simpler: **Relay is the private iPhone interface to the
-isolated agent workspace on `pariksj-dev`.** Browse the workspace jail like the
-iPhone Files app and, from any folder, open a conversation scoped to that folder.
+Relay originally exposed Library, Chat, Task, and Status as separate areas. The
+implemented mental model is simpler: **Relay is the private iPhone interface to
+the isolated agent workspace on `pariksj-dev`.** Browse the workspace jail like
+the iPhone Files app and, from any folder, open a conversation scoped to that
+folder.
 
 ## Current baseline (do not redesign around older infrastructure)
 
@@ -91,8 +94,9 @@ iPhone Files app and, from any folder, open a conversation scoped to that folder
 - List/read endpoints are bounded and report pagination or truncation.
 - Branding remains Relay. Bundle ID, target names, and internal paths remain
   unchanged.
-- The chat editor retains its keyboard-accessory Done action, interactive
-  dismissal, and dismissal on Run.
+- The chat editor retains interactive scroll dismissal, dismissal on Send/Run,
+  and outside-tap dismissal on non-editor content. It has no custom keyboard
+  accessory or floating dismiss control.
 
 ## Target UX flow
 
@@ -108,7 +112,7 @@ App launch
            |- Chat models: Codex GPT-5.6 Sol/Terra/Luna | enabled Azure (none now)
            |- agent -> async job, live output, cancel, continue
            |- chat  -> saved workspace-scoped conversation
-           `- history -> both kinds for this folder
+           `- Threads -> conversations and invocations for this folder
 ```
 
 ## Workstreams

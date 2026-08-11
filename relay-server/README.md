@@ -1,8 +1,10 @@
-# Codex Server Workspace
+# Relay Server Workspace
 
-This workspace owns the EC2-side Codex/Claude/Cursor job API used by the Relay iPhone
-app. It lives inside `/Users/pariksj/Desktop/poc-vault/codex-server` so the iOS
-app and server runner can be changed together when their contract moves.
+This workspace owns the EC2-side Relay backend used by the Relay iPhone app,
+including its Codex/Claude/Cursor job API. It lives inside
+`/Users/pariksj/Desktop/poc-vault/relay-server` so the iOS app and server runner
+can be changed together when their contract moves. Existing `/v1/codex/*`
+routes remain stable for client compatibility.
 
 Configured endpoint shape:
 
@@ -418,7 +420,7 @@ rule is added, remove it before handoff.
 From this workspace:
 
 ```bash
-cd /Users/pariksj/Desktop/poc-vault/codex-server/codex-api-deploy
+cd /Users/pariksj/Desktop/poc-vault/relay-server/codex-api-deploy
 node --check server.mjs
 node --test server.test.mjs
 ```

@@ -8,7 +8,7 @@ struct RelayChatView: View {
     /// dismiss chevron in the top bar. Dismissing never cancels streams (VM-owned).
     var onDismiss: (() -> Void)? = nil
     @State private var showingThreads = false
-    @State private var fullLogText: String?
+    @State private var fullLogRequest: RelayFullLogRequest?
 
     var body: some View {
         NavigationStack {
@@ -22,7 +22,12 @@ struct RelayChatView: View {
 
                 VStack(spacing: 0) {
                     topBar
+                        .simultaneousGesture(keyboardDismissTap)
+                    threadAccessBar
+                        .simultaneousGesture(keyboardDismissTap)
                     messageList
+                        .contentShape(Rectangle())
+                        .simultaneousGesture(keyboardDismissTap)
                 }
             }
             .toolbar(.hidden, for: .navigationBar)
@@ -62,11 +67,10 @@ struct RelayChatView: View {
                     .presentationDetents([.medium, .large])
                     .presentationDragIndicator(.visible)
             }
-            .sheet(item: Binding(
-                get: { fullLogText.map(RelayFullLogText.init(text:)) },
-                set: { fullLogText = $0?.text }
-            )) { payload in
-                RelayFullLogSheet(text: payload.text)
+            .sheet(item: $fullLogRequest) { request in
+                RelayFullLogSheet(job: request.job) {
+                    await viewModel.loadFullLog(for: request.job)
+                }
             }
         }
         // The chat opens as its own full-screen presentation; re-pin the app's
@@ -123,27 +127,78 @@ struct RelayChatView: View {
             }
 
             Spacer()
-
-            Button {
-                showingThreads = true
-            } label: {
-                Image(systemName: "sidebar.left")
-                    .font(AppTheme.uiFont(size: 16, weight: .semibold))
-                    .foregroundStyle(AppTheme.textSecondary)
-                    .frame(width: 36, height: 36)
-                    .background(AppTheme.bgSurfaceHi, in: Circle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Threads")
         }
         .padding(.horizontal, 16)
         .padding(.top, 14)
         .padding(.bottom, 10)
     }
 
+    private var threadAccessBar: some View {
+        Button {
+            showingThreads = true
+        } label: {
+            HStack(spacing: 11) {
+                Image(systemName: "bubble.left.and.bubble.right.fill")
+                    .font(AppTheme.uiFont(size: 15, weight: .semibold))
+                    .foregroundStyle(AppTheme.accent)
+                    .frame(width: 32, height: 32)
+                    .background(AppTheme.accent.opacity(0.14), in: Circle())
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Threads")
+                        .font(AppTheme.uiFont(size: 14, weight: .bold))
+                        .foregroundStyle(AppTheme.textPrimary)
+                    Text("Past conversations & invocations")
+                        .font(AppTheme.uiFont(size: 11, weight: .medium))
+                        .foregroundStyle(AppTheme.textSecondary)
+                }
+
+                Spacer()
+
+                Text("\(viewModel.historyItems.count)")
+                    .font(AppTheme.monoFont(size: 11, weight: .semibold))
+                    .foregroundStyle(AppTheme.textSecondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(AppTheme.bgCanvas, in: Capsule())
+
+                Image(systemName: "chevron.right")
+                    .font(AppTheme.uiFont(size: 11, weight: .bold))
+                    .foregroundStyle(AppTheme.textTertiary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(AppTheme.textTertiary.opacity(0.55), lineWidth: 1)
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Threads, \(viewModel.historyItems.count) conversations and invocations")
+        .accessibilityIdentifier("relay-threads")
+        .padding(.horizontal, 16)
+        .padding(.bottom, 8)
+    }
+
     private var selectedModelSubtitle: String {
         guard let choice = viewModel.selectedChoice else { return "Loading models" }
         return "\(choice.chipLabel) · \(choice.mode.label)"
+    }
+
+    private func dismissKeyboard() {
+        UIApplication.shared.sendAction(
+            #selector(UIResponder.resignFirstResponder),
+            to: nil,
+            from: nil,
+            for: nil
+        )
+    }
+
+    private var keyboardDismissTap: some Gesture {
+        TapGesture().onEnded {
+            dismissKeyboard()
+        }
     }
 
     private var messageList: some View {
@@ -167,7 +222,7 @@ struct RelayChatView: View {
                                         Task { await viewModel.cancel(job: job) }
                                     },
                                     onFullLog: {
-                                        Task { fullLogText = await viewModel.loadFullLog(for: job) }
+                                        fullLogRequest = RelayFullLogRequest(job: job)
                                     }
                                 )
                                 .id(item.id)
@@ -459,19 +514,6 @@ private struct RelayComposer: View {
         .padding(.bottom, Self.normalBottomPadding)
         .background(AppTheme.bgCanvas)
         .animation(.easeOut(duration: 0.18), value: isFocused)
-        .toolbar {
-            ToolbarItemGroup(placement: .keyboard) {
-                Spacer()
-                Button {
-                    isFocused = false
-                } label: {
-                    Image(systemName: "keyboard.chevron.compact.down")
-                        .font(AppTheme.uiFont(size: 17, weight: .semibold))
-                }
-                .foregroundStyle(AppTheme.accent)
-                .accessibilityLabel("Dismiss keyboard")
-            }
-        }
     }
 
     private var canSend: Bool {
@@ -813,23 +855,24 @@ private struct RelayThreadDrawer: View {
                     .listRowBackground(AppTheme.bgSurface)
                 }
 
-                if viewModel.threads.isEmpty {
-                    // Subfolder chats keep their own histories, distinct from parent folders.
-                    Text("No threads in this folder yet. Conversations here stay scoped to \(viewModel.folderDisplayName).")
+                if viewModel.historyItems.isEmpty {
+                    Text("No conversations or invocations in this folder yet.")
                         .font(AppTheme.uiFont(size: 13))
                         .foregroundStyle(AppTheme.textTertiary)
                         .listRowBackground(AppTheme.bgCanvas)
                 }
 
-                // This folder's threads, both modes, flat and newest-first.
-                Section {
-                    ForEach(viewModel.threads) { thread in
-                        threadRow(thread)
+                // Exact-folder conversations plus invocations that do not have a session yet.
+                Section("This folder") {
+                    ForEach(viewModel.historyItems) { item in
+                        historyRow(item)
                             .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                                Button(role: .destructive) {
-                                    Task { await viewModel.delete(thread) }
-                                } label: {
-                                    Label("Delete", systemImage: "trash")
+                                if case .thread(let thread) = item.source {
+                                    Button(role: .destructive) {
+                                        Task { await viewModel.delete(thread) }
+                                    } label: {
+                                        Label("Delete", systemImage: "trash")
+                                    }
                                 }
                             }
                     }
@@ -844,36 +887,62 @@ private struct RelayThreadDrawer: View {
         }
     }
 
-    private func threadRow(_ thread: CodexThread) -> some View {
+    private func historyRow(_ item: CodexThreadFeedItem) -> some View {
         Button {
             Task {
-                await viewModel.openThread(thread)
+                await viewModel.openHistoryItem(item)
                 dismiss()
             }
         } label: {
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 6) {
-                    Text(thread.displayTitle)
+                    Text(item.title)
                         .foregroundStyle(AppTheme.textPrimary)
                         .lineLimit(1)
                     Spacer()
-                    if thread.hasActiveJobs {
+                    if item.isActive {
                         Circle().fill(AppTheme.statusWarn).frame(width: 7, height: 7)
                     }
-                    Text(thread.mode.label)
+                    Text(historyModeLabel(item))
                         .font(AppTheme.uiFont(size: 9, weight: .bold))
                         .foregroundStyle(AppTheme.accent)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
                         .background(AppTheme.accent.opacity(0.15), in: Capsule())
                 }
-                Text(thread.feedPreview)
+                Text(item.preview)
                     .font(.caption)
                     .foregroundStyle(AppTheme.textTertiary)
                     .lineLimit(2)
+                Text(historyMetadata(item))
+                    .font(AppTheme.monoFont(size: 10))
+                    .foregroundStyle(AppTheme.textTertiary)
             }
         }
         .listRowBackground(AppTheme.bgSurface)
+    }
+
+    private func historyModeLabel(_ item: CodexThreadFeedItem) -> String {
+        switch item.source {
+        case .thread(let thread):
+            return thread.mode.label
+        case .pendingJob:
+            return "Task"
+        }
+    }
+
+    private func historyMetadata(_ item: CodexThreadFeedItem) -> String {
+        switch item.source {
+        case .thread(let thread):
+            if thread.mode == .chat {
+                return "\(item.workspaceLabel) · \(thread.provider.displayName) · conversation"
+            }
+            let count = thread.jobCount
+            let invocationText = count == 1 ? "1 invocation" : "\(count) invocations"
+            return "\(item.workspaceLabel) · \(thread.provider.displayName) · \(invocationText)"
+        case .pendingJob(let job):
+            return "\(item.workspaceLabel) · \(job.provider.displayName) · invocation · \(job.status.label)"
+        }
     }
 }
 
@@ -931,28 +1000,47 @@ private struct RelayEmptyConversation: View {
     }
 }
 
-private struct RelayFullLogText: Identifiable {
-    let id = UUID()
-    let text: String
+private struct RelayFullLogRequest: Identifiable {
+    var id: String { job.id }
+    let job: CodexJob
 }
 
 private struct RelayFullLogSheet: View {
-    let text: String
+    let job: CodexJob
+    let load: () async -> String
+    @Environment(\.dismiss) private var dismiss
+    @State private var text: String?
 
     var body: some View {
         NavigationStack {
             ScrollView {
-                Text(text.isEmpty ? "No log output." : text)
-                    .font(AppTheme.monoFont(size: 12))
-                    .foregroundStyle(AppTheme.textPrimary)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(16)
+                if let text {
+                    Text(text.isEmpty ? "No log output." : text)
+                        .font(AppTheme.monoFont(size: 12))
+                        .foregroundStyle(AppTheme.textPrimary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(16)
+                } else {
+                    ProgressView("Loading full log…")
+                        .tint(AppTheme.accent)
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .frame(maxWidth: .infinity, minHeight: 260)
+                }
             }
             .background(AppTheme.bgCanvas)
             .navigationTitle("Log")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
             .preferredColorScheme(.dark)
+        }
+        .task(id: job.id) {
+            guard text == nil else { return }
+            text = await load()
         }
     }
 }

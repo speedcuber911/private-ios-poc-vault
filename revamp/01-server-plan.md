@@ -4,7 +4,7 @@ Updated 2026-08-09. This plan starts from the current `pariksj-dev` Relay
 backend rather than the old Bedrock-first deployment.
 
 The implementation remains the zero-dependency Node server in
-`codex-server/codex-api-deploy/server.mjs`, its `node --test` suite, config
+`relay-server/codex-api-deploy/server.mjs`, its `node --test` suite, config
 rendering in `ops/render-codex-api-config`, and simulator parity in
 `ops/serve-simulator-poc-vault`. Each milestone must be independently
 deployable and preserve the current iPhone app contract.

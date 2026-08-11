@@ -1360,7 +1360,7 @@ test("deletes a workspace-scoped Codex thread transcript and persisted jobs", as
   }
 });
 
-test("does not delete a thread through the wrong workspace filter", async () => {
+test("does not read or delete a thread through the wrong workspace filter", async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
   const workspaceDir = path.join(tmpDir, "scratch");
   const otherWorkspaceDir = path.join(tmpDir, "other");
@@ -1390,6 +1390,13 @@ test("does not delete a thread through the wrong workspace filter", async () => 
     CODEX_BIN: await makeFakeCodex(tmpDir),
   });
   try {
+    const wrongDetail = await fetch(`${server.baseUrl}/v1/codex/threads/${sessionId}?workspaceId=other`);
+    assert.equal(wrongDetail.status, 404);
+    assert.match((await wrongDetail.json()).error, /thread not found/);
+
+    const correctDetail = await fetch(`${server.baseUrl}/v1/codex/threads/${sessionId}?workspaceId=scratch`);
+    assert.equal(correctDetail.status, 200);
+
     const response = await fetch(`${server.baseUrl}/v1/codex/threads/${sessionId}?workspaceId=other`, {
       method: "DELETE",
     });
@@ -3226,6 +3233,17 @@ test("scopes chat threads to workspaces with inheritance and mismatch rejection"
     const detailBody = await detail.json();
     assert.equal(detailBody.thread.workspaceId, "poc-vault");
     assert.equal(detailBody.thread.workspaceName, "POC Vault");
+
+    const scopedDetail = await fetch(
+      `${server.baseUrl}/v1/codex/threads/${chatThreadId}?workspaceId=poc-vault`,
+    );
+    assert.equal(scopedDetail.status, 200);
+
+    const wrongWorkspaceDetail = await fetch(
+      `${server.baseUrl}/v1/codex/threads/${chatThreadId}?workspaceId=scratch`,
+    );
+    assert.equal(wrongWorkspaceDetail.status, 404);
+    assert.match((await wrongWorkspaceDetail.json()).error, /thread not found/);
 
     // A conflicting workspaceId on continuation fails.
     const conflict = await fetch(`${server.baseUrl}/v1/codex/chat`, {

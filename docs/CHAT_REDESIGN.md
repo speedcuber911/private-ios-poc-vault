@@ -1,10 +1,10 @@
 # Relay Chat-First Redesign
 
-> **Superseded in part (2026-08-09):** the navigation and chat-surface shell
+> **Superseded in part (2026-08-11):** the navigation and chat-surface shell
 > described here — the four bottom tabs, mode-locked Chat/Task view models, the
 > composer workspace chip, and the `RelayWorkspaceSheet` folder browser (§1,
-> §3, §6) — is being replaced by the files-first redesign specified in
-> [FILES_REDESIGN.md](FILES_REDESIGN.md) (implementation in progress). The
+> §3, §6) — was replaced by the files-first redesign specified in
+> [FILES_REDESIGN.md](FILES_REDESIGN.md), which is implemented. The
 > DEBUG launch-hook table in §8 changes with it. Still accurate and carried
 > forward: the model-catalog de-duplication and task-catalog entries (§2), the
 > streaming chat internals (§4), the server contract basics (§7, which the new
@@ -192,8 +192,10 @@ progress layer without changing the asynchronous job API:
 - A task session is resumed only when both provider and workspace match the current
   composer selection. Switching workspace starts a new session instead of sending an
   invalid cross-workspace `resumeSessionId`.
-- The prompt keeps interactive scroll dismissal, keyboard dismissal on Run, and the
-  keyboard-accessory dismiss action required for iPhone use.
+- In the current files-first surface, the prompt keeps interactive scroll
+  dismissal, dismissal on Send/Run, and outside-tap dismissal on non-editor
+  content. The custom keyboard-accessory dismiss action was removed after
+  physical-iPhone validation showed it competing with the composer layout.
 
 ## 6. Workspace selection — unified folder browser (Task tab)
 
@@ -352,7 +354,7 @@ certificate stored in the device keychain.
 | Area | Files |
 |---|---|
 | Catalog dedup | `ops/render-codex-api-config`, `ops/serve-simulator-poc-vault` |
-| Task catalog | `ops/render-codex-api-config`, `ops/serve-simulator-poc-vault`, `codex-server/codex-api-deploy/server.mjs` |
+| Task catalog | `ops/render-codex-api-config`, `ops/serve-simulator-poc-vault`, `relay-server/codex-api-deploy/server.mjs` |
 | Sim fixtures | `ops/serve-simulator-poc-vault` (chat pacing, task polling, workspaces, dirs) |
 | Tabs | `ios/POCVault/POCVault/POCVaultApp.swift` |
 | Chat UX / views | `ios/POCVault/POCVault/Views/RelayChatView.swift`, `RelayChatViewModel.swift` |

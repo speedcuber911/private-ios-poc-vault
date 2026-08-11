@@ -6,6 +6,7 @@ struct POCVaultApp: App {
     @StateObject private var libraryViewModel: LibraryViewModel
     @StateObject private var chatSessionStore: RelayChatSessionStore
     @StateObject private var statusFeedViewModel: StatusFeedViewModel
+    @StateObject private var accountStore: RelayAccountStore
     private let manifestClient: ManifestClient
     private let codexClient: CodexClient
 
@@ -22,6 +23,10 @@ struct POCVaultApp: App {
             baseURL: AppConfiguration.codexBaseURL,
             identityStore: identityStore
         )
+        let accountStore = RelayAccountStore(
+            client: RelayAuthClient(baseURL: AppConfiguration.authBaseURL),
+            identityStore: identityStore
+        )
 
         _identityStore = StateObject(wrappedValue: identityStore)
         _libraryViewModel = StateObject(wrappedValue: LibraryViewModel(client: manifestClient))
@@ -30,21 +35,73 @@ struct POCVaultApp: App {
             completionNotifier: CodexLocalNotificationService()
         ))
         _statusFeedViewModel = StateObject(wrappedValue: StatusFeedViewModel(client: codexClient))
+        _accountStore = StateObject(wrappedValue: accountStore)
         self.manifestClient = manifestClient
         self.codexClient = codexClient
     }
 
     var body: some Scene {
         WindowGroup {
-            POCVaultRootView(
-                libraryViewModel: libraryViewModel,
-                statusFeedViewModel: statusFeedViewModel,
-                chatSessionStore: chatSessionStore,
-                identityStore: identityStore,
-                manifestClient: manifestClient,
-                codexClient: codexClient
-            )
+            Group {
+                switch accountStore.phase {
+                case .restoring:
+                    RelayRestoringView()
+                case .signedOut:
+                    AuthenticationView(accountStore: accountStore)
+                case .onboarding:
+                    RelayOnboardingView(accountStore: accountStore)
+                case .ready:
+                    POCVaultRootView(
+                        libraryViewModel: libraryViewModel,
+                        statusFeedViewModel: statusFeedViewModel,
+                        chatSessionStore: chatSessionStore,
+                        accountStore: accountStore,
+                        identityStore: identityStore,
+                        manifestClient: manifestClient,
+                        codexClient: codexClient
+                    )
+                }
+            }
+            .task {
+                await accountStore.restore()
+                #if DEBUG
+                await applyAuthenticationUITestHooks()
+                #endif
+            }
         }
+    }
+
+    #if DEBUG
+    private func applyAuthenticationUITestHooks() async {
+        let env = ProcessInfo.processInfo.environment
+        if accountStore.phase == .signedOut,
+           let username = env["RELAY_UITEST_CREATE_USERNAME"]?.trimmedNonEmpty,
+           let email = env["RELAY_UITEST_CREATE_EMAIL"]?.trimmedNonEmpty,
+           let password = env["RELAY_UITEST_CREATE_PASSWORD"]?.trimmedNonEmpty {
+            await accountStore.signUp(username: username, email: email, password: password)
+        }
+        if accountStore.phase == .onboarding,
+           env["RELAY_UITEST_SKIP_ONBOARDING"] == "1" {
+            accountStore.completeOnboarding()
+        }
+    }
+    #endif
+}
+
+private struct RelayRestoringView: View {
+    var body: some View {
+        ZStack {
+            AppTheme.canvasGradient.ignoresSafeArea()
+            VStack(spacing: 18) {
+                Image(systemName: "point.3.connected.trianglepath.dotted")
+                    .font(.system(size: 36, weight: .medium))
+                    .foregroundStyle(AppTheme.accentGradient)
+                ProgressView()
+                    .tint(AppTheme.accent)
+                    .accessibilityLabel("Restoring Relay session")
+            }
+        }
+        .preferredColorScheme(.dark)
     }
 }
 
@@ -58,6 +115,7 @@ struct POCVaultRootView: View {
     @ObservedObject var libraryViewModel: LibraryViewModel
     @ObservedObject var statusFeedViewModel: StatusFeedViewModel
     @ObservedObject var chatSessionStore: RelayChatSessionStore
+    @ObservedObject var accountStore: RelayAccountStore
     @ObservedObject var identityStore: ClientIdentityStore
     let manifestClient: ManifestClient
     let codexClient: CodexClient
@@ -67,6 +125,7 @@ struct POCVaultRootView: View {
     @State private var showingLibrary = false
     @State private var showingStatus = false
     @State private var showingDiagnostics = false
+    @State private var showingAccount = false
 
     var body: some View {
         NavigationStack(path: $browserPath) {
@@ -107,6 +166,9 @@ struct POCVaultRootView: View {
                 manifestClient: manifestClient
             )
         }
+        .sheet(isPresented: $showingAccount) {
+            AccountSettingsView(accountStore: accountStore)
+        }
         .task {
             identityStore.importIdentityFromSetupEnvironmentIfNeeded()
         }
@@ -138,7 +200,8 @@ struct POCVaultRootView: View {
             },
             onOpenLibrary: isRoot ? { showingLibrary = true } : nil,
             onOpenStatus: isRoot ? { showingStatus = true } : nil,
-            onOpenDiagnostics: isRoot ? { showingDiagnostics = true } : nil
+            onOpenDiagnostics: isRoot ? { showingDiagnostics = true } : nil,
+            onOpenAccount: isRoot ? { showingAccount = true } : nil
         )
     }
 
@@ -190,7 +253,7 @@ struct POCVaultRootView: View {
     /// - RELAY_UITEST_CHAT=1               open the chat cover (for RELAY_UITEST_PATH's
     ///   folder when set, else the root); the existing RELAY_UITEST_MODEL /
     ///   RELAY_UITEST_PROMPT / RELAY_UITEST_TASK_PROMPT auto-drive then takes over.
-    /// - RELAY_UITEST_OPEN=library|status  present that cover/sheet
+    /// - RELAY_UITEST_OPEN=library|status|account  present that cover/sheet
     private func applyUITestHooks() {
         let env = ProcessInfo.processInfo.environment
         if let folder = env["RELAY_UITEST_PATH"]?.trimmedNonEmpty {
@@ -206,6 +269,8 @@ struct POCVaultRootView: View {
             showingLibrary = true
         case "status":
             showingStatus = true
+        case "account":
+            showingAccount = true
         default:
             break
         }
@@ -584,22 +649,32 @@ enum AppConfiguration {
         infoKey: "POCVaultCodexBaseURL",
         fallback: "http://127.0.0.1:8787"
     )
+    static let authBaseURL = configuredURL(
+        supportValue: supportConfig?.authBaseURL,
+        infoKey: "RelayAuthBaseURL",
+        fallback: "http://127.0.0.1:8790"
+    )
     static let runtimeMode = "Simulator Preview"
 #else
     static let manifestURL = configuredURL(
         supportValue: supportConfig?.manifestURL,
         infoKey: "POCVaultManifestURL",
-        fallback: "https://vault.pocs.example.com/manifest.json"
+        fallback: "https://vault.pocs.conformal.live/manifest.json"
     )
     static let signatureURL = configuredURL(
         supportValue: supportConfig?.signatureURL,
         infoKey: "POCVaultSignatureURL",
-        fallback: "https://vault.pocs.example.com/manifest.sig.json"
+        fallback: "https://vault.pocs.conformal.live/manifest.sig.json"
     )
     static let codexBaseURL = configuredURL(
         supportValue: supportConfig?.codexBaseURL,
         infoKey: "POCVaultCodexBaseURL",
-        fallback: "https://codex.pocs.example.com"
+        fallback: "https://codex.pocs.conformal.live"
+    )
+    static let authBaseURL = configuredURL(
+        supportValue: supportConfig?.authBaseURL,
+        infoKey: "RelayAuthBaseURL",
+        fallback: "https://api.pocs.conformal.live"
     )
     static let runtimeMode = "Relay Cloud"
 #endif
@@ -694,6 +769,7 @@ enum AppConfiguration {
         let manifestURL: String?
         let signatureURL: String?
         let codexBaseURL: String?
+        let authBaseURL: String?
         let manifestPublicKey: String?
     }
 }
