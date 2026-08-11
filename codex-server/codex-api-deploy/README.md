@@ -125,9 +125,11 @@ inherits the stored value, while a conflicting id fails with `400`.
 Workspace-scoped chat threads merge with task threads in
 `GET /v1/codex/threads?workspaceId=...` and honor workspace-scoped deletion.
 Legacy chats without a workspace stay global-only. Codex-backed chat uses the
-selected workspace as its read-only ephemeral cwd (falling back to scratch);
-Azure chat remains context-only and never receives filesystem access from the
-workspace selection.
+selected workspace as its ephemeral cwd (falling back to scratch). With
+`CODEX_DANGEROUS_MODE=true`, Codex chat uses the same unrestricted
+`--dangerously-bypass-approvals-and-sandbox` policy as Codex tasks; otherwise
+it remains read-only. Azure chat remains context-only and never receives
+filesystem access from the workspace selection.
 
 `POST /v1/codex/jobs` accepts optional `provider`. Supported values are
 `codex`, `claude`, and `cursor`; omitted provider defaults to `codex`. All job responses
@@ -139,7 +141,9 @@ and resume with the saved Cursor session id. Claude
 jobs run `CLAUDE_BIN` in the selected workspace, read the prompt from stdin, use
 `--print`, pass `--model` and `--effort` when requested, and pass either
 `--session-id <uuid>` for a fresh Claude job or `--resume <session-id>` for a
-follow-up. Claude results come from stdout.
+follow-up. When `CODEX_DANGEROUS_MODE=true`, every Claude job uses
+`--dangerously-skip-permissions` and the server ignores any more restrictive
+permission mode requested by the client. Claude results come from stdout.
 
 For direct Claude subscription auth, leave `CLAUDE_CODE_USE_BEDROCK` and
 `CLAUDE_AWS_PROFILE` empty; ambient AWS credentials are stripped from Claude
