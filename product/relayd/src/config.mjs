@@ -222,6 +222,15 @@ const tunnelBackoffMaxMs = Math.max(
   tunnelBackoffBaseMs,
 );
 
+// Control-plane base URL for handoff pickup and event push. Trial sandboxes
+// already receive RELAYD_ENROLL_URL, so that is the fallback; empty disables
+// every cloud-facing loop.
+const cloudUrl = cleanOptionalUrlBase(process.env.RELAYD_CLOUD_URL || process.env.RELAYD_ENROLL_URL || "", "RELAYD_CLOUD_URL");
+
+const handoffEnabled = parseBooleanEnv("RELAYD_HANDOFF_ENABLED", true);
+
+const handoffPollWaitSec = parseIntegerEnv("RELAYD_HANDOFF_POLL_WAIT_SEC", 20, 0, 60);
+
 const chatsDir = path.join(dataDir, "chats");
 
 const pairingDir = path.join(dataDir, "pairing");
@@ -847,6 +856,9 @@ export {
   tunnelHeartbeatMs,
   tunnelBackoffBaseMs,
   tunnelBackoffMaxMs,
+  cloudUrl,
+  handoffEnabled,
+  handoffPollWaitSec,
   chatsDir,
   parseIntegerEnv,
   parseBooleanEnv,
