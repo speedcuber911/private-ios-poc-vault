@@ -71,6 +71,8 @@ const MUTABLE_TYPES = new Set([
   "job.needs_input",
   "job.completed",
   "job.failed",
+  "handoff.ready",
+  "handoff.failed",
 ]);
 
 const KNOWN_TYPES = new Set([
@@ -80,6 +82,8 @@ const KNOWN_TYPES = new Set([
   "job.completed",
   "job.failed",
   "node.health",
+  "handoff.ready",
+  "handoff.failed",
 ]);
 
 const PROTOCOL_VERSION = 1;
@@ -388,6 +392,10 @@ function categoryFor(type) {
       return "RELAY_JOB_DONE";
     case "job.failed":
       return "RELAY_JOB_FAILED";
+    case "handoff.ready":
+      return "RELAY_HANDOFF_READY";
+    case "handoff.failed":
+      return "RELAY_HANDOFF_FAILED";
     default:
       return "RELAY_EVENT";
   }
