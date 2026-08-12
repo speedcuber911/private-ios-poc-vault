@@ -28,6 +28,20 @@ CREATE TABLE IF NOT EXISTS devices (
   updated_at   INTEGER NOT NULL
 );
 
+-- A node carries TWO distinct public keys that must never be interchanged:
+--   pubkey     - ed25519 SPKI PEM. Verifies signatures on node-originated
+--                requests/events (nodeauth.js) and the broker tunnel
+--                handshake. Set by every node-creation path.
+--   enc_pubkey - base64 of 32 raw X25519 bytes. The recipient key relayd's
+--                seal.mjs (sealTo) encrypts handoff manifests/transcripts
+--                to, so only the node's matching private key can open them.
+--                Currently set only by trial enroll (POST
+--                /v1/trial-nodes/enroll); BYO/managed nodes registered via
+--                POST /v1/nodes always read back null here today.
+-- Using one where the other is expected is silent at write time and fails
+-- much later — a signature check passing/failing for the wrong reason, or a
+-- sealed handoff nobody can open — so name every local var and column that
+-- holds either of these pubkey/encPubkey, never a bare "key".
 CREATE TABLE IF NOT EXISTS nodes (
   id          TEXT PRIMARY KEY,
   account_id  TEXT NOT NULL,

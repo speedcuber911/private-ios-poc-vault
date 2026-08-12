@@ -104,17 +104,22 @@ function ensureNodeEventSchema(db) {
 }
 
 // Non-destructive guard for existing databases that predate the node
-// encryption key column. Follows the same idiom as ensureNodeEventSchema: a
-// database provisioned from an earlier schema must gain the column on open
-// rather than fail closed on first use. db.js stays the canonical home for
-// the core tables.
+// encryption key column (nodes.enc_pubkey — see the two-key note on the
+// `nodes` table in db.js before touching this). Follows the same idiom as
+// ensureNodeEventSchema: a database provisioned from an earlier schema must
+// gain the column on open rather than fail closed on first use. db.js stays
+// the canonical home for the core tables.
+//
+// No try/catch around the PRAGMA read: unlike a bare `catch { return; }`,
+// which would treat a genuine database error (closed handle, corruption)
+// identically to "nothing to migrate" and silently leave the column missing
+// — surfacing later as a confusing "no such column: enc_pubkey" from
+// createNode's INSERT — PRAGMA table_info on a table that does not exist yet
+// returns an empty rowset rather than throwing (verified against
+// node:sqlite), so there is no expected error here to swallow. A real
+// failure should propagate.
 function ensureNodeEncColumn(db) {
-  let columns = [];
-  try {
-    columns = db.prepare("PRAGMA table_info(nodes)").all();
-  } catch {
-    return;
-  }
+  const columns = db.prepare("PRAGMA table_info(nodes)").all();
   if (columns.length === 0) return;
   if (!columns.some((column) => column.name === "enc_pubkey")) {
     db.exec("ALTER TABLE nodes ADD COLUMN enc_pubkey TEXT");
@@ -1038,6 +1043,14 @@ function mapNode(row) {
     kind: row.kind,
     name: row.name,
     pubkey: row.pubkey,
+    // See the two-key note on the `nodes` table in db.js: this is the
+    // X25519 sealed-handoff key, never the ed25519 `pubkey` above. Included
+    // on every node returned from here (including /v1/nodes, which cannot
+    // set it) deliberately: it is public-key material — safe to expose,
+    // same as pubkey — and keeping one node shape everywhere a node is
+    // returned means routes never need an allow-list kept in sync by hand
+    // as fields are added. It is simply always null for nodes registered
+    // through /v1/nodes today, since only trial enroll sets it (MINOR 5).
     encPubkey: row.enc_pubkey ?? null,
     version: row.version,
     lastSeen: row.last_seen == null ? null : Number(row.last_seen),

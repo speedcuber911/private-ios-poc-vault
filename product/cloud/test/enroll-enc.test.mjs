@@ -83,3 +83,84 @@ test("enroll without an encryption key still succeeds and reports null", async (
     assert.equal(current.json.trial.nodeEncPubkey, null);
   } finally { await t.close(); }
 });
+
+// relayd's seal.mjs (product/relayd/src/seal.mjs, sealTo()) enforces that a
+// recipient X25519 key is *canonical* base64 — re-encoding the decoded bytes
+// must reproduce the exact string it was given — and rejects anything that
+// merely decodes to 32 bytes. Enrollment must adopt the identical rule, or a
+// key that is lenient-base64-valid-but-not-canonical sails through here and
+// only fails much later, as an opaque seal_bad_public_key/decrypt failure at
+// handoff time. Every case below decodes to exactly 32 bytes under Node's
+// permissive base64 decoder, so a length-only check (the pre-fix behavior)
+// would accept all three; the canonicality rule must reject all three.
+test("encPubkey must be canonical base64 — seal.mjs's exact rule, not merely 32 decodable bytes", async () => {
+  const provisioner = makeFakeProvisioner();
+  const t = await startTestApp({ env: TRIAL_ENV, provisioner });
+  try {
+    await createTrial(t);
+    const token = provisioner.created[0].envVars.RELAYD_ENROLL_TOKEN;
+    const identity = makeNodeIdentity();
+
+    // All-0xFF bytes canonicalize to a string dense in '+'/'/' and padding,
+    // which guarantees the base64url and whitespace/junk variants below
+    // actually differ from the canonical string (not just coincidentally
+    // reproduce it).
+    const raw = Buffer.alloc(32, 0xff);
+    const canonical = raw.toString("base64");
+    const cases = {
+      base64url: raw.toString("base64url"),
+      embedded_whitespace: `${canonical.slice(0, 4)}\n${canonical.slice(4)}`,
+      spliced_junk: `${canonical.slice(0, 4)}!${canonical.slice(4)}`,
+    };
+
+    for (const [label, malformed] of Object.entries(cases)) {
+      assert.equal(
+        Buffer.from(malformed, "base64").length,
+        32,
+        `${label} fixture must still lenient-decode to 32 bytes (otherwise this isn't testing canonicality)`,
+      );
+      assert.notEqual(malformed, canonical, `${label} fixture must actually differ from the canonical string`);
+
+      const res = await api(t.baseUrl, "POST", "/v1/trial-nodes/enroll", {
+        body: { token, nodeId: NODE_ID, pubkey: identity.pubkeyPem, encPubkey: malformed },
+      });
+      assert.equal(res.status, 400, `${label} must be rejected`);
+      assert.equal(res.json.error, "invalid_enc_pubkey", label);
+      assert.equal(t.app.registry.getNode(NODE_ID), null, `${label} must not create a node`);
+    }
+
+    // The canonical encoding of the exact same bytes is accepted — this is
+    // not a blanket rejection of the fixture's byte content, only of its
+    // non-canonical encodings.
+    const ok = await api(t.baseUrl, "POST", "/v1/trial-nodes/enroll", {
+      body: { token, nodeId: NODE_ID, pubkey: identity.pubkeyPem, encPubkey: canonical },
+    });
+    assert.equal(ok.status, 200);
+    assert.equal(t.app.registry.getNode(NODE_ID).encPubkey, canonical);
+  } finally { await t.close(); }
+});
+
+// A present-but-wrong-typed encPubkey must be a 400, never a silent null.
+// strOrNull() previously turned anything non-string into null, so a client
+// bug that sent a number/object/array/JSON-null for encPubkey would enroll
+// the node successfully with no encryption key at all — permanently unable
+// to receive a sealed handoff, with no error ever surfaced to explain why.
+test("a non-string encPubkey is rejected with 400, not silently dropped to null", async () => {
+  const provisioner = makeFakeProvisioner();
+  const t = await startTestApp({ env: TRIAL_ENV, provisioner });
+  try {
+    await createTrial(t);
+    const token = provisioner.created[0].envVars.RELAYD_ENROLL_TOKEN;
+    const identity = makeNodeIdentity();
+
+    const cases = { number: 12345, object: { a: 1 }, array: [1, 2, 3], null: null };
+    for (const [label, value] of Object.entries(cases)) {
+      const res = await api(t.baseUrl, "POST", "/v1/trial-nodes/enroll", {
+        body: { token, nodeId: NODE_ID, pubkey: identity.pubkeyPem, encPubkey: value },
+      });
+      assert.equal(res.status, 400, `${label} must be rejected`);
+      assert.equal(res.json.error, "invalid_enc_pubkey", label);
+      assert.equal(t.app.registry.getNode(NODE_ID), null, `${label} must not create a node`);
+    }
+  } finally { await t.close(); }
+});
