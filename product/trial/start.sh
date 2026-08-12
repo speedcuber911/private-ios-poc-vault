@@ -17,6 +17,13 @@ export CODEX_RUN_HOME="${CODEX_RUN_HOME:-/home/relay}"
 export RELAYD_STORE="${RELAYD_STORE:-sqlite}"
 
 RELAYD_BIN=/opt/relayd/app/bin/relayd
+# Device-token authentication for this machine. Pairing derives the token from
+# the pairing secret and writes only its SHA-256 here; relayd then requires a
+# bearer token on every request instead of a client certificate, which iOS
+# cannot supply to a machine whose certificate it did not itself anchor. Until
+# pairing writes the file, every request is rejected — the machine is never
+# open.
+export RELAYD_DEVICE_TOKEN_HASH_FILE="${CODEX_DATA_DIR}/device-token.hash"
 ENROLL_MARKER="${CODEX_DATA_DIR}/enrolled"
 PAIR_MARKER="${CODEX_DATA_DIR}/paired"
 # Written into the running sandbox by relay-cloud through envd's file API.
@@ -62,24 +69,36 @@ if [ ! -f "${ENROLL_MARKER}" ]; then
   touch "${ENROLL_MARKER}"
 fi
 
-# Tunnel settings are frozen in the snapshot for the same reason, so they come
-# from the same file. These are not secrets (broker address and SNI suffix),
-# but they still must not be word-split or re-interpreted by the shell — node
-# emits them single-quoted so a value can never break out into a command.
+# Tunnel settings AND the control-plane URL are frozen in the snapshot for the
+# same reason, so they come from the same file. These are not secrets (broker
+# address, SNI suffix, cloud base URL), but they still must not be word-split
+# or re-interpreted by the shell — node emits them single-quoted so a value can
+# never break out into a command.
+#
+# RELAYD_CLOUD_URL is load-bearing and was missing: relayd reads the control
+# plane out of the ENVIRONMENT (config.mjs), and this script exported it
+# nowhere, so `relayd run` started with cloudUrl empty and startHandoffPickup
+# disabled itself on every trial machine ever booted. relay-cloud does pass
+# RELAYD_ENROLL_URL to createSandbox, which looks like it covers this and does
+# not: Cube restores these sandboxes from a snapshot, so container env from the
+# create call is never visible here — that is the whole reason config arrives
+# as a file. Symptom was a handoff stuck at `pending` forever with the node's
+# `lastSeen` still null, because the node never polled even once.
 if [ -f "${ENROLL_CONFIG}" ]; then
   node -e '
     const fs = require("node:fs");
     const cfg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
     const q = (v) => "'"'"'" + String(v).replace(/'"'"'/g, "'"'"'\\'"'"''"'"'") + "'"'"'";
     const out = [];
+    if (cfg.cloudUrl) out.push("RELAYD_CLOUD_URL=" + q(cfg.cloudUrl));
     if (cfg.tunnelHost) out.push("RELAYD_TUNNEL_HOST=" + q(cfg.tunnelHost));
     if (cfg.tunnelPort) out.push("RELAYD_TUNNEL_PORT=" + q(cfg.tunnelPort));
     if (cfg.tunnelSuffix) out.push("RELAYD_TUNNEL_SUFFIX=" + q(cfg.tunnelSuffix));
     fs.writeFileSync(process.argv[2], out.join("\n") + "\n", { mode: 0o600 });
-  ' "${ENROLL_CONFIG}" "${CODEX_DATA_DIR}/tunnel.env"
+  ' "${ENROLL_CONFIG}" "${CODEX_DATA_DIR}/runtime.env"
   set -a
   # shellcheck disable=SC1090
-  . "${CODEX_DATA_DIR}/tunnel.env"
+  . "${CODEX_DATA_DIR}/runtime.env"
   set +a
 fi
 
