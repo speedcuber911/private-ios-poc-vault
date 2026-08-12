@@ -8,6 +8,7 @@ enum ClientIdentityStoreError: Error, LocalizedError {
     case p12ContainsNoIdentity
     case keychainAddFailed(OSStatus)
     case keychainReadFailed(OSStatus)
+    case keychainDeleteFailed(OSStatus)
 
     var errorDescription: String? {
         switch self {
@@ -21,6 +22,8 @@ enum ClientIdentityStoreError: Error, LocalizedError {
             return "The client identity could not be saved to Keychain. OSStatus \(status)."
         case .keychainReadFailed(let status):
             return "The client identity could not be read from Keychain. OSStatus \(status)."
+        case .keychainDeleteFailed(let status):
+            return "The client identity could not be removed from Keychain. OSStatus \(status)."
         }
     }
 }
@@ -28,13 +31,30 @@ enum ClientIdentityStoreError: Error, LocalizedError {
 final class ClientIdentityStore: ObservableObject {
     static let supportDirectoryName = "support"
     static let defaultP12Name = "client.p12"
-    private static let preferredClientCertificateNames = ["iphone"]
+    /// Common names this app will adopt an already-installed keychain identity
+    /// under, when the persistent reference that normally locates it is gone
+    /// (restore to a new device, app reinstall).
+    ///
+    /// "trial-device" is the CN a trial machine issues — see
+    /// `product/relayd/src/trialpair.mjs`, which signs the device CSR with
+    /// `-subj "/CN=trial-device"`. Without it here, a trial identity sitting in
+    /// the keychain could never be recovered, and the trial cannot simply be
+    /// re-run: the pairing slots are put-once and the account gets one trial
+    /// for its lifetime.
+    private static let preferredClientCertificateNames = ["iphone", "trial-device"]
 
     @Published private(set) var lastImportedCertificateName: String?
 
     private let defaults: UserDefaults
     private let persistentRefKey = "com.parikshit.pocvault.identity.persistentRef"
+    /// DER of the node CA extracted from a trial PKCS#12, plus the single host it
+    /// may be pinned for and a marker that the stored identity is trial-issued.
+    /// A CA certificate is public material — no secret is persisted here.
+    private let pinnedCAKey = "com.parikshit.pocvault.identity.pinnedCA"
+    private let pinnedHostKey = "com.parikshit.pocvault.identity.pinnedHost"
+    private let trialIssuedKey = "com.parikshit.pocvault.identity.trialIssued"
     private var cachedIdentity: SecIdentity?
+    private var cachedPinnedCA: SecCertificate?
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -147,14 +167,95 @@ final class ClientIdentityStore: ObservableObject {
         }
     }
 
+    /// BYO / support-directory import. Nothing is pinned: a personal install is
+    /// fronted by a publicly-trusted certificate and its PKCS#12 carries no CA.
     @discardableResult
     func importIdentity(from url: URL, passphrase: String) throws -> URLCredential {
+        try importIdentity(from: url, passphrase: passphrase, trialHost: nil)
+    }
+
+    /// Trial import. `trialHost` is the SNI hostname the machine answers on; when
+    /// it is supplied the node CA found in the PKCS#12 is persisted and pinned to
+    /// that one host, and the identity is marked trial-issued so sign-out can
+    /// purge it without touching a BYO identity the user imported themselves.
+    @discardableResult
+    func importIdentity(from url: URL, passphrase: String, trialHost: String?) throws -> URLCredential {
         let data = try Data(contentsOf: url)
-        let identity = try Self.identity(fromPKCS12: data, passphrase: passphrase)
-        try save(identity: identity, label: url.deletingPathExtension().lastPathComponent)
-        cachedIdentity = identity
-        lastImportedCertificateName = certificateCommonName(for: identity) ?? url.lastPathComponent
-        return URLCredential(identity: identity, certificates: nil, persistence: .forSession)
+        let imported = try Self.importPKCS12(data, passphrase: passphrase)
+        try save(identity: imported.identity, label: url.deletingPathExtension().lastPathComponent)
+        cachedIdentity = imported.identity
+        lastImportedCertificateName = certificateCommonName(for: imported.identity) ?? url.lastPathComponent
+        pinTrialMaterial(caCertificate: imported.caCertificate, host: trialHost)
+        return URLCredential(identity: imported.identity, certificates: nil, persistence: .forSession)
+    }
+
+    // MARK: - Pinned node CA (see RelayServerTrust)
+
+    /// The node CA to evaluate `pinnedHost`'s TLS chain against, or nil when the
+    /// app has never imported a trial identity.
+    var pinnedCACertificate: SecCertificate? {
+        if let cachedPinnedCA {
+            return cachedPinnedCA
+        }
+        guard let der = defaults.data(forKey: pinnedCAKey),
+              let certificate = SecCertificateCreateWithData(nil, der as CFData) else {
+            return nil
+        }
+        cachedPinnedCA = certificate
+        return certificate
+    }
+
+    /// The single host `pinnedCACertificate` may be applied to.
+    var pinnedHost: String? {
+        defaults.string(forKey: pinnedHostKey)?.trimmedNonEmpty
+    }
+
+    /// True when the stored client identity came from a trial pairing rather than
+    /// from a user-supplied PKCS#12.
+    var hasTrialIssuedIdentity: Bool {
+        defaults.bool(forKey: trialIssuedKey)
+    }
+
+    /// Sign-out purge: drops the trial-issued identity and the pinned node CA so
+    /// the next account on this phone inherits neither a pointer to another
+    /// account's machine nor a certificate that would authenticate to it. A BYO
+    /// identity the user imported themselves is deliberately left in place.
+    func discardTrialMaterial() {
+        if hasTrialIssuedIdentity {
+            try? deleteStoredIdentity()
+        }
+        clearPinnedMaterial()
+    }
+
+    /// Records the CA to pin and the one host it applies to. Called by the trial
+    /// import path; internal so the persistence can be unit-tested without a
+    /// PKCS#12 fixture. A nil/empty host means "not a trial import" and leaves
+    /// every pinning key untouched — a BYO import can never start pinning.
+    func pinTrialMaterial(caCertificate: SecCertificate?, host: String?) {
+        guard let host = host?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !host.isEmpty else {
+            return
+        }
+        defaults.set(true, forKey: trialIssuedKey)
+        defaults.set(host, forKey: pinnedHostKey)
+        guard let caCertificate else {
+            // No CA in the blob: leave the app on default handling rather than
+            // pinning something arbitrary. TLS to the machine will fail loudly.
+            defaults.removeObject(forKey: pinnedCAKey)
+            cachedPinnedCA = nil
+            CodexDiagnostics.log("identity_trial_ca_missing")
+            return
+        }
+        defaults.set(SecCertificateCopyData(caCertificate) as Data, forKey: pinnedCAKey)
+        cachedPinnedCA = caCertificate
+        CodexDiagnostics.log("identity_trial_ca_pinned", fields: ["host": host])
+    }
+
+    private func clearPinnedMaterial() {
+        defaults.removeObject(forKey: trialIssuedKey)
+        defaults.removeObject(forKey: pinnedHostKey)
+        defaults.removeObject(forKey: pinnedCAKey)
+        cachedPinnedCA = nil
     }
 
     func credential() -> URLCredential? {
@@ -191,6 +292,23 @@ final class ClientIdentityStore: ObservableObject {
 
     var hasStoredIdentity: Bool {
         identity() != nil
+    }
+
+    func deleteStoredIdentity() throws {
+        if let persistentRef = defaults.data(forKey: persistentRefKey) {
+            let status = SecItemDelete([
+                kSecValuePersistentRef as String: persistentRef
+            ] as CFDictionary)
+            guard status == errSecSuccess || status == errSecItemNotFound else {
+                throw ClientIdentityStoreError.keychainDeleteFailed(status)
+            }
+        }
+        defaults.removeObject(forKey: persistentRefKey)
+        cachedIdentity = nil
+        lastImportedCertificateName = nil
+        // The pinned CA is only ever meaningful next to the identity it arrived
+        // with, so a full identity purge takes it too.
+        clearPinnedMaterial()
     }
 
     private func recoverExistingPreferredIdentity() -> SecIdentity? {
@@ -303,7 +421,15 @@ final class ClientIdentityStore: ObservableObject {
         return commonName as String?
     }
 
-    private static func identity(fromPKCS12 data: Data, passphrase: String) throws -> SecIdentity {
+    /// What a PKCS#12 blob yields: always an identity, plus the issuing CA when
+    /// the blob carries one (a trial p12 is built with `-certfile <ca.pem>`; a
+    /// BYO p12 usually is not, and a missing CA is never an error).
+    struct ImportedPKCS12 {
+        let identity: SecIdentity
+        let caCertificate: SecCertificate?
+    }
+
+    static func importPKCS12(_ data: Data, passphrase: String) throws -> ImportedPKCS12 {
         let options = [kSecImportExportPassphrase as String: passphrase]
         var importedItems: CFArray?
         let status = SecPKCS12Import(data as CFData, options as CFDictionary, &importedItems)
@@ -319,6 +445,48 @@ final class ClientIdentityStore: ObservableObject {
             throw ClientIdentityStoreError.p12ContainsNoIdentity
         }
 
-        return identityValue as! SecIdentity
+        let identity = identityValue as! SecIdentity
+        var leafCertificate: SecCertificate?
+        let leafData: Data? = SecIdentityCopyCertificate(identity, &leafCertificate) == errSecSuccess
+            ? leafCertificate.map { SecCertificateCopyData($0) as Data }
+            : nil
+
+        return ImportedPKCS12(
+            identity: identity,
+            caCertificate: caCertificate(
+                in: certificateChain(in: firstItem),
+                leafData: leafData
+            )
+        )
+    }
+
+    /// The certificate chain `SecPKCS12Import` returned, preferring the explicit
+    /// chain and falling back to the trust object's chain.
+    private static func certificateChain(in item: [String: Any]) -> [SecCertificate] {
+        if let chain = item[kSecImportItemCertChain as String] as? [SecCertificate], !chain.isEmpty {
+            return chain
+        }
+        guard let trustValue = item[kSecImportItemTrust as String],
+              CFGetTypeID(trustValue as CFTypeRef) == SecTrustGetTypeID() else {
+            return []
+        }
+        let trust = trustValue as! SecTrust
+        return SecTrustCopyCertificateChain(trust) as? [SecCertificate] ?? []
+    }
+
+    /// Picks the node CA out of an imported chain: the self-signed entry that is
+    /// not the identity's own leaf. Internal so the selection is unit-testable
+    /// with fixture certificates (public material, no key involved).
+    static func caCertificate(in chain: [SecCertificate], leafData: Data?) -> SecCertificate? {
+        let candidates = chain.filter { SecCertificateCopyData($0) as Data != leafData }
+        return candidates.first(where: isSelfSigned) ?? candidates.first
+    }
+
+    static func isSelfSigned(_ certificate: SecCertificate) -> Bool {
+        guard let subject = SecCertificateCopyNormalizedSubjectSequence(certificate) as Data?,
+              let issuer = SecCertificateCopyNormalizedIssuerSequence(certificate) as Data? else {
+            return false
+        }
+        return subject == issuer
     }
 }

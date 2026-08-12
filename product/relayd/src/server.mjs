@@ -1,0 +1,352 @@
+// relayd server.mjs — extracted verbatim from relay-server/codex-api-deploy/server.mjs (W2-CORE, behavior-preserving).
+import http from "node:http";
+import https from "node:https";
+import { execFile, spawn } from "node:child_process";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import path from "node:path";
+
+import { host, port, requireMtls, allowedCertSubjects, maxConcurrent, maxBodyBytes, maxTranscriptionAudioBytes, proxyBaseUrl, proxyClientCertPath, proxyClientKeyPath } from "./config.mjs";
+import { sendJson, sendHtml, sendError, readBody, readBinaryBody, headerValue, clampLimit, isSafeJobId } from "./util.mjs";
+import { workspaces, workspaceList, publicWorkspace, workspaceDirectoryResponse, selectWorkspaceDirectory, createWorkspaceDirectory } from "./workspaces.mjs";
+import { publicModelCatalog } from "./catalog.mjs";
+import { fsListResponse, serveFsFile } from "./fsapi.mjs";
+import { listProviderSkills, publicSkill } from "./skills.mjs";
+import { cleanThreadProviderFilter, workspaceForJob, listWorkspaceSessions, listWorkspaceThreads, resolveOptionalWorkspaceFilter, threadDetailResponse, deleteThread } from "./threads.mjs";
+import { handleChatRequest } from "./chat.mjs";
+import { isSafeArtifactId, serveJobArtifact } from "./artifacts.mjs";
+import { transcribeAudio, cleanAudioContentType, cleanAudioFilename } from "./transcribe.mjs";
+import { jobsState, jobs, activeChildren, responseShape, wantsFullLogs, enqueueJob, cleanJobProviderFilter, normalizeJobProvider, cancelJob, streamJobEvents, toJobResponse } from "./jobs.mjs";
+import { codexThreadUiHtml } from "./ui.mjs";
+import { handleAdditionRoutes } from "./additions.mjs";
+
+function authorize(req) {
+  const verify = headerValue(req.headers["x-ssl-client-verify"]);
+  const subject = headerValue(req.headers["x-ssl-client-s-dn"]);
+
+  if (!requireMtls) {
+    return { ok: true, subject: subject || null };
+  }
+
+  if (verify !== "SUCCESS") {
+    return { ok: false, status: 401, error: "client certificate is required" };
+  }
+
+  if (!allowedCertSubjects.has(subject)) {
+    return { ok: false, status: 403, error: "client certificate subject is not allowed" };
+  }
+
+  return { ok: true, subject };
+}
+
+
+async function routeRequest(req, res) {
+  const url = new URL(req.url || "/", `http://${req.headers.host || `${host}:${port}`}`);
+
+  if (req.method === "GET" && url.pathname === "/healthz") {
+    return sendJson(res, 200, healthPayload(false));
+  }
+
+  // Explicit invariant (API.md §2.3): pairing is authenticated by a single-use
+  // secret and a blob MAC, never by a client certificate. It lives on its own
+  // listener (pairing.mjs / RELAYD_PAIRING_*) and is NEVER routable here — not
+  // even to fall through to authorize(), which would advertise its existence.
+  if (url.pathname === "/v1/pair") {
+    return sendError(res, 404, "not found");
+  }
+
+  const auth = authorize(req);
+  if (!auth.ok) {
+    return sendError(res, auth.status, auth.error);
+  }
+
+  if (req.method === "GET" && url.pathname === "/v1/codex/health") {
+    return sendJson(res, 200, healthPayload(true));
+  }
+
+  if (req.method === "GET" && url.pathname === "/v1/codex/ui") {
+    return sendHtml(res, 200, codexThreadUiHtml());
+  }
+
+  if (req.method === "GET" && url.pathname === "/v1/codex/models") {
+    return sendJson(res, 200, { models: publicModelCatalog() });
+  }
+
+  if (req.method === "POST" && url.pathname === "/v1/codex/chat") {
+    const body = await readBody(req);
+    return handleChatRequest(req, res, body, auth.subject);
+  }
+
+  if (shouldProxyCodexRequest(req, url)) {
+    return proxyCodexRequest(req, url, res);
+  }
+
+  if (req.method === "GET" && url.pathname === "/v1/codex/skills") {
+    const provider = cleanJobProviderFilter(url.searchParams.get("provider")) || "codex";
+    return sendJson(res, 200, { provider, skills: listProviderSkills(provider).map(publicSkill) });
+  }
+
+  if (req.method === "GET" && url.pathname === "/v1/codex/workspaces") {
+    return sendJson(res, 200, {
+      workspaces: workspaceList().map((workspace) => ({
+        id: workspace.id,
+        name: workspace.name,
+        path: workspace.path,
+      })),
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/v1/codex/workspace-dirs") {
+    return sendJson(
+      res,
+      200,
+      workspaceDirectoryResponse({
+        requestedPath: url.searchParams.get("path"),
+        query: url.searchParams.get("q"),
+      }),
+    );
+  }
+
+  if (req.method === "GET" && url.pathname === "/v1/codex/fs/list") {
+    return sendJson(res, 200, fsListResponse(url.searchParams));
+  }
+
+  if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/v1/codex/fs/file") {
+    return serveFsFile(req, res, url.searchParams);
+  }
+
+  if (req.method === "POST" && url.pathname === "/v1/codex/workspaces/select") {
+    const body = await readBody(req);
+    return sendJson(res, 200, publicWorkspace(selectWorkspaceDirectory(body)));
+  }
+
+  if (req.method === "POST" && url.pathname === "/v1/codex/workspaces/create") {
+    const body = await readBody(req);
+    return sendJson(res, 201, publicWorkspace(createWorkspaceDirectory(body)));
+  }
+
+  if (req.method === "GET" && url.pathname === "/v1/codex/sessions") {
+    const limit = clampLimit(url.searchParams.get("limit"));
+    const workspaceId = url.searchParams.get("workspaceId");
+    const provider = cleanThreadProviderFilter(url.searchParams.get("provider"));
+    return sendJson(res, 200, { sessions: listWorkspaceSessions({ workspaceId, provider, limit }) });
+  }
+
+  if (req.method === "GET" && url.pathname === "/v1/codex/threads") {
+    const limit = clampLimit(url.searchParams.get("limit"));
+    const workspaceId = url.searchParams.get("workspaceId");
+    const provider = cleanThreadProviderFilter(url.searchParams.get("provider"));
+    return sendJson(res, 200, { threads: listWorkspaceThreads({ workspaceId, provider, limit }) });
+  }
+
+  const threadMatch = url.pathname.match(/^\/v1\/codex\/threads\/([^/]+)$/);
+  if (threadMatch && req.method === "GET") {
+    const sessionId = decodeURIComponent(threadMatch[1]);
+    const provider = cleanThreadProviderFilter(url.searchParams.get("provider"));
+    if (!isSafeJobId(sessionId)) return sendError(res, 404, "thread not found");
+    const detail = await threadDetailResponse(sessionId, { provider });
+    if (!detail) return sendError(res, 404, "thread not found");
+    return sendJson(res, 200, detail);
+  }
+
+  if (threadMatch && req.method === "DELETE") {
+    const sessionId = decodeURIComponent(threadMatch[1]);
+    const workspaceId = url.searchParams.get("workspaceId");
+    const provider = cleanThreadProviderFilter(url.searchParams.get("provider"));
+    if (!isSafeJobId(sessionId)) return sendError(res, 404, "thread not found");
+    const deleted = deleteThread(sessionId, { workspaceId, provider, certSubject: auth.subject });
+    if (!deleted) return sendError(res, 404, "thread not found");
+    return sendJson(res, 200, deleted);
+  }
+
+  if (req.method === "POST" && url.pathname === "/v1/codex/transcriptions") {
+    const audio = await readBinaryBody(req, maxTranscriptionAudioBytes);
+    const transcript = await transcribeAudio({
+      audio,
+      contentType: cleanAudioContentType(req.headers["content-type"]),
+      filename: cleanAudioFilename(req.headers["x-audio-filename"]),
+      certSubject: auth.subject,
+    });
+    return sendJson(res, 200, transcript);
+  }
+
+  if (req.method === "GET" && url.pathname === "/v1/codex/jobs") {
+    const limit = clampLimit(url.searchParams.get("limit"));
+    const workspaceId = url.searchParams.get("workspaceId");
+    const provider = cleanJobProviderFilter(url.searchParams.get("provider"));
+    const selectedWorkspace = resolveOptionalWorkspaceFilter(workspaceId);
+    const selectedJobs = [...jobs.values()]
+      .filter((job) => !provider || normalizeJobProvider(job.provider) === provider)
+      .filter((job) => !selectedWorkspace || workspaceForJob(job)?.id === selectedWorkspace.id)
+      .sort((left, right) => Date.parse(right.createdAt || 0) - Date.parse(left.createdAt || 0))
+      .slice(0, limit);
+    return sendJson(res, 200, {
+      jobs: await Promise.all(selectedJobs.map((job) => toJobResponse(job, responseShape("compact")))),
+    });
+  }
+
+  if (req.method === "POST" && url.pathname === "/v1/codex/jobs") {
+    const body = await readBody(req);
+    const job = enqueueJob(body, auth.subject);
+    return sendJson(res, 202, await toJobResponse(job, responseShape("preview")));
+  }
+
+  const artifactMatch = url.pathname.match(/^\/v1\/codex\/jobs\/([^/]+)\/artifacts\/([^/]+)\/(raw|preview)$/);
+  if (artifactMatch && req.method === "GET") {
+    const [, jobId, artifactId, mode] = artifactMatch;
+    if (!isSafeJobId(jobId) || !isSafeArtifactId(artifactId)) return sendError(res, 404, "artifact not found");
+    const job = jobs.get(jobId);
+    if (!job) return sendError(res, 404, "artifact not found");
+    return serveJobArtifact(res, job, artifactId, mode);
+  }
+
+  const streamMatch = url.pathname.match(/^\/v1\/codex\/jobs\/([^/]+)\/stream$/);
+  if (streamMatch && req.method === "GET") {
+    const id = streamMatch[1];
+    if (!isSafeJobId(id)) return sendError(res, 404, "job not found");
+    const job = jobs.get(id);
+    if (!job) return sendError(res, 404, "job not found");
+    return streamJobEvents(req, res, job, url.searchParams);
+  }
+
+  const jobMatch = url.pathname.match(/^\/v1\/codex\/jobs\/([^/]+)(?:\/(cancel))?$/);
+  if (jobMatch) {
+    const [, id, action] = jobMatch;
+    if (!isSafeJobId(id)) return sendError(res, 404, "job not found");
+    const job = jobs.get(id);
+    if (!job) return sendError(res, 404, "job not found");
+
+    if (!action && req.method === "GET") {
+      return sendJson(res, 200, await toJobResponse(job, responseShape(wantsFullLogs(url.searchParams) ? "full" : "preview")));
+    }
+
+    if (action === "cancel" && req.method === "POST") {
+      const cancelledJob = cancelJob(job);
+      return sendJson(res, 202, await toJobResponse(cancelledJob, responseShape("preview")));
+    }
+  }
+
+  // W2-MODULES: v1 ADDITIONS (API.md Part 2) — events feed, devices,
+  // harness ops. Every path handled there previously 404'd; frozen routes
+  // above are untouched.
+  if (await handleAdditionRoutes(req, res, url, auth)) return;
+
+  return sendError(res, 404, "not found");
+}
+
+
+function healthPayload(authenticated) {
+  return {
+    ok: true,
+    authenticated,
+    requireMtls,
+    queueLength: jobsState.queuedJobIds.length,
+    activeJobs: activeChildren.size,
+    maxConcurrent,
+    workspaceCount: workspaces.size,
+  };
+}
+
+
+function shouldProxyCodexRequest(req, url) {
+  return Boolean(
+    proxyBaseUrl &&
+      ["GET", "POST"].includes(req.method || "") &&
+      url.pathname.startsWith("/v1/codex/") &&
+      url.pathname !== "/v1/codex/transcriptions",
+  );
+}
+
+
+async function proxyCodexRequest(req, url, res) {
+  const body = req.method === "GET" ? null : await readRawBody(req, maxBodyBytes);
+  return new Promise((resolve, reject) => {
+    const target = new URL(`${url.pathname}${url.search}`, proxyBaseUrl);
+    const transport = target.protocol === "https:" ? https : http;
+    const options = {
+      method: req.method,
+      headers: {
+        accept: headerValue(req.headers.accept) || "application/json",
+        "user-agent": "poc-vault-codex-thread-ui/1",
+      },
+    };
+    const contentType = headerValue(req.headers["content-type"]);
+    if (contentType) options.headers["content-type"] = contentType;
+    if (body) options.headers["content-length"] = String(body.length);
+
+    if (target.protocol === "https:") {
+      if (proxyClientCertPath) options.cert = fs.readFileSync(proxyClientCertPath);
+      if (proxyClientKeyPath) options.key = fs.readFileSync(proxyClientKeyPath);
+    }
+
+    const upstream = transport.request(target, options, (upstreamRes) => {
+      const contentType = headerValue(upstreamRes.headers["content-type"]);
+      if (/text\/event-stream/i.test(contentType)) {
+        // Pipe SSE responses through instead of buffering so live streams
+        // (chat, job streaming) work in dev proxy mode.
+        res.writeHead(upstreamRes.statusCode || 502, {
+          "content-type": contentType,
+          "cache-control": upstreamRes.headers["cache-control"] || "no-cache, no-transform",
+          connection: "keep-alive",
+          "x-accel-buffering": "no",
+        });
+        upstreamRes.pipe(res);
+        res.on("close", () => upstreamRes.destroy());
+        upstreamRes.on("end", () => resolve());
+        upstreamRes.on("error", () => {
+          res.end();
+          resolve();
+        });
+        return;
+      }
+
+      const chunks = [];
+      upstreamRes.on("data", (chunk) => chunks.push(chunk));
+      upstreamRes.on("end", () => {
+        const body = Buffer.concat(chunks);
+        res.writeHead(upstreamRes.statusCode || 502, {
+          "content-type": upstreamRes.headers["content-type"] || "application/json",
+          "cache-control": "no-store",
+          "content-length": body.length,
+        });
+        res.end(body);
+        resolve();
+      });
+    });
+
+    upstream.on("error", reject);
+    upstream.end(body || undefined);
+  });
+}
+
+
+function readRawBody(req, byteLimit) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > byteLimit) {
+        reject(Object.assign(new Error("request body too large"), { status: 413 }));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
+
+
+export {
+  authorize,
+  routeRequest,
+  healthPayload,
+  shouldProxyCodexRequest,
+  proxyCodexRequest,
+  readRawBody,
+};

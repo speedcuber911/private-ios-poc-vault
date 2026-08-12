@@ -206,6 +206,16 @@ final class RelayChatViewModel: ObservableObject {
     /// the job reaches a terminal state.
     @Published private(set) var liveJobTails: [String: String] = [:]
 
+    /// Sessions handed over from a Mac. Node-level, not folder-scoped: a handoff
+    /// lands in its own worktree workspace, so it is shown wherever the threads
+    /// list is open rather than filtered to the current folder.
+    @Published private(set) var handoffs: [RelayHandoffCard] = []
+    /// Manifests fetched per handoff (`GET /v1/handoffs/:id`), keyed by id.
+    @Published private(set) var handoffManifests: [String: RelayHandoffManifest] = [:]
+    /// The "On your Mac" index, or nil when no Mac has published one.
+    @Published private(set) var macSessions: RelayMacSessionIndex?
+    @Published private(set) var continuingHandoffIDs: Set<String> = []
+
     /// Registered workspace id for this folder, nil until the folder is registered
     /// (lazy `POST /workspaces/select` on first send).
     @Published private(set) var workspaceID: String?
@@ -226,6 +236,8 @@ final class RelayChatViewModel: ObservableObject {
     /// workspace is rejected by the server ("session does not belong to workspace"), so
     /// we only resume when this matches the compose workspace.
     private var currentThreadWorkspaceID: String?
+    /// Human-readable name recorded for the current folder-scoped thread.
+    private var currentThreadWorkspaceName: String?
     private var streamTask: Task<Void, Never>?
     /// Live job SSE consumers keyed by job id. Streams are VM-owned: dismissing the chat
     /// cover never cancels them. When a stream errors/drops the entry clears itself and
@@ -236,6 +248,20 @@ final class RelayChatViewModel: ObservableObject {
     private static let liveTailCharacterCap = 12_000
 
     var isStreaming: Bool { streamingMessageID != nil }
+
+    /// Unified, newest-first history for this exact folder. Server threads carry complete
+    /// conversations; standalone jobs cover invocations whose provider never produced a
+    /// resumable session (or whose session discovery has not completed yet). The extra
+    /// local filter is defense in depth on top of the server's workspaceId query.
+    var historyItems: [CodexThreadFeedItem] {
+        let scopedThreads = threads.filter { belongsToHistoryScope($0.workspaceId) }
+        let scopedJobs = jobs.filter { belongsToHistoryScope($0.workspaceId) }
+        return CodexThreadFeedItem.makeFeed(
+            threads: scopedThreads,
+            jobs: scopedJobs,
+            workspaceID: workspaceID
+        )
+    }
 
     init(client: CodexClient, workspaceID: String?, workspacePath: String?) {
         self.client = client
@@ -249,6 +275,11 @@ final class RelayChatViewModel: ObservableObject {
             return URL(fileURLWithPath: workspacePath).lastPathComponent
         }
         return registeredWorkspaceName ?? "Relay"
+    }
+
+    /// Full jail path shown under the chat header; nil for the root chat.
+    var folderPathLabel: String? {
+        workspacePath
     }
 
     /// Adopt a workspace id learned outside this VM (e.g. the browser registered the
@@ -306,6 +337,7 @@ final class RelayChatViewModel: ObservableObject {
             models = try await client.fetchModels()
             ensureSelectedChoiceValid()
             await refreshThreads()
+            await refreshHandoffs()
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
@@ -315,20 +347,91 @@ final class RelayChatViewModel: ObservableObject {
         #endif
     }
 
-    /// Threads/jobs scoped to this folder's workspace. An unregistered folder has no
-    /// server-side history yet; the root chat sees the app-wide list.
+    /// Load only this folder's threads and invocations. A folder whose dynamic workspace
+    /// has not been registered yet has no server-side history; the workspace-root chat
+    /// keeps only legacy/global conversations whose workspaceId is nil.
     func refreshThreads() async {
-        if workspacePath != nil && workspaceID == nil {
+        guard workspacePath == nil || workspaceID != nil else {
+            threads = []
+            jobs = []
             return
         }
         do {
-            threads = Self.sortedThreads(try await client.fetchThreads(provider: nil, workspaceID: workspaceID, limit: 80))
-            jobs = Self.sortedJobs(try await client.fetchJobs(provider: nil, workspaceID: workspaceID, limit: 20))
+            let fetchedThreads = try await client.fetchThreads(provider: nil, workspaceID: workspaceID, limit: 200)
+            let fetchedJobs = try await client.fetchJobs(provider: nil, workspaceID: workspaceID, limit: 200)
+            threads = Self.sortedThreads(fetchedThreads.filter { belongsToHistoryScope($0.workspaceId) })
+            jobs = Self.sortedJobs(fetchedJobs.filter { belongsToHistoryScope($0.workspaceId) })
             mergeUpdatedJobs()
         } catch {
             if !isCancellation(error) {
                 errorMessage = error.localizedDescription
             }
+        }
+    }
+
+    // MARK: - Handoffs
+
+    /// Reload the handoff cards and the "On your Mac" index. Never throws and
+    /// never fabricates rows: a node that is unreachable leaves the last known
+    /// state in place rather than blanking the list.
+    func refreshHandoffs() async {
+        do {
+            let cards = try await client.fetchHandoffs()
+            handoffs = cards
+            for card in cards where handoffManifests[card.id] == nil {
+                guard let detail = try? await client.fetchHandoff(id: card.id) else { continue }
+                if let manifest = detail.manifest {
+                    handoffManifests[card.id] = manifest
+                }
+            }
+        } catch {
+            if isCancellation(error) { return }
+            CodexDiagnostics.log("handoff_refresh_failed", fields: ["error": String(describing: error)])
+        }
+
+        if let index = try? await client.fetchMacSessions() {
+            macSessions = index
+        }
+    }
+
+    /// Resume the handed-off session as an ordinary job in its own worktree, so
+    /// it streams over the existing job SSE. The conversation then continues
+    /// that session: follow-up task messages target the handoff's workspace.
+    func continueHandoff(_ card: RelayHandoffCard) async {
+        guard card.isActionable, !continuingHandoffIDs.contains(card.id) else { return }
+        continuingHandoffIDs.insert(card.id)
+        defer { continuingHandoffIDs.remove(card.id) }
+
+        do {
+            let created = try await client.continueHandoff(id: card.id)
+            let job: CodexJob
+            if let createdJob = created.job {
+                job = createdJob
+            } else {
+                job = try await client.fetchJob(id: created.id)
+            }
+            if let workspaceID = job.workspaceId ?? card.workspaceID {
+                adoptWorkspaceID(workspaceID)
+                currentThreadWorkspaceID = workspaceID
+            }
+            currentThreadID = job.threadSessionId ?? job.sessionId ?? job.resumeSessionId
+            currentThreadProvider = job.provider
+            currentThreadWorkspaceName = job.workspaceName ?? currentThreadWorkspaceName
+            messages.append(jobItem(job))
+            attachJobStream(to: job)
+            errorMessage = nil
+            await refreshThreads()
+            await refreshHandoffs()
+        } catch {
+            if isCancellation(error) { return }
+            // The node's own words when it has any (409 "handoff is not ready",
+            // "a job is already running for this handoff"), so a refusal is never
+            // reported as a vague failure.
+            errorMessage = error.localizedDescription
+            CodexDiagnostics.log("handoff_continue_failed", fields: [
+                "handoffId": card.id,
+                "error": String(describing: error)
+            ])
         }
     }
 
@@ -446,10 +549,15 @@ final class RelayChatViewModel: ObservableObject {
         guard !text.isEmpty, !isSending else { return }
         isSending = true
 
-        // Lazy workspace registration happens BEFORE the draft is cleared, so a failure
-        // surfaces as a composer banner while the typed prompt stays put.
-        var scopeWorkspaceID: String?
-        if workspaceID != nil || workspacePath != nil {
+        // Every selectable history item belongs to this folder. A brand-new folder
+        // conversation lazily registers the folder before clearing the draft.
+        var scopeWorkspaceID = Self.conversationWorkspaceID(
+            currentThreadID: currentThreadID,
+            currentThreadWorkspaceID: currentThreadWorkspaceID,
+            defaultWorkspaceID: workspaceID
+        )
+        if currentThreadID == nil, currentThreadWorkspaceID == nil,
+           (workspaceID != nil || workspacePath != nil) {
             guard let registered = await ensureWorkspaceRegistered() else {
                 isSending = false
                 return
@@ -505,6 +613,10 @@ final class RelayChatViewModel: ObservableObject {
                         self.currentThreadID = threadId
                         self.currentThreadProvider = CodexProvider(rawProvider: provider)
                         self.currentThreadWorkspaceID = scopeWorkspaceID
+                        if self.currentThreadWorkspaceName == nil, scopeWorkspaceID != nil {
+                            self.currentThreadWorkspaceName = self.registeredWorkspaceName
+                                ?? self.workspacePath.map { URL(fileURLWithPath: $0).lastPathComponent }
+                        }
                     case .delta(let delta):
                         receivedAssistantText = true
                         self.append(delta: delta, to: assistantID)
@@ -558,10 +670,21 @@ final class RelayChatViewModel: ObservableObject {
         isSending = true
         defer { isSending = false }
 
-        // Lazy registration before touching the draft: a failure banners and keeps the prompt.
-        guard let workspaceID = await ensureWorkspaceRegistered() else {
+        // Folder history continues a task in this same workspace. A new task lazily
+        // registers the current folder before touching the draft.
+        let targetWorkspaceID: String?
+        if currentThreadWorkspaceID != nil {
+            targetWorkspaceID = currentThreadWorkspaceID
+        } else if currentThreadID != nil {
+            targetWorkspaceID = nil
+        } else {
+            targetWorkspaceID = await ensureWorkspaceRegistered()
+        }
+        guard let workspaceID = targetWorkspaceID else {
             if workspacePath == nil {
                 errorMessage = "Open a folder to run tasks — the root chat has no workspace."
+            } else if currentThreadID != nil {
+                errorMessage = "This conversation does not have a task workspace. Start a new conversation from the folder to run a task."
             }
             return
         }
@@ -591,6 +714,7 @@ final class RelayChatViewModel: ObservableObject {
             currentThreadID = job.threadSessionId ?? job.sessionId ?? job.resumeSessionId
             currentThreadProvider = provider
             currentThreadWorkspaceID = job.workspaceId ?? workspaceID
+            currentThreadWorkspaceName = job.workspaceName ?? currentThreadWorkspaceName ?? registeredWorkspaceName
             messages.append(jobItem(job))
             attachJobStream(to: job)
             await refreshThreads()
@@ -648,15 +772,25 @@ final class RelayChatViewModel: ObservableObject {
         currentThreadID = nil
         currentThreadProvider = nil
         currentThreadWorkspaceID = nil
+        currentThreadWorkspaceName = nil
         messages = []
     }
 
     func openThread(_ thread: CodexThread) async {
+        guard belongsToHistoryScope(thread.workspaceId) else {
+            errorMessage = "This thread belongs to a different folder."
+            return
+        }
         do {
-            let detail = try await client.fetchThreadDetail(sessionID: thread.sessionId, provider: thread.provider)
+            let detail = try await client.fetchThreadDetail(
+                sessionID: thread.sessionId,
+                workspaceID: workspaceID,
+                provider: thread.provider
+            )
             currentThreadID = detail.thread.sessionId
             currentThreadProvider = detail.thread.provider
             currentThreadWorkspaceID = detail.thread.workspaceId
+            currentThreadWorkspaceName = detail.thread.workspaceName
             // Continuation keeps the thread's explicit mode in the selection.
             let mode = detail.thread.mode
             let threadModel = detail.thread.model
@@ -689,6 +823,52 @@ final class RelayChatViewModel: ObservableObject {
         }
     }
 
+    /// Open either a resumable thread or a standalone invocation from the unified
+    /// history feed. Standalone jobs still restore their prompt and result/log card.
+    func openHistoryItem(_ item: CodexThreadFeedItem) async {
+        switch item.source {
+        case .thread(let thread):
+            await openThread(thread)
+        case .pendingJob(let job):
+            await openStandaloneJob(job)
+        }
+    }
+
+    private func openStandaloneJob(_ job: CodexJob) async {
+        guard belongsToHistoryScope(job.workspaceId) else {
+            errorMessage = "This invocation belongs to a different folder."
+            return
+        }
+        let latest = (try? await client.fetchJob(id: job.id, includeFullLogs: false)) ?? job
+        currentThreadID = latest.threadSessionId
+        currentThreadProvider = latest.provider
+        currentThreadWorkspaceID = latest.workspaceId
+        currentThreadWorkspaceName = latest.workspaceName
+
+        if let model = models.first(where: {
+            $0.provider == latest.provider
+                && $0.supports(.task)
+                && (latest.model == nil || $0.id == latest.model || $0.taskModel == latest.model)
+        }) ?? models.first(where: { $0.provider == latest.provider && $0.supports(.task) }) {
+            selectChoice(RelayModelChoice(model: model, mode: .task))
+        }
+
+        var items: [RelayConversationItem] = []
+        if let prompt = latest.prompt?.trimmedNonEmpty {
+            items.append(RelayConversationItem(
+                role: .user,
+                text: prompt,
+                timestamp: latest.createdAt ?? Date(),
+                provider: latest.provider,
+                modelLabel: latest.model
+            ))
+        }
+        items.append(jobItem(latest))
+        messages = items
+        attachJobStream(to: latest)
+        errorMessage = nil
+    }
+
     func delete(_ thread: CodexThread) async {
         do {
             try await client.deleteThread(
@@ -697,6 +877,10 @@ final class RelayChatViewModel: ObservableObject {
                 provider: thread.provider
             )
             threads.removeAll { $0.sessionId == thread.sessionId }
+            // The server deletes every job attached to a task thread. Remove the same
+            // jobs locally so the unified history feed does not briefly resurrect them
+            // as standalone invocations before the next refresh.
+            jobs.removeAll { $0.threadSessionId == thread.sessionId }
             if currentThreadID == thread.sessionId {
                 startNewConversation()
             }
@@ -724,7 +908,7 @@ final class RelayChatViewModel: ObservableObject {
         do {
             let full = try await client.fetchJob(id: job.id, includeFullLogs: true)
             replaceJob(full)
-            return full.displayOutput ?? full.stdout ?? full.stderr ?? ""
+            return full.rawActivityOutput ?? full.displayOutput ?? ""
         } catch {
             errorMessage = error.localizedDescription
             return error.localizedDescription
@@ -793,6 +977,27 @@ final class RelayChatViewModel: ObservableObject {
         }
     }
 
+    /// Exact-folder membership. A nil workspace is visible only in the workspace-root
+    /// chat; it is never treated as a wildcard for a real folder.
+    private func belongsToHistoryScope(_ itemWorkspaceID: String?) -> Bool {
+        Self.isInHistoryScope(
+            itemWorkspaceID: itemWorkspaceID,
+            folderWorkspaceID: workspaceID,
+            isWorkspaceRoot: workspacePath == nil
+        )
+    }
+
+    nonisolated static func isInHistoryScope(
+        itemWorkspaceID: String?,
+        folderWorkspaceID: String?,
+        isWorkspaceRoot: Bool
+    ) -> Bool {
+        if let folderWorkspaceID {
+            return itemWorkspaceID == folderWorkspaceID
+        }
+        return isWorkspaceRoot && itemWorkspaceID == nil
+    }
+
     /// Which task runner executes a model's jobs. Cursor keeps its own runner; Azure
     /// descriptors fall back to the Codex runner (they are chat-first).
     nonisolated static func taskProvider(for model: CodexModelDescriptor) -> CodexProvider {
@@ -811,6 +1016,18 @@ final class RelayChatViewModel: ObservableObject {
         // otherwise fall back to the chat id for dual-mode models, or the runner default.
         if let taskModel = model.taskModel, !taskModel.isEmpty { return taskModel }
         return model.supports(.chat) ? model.id : nil
+    }
+
+    /// New conversations inherit the open folder. Existing conversations always retain
+    /// their recorded scope, including nil for global chat threads.
+    nonisolated static func conversationWorkspaceID(
+        currentThreadID: String?,
+        currentThreadWorkspaceID: String?,
+        defaultWorkspaceID: String?
+    ) -> String? {
+        currentThreadID == nil && currentThreadWorkspaceID == nil
+            ? defaultWorkspaceID
+            : currentThreadWorkspaceID
     }
 
     private static func sortedThreads(_ threads: [CodexThread]) -> [CodexThread] {

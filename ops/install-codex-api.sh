@@ -83,8 +83,8 @@ fi
 
 python3 "$ROOT/ops/render-codex-api-config" --config "$CONFIG_FILE" --output-dir "$TMP_RENDER_DIR"
 
-install -m 0644 -o root -g root "$ROOT/codex-server/codex-api-deploy/server.mjs" "$INSTALL_DIR/server.mjs"
-install -m 0644 -o root -g root "$ROOT/codex-server/codex-api-deploy/codex-api.service" "$SERVICE_PATH"
+install -m 0644 -o root -g root "$ROOT/relay-server/codex-api-deploy/server.mjs" "$INSTALL_DIR/server.mjs"
+install -m 0644 -o root -g root "$ROOT/relay-server/codex-api-deploy/codex-api.service" "$SERVICE_PATH"
 install -m 0600 -o root -g root "$TMP_RENDER_DIR/codex-api.env" "$ENV_PATH"
 install -m 0644 -o root -g root "$TMP_RENDER_DIR/codex-api.nginx.conf" "$NGINX_CONF_PATH"
 

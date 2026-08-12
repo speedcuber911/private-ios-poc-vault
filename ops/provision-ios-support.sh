@@ -15,6 +15,7 @@ VAULT_DOMAIN="${VAULT_DOMAIN:-vault.pocs.example.com}"
 POC_VAULT_MANIFEST_URL="${POC_VAULT_MANIFEST_URL:-https://${VAULT_DOMAIN}/manifest.json}"
 POC_VAULT_SIGNATURE_URL="${POC_VAULT_SIGNATURE_URL:-https://${VAULT_DOMAIN}/manifest.sig.json}"
 POC_VAULT_CODEX_BASE_URL="${POC_VAULT_CODEX_BASE_URL:-https://codex.${VAULT_DOMAIN#vault.}}"
+RELAY_AUTH_BASE_URL="${RELAY_AUTH_BASE_URL:-https://api.${VAULT_DOMAIN#vault.}}"
 POC_VAULT_MANIFEST_PUBLIC_KEY="${POC_VAULT_MANIFEST_PUBLIC_KEY:-${MANIFEST_PUBLIC_KEY:-}}"
 
 usage() {
@@ -70,12 +71,13 @@ tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
 config_json="$tmpdir/vault-config.json"
-python3 - "$POC_VAULT_MANIFEST_URL" "$POC_VAULT_SIGNATURE_URL" "$POC_VAULT_CODEX_BASE_URL" "$POC_VAULT_MANIFEST_PUBLIC_KEY" >"$config_json" <<'PY'
+python3 - "$POC_VAULT_MANIFEST_URL" "$POC_VAULT_SIGNATURE_URL" "$POC_VAULT_CODEX_BASE_URL" "$RELAY_AUTH_BASE_URL" "$POC_VAULT_MANIFEST_PUBLIC_KEY" >"$config_json" <<'PY'
 import json
 import sys
 
-manifest_url, signature_url, codex_base_url, manifest_public_key = sys.argv[1:5]
+manifest_url, signature_url, codex_base_url, auth_base_url, manifest_public_key = sys.argv[1:6]
 payload = {
+    "authBaseURL": auth_base_url,
     "codexBaseURL": codex_base_url,
     "manifestURL": manifest_url,
     "signatureURL": signature_url,

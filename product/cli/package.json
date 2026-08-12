@@ -1,0 +1,11 @@
+{
+  "name": "@relay/cli",
+  "version": "0.1.0",
+  "description": "Hand a local coding-agent session off to your Relay machine",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "bin": { "relay": "bin/relay" },
+  "files": ["bin", "src"],
+  "scripts": { "test": "node --test test/*.test.mjs" },
+  "license": "MIT"
+}

@@ -148,6 +148,16 @@ private struct WebView: UIViewRepresentable {
                 } else {
                     completionHandler(.performDefaultHandling, nil)
                 }
+            case NSURLAuthenticationMethodServerTrust:
+                // PDFs and HTML on a trial machine are loaded straight from that
+                // node, whose certificate chains to the node's own CA rather than
+                // a public root — the same pinning the API client applies.
+                RelayServerTrust.handleServerTrustChallenge(
+                    challenge,
+                    identityStore: identityStore,
+                    scope: "webview",
+                    completionHandler: completionHandler
+                )
             default:
                 completionHandler(.performDefaultHandling, nil)
             }

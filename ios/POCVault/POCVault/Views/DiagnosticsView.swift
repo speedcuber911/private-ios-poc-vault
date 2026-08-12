@@ -14,7 +14,7 @@ struct DiagnosticsView: View {
     private var contentHorizontalPadding: CGFloat {
         showsNavigationChrome ? 16 : 16
     }
-    private let cardCornerRadius: CGFloat = 14
+    private let cardCornerRadius: CGFloat = 16
 
     var body: some View {
         NavigationStack {
@@ -38,26 +38,22 @@ struct DiagnosticsView: View {
                             Text(screenTitle)
                                 .font(titleFont)
                                 .foregroundStyle(AppTheme.textPrimary)
-                            Text(AppConfiguration.runtimeMode)
-                                .font(.system(size: 14))
-                                .foregroundStyle(AppTheme.textSecondary)
+                            RelayCapsLabel(text: AppConfiguration.runtimeMode)
                         }
                         .padding(.top, showsNavigationChrome ? 18 : 0)
 
                         certificatePanel
 
                         VStack(alignment: .leading, spacing: 0) {
-                            Text("Checks")
-                                .font(.system(size: 16, weight: .medium))
-                                .foregroundStyle(AppTheme.textPrimary)
+                            RelayCapsLabel(text: "Checks", size: 11)
                                 .padding(.bottom, 8)
                             ForEach(Array(checks.enumerated()), id: \.element.id) { index, check in
                                 DiagnosticRow(check: check)
                                 if index < checks.count - 1 {
                                     Rectangle()
-                                        .fill(AppTheme.strokeSubtle)
+                                        .fill(AppTheme.hairline)
                                         .frame(height: 0.5)
-                                        .padding(.leading, 26)
+                                        .padding(.leading, 46)
                                 }
                             }
                         }
@@ -108,7 +104,7 @@ struct DiagnosticsView: View {
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(AppTheme.textSecondary)
                         .frame(width: 32, height: 32)
-                        .background(AppTheme.bgSurface, in: Circle())
+                        .background(AppTheme.textPrimary.opacity(0.06), in: Circle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Refresh diagnostics")
@@ -253,7 +249,7 @@ struct DiagnosticsView: View {
                 .font(.system(size: 16, weight: .medium))
                 .foregroundStyle(AppTheme.textSecondary)
                 .frame(width: 32, height: 32)
-                .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .background(AppTheme.textPrimary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
@@ -269,30 +265,27 @@ struct DiagnosticsView: View {
     }
 
     private var importCertificateForm: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            SecureField(
-                "",
-                text: $passphrase,
-                prompt: Text("P12 passphrase").foregroundColor(AppTheme.textTertiary)
-            )
-            .textContentType(.password)
-            .font(.system(size: 14))
-            .foregroundStyle(AppTheme.textPrimary)
-            .padding(.horizontal, 12)
-            .frame(height: 42)
-            .background(AppTheme.bgCanvas, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(spacing: 10) {
+                SecureField(
+                    "",
+                    text: $passphrase,
+                    prompt: Text("P12 passphrase").foregroundColor(AppTheme.textTertiary)
+                )
+                .textContentType(.password)
+                .font(AppTheme.uiFont(size: 15))
+                .foregroundStyle(AppTheme.textPrimary)
+                Rectangle()
+                    .fill(AppTheme.hairlineStrong)
+                    .frame(height: 1)
+            }
 
             Button {
                 importDefaultCertificate()
             } label: {
                 Label("Import certificate", systemImage: "square.and.arrow.down")
-                    .font(.system(size: 14, weight: .medium))
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 42)
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(AppTheme.bgCanvas)
-            .background(AppTheme.accent, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .buttonStyle(RelayPrimaryButtonStyle())
 
             if let importError {
                 Text(importError)
@@ -313,8 +306,8 @@ struct DiagnosticsView: View {
 
     private var titleFont: Font {
         showsNavigationChrome
-            ? .system(size: 28, weight: .medium, design: .serif)
-            : .system(size: 20, weight: .medium, design: .serif)
+            ? AppTheme.serifFont(size: 28)
+            : AppTheme.serifFont(size: 20)
     }
 }
 
@@ -330,10 +323,13 @@ private struct DiagnosticRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: check.isPassing ? "checkmark.circle.fill" : "xmark.circle.fill")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(check.isPassing ? AppTheme.statusOK : AppTheme.statusError)
-                .frame(width: 18, height: 18, alignment: .top)
+            RelayCapsLabel(
+                text: check.isPassing ? "OK" : "Fail",
+                color: check.isPassing ? AppTheme.textSecondary : AppTheme.statusError,
+                size: 9
+            )
+            .frame(width: 34, alignment: .leading)
+            .padding(.top, 3)
             VStack(alignment: .leading, spacing: 3) {
                 Text(check.title)
                     .font(.system(size: 14, weight: .medium))
@@ -356,7 +352,10 @@ private struct DiagnosticCardModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .background(AppTheme.bgSurfaceHi, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .stroke(AppTheme.hairline, lineWidth: 1)
+            }
     }
 }
 

@@ -1,0 +1,10 @@
+/* Banner text for every user-visible Relay push.
+
+   The cloud sends one fixed alert loc-key for all mutable event types
+   (cloud/src/apns.js: alert = { "loc-key": "RELAY_EVENT" }), so the same
+   sentence has to serve handoff.ready, handoff.failed and the job events.
+   Without this table iOS shows the raw key. The push itself carries no
+   content on purpose — the detail is loaded from the node after the tap —
+   so this stays deliberately generic. A per-event sentence needs the
+   Notification Service Extension, which is not built. */
+"RELAY_EVENT" = "Relay has an update for you.";

@@ -20,7 +20,7 @@ The repository now contains four connected surfaces:
   verifying live mTLS behavior.
 - `ios/POCVault/`: the SwiftUI Relay app that exposes the agent console,
   diagnostics, signed POC library, and authenticated WebViews.
-- `codex-server/`: the EC2-side async job API that lets the phone start,
+- `relay-server/`: the EC2-side async job API that lets the phone start,
   inspect, continue, and cancel agent runs in registered server workspaces.
 
 The most important architectural decision is still that ordinary POC creation is
@@ -67,7 +67,7 @@ hardware-bound to one iPhone.
 
 ### 3. Codex Job Server
 
-The next major addition was `codex-server/`, a Node-based async job API deployed
+The next major addition was `relay-server/`, a Node-based async job API deployed
 on the EC2 host. It added:
 
 - authenticated `/v1/codex/*` routes behind nginx mTLS
@@ -75,7 +75,7 @@ on the EC2 host. It added:
 - persistent jobs, stdout/stderr/result files, and audit JSONL
 - FIFO execution with timeout and cancel support
 - a workspace registry instead of arbitrary phone-supplied paths
-- systemd/nginx deployment assets under `codex-server/codex-api-deploy/`
+- systemd/nginx deployment assets under `relay-server/codex-api-deploy/`
 
 The service exists inside this repo because the Relay app, EC2 runner, and
 static POC host are one operational unit. The phone can control only registered
@@ -92,8 +92,8 @@ The iOS app then gained an agent console. The first version could:
 - use the same imported client identity as the POC WebView flow
 
 The UI later moved away from infrastructure-heavy cards and toward the current
-phone-first console: prompt entry, compact controls, thread/result browsing, and
-collapsible details.
+files-first, phone-first console: per-folder prompt entry, compact controls, a
+visible Threads entry, conversation/result browsing, and explicit full logs.
 
 ### 5. Static POC Catalog Growth
 
@@ -232,17 +232,22 @@ committed.
 ### 13. Current iOS Console Direction
 
 The current Relay console is a provider-aware control surface. The app can show
-Codex and Claude affordances, select models and effort/reasoning levels, choose
-Claude permission modes, record voice prompts, browse threads, and open bounded
-detail views.
+Codex, Claude, and Cursor affordances, select models and effort/reasoning levels,
+record voice prompts, browse folder-scoped conversations and invocations from a
+visible Threads row, and open bounded detail views.
+
+Full logs remain explicit: the sheet is presented before loading starts and
+stays open until the user dismisses it. The custom keyboard dismiss accessory
+was removed; interactive scrolling, Send/Run, and taps outside the composer
+dismiss the keyboard without intercepting composer taps.
 
 Codex-specific skills remain client-side prompt decoration. Selecting skills
 adds a text prefix to the prompt; it does not create a new backend contract.
 
-The phone UI should stay simple: prompt plus results, with compact controls and
-thread detail when needed. Avoid reintroducing endpoint cards, workspace cards,
-offline labels, or broad infrastructure controls unless the user explicitly
-asks for them.
+The phone UI should stay simple: header, Threads entry, conversation/results,
+and composer. Avoid reintroducing endpoint cards, workspace cards, offline
+labels, or broad infrastructure controls unless the user explicitly asks for
+them.
 
 ### 14. Workspace Browser, Artifacts, And Relay Branding
 
@@ -308,11 +313,11 @@ domains, certificate paths, or hostnames into docs or terminal output.
 Use `ios/launch-simulator.sh` for simulator validation. Simulator mode is a
 local preview path and intentionally bypasses production mTLS.
 
-Use `codex-server/codex-api-deploy/server.test.mjs` for server contract checks.
+Use `relay-server/codex-api-deploy/server.test.mjs` for server contract checks.
 The most useful local gate is:
 
 ```bash
-cd codex-server/codex-api-deploy
+cd relay-server/codex-api-deploy
 node --check server.mjs
 node --test server.test.mjs
 ```
@@ -339,6 +344,6 @@ Do not hand-edit generated manifest fields into `pocs/<slug>/poc.json`.
 - [SECURITY.md](../SECURITY.md): secret handling and access model.
 - [docs/IMPLEMENTATION.md](IMPLEMENTATION.md): current implementation shape.
 - [docs/MULTI_INSTALL.md](MULTI_INSTALL.md): new-owner install flow.
-- [codex-server/README.md](../codex-server/README.md): Codex/Claude API runtime.
-- [codex-server/codex-api-deploy/README.md](../codex-server/codex-api-deploy/README.md): deployable server files.
+- [relay-server/README.md](../relay-server/README.md): Codex/Claude API runtime.
+- [relay-server/codex-api-deploy/README.md](../relay-server/codex-api-deploy/README.md): deployable server files.
 - [AGENTS.md](../AGENTS.md): rules for future AI workers in this repo.

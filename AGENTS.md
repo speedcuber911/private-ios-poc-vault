@@ -9,7 +9,7 @@ There are two main surfaces:
 - Hosted POCs: every POC lives under `pocs/<slug>/`, ships static files under
   `public/`, and is advertised through a signed manifest consumed by the iOS app.
 - Remote agents: the phone talks to the EC2 Codex/Claude job API in
-  `codex-server/` to start, monitor, continue, cancel, and review agent runs.
+  `relay-server/` to start, monitor, continue, cancel, and review agent runs.
 
 The remote job API lives inside this repo because the Relay iOS app, static POC
 hosting, and EC2 runner are tightly coupled.
@@ -24,8 +24,8 @@ hosting, and EC2 runner are tightly coupled.
 - Read `SECURITY.md` before pushing or adding new operational files.
 - Be careful with the current worktree. POC deploys can legitimately modify
   ignored `ops/deploys.log` and create untracked `pocs/<slug>/` folders.
-- For Codex server/API work, switch to
-  `/Users/pariksj/Desktop/poc-vault/codex-server`.
+- For Relay server/API work, switch to
+  `/Users/pariksj/Desktop/poc-vault/relay-server`.
 
 ## Non-Negotiable Provider Auth Guardrail
 
@@ -199,7 +199,7 @@ https://codex.pocs.conformal.live
 The server implementation lives in this repo at:
 
 ```text
-/Users/pariksj/Desktop/poc-vault/codex-server
+/Users/pariksj/Desktop/poc-vault/relay-server
 ```
 
 The agent console may be edited here for iOS behavior such as prompt entry,
@@ -210,12 +210,15 @@ cancel/retry behavior, and mTLS client wiring.
 Do not add arbitrary-path execution from the iOS app. The server exposes only
 registered workspace ids, currently `scratch`, `poc-vault`, and `sigiq`.
 
-The phone Codex screen should stay simple: prompt plus collapsible Results. Do
-not reintroduce endpoint cards, workspace cards, offline/online labels, a thread
-picker, or tick icons unless the user explicitly asks for them.
+The phone agent screen should stay simple: header, a visible `Threads` entry,
+conversation/results, and the composer. Do not reintroduce endpoint cards,
+workspace cards, offline/online labels, or tick icons unless the user explicitly
+asks for them.
 
-The prompt editor must remain usable on iPhone: keep the keyboard accessory
-`Done` action, interactive scroll dismissal, and keyboard dismissal on `Run`.
+The prompt editor must remain usable on iPhone: do not add a custom keyboard
+accessory or floating dismiss control. Keep interactive scroll dismissal,
+keyboard dismissal on `Send`/`Run`, and outside-tap dismissal on non-editor
+content. Taps inside the composer must not resign focus.
 
 ## Physical iPhone Provisioning
 
@@ -238,6 +241,7 @@ with `manifestURL` and `signatureURL` values from local config. The passphrase l
 
 ```json
 {
+  "authBaseURL": "https://api.pocs.conformal.live",
   "codexBaseURL": "https://codex.pocs.conformal.live"
 }
 ```
