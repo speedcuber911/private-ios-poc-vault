@@ -32,11 +32,28 @@ const TRIAL_ENV = { E2B_API_URL: "http://cube.invalid", E2B_API_KEY: "k", TRIAL_
 const PAIRING = { pairingId: "11111111-1111-4111-8111-111111111111", pairingSecret: "c2VjcmV0LXNlY3JldC1zZWNyZXQ" };
 
 test("trial create: 201, sandbox env carries enroll+pairing+tunnel, poll shows creating", async () => {
-  const provisioner = makeFakeProvisioner();
-  const t = await startTestApp({ env: TRIAL_ENV, provisioner });
+  // RELAYD_ENROLL_TOKEN is base64url of randomBytes(32); a regression to
+  // std-base64-stripped is byte-identical whenever the draw needs no -/_
+  // substitution (~26.4% of draws), and nothing downstream alphabet-
+  // validates this specific token the way the cloud's AUTH_TOKEN_RE does for
+  // a pairing authToken, so this is lower stakes than finding 2 — but
+  // closing it is cheap: retry the whole (in-memory, fake-provisioner) flow
+  // with a fresh app/account each attempt until the token needs a
+  // substitution character, and assert the premise.
+  let provisioner, t, session, res, env;
+  for (let attempt = 0; attempt < 40; attempt++) {
+    provisioner = makeFakeProvisioner();
+    t = await startTestApp({ env: TRIAL_ENV, provisioner });
+    session = await signIn(t);
+    res = await api(t.baseUrl, "POST", "/v1/trial-nodes", { body: PAIRING, ...authed(session.sessionToken) });
+    env = provisioner.created[0]?.envVars;
+    if (env && /[-_]/.test(env.RELAYD_ENROLL_TOKEN)) break;
+    await t.close();
+    env = null;
+  }
   try {
-    const session = await signIn(t);
-    let res = await api(t.baseUrl, "POST", "/v1/trial-nodes", { body: PAIRING, ...authed(session.sessionToken) });
+    assert.ok(env,
+      "could not mint a RELAYD_ENROLL_TOKEN needing a base64url substitution character after 40 attempts — the test premise is broken, not the code under test");
     assert.equal(res.status, 201);
     assert.equal(res.json.trial.state, "creating");
     assert.equal(res.json.trial.nodeId, null);
@@ -44,7 +61,6 @@ test("trial create: 201, sandbox env carries enroll+pairing+tunnel, poll shows c
     assert.ok(!("enrollTokenHash" in res.json.trial));
     assert.ok(!("sandboxId" in res.json.trial));
 
-    const env = provisioner.created[0].envVars;
     assert.equal(env.RELAYD_ENROLL_PAIRING_ID, PAIRING.pairingId);
     assert.equal(env.RELAYD_ENROLL_PAIRING_SECRET, PAIRING.pairingSecret);
     assert.equal(env.RELAYD_TUNNEL_HOST, "broker.test");
@@ -69,11 +85,23 @@ test("trial create: 201, sandbox env carries enroll+pairing+tunnel, poll shows c
 // written through envd after the sandbox exists, is what actually configures
 // it, so it carries the same contract the boot script reads.
 test("trial create delivers enroll.json into the running sandbox", async () => {
-  const provisioner = makeFakeProvisioner();
-  const t = await startTestApp({ env: TRIAL_ENV, provisioner });
+  // Same 26.4%-vacuous alphabet issue as the test above, for the token
+  // written directly into the sandbox's enroll.json.
+  let provisioner, t, session, res, cfg;
+  for (let attempt = 0; attempt < 40; attempt++) {
+    provisioner = makeFakeProvisioner();
+    t = await startTestApp({ env: TRIAL_ENV, provisioner });
+    session = await signIn(t);
+    res = await api(t.baseUrl, "POST", "/v1/trial-nodes", { body: PAIRING, ...authed(session.sessionToken) });
+    const write = provisioner.writes[0];
+    const candidate = write ? JSON.parse(write.content) : null;
+    if (candidate && /[-_]/.test(candidate.token)) { cfg = candidate; break; }
+    await t.close();
+    cfg = null;
+  }
   try {
-    const session = await signIn(t);
-    const res = await api(t.baseUrl, "POST", "/v1/trial-nodes", { body: PAIRING, ...authed(session.sessionToken) });
+    assert.ok(cfg,
+      "could not mint an enroll.json token needing a base64url substitution character after 40 attempts — the test premise is broken, not the code under test");
     assert.equal(res.status, 201);
 
     assert.equal(provisioner.writes.length, 1);
@@ -81,7 +109,6 @@ test("trial create delivers enroll.json into the running sandbox", async () => {
     assert.equal(write.sandboxId, "sbx_1");
     assert.equal(write.filePath, "/var/lib/relayd/enroll.json");
 
-    const cfg = JSON.parse(write.content);
     assert.equal(cfg.pairingId, PAIRING.pairingId);
     assert.equal(cfg.pairingSecret, PAIRING.pairingSecret);
     assert.equal(cfg.tunnelHost, "broker.test");
@@ -201,7 +228,14 @@ test("trial create: retry after failed provision reuses the row instead of burni
     const reused = t.app.registry.getTrialByAccount(s.accountId);
     assert.equal(reused.id, failedRow.id);
     assert.equal(reused.state, "creating");
-    assert.notEqual(reused.enrollTokenHash, failedRow.enrollTokenHash);
+    // Deleted: `assert.notEqual(reused.enrollTokenHash, failedRow.enrollTokenHash)`
+    // was vacuous by construction, not by chance — failedRow.enrollTokenHash
+    // was already asserted `null` above, so it degenerated to
+    // `assert.notEqual(reused.enrollTokenHash, null)`, wholly subsumed by
+    // the assert.ok below. There is no PREVIOUS non-null hash in this
+    // scenario to meaningfully compare against (the row failed before one
+    // was ever assigned), so the honest fix is to drop the redundant
+    // comparison rather than dress it up.
     assert.ok(reused.enrollTokenHash, "must have a freshly generated enroll token hash");
   } finally {
     await t.close();

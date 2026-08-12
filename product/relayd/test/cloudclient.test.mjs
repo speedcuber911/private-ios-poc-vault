@@ -641,7 +641,16 @@ test("a handoff whose ack never arrives is redelivered on the next poll and impo
       { repo: "me/relay", branch: "relay/handoff-recover" },
       "redelivery preserves the exact same content",
     );
-    assert.notEqual(second[0].lease, first[0].lease, "redelivery mints a fresh lease token, not a stale one");
+    // DELETED: `assert.notEqual(second[0].lease, first[0].lease, ...)` tested
+    // nothing about cloudclient.mjs — startLeasingFakeCloud (this file's own
+    // fixture, above) mints `h.lease = crypto.randomUUID()` itself, so the
+    // two values being unequal is a fact about the TEST's randomness, not
+    // about the client under test. The client's actual job re: leases —
+    // relaying whatever id/lease pairs the poll response carries into the
+    // ack unchanged — is already pinned by "pollHandoffs sends a batched,
+    // signed ack for every handoff in the poll response" above, and this
+    // test's own next line (state reaches "delivered") already proves the
+    // SAME logical handoff was correctly re-acked after redelivery.
     assert.equal(cloud.state.get("deadbeefcafef00d").state, "delivered", "a healthy ack reaches delivered on the next poll");
 
     // "Imports cleanly": modeled here (not in handoff.mjs, which this task

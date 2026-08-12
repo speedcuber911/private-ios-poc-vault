@@ -780,7 +780,21 @@ test("an unconfirmed lease expires and the row becomes claimable again", async (
     assert.deepEqual(reclaimed.json.handoffs.map((h) => h.id), [HANDOFF_ID],
       "an unconfirmed lease must expire and become claimable again — nothing may be permanently lost");
     assert.equal(t.app.registry.getHandoff(HANDOFF_ID).state, "leased", "re-leased under a fresh lease, not left dangling");
+    // `notEqual` on two independently-minted randomUUID()s is true with
+    // probability 1 - 2^-122 essentially regardless of whether re-leasing
+    // works correctly — it can't distinguish "the row's lease_token column
+    // genuinely changed" from "the client happened to see two large random
+    // numbers." Prove the mechanism instead: the OLD lease, legitimately
+    // valid a moment ago, must now be refused, which only holds if the row's
+    // lease_token column actually changed on redelivery.
     assert.notEqual(reclaimed.json.handoffs[0].lease, first.json.handoffs[0].lease, "expiry must mint a fresh, distinct lease token");
+    t.clock.t += 1;
+    const staleAck = await api(t.baseUrl, "POST", "/v1/node/handoffs/ack", {
+      body: { acks: [{ id: HANDOFF_ID, lease: first.json.handoffs[0].lease }] },
+      ...nodeHeaders(identity, { method: "POST", pathWithQuery: "/v1/node/handoffs/ack", ts: t.clock.t }),
+    });
+    assert.deepEqual(staleAck.json.acked, [], "the superseded lease token must no longer confirm delivery");
+    assert.equal(t.app.registry.getHandoff(HANDOFF_ID).state, "leased", "a stale ack must not flip the re-leased row to delivered");
   } finally { await t.close(); }
 });
 

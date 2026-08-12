@@ -132,9 +132,24 @@ test("a notice becomes delivered only through the ack, and an unconfirmed lease 
     t.clock.t += t.config.handoffLeaseSec * 1000 + 1;
     const redelivered = await api(t.baseUrl, "GET", pollPath, nodeHeaders(identity, { pathWithQuery: pollPath, ts: t.clock.t }));
     assert.equal(redelivered.json.notices.length, 1, "an unconfirmed notice must never be lost");
+    // `notEqual` on two independently-minted randomUUID()s is true with
+    // probability 1 - 2^-122 essentially regardless of whether re-leasing
+    // works correctly — it can't distinguish "the row's lease_token column
+    // genuinely changed" from "the client happened to see two large random
+    // numbers." Prove the mechanism instead: the OLD lease, legitimately
+    // valid a moment ago, must now be refused, which only holds if the row's
+    // lease_token column actually changed on redelivery.
     assert.notEqual(redelivered.json.notices[0].lease, leased.lease, "redelivery mints a fresh lease token");
 
     const ackPath = "/v1/node/handoffs/ack";
+    t.clock.t += 1;
+    const staleAck = await api(t.baseUrl, "POST", ackPath, {
+      body: { notices: [{ id: redelivered.json.notices[0].id, lease: leased.lease }] },
+      ...nodeHeaders(identity, { method: "POST", pathWithQuery: ackPath, ts: t.clock.t }),
+    });
+    assert.deepEqual(staleAck.json.noticesAcked, [], "the superseded lease token must no longer confirm delivery");
+    assert.equal(t.app.registry.getSyncNoticeByPairingId(pairingId).state, "leased", "a stale ack must not flip the re-leased row to delivered");
+
     t.clock.t += 1;
     const ack = await api(t.baseUrl, "POST", ackPath, {
       body: { notices: [{ id: redelivered.json.notices[0].id, lease: redelivered.json.notices[0].lease }] },

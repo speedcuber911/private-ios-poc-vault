@@ -35,30 +35,58 @@ function recordingCloud({ noticeStatus = 201 } = {}) {
 }
 
 test("credentials are collected, sealed to the node, and delivered over the rendezvous", async () => {
-  const node = generateEncKeyPair();
-  const home = homeWithCreds(node);
-  fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
-  fs.writeFileSync(path.join(home, ".claude", ".credentials.json"), '{"token":"claude-token"}');
-  fs.mkdirSync(path.join(home, ".codex"), { recursive: true });
-  fs.writeFileSync(path.join(home, ".codex", "auth.json"), '{"token":"codex-token"}');
+  // authTokenFor(secret) is base64url of a sha256 digest. The regex below
+  // only proves that when the digest's bytes actually need a base64url
+  // substitution character (-/_ in place of what standard base64 would spell
+  // as +//): a regression to `.digest("base64").replace(/=+$/,"")` is
+  // byte-identical to the correct spelling whenever the digest needs neither
+  // — measured at 26.383% of secrets — and the cloud hard-rejects the other
+  // alphabet (AUTH_TOKEN_RE in product/cloud/src/pairing.js), so this is the
+  // only thing standing between a passing suite and every sync-auth call
+  // 400ing in production. generateSecret() draws a fresh secret internally
+  // on every cmdSyncAuth call and is not injectable, so retry the whole
+  // (cheap: no network, no subprocess) flow with a fresh home/node/cloud
+  // each time until the token needs a substitution character, and assert
+  // the premise so a stuck loop fails loudly instead of silently passing.
+  let sessionCall = null;
+  let blobCall, bundle, result, lines;
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const node = generateEncKeyPair();
+    const home = homeWithCreds(node);
+    fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".claude", ".credentials.json"), '{"token":"claude-token"}');
+    fs.mkdirSync(path.join(home, ".codex"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".codex", "auth.json"), '{"token":"codex-token"}');
 
-  const cloud = recordingCloud();
-  const lines = [];
+    const cloud = recordingCloud();
+    lines = [];
 
-  const result = await cmdSyncAuth([], {
-    home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl, log: (line) => lines.push(line),
-    execFileImpl: async () => ({ stdout: "ghp_from_gh_cli\n" }),
-  });
+    result = await cmdSyncAuth([], {
+      home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl, log: (line) => lines.push(line),
+      execFileImpl: async () => ({ stdout: "ghp_from_gh_cli\n" }),
+    });
+
+    blobCall = cloud.calls.find((call) => call.pathname.endsWith("/device-blob"));
+    bundle = JSON.parse(openSealed(node.privateKeyPem, Buffer.from(blobCall.raw)).toString("utf8"));
+    const candidate = cloud.calls.find((call) => call.pathname === "/v1/pairing/sessions");
+    // Stop as soon as either the draw is distinguishing (needs -/_, so a
+    // regression to std-base64 would visibly differ) OR the token is already
+    // visibly wrong (contains +//, failing the shape check outright) — the
+    // latter lets a real regression fail immediately and legibly via the
+    // assert.match below, instead of spinning to the attempt cap first.
+    if (candidate && (/[-_]/.test(candidate.body.authToken) || !/^[A-Za-z0-9_-]{43}$/.test(candidate.body.authToken))) {
+      sessionCall = candidate;
+      break;
+    }
+  }
+  assert.ok(sessionCall,
+    "could not mint an authToken needing a base64url substitution character after 40 attempts — the test premise is broken, not the code under test");
 
   assert.deepEqual(result.installed.sort(), ["claude", "codex", "github"]);
-
-  const blobCall = cloud.calls.find((call) => call.pathname.endsWith("/device-blob"));
-  const bundle = JSON.parse(openSealed(node.privateKeyPem, Buffer.from(blobCall.raw)).toString("utf8"));
   assert.equal(bundle.kind, "sync-auth");
   assert.equal(bundle.github.token, "ghp_from_gh_cli");
   assert.equal(bundle.claude.credentials, '{"token":"claude-token"}');
 
-  const sessionCall = cloud.calls.find((call) => call.pathname === "/v1/pairing/sessions");
   assert.equal(sessionCall.body.kind, "sync-auth");
   assert.match(sessionCall.body.authToken, /^[A-Za-z0-9_-]{43}$/, "the rendezvous sees a derived token, not the secret");
   assert.ok(!lines.join("\n").includes("ghp_from_gh_cli"), "no credential is ever printed");
@@ -96,30 +124,51 @@ test("authTokenFor is deterministic per secret and never returns the secret", ()
 // invoked from, so the assertion holds in any environment (CI, a tarball
 // checkout, a detached worktree with no github origin, etc).
 test("cmdSyncAuth refreshes the session index through an injected repo lookup, independent of the host repo", async () => {
-  const node = generateEncKeyPair();
-  const home = homeWithCreds(node);
-  const repoRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-syncauth-repo-")));
-  const sessionFile = path.join(home, ".claude", "projects", claudeProjectSlug(repoRoot), "s1.jsonl");
-  fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
-  fs.writeFileSync(sessionFile, `${JSON.stringify({ type: "user", message: { content: "fix the auth bug" } })}\n`);
+  // Same 26.4%-vacuous alphabet issue as the test above, for the
+  // session-index publish's own independently-generated secret. Retry the
+  // whole (cheap: no network, no subprocess) flow with a fresh
+  // home/repo/cloud each time until this specific token needs a base64url
+  // substitution character, and assert the premise rather than hoping for it.
+  let sessionIndexCall = null;
+  let cloud, lines, result, repoLookupCalledWith;
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const node = generateEncKeyPair();
+    const home = homeWithCreds(node);
+    const repoRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-syncauth-repo-")));
+    // discoverClaudeSessions (src/sessions.mjs) only offers a transcript whose
+    // id matches RESUMABLE_SESSION_ID_RE and whose own records declare the
+    // matching cwd — a bare "s1.jsonl" with no `cwd` field satisfies neither,
+    // so discoverSessions would find nothing and the retry below would spin
+    // forever without ever seeing "Shared 1 local session".
+    const sessionFile = path.join(
+      home, ".claude", "projects", claudeProjectSlug(repoRoot), "11111111-1111-1111-1111-111111111111.jsonl");
+    fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+    fs.writeFileSync(sessionFile, `${JSON.stringify({ type: "user", cwd: repoRoot, message: { content: "fix the auth bug" } })}\n`);
 
-  const cloud = recordingCloud();
-  const lines = [];
-  let repoLookupCalledWith = null;
+    cloud = recordingCloud();
+    lines = [];
+    repoLookupCalledWith = null;
 
-  const result = await cmdSyncAuth([], {
-    home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl, log: (line) => lines.push(line),
-    execFileImpl: async () => { throw new Error("no gh"); },
-    requireGitHubRepoImpl: async (opts) => {
-      repoLookupCalledWith = opts;
-      return { root: repoRoot, fullName: "acme/relay" };
-    },
-  });
+    result = await cmdSyncAuth([], {
+      home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl, log: (line) => lines.push(line),
+      execFileImpl: async () => { throw new Error("no gh"); },
+      requireGitHubRepoImpl: async (opts) => {
+        repoLookupCalledWith = opts;
+        return { root: repoRoot, fullName: "acme/relay" };
+      },
+    });
+
+    const candidate = cloud.calls.find((call) => call.pathname === "/v1/pairing/sessions" && call.body?.kind === "session-index");
+    // Same early-stop-on-visible-regression reasoning as the test above.
+    if (candidate && (/[-_]/.test(candidate.body.authToken) || !/^[A-Za-z0-9_-]{43}$/.test(candidate.body.authToken))) {
+      sessionIndexCall = candidate;
+      break;
+    }
+  }
+  assert.ok(sessionIndexCall,
+    "could not mint a session-index authToken needing a base64url substitution character after 40 attempts — the test premise is broken, not the code under test");
 
   assert.ok(repoLookupCalledWith, "cmdSyncAuth must consult the injected repo lookup, not skip straight to the catch");
-
-  const sessionIndexCall = cloud.calls.find((call) => call.pathname === "/v1/pairing/sessions" && call.body?.kind === "session-index");
-  assert.ok(sessionIndexCall, "cmdSyncAuth must publish a session-index rendezvous session, not only sync-auth");
   assert.match(sessionIndexCall.body.authToken, /^[A-Za-z0-9_-]{43}$/, "the rendezvous sees a derived token, not the secret, for the session-index publish too");
 
   const deviceBlobCalls = cloud.calls.filter((call) => call.pathname.endsWith("/device-blob"));

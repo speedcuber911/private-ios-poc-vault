@@ -14,8 +14,30 @@ const approve = (t, sessionToken, userCode) =>
 test("full device-code flow: start, poll pending, approve, poll returns a session", async () => {
   const t = await startTestApp();
   try {
-    const started = await start(t);
-    assert.equal(started.status, 201);
+    // `.toLowerCase()` below is meant to prove approval is case-insensitive,
+    // but USER_CODE_ALPHABET mixes 20 letters and 8 digits — if the minted
+    // code happens to be all digits (~0.0037% of draws), toLowerCase() is
+    // the identity function and the approve() call is byte-identical to the
+    // already-covered exact-case path, never touching normalizeUserCode's
+    // case fold at all. Retry with a fresh start() until the code contains a
+    // letter, and assert the premise so a stuck loop fails loudly.
+    //
+    // The same loop also waits for deviceCode (base64url of randomBytes(32))
+    // to need a -/_ substitution character: the shape assertion below can't
+    // tell a base64url spelling from a std-base64-stripped regression on the
+    // ~26.4% of draws where the two are byte-identical. Nothing downstream
+    // alphabet-validates deviceCode the way the cloud's AUTH_TOKEN_RE does
+    // for a pairing authToken, so this is lower stakes than finding 2 — but
+    // it is free to fold into the retry already needed for userCode above.
+    let started = null;
+    for (let attempt = 0; attempt < 64; attempt++) {
+      const candidate = await start(t);
+      assert.equal(candidate.status, 201);
+      if (/[A-Z]/.test(candidate.json.userCode) && /[-_]/.test(candidate.json.deviceCode)) { started = candidate; break; }
+    }
+    assert.ok(started,
+      "could not mint a userCode with a letter and a deviceCode needing a base64url substitution character " +
+      "after 64 attempts — the test premise is broken, not the code under test");
     assert.match(started.json.deviceCode, /^[A-Za-z0-9_-]{43}$/);
     assert.match(started.json.userCode, /^[BCDFGHJKLMNPQRSTVWXZ2-9]{4}-[BCDFGHJKLMNPQRSTVWXZ2-9]{4}$/);
     assert.equal(started.json.interval, 5);
@@ -26,6 +48,8 @@ test("full device-code flow: start, poll pending, approve, poll returns a sessio
     assert.equal(pending.json.error, "authorization_pending");
 
     const session = await signIn(t);
+    assert.notEqual(started.json.userCode, started.json.userCode.toLowerCase(),
+      "sanity: this fixture must actually contain a letter to exercise the case fold");
     assert.equal((await approve(t, session.sessionToken, started.json.userCode.toLowerCase())).status, 200);
 
     const granted = await poll(t, started.json.deviceCode);
