@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const { cmdSyncAuth, collectCredentialBundle, authTokenFor } = await import("../src/commands/syncauth.mjs");
+const { cmdSyncAuth, collectCredentialBundle, authTokenFor, macKeyFor, blobTagFor } = await import("../src/commands/syncauth.mjs");
 const { writeCredentials } = await import("../src/creds.mjs");
 const { generateEncKeyPair, openSealed } = await import("../src/seal.mjs");
 const { claudeProjectSlug } = await import("../src/sessions.mjs");
@@ -16,7 +16,7 @@ function homeWithCreds(node) {
   return home;
 }
 
-function recordingCloud() {
+function recordingCloud({ noticeStatus = 201 } = {}) {
   const calls = [];
   return {
     calls,
@@ -25,6 +25,9 @@ function recordingCloud() {
       calls.push({ pathname, headers: options.headers || {}, raw: options.body, body: typeof options.body === "string" ? JSON.parse(options.body) : null });
       if (pathname === "/v1/pairing/sessions") {
         return { status: 201, json: async () => ({ pairingId: "11111111-1111-4111-8111-111111111111", expiresAt: 1 }) };
+      }
+      if (pathname === "/v1/sync-auth/notices") {
+        return { status: noticeStatus, json: async () => ({ notice: { id: "notice-1", state: "pending" } }) };
       }
       return { status: 204, json: async () => null };
     },
@@ -151,4 +154,131 @@ test("collectCredentialBundle never fabricates a token from a malformed execFile
 
   assert.equal(bundle.github, undefined, "a missing stdout must never be coerced into the literal string 'undefined'");
   assert.ok(skipped.includes("github"));
+});
+
+// ---------------------------------------------------------------------------
+// Announcing the slot. Sealing a bundle into a rendezvous is only half a
+// sync: nothing on the node can discover a pending pairing session, so
+// without this notice the credentials sit in a slot nobody ever reads and
+// expire 15 minutes later — a sync that reported success and did nothing.
+
+function noticeCalls(cloud) {
+  return cloud.calls.filter((call) => call.pathname === "/v1/sync-auth/notices");
+}
+
+test("the machine is told where to collect: a notice names the pairing id, the node and the secret", async () => {
+  const node = generateEncKeyPair();
+  const home = homeWithCreds(node);
+  const cloud = recordingCloud();
+  const lines = [];
+
+  await cmdSyncAuth([], {
+    home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl, log: (line) => lines.push(line),
+    execFileImpl: async () => ({ stdout: "ghp_notice_token\n" }),
+    requireGitHubRepoImpl: async () => { throw new Error("not a repo"); },
+  });
+
+  const notices = noticeCalls(cloud);
+  assert.equal(notices.length, 1, "the credential bundle must be announced exactly once");
+  assert.equal(notices[0].body.nodeId, "node-1", "the notice names the pinned machine");
+
+  const sessionCall = cloud.calls.find((call) => call.pathname === "/v1/pairing/sessions");
+  const blobCall = cloud.calls.find((call) => call.pathname.endsWith("/device-blob"));
+  assert.equal(notices[0].body.pairingId, "11111111-1111-4111-8111-111111111111");
+
+  // The secret in the notice must be the one that actually opens the slot and
+  // authenticates the blob — not a fresh one, and not the derived token.
+  assert.equal(authTokenFor(notices[0].body.secret), sessionCall.body.authToken,
+    "the announced secret must derive the auth token the rendezvous was created with");
+  assert.equal(blobTagFor(macKeyFor(notices[0].body.secret), "device-blob", Buffer.from(blobCall.raw)),
+    blobCall.headers["x-pairing-tag"],
+    "the announced secret must derive the MAC key the blob was tagged with");
+  assert.notEqual(notices[0].body.secret, sessionCall.body.authToken,
+    "the notice carries the secret, not the token derived from it");
+
+  // The notice rides the session bearer, like every other CLI call.
+  assert.match(String(notices[0].headers.authorization || ""), /^Bearer /);
+
+  // And none of it is ever printed.
+  const printed = lines.join("\n");
+  assert.ok(!printed.includes(notices[0].body.secret), "the rendezvous secret is never printed");
+  assert.ok(!printed.includes("ghp_notice_token"), "no credential is ever printed");
+});
+
+test("the session index is announced too, or the phone would never see it", async () => {
+  const node = generateEncKeyPair();
+  const home = homeWithCreds(node);
+  const repoRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-syncauth-notice-repo-")));
+  const sessionFile = path.join(home, ".claude", "projects", claudeProjectSlug(repoRoot), "s1.jsonl");
+  fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+  fs.writeFileSync(sessionFile, `${JSON.stringify({ type: "user", message: { content: "fix the auth bug" } })}\n`);
+
+  const cloud = recordingCloud();
+  await cmdSyncAuth([], {
+    home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl, log: () => {},
+    execFileImpl: async () => { throw new Error("no gh"); },
+    requireGitHubRepoImpl: async () => ({ root: repoRoot, fullName: "acme/relay" }),
+  });
+
+  const notices = noticeCalls(cloud);
+  assert.equal(notices.length, 2, "one notice for the credential bundle, one for the session index");
+  assert.deepEqual(notices.map((call) => call.body.nodeId), ["node-1", "node-1"],
+    "both notices must name the machine — the cloud refuses one that does not, and the index would never arrive");
+  assert.notEqual(notices[0].body.secret, notices[1].body.secret,
+    "each rendezvous originates its own secret");
+});
+
+// The whole point of this feature is that a sync which quietly did nothing is
+// worse than one that failed: the user walks away believing their sandbox is
+// authenticated. A notice the cloud refuses must therefore end the command
+// loudly, not be swallowed like the best-effort session-index refresh.
+test("a notice the cloud refuses fails the command instead of reporting a sync that never lands", async () => {
+  const node = generateEncKeyPair();
+  const home = homeWithCreds(node);
+  const cloud = recordingCloud({ noticeStatus: 503 });
+  const lines = [];
+
+  await assert.rejects(
+    () => cmdSyncAuth([], {
+      home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl, log: (line) => lines.push(line),
+      execFileImpl: async () => ({ stdout: "ghp_never_announced\n" }),
+      requireGitHubRepoImpl: async () => { throw new Error("not a repo"); },
+    }),
+    (error) => {
+      assert.match(error.message, /sync_notice_failed_503/);
+      assert.match(error.message, /relay sync-auth/, "the error must tell the user what to do next");
+      assert.ok(!error.message.includes("ghp_never_announced"), "an error must never carry a credential");
+      return true;
+    },
+  );
+
+  assert.ok(!lines.join("\n").includes("Sent github login"),
+    "nothing may claim a credential reached the machine when the machine was never told");
+});
+
+test("a session without a pinned machine refuses before any credential is collected", async () => {
+  // Both halves of the pin are required now: the key to seal TO, and the node
+  // id to announce the slot to. A credentials file holding only one of them
+  // (an interrupted `relay login`, or one that ran before the machine
+  // existed) must refuse rather than seal a bundle nothing will ever collect.
+  const cases = [
+    ["neither", {}],
+    ["a key but no machine id", { nodeEncPubkey: generateEncKeyPair().publicKeyB64 }],
+    ["a machine id but no key", { nodeId: "node-1" }],
+  ];
+  for (const [label, pinned] of cases) {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-syncauth-nomachine-"));
+    writeCredentials({ sessionToken: "sess", accountId: "acct", ...pinned }, { home });
+    const cloud = recordingCloud();
+
+    await assert.rejects(
+      () => cmdSyncAuth([], {
+        home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl, log: () => {},
+        execFileImpl: async () => ({ stdout: "ghp_should_never_be_collected\n" }),
+      }),
+      /no_machine_pinned/,
+      `${label}: must refuse`,
+    );
+    assert.equal(cloud.calls.length, 0, "nothing may be sent anywhere without a machine to send it to");
+  }
 });
