@@ -37,10 +37,20 @@ function normalizeCwd(value) {
 // ever loading the whole thing. Used so that discovery (deriving a title) and
 // excerpting (reading the newest turns) stay cheap regardless of how large a
 // live session transcript has grown.
+// O_NONBLOCK is defence in depth, not the primary guard: every call site
+// below stats the entry and skips anything that is not a regular file
+// (stat.isFile()) before ever reaching here. But an open-for-read on a FIFO
+// blocks the OS thread until a writer shows up, with no way to time it out
+// from JS once fs.openSync has been called — so if a FIFO ever slips through
+// (a TOCTOU race, or a future call site that forgets the stat check), a
+// non-blocking open turns that hang into an immediate ENXIO/EAGAIN instead,
+// which the catch below already treats as "no content".
+const NONBLOCK_READ_FLAGS = fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0);
+
 function readBoundedChunk(filePath, { maxBytes = BOUNDED_READ_BYTES, fromEnd = false } = {}) {
   let fd;
   try {
-    fd = fs.openSync(filePath, "r");
+    fd = fs.openSync(filePath, NONBLOCK_READ_FLAGS);
   } catch {
     return "";
   }
@@ -123,6 +133,11 @@ function discoverClaudeSessions({ cwd, home }) {
     const filePath = path.join(dir, name);
     const stat = safeStat(filePath);
     if (!stat) continue; // e.g. a dangling symlink; one damaged entry must not abort discovery.
+    // A directory, FIFO, socket, or device can share a ".jsonl" name. Skip
+    // anything that is not a regular file *before* ever opening it — opening
+    // a FIFO with no writer blocks the OS thread indefinitely, which no
+    // in-process timeout can recover from.
+    if (!stat.isFile()) continue;
     const records = readJsonLines(filePath, { limit: 40 });
     sessions.push({
       id: name.slice(0, -".jsonl".length),
@@ -157,11 +172,14 @@ function discoverCodexSessions({ cwd, home }) {
       if (entry.isDirectory()) { stack.push(entryPath); continue; }
       if (!entry.name.startsWith("rollout-") || !entry.name.endsWith(".jsonl")) continue;
       visited += 1;
+      const stat = safeStat(entryPath);
+      // Stat (cheap, non-blocking) before ever opening the file: a FIFO or
+      // other non-regular entry sharing this name must be skipped here, not
+      // discovered by trying to open it and blocking forever with no writer.
+      if (!stat || !stat.isFile()) continue;
       const records = readJsonLines(entryPath, { limit: 40 });
       const recordedCwd = records.find((record) => typeof record?.cwd === "string")?.cwd;
       if (normalizeCwd(recordedCwd) !== wantedCwd) continue;
-      const stat = safeStat(entryPath);
-      if (!stat) continue; // File vanished between the content read and the stat.
       found.push({
         id: entry.name.slice("rollout-".length, -".jsonl".length),
         harness: "codex",

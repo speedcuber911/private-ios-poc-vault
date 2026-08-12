@@ -109,6 +109,33 @@ test("a hostile negative poll interval from the server is clamped, never passed 
   assert.ok(sleeps.every((ms) => ms >= 1000), `every sleep must be clamped to >= 1000ms, got ${JSON.stringify(sleeps)}`);
 });
 
+test("a huge or Infinity poll interval from the server is capped, never overflowing Node's setTimeout limit", async () => {
+  // Math.max(1, ...) floors a hostile interval but does nothing to cap it.
+  // Node's setTimeout silently clamps any delay above 2147483647ms (~24.8
+  // days) to 1ms, which reproduces the exact unthrottled hot loop this
+  // clamp was meant to prevent in the first place — just triggered by a
+  // huge/Infinity value instead of a negative one. A sane upper bound must
+  // be enforced before the value ever reaches sleep().
+  for (const hostileInterval of [1e20, Infinity]) {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-login-hugeint-"));
+    const cloud = fakeCloud({
+      "/v1/auth/device/start": { status: 201, json: { deviceCode: "dc", userCode: "ABCD-EFGH", verificationUri: "u", interval: hostileInterval, expiresIn: 900 } },
+      "/v1/auth/device/token": { status: 200, json: { sessionToken: "sess", refreshToken: "ref", accountId: "acct" } },
+      "/v1/trial-nodes/current": { status: 404, json: { error: "no_trial" } },
+    });
+    const sleeps = [];
+
+    await cmdLogin([], { home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl,
+      openBrowser: () => {}, log: () => {}, sleep: async (ms) => { sleeps.push(ms); } });
+
+    assert.ok(sleeps.length > 0, "the loop must have slept at least once");
+    assert.ok(
+      sleeps.every((ms) => ms <= 300_000),
+      `every sleep must be capped to a sane maximum, got ${JSON.stringify(sleeps)} for interval=${hostileInterval}`,
+    );
+  }
+});
+
 test("polling stops with login_expired once the server's expiresIn budget elapses, even if the server keeps saying pending", async () => {
   // A partition or server bug that keeps returning authorization_pending forever
   // must not hang `relay login` forever — the client tracks its own deadline

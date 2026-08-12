@@ -55,10 +55,15 @@ async function cmdLogin(args = [], deps = {}) {
   const deadline = Number.isFinite(expiresInSeconds) && expiresInSeconds > 0
     ? now() + expiresInSeconds * 1000
     : Infinity;
-  // The server-supplied interval is untrusted: Node clamps a negative
-  // setTimeout delay to 0, so a hostile or buggy `interval` could otherwise
-  // drive this into a hot loop against the auth server. Floor it at 1s.
-  const intervalMs = Math.max(1, Number(interval) || 5) * 1000;
+  // The server-supplied interval is untrusted in both directions: Node
+  // clamps a negative setTimeout delay to 0, so a hostile or buggy negative
+  // `interval` could otherwise drive this into a hot loop against the auth
+  // server — floor it at 1s. Symmetrically, Node's setTimeout silently
+  // clamps any delay above 2147483647ms (~24.8 days) to 1ms, so a huge or
+  // Infinity `interval` would reproduce that exact same hot loop via the
+  // opposite extreme — cap it at a sane maximum well under that ceiling.
+  const MAX_POLL_INTERVAL_SECONDS = 300;
+  const intervalMs = Math.min(MAX_POLL_INTERVAL_SECONDS, Math.max(1, Number(interval) || 5)) * 1000;
 
   let session = null;
   for (;;) {

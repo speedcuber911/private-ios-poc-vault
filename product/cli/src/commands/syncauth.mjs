@@ -65,8 +65,15 @@ async function collectCredentialBundle({ home = os.homedir(), execFileImpl = exe
 
   let githubToken = null;
   try {
-    const { stdout } = await execFileImpl("gh", ["auth", "token"]);
-    githubToken = String(stdout).trim() || null;
+    const result = await execFileImpl("gh", ["auth", "token"]);
+    // A well-formed execFileImpl always resolves { stdout, stderr }, but
+    // guard the shape anyway: a malformed result with no `stdout` key must
+    // never be coerced (via String(undefined)) into the literal token
+    // string "undefined" — a credential-shaped string that is not a
+    // credential is exactly the kind of thing that ends up written to disk
+    // and silently failing later.
+    const stdout = typeof result?.stdout === "string" ? result.stdout : "";
+    githubToken = stdout.trim() || null;
   } catch {
     githubToken = null;
   }
@@ -117,6 +124,13 @@ async function cmdSyncAuth(args = [], deps = {}) {
   const {
     home = undefined, baseUrl = DEFAULT_BASE_URL, fetchImpl = fetch, log = console.log,
     execFileImpl = execFileAsync, machine = os.hostname(),
+    cwd = process.cwd(),
+    // Overridable so a test can pin that the refresh genuinely runs without
+    // depending on the properties of whatever repository the suite happens
+    // to be invoked inside (a github.com origin, a working .git, etc).
+    // Deliberately lazy (dynamic import) in the default so a plain `import`
+    // at module load time can't create a require-cycle with repo.mjs.
+    requireGitHubRepoImpl = async (opts) => (await import("../repo.mjs")).requireGitHubRepo(opts),
   } = deps;
 
   const credentials = readCredentials({ home });
@@ -132,8 +146,7 @@ async function cmdSyncAuth(args = [], deps = {}) {
   // Best-effort, and skipped outside a repo: a stale index must never fail a
   // credential sync that otherwise succeeded.
   try {
-    const { requireGitHubRepo } = await import("../repo.mjs");
-    const repo = await requireGitHubRepo({ cwd: deps.cwd || process.cwd() });
+    const repo = await requireGitHubRepoImpl({ cwd });
     const count = await publishSessionIndex({
       repoFullName: repo.fullName, root: fs.realpathSync(repo.root), home: home || os.homedir(),
       api, nodeEncPubkey: credentials.nodeEncPubkey, machine,
