@@ -57,8 +57,19 @@ final class RelayNodeStore: ObservableObject {
     func updateTrial(_ trial: RelayTrialNode) {
         self.trial = trial
         persist(trial)
-        if activeNodeURL == nil {
+
+        // Follow the server's answer about WHICH machine, and whether there is
+        // a usable one at all. Previously this adopted a node URL only when
+        // none was set, so a machine that had been replaced or torn down was
+        // dialled forever: the phone kept hammering a destroyed node while the
+        // banner read "Trial expired", and every request failed at TLS with
+        // nothing connecting the two. A dead pointer is worse than none —
+        // `hasMachine` can then route to the trial flow instead.
+        switch trial.state {
+        case .ready, .creating:
             activeNodeURL = trial.nodeURL
+        case .expired, .destroyed, .failed:
+            activeNodeURL = nil
         }
     }
 
