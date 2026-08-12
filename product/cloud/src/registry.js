@@ -731,19 +731,48 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     return mapDeviceCode(db.prepare("SELECT * FROM device_codes WHERE user_code = ?").get(userCode));
   }
 
+  // Approval is a ONE-TIME transition, enforced atomically here rather than by
+  // a read-then-write in the route. Without `AND account_id IS NULL` a second
+  // account could silently rebind an already-approved code, and the victim's
+  // CLI — which sees nothing but a successful login — would receive a session
+  // for the ATTACKER's account: every later `relay handoff` targets the
+  // attacker's node, and `relay sync-auth` seals the victim's GitHub token and
+  // harness credentials to the attacker's node key. Returns null when the
+  // transition did not happen, so the caller must decide what to do about it
+  // instead of reading back a row that someone else's write may have won.
   function approveDeviceCode(id, accountId) {
-    db.prepare("UPDATE device_codes SET account_id = ?, approved_at = ? WHERE id = ?").run(accountId, now(), id);
+    const result = db.prepare(
+      `UPDATE device_codes SET account_id = ?, approved_at = ?
+         WHERE id = ? AND account_id IS NULL AND consumed_at IS NULL`,
+    ).run(accountId, now(), id);
+    if (result.changes === 0) return null;
     return mapDeviceCode(db.prepare("SELECT * FROM device_codes WHERE id = ?").get(id));
   }
 
+  // The atomic `AND consumed_at IS NULL` is what makes redemption single-use
+  // under concurrency: two simultaneous polls on one approved code race here,
+  // and exactly one of them sees changes > 0.
   function consumeDeviceCode(id) {
     const result = db.prepare("UPDATE device_codes SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL")
       .run(now(), id);
     return result.changes > 0;
   }
 
+  // Redeemed rows go too, not just expired ones: a consumed row holds no live
+  // secret (the device code is stored only as sha256) and is not redeemable,
+  // but it pins a dead user_code in the unique index and keeps a dead
+  // account_id link for the remainder of its TTL.
   function sweepDeviceCodes(nowMs) {
-    db.prepare("DELETE FROM device_codes WHERE expires_at <= ?").run(nowMs);
+    db.prepare("DELETE FROM device_codes WHERE expires_at <= ? OR consumed_at IS NOT NULL").run(nowMs);
+  }
+
+  // Live = still redeemable: unconsumed and unexpired. The ceiling on
+  // POST /v1/auth/device/start is read off this, so consumed and aged-out rows
+  // must not count against it.
+  function countLiveDeviceCodes(nowMs) {
+    return Number(db.prepare(
+      "SELECT COUNT(*) AS n FROM device_codes WHERE consumed_at IS NULL AND expires_at > ?",
+    ).get(nowMs).n);
   }
 
   // ── pairing sessions (protocol v2) ──────────────────────────────────────
@@ -1006,6 +1035,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     approveDeviceCode,
     consumeDeviceCode,
     sweepDeviceCodes,
+    countLiveDeviceCodes,
     insertPairingSession,
     getPairingSession,
     setPairingBlob,
@@ -1088,10 +1118,10 @@ function mapDeviceCode(row) {
     id: row.id,
     userCode: row.user_code,
     accountId: row.account_id ?? null,
-    approvedAt: row.approved_at ?? null,
-    consumedAt: row.consumed_at ?? null,
-    expiresAt: row.expires_at,
-    createdAt: row.created_at,
+    approvedAt: row.approved_at == null ? null : Number(row.approved_at),
+    consumedAt: row.consumed_at == null ? null : Number(row.consumed_at),
+    expiresAt: Number(row.expires_at),
+    createdAt: Number(row.created_at),
   };
 }
 

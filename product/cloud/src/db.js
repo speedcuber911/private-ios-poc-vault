@@ -158,6 +158,15 @@ CREATE TABLE IF NOT EXISTS device_codes (
 );
 CREATE INDEX IF NOT EXISTS idx_device_codes_expires ON device_codes (expires_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_device_codes_user_code ON device_codes (user_code);
+-- device_code_hash is read on EVERY /v1/auth/device/token poll. Unindexed it
+-- is a full table scan, and node:sqlite's DatabaseSync is synchronous, so the
+-- scan blocks the whole event loop: ~11.6 ms per poll at 500k rows. The row
+-- count is attacker-influenced (POST /v1/auth/device/start is unauthenticated),
+-- which made an unauthenticated write amplify into an unauthenticated blocking
+-- read. Not UNIQUE: the value is sha256 of 256 bits of entropy, so uniqueness
+-- is guaranteed by construction, and a UNIQUE index would turn any legacy
+-- duplicate into a failure to open the database at boot.
+CREATE INDEX IF NOT EXISTS idx_device_codes_hash ON device_codes (device_code_hash);
 
 CREATE TABLE IF NOT EXISTS repos (
   id TEXT PRIMARY KEY,
