@@ -152,6 +152,21 @@ CREATE TABLE IF NOT EXISTS repos (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_repos_account_name ON repos (account_id, full_name);
 
+CREATE TABLE IF NOT EXISTS handoffs (
+  id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  node_id TEXT NOT NULL,
+  repo TEXT NOT NULL,
+  branch TEXT NOT NULL,
+  state TEXT NOT NULL,
+  reason TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  delivered_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_handoffs_node_state ON handoffs (node_id, state);
+CREATE INDEX IF NOT EXISTS idx_handoffs_account_repo ON handoffs (account_id, repo, created_at);
+
 CREATE INDEX IF NOT EXISTS idx_devices_account ON devices (account_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_account ON nodes (account_id);
 CREATE INDEX IF NOT EXISTS idx_node_events_created ON node_events (created_at);

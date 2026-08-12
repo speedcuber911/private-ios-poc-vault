@@ -24,6 +24,7 @@ import { createPairing } from "./pairing.js";
 import { createNotify, parseNodePubkey } from "./notify.js";
 import { createApnsClient, createNoopTransport } from "./apns.js";
 import { createProvisioner } from "./provisioner.js";
+import { verifyNodeRequest } from "./nodeauth.js";
 
 const NODE_KINDS = new Set(["byo", "managed"]);
 
@@ -107,6 +108,33 @@ export function createApp({
   // otherwise be re-entered by the next tick and double-issue pause/kill/
   // deleteNode against the same rows.
   let trialSweepInFlight = false;
+
+  // Waiters for GET /v1/node/handoffs, keyed by node id. Lives inside
+  // createApp (not module-global) so each app instance — and therefore each
+  // test — owns its own waiters instead of leaking state across instances.
+  const handoffWaiters = new Map();
+
+  function wakeHandoffWaiters(nodeId) {
+    const waiters = handoffWaiters.get(nodeId);
+    if (!waiters) return;
+    handoffWaiters.delete(nodeId);
+    for (const resolve of waiters) resolve();
+  }
+
+  function waitForHandoff(nodeId, timeoutMs) {
+    return new Promise((resolve) => {
+      const waiters = handoffWaiters.get(nodeId) || new Set();
+      const settle = () => {
+        clearTimeout(timer);
+        waiters.delete(settle);
+        resolve();
+      };
+      const timer = setTimeout(settle, timeoutMs);
+      timer.unref?.();
+      waiters.add(settle);
+      handoffWaiters.set(nodeId, waiters);
+    });
+  }
 
   async function sweepTrials() {
     if (trialSweepInFlight) return;
@@ -396,6 +424,36 @@ export function createApp({
       });
     }
 
+    // ── node handoff long-poll (signature-authed) ───────────────────────
+    //
+    // A node holds this open waiting for the next `relay handoff` ping meant
+    // for it. Signature-authed rather than session-authed: the node has no
+    // session, only its ed25519 identity — the same shape as the other
+    // node-signed GETs in nodeauth.js.
+    if (method === "GET" && path === "/v1/node/handoffs") {
+      const pathWithQuery = `${path}${url.search}`;
+      const verified = verifyNodeRequest(req, pathWithQuery, { registry, now });
+      if (verified.error) return sendJson(res, 401, { error: "unauthorized" });
+
+      const nodeId = verified.node.id;
+      const requested = Number.parseInt(url.searchParams.get("wait") || "0", 10);
+      const waitSec = Number.isSafeInteger(requested)
+        ? Math.max(0, Math.min(requested, config.handoffPollMaxWaitSec))
+        : 0;
+      if (waitSec > 0 && registry.countPendingHandoffs(nodeId) === 0) {
+        await waitForHandoff(nodeId, waitSec * 1000);
+      }
+
+      const pending = registry.listPendingHandoffs(nodeId);
+      for (const handoff of pending) {
+        registry.updateHandoff(handoff.id, { state: "delivered", deliveredAt: now() });
+      }
+      registry.touchNode(nodeId);
+      return sendJson(res, 200, {
+        handoffs: pending.map(({ id, repo, branch }) => ({ id, repo, branch })),
+      });
+    }
+
     // ── session-authed registry endpoints ───────────────────────────────
     const account = await auth.authenticate(req);
     if (!account) return sendJson(res, 401, { error: "unauthorized" });
@@ -520,6 +578,43 @@ export function createApp({
 
     if (method === "GET" && path === "/v1/repos") {
       return sendJson(res, 200, { repos: registry.listRepos(account.id) });
+    }
+
+    // ── handoffs (session-authed: create + list) ────────────────────────
+    //
+    // The ping is deliberately content-free — only names (handoffId, repo,
+    // branch, nodeId) are accepted and stored. No transcript, no manifest,
+    // nothing that would make the cloud a party to the conversation.
+    if (method === "POST" && path === "/v1/handoffs") {
+      const body = await readJson(req, config.jsonBodyMaxBytes);
+      const handoffId = strOrNull(body?.handoffId);
+      const repo = normalizeRepoFullName(body?.repo);
+      const branch = strOrNull(body?.branch);
+      const nodeId = strOrNull(body?.nodeId);
+      if (!handoffId || !/^[a-f0-9]{16,64}$/.test(handoffId) || !repo || !branch ||
+          !branch.startsWith("relay/handoff-") || branch.length > 200 || !nodeId) {
+        return sendJson(res, 400, { error: "invalid_handoff" });
+      }
+      if (!registry.getRepo(account.id, repo)) return sendJson(res, 404, { error: "unknown_repo" });
+      const node = registry.getNode(nodeId);
+      if (!node || node.accountId !== account.id) return sendJson(res, 404, { error: "unknown_node" });
+
+      const existing = registry.getHandoff(handoffId);
+      if (existing) {
+        if (existing.accountId !== account.id) return sendJson(res, 400, { error: "invalid_handoff" });
+        return sendJson(res, 201, { handoff: publicHandoff(existing) });
+      }
+      const created = registry.createHandoff({ id: handoffId, accountId: account.id, nodeId, repo, branch });
+      wakeHandoffWaiters(nodeId);
+      return sendJson(res, 201, { handoff: publicHandoff(created) });
+    }
+
+    if (method === "GET" && path === "/v1/handoffs") {
+      const repo = normalizeRepoFullName(url.searchParams.get("repo"));
+      if (!repo) return sendJson(res, 400, { error: "invalid_repo" });
+      return sendJson(res, 200, {
+        handoffs: registry.listHandoffsForRepo(account.id, repo, 50).map(publicHandoff),
+      });
     }
 
     if (path === "/v1/trial-nodes" && method === "POST") {
@@ -714,6 +809,22 @@ function publicTrial(trial, config, registry) {
     sni: trial.nodeId && config.tunnel.suffix ? `${trial.nodeId}${config.tunnel.suffix}` : null,
     createdAt: trial.createdAt,
     expiresAt: trial.expiresAt,
+  };
+}
+
+// Drops accountId — a response must never leak the internal id, only the
+// names the whole handoff feature is built to carry.
+function publicHandoff(handoff) {
+  return {
+    id: handoff.id,
+    nodeId: handoff.nodeId,
+    repo: handoff.repo,
+    branch: handoff.branch,
+    state: handoff.state,
+    reason: handoff.reason,
+    createdAt: handoff.createdAt,
+    updatedAt: handoff.updatedAt,
+    deliveredAt: handoff.deliveredAt,
   };
 }
 
