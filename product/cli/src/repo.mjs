@@ -1,6 +1,7 @@
 // Git facts the handoff needs, and the guard that keeps `relay` inside a
 // GitHub-backed repository. GitHub is the transport for repo state, so a repo
 // without a github.com origin cannot be handed off at all — say so early.
+import fs from "node:fs";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -14,7 +15,7 @@ const execFileAsync = promisify(execFile);
 // able to swallow a "/"), and are returned exactly as GitHub gave them: this
 // module must not silently fold "Me/Relay" and "me/relay" into different
 // identifiers than the ones GitHub itself uses.
-const GITHUB_REMOTE_RE = /^(?:https?:\/\/(?:[^@/]+@)?github\.com\/|git:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com(?::\d+)?\/)([^/]+)\/([^/]+?)(?:\.git)?$/i;
+const GITHUB_REMOTE_RE = /^(?:https?:\/\/(?:[^@/]+@)?github\.com(?::\d+)?\/|git:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com(?::\d+)?\/)([^/]+)\/([^/]+?)(?:\.git)?$/i;
 
 // Any URI-style scheme other than `file://` is a network transport, not a
 // local path — reject it outright, even under RELAY_ALLOW_LOCAL_REMOTE.
@@ -50,13 +51,76 @@ function parseLocalRemote(url) {
   }
 
   const cleaned = raw.replace(/^file:\/\//i, "").replace(/\.git$/, "");
-  if (!cleaned.startsWith("/")) return null; // only absolute local paths, never a relative lookup
+  // A canonical absolute local path starts with exactly one "/". Two or more
+  // is a UNC network path on Windows/Cygwin git ("//host/share/...") even
+  // though macOS/Linux git happens to resolve it locally — RELAY_ALLOW_LOCAL_
+  // REMOTE is a test-only bypass and must not accept a shape that is a
+  // network remote on any platform relay might run on.
+  if (!cleaned.startsWith("/") || cleaned.startsWith("//")) return null;
   return `local/${path.basename(cleaned).toLowerCase()}`;
 }
 
 async function git(root, args, execFileImpl = execFileAsync) {
   const { stdout } = await execFileImpl("git", ["-C", root, ...args], { maxBuffer: 32 * 1024 * 1024 });
   return stdout;
+}
+
+// Bounds the work workingTreeSummary will do counting untracked lines: a
+// repo with an untracked `node_modules` (30k-100k files — exactly the "quick
+// experiment, no .gitignore yet" repo a handoff targets) must not turn the
+// shut-the-laptop command into a multi-minute wait. Past the cap, files are
+// still counted toward `files`/the summary's file total; only their line
+// counts stop being added to `insertions`, and the summary says so.
+const MAX_UNTRACKED_FILES_COUNTED = 2000;
+const UNTRACKED_STREAM_CHUNK_BYTES = 64 * 1024;
+const UNTRACKED_STREAM_FLAGS = fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0);
+
+// Counts newline-terminated lines in a file without ever holding more than
+// one fixed-size chunk of it in memory. This replaces a design that spawned
+// one `git diff --no-index` subprocess per untracked file (~5.2ms each,
+// serially — 26s at 5,000 files) to solve an earlier, narrower problem (a
+// single very large untracked file driving a multi-hundred-MB heap spike from
+// `fs.readFileSync`). Counting in-process with a bounded buffer solves both:
+// no subprocess per file, and no whole-file string in the JS heap either.
+// O_NONBLOCK is defence in depth, not the primary guard — every call site
+// stats the entry and skips anything that is not `isFile()` before this is
+// ever reached — but it turns a FIFO that slips through a future TOCTOU race
+// into an immediate ENXIO/EAGAIN instead of a blocked open, matching the same
+// pattern already used for session transcripts in sessions.mjs. A trailing
+// line with no final "\n" still counts as one line, matching how `git diff
+// --numstat` counts a new file's last, unterminated line.
+function countFileLines(filePath) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, UNTRACKED_STREAM_FLAGS);
+  } catch {
+    return 0;
+  }
+  try {
+    const buffer = Buffer.alloc(UNTRACKED_STREAM_CHUNK_BYTES);
+    let lines = 0;
+    let sawAnyByte = false;
+    let endedWithNewline = true;
+    for (;;) {
+      const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      sawAnyByte = true;
+      for (let i = 0; i < bytesRead; i += 1) {
+        if (buffer[i] === 0x0a) lines += 1;
+      }
+      endedWithNewline = buffer[bytesRead - 1] === 0x0a;
+    }
+    if (sawAnyByte && !endedWithNewline) lines += 1;
+    return lines;
+  } catch {
+    return 0;
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // Already closed or never fully opened; nothing more to do.
+    }
+  }
 }
 
 async function requireGitHubRepo({ cwd = process.cwd(), execFileImpl = execFileAsync } = {}) {
@@ -144,33 +208,51 @@ async function workingTreeSummary({ root, execFileImpl = execFileAsync }) {
   }
 
   // Untracked files never appear in `git diff`, staged or not, so their line
-  // counts are collected separately — by asking git to diff each one against
-  // /dev/null, never by reading the file into a JS string. The git
-  // subprocess streams the file through native code; for a very large
-  // untracked file that keeps the count off the Node heap entirely, instead
-  // of loading the whole thing into a JS string just to call .split("\n").
+  // counts are collected separately, in-process (countFileLines), never by
+  // spawning a subprocess per file and never by loading a whole file into a
+  // JS string. Two guards run before any file is opened:
+  //   1. fs.statSync (unlike lstatSync) follows a symlink entry to its
+  //      ultimate target and skips anything that is not a plain file — a
+  //      symlink to a FIFO, a socket, or a device would otherwise be opened
+  //      and, for a FIFO with no writer, block forever with no way to
+  //      interrupt it from JS (the same class the session-discovery FIFO fix
+  //      already closed). ENOENT (a dangling target) is swallowed by
+  //      throwIfNoEntry; every other failure, most notably ELOOP from a
+  //      symlink loop, is caught explicitly. Skipped entries contribute 0,
+  //      same as any other unreadable entry already did.
+  //   2. MAX_UNTRACKED_FILES_COUNTED caps how many files get opened at all,
+  //      so an untracked `node_modules` (30k-100k files) cannot turn this
+  //      into a multi-minute wait even at in-process speed. Truncation is
+  //      reported in the summary, not silently dropped.
+  let untrackedCounted = 0;
+  let untrackedTruncated = false;
   for (const entry of entries) {
     if (entry.status !== "??") continue;
     const untracked = path.join(root, entry.path);
-    let numstatLine = "";
+
+    let stat;
     try {
-      numstatLine = (await git(root, ["diff", "--no-index", "--numstat", "--", "/dev/null", untracked], execFileImpl)).trim();
-    } catch (err) {
-      // `git diff --no-index` exits non-zero whenever it finds a difference
-      // (the normal case here, since /dev/null vs. any real file always
-      // differs) — the numstat line still arrives on stdout, attached to the
-      // rejected error. A genuine failure (unreadable file, dangling
-      // symlink, ...) yields no usable stdout and contributes 0, same as
-      // before.
-      numstatLine = (err?.stdout || "").toString().trim();
+      stat = fs.statSync(untracked, { throwIfNoEntry: false });
+    } catch {
+      stat = null;
     }
-    const [added] = numstatLine.split("\t");
-    insertions += Number.parseInt(added, 10) || 0;
+    if (!stat || !stat.isFile()) continue;
+
+    if (untrackedCounted >= MAX_UNTRACKED_FILES_COUNTED) {
+      untrackedTruncated = true;
+      continue;
+    }
+    untrackedCounted += 1;
+    insertions += countFileLines(untracked);
   }
 
   const files = entries.length;
   const noun = files === 1 ? "file" : "files";
-  return { files, insertions, deletions, summary: `${files} ${noun} changed, +${insertions}/-${deletions}` };
+  let summary = `${files} ${noun} changed, +${insertions}/-${deletions}`;
+  if (untrackedTruncated) {
+    summary += ` (line counts capped at ${MAX_UNTRACKED_FILES_COUNTED} untracked files; totals may undercount)`;
+  }
+  return { files, insertions, deletions, summary, truncated: untrackedTruncated };
 }
 
-export { requireGitHubRepo, parseGitHubRemote, currentBranch, workingTreeSummary, git };
+export { requireGitHubRepo, parseGitHubRemote, currentBranch, workingTreeSummary, git, MAX_UNTRACKED_FILES_COUNTED };
