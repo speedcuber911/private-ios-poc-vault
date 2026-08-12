@@ -44,7 +44,19 @@ import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 
 const SLOTS = new Set(["node", "device"]);
 
-// Max live (unexpired, unclosed) sessions per account.
+// Rendezvous kinds sharing these same put-once, MAC'd, 15-minute-TTL rails,
+// but never each other's quota or backlog:
+//   pair          — node <-> phone enrollment (CSR one way, cert the other).
+//   sync-auth     — `relay sync-auth` ships a sealed credential bundle from
+//                   the laptop CLI to the sandbox; only the device slot is
+//                   written (by the CLI) and read (by the node).
+//   session-index — the "On your Mac" session index; same one-way shape as
+//                   sync-auth, different payload.
+// Slot names stay exactly "node" / "device" for all three kinds — sync-auth
+// and session-index simply never write "node".
+const KINDS = new Set(["pair", "sync-auth", "session-index"]);
+
+// Max live (unexpired, unclosed) sessions per (account, kind).
 const DEFAULT_MAX_SESSIONS_PER_ACCOUNT = 5;
 
 // authToken shape check. It is base64url of a sha256 digest (43 chars), but a
@@ -71,15 +83,19 @@ export function createPairing({ registry, config, now = () => Date.now() }) {
     ? config.pairingMaxSessionsPerAccount
     : DEFAULT_MAX_SESSIONS_PER_ACCOUNT;
 
-  // The caller (the node's owner, via the phone) supplies authToken. The cloud
-  // NEVER generates a pairing secret and NEVER returns one — there is nothing
-  // secret in the response. Returns { pairingId, expiresAt } | "invalid_auth_token"
-  // | "too_many_sessions".
-  function createSession({ accountId, authToken }) {
+  // The caller (the node's owner, via the phone, the CLI, or the node itself
+  // depending on kind) supplies authToken. The cloud NEVER generates a
+  // pairing secret and NEVER returns one — there is nothing secret in the
+  // response. Returns { pairingId, expiresAt } | "invalid_auth_token" |
+  // "invalid_kind" | "too_many_sessions".
+  function createSession({ accountId, authToken, kind = "pair" }) {
     if (typeof authToken !== "string" || !AUTH_TOKEN_RE.test(authToken)) {
       return "invalid_auth_token";
     }
-    if (registry.countLivePairingSessions(accountId, now()) >= maxPerAccount) {
+    if (!KINDS.has(kind)) {
+      return "invalid_kind";
+    }
+    if (registry.countLivePairingSessions(accountId, kind, now()) >= maxPerAccount) {
       return "too_many_sessions";
     }
     const pairingId = randomUUID();
@@ -87,6 +103,7 @@ export function createPairing({ registry, config, now = () => Date.now() }) {
     registry.insertPairingSession({
       id: pairingId,
       accountId,
+      kind,
       authTokenHash: sha256Hex(authToken),
       expiresAt,
     });
