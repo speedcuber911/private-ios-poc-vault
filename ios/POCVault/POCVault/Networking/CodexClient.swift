@@ -708,6 +708,13 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
             (data, response) = try await session.data(for: request)
         } catch {
             let nsError = error as NSError
+            // NSURLErrorDomain -1200 is the same opaque code for every TLS
+            // failure. The underlying error carries the actual OSStatus (a
+            // handshake abort and a rejected client certificate are different
+            // numbers), and the identity description says what we would have
+            // offered had iOS asked — together they separate "we sent the wrong
+            // certificate" from "we were never asked for one".
+            let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError
             CodexDiagnostics.log("codex_request_error", fields: [
                 "method": method,
                 "path": path,
@@ -715,7 +722,10 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
                 "domain": nsError.domain,
                 "code": String(nsError.code),
                 "description": error.localizedDescription,
-                "hasClientIdentity": String(identityStore.hasStoredIdentity)
+                "hasClientIdentity": String(identityStore.hasStoredIdentity),
+                "underlyingDomain": underlying?.domain ?? "",
+                "underlyingCode": underlying.map { String($0.code) } ?? "",
+                "identity": identityStore.storedIdentityDescription
             ])
             throw error
         }
@@ -889,6 +899,19 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         scope: String,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
+        // Logged for EVERY challenge, before the switch. A trial machine failed
+        // with -1200 after the server-trust challenge succeeded, and the
+        // question that could not be answered from the existing events was
+        // whether iOS ever asked for a client certificate at all — the
+        // per-branch logs below cannot distinguish "not asked" from "asked and
+        // we declined". They are still emitted; this one establishes the set.
+        CodexDiagnostics.log("codex_auth_challenge_received", fields: [
+            "host": challenge.protectionSpace.host,
+            "method": challenge.protectionSpace.authenticationMethod,
+            "scope": scope,
+            "previousFailureCount": String(challenge.previousFailureCount)
+        ])
+
         switch challenge.protectionSpace.authenticationMethod {
         case NSURLAuthenticationMethodClientCertificate:
             if let credential = identityStore.credential() {

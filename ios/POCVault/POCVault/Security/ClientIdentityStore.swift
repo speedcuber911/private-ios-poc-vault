@@ -81,6 +81,38 @@ final class ClientIdentityStore: ObservableObject {
         return preferredClientCertificateNames.contains(normalizedName)
     }
 
+    /// Diagnostic-only summary of the identity that would be offered to a
+    /// server, as `subjectCN|issuer`. A trial machine advertises exactly one
+    /// acceptable client CA, so the issuer here is what decides whether iOS can
+    /// satisfy that request at all — and it is not otherwise recoverable from
+    /// the device, because the identity lives in the keychain rather than the
+    /// app container. Never includes key material.
+    var storedIdentityDescription: String {
+        guard let identity = identity() else { return "none" }
+        var certificate: SecCertificate?
+        guard SecIdentityCopyCertificate(identity, &certificate) == errSecSuccess,
+              let certificate else {
+            return "identity-without-certificate"
+        }
+        let subject = certificateCommonName(for: identity) ?? "?"
+        // iOS exposes no readable issuer string, but the question is not what
+        // the issuer is called — it is whether it is the CA this machine
+        // advertises as its only acceptable client CA. The pinned CA came from
+        // the same PKCS#12 as this identity, so comparing the identity's
+        // normalized issuer against the pinned CA's normalized subject answers
+        // it exactly, with no string parsing.
+        let issuerDER = SecCertificateCopyNormalizedIssuerSequence(certificate) as Data?
+        let pinnedSubjectDER = pinnedCACertificate
+            .flatMap { SecCertificateCopyNormalizedSubjectSequence($0) as Data? }
+        let issuedByPinnedCA: String
+        switch (issuerDER, pinnedSubjectDER) {
+        case (nil, _): issuedByPinnedCA = "unknown-issuer"
+        case (_, nil): issuedByPinnedCA = "no-pinned-ca"
+        case let (issuer?, pinned?): issuedByPinnedCA = issuer == pinned ? "yes" : "NO"
+        }
+        return "\(subject)|issuedByPinnedCA=\(issuedByPinnedCA)"
+    }
+
     var supportDirectory: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent(Self.supportDirectoryName, isDirectory: true)
