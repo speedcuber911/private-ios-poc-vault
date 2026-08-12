@@ -514,3 +514,77 @@ test("an existing branch literally named 'relay' is refused with a named error, 
   await assert.rejects(() => cmdHandoff([], { home: s.home, cwd: s.work, baseUrl: "https://cloud.test",
     fetchImpl: s.fetchImpl, log: () => {}, machine: "MacBook-Pro" }), /branch_path_conflict/);
 });
+
+// task-21: `relay handoff`'s best-effort session-index publish
+// (publishSessionIndex, called from the bottom of cmdHandoff) used to omit
+// `nodeId` entirely, which the cloud's POST /v1/sync-auth/notices rejects
+// with a 400 on every single call — never under a race, always. The bare
+// `catch {}` around it then swallowed that failure, so nothing ever surfaced
+// it. These two tests pin: (1) the notice this command sends genuinely
+// carries this machine's pinned nodeId and a real cloud-shaped validator
+// accepts it, and (2) when the publish fails for any reason, the user is
+// told, but the handoff itself is still reported as succeeded.
+function syncAuthAwareFetchImpl(s, { noticeStatus = "validate" } = {}) {
+  const pairingId = "session-idx-1111-1111-1111-111111111111";
+  const notices = [];
+  const fetchImpl = async (url, options = {}) => {
+    const pathname = new URL(url).pathname;
+    let body = null;
+    if (typeof options.body === "string") { try { body = JSON.parse(options.body); } catch { body = null; } }
+    if (pathname === "/v1/handoffs") {
+      return { status: 201, json: async () => ({ handoff: { id: body.handoffId, state: "pending" } }) };
+    }
+    if (pathname === "/v1/pairing/sessions") {
+      return { status: 201, json: async () => ({ pairingId, expiresAt: Date.now() + 900000 }) };
+    }
+    if (pathname === `/v1/pairing/sessions/${pairingId}/device-blob` && options.method === "POST") {
+      return { status: 204, json: async () => null };
+    }
+    if (pathname === "/v1/sync-auth/notices") {
+      notices.push(body);
+      if (noticeStatus !== "validate") return { status: noticeStatus, json: async () => ({ error: "boom" }) };
+      // Mirrors the cloud's own strOrNull(body?.nodeId) validation
+      // (product/cloud/src/server.js): missing pairingId, nodeId, or secret
+      // is a 400, exactly what the pre-fix call shape (no nodeId key at all)
+      // always hit.
+      const strOrNull = (v) => (typeof v === "string" && v.length > 0 ? v : null);
+      const ok = strOrNull(body?.pairingId) && strOrNull(body?.nodeId) && strOrNull(body?.secret);
+      return ok
+        ? { status: 201, json: async () => ({ notice: { id: "n1" } }) }
+        : { status: 400, json: async () => ({ error: "invalid_notice" }) };
+    }
+    return s.fetchImpl(url, options);
+  };
+  return { fetchImpl, notices };
+}
+
+test("relay handoff's session-index publish carries this machine's pinned nodeId and genuinely succeeds (task-21 finding 1)", async () => {
+  const s = await scenario();
+  const { fetchImpl, notices } = syncAuthAwareFetchImpl(s);
+  const lines = [];
+
+  const result = await cmdHandoff([], { home: s.home, cwd: s.work, baseUrl: "https://cloud.test",
+    fetchImpl, log: (line) => lines.push(line), machine: "MacBook-Pro" });
+
+  assert.equal(result.pushed, true);
+  assert.equal(notices.length, 1, "exactly one sync-auth notice was sent");
+  assert.equal(notices[0].nodeId, "node-1", "the notice carries the node this machine is pinned to, not undefined");
+  assert.ok(!lines.some((line) => /could not update/i.test(line)),
+    "no failure was reported to the user — the publish genuinely succeeded end to end");
+});
+
+test("a failed session-index publish is reported to the user without failing the handoff (task-21 finding 1)", async () => {
+  const s = await scenario();
+  // A failure unrelated to the nodeId bug this file was fixed for (e.g. the
+  // rendezvous itself 500ing) — proves the catch reports ANY failure, not
+  // just the one bug that motivated it.
+  const { fetchImpl } = syncAuthAwareFetchImpl(s, { noticeStatus: 500 });
+  const lines = [];
+
+  const result = await cmdHandoff([], { home: s.home, cwd: s.work, baseUrl: "https://cloud.test",
+    fetchImpl, log: (line) => lines.push(line), machine: "MacBook-Pro" });
+
+  assert.equal(result.pushed, true, "the handoff itself is still reported as succeeded");
+  assert.match(lines.join("\n"), /could not update the "On your Mac" session list/i,
+    "the failure is visible to the user, not silently swallowed");
+});

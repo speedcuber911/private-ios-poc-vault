@@ -301,15 +301,21 @@ function macSessionsPath(dataDir) {
 // Persists the "On your Mac" session index the phone renders. Only the
 // allow-listed fields below are ever written — no transcript, no prompt, no
 // credential can ride along even if a compromised/buggy sender put one in
-// the bundle, because nothing but these five strings per session is copied.
+// the bundle, because every field copied out of it, top-level (machine,
+// updatedAt) and per-session alike, is bounded to a plain string (or null/""
+// when absent or wrong-typed) by stringField() or String() — never copied
+// verbatim. An object or array planted in `machine`/`updatedAt` — the shape
+// used to smuggle {transcript, token} straight onto disk before this used
+// stringField() like every other bundle field in this file — becomes null,
+// not a write of whatever JSON the sender attached.
 function saveMacSessions(bundle, { dataDir }) {
   if (bundle?.v !== SUPPORTED_VERSION) throw new Error("unsupported_bundle_version");
   if (bundle?.kind !== "session-index") throw new Error("unexpected_bundle_kind");
 
   const sessions = Array.isArray(bundle.sessions) ? bundle.sessions.slice(0, 200) : [];
   const payload = {
-    machine: bundle.machine || null,
-    updatedAt: bundle.updatedAt || null,
+    machine: stringField(bundle.machine),
+    updatedAt: stringField(bundle.updatedAt),
     sessions: sessions.map((session) => ({
       id: String(session.id),
       harness: String(session.harness),

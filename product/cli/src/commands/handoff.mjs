@@ -290,15 +290,29 @@ async function cmdHandoff(args = [], deps = {}) {
   }
 
   // Keep the phone's "On your Mac" list current. Best-effort by design: the
-  // handoff has already succeeded and must not be reported as failed here.
+  // handoff has already succeeded and must not be reported as FAILED here —
+  // but best-effort still means visible. A silent catch here previously hid
+  // a 100%-reproducing bug (a missing nodeId that made the cloud 400 every
+  // single call); "non-fatal" must never again mean "nobody finds out".
+  //
+  // Note for whoever reaches for this next: even a successful publish here
+  // does not make the cloud close its rendezvous session early. It only
+  // auto-closes once BOTH the device slot and the node slot have been read
+  // (product/cloud/src/pairing.js getBlob), and relayd's collectRendezvousBlob
+  // only ever reads the device slot for "sync-auth"/"session-index" kinds —
+  // the node slot is never written or read on this path. So every publish,
+  // failed or not, leaves its session to expire on the ordinary 15-minute TTL
+  // sweep rather than closing early. That is a cloud/relayd protocol gap, not
+  // something fixable from here.
   try {
     const { publishSessionIndex } = await import("./syncauth.mjs");
     await publishSessionIndex({
       repoFullName: repo.fullName, root: realRoot, home: home || os.homedir(),
-      api, nodeEncPubkey: credentials.nodeEncPubkey, machine,
+      api, nodeId: credentials.nodeId, nodeEncPubkey: credentials.nodeEncPubkey, machine,
     });
-  } catch {
-    // The index stays as it was; nothing about the handoff changes.
+  } catch (err) {
+    log(`  Note: could not update the "On your Mac" session list (${err?.message || "unknown error"}).`);
+    log("  Your handoff still succeeded; run `relay sync-auth` to refresh the index.");
   }
 
   log("");
