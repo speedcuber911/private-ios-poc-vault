@@ -141,6 +141,20 @@ test("a credential collected by relay sync-auth on the laptop ends up installed 
     assert.deepEqual(result.installed.sort(), ["claude", "codex", "github"]);
     assert.ok(!printed.join("\n").includes(GITHUB_TOKEN), "the command never prints a credential");
 
+    // ── the blob the cloud DID store is the sealed one, and it is real
+    //    ciphertext rather than an accident of encoding. Checked HERE,
+    //    before the sandbox ever collects it: sync-auth's rendezvous is
+    //    one-directional (only the device slot is ever written or read), so
+    //    the collection below closes the session and drops the blob bytes
+    //    the instant it reads them — see pairing.js's ONE_WAY_KINDS. Reading
+    //    the database for this marker any later would find nothing, not
+    //    because sealing didn't happen, but because collection did.
+    const storedBeforeCollection = everyStoredValue(t.app.db);
+    assert.ok(
+      storedBeforeCollection.some((value) => Buffer.from(value, "base64").subarray(0, 8).toString("utf8") === "RLYSEAL1"),
+      "the cloud should be holding a sealed blob — otherwise this test proved nothing about the seal",
+    );
+
     // ── the sandbox polls, exactly as relayd's cloud client does ──────────
     const pollPath = "/v1/node/handoffs?wait=0";
     const poll = await api(t.baseUrl, "GET", pollPath,
@@ -175,10 +189,15 @@ test("a credential collected by relay sync-auth on the laptop ends up installed 
       assert.ok(!stored.some((value) => value.includes(marker)),
         `${marker} must never appear anywhere in the control plane's database`);
     }
-    // The blob the cloud DID store is the sealed one, and it is real
-    // ciphertext rather than an accident of encoding.
-    assert.ok(stored.some((value) => Buffer.from(value, "base64").subarray(0, 8).toString("utf8") === "RLYSEAL1"),
-      "the cloud should be holding a sealed blob — otherwise this test proved nothing about the seal");
+    // And the sealed blob itself is gone too, not merely unreadable: a
+    // one-directional rendezvous (sync-auth) closes and drops its bytes as
+    // soon as its one slot is read, exactly like a two-sided `pair` session
+    // closes once both of ITS slots are read — see pairing.js's
+    // ONE_WAY_KINDS. The presence check above already proved sealing
+    // happened; this proves collection does not leave ciphertext lingering
+    // against the account's rendezvous quota for the rest of the TTL.
+    assert.ok(!stored.some((value) => Buffer.from(value, "base64").subarray(0, 8).toString("utf8") === "RLYSEAL1"),
+      "the sealed blob should have been dropped once the sandbox collected it");
 
     // ── the ack closes the loop the same way a handoff's does ─────────────
     const ackPath = "/v1/node/handoffs/ack";

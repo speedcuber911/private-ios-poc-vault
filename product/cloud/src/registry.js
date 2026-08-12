@@ -974,8 +974,6 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
   // lets a node long-poll pick up work with no content ever transiting the
   // cloud. `createHandoff` is the write half of `POST /v1/handoffs`;
   // idempotency on `id` is enforced by the caller via getHandoff, not here.
-  const HANDOFF_PATCH_COLUMNS = { state: "state", reason: "reason", deliveredAt: "delivered_at" };
-
   function createHandoff({ id, accountId, nodeId, repo, branch }) {
     const ts = now();
     db.prepare(
@@ -1182,16 +1180,31 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     db.prepare("DELETE FROM sync_notices WHERE expires_at + ? <= ?").run(SYNC_NOTICE_GRACE_MS, nowMs);
   }
 
-  function updateHandoff(id, patch = {}) {
-    const assignments = [];
-    const values = [];
-    for (const [key, column] of Object.entries(HANDOFF_PATCH_COLUMNS)) {
-      if (key in patch) { assignments.push(`${column} = ?`); values.push(patch[key]); }
-    }
-    assignments.push("updated_at = ?");
-    values.push(now(), id);
-    db.prepare(`UPDATE handoffs SET ${assignments.join(", ")} WHERE id = ?`).run(...values);
-    return getHandoff(id);
+  // The ONLY path to `failed` — same CAS idiom as confirmHandoffDelivery
+  // above: an UPDATE guarded by a WHERE clause, not a read-then-write, so two
+  // concurrent reports of the same terminal failure cannot race each other.
+  // Deliberately allowed from EVERY other state, including `delivered`:
+  // `delivered` means the poll response reached the node, not that the
+  // import that follows it succeeded (ackDelivery fires before import, on
+  // purpose, for the partition case — see confirmHandoffDelivery), so a node
+  // that acks and then fails to clone/decrypt/import must still be able to
+  // land here. `reason` is validated by the caller against the cloud's own
+  // closed vocabulary before it ever reaches this function — see
+  // HANDOFF_FAILURE_REASONS in server.js — so nothing free-form from the
+  // node is one call away from this column.
+  //
+  // Once `failed`, stays `failed`: a second report (a retry after a dropped
+  // response, for instance) touches zero rows, so the FIRST reason recorded
+  // wins rather than being silently overwritten by a later, possibly-less
+  // specific one. `node_id` scopes the CAS to the node that actually owns
+  // this handoff, exactly like every other node-authed handoff mutation in
+  // this file.
+  function failHandoff(nodeId, id, reason) {
+    const info = db.prepare(
+      "UPDATE handoffs SET state = 'failed', reason = ?, updated_at = ? " +
+      "WHERE id = ? AND node_id = ? AND state != 'failed'",
+    ).run(reason, now(), id, nodeId);
+    return info.changes > 0;
   }
 
   return {
@@ -1274,7 +1287,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     countPendingHandoffs,
     leaseHandoffs,
     confirmHandoffDelivery,
-    updateHandoff,
+    failHandoff,
     createSyncNotice,
     getSyncNoticeByPairingId,
     listPendingSyncNotices,

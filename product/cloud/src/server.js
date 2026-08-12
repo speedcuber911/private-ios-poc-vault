@@ -651,7 +651,7 @@ export function createApp({
       for (const entry of acksRaw) {
         const id = strOrNull(entry?.id);
         const lease = strOrNull(entry?.lease);
-        if (!id || !/^[a-f0-9]{16,64}$/.test(id) || !lease) {
+        if (!id || !HANDOFF_ID_RE.test(id) || !lease) {
           return sendJson(res, 400, { error: "invalid_ack" });
         }
         acks.push({ id, lease });
@@ -671,6 +671,51 @@ export function createApp({
       const confirmed = registry.confirmHandoffDelivery(verified.node.id, acks);
       const noticesAcked = registry.confirmSyncNoticeDelivery(verified.node.id, noticeAcks);
       return sendJson(res, 200, { acked: confirmed, noticesAcked });
+    }
+
+    // ── node handoff failure report (signature-authed) ──────────────────
+    //
+    // The node's own terminal-failure signal. Before this route existed the
+    // handoffs table had exactly three states (pending/leased/delivered),
+    // `reason` was always NULL, and `relay status`'s failure branch — and
+    // design §10's whole "every failure ends visible" promise — had no
+    // implementation path: relayd genuinely emits `handoff.failed` with a
+    // reason, but nothing carried it to this row. This is that path.
+    //
+    // Node-authed and replay-guarded exactly like the poll and the ack
+    // above — reporting a failure is a state-mutating write, not a read, so
+    // it gets no exemption from the T7-I3 default. `reason` is checked
+    // against HANDOFF_FAILURE_REASONS (a closed vocabulary) rather than
+    // stored verbatim: the cloud is content-free by design, and a free-text
+    // reason from the node is exactly the shape of leak `record.error`
+    // escaping relayd's own PUBLIC_REASONS allow-list already showed is
+    // possible — this route refuses anything outside the five known codes
+    // instead of trusting the caller to have sanitised it.
+    if (
+      method === "POST" && seg.length === 5 &&
+      seg[0] === "v1" && seg[1] === "node" && seg[2] === "handoffs" && seg[4] === "fail"
+    ) {
+      const id = seg[3];
+      const pathWithQuery = `${path}${url.search}`;
+      const verified = verifyNodeRequest(req, pathWithQuery, { registry, now, replayGuard: handoffReplayGuard });
+      if (verified.error) return sendJson(res, 401, { error: "unauthorized" });
+      if (!HANDOFF_ID_RE.test(id)) return sendJson(res, 400, { error: "invalid_handoff" });
+
+      const body = await readJson(req, config.jsonBodyMaxBytes);
+      const reason = strOrNull(body?.reason);
+      if (!reason || !HANDOFF_FAILURE_REASONS.has(reason)) {
+        return sendJson(res, 400, { error: "invalid_reason" });
+      }
+
+      // Same 404 whether the id is unknown or simply belongs to another
+      // node — a node has no business learning which is true of an id it
+      // does not own.
+      const handoff = registry.getHandoff(id);
+      if (!handoff || handoff.nodeId !== verified.node.id) {
+        return sendJson(res, 404, { error: "unknown_handoff" });
+      }
+      registry.failHandoff(verified.node.id, id, reason);
+      return sendJson(res, 200, { handoff: publicHandoff(registry.getHandoff(id)) });
     }
 
     // ── session-authed registry endpoints ───────────────────────────────
@@ -817,7 +862,7 @@ export function createApp({
       const repo = normalizeRepoFullName(body?.repo);
       const branch = strOrNull(body?.branch);
       const nodeId = strOrNull(body?.nodeId);
-      if (!handoffId || !/^[a-f0-9]{16,64}$/.test(handoffId) || !repo ||
+      if (!handoffId || !HANDOFF_ID_RE.test(handoffId) || !repo ||
           !isValidHandoffBranch(branch) || !nodeId) {
         return sendJson(res, 400, { error: "invalid_handoff" });
       }
@@ -1161,6 +1206,47 @@ function isValidHandoffBranch(branch) {
   if (branch.split("/").some((segment) => segment.startsWith(".") || segment.endsWith(".lock"))) return false;
   return true;
 }
+
+// Shape a handoff id must have everywhere it crosses this server: minted by
+// the CLI as 16 hex characters, accepted here up to 64 so a future longer id
+// is not a breaking change. One constant, three call sites (create, ack,
+// fail-report) — previously two copies of the same literal.
+const HANDOFF_ID_RE = /^[a-f0-9]{16,64}$/;
+
+// The CLOSED vocabulary `reason` may hold once a handoff reaches `failed`.
+// The cloud is content-free by design — it may learn NAMES (repo, branch,
+// ids, event types) but never transcript or credential content — and a
+// node-supplied reason is the one place a free-text string could otherwise
+// ride into an account's own JSON forever. So this is an allow-list, not a
+// sanitiser: a reason relayd sends that is not one of these five strings is
+// refused at the door (400 invalid_reason) rather than stored, coerced, or
+// clipped. See the relayd-contract note this list is paired with — relayd's
+// own PUBLIC_REASONS (handoff.mjs) has ~25 fine-grained codes; relayd must
+// fold each of them into exactly one of these five before reporting, the
+// same coarsening its own `clone_failed` already does deliberately (a failed
+// clone never says WHY, because "not found" vs "no access" is a private-repo
+// existence oracle against the user's credential).
+//
+//   clone_failed      — repo could not be fetched: missing/expired GitHub
+//                        credential, or no access. Matches the CLI's
+//                        existing `/auth|credential|clone_failed/i` check in
+//                        status.mjs, so this reason alone already triggers
+//                        the "run relay sync-auth" hint with no CLI change.
+//   decrypt_failed     — the sealed manifest/session could not be opened
+//                        (missing key, bad magic, truncated, decrypt error).
+//   manifest_invalid   — the manifest itself was missing, oversized,
+//                        malformed, or named a blob outside the checkout.
+//   workspace_failed   — checkout/workspace registration/local-store error
+//                        on the node, unrelated to the content above.
+//   internal_error      — catch-all: anything relayd cannot place in the
+//                        four buckets above still needs a terminal state.
+const HANDOFF_FAILURE_REASONS = new Set([
+  "clone_failed",
+  "decrypt_failed",
+  "manifest_invalid",
+  "workspace_failed",
+  "internal_error",
+]);
 
 function publicTrial(trial, config, registry) {
   const node = trial.nodeId ? registry.getNode(trial.nodeId) : null;
