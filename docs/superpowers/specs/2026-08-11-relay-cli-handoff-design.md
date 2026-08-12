@@ -206,8 +206,15 @@ session." New work fired from the phone always targets the sandbox.
 ## 9. Security posture
 
 - GitHub and the cloud only ever see **ciphertext or names** (repo, branch,
-  event types). Transcript plaintext exists in exactly two places: the
+  event types). Full transcript plaintext exists in exactly two places: the
   laptop and inside the sandbox.
+  **Correction (2026-08-12, found by the pre-merge security review):** the
+  card the phone renders deliberately carries a bounded excerpt (≤2000
+  chars), the derived title, and the laptop `cwd` — §1 and §6 always
+  specified this. That reaches the phone over mTLS, direct from the node,
+  and never transits GitHub or the cloud. So "exactly two places" is true of
+  the *full* transcript and of every byte GitHub or the cloud can see; it
+  was never true of the excerpt, and the phone is a third place by design.
 - Existing invariants carry verbatim: workspace jail + realpath
   containment, secret denylist, isolated runner user, provider credentials
   in runner-home/root-protected locations only, no provider creds to the
