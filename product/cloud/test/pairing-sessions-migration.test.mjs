@@ -103,6 +103,74 @@ test("createDb migrates a pre-kind pairing_sessions table instead of leaving it 
   }
 });
 
+// Finding 7 (review): the FIRST branch of migratePairingSessions —
+// `if (!columns.some(c => c.name === "auth_token_hash")) { DROP TABLE;
+// return; }` — was untested in isolation. Deleting it survives the suite,
+// because every shipped v1 table that lacks auth_token_hash ALSO lacks
+// kind, so the second branch (tested above) already drops it too — the two
+// branches happen to overlap on every schema version that has ever shipped.
+// The one shape this branch uniquely handles — auth_token_hash absent, kind
+// present — never existed in production, so this is deliberately a
+// synthetic fixture: it isolates the branch from its accidental cover so a
+// future change that narrows or removes it is caught here, not by
+// discovering in production that dropping a table full of NOT NULL columns
+// it doesn't have is somehow not what happened.
+function buildNoAuthTokenHashDb(filePath) {
+  const db = new DatabaseSync(filePath);
+  db.exec(`
+    CREATE TABLE pairing_sessions (
+      id              TEXT PRIMARY KEY,
+      account_id      TEXT NOT NULL,
+      kind            TEXT NOT NULL DEFAULT 'pair',
+      node_blob       TEXT,
+      node_tag        TEXT,
+      node_read_at    INTEGER,
+      device_blob     TEXT,
+      device_tag      TEXT,
+      device_read_at  INTEGER,
+      closed_at       INTEGER,
+      expires_at      INTEGER NOT NULL,
+      created_at      INTEGER NOT NULL
+    );
+  `);
+  db.prepare(
+    `INSERT INTO pairing_sessions (id, account_id, kind, expires_at, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).run("session-no-auth-token-hash", "acct-1", "pair", 999999999999, 1000);
+  db.close();
+}
+
+test("createDb migrates a pairing_sessions table missing auth_token_hash even when kind is already present", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "relay-pairing-migration-no-ath-"));
+  const filePath = path.join(dir, "relay.sqlite");
+  try {
+    buildNoAuthTokenHashDb(filePath);
+
+    const raw = new DatabaseSync(filePath);
+    const preColumns = raw.prepare("PRAGMA table_info(pairing_sessions)").all().map((c) => c.name);
+    raw.close();
+    assert.ok(!preColumns.includes("auth_token_hash"), "fixture must start without auth_token_hash (or this proves nothing)");
+    assert.ok(preColumns.includes("kind"), "fixture must isolate the auth_token_hash branch by already having kind");
+
+    const db = createDb(filePath);
+    const afterColumns = db.prepare("PRAGMA table_info(pairing_sessions)").all().map((c) => c.name);
+    assert.ok(afterColumns.includes("auth_token_hash"), "auth_token_hash must exist after opening the old-shape database");
+    assert.ok(afterColumns.includes("kind"));
+
+    const remaining = db.prepare("SELECT COUNT(*) AS n FROM pairing_sessions").get();
+    assert.equal(Number(remaining.n), 0, "the stale row must not survive the migration");
+
+    const registry = createRegistry(db, { now: () => 2000 });
+    registry.insertPairingSession({
+      id: "session-fresh-2", accountId: "acct-1", kind: "pair", authTokenHash: "hash-fresh-2", expiresAt: 999999999999,
+    });
+    assert.ok(registry.getPairingSession("session-fresh-2"), "the migrated schema must be usable afterwards");
+    db.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("the pairing_sessions migration is idempotent across repeated opens of the same on-disk file", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "relay-pairing-migration-idem-"));
   const filePath = path.join(dir, "relay.sqlite");

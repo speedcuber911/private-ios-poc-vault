@@ -154,10 +154,23 @@ CREATE TABLE IF NOT EXISTS device_codes (
   approved_at INTEGER,
   consumed_at INTEGER,
   expires_at INTEGER NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  -- Trusted client IP (nginx's X-Real-IP, set to $remote_addr; the app binds
+  -- 127.0.0.1, so nginx is the only possible peer and the header cannot be
+  -- spoofed by the caller) at POST /v1/auth/device/start. NULL when the
+  -- signal isn't available (direct-to-app callers, e.g. tests). Backs the
+  -- per-IP live-code ceiling — see countLiveDeviceCodesForIp in registry.js
+  -- and config.deviceCodeMaxLivePerIp. The global ceiling alone let one
+  -- attacker holding DEVICE_CODE_MAX_LIVE codes deny every other login.
+  client_ip TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_device_codes_expires ON device_codes (expires_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_device_codes_user_code ON device_codes (user_code);
+-- Backs countLiveDeviceCodesForIp, read on every unauthenticated
+-- POST /v1/auth/device/start, for the same reason idx_device_codes_hash
+-- exists: an unauthenticated write must not amplify into an unauthenticated
+-- blocking table scan.
+CREATE INDEX IF NOT EXISTS idx_device_codes_client_ip ON device_codes (client_ip, expires_at);
 -- device_code_hash is read on EVERY /v1/auth/device/token poll. Unindexed it
 -- is a full table scan, and node:sqlite's DatabaseSync is synchronous, so the
 -- scan blocks the whole event loop: ~11.6 ms per poll at 500k rows. The row
@@ -186,7 +199,18 @@ CREATE TABLE IF NOT EXISTS handoffs (
   reason TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
-  delivered_at INTEGER
+  delivered_at INTEGER,
+  -- A poll response reaching res.end()'s write() is not proof it reached the
+  -- node — a partitioned peer observes no FIN and the socket looks alive for
+  -- the whole poll (Task 8 review, Finding 1 / IMPORTANT 1). GET
+  -- /v1/node/handoffs therefore LEASES a pending row (state='leased') rather
+  -- than delivering it; lease_token is the single-use capability
+  -- POST /v1/node/handoffs/ack must present to confirm it, and
+  -- lease_expires_at is when an unconfirmed lease becomes claimable again.
+  -- Both are NULL outside the 'leased' state. See registry.js's
+  -- leaseHandoffs/confirmHandoffDelivery/reclaimExpiredLeases.
+  lease_token TEXT,
+  lease_expires_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_handoffs_node_state ON handoffs (node_id, state);
 CREATE INDEX IF NOT EXISTS idx_handoffs_account_repo ON handoffs (account_id, repo, created_at);

@@ -55,6 +55,19 @@ export function loadConfig(env = process.env) {
     // allows ~9,000 starts per IP per code lifetime, so this is the difference
     // between a bounded table and an unbounded one, not a per-user quota.
     deviceCodeMaxLive: intFrom(env.DEVICE_CODE_MAX_LIVE, 2000),
+    // Per-IP twin of the ceiling above. The global cap alone bounds the
+    // table but not who fills it: one caller holding DEVICE_CODE_MAX_LIVE
+    // codes denies every OTHER caller a code for the rest of the TTL window.
+    // A per-IP limit needs a trustworthy client-IP signal, and this
+    // deployment has one: deploy/relay-cloud.nginx.conf.template sets
+    // `X-Real-IP $remote_addr`, and the app binds 127.0.0.1 (see `host`
+    // above), so nginx is the only possible peer and the header cannot be
+    // spoofed by the caller. Sized well above legitimate simultaneous use
+    // from one IP (a shared office/VPN egress with many engineers mid-login
+    // at once) while keeping any single IP far short of the global ceiling —
+    // the point is to raise the number of distinct source IPs an attacker
+    // needs, not to rate-limit ordinary users.
+    deviceCodeMaxLivePerIp: intFrom(env.DEVICE_CODE_MAX_LIVE_PER_IP, 50),
 
     // Pairing rendezvous
     pairingTtlSec: intFrom(env.PAIRING_TTL_SEC, 15 * 60),
@@ -146,6 +159,20 @@ export function loadConfig(env = process.env) {
     // can never make a held request outlive the reverse proxy's own timeout
     // — see Task 8 review, M-1.
     handoffPollMaxWaitSec: Math.min(intFrom(env.HANDOFF_POLL_MAX_WAIT_SEC, 25), 290),
+
+    // Visibility timeout for a handed-out-but-not-yet-confirmed handoff. A
+    // poll response reaching res.end()'s write() is not proof it reached the
+    // node — a partitioned peer observes no FIN and the socket looks alive
+    // for the whole poll — so GET /v1/node/handoffs LEASES a row rather than
+    // delivering it, and POST /v1/node/handoffs/ack is the only path to
+    // `delivered`. An unconfirmed lease expires and the row becomes
+    // claimable again: recoverable by construction, not by trying to detect
+    // a dead peer (which cannot be done in general). See Task 8 review,
+    // Finding 1 / IMPORTANT 1. Kept short: relayd acks immediately after
+    // successfully parsing the poll response (proof the bytes crossed a live
+    // connection), so the normal case never comes close to this window —
+    // it only bounds how long a genuinely partitioned handoff stays stuck.
+    handoffLeaseSec: Math.max(1, intFrom(env.HANDOFF_LEASE_SEC, 30)),
   };
 }
 

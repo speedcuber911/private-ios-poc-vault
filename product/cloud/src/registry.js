@@ -126,10 +126,41 @@ function ensureNodeEncColumn(db) {
   }
 }
 
+// Non-destructive guard for existing databases that predate the handoff
+// lease columns (handoffs.lease_token, handoffs.lease_expires_at — Task 8
+// review, Finding 1 / IMPORTANT 1: a poll response written into a
+// partitioned node's socket looked exactly like a successful delivery, so
+// the row was flipped to `delivered` and lost for good with no recovery
+// path). Same idiom as ensureNodeEncColumn: gain the columns on open rather
+// than fail closed on first use.
+function ensureHandoffLeaseColumns(db) {
+  const columns = db.prepare("PRAGMA table_info(handoffs)").all();
+  if (columns.length === 0) return;
+  const names = new Set(columns.map((column) => column.name));
+  if (!names.has("lease_token")) db.exec("ALTER TABLE handoffs ADD COLUMN lease_token TEXT");
+  if (!names.has("lease_expires_at")) db.exec("ALTER TABLE handoffs ADD COLUMN lease_expires_at INTEGER");
+}
+
+// Non-destructive guard for existing databases that predate the per-IP
+// device-code ceiling (device_codes.client_ip — the correction to the
+// "per-IP needs trusted proxy headers this deployment does not have"
+// residual: nginx sets X-Real-IP and the app binds 127.0.0.1, so the signal
+// IS trustworthy here). Same idiom as ensureNodeEncColumn.
+function ensureDeviceCodeClientIpColumn(db) {
+  const columns = db.prepare("PRAGMA table_info(device_codes)").all();
+  if (columns.length === 0) return;
+  if (!columns.some((column) => column.name === "client_ip")) {
+    db.exec("ALTER TABLE device_codes ADD COLUMN client_ip TEXT");
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_device_codes_client_ip ON device_codes (client_ip, expires_at)");
+}
+
 export function createRegistry(db, { now = () => Date.now() } = {}) {
   ensureAuthSchema(db);
   ensureNodeEventSchema(db);
   ensureNodeEncColumn(db);
+  ensureHandoffLeaseColumns(db);
+  ensureDeviceCodeClientIpColumn(db);
 
   // ── accounts ────────────────────────────────────────────────────────────
   function createAccount({ id = randomUUID(), appleSub = null, email = null }) {
@@ -713,11 +744,11 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
   }
 
   // ── device codes (CLI login) ────────────────────────────────────────────
-  function createDeviceCode({ deviceCodeHash, userCode, expiresAt }) {
+  function createDeviceCode({ deviceCodeHash, userCode, expiresAt, clientIp = null }) {
     const id = randomUUID();
     db.prepare(
-      "INSERT INTO device_codes (id, device_code_hash, user_code, expires_at, created_at) VALUES (?, ?, ?, ?, ?)",
-    ).run(id, deviceCodeHash, userCode, expiresAt, now());
+      "INSERT INTO device_codes (id, device_code_hash, user_code, expires_at, created_at, client_ip) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run(id, deviceCodeHash, userCode, expiresAt, now(), clientIp);
     return mapDeviceCode(db.prepare("SELECT * FROM device_codes WHERE id = ?").get(id));
   }
 
@@ -773,6 +804,21 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     return Number(db.prepare(
       "SELECT COUNT(*) AS n FROM device_codes WHERE consumed_at IS NULL AND expires_at > ?",
     ).get(nowMs).n);
+  }
+
+  // The per-IP twin of countLiveDeviceCodes. The global ceiling alone bounds
+  // the table but not who fills it: one caller holding DEVICE_CODE_MAX_LIVE
+  // codes denies every OTHER caller a code for the rest of the TTL window.
+  // `clientIp` is nginx's `X-Real-IP` (trustworthy — see the column comment
+  // on device_codes in db.js); a null clientIp (no trusted signal available)
+  // counts against nothing, matching the global ceiling's own fail-open
+  // posture when the signal is absent rather than inventing a shared bucket
+  // for every signal-less caller to collide in.
+  function countLiveDeviceCodesForIp(clientIp, nowMs) {
+    if (!clientIp) return 0;
+    return Number(db.prepare(
+      "SELECT COUNT(*) AS n FROM device_codes WHERE client_ip = ? AND consumed_at IS NULL AND expires_at > ?",
+    ).get(clientIp, nowMs).n);
   }
 
   // ── pairing sessions (protocol v2) ──────────────────────────────────────
@@ -949,19 +995,95 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     ).all(accountId, repo, limit).map(mapHandoff);
   }
 
+  // A row a poll leased but nobody ever confirmed must become claimable
+  // again, not stay stuck `leased` forever behind a peer that is never
+  // coming back. Reclaiming lazily here — rather than on a timer — mirrors
+  // createReplayGuard's lazy sweep: no extra timer to keep unref'd, and it
+  // runs exactly when the answer matters (the next time this node's pending
+  // work is read). Called from both listPendingHandoffs and
+  // countPendingHandoffs so neither can observe a stale `leased` row the
+  // other has already reclaimed.
+  function reclaimExpiredLeases(nodeId) {
+    db.prepare(
+      "UPDATE handoffs SET state = 'pending', lease_token = NULL, lease_expires_at = NULL, updated_at = ? " +
+      "WHERE node_id = ? AND state = 'leased' AND lease_expires_at <= ?",
+    ).run(now(), nodeId, now());
+  }
+
   // Capped so a node that was offline for a long stretch — during which many
   // pings landed — cannot be handed one unbounded JSON response; a node past
   // the cap simply finds the rest still `pending` on its next poll. See Task
   // 8 review, M-6.
+  //
+  // `rowid` is the tiebreaker: `created_at` is millisecond-resolution, so two
+  // handoffs minted in the same millisecond would otherwise sort
+  // nondeterministically under a LIMIT (SQLite makes no ordering guarantee
+  // among rows with an equal ORDER BY key) — a node offline through a burst
+  // could be hand-waved a nondeterministic, possibly-not-oldest slice of its
+  // backlog on every poll. rowid reflects insertion order, so ties resolve to
+  // "earliest created" the same way the millisecond column intends.
   function listPendingHandoffs(nodeId, limit = 50) {
+    reclaimExpiredLeases(nodeId);
     return db.prepare(
       "SELECT * FROM handoffs WHERE node_id = ? AND state = 'pending' ORDER BY created_at, rowid LIMIT ?",
     ).all(nodeId, limit).map(mapHandoff);
   }
 
   function countPendingHandoffs(nodeId) {
+    reclaimExpiredLeases(nodeId);
     return Number(db.prepare("SELECT COUNT(*) AS n FROM handoffs WHERE node_id = ? AND state = 'pending'")
       .get(nodeId).n);
+  }
+
+  // Hands a batch of pending rows out on a lease rather than delivering them
+  // outright — see the lease_token/lease_expires_at comment on the handoffs
+  // table in db.js and Task 8 review, Finding 1 / IMPORTANT 1. Each id is
+  // flipped `pending` -> `leased` with a fresh, unguessable token
+  // (capability, not just an identifier) and a `leaseMs` visibility timeout,
+  // ONLY if it is still `pending` at the moment of the UPDATE — so a caller
+  // can never lease a row twice or steal one already leased to a different
+  // batch. Nothing awaits between a caller's listPendingHandoffs and this
+  // call today, so there is no actual race in this single-threaded,
+  // synchronous-DB process; the WHERE clause keeps the guarantee true
+  // regardless.
+  function leaseHandoffs(ids, nodeId, leaseMs) {
+    if (!Array.isArray(ids) || ids.length === 0) return [];
+    const expiresAt = now() + leaseMs;
+    const stmt = db.prepare(
+      "UPDATE handoffs SET state = 'leased', lease_token = ?, lease_expires_at = ?, updated_at = ? " +
+      "WHERE id = ? AND node_id = ? AND state = 'pending'",
+    );
+    const leased = [];
+    for (const id of ids) {
+      const token = randomUUID();
+      const info = stmt.run(token, expiresAt, now(), id, nodeId);
+      if (info.changes > 0) leased.push(getHandoff(id));
+    }
+    return leased;
+  }
+
+  // The ONLY path to `delivered`. A compare-and-swap on
+  // (id, node_id, state='leased', lease_token): an ack naming the wrong
+  // token — because the lease already expired and the row was reclaimed
+  // (and possibly re-leased under a fresh token), or because the id/token
+  // pairing was never issued to this node — matches zero rows and is
+  // silently ignored. That is exactly what "unconfirmed" is supposed to
+  // mean: no ambient authority lets a caller confirm a delivery it cannot
+  // prove it received. Returns the subset of `acks` that were actually
+  // confirmed, so the caller can tell a stale/rejected ack from a live one
+  // without a second round trip.
+  function confirmHandoffDelivery(nodeId, acks) {
+    if (!Array.isArray(acks) || acks.length === 0) return [];
+    const stmt = db.prepare(
+      "UPDATE handoffs SET state = 'delivered', delivered_at = ?, lease_token = NULL, lease_expires_at = NULL, " +
+      "updated_at = ? WHERE id = ? AND node_id = ? AND state = 'leased' AND lease_token = ?",
+    );
+    const confirmed = [];
+    for (const { id, lease } of acks) {
+      const info = stmt.run(now(), now(), id, nodeId, lease);
+      if (info.changes > 0) confirmed.push(id);
+    }
+    return confirmed;
   }
 
   function updateHandoff(id, patch = {}) {
@@ -1036,6 +1158,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     consumeDeviceCode,
     sweepDeviceCodes,
     countLiveDeviceCodes,
+    countLiveDeviceCodesForIp,
     insertPairingSession,
     getPairingSession,
     setPairingBlob,
@@ -1053,6 +1176,8 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     listHandoffsForRepo,
     listPendingHandoffs,
     countPendingHandoffs,
+    leaseHandoffs,
+    confirmHandoffDelivery,
     updateHandoff,
   };
 }
@@ -1122,6 +1247,7 @@ function mapDeviceCode(row) {
     consumedAt: row.consumed_at == null ? null : Number(row.consumed_at),
     expiresAt: Number(row.expires_at),
     createdAt: Number(row.created_at),
+    clientIp: row.client_ip ?? null,
   };
 }
 
@@ -1138,6 +1264,11 @@ function mapHandoff(row) {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     deliveredAt: row.delivered_at ?? null,
+    // Internal-only (never in publicHandoff's explicit field list, so a node
+    // long-poll's own lease token is never echoed to the account's own
+    // session-authed clients via POST/GET /v1/handoffs).
+    leaseToken: row.lease_token ?? null,
+    leaseExpiresAt: row.lease_expires_at ?? null,
   };
 }
 
