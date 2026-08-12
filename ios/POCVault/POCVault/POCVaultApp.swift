@@ -2,12 +2,15 @@ import SwiftUI
 
 @main
 struct POCVaultApp: App {
+    /// iOS hands the APNs device token to a UIApplicationDelegate and nowhere else.
+    @UIApplicationDelegateAdaptor(RelayAppDelegate.self) private var appDelegate
     @StateObject private var identityStore: ClientIdentityStore
     @StateObject private var libraryViewModel: LibraryViewModel
     @StateObject private var chatSessionStore: RelayChatSessionStore
     @StateObject private var statusFeedViewModel: StatusFeedViewModel
     @StateObject private var accountStore: RelayAccountStore
     @StateObject private var nodeStore: RelayNodeStore
+    @StateObject private var pushService: RelayPushService
     private let manifestClient: ManifestClient
     private let codexClient: CodexClient
     private let trialClient: RelayTrialClient
@@ -45,6 +48,7 @@ struct POCVaultApp: App {
         ))
         _statusFeedViewModel = StateObject(wrappedValue: StatusFeedViewModel(client: codexClient))
         _accountStore = StateObject(wrappedValue: accountStore)
+        _pushService = StateObject(wrappedValue: RelayPushService(accountStore: accountStore))
         self.manifestClient = manifestClient
         self.codexClient = codexClient
         self.trialClient = RelayTrialClient(baseURL: AppConfiguration.authBaseURL)
@@ -75,7 +79,8 @@ struct POCVaultApp: App {
                         nodeStore: nodeStore,
                         manifestClient: manifestClient,
                         codexClient: codexClient,
-                        trialClient: trialClient
+                        trialClient: trialClient,
+                        pushService: pushService
                     )
                     // Adopting (or losing) a machine restarts the browser stack so
                     // listings refetch; the shared client and the chat/status
@@ -147,10 +152,14 @@ struct POCVaultRootView: View {
     let manifestClient: ManifestClient
     let codexClient: CodexClient
     let trialClient: RelayTrialClient
+    @ObservedObject var pushService: RelayPushService
 
     @Environment(\.scenePhase) private var scenePhase
     @State private var browserPath: [BrowserRoute] = []
     @State private var chatLaunch: RelayChatLaunch?
+    /// Raised when a handoff push is tapped: the threads list is where handoff
+    /// cards live, so that is where the tap has to land.
+    @State private var opensThreadsForHandoff = false
     @State private var showingLibrary = false
     @State private var showingStatus = false
     @State private var showingDiagnostics = false
@@ -180,7 +189,11 @@ struct POCVaultRootView: View {
             libraryCover
         }
         .fullScreenCover(item: $chatLaunch) { launch in
-            RelayChatView(viewModel: launch.viewModel, onDismiss: { chatLaunch = nil })
+            RelayChatView(
+                viewModel: launch.viewModel,
+                onDismiss: { chatLaunch = nil },
+                threadsRequest: $opensThreadsForHandoff
+            )
         }
         .sheet(isPresented: $showingStatus) {
             CodexStatusView(
@@ -205,6 +218,23 @@ struct POCVaultRootView: View {
         }
         .task {
             identityStore.importIdentityFromSetupEnvironmentIfNeeded()
+        }
+        // Push registration waits for a signed-in account: this view only exists
+        // in the `.ready` phase, and the cloud device route is session-authed.
+        .task {
+            RelayAppDelegate.pushService = pushService
+            pushService.registerForPushNotifications()
+            await pushService.registerPendingDeviceTokenIfNeeded()
+        }
+        // A handoff push carries no content — only a node id and an event type —
+        // so the tap opens the threads list and the card loads from the node.
+        .onChange(of: pushService.pendingRoute) { _, route in
+            guard case .handoff = route else { return }
+            pushService.clearPendingRoute()
+            if chatLaunch == nil {
+                openChat(folderPath: nil, workspaceID: nil)
+            }
+            opensThreadsForHandoff = true
         }
         // A trial machine expires on the server's clock, so the countdown and
         // the expiry banner are only honest if we re-read state on foreground.

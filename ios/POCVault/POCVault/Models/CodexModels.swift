@@ -1680,7 +1680,9 @@ private extension KeyedDecodingContainer {
     }
 }
 
-private enum CodexDateParser {
+/// Lenient timestamp parsing shared by the model layer: ISO-8601 with or without
+/// fractional seconds, or a bare epoch-seconds number.
+enum CodexDateParser {
     static func parse(_ value: String) -> Date? {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         if let seconds = Double(trimmed) {

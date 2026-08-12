@@ -52,6 +52,11 @@
 		200000000000000000000046 /* TrialProvisioningView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000050 /* TrialProvisioningView.swift */; };
 		200000000000000000000047 /* TrialStatusBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000051 /* TrialStatusBanner.swift */; };
 		200000000000000000000048 /* RelayServerTrust.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000052 /* RelayServerTrust.swift */; };
+		200000000000000000000060 /* RelayHandoff.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000060 /* RelayHandoff.swift */; };
+		200000000000000000000061 /* RelayHandoffCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000061 /* RelayHandoffCardView.swift */; };
+		200000000000000000000062 /* RelayPushService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000062 /* RelayPushService.swift */; };
+		200000000000000000000063 /* HandoffTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000063 /* HandoffTests.swift */; };
+		200000000000000000000064 /* Resources/Localizable.strings in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000064 /* Resources/Localizable.strings */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -114,6 +119,11 @@
 		100000000000000000000050 /* TrialProvisioningView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrialProvisioningView.swift; sourceTree = "<group>"; };
 		100000000000000000000051 /* TrialStatusBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrialStatusBanner.swift; sourceTree = "<group>"; };
 		100000000000000000000052 /* RelayServerTrust.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayServerTrust.swift; sourceTree = "<group>"; };
+		100000000000000000000060 /* RelayHandoff.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayHandoff.swift; sourceTree = "<group>"; };
+		100000000000000000000061 /* RelayHandoffCardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayHandoffCardView.swift; sourceTree = "<group>"; };
+		100000000000000000000062 /* RelayPushService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayPushService.swift; sourceTree = "<group>"; };
+		100000000000000000000063 /* HandoffTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HandoffTests.swift; sourceTree = "<group>"; };
+		100000000000000000000064 /* Resources/Localizable.strings */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; path = Resources/Localizable.strings; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -165,6 +175,7 @@
 				100000000000000000000022 /* Resources/Assets.xcassets */,
 				100000000000000000000025 /* Resources/Fonts/DMSans.ttf */,
 				100000000000000000000026 /* Resources/Fonts/DMMono-Regular.ttf */,
+				100000000000000000000064 /* Resources/Localizable.strings */,
 			);
 			path = POCVault;
 			sourceTree = "<group>";
@@ -175,6 +186,7 @@
 				100000000000000000000003 /* ManifestTests.swift */,
 				100000000000000000000043 /* AccountTests.swift */,
 				100000000000000000000046 /* TrialPairingTests.swift */,
+				100000000000000000000063 /* HandoffTests.swift */,
 			);
 			path = POCVaultTests;
 			sourceTree = "<group>";
@@ -197,6 +209,7 @@
 				100000000000000000000035 /* RelayAccount.swift */,
 				100000000000000000000044 /* RelayTrialNode.swift */,
 				100000000000000000000048 /* RelayNodeStore.swift */,
+				100000000000000000000060 /* RelayHandoff.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -246,6 +259,7 @@
 				100000000000000000000049 /* RelayTrialFlowModel.swift */,
 				100000000000000000000050 /* TrialProvisioningView.swift */,
 				100000000000000000000051 /* TrialStatusBanner.swift */,
+				100000000000000000000061 /* RelayHandoffCardView.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -263,6 +277,7 @@
 			isa = PBXGroup;
 			children = (
 				100000000000000000000028 /* CodexAppServices.swift */,
+				100000000000000000000062 /* RelayPushService.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -378,6 +393,7 @@
 				200000000000000000000019 /* Resources/Assets.xcassets in Resources */,
 				200000000000000000000022 /* Resources/Fonts/DMSans.ttf in Resources */,
 				200000000000000000000023 /* Resources/Fonts/DMMono-Regular.ttf in Resources */,
+				200000000000000000000064 /* Resources/Localizable.strings in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -430,6 +446,9 @@
 				200000000000000000000046 /* TrialProvisioningView.swift in Sources */,
 				200000000000000000000047 /* TrialStatusBanner.swift in Sources */,
 				200000000000000000000048 /* RelayServerTrust.swift in Sources */,
+				200000000000000000000060 /* RelayHandoff.swift in Sources */,
+				200000000000000000000061 /* RelayHandoffCardView.swift in Sources */,
+				200000000000000000000062 /* RelayPushService.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -440,6 +459,7 @@
 				200000000000000000000002 /* ManifestTests.swift in Sources */,
 				200000000000000000000039 /* AccountTests.swift in Sources */,
 				200000000000000000000042 /* TrialPairingTests.swift in Sources */,
+				200000000000000000000063 /* HandoffTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

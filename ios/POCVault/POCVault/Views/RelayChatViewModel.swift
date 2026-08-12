@@ -206,6 +206,16 @@ final class RelayChatViewModel: ObservableObject {
     /// the job reaches a terminal state.
     @Published private(set) var liveJobTails: [String: String] = [:]
 
+    /// Sessions handed over from a Mac. Node-level, not folder-scoped: a handoff
+    /// lands in its own worktree workspace, so it is shown wherever the threads
+    /// list is open rather than filtered to the current folder.
+    @Published private(set) var handoffs: [RelayHandoffCard] = []
+    /// Manifests fetched per handoff (`GET /v1/handoffs/:id`), keyed by id.
+    @Published private(set) var handoffManifests: [String: RelayHandoffManifest] = [:]
+    /// The "On your Mac" index, or nil when no Mac has published one.
+    @Published private(set) var macSessions: RelayMacSessionIndex?
+    @Published private(set) var continuingHandoffIDs: Set<String> = []
+
     /// Registered workspace id for this folder, nil until the folder is registered
     /// (lazy `POST /workspaces/select` on first send).
     @Published private(set) var workspaceID: String?
@@ -327,6 +337,7 @@ final class RelayChatViewModel: ObservableObject {
             models = try await client.fetchModels()
             ensureSelectedChoiceValid()
             await refreshThreads()
+            await refreshHandoffs()
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
@@ -355,6 +366,72 @@ final class RelayChatViewModel: ObservableObject {
             if !isCancellation(error) {
                 errorMessage = error.localizedDescription
             }
+        }
+    }
+
+    // MARK: - Handoffs
+
+    /// Reload the handoff cards and the "On your Mac" index. Never throws and
+    /// never fabricates rows: a node that is unreachable leaves the last known
+    /// state in place rather than blanking the list.
+    func refreshHandoffs() async {
+        do {
+            let cards = try await client.fetchHandoffs()
+            handoffs = cards
+            for card in cards where handoffManifests[card.id] == nil {
+                guard let detail = try? await client.fetchHandoff(id: card.id) else { continue }
+                if let manifest = detail.manifest {
+                    handoffManifests[card.id] = manifest
+                }
+            }
+        } catch {
+            if isCancellation(error) { return }
+            CodexDiagnostics.log("handoff_refresh_failed", fields: ["error": String(describing: error)])
+        }
+
+        if let index = try? await client.fetchMacSessions() {
+            macSessions = index
+        }
+    }
+
+    /// Resume the handed-off session as an ordinary job in its own worktree, so
+    /// it streams over the existing job SSE. The conversation then continues
+    /// that session: follow-up task messages target the handoff's workspace.
+    func continueHandoff(_ card: RelayHandoffCard) async {
+        guard card.isActionable, !continuingHandoffIDs.contains(card.id) else { return }
+        continuingHandoffIDs.insert(card.id)
+        defer { continuingHandoffIDs.remove(card.id) }
+
+        do {
+            let created = try await client.continueHandoff(id: card.id)
+            let job: CodexJob
+            if let createdJob = created.job {
+                job = createdJob
+            } else {
+                job = try await client.fetchJob(id: created.id)
+            }
+            if let workspaceID = job.workspaceId ?? card.workspaceID {
+                adoptWorkspaceID(workspaceID)
+                currentThreadWorkspaceID = workspaceID
+            }
+            currentThreadID = job.threadSessionId ?? job.sessionId ?? job.resumeSessionId
+            currentThreadProvider = job.provider
+            currentThreadWorkspaceName = job.workspaceName ?? currentThreadWorkspaceName
+            messages.append(jobItem(job))
+            attachJobStream(to: job)
+            errorMessage = nil
+            await refreshThreads()
+            await refreshHandoffs()
+        } catch {
+            if isCancellation(error) { return }
+            // The node's own words when it has any (409 "handoff is not ready",
+            // "a job is already running for this handoff"), so a refusal is never
+            // reported as a vague failure.
+            errorMessage = error.localizedDescription
+            CodexDiagnostics.log("handoff_continue_failed", fields: [
+                "handoffId": card.id,
+                "error": String(describing: error)
+            ])
         }
     }
 
