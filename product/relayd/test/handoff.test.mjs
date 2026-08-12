@@ -45,7 +45,7 @@ const { initIdentity, identityPaths, readEncPublicKeyB64 } = await import("../sr
 const { sealTo } = await import("../src/seal.mjs");
 const handoffModule = await import("../src/handoff.mjs");
 const { importHandoff, continueHandoff, completeHandoffJob, startHandoffLoop, checkoutPathFor, isSecretPath,
-  withPinnedCwd } = handoffModule;
+  withPinnedCwd, execFileEscalating } = handoffModule;
 const { store } = await import("../src/store.mjs");
 const { handleAdditionRoutes } = await import("../src/additions.mjs");
 const { sendError } = await import("../src/util.mjs");
@@ -442,6 +442,43 @@ test("M5/M6: hostile repo and branch strings never reach argv, and the handoff s
   assert.deepEqual(escaped(), [], "nothing was written outside the jail");
 });
 
+test("V6: an oversized untrusted value echoed for an operator is clipped, not carried in full", async () => {
+  const id = "clipuntrusted0ab";
+  // "-" every 30 chars keeps every run under the SECRET_PATTERNS opaque-blob
+  // threshold (40+ contiguous [A-Za-z0-9+/]) so redactSecrets leaves this
+  // alone — what is actually under test here is redactUntrusted's OWN
+  // clip(64), not the (separately tested) secret redaction.
+  const hugeRepo = Array(200).fill("a".repeat(30)).join("-");
+  const auditPath = path.join(process.env.CODEX_DATA_DIR, "audit.jsonl");
+  const before = fs.existsSync(auditPath) ? fs.readFileSync(auditPath, "utf8").length : 0;
+
+  const record = await importHandoff({ id, repo: hugeRepo, branch: "relay/handoff-x" }, deps("/nonexistent/repo.git"));
+
+  assert.equal(record.error, "invalid_repo");
+  const lines = fs.readFileSync(auditPath, "utf8").slice(before).trim().split("\n").filter(Boolean).map(JSON.parse);
+  const failure = lines.find((l) => l.event === "handoff_failed" && l.handoffId === id);
+  assert.ok(failure, "an audit entry must exist for the refused import");
+  assert.ok(
+    failure.detail.length < 200,
+    `redactUntrusted must clip the echoed value; got a ${failure.detail.length}-char detail from a 5000-char repo`,
+  );
+});
+
+// NOTE on parsePorcelainZ's "R"/"C" origin-path consumption (V5 in the
+// mutation catalog): tried to reach it here with a real rename plus
+// `status.renames=true` in the push's HOME, and could not. `completeHandoffJob`
+// always runs `git reset -q` immediately before the status call, so nothing
+// is ever staged when it runs — and git's status/diff rename detection (with
+// or without `status.renames`/`--find-renames`) only correlates a deleted
+// path with a new one when the comparison is against STAGED content, never
+// for two working-tree-only changes. Confirmed directly against git 2.54: a
+// tracked-then-deleted file plus a new untracked file never produces an "R"
+// entry from `git status --porcelain -z --untracked-files=all`, staged or
+// not. That makes this branch appear to be dead code given how this module
+// calls git today — left in place as defence against a future edit that adds
+// a status call without the preceding reset, not chased further with a
+// synthetic test that wouldn't actually exercise it.
+
 // ---------------------------------------------------------------------------
 // The jail (property 1).
 
@@ -500,6 +537,49 @@ test("I1: a symlink pre-planted at the checkout path is destroyed, never followe
   assert.equal(fs.lstatSync(checkoutPathFor(id)).isDirectory(), true, "a real directory replaced the link");
   assert.equal(fs.readFileSync(precious, "utf8"), "do not touch\n", "the victim directory is untouched");
   assert.deepEqual(escaped(), [], "the clone must not have landed through the symlink");
+});
+
+test("m-5: a benign ENOENT racing removePinnedEntry's own unlink must not fail an otherwise-clean import", async () => {
+  // removePinnedEntry's lstat-then-unlink is two syscalls with nothing this
+  // module controls in between; if whatever it lstat'd (a pre-planted
+  // symlink, here) is gone by the time unlink runs, that is not a failure —
+  // the entry the module wanted gone is already gone. Without a specific
+  // catch for it, the raw ENOENT propagates uncaught and importHandoff
+  // reports "internal_error" for what was actually a clean import.
+  const id = "raceenoentabcdef";
+  fs.symlinkSync(path.join(OUTSIDE, "does-not-need-to-exist"), checkoutPathFor(id));
+  // removePinnedEntry runs inside withPinnedCwd and unlinks by the bare
+  // RELATIVE name (a single path component resolved from the pinned cwd),
+  // never the absolute path — match on that.
+  const targetName = path.basename(checkoutPathFor(id));
+
+  const originalUnlinkSync = fs.unlinkSync;
+  let intercepted = false;
+  fs.unlinkSync = (p, ...rest) => {
+    if (!intercepted && p === targetName) {
+      intercepted = true;
+      // Simulate a racing remover that gets there first: the entry is
+      // ACTUALLY gone (a real concurrent unlink would really remove it) by
+      // the time this call's own unlink(2) runs, which is why it sees ENOENT
+      // rather than succeeding itself.
+      originalUnlinkSync.call(fs, p, ...rest);
+      const error = new Error(`ENOENT: no such file or directory, unlink '${p}'`);
+      error.code = "ENOENT";
+      throw error;
+    }
+    return originalUnlinkSync.call(fs, p, ...rest);
+  };
+
+  let record;
+  try {
+    const origin = await makeOriginRepo({ manifest: { ...MANIFEST, id } });
+    record = await importHandoff({ id, repo: MANIFEST.repo, branch: MANIFEST.branch }, deps(origin));
+  } finally {
+    fs.unlinkSync = originalUnlinkSync;
+  }
+
+  assert.ok(intercepted, "the fixture must actually have raced removePinnedEntry's unlink");
+  assert.equal(record.state, "ready", "a lost ENOENT race on an entry that is already gone must not fail the import");
 });
 
 test("I1: a same-uid racer swapping the checkout path cannot get a single byte outside the jail", async () => {
@@ -645,6 +725,40 @@ test("M30: a node with no encryption key refuses rather than importing blindly",
   assert.equal(fs.existsSync(checkoutPathFor(id)), false, "the checkout is cleaned up");
 });
 
+test("I-3: the published checkout swapped for a symlink out of the jail before registration is refused, not silently accepted", async () => {
+  const id = "wsregswap000abcd";
+  const origin = await makeOriginRepo({ manifest: { ...MANIFEST, id } });
+  const spoil = path.join(OUTSIDE, "wsreg-spoil");
+
+  const record = await importHandoff(
+    { id, repo: MANIFEST.repo, branch: MANIFEST.branch },
+    deps(origin, {
+      // The same same-uid race this whole module exists to defend against:
+      // move the just-published, containment-verified checkout aside and
+      // leave a symlink to it out of the jail at the stable name. This is
+      // NOT unreachable "by construction" — browseWorkspaceForPath
+      // re-resolves `checkout` from "/" right here and gets a different,
+      // outside answer, because containment was proved at PUBLISH time,
+      // several lines above, not at this one.
+      beforeWorkspaceRegistration(checkout) {
+        fs.renameSync(checkout, spoil);
+        fs.symlinkSync(spoil, checkout);
+      },
+    }),
+  );
+
+  assert.equal(record.state, "failed");
+  assert.equal(record.error, "workspace_registration_failed");
+  assert.equal(store.getHandoff(id).state, "failed");
+  // The symlink at our stable name is unlinked, never followed, and the
+  // attacker's tree at `spoil` is left alone: a cleanup that deletes what it
+  // did not create is an arbitrary-delete primitive aimed wherever an
+  // attacker points it.
+  assert.equal(fs.existsSync(checkoutPathFor(id)), false, "the stable name is cleared");
+  assert.ok(fs.existsSync(path.join(spoil, "README.md")), "the swapped-aside tree itself is left alone, not deleted");
+  fs.rmSync(spoil, { recursive: true, force: true });
+});
+
 // ---------------------------------------------------------------------------
 // The manifest (I5).
 
@@ -778,6 +892,133 @@ test("CRITICAL 3: credentials in the working tree cannot ride the push back", as
   assert.ok(fs.existsSync(path.join(checkout, ".env")), "withholding must not destroy the user's file");
 });
 
+test("I-2: layer 2 catches a secret that reaches the index by a path layer 1 never enumerated", async () => {
+  // Layer 1 filters the paths `git status` reported, once, at the start.
+  // Layer 2 re-checks the paths that ACTUALLY reached the index. These are
+  // not the same input: between the status snapshot and the `git add` calls
+  // there is a real window (a chunked loop, each iteration `await`ed) during
+  // which the same-uid coding agent this module's threat model already
+  // assumes — the harness that just ran in this checkout — can change what a
+  // reported name resolves to. Here a plain file reported as "work.txt"
+  // becomes a DIRECTORY containing a secret before `git add -- work.txt`
+  // runs: git recurses into it and stages "work.txt/.env", a path layer 1
+  // never saw and so never filtered. Layer 2 is the only thing standing
+  // between that and a live key on the remote's history — proven by
+  // literally deleting the layer-2 check and re-running this test (see
+  // task-14-report.md): the push then succeeds and the secret lands in
+  // `git log -p --all` on the origin.
+  const id = "toctoulayer2abcd";
+  const { origin, checkout } = await stageHandoffForPush(id, { lastJobId: "job-toctou-1" });
+  const SECRET = "sk-live-zqxTOCTOUSECRETzqx";
+  fs.writeFileSync(path.join(checkout, "work.txt"), "legit content, for now\n");
+  const localEvents = captureLocalEvents();
+
+  const swapAfterStatus = async (bin, args, options) => {
+    const result = await execFileAsync(bin, args, options);
+    if (args[2] === "status") {
+      fs.rmSync(path.join(checkout, "work.txt"), { force: true });
+      fs.mkdirSync(path.join(checkout, "work.txt"));
+      fs.writeFileSync(path.join(checkout, "work.txt", ".env"), `OPENAI_API_KEY=${SECRET}\n`);
+    }
+    return result;
+  };
+
+  const result = await completeHandoffJob(
+    { id: "job-toctou-1", status: "succeeded", workspaceId: "dir-handoff-x" },
+    { execFileImpl: swapAfterStatus },
+  );
+
+  assert.equal(result.pushed, false, "the push must be blocked, not merely have the secret filtered back out");
+  assert.equal(result.reason, "push_blocked_secret");
+  assert.equal(store.getHandoff(id).error, "push_blocked_secret");
+  assert.deepEqual(
+    localEvents().filter((event) => event.name.startsWith("handoff.")).map((event) => event.name),
+    ["handoff.push_failed"],
+  );
+  const { stdout } = await execFileAsync("git", ["-C", origin, "log", "-p", "--all"], { maxBuffer: 32 * 1024 * 1024 });
+  assert.equal(stdout.includes(SECRET), false, "the secret value must never exist anywhere in the pushed history");
+});
+
+test("I-1: a file named ':!x' must not silently defeat the push — git add takes pathspecs, not filenames", async () => {
+  const id = "pathspec000babcd";
+  const { origin, checkout } = await stageHandoffForPush(id, { lastJobId: "job-pathspec-1" });
+  fs.writeFileSync(path.join(checkout, "work.txt"), "the agent's work\n");
+  // ":!work.txt" is a NEGATIVE pathspec ("exclude anything matching
+  // work.txt"), not a filename, unless GIT_LITERAL_PATHSPECS is set. Without
+  // the fix, `git add -- ":!work.txt" "work.txt"` stages NOTHING — the
+  // exclusion wins over the inclusion for the exact name it names — so no
+  // commit is made, `git push` succeeds as a no-op, record.error is cleared,
+  // and the phone is told handoff.pushed — while work.txt never left the
+  // sandbox. That silence is exactly the invariant this module exists to
+  // hold: every failure ends visible.
+  fs.writeFileSync(path.join(checkout, ":!work.txt"), "an ordinary file that happens to look like a pathspec\n");
+
+  const result = await completeHandoffJob({ id: "job-pathspec-1", status: "succeeded", workspaceId: "dir-handoff-x" });
+
+  assert.equal(result.pushed, true, "the push must still succeed");
+  const pushed = await branchFilesOnOrigin(origin, MANIFEST.branch);
+  assert.ok(pushed.includes("work.txt"), "the agent's real work must reach the remote even with a pathspec-shaped filename present");
+  assert.ok(pushed.includes(":!work.txt"), "the pathspec-shaped filename must be staged and pushed literally, not interpreted");
+});
+
+test("I-1: a file named '*' cannot re-glob a withheld secret back into the index", async () => {
+  const id = "pathspec0starabc";
+  const { origin, checkout } = await stageHandoffForPush(id, { lastJobId: "job-pathspec-2" });
+  const SECRET = "sk-live-zqxGLOBSECRETzqx";
+  fs.writeFileSync(path.join(checkout, ".env"), `OPENAI_API_KEY=${SECRET}\n`);
+  fs.writeFileSync(path.join(checkout, "*"), "a legitimately named file, not a wildcard\n");
+  fs.writeFileSync(path.join(checkout, "work.txt"), "legit work\n");
+
+  const result = await completeHandoffJob({ id: "job-pathspec-2", status: "succeeded", workspaceId: "dir-handoff-x" });
+
+  // With literal pathspecs, "*" adds only the file literally named "*" — it
+  // does not re-glob ".env" back into the set layer 1 withheld. The push
+  // must succeed with the legitimate files and the secret must never reach
+  // the remote (not even under layer 2's fail-closed reason).
+  assert.equal(result.pushed, true, "the legitimate work still gets pushed");
+  const pushed = await branchFilesOnOrigin(origin, MANIFEST.branch);
+  assert.ok(pushed.includes("work.txt") && pushed.includes("*"), "the legitimately named files reach the remote");
+  assert.equal(pushed.includes(".env"), false, "the withheld secret must not be re-globbed back into the index");
+  const { stdout } = await execFileAsync("git", ["-C", origin, "log", "-p", "--all"], { maxBuffer: 32 * 1024 * 1024 });
+  assert.equal(stdout.includes(SECRET), false, "the secret value must not exist anywhere in the pushed history");
+});
+
+test("I-1: the push refspec is fully qualified, so a branch name cannot be read as a force-push flag", async () => {
+  const id = "pathspecrefspec1";
+  const origin = await makeOriginRepo({ manifest: { ...MANIFEST, id } });
+  await importHandoff({ id, repo: MANIFEST.repo, branch: MANIFEST.branch }, deps(origin));
+  store.saveHandoff({ ...store.getHandoff(id), lastJobId: "job-pathspec-3" });
+  const checkout = checkoutPathFor(id);
+  fs.writeFileSync(path.join(checkout, "work.txt"), "legit work\n");
+
+  let pushArgs = null;
+  // completeHandoffJob's own execFileImpl is not swappable from the deps()
+  // helper (push-back always used the real git binary); this hooks the same
+  // seam runImport already uses elsewhere in the file, applied here so the
+  // exact argv reaching git can be inspected without needing a branch name
+  // that could survive git's own ref-format validation (a leading "+" is a
+  // legal ref character, unlike ":" "^" "?" "*" "[", which check-ref-format
+  // already forbids).
+  const spy = async (bin, args, options) => {
+    // args are ["-C", checkout, <git subcommand>, ...] for every call this
+    // module makes here.
+    if (args[2] === "push") pushArgs = args;
+    return execFileAsync(bin, args, options);
+  };
+
+  const result = await completeHandoffJob(
+    { id: "job-pathspec-3", status: "succeeded", workspaceId: "dir-handoff-x" },
+    { execFileImpl: spy },
+  );
+
+  assert.equal(result.pushed, true);
+  assert.deepEqual(
+    pushArgs.slice(-1),
+    [`refs/heads/${MANIFEST.branch}:refs/heads/${MANIFEST.branch}`],
+    "the push argument must be a fully-qualified two-sided refspec, never a bare branch name a leading '+' could turn into a force-push",
+  );
+});
+
 test("the secret-path policy matches by shape, not by the two names that were reported", () => {
   const denied = [
     ".env", ".env.local", "sub/dir/.env.production", ".envrc", ".secrets/harness-token.json",
@@ -811,6 +1052,41 @@ test("I3: a failed push is announced, not just audited, and the record says so",
   );
 });
 
+test("m-2: a continue landing during a multi-second push must not have its lastJobId reverted", async () => {
+  // completeHandoffJob reads the record ONCE at the top and, on the way out,
+  // persists a copy of THAT stale snapshot with only error/updatedAt changed.
+  // A `continue` that lands while the push is still running (git push can
+  // take seconds) updates `lastJobId` in the store in the meantime; if the
+  // push's own final persist() spreads the stale snapshot, it silently
+  // reverts that update the instant the push finishes.
+  const id = "concurrentlastjb";
+  const { checkout } = await stageHandoffForPush(id, { lastJobId: "job-m2-first" });
+  fs.writeFileSync(path.join(checkout, "work.txt"), "work\n");
+
+  const raceInAContinue = async (bin, args, options) => {
+    const result = await execFileAsync(bin, args, options);
+    if (args[2] === "status") {
+      // Simulate the record store's view of a concurrent continueHandoff:
+      // a second job was enqueued and lastJobId moved on while this push
+      // was still in flight.
+      store.saveHandoff({ ...store.getHandoff(id), lastJobId: "job-m2-second" });
+    }
+    return result;
+  };
+
+  const result = await completeHandoffJob(
+    { id: "job-m2-first", status: "succeeded", workspaceId: "dir-handoff-x" },
+    { execFileImpl: raceInAContinue },
+  );
+
+  assert.equal(result.pushed, true);
+  assert.equal(
+    store.getHandoff(id).lastJobId,
+    "job-m2-second",
+    "a concurrent continue's lastJobId must survive the push's own final persist",
+  );
+});
+
 test("I3: a job that did not succeed, and an orphaned job, are both reported rather than silently null", async () => {
   const id = "pushskip0000abcd";
   await stageHandoffForPush(id, { lastJobId: "job-skip-1" });
@@ -827,8 +1103,159 @@ test("I3: a job that did not succeed, and an orphaned job, are both reported rat
   assert.equal(await completeHandoffJob({ id: "job-ordinary", status: "succeeded", workspaceId: "scratch" }), null);
 });
 
+test("V1: a checkout path swapped for a symlink itself is not resolved for a push", async () => {
+  const id = "verifiedchkout01";
+  const { checkout } = await stageHandoffForPush(id, { lastJobId: "job-verified-1" });
+  const spoil = path.join(OUTSIDE, "verifiedcheckout-spoil");
+  fs.mkdirSync(spoil, { recursive: true });
+  fs.writeFileSync(path.join(spoil, "not-yours.txt"), "attacker content\n");
+  // Same containment attack as I-3, aimed at the PUSH side instead of the
+  // pickup side: the stable checkout name is swapped for a symlink pointing
+  // outside the jail between when a job finished and when the push-back
+  // resolves the checkout it should commit and push from.
+  fs.rmSync(checkout, { recursive: true, force: true });
+  fs.symlinkSync(spoil, checkout);
+
+  const result = await completeHandoffJob({ id: "job-verified-1", status: "succeeded", workspaceId: "dir-handoff-x" });
+
+  assert.equal(result.pushed, false, "a checkout that no longer resolves inside the jail must never be pushed from");
+  assert.equal(result.reason, "checkout_missing");
+  fs.rmSync(spoil, { recursive: true, force: true });
+});
+
+test("V2: a checkout reached only through a symlinked ANCESTOR (real leaf, different realpath) is not resolved for a push", async () => {
+  // V1 swaps the leaf itself for a symlink, which lstat catches directly.
+  // This is the other half: the leaf stays a REAL directory, but an ancestor
+  // component is a symlink, so the literal path still lstats as a directory
+  // while fs.realpathSync resolves to a different string outside the jail —
+  // exactly what `real !== expected || !resolvedPathWithinRoot(real)` exists
+  // to catch, and what V1 alone cannot exercise.
+  const id = "verifiedchkout02";
+  await stageHandoffForPush(id, { lastJobId: "job-verified-2" });
+  const realRoot = fs.realpathSync(workspaceRoot);
+  const elsewhere = `${realRoot}-ancestor-swap`;
+  fs.renameSync(realRoot, elsewhere); // the real checkout (with .git) moves too
+  fs.symlinkSync(elsewhere, realRoot);
+  try {
+    const result = await completeHandoffJob({ id: "job-verified-2", status: "succeeded", workspaceId: "dir-handoff-x" });
+    assert.equal(result.pushed, false, "a checkout reached only via a symlinked ancestor must never be pushed from");
+    assert.equal(result.reason, "checkout_missing");
+  } finally {
+    fs.rmSync(realRoot, { force: true });
+    fs.renameSync(elsewhere, realRoot);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The jail root (resolveJailRoot).
+
+test("resolveJailRoot: the browse root swapped for a symlink is refused, not silently trusted", async () => {
+  const realRoot = fs.realpathSync(workspaceRoot);
+  const elsewhere = `${realRoot}-elsewhere-symlink`;
+  fs.renameSync(realRoot, elsewhere);
+  fs.symlinkSync(elsewhere, realRoot);
+  try {
+    const id = "jailrootsymlnk01";
+    const origin = await makeOriginRepo({ manifest: { ...MANIFEST, id } });
+    const record = await importHandoff({ id, repo: MANIFEST.repo, branch: MANIFEST.branch }, deps(origin));
+    assert.equal(record.state, "failed");
+    assert.equal(record.error, "jail_root_unusable", "a symlinked browse root must never be trusted as the jail");
+  } finally {
+    fs.rmSync(realRoot, { force: true }); // unlink the symlink we planted
+    fs.renameSync(elsewhere, realRoot);
+  }
+});
+
+test("resolveJailRoot: the browse root swapped for a plain file is refused, not silently trusted", async () => {
+  const realRoot = fs.realpathSync(workspaceRoot);
+  const elsewhere = `${realRoot}-elsewhere-file`;
+  fs.renameSync(realRoot, elsewhere);
+  fs.writeFileSync(realRoot, "not a directory\n");
+  try {
+    const id = "jailrootfile0001";
+    const origin = await makeOriginRepo({ manifest: { ...MANIFEST, id } });
+    const record = await importHandoff({ id, repo: MANIFEST.repo, branch: MANIFEST.branch }, deps(origin));
+    assert.equal(record.state, "failed");
+    assert.equal(record.error, "jail_root_unusable", "a browse root that is not a directory must never be trusted as the jail");
+  } finally {
+    fs.rmSync(realRoot, { force: true });
+    fs.renameSync(elsewhere, realRoot);
+  }
+});
+
+test("resolveJailRoot: an ancestor swapped for a symlink (real leaf, different realpath) is refused, not silently trusted", async () => {
+  // The two tests above swap the LEAF (workspaceBrowseRoot) itself. This is
+  // the other half: the leaf directory entry stays a REAL directory —
+  // isSymbolicLink() and isDirectory() both pass — but an ANCESTOR component
+  // is now a symlink, so fs.realpathSync resolves the whole path to a
+  // DIFFERENT string than the one config.mjs froze at boot. That is exactly
+  // what "the browse root moved after startup" exists to catch, and neither
+  // of the other two tests can exercise it.
+  const realParent = fs.realpathSync(root);
+  const elsewhere = `${realParent}-ancestor-swap`;
+  fs.renameSync(realParent, elsewhere); // everything under root moves, including workspaceRoot
+  fs.symlinkSync(elsewhere, realParent);
+  try {
+    const id = "jailrootancestor";
+    const origin = await makeOriginRepo({ manifest: { ...MANIFEST, id } });
+    const record = await importHandoff({ id, repo: MANIFEST.repo, branch: MANIFEST.branch }, deps(origin));
+    assert.equal(record.state, "failed");
+    assert.equal(record.error, "jail_root_unusable", "a browse root reached only through a symlinked ancestor must never be trusted as the jail");
+  } finally {
+    fs.rmSync(realParent, { force: true });
+    fs.renameSync(elsewhere, realParent);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // The pickup loop (C2).
+
+test("L5: waitSec is floored to at least 1 before it is ever sent to the cloud", async () => {
+  for (const [waitSec, expected] of [[0, 1], [-5, 1], [NaN, 1], [0.9, 1], [3.9, 3]]) {
+    let seen = null;
+    const loop = startHandoffLoop({
+      cloud: { async pollHandoffs(sec) { seen ??= sec; return []; } },
+      waitSec,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    loop.stop();
+    assert.equal(seen, expected, `waitSec ${waitSec} must floor to ${expected}, got ${seen}`);
+  }
+});
+
+test("L6: a poll cycle never imports more than the batch cap, and the rest arrive next cycle", async () => {
+  const attempted = [];
+  let cycle = 0;
+  const cloud = {
+    async pollHandoffs() {
+      cycle += 1;
+      if (cycle > 1) return [];
+      // 30 descriptors in one answer — more than MAX_POLL_BATCH (20).
+      // Deliberately invalid ids (a "/" fails assertSafeHandoffId at once,
+      // synchronously) so each settles instantly with no network I/O — the
+      // batch cap is what is under test here, not the clone path.
+      return Array.from({ length: 30 }, (_, i) => ({ id: `../capbatch${String(i).padStart(8, "0")}`, repo: "me/relay", branch: "b" }));
+    },
+  };
+  // No direct hook into the loop's own importHandoff call; count via the
+  // audit trail instead, which is emitted once per attempted import
+  // regardless of outcome (every one of these ids is invalid, so each
+  // becomes exactly one handoff_failed audit — countable and deterministic).
+  const before = fs.existsSync(path.join(process.env.CODEX_DATA_DIR, "audit.jsonl"))
+    ? fs.readFileSync(path.join(process.env.CODEX_DATA_DIR, "audit.jsonl"), "utf8").length
+    : 0;
+
+  const loop = startHandoffLoop({ cloud, waitSec: 1 });
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  loop.stop();
+
+  const auditPath = path.join(process.env.CODEX_DATA_DIR, "audit.jsonl");
+  const lines = fs.readFileSync(auditPath, "utf8").slice(before).trim().split("\n").filter(Boolean).map(JSON.parse);
+  // An invalid id is unrecordable, so handoffId is null on its audit entry;
+  // the id survives (clipped) inside `detail` instead.
+  attempted.push(...lines.filter((l) => l.event === "handoff_failed" && String(l.detail).includes("capbatch")));
+  assert.equal(attempted.length, 20, `exactly MAX_POLL_BATCH (20) of the 30 offered must be attempted in the first cycle, got ${attempted.length}`);
+});
 
 test("C2: the poll loop has a floor on the SUCCESS path", async () => {
   let polls = 0;
@@ -946,6 +1373,32 @@ test("M2: checkoutPathFor validates the id itself, so no caller can hand it an u
   }
 });
 
+test("m-1: execFileEscalating kills a child that ignores SIGTERM instead of hanging forever", async () => {
+  // execFile's own `timeout` sends SIGTERM once. A well-behaved child (real
+  // git) exits; this one traps and ignores it, standing in for the one
+  // remaining unbounded wait the review found: without escalation, this
+  // promise would never settle, and runImport — the whole pickup loop behind
+  // it — would wedge forever.
+  const script = path.join(root, "ignore-sigterm.sh");
+  fs.writeFileSync(script, "#!/bin/sh\ntrap '' TERM\nsleep 30\n");
+  fs.chmodSync(script, 0o755);
+
+  const startedAt = Date.now();
+  await assert.rejects(
+    () => execFileEscalating("/bin/sh", [script], { timeout: 200 }),
+    "a child that ignores SIGTERM must still be killed, not hang the caller forever",
+  );
+  const elapsedMs = Date.now() - startedAt;
+  // Killed within timeout + grace + generous scheduling slack, never anywhere
+  // near the child's own 30s sleep.
+  assert.ok(elapsedMs < 10_000, `expected escalation well under 10s, took ${elapsedMs}ms`);
+});
+
+test("m-1: execFileEscalating does not touch a child that exits on its own before the timeout", async () => {
+  const result = await execFileEscalating(process.execPath, ["-e", "console.log('ok')"], { timeout: 5000 });
+  assert.match(result.stdout, /ok/);
+});
+
 test("N2: withPinnedCwd refuses a directory that is not really the directory it was asked for", () => {
   const realDir = path.join(OUTSIDE, "pin-real");
   const linkDir = path.join(OUTSIDE, "pin-link");
@@ -1024,9 +1477,11 @@ test("M18/M19: the clone runs with the run home and with git's terminal prompt d
   const origin = await makeOriginRepo({ manifest: { ...MANIFEST, id } });
   let seenEnv = null;
   let seenArgs = null;
+  let seenTimeout = null;
   const spy = async (bin, args, options) => {
     seenEnv = options?.env;
     seenArgs = args;
+    seenTimeout = options?.timeout;
     return execFileAsync(bin, args, options);
   };
 
@@ -1037,6 +1492,9 @@ test("M18/M19: the clone runs with the run home and with git's terminal prompt d
   // a terminal prompt would hang the pickup loop until the timeout.
   assert.equal(seenEnv.HOME, runHome);
   assert.equal(seenEnv.GIT_TERMINAL_PROMPT, "0");
+  // M31: no git invocation may hang the pickup loop unbounded — the clone
+  // must always carry a finite timeout.
+  assert.ok(Number.isFinite(seenTimeout) && seenTimeout > 0, `the clone must carry a finite timeout, got ${seenTimeout}`);
   // The credential never rides in argv, whatever else the argv carries.
   assert.equal(seenArgs.some((arg) => /token|password|@github\.com/i.test(String(arg))), false);
 });

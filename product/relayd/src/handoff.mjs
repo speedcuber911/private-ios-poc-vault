@@ -18,10 +18,17 @@
 // swap entries there while we work.
 //
 // TWO PROPERTIES govern this module. Neither is a list of patched findings.
+// PROPERTY 1 is stated exactly, not rounded up to something tidier — a
+// second, independent review found the tidier version false and the true one
+// still holds; read RESIDUAL below before trusting any summary of what this
+// module guarantees, including this one:
 //
-//   1. Nothing this module creates may exist outside the jail
-//      (workspaceBrowseRoot) at ANY instant — not transiently, not on a
-//      failure path.
+//   1. No sequence of symlinks, renames or unlinks can make this module
+//      RESOLVE A NAME THE ATTACKER CONTROLS and write through it. This is
+//      NOT the same as "nothing this module creates ever exists outside the
+//      jail at any instant" — that stronger claim is false in the presence
+//      of the same-uid attacker this module's own threat model assumes; see
+//      RESIDUAL.
 //
 //   2. Every handoff reaches a terminal, visible state. No input may leave one
 //      wedged in `importing`, and no failure may be silent.
@@ -70,13 +77,32 @@
 // restored in a `finally` before the clone has done anything at all (`spawn`
 // creates the child synchronously; only its completion is asynchronous).
 //
-// RESIDUAL, stated rather than hidden: a same-uid attacker can `rename` a
-// directory we created at any moment, and the bytes follow the inode. That is
-// not a write to a path of THEIR choosing through OUR privileges — they moved a
-// directory they could equally have moved a second later — and it can never be
-// published, because the identity check at (e) refuses it. No sequence of
-// symlinks, renames or unlinks can make this module write through a name the
-// attacker controls.
+// RESIDUAL, stated rather than hidden, and corrected once already — an
+// earlier version of this paragraph claimed the relocation below was "not a
+// path of their choosing"; a reviewer moved a complete in-progress clone
+// (2,446 filesystem entries) to a destination they picked and proved that
+// claim wrong. What is actually true, no more and no less:
+//
+//   - A same-uid attacker CAN `rename` a directory we created, at any moment,
+//     to A DESTINATION OF THEIR CHOOSING, and the bytes follow the inode
+//     there. That destination is real, not hypothetical, and is exactly as
+//     attacker-chosen as any other path they control.
+//   - What they gain from it is nothing: no privilege of this module is
+//     borrowed to do it (relayd and the harness sharing this sandbox run at
+//     the same uid with no drop, so the attacker could already read and write
+//     that destination directly), and the relocated tree can NEVER be
+//     published under a handoff's name — the identity check at (e) compares
+//     the entry about to be published against the exact inode git cloned
+//     into, and a renamed-away directory fails that check every time.
+//
+// So: no sequence of symlinks, renames or unlinks can make this module
+// RESOLVE a name the attacker controls and write through it — that is
+// PROPERTY 1 as stated above, and it holds. "Nothing this module creates
+// exists outside the jail at any instant" is a different, stronger claim,
+// and it does NOT hold: a lost race can leave a complete tree this module
+// created sitting outside the jail, at a path the attacker chose, forever —
+// just never listed, never resumed, and never reachable through this
+// module's own jailed name for it.
 //
 // PROPERTY 2 is structural too. `importHandoff` is a settle function: the
 // whole pickup runs inside `runImport`, which either returns a ready record or
@@ -94,7 +120,6 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 
 import { workspaceBrowseRoot, runHome as configuredRunHome, codexHome, gitBin } from "./config.mjs";
 import { identityPaths, readEncPrivateKeyPem } from "./identity.mjs";
@@ -107,7 +132,44 @@ import { appendAudit } from "./audit.mjs";
 import { enqueueJob, jobs } from "./jobs.mjs";
 import { nowIso } from "./util.mjs";
 
-const execFileAsync = promisify(execFile);
+// execFile's own `timeout` option sends `killSignal` (SIGTERM by default)
+// exactly ONCE when it elapses. Real git does not trap SIGTERM, so this is
+// untested against real git — but any child that DOES ignore it (a wedged
+// helper, a broken credential prompt that swallows signals) leaves the
+// callback unfired and the promise pending FOREVER: runImport, and therefore
+// the whole pickup loop behind it, wedges — the one remaining unbounded wait
+// in this module. Escalate: if the child is still alive a grace period after
+// its own timeout should have ended it, send SIGKILL unconditionally. This
+// bypasses the injectable execFileImpl on purpose — it is the PRODUCTION
+// default, not something a test should be able to weaken by supplying its own
+// execFileImpl without also opting into no escalation.
+const GIT_KILL_GRACE_MS = 3000;
+
+function execFileEscalating(bin, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    let killTimer = null;
+    const child = execFile(bin, args, options, (error, stdout, stderr) => {
+      if (killTimer) clearTimeout(killTimer);
+      if (error) {
+        error.stdout = stdout;
+        error.stderr = stderr;
+        reject(error);
+      } else {
+        resolve({ stdout, stderr });
+      }
+    });
+    if (Number.isFinite(options.timeout)) {
+      killTimer = setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          /* already gone */
+        }
+      }, options.timeout + GIT_KILL_GRACE_MS);
+      killTimer.unref?.();
+    }
+  });
+}
 
 const MAX_SEALED_BLOB_BYTES = 20 * 1024 * 1024;
 // A manifest is a few hundred bytes of names. 64 KB is three orders of
@@ -378,6 +440,18 @@ function resolveJailRoot() {
 // can run, let alone observe the changed cwd, and it is restored in a `finally`
 // before the block returns. (`spawn` creates the child synchronously; only its
 // completion is asynchronous, and by then the cwd is already restored.)
+//
+// LANDMINE FOR THE NEXT EDIT (m-10): libuv resolves a relative `fs` path in
+// its threadpool thread at SYSCALL time, not at call time — so an ASYNC fs
+// call issued anywhere in this process, even one that looks unrelated,
+// before a pinned block's `chdir` can still resolve against the MOVED cwd if
+// its syscall hasn't run yet by the time the pin lands. This does not bite
+// today because every pinned block here is genuinely await-free and
+// `relayd/src` has no other relative-path `fs` call site — but the moment
+// either of those stops being true, a bystander async fs call becomes
+// capturable. Do not add an `await` inside a pinned block, and do not add a
+// relative-path fs call (including a relative RELAYD_GIT_BIN) anywhere else
+// in this daemon without re-checking this.
 function withPinnedCwd(dir, expected, fn) {
   if (typeof process.chdir !== "function") {
     // A worker thread has no chdir, so nothing here can hold its guarantee.
@@ -391,6 +465,14 @@ function withPinnedCwd(dir, expected, fn) {
     // path, not the string we asked for: if `dir` was a symlink, or an
     // ancestor was swapped, or the browse root itself was renamed aside and
     // replaced, the two differ and nothing has been written yet.
+    //
+    // (m-11) This proof depends on being the FIRST process.cwd() call after
+    // the chdir above, and on nothing else. Node CACHES the cwd string on
+    // every call after the one right after a chdir, so a second call here
+    // would silently read the cache instead of calling getcwd(2) again — the
+    // check would still pass, but it would no longer be proving anything.
+    // Do not insert another process.cwd() (or anything that might call it)
+    // between the chdir above and this line.
     if (process.cwd() !== expected) {
       throw refuse("checkout_escaped_jail", "the working directory is not the directory we asked for");
     }
@@ -483,7 +565,16 @@ function removePinnedEntry(name) {
     throw refuse("checkout_publish_failed", `cannot stat the checkout path (${error?.code})`, error);
   }
   if (entry.isSymbolicLink() || !entry.isDirectory()) {
-    fs.unlinkSync(name);
+    // lstat-then-unlink is two syscalls with nothing this module controls in
+    // between. If the entry is already gone by the time unlink runs, that is
+    // not a failure — what this call wanted gone is already gone — but
+    // without this catch the raw ENOENT propagated uncaught and turned a
+    // clean import into a public "internal_error".
+    try {
+      fs.unlinkSync(name);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
     return true;
   }
   fs.rmSync(name, { recursive: true, force: true });
@@ -924,8 +1015,21 @@ async function runImport(id, descriptor, base, options, adoptCheckout) {
     throw refuse("session_staging_failed", error?.code || undefined, error);
   }
 
+  // Test-only seam: lets a test simulate, deterministically, the same same-uid
+  // race this whole module exists to defend against — swapping the published
+  // checkout for a symlink out of the jail — in the narrow window right
+  // before registration, without needing to actually win a race. A no-op in
+  // production.
+  options.beforeWorkspaceRegistration?.(checkout);
+
   // Registered LAST, so a failure earlier never leaves an attacker-supplied
-  // clone listed as a browsable workspace.
+  // clone listed as a browsable workspace. This is NOT unreachable by
+  // construction: containment was proved at publish time, above, not here.
+  // browseWorkspaceForPath re-resolves `checkout` from `/` and returns null
+  // the moment that resolution leaves the browse root — reachable by exactly
+  // the same-uid attacker who can already rename or symlink a path component
+  // between publish and this call, which is the premise of this entire
+  // module's threat model, not a hypothetical.
   const workspace = browseWorkspaceForPath(checkout, { materialize: true });
   if (!workspace) throw refuse("workspace_registration_failed");
 
@@ -950,8 +1054,9 @@ async function importHandoff(descriptor, options = {}) {
     cloud: options.cloud ?? null,
     baseDir: options.baseDir,
     runHome: options.runHome ?? configuredRunHome,
-    execFileImpl: options.execFileImpl ?? execFileAsync,
+    execFileImpl: options.execFileImpl ?? execFileEscalating,
     remoteUrlFor: options.remoteUrlFor ?? ((repo) => `https://github.com/${repo}.git`),
+    beforeWorkspaceRegistration: options.beforeWorkspaceRegistration,
   };
 
   let id;
@@ -1086,6 +1191,15 @@ async function continueHandoff(id, { prompt = null, certSubject = null } = {}) {
 // So the policy is code, applied to an explicit file list, and then re-checked
 // against what actually reached the index. `.gitignore` remains a first filter
 // (git status honours it), never the control.
+//
+// Two honest limits, stated rather than assumed away: (m-6) a SYMLINK whose
+// name isn't secret-shaped is pushed as a symlink object — its target PATH
+// (which can be a host path) reaches the remote even though its bytes never
+// do. (m-7) this is a NAME policy, not a content scanner: a secret pasted
+// into a file whose name doesn't match SECRET_PATH_RULES (e.g. notes.md)
+// is pushed. Both are inherent to matching by shape rather than reading
+// every byte of every file; worth knowing before assuming this list is a
+// content-aware secret scanner.
 const SECRET_PATH_RULES = [
   /(^|\/)\.env($|[.\-_])/i,
   /(^|\/)\.envrc$/i,
@@ -1183,13 +1297,25 @@ function announcePushOutcome(record, outcome, extra = {}) {
     // phone stops being told the work was pushed when it was not.
     error: pushed ? null : extra.reason || "push_failed",
   });
-  persist({ ...record, error: pushed ? null : extra.reason || "push_failed", updatedAt: nowIso() });
+  // Re-read rather than spread the `record` snapshot the caller captured at
+  // the top of completeHandoffJob: a `continue` landing while `git push` was
+  // still running (which can take seconds) updates `lastJobId` in the store
+  // in the meantime, and persisting the stale snapshot here would silently
+  // revert that the instant the push finishes. Only the fields THIS function
+  // owns (error, updatedAt) are ever changed; everything else reflects
+  // whatever is actually in the store right now.
+  const current = readHandoff(record.id) || record;
+  persist({ ...current, error: pushed ? null : extra.reason || "push_failed", updatedAt: nowIso() });
   // The cloud's node-event schema knows only handoff.ready / handoff.failed
   // (cloud/src/notify.js KNOWN_TYPES), so a push result has no push channel; it
   // reaches the phone over the local SSE feed and the record instead.
 }
 
-async function completeHandoffJob(job) {
+async function completeHandoffJob(job, options = {}) {
+  // Test-only seam, mirroring the one runImport already takes: lets a test
+  // observe or interleave with the exact argv/timing git sees, without
+  // needing to win a real race. Production always uses execFileEscalating.
+  const execFileImpl = options.execFileImpl ?? execFileEscalating;
   const jobId = typeof job?.id === "string" ? job.id : null;
   if (!jobId) return null;
   const handoffId = handoffIdForJob(job);
@@ -1211,9 +1337,18 @@ async function completeHandoffJob(job) {
     return { branch: record.branch, pushed: false, reason: "checkout_missing" };
   }
 
+  // GIT_LITERAL_PATHSPECS=1 turns off ALL pathspec magic — globs, and the
+  // ":(...)"/"!"/leading-":" special syntax — for every call below. Without
+  // it, `git add -- <paths from git status>` interprets those paths as
+  // PATHSPECS, not filenames: a file named ":!work.txt" makes `git add --
+  // ":!work.txt" "work.txt"` stage NOTHING (the exclusion wins), so no commit
+  // is made, `git push` succeeds as a no-op, and the module reports
+  // pushed:true while the agent's work never reached the remote — the one
+  // place in this module a failure was silent. A file named "*" would
+  // otherwise re-glob a path layer 1 withheld right back into the add list.
   const git = (...args) =>
-    execFileAsync(gitBin, ["-C", checkout, ...args], {
-      env: { ...process.env, HOME: configuredRunHome, GIT_TERMINAL_PROMPT: "0" },
+    execFileImpl(gitBin, ["-C", checkout, ...args], {
+      env: { ...process.env, HOME: configuredRunHome, GIT_TERMINAL_PROMPT: "0", GIT_LITERAL_PATHSPECS: "1" },
       timeout: GIT_TIMEOUT_MS,
       maxBuffer: GIT_MAX_BUFFER,
     });
@@ -1238,9 +1373,17 @@ async function completeHandoffJob(job) {
       await git("add", "--", ...allowed.slice(index, index + 200));
     }
 
-    // Second layer, and the one that fails closed: whatever the pathspecs and
-    // git's own expansion actually produced is checked again before a commit
-    // object exists. If a denied path is in the index here, nothing is pushed.
+    // Second layer, and load-bearing TODAY, not defence against a future
+    // divergence: layer 1 filters the paths `git status` reported, once, at
+    // the start; this re-checks the paths that ACTUALLY reached the index.
+    // Those are not the same input — a path `git status` reported as a plain
+    // file can become a directory containing a secret in the window before
+    // `git add` runs (the harness sharing this sandbox is exactly the
+    // same-uid actor this module's threat model assumes), and git then
+    // stages everything under it, under a name layer 1 never saw and so
+    // never filtered. Deleting this check is exactly what turns that TOCTOU
+    // into a live key on the remote's unrevocable history — see the "I-2"
+    // test, which dies without it.
     const staged = splitNulList((await git("diff", "--cached", "--name-only", "-z")).stdout);
     const leaked = staged.filter((entry) => isSecretPath(entry));
     if (leaked.length > 0) {
@@ -1257,7 +1400,14 @@ async function completeHandoffJob(job) {
     }
 
     if (staged.length > 0) await commitGit("commit", "-m", `relay: job ${jobId}`);
-    await git("push", "origin", record.branch);
+    // Fully-qualified two-sided refspec, never a bare branch name. `git push
+    // origin <name>` treats a single positional argument as a REFSPEC, and a
+    // leading "+" is a legal character in a real git ref name (unlike ":"
+    // "^" "?" "*" "[", which check-ref-format already forbids) but is also
+    // git's force-push prefix — "git push origin +main" force-pushes. Writing
+    // the refspec out ourselves means an attacker-controlled branch name can
+    // only ever be a REF COMPONENT, never syntax.
+    await git("push", "origin", `refs/heads/${record.branch}:refs/heads/${record.branch}`);
     announcePushOutcome(record, "pushed", { jobId, withheld: withheld.length });
     return { branch: record.branch, pushed: true, withheld: withheld.length };
   } catch (error) {
@@ -1359,7 +1509,10 @@ export {
   // Exported so the jail's two load-bearing primitives have direct tests
   // instead of only being reachable through a race: `withPinnedCwd` is the
   // containment mechanism itself, and PUBLIC_REASONS is the closed vocabulary
-  // that decides what a client is ever allowed to be told.
+  // that decides what a client is ever allowed to be told. execFileEscalating
+  // is exported so its SIGKILL escalation can be tested directly, with a
+  // short timeout, instead of waiting out the real 10-minute GIT_TIMEOUT_MS.
   withPinnedCwd,
   PUBLIC_REASONS,
+  execFileEscalating,
 };
