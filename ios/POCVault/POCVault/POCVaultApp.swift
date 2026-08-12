@@ -2,12 +2,18 @@ import SwiftUI
 
 @main
 struct POCVaultApp: App {
+    /// iOS hands the APNs device token to a UIApplicationDelegate and nowhere else.
+    @UIApplicationDelegateAdaptor(RelayAppDelegate.self) private var appDelegate
     @StateObject private var identityStore: ClientIdentityStore
     @StateObject private var libraryViewModel: LibraryViewModel
     @StateObject private var chatSessionStore: RelayChatSessionStore
     @StateObject private var statusFeedViewModel: StatusFeedViewModel
+    @StateObject private var accountStore: RelayAccountStore
+    @StateObject private var nodeStore: RelayNodeStore
+    @StateObject private var pushService: RelayPushService
     private let manifestClient: ManifestClient
     private let codexClient: CodexClient
+    private let trialClient: RelayTrialClient
 
     init() {
         let identityStore = ClientIdentityStore()
@@ -18,33 +24,115 @@ struct POCVaultApp: App {
             identityStore: identityStore,
             trustedPublicKeyRawRepresentation: AppConfiguration.trustedManifestPublicKey
         )
+        // One client for the whole app, built at the node the store already
+        // restored (a trial adopted on a previous launch, else the personal
+        // install). Chat, status and the browser all share it, so `retarget`
+        // moves every surface at once instead of only the browser's copy.
+        let nodeStore = RelayNodeStore()
         let codexClient = CodexClient(
-            baseURL: AppConfiguration.codexBaseURL,
+            baseURL: nodeStore.effectiveBaseURL,
             identityStore: identityStore
+        )
+        let accountStore = RelayAccountStore(
+            client: RelayAuthClient(baseURL: AppConfiguration.authBaseURL),
+            identityStore: identityStore,
+            nodeStore: nodeStore
         )
 
         _identityStore = StateObject(wrappedValue: identityStore)
+        _nodeStore = StateObject(wrappedValue: nodeStore)
         _libraryViewModel = StateObject(wrappedValue: LibraryViewModel(client: manifestClient))
         _chatSessionStore = StateObject(wrappedValue: RelayChatSessionStore(
             client: codexClient,
             completionNotifier: CodexLocalNotificationService()
         ))
         _statusFeedViewModel = StateObject(wrappedValue: StatusFeedViewModel(client: codexClient))
+        _accountStore = StateObject(wrappedValue: accountStore)
+        _pushService = StateObject(wrappedValue: RelayPushService(accountStore: accountStore))
         self.manifestClient = manifestClient
         self.codexClient = codexClient
+        self.trialClient = RelayTrialClient(baseURL: AppConfiguration.authBaseURL)
     }
 
     var body: some Scene {
         WindowGroup {
-            POCVaultRootView(
-                libraryViewModel: libraryViewModel,
-                statusFeedViewModel: statusFeedViewModel,
-                chatSessionStore: chatSessionStore,
-                identityStore: identityStore,
-                manifestClient: manifestClient,
-                codexClient: codexClient
-            )
+            Group {
+                switch accountStore.phase {
+                case .restoring:
+                    RelayRestoringView()
+                case .signedOut:
+                    AuthenticationView(accountStore: accountStore)
+                case .onboarding:
+                    RelayOnboardingView(
+                        accountStore: accountStore,
+                        nodeStore: nodeStore,
+                        identityStore: identityStore,
+                        trialClient: trialClient
+                    )
+                case .ready:
+                    POCVaultRootView(
+                        libraryViewModel: libraryViewModel,
+                        statusFeedViewModel: statusFeedViewModel,
+                        chatSessionStore: chatSessionStore,
+                        accountStore: accountStore,
+                        identityStore: identityStore,
+                        nodeStore: nodeStore,
+                        manifestClient: manifestClient,
+                        codexClient: codexClient,
+                        trialClient: trialClient,
+                        pushService: pushService
+                    )
+                    // Adopting (or losing) a machine restarts the browser stack so
+                    // listings refetch; the shared client and the chat/status
+                    // stores survive it.
+                    .id(nodeStore.effectiveBaseURL)
+                }
+            }
+            // Repointing happens here rather than in `body`: constructing a client
+            // per body evaluation leaked a URLSession every time SwiftUI re-ran it.
+            .onChange(of: nodeStore.effectiveBaseURL, initial: true) { _, newBaseURL in
+                codexClient.retarget(baseURL: newBaseURL)
+            }
+            .task {
+                await accountStore.restore()
+                #if DEBUG
+                await applyAuthenticationUITestHooks()
+                #endif
+            }
         }
+    }
+
+    #if DEBUG
+    private func applyAuthenticationUITestHooks() async {
+        let env = ProcessInfo.processInfo.environment
+        if accountStore.phase == .signedOut,
+           let username = env["RELAY_UITEST_CREATE_USERNAME"]?.trimmedNonEmpty,
+           let email = env["RELAY_UITEST_CREATE_EMAIL"]?.trimmedNonEmpty,
+           let password = env["RELAY_UITEST_CREATE_PASSWORD"]?.trimmedNonEmpty {
+            await accountStore.signUp(username: username, email: email, password: password)
+        }
+        if accountStore.phase == .onboarding,
+           env["RELAY_UITEST_SKIP_ONBOARDING"] == "1" {
+            accountStore.completeOnboarding()
+        }
+    }
+    #endif
+}
+
+private struct RelayRestoringView: View {
+    var body: some View {
+        ZStack {
+            AppTheme.canvasGradient.ignoresSafeArea()
+            VStack(spacing: 18) {
+                Image(systemName: "point.3.connected.trianglepath.dotted")
+                    .font(.system(size: 36, weight: .medium))
+                    .foregroundStyle(AppTheme.accentGradient)
+                ProgressView()
+                    .tint(AppTheme.accent)
+                    .accessibilityLabel("Restoring Relay session")
+            }
+        }
+        .preferredColorScheme(.dark)
     }
 }
 
@@ -58,15 +146,24 @@ struct POCVaultRootView: View {
     @ObservedObject var libraryViewModel: LibraryViewModel
     @ObservedObject var statusFeedViewModel: StatusFeedViewModel
     @ObservedObject var chatSessionStore: RelayChatSessionStore
+    @ObservedObject var accountStore: RelayAccountStore
     @ObservedObject var identityStore: ClientIdentityStore
+    @ObservedObject var nodeStore: RelayNodeStore
     let manifestClient: ManifestClient
     let codexClient: CodexClient
+    let trialClient: RelayTrialClient
+    @ObservedObject var pushService: RelayPushService
 
+    @Environment(\.scenePhase) private var scenePhase
     @State private var browserPath: [BrowserRoute] = []
     @State private var chatLaunch: RelayChatLaunch?
+    /// Raised when a handoff push is tapped: the threads list is where handoff
+    /// cards live, so that is where the tap has to land.
+    @State private var opensThreadsForHandoff = false
     @State private var showingLibrary = false
     @State private var showingStatus = false
     @State private var showingDiagnostics = false
+    @State private var showingAccount = false
 
     var body: some View {
         NavigationStack(path: $browserPath) {
@@ -92,7 +189,11 @@ struct POCVaultRootView: View {
             libraryCover
         }
         .fullScreenCover(item: $chatLaunch) { launch in
-            RelayChatView(viewModel: launch.viewModel, onDismiss: { chatLaunch = nil })
+            RelayChatView(
+                viewModel: launch.viewModel,
+                onDismiss: { chatLaunch = nil },
+                threadsRequest: $opensThreadsForHandoff
+            )
         }
         .sheet(isPresented: $showingStatus) {
             CodexStatusView(
@@ -107,8 +208,47 @@ struct POCVaultRootView: View {
                 manifestClient: manifestClient
             )
         }
+        .sheet(isPresented: $showingAccount) {
+            AccountSettingsView(
+                accountStore: accountStore,
+                nodeStore: nodeStore,
+                identityStore: identityStore,
+                trialClient: trialClient
+            )
+        }
         .task {
             identityStore.importIdentityFromSetupEnvironmentIfNeeded()
+        }
+        // Push registration waits for a signed-in account: this view only exists
+        // in the `.ready` phase, and the cloud device route is session-authed.
+        .task {
+            RelayAppDelegate.pushService = pushService
+            pushService.registerForPushNotifications()
+            await pushService.registerPendingDeviceTokenIfNeeded()
+        }
+        // A handoff push carries no content — only a node id and an event type —
+        // so the tap opens the threads list and the card loads from the node.
+        .onChange(of: pushService.pendingRoute) { _, route in
+            guard case .handoff = route else { return }
+            pushService.clearPendingRoute()
+            if chatLaunch == nil {
+                openChat(folderPath: nil, workspaceID: nil)
+            }
+            opensThreadsForHandoff = true
+        }
+        // A trial machine expires on the server's clock, so the countdown and
+        // the expiry banner are only honest if we re-read state on foreground.
+        .task(id: scenePhase) {
+            guard scenePhase == .active, nodeStore.trial != nil,
+                  let bearer = accountStore.currentSessionToken else { return }
+            // Only an authoritative "no trial" may forget the machine — see
+            // RelayNodeStore.applyRefresh. A `try?` here once turned every
+            // offline foreground into permanent, unrecoverable loss.
+            do {
+                nodeStore.applyRefresh(.success(try await trialClient.currentTrial(bearer: bearer)))
+            } catch {
+                nodeStore.applyRefresh(.failure(error))
+            }
         }
         .task {
             // App-wide job monitor + completion notifications, owned by the session store.
@@ -138,8 +278,34 @@ struct POCVaultRootView: View {
             },
             onOpenLibrary: isRoot ? { showingLibrary = true } : nil,
             onOpenStatus: isRoot ? { showingStatus = true } : nil,
-            onOpenDiagnostics: isRoot ? { showingDiagnostics = true } : nil
+            onOpenDiagnostics: isRoot ? { showingDiagnostics = true } : nil,
+            onOpenAccount: isRoot ? { showingAccount = true } : nil
         )
+        // Only at the root: the countdown is about the machine as a whole, so
+        // repeating it on every drilled-in folder would be noise.
+        .safeAreaInset(edge: .top) {
+            if isRoot, let trial = nodeStore.trial, trial.state != .destroyed {
+                TrialStatusBanner(
+                    trial: trial,
+                    client: codexClient,
+                    onJoinWaitlist: joinPaidWaitlist
+                )
+                .padding(.horizontal, 16)
+                .padding(.bottom, 8)
+            }
+        }
+    }
+
+    /// The expiry banner's "Join the paid waitlist" posts to the public
+    /// `/v1/waitlist` endpoint with the signed-in account's email.
+    private func joinPaidWaitlist() async -> Bool {
+        guard let email = accountStore.user?.email.trimmedNonEmpty else { return false }
+        do {
+            try await trialClient.joinWaitlist(email: email)
+            return true
+        } catch {
+            return false
+        }
     }
 
     private func openChat(folderPath: String?, workspaceID: String?) {
@@ -157,7 +323,6 @@ struct POCVaultRootView: View {
                         .font(AppTheme.uiFont(size: 16, weight: .semibold))
                         .foregroundStyle(AppTheme.textSecondary)
                         .frame(width: 36, height: 36)
-                        .background(AppTheme.bgSurfaceHi, in: Circle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Close library")
@@ -190,7 +355,7 @@ struct POCVaultRootView: View {
     /// - RELAY_UITEST_CHAT=1               open the chat cover (for RELAY_UITEST_PATH's
     ///   folder when set, else the root); the existing RELAY_UITEST_MODEL /
     ///   RELAY_UITEST_PROMPT / RELAY_UITEST_TASK_PROMPT auto-drive then takes over.
-    /// - RELAY_UITEST_OPEN=library|status  present that cover/sheet
+    /// - RELAY_UITEST_OPEN=library|status|account  present that cover/sheet
     private func applyUITestHooks() {
         let env = ProcessInfo.processInfo.environment
         if let folder = env["RELAY_UITEST_PATH"]?.trimmedNonEmpty {
@@ -206,6 +371,8 @@ struct POCVaultRootView: View {
             showingLibrary = true
         case "status":
             showingStatus = true
+        case "account":
+            showingAccount = true
         default:
             break
         }
@@ -298,37 +465,33 @@ private struct CodexStatusView: View {
 
                 VStack(alignment: .leading, spacing: 0) {
                     Text("Status")
-                        .font(.system(size: 26, weight: .medium, design: .serif))
+                        .font(AppTheme.serifFont(size: 28))
                         .foregroundStyle(AppTheme.textPrimary)
                         .padding(.horizontal, 20)
                         .padding(.top, 16)
                         .padding(.bottom, 16)
 
-                    HStack(spacing: 2) {
+                    HStack(spacing: 18) {
                         ForEach(StatusSection.allCases) { section in
                             Button {
                                 withAnimation(.easeInOut(duration: 0.18)) {
                                     selectedSection = section
                                 }
                             } label: {
-                                Text(section.title)
-                                    .font(.system(size: 14, weight: selectedSection == section ? .medium : .regular))
-                                    .foregroundStyle(selectedSection == section ? AppTheme.textPrimary : AppTheme.textSecondary)
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 8)
-                                    .background {
-                                        if selectedSection == section {
-                                            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                                .fill(AppTheme.textPrimary.opacity(0.12))
-                                        }
-                                    }
+                                VStack(spacing: 5) {
+                                    Text(section.title)
+                                        .font(.system(size: 14, weight: selectedSection == section ? .medium : .regular))
+                                        .foregroundStyle(selectedSection == section ? AppTheme.textPrimary : AppTheme.textTertiary)
+                                    Rectangle()
+                                        .fill(selectedSection == section ? AppTheme.accent : Color.clear)
+                                        .frame(height: 2)
+                                }
+                                .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
                         }
                     }
-                    .padding(3)
-                    .background(AppTheme.bgSurfaceHi, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    .padding(.horizontal, 16)
+                    .padding(.horizontal, 20)
                     .padding(.bottom, 16)
 
                     switch selectedSection {
@@ -356,7 +519,7 @@ private struct CodexStatusView: View {
                                 }
                                 .overlay(alignment: .top) {
                                     Rectangle()
-                                        .fill(AppTheme.strokeSubtle)
+                                        .fill(AppTheme.hairline)
                                         .frame(height: 0.5)
                                 }
                             }
@@ -433,7 +596,7 @@ private struct CodexActivityRow: View {
                 .font(.system(size: 15))
                 .foregroundStyle(AppTheme.textSecondary)
                 .frame(width: 32, height: 32)
-                .background(AppTheme.bgSurface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .background(AppTheme.textPrimary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
 
             VStack(alignment: .leading, spacing: 5) {
                 Text(item.title)
@@ -446,19 +609,16 @@ private struct CodexActivityRow: View {
                     Text("\(item.workspaceLabel) · \(timestampText)")
                         .font(.system(size: 11))
                         .foregroundStyle(AppTheme.textSecondary)
-                    Text(provider.displayName)
-                        .font(.system(size: 11))
-                        .foregroundStyle(provider == .codex ? AppTheme.textSecondary : AppTheme.accent)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 2)
-                        .background((provider == .codex ? AppTheme.textPrimary : AppTheme.accent).opacity(provider == .codex ? 0.08 : 0.14), in: Capsule())
-                    HStack(spacing: 3) {
-                        Image(systemName: statusSymbol)
-                            .font(.system(size: 11, weight: .semibold))
-                        Text(item.status?.label ?? "Thread")
-                            .font(.system(size: 11))
-                    }
-                    .foregroundStyle(statusColor)
+                    RelayCapsLabel(
+                        text: provider.displayName,
+                        color: provider == .codex ? AppTheme.textTertiary : AppTheme.accent,
+                        size: 9
+                    )
+                    RelayCapsLabel(
+                        text: item.status?.label ?? "Thread",
+                        color: statusColor,
+                        size: 9
+                    )
                 }
                 .lineLimit(1)
             }
@@ -469,21 +629,9 @@ private struct CodexActivityRow: View {
         .padding(.vertical, 12)
         .overlay(alignment: .bottom) {
             Rectangle()
-                .fill(AppTheme.strokeSubtle)
+                .fill(AppTheme.hairline)
                 .frame(height: 0.5)
                 .padding(.leading, 62)
-        }
-    }
-
-    private var statusSymbol: String {
-        guard let status = item.status else { return item.isActive ? "clock" : "checkmark" }
-        switch status {
-        case .succeeded:
-            return "checkmark"
-        case .queued, .running, .canceling:
-            return "clock"
-        default:
-            return "exclamationmark"
         }
     }
 
@@ -493,16 +641,16 @@ private struct CodexActivityRow: View {
     }
 
     private var statusColor: Color {
-        guard let status = item.status else { return AppTheme.statusInfo }
+        guard let status = item.status else { return AppTheme.textTertiary }
         switch status {
         case .queued, .running, .canceling:
-            return AppTheme.statusWarn
+            return AppTheme.accentBright
         case .succeeded:
-            return AppTheme.statusOK
+            return AppTheme.textSecondary
         case .failed, .timeout:
             return AppTheme.statusError
         case .canceled, .unknown:
-            return AppTheme.statusNeutral
+            return AppTheme.textTertiary
         }
     }
 
@@ -513,48 +661,52 @@ private struct CodexActivityRow: View {
     }()
 }
 
+/// Editorial Ember design language — see docs/superpowers/specs/2026-08-11-editorial-ember-design.md.
+/// Serif for identity, sans for function; one surface with hairlines; ember only where
+/// attention belongs; status is typographic, never a dot.
 enum AppTheme {
-    static let bgCanvas = Color(hex: 0x1A1917)
-    static let bgSurface = warmText.opacity(0.06)
-    static let bgSurfaceHi = Color(hex: 0x232220)
-    static let threadPreviewBackground = Color(hex: 0x272522)
-    static let strokeSubtle = warmText.opacity(0.07)
-    static let strokeStrong = warmText.opacity(0.07)
-    static let textPrimary = warmText
-    static let textSecondary = warmText.opacity(0.45)
-    static let textTertiary = warmText.opacity(0.27)
-    static let inactiveTab = warmText.opacity(0.38)
+    // Canvas
+    static let canvasTop = Color(hex: 0x1E1B17)
+    static let canvasBottom = Color(hex: 0x151310)
+    /// Solid canvas for sheets and fills that cannot take the gradient.
+    static let bgCanvas = Color(hex: 0x1A1815)
+    static let canvasGradient = LinearGradient(
+        colors: [canvasTop, canvasBottom],
+        startPoint: .top,
+        endPoint: .bottom
+    )
+
+    // Ink — cream at four opacity steps. Success/neutral status text uses these.
+    static let textPrimary = ink
+    static let textSecondary = ink.opacity(0.55)
+    static let textTertiary = ink.opacity(0.38)
+    static let textFaint = ink.opacity(0.25)
+
+    // Structure — hairlines instead of boxes.
+    static let hairline = ink.opacity(0.10)
+    static let hairlineStrong = ink.opacity(0.16)
+
+    // Ember — the primary action, the user's own words, live activity. Nothing else.
     static let accent = Color(hex: 0xD4804A)
     static let accentBright = Color(hex: 0xE8965C)
-    static let accentDeep = Color(hex: 0xB5612F)
-    static let statusOK = Color(hex: 0x32D74B)
-    static let statusWarn = Color(hex: 0xFF9F0A)
-    static let statusError = statusWarn
-    static let statusInfo = textSecondary
-    static let statusNeutral = textTertiary
-
-    private static let warmText = Color(hex: 0xEDE8DF)
-
-    // Visual-leap tokens: gradients, glass, depth.
+    static let accentDeep = Color(hex: 0xC96F35)
+    static let onEmber = Color(hex: 0x1C1207)
     static let accentGradient = LinearGradient(
         colors: [accentBright, accentDeep],
         startPoint: .topLeading,
         endPoint: .bottomTrailing
     )
-    static let canvasGradient = LinearGradient(
-        colors: [Color(hex: 0x201E1B), Color(hex: 0x161513)],
-        startPoint: .top,
-        endPoint: .bottom
-    )
-    static let userBubbleGradient = LinearGradient(
-        colors: [accentBright, accentDeep],
-        startPoint: .topLeading,
-        endPoint: .bottomTrailing
-    )
-    /// Translucent surface for glassy cards (use over .ultraThinMaterial).
-    static let glassTint = warmText.opacity(0.04)
-    static let glassStroke = warmText.opacity(0.10)
+    static let userBubbleGradient = accentGradient
+
+    // Status text colors (words, not shapes). Success stays cream on purpose.
+    static let statusWarn = Color(hex: 0xE0B25C)
+    static let statusError = Color(hex: 0xD9776B)
+
+    // Depth
     static let shadowColor = Color.black.opacity(0.35)
+    static let emberShadow = accentDeep.opacity(0.25)
+
+    private static let ink = Color(hex: 0xEDE8DF)
 
     static func uiFont(size: CGFloat, weight: Font.Weight = .regular) -> Font {
         Font.custom("DMSans-9ptRegular", size: size).weight(weight)
@@ -562,6 +714,67 @@ enum AppTheme {
 
     static func monoFont(size: CGFloat, weight: Font.Weight = .regular) -> Font {
         Font.custom("DMMono-Regular", size: size).weight(weight)
+    }
+
+    /// New York serif — screen titles, wordmark, folder/chat headers only.
+    static func serifFont(size: CGFloat, weight: Font.Weight = .medium) -> Font {
+        .system(size: size, weight: weight, design: .serif)
+    }
+}
+
+/// Small-caps letterspaced label — the only rendering for status words, bylines,
+/// and section labels (spec rule 5: status is typographic, never a dot).
+struct RelayCapsLabel: View {
+    let text: String
+    var color: Color = AppTheme.textTertiary
+    var size: CGFloat = 10
+
+    var body: some View {
+        Text(text.uppercased())
+            .font(AppTheme.uiFont(size: size, weight: .semibold))
+            .tracking(1.1)
+            .foregroundStyle(color)
+    }
+}
+
+/// Primary action: full-chroma ember pill, one per screen at most.
+/// Disabled state desaturates to cream — never dimmed ember (spec rule 3).
+struct RelayPrimaryButtonStyle: ButtonStyle {
+    var isEnabled = true
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(AppTheme.uiFont(size: 16, weight: .semibold))
+            .foregroundStyle(isEnabled ? AppTheme.onEmber : AppTheme.textTertiary)
+            .frame(maxWidth: .infinity)
+            .frame(height: 50)
+            .background(
+                isEnabled
+                    ? AnyShapeStyle(AppTheme.accentGradient)
+                    : AnyShapeStyle(AppTheme.textPrimary.opacity(0.04)),
+                in: Capsule()
+            )
+            .overlay {
+                if !isEnabled {
+                    Capsule().stroke(AppTheme.hairline, lineWidth: 1)
+                }
+            }
+            .shadow(color: isEnabled ? AppTheme.emberShadow : .clear, radius: 20, y: 6)
+            .opacity(configuration.isPressed ? 0.85 : 1)
+    }
+}
+
+/// Secondary action: hairline outline pill, cream text.
+struct RelayOutlineButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(AppTheme.uiFont(size: 15, weight: .medium))
+            .foregroundStyle(AppTheme.textPrimary)
+            .frame(maxWidth: .infinity)
+            .frame(height: 50)
+            .overlay(Capsule().stroke(AppTheme.hairlineStrong, lineWidth: 1))
+            .contentShape(Capsule())
+            .opacity(configuration.isPressed ? 0.7 : 1)
     }
 }
 
@@ -584,22 +797,32 @@ enum AppConfiguration {
         infoKey: "POCVaultCodexBaseURL",
         fallback: "http://127.0.0.1:8787"
     )
+    static let authBaseURL = configuredURL(
+        supportValue: supportConfig?.authBaseURL,
+        infoKey: "RelayAuthBaseURL",
+        fallback: "http://127.0.0.1:8790"
+    )
     static let runtimeMode = "Simulator Preview"
 #else
     static let manifestURL = configuredURL(
         supportValue: supportConfig?.manifestURL,
         infoKey: "POCVaultManifestURL",
-        fallback: "https://vault.pocs.example.com/manifest.json"
+        fallback: "https://vault.pocs.conformal.live/manifest.json"
     )
     static let signatureURL = configuredURL(
         supportValue: supportConfig?.signatureURL,
         infoKey: "POCVaultSignatureURL",
-        fallback: "https://vault.pocs.example.com/manifest.sig.json"
+        fallback: "https://vault.pocs.conformal.live/manifest.sig.json"
     )
     static let codexBaseURL = configuredURL(
         supportValue: supportConfig?.codexBaseURL,
         infoKey: "POCVaultCodexBaseURL",
-        fallback: "https://codex.pocs.example.com"
+        fallback: "https://codex.pocs.conformal.live"
+    )
+    static let authBaseURL = configuredURL(
+        supportValue: supportConfig?.authBaseURL,
+        infoKey: "RelayAuthBaseURL",
+        fallback: "https://api.pocs.conformal.live"
     )
     static let runtimeMode = "Relay Cloud"
 #endif
@@ -694,6 +917,7 @@ enum AppConfiguration {
         let manifestURL: String?
         let signatureURL: String?
         let codexBaseURL: String?
+        let authBaseURL: String?
         let manifestPublicKey: String?
     }
 }

@@ -1,0 +1,15 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 22
+  pre_build:
+    commands:
+      - npm ci --ignore-scripts --no-audit --no-fund
+      - npm test
+      - bash -n deploy/install.sh deploy/backup-sqlite.sh deploy/verify-backup.sh deploy/cicd-deploy.sh
+      - python3 -m py_compile deploy/configure-nginx.py
+  build:
+    commands:
+      - bash deploy/cicd-deploy.sh

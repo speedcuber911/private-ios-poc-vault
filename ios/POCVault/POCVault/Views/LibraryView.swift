@@ -127,9 +127,7 @@ struct LibraryView: View {
                         POCSectionHeader(selectedFilter: $selectedFilter)
                             .padding(.horizontal, 16)
                             .padding(.bottom, 12)
-                        Text("Library")
-                            .font(.system(size: 12))
-                            .foregroundStyle(AppTheme.textSecondary)
+                        RelayCapsLabel(text: "Library")
                             .padding(.horizontal, 20)
                             .padding(.bottom, 8)
                         LazyVStack(spacing: 0) {
@@ -139,7 +137,7 @@ struct LibraryView: View {
                         }
                         .overlay(alignment: .top) {
                             Rectangle()
-                                .fill(AppTheme.strokeSubtle)
+                                .fill(AppTheme.hairline)
                                 .frame(height: 0.5)
                         }
 
@@ -262,7 +260,7 @@ private struct VaultHeader: View {
                 RelayLogoMark(size: 30)
 
                 Text("Relay")
-                    .font(.system(size: 24, weight: .medium, design: .serif))
+                    .font(AppTheme.serifFont(size: 28))
                     .foregroundStyle(AppTheme.textPrimary)
 
                 Spacer()
@@ -292,11 +290,11 @@ struct RelayLogoMark: View {
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(AppTheme.bgSurfaceHi)
+                .fill(AppTheme.textPrimary.opacity(0.06))
 
             Image(systemName: "terminal.fill")
                 .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(AppTheme.textPrimary)
+                .foregroundStyle(AppTheme.textSecondary)
         }
         .frame(width: size, height: size)
         .accessibilityHidden(true)
@@ -314,7 +312,6 @@ private struct HeaderButton: View {
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundStyle(AppTheme.textSecondary)
                 .frame(width: 32, height: 32)
-                .background(AppTheme.bgSurface, in: Circle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel(label)
@@ -338,7 +335,7 @@ private struct SearchBox: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .background(AppTheme.bgSurfaceHi, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(Capsule().stroke(AppTheme.hairlineStrong, lineWidth: 1))
         .tint(AppTheme.accent)
     }
 }
@@ -347,24 +344,22 @@ private struct POCSectionHeader: View {
     @Binding var selectedFilter: LibraryFilter
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 18) {
             ForEach(LibraryFilter.allCases) { filter in
                 Button {
                     withAnimation(.easeInOut(duration: 0.18)) {
                         selectedFilter = filter
                     }
                 } label: {
-                    Text(filter.rawValue)
-                        .font(.system(size: 13, weight: selectedFilter == filter ? .medium : .regular))
-                        .foregroundStyle(selectedFilter == filter ? AppTheme.textPrimary : AppTheme.textSecondary)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 5)
-                        .background {
-                            if selectedFilter == filter {
-                                Capsule()
-                                    .fill(AppTheme.textPrimary.opacity(0.12))
-                            }
-                        }
+                    VStack(spacing: 5) {
+                        Text(filter.rawValue)
+                            .font(.system(size: 13, weight: selectedFilter == filter ? .medium : .regular))
+                            .foregroundStyle(selectedFilter == filter ? AppTheme.textPrimary : AppTheme.textTertiary)
+                        Rectangle()
+                            .fill(selectedFilter == filter ? AppTheme.accent : Color.clear)
+                            .frame(height: 2)
+                    }
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
             }
@@ -379,7 +374,7 @@ private struct POCEntryCard: View {
         HStack(spacing: 12) {
             ZStack {
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(AppTheme.bgSurfaceHi)
+                    .fill(AppTheme.textPrimary.opacity(0.06))
                 Image(systemName: "scope")
                     .font(.system(size: 20))
                     .foregroundStyle(AppTheme.textSecondary)
@@ -424,7 +419,7 @@ private struct POCEntryCard: View {
         .background(AppTheme.bgCanvas)
         .overlay(alignment: .bottom) {
             Rectangle()
-                .fill(AppTheme.strokeSubtle)
+                .fill(AppTheme.hairline)
                 .frame(height: 0.5)
                 .padding(.leading, 72)
         }
@@ -483,7 +478,7 @@ private struct StatusCard: View {
         VStack(alignment: .leading, spacing: 10) {
             Image(systemName: symbol)
                 .font(.system(size: 24, weight: .semibold))
-                .foregroundStyle(AppTheme.accent)
+                .foregroundStyle(AppTheme.textSecondary)
             Text(title)
                 .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(AppTheme.textPrimary)
@@ -494,6 +489,9 @@ private struct StatusCard: View {
         }
         .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(AppTheme.bgSurfaceHi, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(AppTheme.hairline, lineWidth: 1)
+        }
     }
 }

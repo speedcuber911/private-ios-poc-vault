@@ -1,0 +1,10 @@
+{
+  "name": "relayd",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Relay node daemon — behavior-preserving extraction of relay-server/codex-api-deploy/server.mjs (W2-CORE).",
+  "scripts": {
+    "test": "node --test"
+  }
+}

@@ -74,7 +74,7 @@ flowchart LR
 ├── pocs/                 # Source metadata and static POC assets
 ├── ops/                  # Deploy, signing, verification, cert, and server scripts
 ├── ios/POCVault/         # Native Relay iOS app; legacy internal path
-├── codex-server/         # EC2 async Codex job API
+├── relay-server/         # Relay backend and async agent job API
 ├── build/                # Generated manifest and signature artifacts
 ├── README.md             # Project overview and operating guide
 ├── SECURITY.md           # Secret-handling and access-model notes
@@ -329,6 +329,7 @@ Support config shape:
 
 ```json
 {
+  "authBaseURL": "https://api.pocs.example.com",
   "codexBaseURL": "https://codex.pocs.example.com",
   "manifestPublicKey": "<base64url-ed25519-public-key>",
   "manifestURL": "https://vault.pocs.example.com/manifest.json",
@@ -387,7 +388,7 @@ runner API are deployed as one operational system.
 Server workspace:
 
 ```text
-codex-server/
+relay-server/
 ```
 
 Live API shape:
@@ -415,8 +416,15 @@ Current API behavior:
   is available when configured on the runner.
 - Chat mode uses `bedrock` or `azure`; Task mode continues to use the existing
   async `codex` and `claude` job contracts.
-- Relay polls active Task jobs while the Task tab is visible, renders completed
-  job answers as Markdown, and groups task threads by workspace.
+- Relay opens one conversation surface per folder. A visible `Threads` row below
+  the header opens that folder's newest-first history, combining resumable chat
+  and task threads with standalone invocations that do not yet have a session.
+- Opening a history item restores its conversation or invocation result. **View
+  Full Log** presents a stable loading sheet and fetches unbounded job activity
+  only after the user explicitly requests it.
+- The composer uses the keyboard safe area, interactive scroll dismissal,
+  dismissal on `Send`/`Run`, and taps outside the editor to resign focus. Relay
+  does not add a floating or keyboard-accessory dismissal button.
 - Threads are provider-locked, so a Codex thread is resumed by Codex and a
   Claude thread is resumed by Claude. Relay also requires the selected workspace
   to match before sending a task `resumeSessionId`.
@@ -439,7 +447,15 @@ sigiq
 ```
 
 For server-specific deployment and verification details, read
-[codex-server/README.md](codex-server/README.md).
+[relay-server/README.md](relay-server/README.md).
+
+For the live Relay account/control-plane deployment on the shared POC EC2,
+including Route 53/nginx, SQLite backups, AWS-native CI/CD, verification, and
+rollback, read
+[docs/RELAY_POC_EC2_DEPLOYMENT.md](docs/RELAY_POC_EC2_DEPLOYMENT.md).
+The implementation timeline, exact resource inventory, failure notes, and
+next-agent continuation checklist are in
+[docs/RELAY_POC_EC2_AGENT_HANDOFF.md](docs/RELAY_POC_EC2_AGENT_HANDOFF.md).
 
 For a complete implementation walkthrough across Relay, the POC host, agent
 console, transcription flow, security model, and verification commands,
@@ -458,7 +474,7 @@ python3 -m py_compile ops/render-manifest.py ops/sign-manifest.py ops/deploy-poc
 bash -n ios/launch-simulator.sh
 python3 ops/render-manifest.py --pocs-dir pocs -o build/manifest.json
 python3 ops/sign-manifest.py build/manifest.json --allow-missing-key
-cd codex-server/codex-api-deploy && node --check server.mjs && node --test server.test.mjs
+cd relay-server/codex-api-deploy && node --check server.mjs && node --test server.test.mjs
 ```
 
 Live perimeter check for a configured instance:

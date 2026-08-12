@@ -66,7 +66,7 @@ The Codex API is not part of the static POC manifest contract. Its local
 workspace lives inside this repo at:
 
 ```text
-/Users/pariksj/Desktop/poc-vault/codex-server
+/Users/pariksj/Desktop/poc-vault/relay-server
 ```
 
 Live `/v1/codex/*` routes require:

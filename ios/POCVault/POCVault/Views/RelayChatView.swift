@@ -7,22 +7,26 @@ struct RelayChatView: View {
     /// Set when the chat is presented as a folder's full-screen cover; shows the
     /// dismiss chevron in the top bar. Dismissing never cancels streams (VM-owned).
     var onDismiss: (() -> Void)? = nil
+    /// Raised by the root when a handoff push is tapped: open the threads list,
+    /// which is where handoff cards live. Lowered again once honored, so a second
+    /// push after the sheet was closed still opens it.
+    var threadsRequest: Binding<Bool> = .constant(false)
     @State private var showingThreads = false
-    @State private var fullLogText: String?
+    @State private var fullLogRequest: RelayFullLogRequest?
 
     var body: some View {
         NavigationStack {
             ZStack {
                 AppTheme.canvasGradient.ignoresSafeArea()
-                AppTheme.accent.opacity(0.06)
-                    .blur(radius: 80)
-                    .frame(height: 200)
-                    .frame(maxHeight: .infinity, alignment: .top)
-                    .ignoresSafeArea()
 
                 VStack(spacing: 0) {
                     topBar
+                        .simultaneousGesture(keyboardDismissTap)
+                    threadAccessBar
+                        .simultaneousGesture(keyboardDismissTap)
                     messageList
+                        .contentShape(Rectangle())
+                        .simultaneousGesture(keyboardDismissTap)
                 }
             }
             .toolbar(.hidden, for: .navigationBar)
@@ -52,7 +56,11 @@ struct RelayChatView: View {
                 )
             }
             .task {
+                honorThreadsRequest()
                 await viewModel.bootstrap()
+            }
+            .onChange(of: threadsRequest.wrappedValue) { _, _ in
+                honorThreadsRequest()
             }
             .refreshable {
                 await viewModel.refreshThreads()
@@ -62,11 +70,10 @@ struct RelayChatView: View {
                     .presentationDetents([.medium, .large])
                     .presentationDragIndicator(.visible)
             }
-            .sheet(item: Binding(
-                get: { fullLogText.map(RelayFullLogText.init(text:)) },
-                set: { fullLogText = $0?.text }
-            )) { payload in
-                RelayFullLogSheet(text: payload.text)
+            .sheet(item: $fullLogRequest) { request in
+                RelayFullLogSheet(job: request.job) {
+                    await viewModel.loadFullLog(for: request.job)
+                }
             }
         }
         // The chat opens as its own full-screen presentation; re-pin the app's
@@ -82,7 +89,6 @@ struct RelayChatView: View {
                         .font(AppTheme.uiFont(size: 16, weight: .semibold))
                         .foregroundStyle(AppTheme.textSecondary)
                         .frame(width: 36, height: 36)
-                        .background(AppTheme.bgSurfaceHi, in: Circle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Close chat")
@@ -95,55 +101,96 @@ struct RelayChatView: View {
                     .font(AppTheme.uiFont(size: 16, weight: .semibold))
                     .foregroundStyle(AppTheme.textSecondary)
                     .frame(width: 36, height: 36)
-                    .background(AppTheme.bgSurfaceHi, in: Circle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("New conversation")
 
-            HStack(spacing: 9) {
-                Circle()
-                    .fill(AppTheme.accentGradient)
-                    .frame(width: 30, height: 30)
-                    .overlay {
-                        Image(systemName: "folder.fill")
-                            .font(.system(size: 12, weight: .bold))
-                            .foregroundStyle(.white)
-                    }
-                    .shadow(color: AppTheme.accent.opacity(0.5), radius: 6, y: 2)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(viewModel.folderDisplayName)
-                        .font(AppTheme.uiFont(size: 22, weight: .bold))
-                        .foregroundStyle(AppTheme.textPrimary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(viewModel.folderDisplayName)
+                    .font(AppTheme.serifFont(size: 24))
+                    .foregroundStyle(AppTheme.textPrimary)
+                    .lineLimit(1)
+                if let path = viewModel.folderPathLabel {
+                    Text(path)
+                        .font(AppTheme.monoFont(size: 10))
+                        .foregroundStyle(AppTheme.textTertiary)
                         .lineLimit(1)
-                    Text(selectedModelSubtitle)
-                        .font(AppTheme.uiFont(size: 11, weight: .medium))
-                        .foregroundStyle(AppTheme.textSecondary)
-                        .lineLimit(1)
+                        .truncationMode(.head)
                 }
             }
 
             Spacer()
-
-            Button {
-                showingThreads = true
-            } label: {
-                Image(systemName: "sidebar.left")
-                    .font(AppTheme.uiFont(size: 16, weight: .semibold))
-                    .foregroundStyle(AppTheme.textSecondary)
-                    .frame(width: 36, height: 36)
-                    .background(AppTheme.bgSurfaceHi, in: Circle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Threads")
         }
         .padding(.horizontal, 16)
         .padding(.top, 14)
         .padding(.bottom, 10)
     }
 
-    private var selectedModelSubtitle: String {
-        guard let choice = viewModel.selectedChoice else { return "Loading models" }
-        return "\(choice.chipLabel) · \(choice.mode.label)"
+    private var threadAccessBar: some View {
+        Button {
+            showingThreads = true
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "bubble.left.and.bubble.right")
+                    .font(AppTheme.uiFont(size: 14, weight: .medium))
+                    .foregroundStyle(AppTheme.textSecondary)
+
+                Text("Threads")
+                    .font(AppTheme.uiFont(size: 14, weight: .medium))
+                    .foregroundStyle(AppTheme.textPrimary)
+
+                // A session waiting to be picked up is the one thing in the
+                // drawer the user did not start here, so it is named out front.
+                if !viewModel.handoffs.isEmpty {
+                    RelayCapsLabel(
+                        text: "\(viewModel.handoffs.count) handed off",
+                        color: AppTheme.accent,
+                        size: 9
+                    )
+                }
+
+                Spacer()
+
+                Text("\(viewModel.historyItems.count)")
+                    .font(AppTheme.monoFont(size: 11))
+                    .foregroundStyle(AppTheme.textTertiary)
+
+                Image(systemName: "chevron.right")
+                    .font(AppTheme.uiFont(size: 11, weight: .semibold))
+                    .foregroundStyle(AppTheme.textFaint)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .overlay(alignment: .bottom) {
+                Rectangle()
+                    .fill(AppTheme.hairline)
+                    .frame(height: 1)
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Threads, \(viewModel.historyItems.count) conversations and invocations")
+        .accessibilityIdentifier("relay-threads")
+    }
+
+    private func honorThreadsRequest() {
+        guard threadsRequest.wrappedValue else { return }
+        threadsRequest.wrappedValue = false
+        showingThreads = true
+    }
+
+    private func dismissKeyboard() {
+        UIApplication.shared.sendAction(
+            #selector(UIResponder.resignFirstResponder),
+            to: nil,
+            from: nil,
+            for: nil
+        )
+    }
+
+    private var keyboardDismissTap: some Gesture {
+        TapGesture().onEnded {
+            dismissKeyboard()
+        }
     }
 
     private var messageList: some View {
@@ -167,7 +214,7 @@ struct RelayChatView: View {
                                         Task { await viewModel.cancel(job: job) }
                                     },
                                     onFullLog: {
-                                        Task { fullLogText = await viewModel.loadFullLog(for: job) }
+                                        fullLogRequest = RelayFullLogRequest(job: job)
                                     }
                                 )
                                 .id(item.id)
@@ -218,7 +265,7 @@ struct RelayChatView: View {
                     .foregroundStyle(AppTheme.textPrimary)
                     .frame(width: 38, height: 38)
                     .background(.ultraThinMaterial, in: Circle())
-                    .overlay { Circle().stroke(AppTheme.glassStroke, lineWidth: 0.6) }
+                    .overlay { Circle().stroke(AppTheme.hairline, lineWidth: 0.6) }
                     .shadow(color: AppTheme.shadowColor, radius: 8, y: 3)
             }
             .buttonStyle(.plain)
@@ -261,7 +308,9 @@ private struct RelayComposer: View {
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(AppTheme.accent)
             Text(text)
-                .font(AppTheme.uiFont(size: 13, weight: .medium))
+                .font(AppTheme.uiFont(size: 11, weight: .semibold))
+                .tracking(0.8)
+                .textCase(.uppercase)
                 .lineLimit(usesAccessibilityLayout ? 3 : 1)
                 .multilineTextAlignment(.leading)
                 .truncationMode(.tail)
@@ -284,7 +333,7 @@ private struct RelayComposer: View {
         .frame(minHeight: 34)
         .frame(maxWidth: usesAccessibilityLayout ? .infinity : 240, alignment: .leading)
         .fixedSize(horizontal: !usesAccessibilityLayout, vertical: false)
-        .background(AppTheme.bgSurfaceHi, in: Capsule())
+        .overlay(Capsule().stroke(AppTheme.hairlineStrong, lineWidth: 1))
     }
 
     /// Harness-first model picker: each agent harness (Codex, Claude Code, Cursor) is a
@@ -423,13 +472,12 @@ private struct RelayComposer: View {
                     } label: {
                         ZStack {
                             Circle()
-                                .fill(canSend ? AnyShapeStyle(AppTheme.accentGradient) : AnyShapeStyle(AppTheme.bgSurface))
+                                .fill(canSend ? AnyShapeStyle(AppTheme.accentGradient) : AnyShapeStyle(AppTheme.textPrimary.opacity(0.08)))
                                 .frame(width: 34, height: 34)
                             Image(systemName: "arrow.up")
                                 .font(.system(size: 15, weight: .bold))
                                 .foregroundStyle(canSend ? .white : AppTheme.textTertiary)
                         }
-                        .shadow(color: canSend ? AppTheme.accent.opacity(0.5) : .clear, radius: 6, y: 2)
                     }
                     .buttonStyle(.plain)
                     .disabled(!canSend)
@@ -441,37 +489,15 @@ private struct RelayComposer: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
             .background {
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .fill(.ultraThinMaterial)
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 18, style: .continuous)
-                            .fill(AppTheme.glassTint)
-                    }
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 18, style: .continuous)
-                            .stroke(AppTheme.glassStroke, lineWidth: 0.7)
-                    }
+                Capsule().stroke(AppTheme.hairlineStrong, lineWidth: 1)
             }
             .animation(.spring(response: 0.3, dampingFraction: 0.7), value: isStreaming)
         }
         .padding(.horizontal, 12)
         .padding(.top, 10)
         .padding(.bottom, Self.normalBottomPadding)
-        .background(AppTheme.bgCanvas)
+        .background(AppTheme.canvasBottom)
         .animation(.easeOut(duration: 0.18), value: isFocused)
-        .toolbar {
-            ToolbarItemGroup(placement: .keyboard) {
-                Spacer()
-                Button {
-                    isFocused = false
-                } label: {
-                    Image(systemName: "keyboard.chevron.compact.down")
-                        .font(AppTheme.uiFont(size: 17, weight: .semibold))
-                }
-                .foregroundStyle(AppTheme.accent)
-                .accessibilityLabel("Dismiss keyboard")
-            }
-        }
     }
 
     private var canSend: Bool {
@@ -501,49 +527,20 @@ private struct RelayChatBubble: View {
     var body: some View {
         HStack(alignment: .bottom, spacing: 8) {
             if isUser { Spacer(minLength: 44) }
-            if !isUser { avatar }
 
-            VStack(alignment: .leading, spacing: 7) {
-                HStack(spacing: 6) {
-                    Text(label)
-                        .font(AppTheme.uiFont(size: 11, weight: .semibold))
-                        .foregroundStyle(metaColor)
-                    if let model = item.modelLabel, !isUser {
-                        Text(model)
-                            .font(AppTheme.uiFont(size: 11))
-                            .foregroundStyle(AppTheme.textTertiary)
-                            .lineLimit(1)
-                    }
-                    if showCopied {
-                        Text("Copied")
-                            .font(AppTheme.uiFont(size: 10, weight: .semibold))
-                            .foregroundStyle(AppTheme.statusOK)
-                            .transition(.opacity)
-                    }
-                }
-
-                if showWaitingDots {
-                    RelayTypingDots()
-                        .padding(.vertical, 2)
+            Group {
+                if isUser {
+                    messageColumn
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 11)
+                        .background(AppTheme.userBubbleGradient)
+                        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                        .shadow(color: AppTheme.shadowColor.opacity(0.4), radius: 10, y: 4)
                 } else {
-                    RelayStreamingContent(text: item.text, isStreaming: item.isStreaming, userAligned: isUser)
-                }
-
-                if let footer = footerText {
-                    Text(footer)
-                        .font(AppTheme.monoFont(size: 10))
-                        .foregroundStyle(isUser ? AppTheme.bgCanvas.opacity(0.6) : AppTheme.textTertiary)
+                    messageColumn
+                        .padding(.vertical, 2)
                 }
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 11)
-            .background(bubbleBackground)
-            .overlay {
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .stroke(bubbleStroke, lineWidth: 0.6)
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-            .shadow(color: AppTheme.shadowColor.opacity(isUser ? 0.4 : 0.25), radius: isUser ? 10 : 6, x: 0, y: 4)
             .contextMenu {
                 Button {
                     UIPasteboard.general.string = item.text
@@ -555,27 +552,39 @@ private struct RelayChatBubble: View {
         }
     }
 
-    @ViewBuilder private var bubbleBackground: some View {
-        if isUser {
-            AppTheme.userBubbleGradient
-        } else {
-            ZStack {
-                AppTheme.bgSurfaceHi
-                AppTheme.glassTint
+    private var messageColumn: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 6) {
+                RelayCapsLabel(
+                    text: bylineText,
+                    color: isUser ? AppTheme.onEmber.opacity(0.7) : AppTheme.accent
+                )
+                if showCopied {
+                    RelayCapsLabel(text: "Copied", color: AppTheme.textSecondary, size: 9)
+                        .transition(.opacity)
+                }
+            }
+
+            if showWaitingDots {
+                RelayTypingDots()
+                    .padding(.vertical, 2)
+            } else {
+                RelayStreamingContent(text: item.text, isStreaming: item.isStreaming, userAligned: isUser)
+            }
+
+            if let footer = footerText {
+                Text(footer)
+                    .font(AppTheme.monoFont(size: 10))
+                    .foregroundStyle(isUser ? AppTheme.onEmber.opacity(0.7) : AppTheme.textTertiary)
             }
         }
     }
 
-    private var avatar: some View {
-        Circle()
-            .fill(AppTheme.accentGradient)
-            .frame(width: 26, height: 26)
-            .overlay {
-                Image(systemName: "sparkle")
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundStyle(.white)
-            }
-            .shadow(color: AppTheme.accent.opacity(0.5), radius: 5, x: 0, y: 2)
+    private var bylineText: String {
+        if isUser { return "You" }
+        let provider = item.provider?.displayName ?? "Relay"
+        if let model = item.modelLabel { return "\(provider) · \(model)" }
+        return provider
     }
 
     private func flashCopied() {
@@ -603,9 +612,6 @@ private struct RelayChatBubble: View {
     }
 
     private var isUser: Bool { item.role == .user }
-    private var label: String { isUser ? "You" : item.provider?.displayName ?? "Relay" }
-    private var metaColor: Color { isUser ? AppTheme.bgCanvas.opacity(0.78) : AppTheme.accent }
-    private var bubbleStroke: Color { isUser ? Color.white.opacity(0.14) : AppTheme.glassStroke }
 }
 
 /// Animated three-dot "thinking" indicator shown before the first token arrives.
@@ -616,8 +622,8 @@ private struct RelayTypingDots: View {
         HStack(spacing: 5) {
             ForEach(0..<3, id: \.self) { i in
                 Circle()
-                    .fill(AppTheme.accent)
-                    .frame(width: 7, height: 7)
+                    .fill(AppTheme.textTertiary)
+                    .frame(width: 5, height: 5)
                     .scaleEffect(scale(for: i))
                     .opacity(0.5 + 0.5 * scale(for: i))
             }
@@ -678,10 +684,8 @@ private struct RelayJobCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
-                RelayStatusPill(status: job.status)
-                Text(job.provider.displayName)
-                    .font(AppTheme.uiFont(size: 12, weight: .medium))
-                    .foregroundStyle(AppTheme.textSecondary)
+                RelayStatusPill(status: job.status, startedAt: job.startedAt ?? job.createdAt)
+                RelayCapsLabel(text: job.provider.displayName, color: AppTheme.textTertiary)
                 Spacer()
                 // Status lives in the pill only (it used to repeat as plain text here);
                 // the trailing slot shows the run duration once the server reports one.
@@ -722,10 +726,9 @@ private struct RelayJobCard: View {
             .font(AppTheme.uiFont(size: 13, weight: .medium))
         }
         .padding(14)
-        .background(AppTheme.bgSurfaceHi, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(AppTheme.accent.opacity(0.22), lineWidth: 0.8)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(job.status.isActive ? AppTheme.accent.opacity(0.35) : AppTheme.hairline, lineWidth: 1)
         }
         .onChange(of: job.status.isActive) { _, isActive in
             // Light tap when the job reaches a terminal state while the card is visible.
@@ -767,14 +770,25 @@ private struct RelayJobCard: View {
 
 private struct RelayStatusPill: View {
     let status: CodexJobStatus
+    let startedAt: Date?
 
     var body: some View {
-        Text(status.label)
-            .font(AppTheme.uiFont(size: 11, weight: .semibold))
-            .foregroundStyle(status.relayTint)
-            .padding(.horizontal, 9)
-            .padding(.vertical, 4)
-            .background(status.relayTint.opacity(0.12), in: Capsule())
+        if status.isActive, let startedAt {
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                RelayCapsLabel(
+                    text: "\(status.label) · \(elapsedLabel(to: context.date))",
+                    color: AppTheme.accentBright
+                )
+            }
+        } else {
+            RelayCapsLabel(text: status.label, color: status.relayTint)
+        }
+    }
+
+    private func elapsedLabel(to now: Date) -> String {
+        guard let startedAt else { return "" }
+        let seconds = max(0, Int(now.timeIntervalSince(startedAt)))
+        return String(format: "%d:%02d", seconds / 60, seconds % 60)
     }
 }
 
@@ -782,15 +796,13 @@ private extension CodexJobStatus {
     var relayTint: Color {
         switch self {
         case .queued, .running, .canceling:
-            return AppTheme.statusWarn
+            return AppTheme.accentBright
         case .succeeded:
-            return AppTheme.statusOK
+            return AppTheme.textSecondary
         case .failed:
             return AppTheme.statusError
-        case .canceled, .timeout:
-            return AppTheme.statusNeutral
-        case .unknown:
-            return AppTheme.statusInfo
+        case .canceled, .timeout, .unknown:
+            return AppTheme.textTertiary
         }
     }
 }
@@ -810,70 +822,153 @@ private struct RelayThreadDrawer: View {
                         Label("New conversation", systemImage: "square.and.pencil")
                             .foregroundStyle(AppTheme.accent)
                     }
-                    .listRowBackground(AppTheme.bgSurface)
+                    .listRowBackground(Color.clear)
                 }
 
-                if viewModel.threads.isEmpty {
-                    // Subfolder chats keep their own histories, distinct from parent folders.
-                    Text("No threads in this folder yet. Conversations here stay scoped to \(viewModel.folderDisplayName).")
+                handoffSection
+
+                if viewModel.historyItems.isEmpty {
+                    Text("No conversations or invocations in this folder yet.")
                         .font(AppTheme.uiFont(size: 13))
                         .foregroundStyle(AppTheme.textTertiary)
                         .listRowBackground(AppTheme.bgCanvas)
                 }
 
-                // This folder's threads, both modes, flat and newest-first.
-                Section {
-                    ForEach(viewModel.threads) { thread in
-                        threadRow(thread)
+                // Exact-folder conversations plus invocations that do not have a session yet.
+                Section("This folder") {
+                    ForEach(viewModel.historyItems) { item in
+                        historyRow(item)
                             .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                                Button(role: .destructive) {
-                                    Task { await viewModel.delete(thread) }
-                                } label: {
-                                    Label("Delete", systemImage: "trash")
+                                if case .thread(let thread) = item.source {
+                                    Button(role: .destructive) {
+                                        Task { await viewModel.delete(thread) }
+                                    } label: {
+                                        Label("Delete", systemImage: "trash")
+                                    }
                                 }
                             }
                     }
                 }
+
+                macSessionSection
             }
             .scrollContentBackground(.hidden)
             .background(AppTheme.bgCanvas)
             .navigationTitle("Threads")
             .navigationBarTitleDisplayMode(.inline)
-            .task { await viewModel.refreshThreads() }
+            .task {
+                await viewModel.refreshThreads()
+                await viewModel.refreshHandoffs()
+            }
             .preferredColorScheme(.dark)
         }
     }
 
-    private func threadRow(_ thread: CodexThread) -> some View {
+    /// Sessions handed over from a Mac. Above this folder's history because a
+    /// handoff is the thing the user was just pushed about.
+    @ViewBuilder private var handoffSection: some View {
+        if !viewModel.handoffs.isEmpty {
+            Section("Handed off") {
+                ForEach(viewModel.handoffs) { card in
+                    RelayHandoffCardView(
+                        card: card,
+                        manifest: viewModel.handoffManifests[card.id],
+                        isContinuing: viewModel.continuingHandoffIDs.contains(card.id),
+                        onContinue: {
+                            Task {
+                                await viewModel.continueHandoff(card)
+                                dismiss()
+                            }
+                        }
+                    )
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets(top: 6, leading: 8, bottom: 6, trailing: 8))
+                }
+            }
+        }
+    }
+
+    /// The Mac's own session index: browsable, metadata only, with the honest
+    /// affordances — start fresh here, or run `relay handoff` over there.
+    @ViewBuilder private var macSessionSection: some View {
+        if let index = viewModel.macSessions, !index.sessions.isEmpty {
+            Section {
+                ForEach(index.sessions) { session in
+                    RelayMacSessionRow(session: session, onStartFresh: {
+                        viewModel.prompt = "Continue the work from “\(session.displayTitle)”."
+                        dismiss()
+                    })
+                    .listRowBackground(Color.clear)
+                }
+            } header: {
+                HStack(spacing: 8) {
+                    Text(index.sectionTitle)
+                    Spacer()
+                    if let updatedAt = index.updatedAtDate {
+                        Text(RelayRelativeTime.string(for: updatedAt))
+                            .font(AppTheme.monoFont(size: 10))
+                            .foregroundStyle(AppTheme.textFaint)
+                    }
+                }
+            } footer: {
+                Text("Run relay handoff there to continue one of these exactly.")
+                    .font(AppTheme.uiFont(size: 12))
+                    .foregroundStyle(AppTheme.textFaint)
+            }
+        }
+    }
+
+    private func historyRow(_ item: CodexThreadFeedItem) -> some View {
         Button {
             Task {
-                await viewModel.openThread(thread)
+                await viewModel.openHistoryItem(item)
                 dismiss()
             }
         } label: {
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 6) {
-                    Text(thread.displayTitle)
+                    Text(item.title)
                         .foregroundStyle(AppTheme.textPrimary)
                         .lineLimit(1)
                     Spacer()
-                    if thread.hasActiveJobs {
-                        Circle().fill(AppTheme.statusWarn).frame(width: 7, height: 7)
+                    if item.isActive {
+                        RelayCapsLabel(text: "Active", color: AppTheme.accentBright, size: 9)
                     }
-                    Text(thread.mode.label)
-                        .font(AppTheme.uiFont(size: 9, weight: .bold))
-                        .foregroundStyle(AppTheme.accent)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(AppTheme.accent.opacity(0.15), in: Capsule())
+                    RelayCapsLabel(text: historyModeLabel(item), color: AppTheme.accent, size: 9)
                 }
-                Text(thread.feedPreview)
+                Text(item.preview)
                     .font(.caption)
                     .foregroundStyle(AppTheme.textTertiary)
                     .lineLimit(2)
+                Text(historyMetadata(item))
+                    .font(AppTheme.monoFont(size: 10))
+                    .foregroundStyle(AppTheme.textTertiary)
             }
         }
-        .listRowBackground(AppTheme.bgSurface)
+        .listRowBackground(Color.clear)
+    }
+
+    private func historyModeLabel(_ item: CodexThreadFeedItem) -> String {
+        switch item.source {
+        case .thread(let thread):
+            return thread.mode.label
+        case .pendingJob:
+            return "Task"
+        }
+    }
+
+    private func historyMetadata(_ item: CodexThreadFeedItem) -> String {
+        switch item.source {
+        case .thread(let thread):
+            if thread.mode == .chat {
+                return "\(item.workspaceLabel) · \(thread.provider.displayName) · conversation"
+            }
+            let count = thread.jobCount
+            let invocationText = count == 1 ? "1 invocation" : "\(count) invocations"
+            return "\(item.workspaceLabel) · \(thread.provider.displayName) · \(invocationText)"
+        case .pendingJob(let job):
+            return "\(item.workspaceLabel) · \(job.provider.displayName) · invocation · \(job.status.label)"
+        }
     }
 }
 
@@ -886,7 +981,10 @@ private struct RelayStatusBanner: View {
             .foregroundStyle(AppTheme.statusError)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(12)
-            .background(AppTheme.statusError.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(AppTheme.statusError.opacity(0.3), lineWidth: 1)
+            }
     }
 }
 
@@ -898,15 +996,12 @@ private struct RelayEmptyConversation: View {
     var body: some View {
         VStack(spacing: 14) {
             Image(systemName: isTask ? "terminal.fill" : "message.fill")
-                .font(.system(size: 32, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(width: 78, height: 78)
-                .background(AppTheme.accentGradient, in: Circle())
-                .shadow(color: AppTheme.accent.opacity(0.45), radius: 16, y: 6)
+                .font(.system(size: 30, weight: .medium))
+                .foregroundStyle(AppTheme.accentGradient)
 
             VStack(spacing: 6) {
                 Text(isTask ? "Run a task" : "Start a conversation")
-                    .font(AppTheme.uiFont(size: 20, weight: .semibold))
+                    .font(AppTheme.serifFont(size: 24))
                     .foregroundStyle(AppTheme.textPrimary)
                 Text(isTask
                      ? "Queue an agent job in this folder."
@@ -922,7 +1017,7 @@ private struct RelayEmptyConversation: View {
                     .foregroundStyle(AppTheme.textSecondary)
                     .padding(.horizontal, 12)
                     .frame(height: 30)
-                    .background(AppTheme.bgSurfaceHi, in: Capsule())
+                    .overlay(Capsule().stroke(AppTheme.hairlineStrong, lineWidth: 1))
             }
         }
         .frame(maxWidth: .infinity, minHeight: 320, alignment: .center)
@@ -931,28 +1026,47 @@ private struct RelayEmptyConversation: View {
     }
 }
 
-private struct RelayFullLogText: Identifiable {
-    let id = UUID()
-    let text: String
+private struct RelayFullLogRequest: Identifiable {
+    var id: String { job.id }
+    let job: CodexJob
 }
 
 private struct RelayFullLogSheet: View {
-    let text: String
+    let job: CodexJob
+    let load: () async -> String
+    @Environment(\.dismiss) private var dismiss
+    @State private var text: String?
 
     var body: some View {
         NavigationStack {
             ScrollView {
-                Text(text.isEmpty ? "No log output." : text)
-                    .font(AppTheme.monoFont(size: 12))
-                    .foregroundStyle(AppTheme.textPrimary)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(16)
+                if let text {
+                    Text(text.isEmpty ? "No log output." : text)
+                        .font(AppTheme.monoFont(size: 12))
+                        .foregroundStyle(AppTheme.textPrimary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(16)
+                } else {
+                    ProgressView("Loading full log…")
+                        .tint(AppTheme.accent)
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .frame(maxWidth: .infinity, minHeight: 260)
+                }
             }
             .background(AppTheme.bgCanvas)
             .navigationTitle("Log")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
             .preferredColorScheme(.dark)
+        }
+        .task(id: job.id) {
+            guard text == nil else { return }
+            text = await load()
         }
     }
 }

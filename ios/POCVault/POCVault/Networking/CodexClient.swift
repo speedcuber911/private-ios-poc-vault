@@ -161,11 +161,26 @@ enum CodexDiagnostics {
 }
 
 final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
-    let baseURL: URL
+    /// The node this client talks to. Mutable so adopting a trial machine can
+    /// repoint every store that already holds this client (chat, status feed,
+    /// browser) without rebuilding them and losing in-flight state; guarded by a
+    /// lock because requests are issued from arbitrary tasks.
+    var baseURL: URL {
+        baseURLLock.lock()
+        defer { baseURLLock.unlock() }
+        return storedBaseURL
+    }
 
+    private var storedBaseURL: URL
+    private let baseURLLock = NSLock()
     private let identityStore: ClientIdentityStore
     private let encoder = JSONEncoder()
-    private let decoder: JSONDecoder = {
+    private let decoder = CodexClient.makeDecoder()
+
+    /// The exact decoder every node response goes through. Exposed so tests can
+    /// decode fixtures the way the client will, instead of keeping a second
+    /// configuration that can silently drift from this one.
+    static func makeDecoder() -> JSONDecoder {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         decoder.dateDecodingStrategy = .custom { decoder in
@@ -185,19 +200,35 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
             )
         }
         return decoder
-    }()
+    }
 
     private lazy var session: URLSession = {
         URLSession(configuration: .ephemeral, delegate: self, delegateQueue: nil)
     }()
 
     init(baseURL: URL, identityStore: ClientIdentityStore) {
-        self.baseURL = baseURL
+        self.storedBaseURL = baseURL
         self.identityStore = identityStore
         super.init()
         CodexDiagnostics.log("codex_client_init", fields: [
             "baseURL": baseURL.absoluteString,
             "hasClientIdentity": String(identityStore.hasStoredIdentity)
+        ])
+    }
+
+    /// Repoints this client at another node (trial adoption, or reverting to the
+    /// personal install when a trial is deleted). The `URLSession` is kept: it is
+    /// ephemeral and per-host, so nothing from the previous node leaks into the
+    /// new one, and no store holding this client has to be rebuilt.
+    func retarget(baseURL: URL) {
+        baseURLLock.lock()
+        let didChange = storedBaseURL != baseURL
+        storedBaseURL = baseURL
+        baseURLLock.unlock()
+
+        guard didChange else { return }
+        CodexDiagnostics.log("codex_client_retarget", fields: [
+            "baseURL": baseURL.absoluteString
         ])
     }
 
@@ -323,8 +354,15 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         return try decoder.decode(CodexListEnvelope<CodexThread>.self, from: data).values
     }
 
-    func fetchThreadDetail(sessionID: String, provider: CodexProvider? = nil) async throws -> CodexThreadDetail {
+    func fetchThreadDetail(
+        sessionID: String,
+        workspaceID: String? = nil,
+        provider: CodexProvider? = nil
+    ) async throws -> CodexThreadDetail {
         var queryItems: [URLQueryItem] = []
+        if let workspaceID, !workspaceID.isEmpty {
+            queryItems.append(URLQueryItem(name: "workspaceId", value: workspaceID))
+        }
         appendProvider(provider, to: &queryItems)
 
         let data = try await perform(path: "/v1/codex/threads/\(Self.pathComponent(sessionID))", queryItems: queryItems)
@@ -395,6 +433,54 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
             return nil
         }
         return try? decoder.decode(CodexJob.self, from: data)
+    }
+
+    // MARK: - Handoffs
+
+    /// Sessions handed over from a Mac (`GET /v1/handoffs` → `{handoffs: [...]}`).
+    /// The list projection carries no manifest and never the primed prompt.
+    func fetchHandoffs() async throws -> [RelayHandoffCard] {
+        let data = try await perform(path: "/v1/handoffs")
+        return try decoder.decode(CodexListEnvelope<RelayHandoffCard>.self, from: data).values
+    }
+
+    /// One handoff with the manifest relayd decrypted on the node
+    /// (`GET /v1/handoffs/:id` → `{handoff: {...}}`). An unknown or malformed id
+    /// is a clean 404 from the node, surfaced here as `httpFailure(404, _)`.
+    func fetchHandoff(id: String) async throws -> RelayHandoffDetail {
+        let data = try await perform(path: "/v1/handoffs/\(Self.pathComponent(id))")
+        guard !data.isEmpty else {
+            throw CodexClientError.emptyResponse
+        }
+        return try decoder.decode(RelayHandoffEnvelope.self, from: data).handoff
+    }
+
+    /// Resumes the handed-off session as an ordinary job in its worktree
+    /// (`POST /v1/handoffs/:id/continue` → 202 `{job: {...}}`), so its output
+    /// streams over the existing job SSE. 409 when the handoff is not ready or
+    /// already has a job running.
+    func continueHandoff(id: String, prompt: String? = nil) async throws -> CodexCreateJobResponse {
+        var body: [String: String] = [:]
+        if let prompt = prompt?.trimmedNonEmpty {
+            body["prompt"] = prompt
+        }
+        let data = try await perform(
+            path: "/v1/handoffs/\(Self.pathComponent(id))/continue",
+            method: "POST",
+            body: try JSONSerialization.data(withJSONObject: body)
+        )
+        guard !data.isEmpty else {
+            throw CodexClientError.emptyResponse
+        }
+        return try decoder.decode(CodexCreateJobResponse.self, from: data)
+    }
+
+    /// The "On your Mac" index (`GET /v1/mac-sessions` → `{index: ... | null}`).
+    /// Metadata only; nil when no Mac has ever published one.
+    func fetchMacSessions() async throws -> RelayMacSessionIndex? {
+        let data = try await perform(path: "/v1/mac-sessions")
+        guard !data.isEmpty else { return nil }
+        return try decoder.decode(RelayMacSessionEnvelope.self, from: data).index
     }
 
     func transcribeAudio(fileURL: URL) async throws -> CodexTranscriptionResponse {
@@ -658,6 +744,34 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         return (data, httpResponse)
     }
 
+    /// Downloads the node's whole workspace jail as a tar and returns a local
+    /// file URL for sharing. Streamed to disk rather than held in memory: a
+    /// trial machine's jail can be far larger than an iPhone will tolerate as
+    /// a single `Data`. The caller owns the returned file.
+    func downloadExport() async throws -> URL {
+        let url = endpoint(path: "/v1/export.tar", queryItems: [])
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 600
+        request.setValue("application/x-tar", forHTTPHeaderField: "Accept")
+
+        let (temporaryURL, response) = try await session.download(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw CodexClientError.emptyResponse
+        }
+        guard (200...299).contains(http.statusCode) else {
+            try? FileManager.default.removeItem(at: temporaryURL)
+            throw CodexClientError.httpFailure(http.statusCode, nil)
+        }
+        // URLSession deletes its temp file as soon as this call returns, so the
+        // payload has to be moved somewhere the share sheet can still read.
+        let destination = FileManager.default.temporaryDirectory
+            .appendingPathComponent("relay-workspaces.tar")
+        try? FileManager.default.removeItem(at: destination)
+        try FileManager.default.moveItem(at: temporaryURL, to: destination)
+        return destination
+    }
+
     private func endpoint(path: String, queryItems: [URLQueryItem]) -> URL {
         let base = baseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let normalizedPath = path.hasPrefix("/") ? String(path.dropFirst()) : path
@@ -792,6 +906,17 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
                 ])
                 completionHandler(.performDefaultHandling, nil)
             }
+        case NSURLAuthenticationMethodServerTrust:
+            // A trial machine's certificate is signed by that node's own CA (the
+            // broker is TLS passthrough), so the system trust store can never
+            // validate it. Pin the CA that shipped in the pairing PKCS#12 — for
+            // that host only; every other host keeps default handling.
+            RelayServerTrust.handleServerTrustChallenge(
+                challenge,
+                identityStore: identityStore,
+                scope: scope,
+                completionHandler: completionHandler
+            )
         default:
             CodexDiagnostics.log("codex_auth_challenge", fields: [
                 "host": challenge.protectionSpace.host,
@@ -833,7 +958,7 @@ private struct CodexListEnvelope<Element: Decodable>: Decodable {
         }
 
         let container = try decoder.container(keyedBy: CodexDynamicCodingKey.self)
-        for key in ["items", "data", "results", "models", "workspaces", "jobs", "sessions", "threads"] {
+        for key in ["items", "data", "results", "models", "workspaces", "jobs", "sessions", "threads", "handoffs"] {
             if let codingKey = CodexDynamicCodingKey(stringValue: key),
                let values = try? container.decode([Element].self, forKey: codingKey) {
                 self.values = values
@@ -843,6 +968,14 @@ private struct CodexListEnvelope<Element: Decodable>: Decodable {
 
         self.values = []
     }
+}
+
+private struct RelayHandoffEnvelope: Decodable {
+    let handoff: RelayHandoffDetail
+}
+
+private struct RelayMacSessionEnvelope: Decodable {
+    let index: RelayMacSessionIndex?
 }
 
 private struct CodexDynamicCodingKey: CodingKey {

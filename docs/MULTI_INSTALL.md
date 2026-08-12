@@ -271,7 +271,7 @@ python3 -m py_compile ops/render-manifest.py ops/sign-manifest.py ops/deploy-poc
 bash -n ops/init-install-config ops/install-server.sh ops/install-codex-api.sh ops/provision-ec2.sh ops/issue-server-cert.sh ops/generate-client-certs.sh ops/provision-ios-support.sh ios/launch-simulator.sh
 python3 ops/render-manifest.py --pocs-dir pocs -o build/manifest.json
 python3 ops/sign-manifest.py build/manifest.json --allow-missing-key
-cd codex-server/codex-api-deploy && node --check server.mjs && node --test server.test.mjs
+cd relay-server/codex-api-deploy && node --check server.mjs && node --test server.test.mjs
 ```
 
 Live perimeter check:

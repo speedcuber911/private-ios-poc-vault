@@ -22,7 +22,7 @@ The platform has three connected layers:
    authenticated WebViews.
 2. Static POCs are stored under `pocs/<slug>/public/`, discovered through a
    generated manifest, and served through nginx behind mTLS.
-3. The EC2 Codex server accepts authenticated job requests from the phone,
+3. The EC2 Relay server accepts authenticated job requests from the phone,
    persists job state, runs Codex or Claude in registered workspaces, exposes
    thread summaries, and supports phone-recorded prompt transcription through
    Azure Speech.
@@ -80,31 +80,38 @@ server from `ios/launch-simulator.sh`.
 > First into a chat-first design with separate **Chat** and **Task** bottom tabs,
 > streaming replies, and a reimagined workspace picker
 > ([CHAT_REDESIGN.md](CHAT_REDESIGN.md)). That tab layout is now itself being
-> superseded by a **files-first** redesign — a file-browser root with per-folder
-> conversations and explicit chat/task model choices — specified in
-> [FILES_REDESIGN.md](FILES_REDESIGN.md) (implementation in progress as of
-> 2026-08-09). Read FILES_REDESIGN.md for the target navigation and chat
+> superseded by the current **files-first** design — a file-browser root with
+> per-folder conversations and explicit chat/task model choices — specified in
+> [FILES_REDESIGN.md](FILES_REDESIGN.md) and implemented as of 2026-08-11. Read
+> FILES_REDESIGN.md for the current navigation and chat
 > surface, CHAT_REDESIGN.md for the catalog de-duplication and streaming-chat
 > details that carry forward, and the notes below for the prior single-console
 > thread model, which the redesign removes.
 
-The Relay agent console has moved from a job-list surface to a prompt-first,
-thread-oriented operator console:
+The Relay agent console has moved from a job-list surface to a files-first,
+folder-scoped conversation console:
 
 - The compose panel starts a new thread or continues a selected thread.
-- The thread feed merges EC2-native sessions with the latest persisted job
-  metadata.
+- A visible `Threads` row below the chat header opens the current folder's
+  newest-first history.
+- The history merges EC2-native sessions with persisted job metadata and keeps
+  standalone invocations visible even when no resumable session was produced.
+- Jobs already represented by a thread are de-duplicated, and exact workspace
+  filtering prevents one folder's history from leaking into another.
 - Smoke-test threads are hidden from the main feed by default.
 - Jobs that are still starting appear as pending feed rows until a session file
   is discovered.
-- The internal thread browser supports search and can reveal smoke tests when
-  needed, while the main screen stays focused on prompt composition and results.
+- The history sheet stays secondary to the main conversation and composer.
 - Thread titles are derived from prompt/result/error content, with special
   handling for GitHub pull request URLs.
 - Raw job activity previews now favor the latest log tail so active failures
   show the newest useful lines first.
-- Thread detail opens on a bounded latest-answer preview and can expand/load the
-  latest job detail when the user wants the full answer.
+- Opening a history row restores its bounded conversation or invocation result.
+  `View full log` opens a stable sheet first, displays a loading state, and then
+  renders explicitly requested raw activity without dismissing itself.
+- The composer uses the keyboard safe area, interactive scroll dismissal,
+  dismissal on Send/Run, and outside taps on non-editor content. It has no
+  custom keyboard-accessory or floating dismissal button.
 
 The compose controls support provider, model, effort/reasoning, attachments,
 voice transcription, Claude permission modes, and a searchable skill picker.
@@ -144,7 +151,7 @@ Network behavior:
 
 ## Codex API
 
-Deployable server files live in `codex-server/codex-api-deploy/`.
+Deployable server files live in `relay-server/codex-api-deploy/`.
 
 Current authenticated API surface:
 
@@ -302,7 +309,7 @@ portable install path is:
 - `ops/provision-ios-support.sh` writes URLs and the trusted manifest public
   key into the app support config for physical devices.
 
-The Codex server docs now call out:
+The Relay server docs now call out:
 
 - authenticated endpoint inventory
 - thread summary behavior
@@ -320,7 +327,7 @@ python3 -m py_compile ops/render-manifest.py ops/sign-manifest.py ops/deploy-poc
 bash -n ios/launch-simulator.sh
 python3 ops/render-manifest.py --pocs-dir pocs -o build/manifest.json
 python3 ops/sign-manifest.py build/manifest.json --allow-missing-key
-cd codex-server/codex-api-deploy && node --check server.mjs && node --test server.test.mjs
+cd relay-server/codex-api-deploy && node --check server.mjs && node --test server.test.mjs
 ```
 
 For the iOS test suite:

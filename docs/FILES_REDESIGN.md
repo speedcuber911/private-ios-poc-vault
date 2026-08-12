@@ -8,9 +8,8 @@
 > model picker groups Agents **by harness** (Codex / Claude Code / Cursor),
 > each revealing its own models, instead of a flat task-capable list. As of
 > 2026-08-11 the checked-in server matches the live EC2 install and its files
-> API is responding behind the existing mTLS perimeter. A physical-device app
-> build/install still requires the macOS/Xcode workflow and is tracked
-> separately from the server rollout.
+> API is responding behind the existing mTLS perimeter. The updated app was
+> also signed, installed, and relaunched on the physical iPhone on 2026-08-11.
 
 This is the successor to [CHAT_REDESIGN.md](CHAT_REDESIGN.md). It replaces the
 four-tab, chat-first navigation model with a **files-first** design: the app
@@ -43,7 +42,7 @@ App launch
            |- Chat models: Codex GPT-5.6 Sol/Terra/Luna | configured Azure
            |- agent -> async job, live output, cancel, continue
            |- chat  -> saved workspace-scoped conversation
-           `- history -> both kinds for this folder
+           `- Threads -> conversations and invocations for this folder
 ```
 
 What this replaces from the chat-first design:
@@ -111,8 +110,10 @@ every folder screen. A new `RelayChatSessionStore` owned by the App struct:
 - runs the **single app-wide job monitor loop** (replacing the tab-visibility
   monitors) and feeds completion notifications.
 
-The chat editor keeps its keyboard-accessory Done action, interactive scroll
-dismissal, and dismissal on Run — these are hard requirements, not styling.
+The chat editor keeps interactive scroll dismissal, dismissal on Send/Run, and
+outside-tap dismissal on non-editor content. It does not add a custom keyboard
+accessory or floating dismiss control, and taps inside the composer must retain
+focus.
 
 ---
 
@@ -153,16 +154,22 @@ Notes:
 ### Threads
 
 Sending in chat mode creates a **workspace-scoped chat thread**; sending in
-task mode creates an async job as before. The thread drawer for a folder shows
-both kinds in one flat recency list with mode badges. Subfolder conversations
-are intentionally distinct from their parent folder's.
+task mode creates an async job as before. A visible **Threads** row below the
+chat header opens that folder's flat, newest-first history with mode badges. It
+includes resumable chat/task threads and standalone invocations that have not
+produced a session, while de-duplicating jobs already represented by a thread.
+Subfolder conversations are intentionally distinct from their parent folder's.
+
+`View full log` opens a stable sheet immediately, shows a loading state while
+the explicit full-log request runs, and remains presented until the user
+dismisses it.
 
 ---
 
 ## 4. Server API additions
 
 The server remains the zero-dependency Node service in
-`codex-server/codex-api-deploy/server.mjs`. All additions are backward
+`relay-server/codex-api-deploy/server.mjs`. All additions are backward
 compatible: the previously installed app keeps working at every milestone, and
 the legacy `GET /v1/codex/workspace-dirs` response shape is preserved.
 

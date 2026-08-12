@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path("~/.poc-vault/secrets/config.env").expanduser()
 DEFAULT_OUTPUT_DIR = ROOT / "build" / "codex-api"
-DEFAULT_TEMPLATE = ROOT / "codex-server" / "codex-api-deploy" / "codex-api.nginx.conf.template"
+DEFAULT_TEMPLATE = ROOT / "relay-server" / "codex-api-deploy" / "codex-api.nginx.conf.template"
 DEFAULT_OPENCODE_CONFIG = Path("~/.config/opencode/opencode.jsonc").expanduser()
 
 

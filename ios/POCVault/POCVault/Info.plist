@@ -12,6 +12,8 @@
 	<dict>
 		<key>CFBundlePrimaryIcon</key>
 		<dict>
+			<key>CFBundleIconName</key>
+			<string>AppIcon</string>
 			<key>CFBundleIconFiles</key>
 			<array>
 				<string>AppIcon60x60</string>
@@ -27,9 +29,11 @@
 	<key>CFBundleShortVersionString</key>
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
@@ -46,6 +50,8 @@
 	<string>$(POC_VAULT_MANIFEST_URL)</string>
 	<key>POCVaultCodexBaseURL</key>
 	<string>$(POC_VAULT_CODEX_BASE_URL)</string>
+	<key>RelayAuthBaseURL</key>
+	<string>$(RELAY_AUTH_BASE_URL)</string>
 	<key>POCVaultSignatureURL</key>
 	<string>$(POC_VAULT_SIGNATURE_URL)</string>
 	<key>POCVaultManifestPublicKey</key>

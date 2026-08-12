@@ -443,11 +443,9 @@ struct FileViewerView: View {
             Image(systemName: viewModel.entry.browserGlyph)
                 .font(.system(size: 30, weight: .semibold))
                 .foregroundStyle(AppTheme.accent)
-                .frame(width: 78, height: 78)
-                .background(AppTheme.accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
 
             Text(viewModel.entry.displayName)
-                .font(AppTheme.uiFont(size: 18, weight: .semibold))
+                .font(AppTheme.serifFont(size: 20))
                 .foregroundStyle(AppTheme.textPrimary)
                 .multilineTextAlignment(.center)
 
@@ -467,10 +465,10 @@ struct FileViewerView: View {
                 ShareLink(item: shareURL) {
                     Label("Share file", systemImage: "square.and.arrow.up")
                         .font(AppTheme.uiFont(size: 14, weight: .semibold))
-                        .foregroundStyle(AppTheme.accent)
+                        .foregroundStyle(AppTheme.textPrimary)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 9)
-                        .background(AppTheme.accent.opacity(0.14), in: Capsule())
+                        .overlay(Capsule().stroke(AppTheme.hairlineStrong, lineWidth: 1))
                 }
                 .buttonStyle(.plain)
             }
@@ -522,7 +520,7 @@ struct FileViewerView: View {
             .padding(.vertical, 16)
             .overlay(alignment: .top) {
                 Rectangle()
-                    .fill(AppTheme.strokeSubtle)
+                    .fill(AppTheme.hairline)
                     .frame(height: 0.5)
             }
         }
@@ -559,12 +557,12 @@ struct FileViewerView: View {
         ToolbarItem(placement: .principal) {
             VStack(spacing: 1) {
                 Text(viewModel.entry.displayName)
-                    .font(AppTheme.uiFont(size: 15, weight: .semibold))
+                    .font(AppTheme.serifFont(size: 16))
                     .foregroundStyle(AppTheme.textPrimary)
                     .lineLimit(1)
                 if let metadata = metadataLine {
                     Text(metadata)
-                        .font(AppTheme.uiFont(size: 10))
+                        .font(AppTheme.monoFont(size: 10))
                         .foregroundStyle(AppTheme.textTertiary)
                         .lineLimit(1)
                 }
@@ -629,6 +627,9 @@ private struct FileViewerErrorBanner: View {
             .foregroundStyle(AppTheme.statusError)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(12)
-            .background(AppTheme.statusError.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(AppTheme.statusError.opacity(0.3), lineWidth: 1)
+            }
     }
 }
