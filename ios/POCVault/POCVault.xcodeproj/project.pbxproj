@@ -592,7 +592,7 @@
 				POC_VAULT_MANIFEST_PUBLIC_KEY = "";
 				POC_VAULT_MANIFEST_URL = "https://vault.pocs.example.com/manifest.json";
 				POC_VAULT_SIGNATURE_URL = "https://vault.pocs.example.com/manifest.sig.json";
-				RELAY_AUTH_BASE_URL = "https://api.pocs.example.com";
+				RELAY_AUTH_BASE_URL = "https://relay.ai-rocket-experiments.com";
 				PRODUCT_BUNDLE_IDENTIFIER = com.parikshit.pocvault;
 				PRODUCT_MODULE_NAME = POCVault;
 				PRODUCT_NAME = Relay;
@@ -616,7 +616,7 @@
 				POC_VAULT_MANIFEST_PUBLIC_KEY = "";
 				POC_VAULT_MANIFEST_URL = "https://vault.pocs.conformal.live/manifest.json";
 				POC_VAULT_SIGNATURE_URL = "https://vault.pocs.conformal.live/manifest.sig.json";
-				RELAY_AUTH_BASE_URL = "https://api.pocs.conformal.live";
+				RELAY_AUTH_BASE_URL = "https://relay.ai-rocket-experiments.com";
 				PRODUCT_BUNDLE_IDENTIFIER = com.parikshit.pocvault;
 				PRODUCT_MODULE_NAME = POCVault;
 				PRODUCT_NAME = Relay;
