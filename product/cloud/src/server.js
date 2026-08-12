@@ -104,6 +104,9 @@ export function createApp({
     // orphan instead of an account that cannot be deleted.
     beforeAccountDelete: (accountId) =>
       releaseSandbox(registry.getTrialByAccount(accountId), "account_deleted"),
+    // Shared with the legacy /v1/auth/apple route, so both paths accept
+    // exactly the same tokens and there is one Apple verifier to reason about.
+    verifyAppleIdToken: legacyAuth.verifyAppleIdentityToken,
   });
   const auth = {
     ...legacyAuth,
