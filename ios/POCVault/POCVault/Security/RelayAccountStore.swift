@@ -19,6 +19,10 @@ final class RelayAccountStore: ObservableObject {
     private let identityStore: ClientIdentityStore
     private let tokenStore: RelaySessionTokenStore
     private let defaults: UserDefaults
+    /// Held so ending a session can also drop the machine pointer: the trial
+    /// record is account-scoped state, and leaving it behind would hand the next
+    /// account on this phone another account's machine.
+    private let nodeStore: RelayNodeStore?
     private var sessionToken: String?
     private var hasRestored = false
 
@@ -26,12 +30,14 @@ final class RelayAccountStore: ObservableObject {
         client: RelayAuthClient,
         identityStore: ClientIdentityStore,
         defaults: UserDefaults = .standard,
-        tokenStore: RelaySessionTokenStore = RelaySessionTokenStore()
+        tokenStore: RelaySessionTokenStore = RelaySessionTokenStore(),
+        nodeStore: RelayNodeStore? = nil
     ) {
         self.client = client
         self.identityStore = identityStore
         self.defaults = defaults
         self.tokenStore = tokenStore
+        self.nodeStore = nodeStore
     }
 
     func restore() async {
@@ -98,7 +104,7 @@ final class RelayAccountStore: ObservableObject {
 
     func signOut() async {
         guard let token = sessionToken else {
-            clearLocalSession()
+            clearLocalSession(purgingDeviceAccess: true)
             return
         }
         isWorking = true
@@ -110,12 +116,12 @@ final class RelayAccountStore: ObservableObject {
             // A local sign-out must remain possible during an outage. Better
             // Auth sessions expire server-side and are not retained by Relay.
         }
-        clearLocalSession()
+        clearLocalSession(purgingDeviceAccess: true)
     }
 
     func deleteAccount(password: String?) async -> Bool {
         guard let token = sessionToken else {
-            clearLocalSession()
+            clearLocalSession(purgingDeviceAccess: true)
             return true
         }
         isWorking = true
@@ -128,7 +134,7 @@ final class RelayAccountStore: ObservableObject {
                 defaults.removeObject(forKey: onboardingKey(for: deletedUserID))
             }
             try? identityStore.deleteStoredIdentity()
-            clearLocalSession()
+            clearLocalSession(purgingDeviceAccess: true)
             return true
         } catch {
             errorMessage = error.localizedDescription
@@ -163,8 +169,22 @@ final class RelayAccountStore: ObservableObject {
         phase = defaults.bool(forKey: onboardingKey(for: user.id)) ? .ready : .onboarding
     }
 
-    private func clearLocalSession() {
+    /// `purgingDeviceAccess` is set only when the user deliberately leaves the
+    /// account (sign out, delete account). Then this device's access to that
+    /// account's machine goes with it: the trial pointer and the trial-issued
+    /// client identity plus its pinned CA are removed, so a second account
+    /// signing in here inherits neither. A BYO identity the user imported for
+    /// their own install is theirs, not the account's, and is left alone.
+    ///
+    /// A dropped session (expired token, auth server unreachable) must NOT purge:
+    /// the same user signs back in and their machine — whose pairing can never be
+    /// repeated — has to still be there.
+    private func clearLocalSession(purgingDeviceAccess: Bool = false) {
         try? tokenStore.delete()
+        if purgingDeviceAccess {
+            nodeStore?.clear()
+            identityStore.discardTrialMaterial()
+        }
         sessionToken = nil
         user = nil
         errorMessage = nil

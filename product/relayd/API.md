@@ -934,9 +934,16 @@ keypair and sending a CSR:
    key+cert+CA-pem into a **passphrase-protected PKCS#12** via `openssl
    pkcs12 -export`.
 3. The passphrase is `hex(hmac-sha256(key = secret, msg =
-   "relay-trial-p12-v1"))` — derivable by both peers from the same pairing
-   `secret` that derives `authToken`/`macKey` above, so the cloud (which
-   holds only `authToken`) cannot compute it either.
+   "relay-trial-p12-v1"))` — derived from the same pairing `secret` that
+   derives `authToken`/`macKey` above. **Unlike BYO, the cloud on the trial
+   tier is not blind to this secret.** The pairing-*session* endpoint
+   (`POST /v1/pairing/sessions`) is told only `authToken`, exactly as in the
+   BYO flow above — but the separate, trial-only `POST /v1/trial-nodes` call
+   takes the raw `secret` directly in its body as `pairingSecret`
+   (`product/cloud/src/server.js`), because the cloud needs it to hand to the
+   sandbox in step 4 below. The cloud can therefore compute both `macKey` and
+   this passphrase for a trial node; nothing in this delta is
+   zero-knowledge.
 4. The p12 bytes are posted as the node-blob (`POST .../node-blob`,
    MAC-tagged with the same `blobTag`/`NODE_SLOT` scheme as BYO), and the
    temporary key/CSR/cert/CA/p12 files are removed from `tmp/` whether
@@ -948,10 +955,12 @@ not the phone, that generated it, and the cloud transported the pairing
 secret into the sandbox as part of provisioning
 (`RELAYD_ENROLL_PAIRING_ID`/`RELAYD_ENROLL_PAIRING_SECRET` env vars, cleared
 before the daemon starts — see `product/trial/start.sh`). This is acceptable
-only because trial sandboxes already run on operator infrastructure; **BYO
-installs must never receive a secret from the cloud this way**, which is why
-this lives in a module separate from `pairing.mjs` and is reachable only
-through `relayd enroll`.
+only because trial sandboxes already run on operator infrastructure and the
+operator is already inside the trust boundary for trial nodes; **BYO
+installs must never receive a secret from the cloud this way** — the BYO
+cloud rendezvous is told only `authToken` and has no path to the raw secret
+at all — which is why this lives in a module separate from `pairing.mjs` and
+is reachable only through `relayd enroll`.
 
 #### CLI contract
 
@@ -1160,6 +1169,59 @@ Unknown capability keys must be ignored by clients; absent keys mean
 `"queuePosition": n` (1-based) while `status == "queued"`, `null`
 otherwise — the product plan's "queue with visible position" without a new
 endpoint. Additive field; frozen clients ignore it.
+
+### 2.9 `GET /v1/export.tar` — whole-jail workspace export
+
+Implemented (`relayd/src/fsapi.mjs:392`, `serveExportTar`; routed in
+`src/additions.mjs`). Streams every readable file under
+`workspaceBrowseRoot` as a single tar archive — the mechanism behind the
+trial-sandbox "export my files" flow (`revamp/07-trial-sandbox-plan.md`),
+though the route itself is not trial-specific: any node exposes it.
+
+Auth: same mTLS `authorize()` gate as the rest of the data path (applied
+before `handleAdditionRoutes` dispatches to this route, `server.mjs:60`,
+`:240`) — no separate credential.
+
+Response: `200`, `content-type: application/x-tar`,
+`cache-control: no-store`, `x-content-type-options: nosniff`,
+`content-disposition: attachment; filename="relay-workspaces.tar"`. No
+`Range` support — the whole archive streams as one response.
+
+Entry selection mirrors `fs/list`'s jail-safe walk (`fsEntryForDirent`):
+symlinks that escape `workspaceBrowseRoot` are dropped, and any file that
+matches the secret read-denylist (§1.3) is excluded from the archive
+**before** `tar` ever sees it — the export can never surface a file that
+`fs/file` would 403 on. Only files are added (directories are walked, not
+archived as entries).
+
+Size bound: `maxExportBytes` = 512 MiB. The total is computed from `stat()`
+sizes and checked **before any response header is written**, so an
+oversized jail fails cleanly with `413 export_too_large` instead of dying
+partway through an already-started stream.
+
+**Security note — `--null` is load-bearing, not stylistic.** The archive is
+built by spawning `tar -cf - -C <workspaceBrowseRoot> --null -T -` and
+writing the entry list to the child's stdin (not argv — a large jail can
+list more files than a platform's `ARG_MAX` allows). The list is
+**NUL-separated**, never newline-separated: both bsdtar and GNU tar treat a
+bare `-C` line inside a `-T` file list as a live "change directory"
+directive, and workspace filenames are attacker-controlled (only `/` is
+illegal in a POSIX filename, so a name can contain an embedded newline).
+A newline-joined list lets a crafted filename inject a `-C\n..\n<target>`
+directive and walk `tar` outside the jail. `--null` disables that directive
+parsing entirely, closing the escape. `--null` alone is not sufficient,
+though: a list field that is literally `..` still escapes `-C` on both tar
+implementations. What actually makes this safe is that every field is
+`entry.path`, derived from an already jail-realpath-contained path — if this
+list ever accepts a less-trusted path source, restoring that containment,
+not the `--null` flag, is the invariant to re-establish. Do not "simplify"
+this to a plain newline-joined list.
+
+Failure handling: a spawn failure or an empty jail can close the tar
+child's stdin pipe before the list finishes writing; that surfaces as
+`EPIPE`, which is swallowed rather than crashing the daemon (mirrors the
+job-stdin guard in `jobs.mjs`). If the client disconnects mid-stream, the
+still-running `tar` child is killed.
 
 ---
 

@@ -1,6 +1,22 @@
-# Cube/E2B template manifest. Build with ./build.sh on the Cube host.
-template_id = "relay-trial"
+# Resource manifest for the relay-trial template, read by ./build.sh.
+#
+# This is NOT consumed by an `e2b` CLI — Cube ships none, and the template is
+# registered over the HTTP API instead. The file survives as the single place
+# the machine's shape is declared, so build.sh never hard-codes it.
+#
+# `template_id` is deliberately absent: Cube always generates the id
+# server-side with a `tpl-` prefix and ignores any client-supplied value.
 dockerfile = "Dockerfile"
 start_cmd = "/opt/relayd/start.sh"
+
+# Sent as millicores (cpu_count * 1000).
 cpu_count = 1
+
+# MiB.
 memory_mb = 1024
+
+# Writable overlay on top of the read-only image. CubeMaster REQUIRES this —
+# omitting it fails template creation with `writable_layer_size is required`,
+# even though the API schema marks the field optional. Sized for a trial
+# machine that clones repos and installs project dependencies.
+writable_layer_size = "5G"

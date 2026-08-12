@@ -2,10 +2,15 @@ import SwiftUI
 
 struct AccountSettingsView: View {
     @ObservedObject var accountStore: RelayAccountStore
+    @ObservedObject var nodeStore: RelayNodeStore
+    @ObservedObject var identityStore: ClientIdentityStore
+    let trialClient: RelayTrialClient
     @Environment(\.dismiss) private var dismiss
 
     @State private var showingDeleteConfirmation = false
     @State private var deletionPassword = ""
+    @State private var isDeletingTrial = false
+    @State private var trialDeleteError: String?
 
     var body: some View {
         NavigationStack {
@@ -49,6 +54,28 @@ struct AccountSettingsView: View {
                             Label(error, systemImage: "exclamationmark.triangle.fill")
                                 .foregroundStyle(AppTheme.statusError)
                         }
+                    }
+                }
+
+                if let trial = nodeStore.trial {
+                    Section {
+                        LabeledContent("Status", value: Self.stateLabel(for: trial.state))
+                        LabeledContent("Expires", value: Self.expiryFormatter.string(from: trial.expiresDate))
+
+                        Button("Delete trial machine", role: .destructive) {
+                            Task { await deleteTrialMachine() }
+                        }
+                        .disabled(isDeletingTrial)
+                        .accessibilityIdentifier("relay-delete-trial-machine")
+
+                        if let trialDeleteError {
+                            Label(trialDeleteError, systemImage: "exclamationmark.triangle.fill")
+                                .foregroundStyle(AppTheme.statusError)
+                        }
+                    } header: {
+                        Text("Trial machine")
+                    } footer: {
+                        Text("Deleting removes the trial machine and its data immediately. Connect your own machine any time to keep working.")
                     }
                 }
 
@@ -104,4 +131,37 @@ struct AccountSettingsView: View {
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—"
         return "\(version) (\(build))"
     }
+
+    private func deleteTrialMachine() async {
+        guard let bearer = accountStore.currentSessionToken else { return }
+        isDeletingTrial = true
+        trialDeleteError = nil
+        defer { isDeletingTrial = false }
+        do {
+            try await trialClient.deleteTrial(bearer: bearer)
+            nodeStore.clear()
+            // The machine is gone, so its client certificate and pinned CA are
+            // dead weight on this phone — and must not outlive it.
+            identityStore.discardTrialMaterial()
+        } catch {
+            trialDeleteError = "Relay couldn't delete the trial machine. Try again."
+        }
+    }
+
+    private static func stateLabel(for state: RelayTrialNode.State) -> String {
+        switch state {
+        case .creating: return "Creating"
+        case .ready: return "Active"
+        case .expired: return "Expired"
+        case .destroyed: return "Destroyed"
+        case .failed: return "Failed"
+        }
+    }
+
+    private static let expiryFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter
+    }()
 }

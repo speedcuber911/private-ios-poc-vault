@@ -407,8 +407,36 @@ const maxExportBytes = 512 * 1024 * 1024;
 // fs/list, which is asked for one specific directory) this walk covers
 // everything under the root and one bad permission bit should not block the
 // rest of the archive.
+//
+// The walk is cycle-safe. fsEntryForDirent resolves a symlinked directory to
+// its realpath and then only checks containment, so `ln -s .. loop` inside a
+// workspace is a perfectly legal, contained, self-referencing directory — and
+// following it re-walks the same subtree forever. Untracked, that is not a
+// hypothetical: one 2-byte file plus one such link yields thousands of
+// duplicate entries (inflating the byte total the export cap is checked
+// against, and duplicating every file in the archive), and a slightly deeper
+// jail dies with `RangeError: Maximum call stack size exceeded`, which
+// surfaces as a 500. The route is unconditional, so BYO nodes are affected
+// too, and this is the path "Export my files" depends on.
+//
+// `visited` is keyed on the resolved absolute path, which is sufficient
+// because every path that reaches here is already canonical: the walk starts
+// at the realpath'd workspaceBrowseRoot and fsEntryForDirent hands back a
+// realpath for symlinks and parent-plus-name for real directories. The depth
+// cap is an independent second backstop, so a cycle the key check somehow
+// misses still terminates rather than exhausting the stack.
+//
+// None of this weakens containment: entries are still produced only by
+// fsEntryForDirent, which drops anything that escapes the root. Skipping an
+// already-visited directory can only ever remove duplicates.
 
-function collectExportEntries(rootPath, maps) {
+const maxExportDepth = 64;
+
+function collectExportEntries(rootPath, maps, visited = new Set(), depth = 0) {
+  if (depth > maxExportDepth) return [];
+  if (visited.has(rootPath)) return [];
+  visited.add(rootPath);
+
   let dirents;
   try {
     dirents = fs.readdirSync(rootPath, { withFileTypes: true });
@@ -421,7 +449,7 @@ function collectExportEntries(rootPath, maps) {
     const entry = fsEntryForDirent(rootPath, dirent, maps);
     if (!entry) continue;
     if (entry.kind === "dir") {
-      entries.push(...collectExportEntries(entry.absolutePath, maps));
+      entries.push(...collectExportEntries(entry.absolutePath, maps, visited, depth + 1));
       continue;
     }
     if (entry.kind === "file" && !entry.readDenied) {
@@ -505,6 +533,7 @@ export {
   serveFsFile,
   serveFsFilePreview,
   maxExportBytes,
+  maxExportDepth,
   collectExportEntries,
   serveExportTar,
 };

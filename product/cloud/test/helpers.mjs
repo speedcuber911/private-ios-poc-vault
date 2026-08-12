@@ -79,9 +79,12 @@ function makeApnsSigningKey() {
 }
 
 // ── app harness ───────────────────────────────────────────────────────────
+// `db` and `now` may be supplied to stand a SECOND app over the same database
+// and clock — how the trial kill-switch test rebuilds the service with the
+// trial config removed without losing the rows the first one wrote.
 export async function startTestApp(overrides = {}) {
-  const clock = { t: Date.now() };
-  const now = () => clock.t;
+  const clock = overrides.clock ?? { t: Date.now() };
+  const now = overrides.now ?? (() => clock.t);
 
   const config = loadConfig({
     SESSION_SECRET: "test-session-secret-must-be-long-enough-000",
@@ -101,7 +104,7 @@ export async function startTestApp(overrides = {}) {
 
   const app = createApp({
     config,
-    db: createDb(":memory:"),
+    db: overrides.db ?? createDb(":memory:"),
     jwksFetcher: idp.jwksFetcher,
     mailTransport: mail,
     apnsTransport,

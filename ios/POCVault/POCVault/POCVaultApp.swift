@@ -7,7 +7,7 @@ struct POCVaultApp: App {
     @StateObject private var chatSessionStore: RelayChatSessionStore
     @StateObject private var statusFeedViewModel: StatusFeedViewModel
     @StateObject private var accountStore: RelayAccountStore
-    @StateObject private var nodeStore = RelayNodeStore()
+    @StateObject private var nodeStore: RelayNodeStore
     private let manifestClient: ManifestClient
     private let codexClient: CodexClient
     private let trialClient: RelayTrialClient
@@ -21,16 +21,23 @@ struct POCVaultApp: App {
             identityStore: identityStore,
             trustedPublicKeyRawRepresentation: AppConfiguration.trustedManifestPublicKey
         )
+        // One client for the whole app, built at the node the store already
+        // restored (a trial adopted on a previous launch, else the personal
+        // install). Chat, status and the browser all share it, so `retarget`
+        // moves every surface at once instead of only the browser's copy.
+        let nodeStore = RelayNodeStore()
         let codexClient = CodexClient(
-            baseURL: AppConfiguration.codexBaseURL,
+            baseURL: nodeStore.effectiveBaseURL,
             identityStore: identityStore
         )
         let accountStore = RelayAccountStore(
             client: RelayAuthClient(baseURL: AppConfiguration.authBaseURL),
-            identityStore: identityStore
+            identityStore: identityStore,
+            nodeStore: nodeStore
         )
 
         _identityStore = StateObject(wrappedValue: identityStore)
+        _nodeStore = StateObject(wrappedValue: nodeStore)
         _libraryViewModel = StateObject(wrappedValue: LibraryViewModel(client: manifestClient))
         _chatSessionStore = StateObject(wrappedValue: RelayChatSessionStore(
             client: codexClient,
@@ -65,11 +72,21 @@ struct POCVaultApp: App {
                         chatSessionStore: chatSessionStore,
                         accountStore: accountStore,
                         identityStore: identityStore,
+                        nodeStore: nodeStore,
                         manifestClient: manifestClient,
-                        codexClient: CodexClient(baseURL: nodeStore.effectiveBaseURL, identityStore: identityStore)
+                        codexClient: codexClient,
+                        trialClient: trialClient
                     )
+                    // Adopting (or losing) a machine restarts the browser stack so
+                    // listings refetch; the shared client and the chat/status
+                    // stores survive it.
                     .id(nodeStore.effectiveBaseURL)
                 }
+            }
+            // Repointing happens here rather than in `body`: constructing a client
+            // per body evaluation leaked a URLSession every time SwiftUI re-ran it.
+            .onChange(of: nodeStore.effectiveBaseURL, initial: true) { _, newBaseURL in
+                codexClient.retarget(baseURL: newBaseURL)
             }
             .task {
                 await accountStore.restore()
@@ -126,9 +143,12 @@ struct POCVaultRootView: View {
     @ObservedObject var chatSessionStore: RelayChatSessionStore
     @ObservedObject var accountStore: RelayAccountStore
     @ObservedObject var identityStore: ClientIdentityStore
+    @ObservedObject var nodeStore: RelayNodeStore
     let manifestClient: ManifestClient
     let codexClient: CodexClient
+    let trialClient: RelayTrialClient
 
+    @Environment(\.scenePhase) private var scenePhase
     @State private var browserPath: [BrowserRoute] = []
     @State private var chatLaunch: RelayChatLaunch?
     @State private var showingLibrary = false
@@ -176,10 +196,29 @@ struct POCVaultRootView: View {
             )
         }
         .sheet(isPresented: $showingAccount) {
-            AccountSettingsView(accountStore: accountStore)
+            AccountSettingsView(
+                accountStore: accountStore,
+                nodeStore: nodeStore,
+                identityStore: identityStore,
+                trialClient: trialClient
+            )
         }
         .task {
             identityStore.importIdentityFromSetupEnvironmentIfNeeded()
+        }
+        // A trial machine expires on the server's clock, so the countdown and
+        // the expiry banner are only honest if we re-read state on foreground.
+        .task(id: scenePhase) {
+            guard scenePhase == .active, nodeStore.trial != nil,
+                  let bearer = accountStore.currentSessionToken else { return }
+            // Only an authoritative "no trial" may forget the machine — see
+            // RelayNodeStore.applyRefresh. A `try?` here once turned every
+            // offline foreground into permanent, unrecoverable loss.
+            do {
+                nodeStore.applyRefresh(.success(try await trialClient.currentTrial(bearer: bearer)))
+            } catch {
+                nodeStore.applyRefresh(.failure(error))
+            }
         }
         .task {
             // App-wide job monitor + completion notifications, owned by the session store.
@@ -212,6 +251,31 @@ struct POCVaultRootView: View {
             onOpenDiagnostics: isRoot ? { showingDiagnostics = true } : nil,
             onOpenAccount: isRoot ? { showingAccount = true } : nil
         )
+        // Only at the root: the countdown is about the machine as a whole, so
+        // repeating it on every drilled-in folder would be noise.
+        .safeAreaInset(edge: .top) {
+            if isRoot, let trial = nodeStore.trial, trial.state != .destroyed {
+                TrialStatusBanner(
+                    trial: trial,
+                    client: codexClient,
+                    onJoinWaitlist: joinPaidWaitlist
+                )
+                .padding(.horizontal, 16)
+                .padding(.bottom, 8)
+            }
+        }
+    }
+
+    /// The expiry banner's "Join the paid waitlist" posts to the public
+    /// `/v1/waitlist` endpoint with the signed-in account's email.
+    private func joinPaidWaitlist() async -> Bool {
+        guard let email = accountStore.user?.email.trimmedNonEmpty else { return false }
+        do {
+            try await trialClient.joinWaitlist(email: email)
+            return true
+        } catch {
+            return false
+        }
     }
 
     private func openChat(folderPath: String?, workspaceID: String?) {

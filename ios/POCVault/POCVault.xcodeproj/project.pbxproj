@@ -50,6 +50,8 @@
 		200000000000000000000044 /* RelayNodeStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000048 /* RelayNodeStore.swift */; };
 		200000000000000000000045 /* RelayTrialFlowModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000049 /* RelayTrialFlowModel.swift */; };
 		200000000000000000000046 /* TrialProvisioningView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000050 /* TrialProvisioningView.swift */; };
+		200000000000000000000047 /* TrialStatusBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000051 /* TrialStatusBanner.swift */; };
+		200000000000000000000048 /* RelayServerTrust.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000052 /* RelayServerTrust.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -110,6 +112,8 @@
 		100000000000000000000048 /* RelayNodeStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayNodeStore.swift; sourceTree = "<group>"; };
 		100000000000000000000049 /* RelayTrialFlowModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayTrialFlowModel.swift; sourceTree = "<group>"; };
 		100000000000000000000050 /* TrialProvisioningView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrialProvisioningView.swift; sourceTree = "<group>"; };
+		100000000000000000000051 /* TrialStatusBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrialStatusBanner.swift; sourceTree = "<group>"; };
+		100000000000000000000052 /* RelayServerTrust.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayServerTrust.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -203,6 +207,7 @@
 				100000000000000000000009 /* ClientIdentityStore.swift */,
 				100000000000000000000037 /* RelayAccountStore.swift */,
 				100000000000000000000045 /* RelayTrialPairing.swift */,
+				100000000000000000000052 /* RelayServerTrust.swift */,
 			);
 			path = Security;
 			sourceTree = "<group>";
@@ -240,6 +245,7 @@
 				100000000000000000000040 /* AccountSettingsView.swift */,
 				100000000000000000000049 /* RelayTrialFlowModel.swift */,
 				100000000000000000000050 /* TrialProvisioningView.swift */,
+				100000000000000000000051 /* TrialStatusBanner.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -422,6 +428,8 @@
 				200000000000000000000044 /* RelayNodeStore.swift in Sources */,
 				200000000000000000000045 /* RelayTrialFlowModel.swift in Sources */,
 				200000000000000000000046 /* TrialProvisioningView.swift in Sources */,
+				200000000000000000000047 /* TrialStatusBanner.swift in Sources */,
+				200000000000000000000048 /* RelayServerTrust.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

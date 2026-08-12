@@ -5143,3 +5143,67 @@ localTest(
     }
   },
 );
+
+localTest(
+  "GET /v1/export.tar terminates on a symlink cycle and lists each file exactly once",
+  "needs local workspace fixtures seeded on disk, including a directory symlink cycle inside the jail",
+  async () => {
+    // A symlinked directory is resolved to its realpath and then only checked
+    // for containment, so `ln -s .. loop` inside a workspace is a legal,
+    // contained, self-referencing directory. Walking it without a visited set
+    // re-enters the same subtree forever: the export either returns the same
+    // files thousands of times (inflating the total the 512 MiB cap is checked
+    // against) or dies with `RangeError: Maximum call stack size exceeded` and
+    // surfaces as a 500. Both make "Export my files" unusable, and the route is
+    // unconditional so BYO nodes are hit too.
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+    const browseRoot = path.join(tmpDir, "workspaces");
+    const welcomeDir = path.join(browseRoot, "welcome");
+    const nestedDir = path.join(welcomeDir, "nested");
+    await fs.mkdir(nestedDir, { recursive: true });
+    await fs.writeFile(path.join(welcomeDir, "hello.txt"), "hello\n");
+    await fs.writeFile(path.join(nestedDir, "deep.txt"), "deep\n");
+
+    // Two cycles, both entirely inside the jail and both perfectly legal:
+    // `loop` climbs back to the browse root, `self` points at its own parent.
+    await fs.symlink("..", path.join(welcomeDir, "loop"));
+    await fs.symlink("..", path.join(nestedDir, "self"));
+
+    const server = await startServer({
+      CODEX_REQUIRE_MTLS: "false",
+      CODEX_DATA_DIR: path.join(tmpDir, "data"),
+      CODEX_WORKSPACE_BROWSE_ROOT: browseRoot,
+      CODEX_WORKSPACES: JSON.stringify([{ id: "welcome", name: "Welcome", path: welcomeDir }]),
+      CODEX_BIN: await makeFakeCodex(tmpDir),
+    });
+    try {
+      const res = await fetch(`${server.baseUrl}/v1/export.tar`);
+      assert.equal(res.status, 200, "the cycle must not surface as a 500");
+
+      const buffer = Buffer.from(await res.arrayBuffer());
+      // bsdtar (macOS) interleaves its own `PaxHeader/…` records and `._…`
+      // AppleDouble sidecars; neither comes from the walk, so both are dropped
+      // before counting. GNU tar emits neither and is unaffected by this.
+      const listing = tarEntryNames(buffer).filter(
+        (name) => !name.split("/").some((part) => part === "PaxHeader" || part.startsWith("._")),
+      );
+
+      // The real payload, each exactly once — no duplicates from re-walking.
+      const counts = new Map();
+      for (const name of listing) counts.set(name, (counts.get(name) || 0) + 1);
+      const duplicated = [...counts.entries()].filter(([, n]) => n > 1);
+      assert.deepEqual(
+        duplicated,
+        [],
+        `every entry must appear exactly once (duplicated: ${JSON.stringify(duplicated)})`,
+      );
+      assert.deepEqual(
+        [...counts.keys()].sort(),
+        ["welcome/hello.txt", "welcome/nested/deep.txt"],
+        "both real files must be present, and nothing else",
+      );
+    } finally {
+      await server.stop();
+    }
+  },
+);

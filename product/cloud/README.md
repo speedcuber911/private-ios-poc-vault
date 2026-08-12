@@ -58,7 +58,7 @@ ExperimentalWarning on Node 22 is expected.
 | `GET /v1/account` | session | account + entitlements |
 | `POST/GET /v1/devices`, `PATCH/DELETE /v1/devices/:id` | session | `apnsToken`, `platform`, `name`, `certSerials` |
 | `POST/GET /v1/nodes`, `GET/DELETE /v1/nodes/:id` | session | create is entitlement-gated (`nodes.max`) and validates the ed25519 pubkey |
-| `POST /v1/trial-nodes` | session | provisions a trial sandbox for the account; 404 `trial_unavailable` when no provisioner is configured, 409 `trial_already_used`, 503 `trial_capacity` |
+| `POST /v1/trial-nodes` | session | body `{pairingId, pairingSecret}`; provisions a trial sandbox for the account; 404 `trial_unavailable` when no provisioner is configured, 409 `trial_already_used` (unless the account's existing trial is `failed`, in which case it's retried in place), 503 `trial_capacity`, 502 `provision_failed` |
 | `GET/DELETE /v1/trial-nodes/current` | session | poll trial state, or tear it down early (kills the sandbox, deletes the node) |
 | `POST /v1/trial-nodes/enroll` | single-use enroll token (`{token}` in body) | the sandbox's own bootstrap call — registers its node identity, burns the token, returns `{ok, sni}` |
 | `POST /v1/pairing/sessions` | session | → `{pairingId, secret, expiresAt}`; only the sha256 of the secret is stored |
@@ -105,15 +105,37 @@ Every signup can get one instantly-provisioned trial machine
 `kind: "trial"` — same broker tunnel, same mTLS, same jail — that happens to
 have been created by the cloud instead of a user's own box.
 
-`POST /v1/trial-nodes` (session-authed) is gated by one-trial-per-account
-(409 `trial_already_used`) and a global concurrency cap (`TRIAL_MAX_ACTIVE`,
-503 `trial_capacity`), then calls the provisioner (`src/provisioner.js`) to
-create a sandbox and hands it a single-use enroll token plus tunnel
-coordinates via env vars (`RELAYD_ENROLL_URL/TOKEN/PAIRING_ID/PAIRING_SECRET`,
+`POST /v1/trial-nodes` (session-authed) takes `{pairingId, pairingSecret}` in
+the body — the caller (iOS) creates the pairing session first via
+`POST /v1/pairing/sessions` and passes its id plus the raw pairing secret
+through so the sandbox can be handed the same secret via env vars (below);
+a missing/malformed pair is `400 pairing_required`. The route is gated by
+one-trial-per-account (409 `trial_already_used`) and a global concurrency
+cap (`TRIAL_MAX_ACTIVE`, 503 `trial_capacity`), then calls the provisioner
+(`src/provisioner.js`) to create a sandbox and hands it a single-use enroll
+token plus tunnel coordinates via env vars
+(`RELAYD_ENROLL_URL/TOKEN/PAIRING_ID/PAIRING_SECRET`,
 `RELAYD_TUNNEL_HOST/PORT/SUFFIX`) — none of which are ever returned to the
 caller. If `E2B_API_URL` is unset the provisioner is `null` and the route
 404s `trial_unavailable`, which is how the fork screen's "Try instantly"
 option feature-flags itself off.
+
+**Retry after a failed provision.** `trial_nodes.account_id` is `UNIQUE`, so
+in the ordinary case a second `POST /v1/trial-nodes` for an account that
+already has a row 409s `trial_already_used` — the one-trial-per-account cap
+is enforced over *provisioned machines*, not raw call attempts. The one
+exception: if `provisioner.createSandbox()` throws, the existing row is
+updated to `state: "failed"` (`enrollTokenHash` cleared) and the call
+returns `502 provision_failed` instead of inserting a second row. Because
+`existingTrial.state !== "failed"` is the only condition that still 409s, a
+subsequent `POST /v1/trial-nodes` from that account is treated as a retry:
+it reuses the same row in place — resetting it to `state: "creating"` with a
+fresh `enrollTokenHash` and `expiresAt`, and clearing `nodeId`/`sandboxId` —
+rather than being rejected or minting a second lifetime trial. Every other
+state (`creating`, `ready`, `expired`, `destroyed`) is legitimately spent and
+still 409s. This exists because a transient provisioner failure (the Cube
+host briefly unreachable, a template pull failure, etc.) must not
+permanently burn the account's one lifetime trial.
 
 The sandbox calls back to `POST /v1/trial-nodes/enroll` with its freshly
 generated node identity pubkey; the cloud verifies the token against
@@ -122,16 +144,74 @@ state), registers the node (`kind: "trial"`), and burns the token. From there
 the trial node is indistinguishable from any other node to the rest of this
 API.
 
+A trial node does **not** consume the account's `nodes.max` entitlement: the
+enroll route creates it bypassing the gate, and `POST /v1/nodes` counts only
+non-trial nodes (`registry.countNodes(id, { includeTrial: false })`). Counting
+it would 403 `entitlement_limit` for any trial user who tries to register their
+own box — which is exactly the "Upgrade to BYO" path the trial exists to lead
+into.
+
 A reaper (`sweepTrials`, folded into the existing 60 s `runSweeps()` timer)
 pauses the sandbox at `expires_at` (`TRIAL_TTL_SEC`, default 7 days) and
 destroys it `TRIAL_GRACE_SEC` (default 3 days) after that, deleting the node
 row. Both steps are idempotent and state-driven off `expires_at`, so a
-crashed reaper pass is safe to re-run.
+crashed reaper pass is safe to re-run. Each row is isolated in its own
+try/catch, so one trial's failure cannot abort the pass and strand every trial
+behind it, and the sweep holds an in-flight flag so a slow pass cannot be
+re-entered by the next 60 s tick.
+
+**Lifecycle enforcement is not gated on the feature flag.** `E2B_API_URL`
+switches off *creating* trials; the reaper keeps running without it, because a
+kill switch that also froze every existing trial would leave users with
+indefinite access. Expiring access (state, enroll token, node row) is pure
+control-plane work and always happens. Only the sandbox-destroying half needs
+the provisioner — see "Orphaned sandboxes" below for what happens when it is
+absent or unreachable.
+
+**Account deletion destroys the sandbox.** `deleteAccount` drops the
+`trial_nodes` row, after which nothing can map the account back to a live
+microVM, so the Better Auth `deleteUser.afterDelete` hook releases the sandbox
+first (`beforeAccountDelete` in `server.js`). A failure there is recorded as an
+orphan rather than aborting the deletion: an unreachable Cube host must never
+make an account undeletable.
+
+### Orphaned sandboxes
+
+A sandbox Relay still believes is running but can no longer reach through
+`trial_nodes` is recorded in `sandbox_orphans` (sandbox id, trial id, account
+id, reason) instead of being silently forgotten. Two ways in: account deletion
+with the provisioner unreachable, and the reaper reaching its destroy point
+while the trial feature is switched off. Every sweep retries the backlog and
+clears each row as soon as the destroy succeeds.
+
+One window this does not cover: `createSandbox` returning after the machine
+exists but before the row learns its id. A response with no usable `sandboxID`
+is now a hard failure (the row lands in `failed` and the account can retry)
+rather than being silently recorded as nothing, but a crash between the create
+returning and the `updateTrial` write still leaves a machine with no id
+anywhere. `metadata.trialId` is set on every sandbox, so the backstop for that
+window is a Cube-list-vs-`trial_nodes` reconciliation sweep — **not yet built**.
 
 The provisioner itself speaks the E2B REST protocol (`POST /sandboxes`,
 `DELETE /sandboxes/:id`, `POST /sandboxes/:id/pause`, `x-api-key` auth)
 against whatever `E2B_API_URL` points at — a self-hosted Cube host today,
-hosted e2b later, with no code change.
+hosted e2b later, with no code change. Every call carries an
+`AbortSignal.timeout` (`TRIAL_PROVISIONER_TIMEOUT_MS`, default 30 s): Node's
+fetch has no default timeout, and an unbounded call inside the reaper would
+stall the whole pass indefinitely with nothing to detect it.
+
+The sandbox-level `timeout` sent on create is in **seconds** — the unit the
+E2B/Cube protocol defines, forwarded unconverted into
+`context.WithTimeout(ctx, timeout * time.Second)`. It is derived from the trial
+lifecycle (`ttl + grace + 1 h`, overridable with `TRIAL_SANDBOX_TIMEOUT_SEC`)
+rather than being an independent constant, so the platform-level auto-kill
+expires just *after* Relay's own destroy point and acts as the backstop for
+orphans instead of killing live trials. Two traps this deliberately avoids:
+sending milliseconds asks for ~41 days (the auto-kill never fires), and a naive
+divide-by-1000 of the old 1-hour constant would destroy every trial machine an
+hour after signup. Cube treats an absent or zero `timeout` as its own 60-second
+default, so the value is validated at the call site and an unusable one fails
+the create outright.
 
 ## Broker contract (tunnel-registry hook)
 
@@ -215,8 +295,16 @@ APNS_TEAM_ID=<team-id>
 APNS_BUNDLE_ID=<app-bundle-id>
 APNS_SIGNING_KEY_P8=<contents of the .p8, PEM>
 
-# Trial sandboxes — optional; unset E2B_API_URL disables the feature (the
-# fork screen hides "Try instantly" and POST /v1/trial-nodes 404s):
+# Trial sandboxes — optional; unset E2B_API_URL disables CREATING trials (the
+# fork screen hides "Try instantly" and POST /v1/trial-nodes 404s). The reaper
+# keeps enforcing expiry on existing trials either way.
+#
+# All-or-nothing: if E2B_API_URL is set, the service REFUSES TO START unless
+# E2B_API_KEY, TRIAL_TEMPLATE_ID, ENROLL_BASE_URL, TUNNEL_HOST and
+# TUNNEL_SUFFIX are all present. A half-configured trial feature fails
+# silently and plausibly otherwise — without ENROLL_BASE_URL the sandbox
+# enrols against loopback (itself), and without TUNNEL_SUFFIX the phone gets a
+# null SNI and quietly talks to the wrong machine.
 E2B_API_URL=<cube-or-e2b-api-url>
 E2B_API_KEY=<api-key>
 TRIAL_TEMPLATE_ID=relay-trial
@@ -224,8 +312,11 @@ TUNNEL_HOST=<broker-host>
 TUNNEL_PORT=<broker-tunnel-port>
 TUNNEL_SUFFIX=.tun.<domain>
 ENROLL_BASE_URL=https://api.<domain>
-# TRIAL_TTL_SEC / TRIAL_GRACE_SEC / TRIAL_MAX_ACTIVE / TRIAL_SANDBOX_TIMEOUT_MS
-# all have sane defaults (7d / 3d / 20 / 1h) and need not be set explicitly.
+# TRIAL_TTL_SEC / TRIAL_GRACE_SEC / TRIAL_MAX_ACTIVE / TRIAL_PROVISIONER_TIMEOUT_MS
+# all have sane defaults (7d / 3d / 20 / 30s) and need not be set explicitly.
+# TRIAL_SANDBOX_TIMEOUT_SEC (SECONDS — the E2B/Cube protocol's unit) defaults to
+# ttl + grace + 1h so the platform auto-kill backstops orphans rather than
+# killing live trials; override only with that relationship in mind.
 ```
 
 Front with nginx terminating public TLS for `api.<domain>` and proxy only to

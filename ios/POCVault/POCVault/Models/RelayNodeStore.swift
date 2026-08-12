@@ -35,18 +35,36 @@ final class RelayNodeStore: ObservableObject {
     }
 
     /// Refreshes the known trial state (e.g. an expiry countdown tick) without
-    /// necessarily repointing the app: a present trial keeps the current node URL
-    /// (setting one only if none was active yet), while a nil trial clears it.
-    func updateTrial(_ trial: RelayTrialNode?) {
+    /// necessarily repointing the app: the current node URL is kept, and one is
+    /// set only if none was active yet.
+    ///
+    /// Deliberately non-optional. Forgetting a machine is a destructive,
+    /// unrecoverable act (the cloud answers `trial_already_used` for every state
+    /// but `failed`), so it has to go through `clear()` — never through a nil
+    /// that a `try?` could have produced.
+    func updateTrial(_ trial: RelayTrialNode) {
         self.trial = trial
-        guard let trial else {
-            activeNodeURL = nil
-            defaults.removeObject(forKey: Self.storageKey)
-            return
-        }
         persist(trial)
         if activeNodeURL == nil {
             activeNodeURL = trial.nodeURL
+        }
+    }
+
+    /// Applies the outcome of a trial refresh.
+    ///
+    /// Only the server authoritatively answering "this account has no trial"
+    /// (`RelayTrialClientError.noTrial`, the 404 `no_trial` body) may erase the
+    /// persisted machine. Offline, DNS, 5xx, an expired session, or a response
+    /// the app cannot decode all leave the record and `activeNodeURL` exactly as
+    /// they were — foregrounding the app with no signal must never cost the user
+    /// their machine.
+    func applyRefresh(_ result: Result<RelayTrialNode, Error>) {
+        switch result {
+        case .success(let trial):
+            updateTrial(trial)
+        case .failure(let error):
+            guard (error as? RelayTrialClientError) == .noTrial else { return }
+            clear()
         }
     }
 

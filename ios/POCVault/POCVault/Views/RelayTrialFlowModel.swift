@@ -86,7 +86,14 @@ final class RelayTrialFlowModel: ObservableObject {
             defer { try? FileManager.default.removeItem(at: p12URL) }
 
             step = .importingIdentity
-            _ = try identityStore.importIdentity(from: p12URL, passphrase: RelayTrialPairing.p12Passphrase(secret: secret))
+            // The machine's SNI host is handed over with the import so the node
+            // CA inside the blob is pinned to that host and nothing else — the
+            // phone cannot otherwise validate a passthrough-routed machine.
+            _ = try identityStore.importIdentity(
+                from: p12URL,
+                passphrase: RelayTrialPairing.p12Passphrase(secret: secret),
+                trialHost: readyTrial.sni
+            )
 
             nodeStore.adoptTrial(readyTrial)
             step = .done
@@ -173,6 +180,10 @@ final class RelayTrialFlowModel: ObservableObject {
             return "Trial machines aren't available right now. Try again soon."
         case .alreadyUsed:
             return "This account's trial was already used."
+        case .pairingConflict:
+            return "Another setup for this machine is already in progress. Try again in a moment."
+        case .tooManyAttempts:
+            return "Too many setup attempts in a row. Wait a few minutes, then try again."
         case .capacity:
             return "Relay is at trial capacity right now. Try again in a few minutes."
         case .provisionFailed:
