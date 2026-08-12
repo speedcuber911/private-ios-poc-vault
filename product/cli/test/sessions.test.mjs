@@ -112,3 +112,90 @@ test("a truncated trailing line in a live session does not crash discovery", () 
   assert.doesNotThrow(() => sessionExcerpt(sessions[0], { maxChars: 100 }));
   assert.doesNotThrow(() => readSessionBytes(sessions[0], { maxBytes: 1_000_000 }));
 });
+
+test("a dangling symlink alongside a valid session does not abort discovery", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-sessions-dangling-"));
+  writeClaudeSession(home, "77777777-7777-4777-8777-777777777777", [
+    { type: "user", cwd: CWD, message: { content: "a valid session" } },
+  ]);
+  const dir = path.join(home, ".claude", "projects", claudeProjectSlug(CWD));
+  const target = path.join(dir, "does-not-exist.jsonl");
+  fs.symlinkSync(target, path.join(dir, "dangling.jsonl"));
+
+  const sessions = discoverSessions({ cwd: CWD, home });
+
+  assert.equal(sessions.length, 1);
+  assert.equal(sessions[0].id, "77777777-7777-4777-8777-777777777777");
+});
+
+test("discovery of a very large session file does not read the whole file", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-sessions-oversized-"));
+  const file = writeClaudeSession(home, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", [
+    { type: "user", cwd: CWD, message: { content: "first turn" } },
+  ]);
+  // Pad the file well past any reasonable bounded-read cap.
+  fs.appendFileSync(file, "z".repeat(3 * 1024 * 1024));
+
+  const originalReadFileSync = fs.readFileSync;
+  let calledOnBigFile = false;
+  fs.readFileSync = (target, ...rest) => {
+    if (target === file) calledOnBigFile = true;
+    return originalReadFileSync(target, ...rest);
+  };
+
+  let sessions;
+  try {
+    sessions = discoverSessions({ cwd: CWD, home });
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+  }
+
+  assert.equal(sessions.length, 1);
+  assert.equal(sessions[0].title, "first turn");
+  assert.ok(sessions[0].sizeBytes > 3 * 1024 * 1024);
+  assert.equal(calledOnBigFile, false, "discovery should not load the whole file just to derive a title");
+});
+
+test("sessionExcerpt truncates to the newest turns when content exceeds maxChars", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-sessions-excbound-"));
+  writeClaudeSession(home, "99999999-9999-4999-8999-999999999999", [
+    { type: "user", cwd: CWD, message: { content: "OLDEST-" + "a".repeat(2000) } },
+    { type: "assistant", message: { content: "MIDDLE-" + "b".repeat(2000) } },
+    { type: "user", message: { content: "NEWEST-" + "c".repeat(2000) } },
+  ]);
+
+  const excerpt = sessionExcerpt(discoverSessions({ cwd: CWD, home })[0], { maxChars: 50 });
+
+  assert.equal(excerpt.length, 50);
+  assert.match(excerpt, /^c+$/, "the excerpt should be drawn from the tail of the newest turn, not the head");
+  assert.doesNotMatch(excerpt, /OLDEST|MIDDLE/);
+});
+
+test("the scan cap is honoured even for a flat directory of rollout files", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-sessions-cap-"));
+  const dir = path.join(home, ".codex", "sessions", "flat");
+  fs.mkdirSync(dir, { recursive: true });
+  const total = 520;
+  for (let i = 0; i < total; i += 1) {
+    const id = String(i).padStart(4, "0");
+    fs.writeFileSync(path.join(dir, `rollout-${id}.jsonl`), `${JSON.stringify({ cwd: CWD })}\n`);
+  }
+
+  const sessions = discoverSessions({ cwd: CWD, home });
+
+  assert.ok(sessions.length < total, "the flat-directory cap should stop examining files once the limit is hit");
+});
+
+test("claudeProjectSlug pins the exact slug format shared with relayd", () => {
+  assert.equal(claudeProjectSlug("/Users/a/b"), "-Users-a-b");
+});
+
+test("codex cwd matching tolerates a trailing slash", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-sessions-trailingslash-"));
+  writeCodexRollout(home, "cccc3333", CWD + "/", new Date("2026-08-11T09:00:00Z"));
+
+  const sessions = discoverSessions({ cwd: CWD, home });
+
+  assert.equal(sessions.length, 1);
+  assert.equal(sessions[0].id, "cccc3333");
+});
