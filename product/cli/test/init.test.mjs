@@ -38,11 +38,11 @@ test("init registers the repo and pins the node key fingerprint locally", async 
     },
   });
 
-  assert.deepEqual(calls[0], { pathname: "/v1/repos", body: { fullName: "me/relay" } });
+  assert.deepEqual(calls[0], { pathname: "/v1/repos", body: { fullName: "Me/Relay" } });
   const pinned = JSON.parse(fs.readFileSync(path.join(dir, ".git", "relay", "node.json"), "utf8"));
   assert.equal(pinned.nodeId, "node-1");
   assert.match(pinned.encPubkeyFingerprint, /^[a-f0-9]{16}$/);
-  assert.match(lines.join("\n"), /me\/relay/);
+  assert.match(lines.join("\n"), /Me\/Relay/);
 });
 
 test("init refuses without a login", async () => {
@@ -73,14 +73,14 @@ test("init works inside a git worktree, where .git at the root is a file, not a 
     },
   });
 
-  assert.deepEqual(calls[0], { pathname: "/v1/repos", body: { fullName: "me/relay" } });
+  assert.deepEqual(calls[0], { pathname: "/v1/repos", body: { fullName: "Me/Relay" } });
 
   const { stdout: gitDirOut } = await execFileAsync("git", ["-C", worktreeDir, "rev-parse", "--git-dir"]);
   const realGitDir = path.resolve(worktreeDir, gitDirOut.trim());
   const pinned = JSON.parse(fs.readFileSync(path.join(realGitDir, "relay", "node.json"), "utf8"));
   assert.equal(pinned.nodeId, "node-1");
   assert.match(pinned.encPubkeyFingerprint, /^[a-f0-9]{16}$/);
-  assert.match(lines.join("\n"), /me\/relay/);
+  assert.match(lines.join("\n"), /Me\/Relay/);
 });
 
 test("init refuses outside a github repo", async () => {
