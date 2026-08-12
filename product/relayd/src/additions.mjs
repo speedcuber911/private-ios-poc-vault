@@ -10,6 +10,9 @@ import { streamNodeEvents, emitEvent } from "./events.mjs";
 import { listDevices, revokeDevice, publicDevice } from "./identity.mjs";
 import { listHarnesses, getOp, listOps, publicOp, startLoginOp, startSmokeOp } from "./harness.mjs";
 import { serveExportTar } from "./fsapi.mjs";
+import { continueHandoff } from "./handoff.mjs";
+import { store } from "./store.mjs";
+import { toJobResponse, responseShape } from "./jobs.mjs";
 
 // Returns true when the request was handled.
 async function handleAdditionRoutes(req, res, url, auth) {
@@ -77,7 +80,51 @@ async function handleAdditionRoutes(req, res, url, auth) {
     return true;
   }
 
+  if (req.method === "GET" && url.pathname === "/v1/handoffs") {
+    const handoffs = store.listHandoffs().map(publicHandoff);
+    sendJson(res, 200, { handoffs });
+    return true;
+  }
+
+  const handoffMatch = url.pathname.match(/^\/v1\/handoffs\/([^/]+)$/);
+  if (handoffMatch && req.method === "GET") {
+    const record = store.getHandoff(handoffMatch[1]);
+    if (!record) { sendError(res, 404, "handoff not found"); return true; }
+    sendJson(res, 200, { handoff: { ...publicHandoff(record), manifest: record.manifest } });
+    return true;
+  }
+
+  const continueMatch = url.pathname.match(/^\/v1\/handoffs\/([^/]+)\/continue$/);
+  if (continueMatch && req.method === "POST") {
+    const body = await readBody(req);
+    const job = await continueHandoff(continueMatch[1], {
+      prompt: typeof body?.prompt === "string" && body.prompt.trim() ? body.prompt.trim() : null,
+      certSubject: auth.subject,
+    });
+    sendJson(res, 202, { job: await toJobResponse(job, responseShape("preview")) });
+    return true;
+  }
+
   return false;
+}
+
+// Public projection of a handoff record for GET /v1/handoffs[/:id]. Omits
+// primedPrompt, which is prompt scaffolding rather than user-facing content.
+function publicHandoff(record) {
+  return {
+    id: record.id,
+    state: record.state,
+    repo: record.repo,
+    branch: record.branch,
+    title: record.title,
+    provider: record.provider,
+    workspaceId: record.workspaceId,
+    canResumeNatively: Boolean(record.resumeSessionId),
+    lastJobId: record.lastJobId,
+    error: record.error,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+  };
 }
 
 export { handleAdditionRoutes };
