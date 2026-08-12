@@ -99,7 +99,13 @@ async function handleAdditionRoutes(req, res, url, auth) {
 
   const handoffMatch = url.pathname.match(/^\/v1\/handoffs\/([^/]+)$/);
   if (handoffMatch && req.method === "GET") {
-    const record = store.getHandoff(handoffMatch[1]);
+    let record;
+    try {
+      record = store.getHandoff(handoffMatch[1]);
+    } catch (error) {
+      if (handleHandoffLookupError(res, "GET /v1/handoffs/:id", error)) return true;
+      throw error;
+    }
     if (!record) { sendError(res, 404, "handoff not found"); return true; }
     sendJson(res, 200, { handoff: { ...publicHandoff(record), manifest: record.manifest } });
     return true;
@@ -108,14 +114,47 @@ async function handleAdditionRoutes(req, res, url, auth) {
   const continueMatch = url.pathname.match(/^\/v1\/handoffs\/([^/]+)\/continue$/);
   if (continueMatch && req.method === "POST") {
     const body = await readBody(req);
-    const job = await continueHandoff(continueMatch[1], {
-      prompt: typeof body?.prompt === "string" && body.prompt.trim() ? body.prompt.trim() : null,
-      certSubject: auth.subject,
-    });
+    let job;
+    try {
+      job = await continueHandoff(continueMatch[1], {
+        prompt: typeof body?.prompt === "string" && body.prompt.trim() ? body.prompt.trim() : null,
+        certSubject: auth.subject,
+      });
+    } catch (error) {
+      if (handleHandoffLookupError(res, "POST /v1/handoffs/:id/continue", error)) return true;
+      throw error;
+    }
     sendJson(res, 202, { job: await toJobResponse(job, responseShape("preview")) });
     return true;
   }
 
+  return false;
+}
+
+// store.getHandoff/continueHandoff both route through store.mjs's
+// (unexported) assertSafeRecordId, which throws this exact message for any
+// id that fails its own path-safety check — wrong charset, "..", empty,
+// too long, ... A handoff id arrives straight off the network as a URL
+// path segment, so this is reachable by any caller, not just a buggy
+// client: a traversal-shaped id like "../etc/passwd" hits it too. From the
+// client's side a bad id and a real-but-unknown id must be indistinguishable
+// — both mean "not here" — so this is a clean 404, never a 500 that echoes
+// an internal validator's message back out. Anything else thrown is a
+// genuine failure: still surfaced as a 500 (via the caller's rethrow), but
+// logged here first so it is never silently absorbed along with the id
+// case. Already-typed errors (continueHandoff's own 404/409) carry a
+// numeric `.status` and are deliberately left alone — they already produce
+// the right response and don't need re-logging as if they were a bug.
+const INVALID_RECORD_ID_MESSAGE = "record id is invalid";
+
+function handleHandoffLookupError(res, route, error) {
+  if (error?.message === INVALID_RECORD_ID_MESSAGE) {
+    sendError(res, 404, "handoff not found");
+    return true;
+  }
+  if (!Number.isInteger(error?.status)) {
+    console.error(`relayd: ${route} failed — ${error?.stack || error?.message || String(error)}`);
+  }
   return false;
 }
 
