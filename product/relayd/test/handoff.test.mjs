@@ -1121,6 +1121,12 @@ test("the secret-path policy matches by shape, not by the two names that were re
     "config/secrets.yaml", ".git-credentials", ".netrc", ".npmrc", "app/.aws/credentials",
     ".ssh/id_ed25519", "keys/server.pem", "certs/tls.key", "svc/service-account-prod.json",
     ".claude/.credentials.json", "infra/terraform.tfstate",
+    // Each of these is caught by exactly ONE rule, so deleting that rule shows
+    // up here. Without them the key-by-name rule and the .ssh-directory rule
+    // each cover for the other and either can be deleted with the suite still
+    // green — which is how a rule gets "tidied away" in a later edit.
+    "deploy/id_rsa", // only the id_<type> rule
+    ".ssh/authorized_keys", // only the .ssh directory rule
   ];
   const allowed = [
     "src/index.mjs", "README.md", "environment.md", "docs/env-setup.md", "src/secretsauce.ts",
@@ -1351,6 +1357,13 @@ test("L6: a poll cycle never imports more than the batch cap, and the rest arriv
   // the id survives (clipped) inside `detail` instead.
   attempted.push(...lines.filter((l) => l.event === "handoff_failed" && String(l.detail).includes("capbatch")));
   assert.equal(attempted.length, 20, `exactly MAX_POLL_BATCH (20) of the 30 offered must be attempted in the first cycle, got ${attempted.length}`);
+  // The truncation itself must be RECORDED. Ten descriptors silently dropped
+  // per cycle is exactly the shape of failure this module's property 2 exists
+  // to forbid, and without this assertion the audit call can be deleted with
+  // the suite still green.
+  const truncated = lines.find((line) => line.event === "handoff_poll_truncated");
+  assert.ok(truncated, "a truncated poll batch must leave a record, not be silently dropped");
+  assert.deepEqual({ offered: truncated.offered, taken: truncated.taken }, { offered: 30, taken: 20 });
 });
 
 test("C2: the poll loop has a floor on the SUCCESS path", async () => {
@@ -1791,4 +1804,400 @@ test("POST /v1/handoffs/:id/continue: a genuinely unknown, validly-shaped id is 
 
   assert.equal(handled, true);
   assert.equal(res.statusCode, 404, `expected a clean 404, got ${res.statusCode} / ${res.body}`);
+});
+
+// ---------------------------------------------------------------------------
+// Guard-deletion pins (adjudication item 2).
+//
+// The module's own rule — "every guard has a test that DIES when the guard is
+// removed" — was applied unevenly, and a whole-branch review measured the
+// result: a 62.3% mutation score with the survivors clustered on the jail's
+// EDGES. Deleting the whole `resolveJailRoot` gate, `removeInsideJail`'s
+// containment refusal, `verifiedCheckout`'s .git check, either failure-path
+// cleanup, or the poll loop's import-vs-poll distinction all left this suite
+// green. The jail itself was independently verified to hold under six attack
+// strategies raced up to 200 times — the code is right; these are the tests
+// that would notice if it stopped being. Each test below names the exact
+// mutation it kills, and each was confirmed by making that mutation and
+// watching this test, specifically, go red.
+//
+// NOT production changes. Nothing below required one, and nothing below got
+// one.
+
+// Audit entries appended since the call. The audit log is the operator's
+// channel and the only observable for several guards here.
+function auditWatch() {
+  const auditPath = path.join(process.env.CODEX_DATA_DIR, "audit.jsonl");
+  const from = fs.existsSync(auditPath) ? fs.readFileSync(auditPath, "utf8").length : 0;
+  return () => (fs.existsSync(auditPath)
+    ? fs.readFileSync(auditPath, "utf8").slice(from).trim().split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+    : []);
+}
+
+const stagingEntries = () => fs.readdirSync(workspaceRoot).filter((name) => name.startsWith(".relayd-handoff-"));
+
+// PIN 1 — resolveJailRoot's mkdir mode, and startClone's.
+// Kills: `fs.mkdirSync(workspaceBrowseRoot, { ..., mode: 0o700 })` -> 0o777,
+//        `fs.mkdirSync(name, 0o700)` -> 0o777.
+// The browse root holds every handoff checkout and every staging directory;
+// created at the process umask it is world-readable, and a same-uid actor is
+// not the only reader that matters on a shared box.
+test("guard: the browse root relayd creates, and the staging directory inside it, are 0700", async () => {
+  const id = "modes000000000ab";
+  const origin = await makeOriginRepo({ manifest: { ...MANIFEST, id } });
+  const realRoot = fs.realpathSync(workspaceRoot);
+  const saved = `${realRoot}-saved-for-modes`;
+  // Take the browse root away so resolveJailRoot is the thing that creates it.
+  fs.renameSync(realRoot, saved);
+  try {
+    const record = await importHandoff({ id, repo: MANIFEST.repo, branch: MANIFEST.branch }, deps(origin));
+    assert.equal(record.state, "ready");
+    assert.equal(fs.lstatSync(realRoot).mode & 0o777, 0o700,
+      "a browse root relayd had to create must not arrive at the process umask");
+    // The published checkout IS the staging directory, renamed — so its mode
+    // is the mode startClone gave it, observed without racing the clone.
+    assert.equal(fs.lstatSync(checkoutPathFor(id)).mode & 0o777, 0o700,
+      "the staging directory (and therefore the checkout) must be 0700");
+  } finally {
+    fs.rmSync(realRoot, { recursive: true, force: true });
+    fs.renameSync(saved, realRoot);
+  }
+});
+
+// PIN 2 — removeInsideJail's containment refusal.
+// Kills: deleting `if (real === workspaceBrowseRoot || !resolvedPathWithinRoot(real))`.
+// This is the ONE delete in the module, and the failure path calls it with a
+// path built from the jail root. If the jail root itself has been moved aside
+// and replaced with a symlink — a same-uid rename, the premise of this
+// module's threat model — that path now resolves into a tree of the
+// attacker's choosing, and a cleanup that follows it is an arbitrary-delete
+// primitive aimed wherever they pointed it. Refusing is the only safe answer.
+test("guard: cleanup after a late failure refuses to delete a path that no longer resolves inside the jail", async () => {
+  const id = "cleanupescape001";
+  const origin = await makeOriginRepo({ manifest: { ...MANIFEST, id } });
+  const realRoot = fs.realpathSync(workspaceRoot);
+  const decoy = `${realRoot}-decoy-cleanup`;
+  const finalName = path.basename(checkoutPathFor(id));
+  let swapped = false;
+
+  const record = await importHandoff(
+    { id, repo: MANIFEST.repo, branch: MANIFEST.branch },
+    deps(origin, {
+      beforeWorkspaceRegistration() {
+        // The jail moves; the name stays. Everything this module still holds
+        // by name now points somewhere else entirely.
+        fs.renameSync(realRoot, decoy);
+        fs.symlinkSync(decoy, realRoot);
+        swapped = true;
+      },
+    }),
+  );
+
+  try {
+    assert.equal(record.state, "failed");
+    assert.equal(record.error, "workspace_registration_failed",
+      "a checkout that no longer resolves inside the jail is never registered");
+    assert.equal(
+      fs.existsSync(path.join(decoy, finalName)),
+      true,
+      "the cleanup must REFUSE: deleting a path outside the jail is an arbitrary delete, not a cleanup",
+    );
+  } finally {
+    if (swapped) {
+      fs.rmSync(realRoot, { force: true }); // unlink the symlink we planted
+      fs.renameSync(decoy, realRoot);
+    }
+  }
+});
+
+// PIN 3 — verifiedCheckout's `.git` check.
+// Kills: deleting `if (!fs.existsSync(path.join(real, ".git"))) return null;`.
+// Without it the push-back runs `git -C <checkout>` against a directory that
+// is not a repository, and git DISCOVERS ONE BY WALKING UP — so a reset, an
+// add and a push would be aimed at whatever repository happens to be an
+// ancestor of the browse root. The failure must be `checkout_missing`, which
+// is also the only reason the push path may report here.
+test("guard: a checkout directory that is not a git repository is never pushed from", async () => {
+  const id = "nogitdir00000abc";
+  const { checkout } = await stageHandoffForPush(id, { lastJobId: "job-nogit-1" });
+  fs.rmSync(path.join(checkout, ".git"), { recursive: true, force: true });
+
+  const result = await completeHandoffJob({ id: "job-nogit-1", status: "succeeded", workspaceId: "dir-handoff-x" });
+
+  assert.equal(result.pushed, false);
+  assert.equal(result.reason, "checkout_missing",
+    "not a repository must read as 'no checkout', never as a push that git resolved somewhere else");
+  assert.equal(store.getHandoff(id).error, "checkout_missing");
+});
+
+// PIN 4 — the failure-path cleanups in runImport and startClone.
+// Kills: deleting `removeStagingIfOurs(realRoot, handle)` from runImport's
+//        finally, and deleting `removePinnedEntry(name)` from startClone's
+//        own catch.
+// A staging directory left behind is a full clone of the user's repository
+// sitting in the browse root under a name nothing will ever look at again.
+test("guard: neither a failed clone nor a failure before the clone starts leaves a staging directory behind", async () => {
+  assert.deepEqual(stagingEntries(), [], "precondition: the jail starts clean");
+
+  // (a) the clone itself fails — runImport's finally is what cleans up.
+  const failing = async () => {
+    const error = new Error("Command failed: git clone");
+    error.stderr = "fatal: repository not found\n";
+    throw error;
+  };
+  const cloneFailed = await importHandoff(
+    { id: "stagingclean0001", repo: "me/relay", branch: "relay/handoff-x" },
+    deps("ignored", { execFileImpl: failing }),
+  );
+  assert.equal(cloneFailed.error, "clone_failed");
+  assert.deepEqual(stagingEntries(), [], "a failed clone must not leave its staging directory in the jail");
+
+  // (b) the spawn itself throws, before startClone has returned a handle at
+  // all — the caller cannot clean up something it was never given, so
+  // startClone's own catch has to.
+  const refusing = () => {
+    throw new Error("spawn refused");
+  };
+  const spawnFailed = await importHandoff(
+    { id: "stagingclean0002", repo: "me/relay", branch: "relay/handoff-x" },
+    deps("ignored", { execFileImpl: refusing }),
+  );
+  assert.equal(spawnFailed.state, "failed");
+  assert.deepEqual(stagingEntries(), [],
+    "a failure between mkdir and handing back a handle must take the directory with it");
+});
+
+// PIN 5 — the failure-path cleanup of the STABLE name.
+// Kills: deleting `if (publishAttempted) removeQuietly(path.join(realRoot, finalName))`.
+// A publish that is refused after a rename may already have half-landed on the
+// stable name, and anything sitting at that name after a failed import is
+// something a later `continue` or a browse could pick up as if it were the
+// handoff's checkout. Nothing may survive there.
+test("guard: a refused publish leaves nothing at the handoff's stable checkout name", async () => {
+  const id = "publishleft00abc";
+  const spoil = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-handoff-leftover-"));
+  const origin = await makeOriginRepo({ manifest: { ...MANIFEST, id } });
+
+  // Something is already sitting at the stable name — pre-planted by the same
+  // same-uid actor, or left by an earlier crash. Either way it is not ours and
+  // it must not still be there when the import has failed.
+  fs.mkdirSync(checkoutPathFor(id), { recursive: true });
+  fs.writeFileSync(path.join(checkoutPathFor(id), "LEFTOVER"), "not a real checkout\n");
+
+  // The attacker's half of the publish race, run deterministically in place of
+  // git: our staging directory is renamed away and theirs is left at the same
+  // name, so `stagingIsOurs` refuses and the publish never completes.
+  const swapper = () => {
+    const staging = process.cwd();
+    return (async () => {
+      fs.renameSync(staging, path.join(spoil, "stolen"));
+      fs.mkdirSync(staging, { recursive: true });
+      return { stdout: "", stderr: "" };
+    })();
+  };
+
+  const record = await importHandoff(
+    { id, repo: MANIFEST.repo, branch: MANIFEST.branch },
+    deps(origin, { execFileImpl: swapper }),
+  );
+
+  assert.equal(record.state, "failed");
+  assert.equal(record.error, "checkout_escaped_jail");
+  assert.equal(fs.existsSync(checkoutPathFor(id)), false,
+    "nothing may be left at the stable name after a refused publish, not even what was there before");
+  fs.rmSync(spoil, { recursive: true, force: true });
+});
+
+// PIN 6 — the poll loop's import-vs-poll distinction.
+// Kills: deleting the inner try/catch around `importHandoff`.
+// `importHandoff` is a settle function and should never throw — but "should
+// never" is exactly the assumption that hid a wedged handoff behind a
+// "network problem" for a release. A descriptor whose own property getters
+// throw takes announceUnrecordable down with it, which is the one way to make
+// the settle function reject. It must be audited as an IMPORT failure: a poll
+// failure also triggers the backoff, so the mislabel costs the operator both
+// the diagnosis and the next minute of pickups.
+test("guard: a descriptor that makes the settle function itself throw is an import failure, never a poll failure", async () => {
+  const hostile = new Proxy({}, {
+    get() {
+      throw new Error("hostile descriptor getter");
+    },
+  });
+  let polls = 0;
+  const cloud = {
+    async pollHandoffs() {
+      polls += 1;
+      return polls === 1 ? [hostile] : [];
+    },
+  };
+  const audited = auditWatch();
+
+  const loop = startHandoffLoop({ cloud, waitSec: 1 });
+  // Long enough to clear the unconditional POLL_FLOOR_MS between cycles, so
+  // "the loop is still polling" is an observation and not a guess.
+  await new Promise((resolve) => setTimeout(resolve, 1400));
+  loop.stop();
+
+  const events = audited().map((entry) => entry.event);
+  assert.ok(events.includes("handoff_import_failed"),
+    `the failure must be recorded as an import failure; saw ${JSON.stringify(events)}`);
+  assert.ok(!events.includes("handoff_poll_failed"),
+    "an import failure must never be recorded as a poll failure — that mislabel also costs the operator the backoff");
+  assert.ok(polls >= 2, "and the loop keeps polling afterwards");
+});
+
+// ---------------------------------------------------------------------------
+// F-2 — `record.error` really is drawn from PUBLIC_REASONS now.
+
+// The reviewer's own demonstration, inverted into a test: every reason the
+// push-back path can persist, membership-tested against the exported set. Kills
+// any future edit that adds a push reason without adding it to the vocabulary.
+test("F-2: every reason the push-back path can persist is a member of PUBLIC_REASONS", () => {
+  const pushReasons = [
+    "push_failed", "push_blocked_secret", "checkout_missing", "record_missing",
+    "job_failed", "job_cancelled", "job_timeout", "job_unknown",
+  ];
+  for (const reason of pushReasons) {
+    assert.equal(handoffModule.PUBLIC_REASONS.has(reason), true,
+      `${reason} reaches record.error and the phone, so it must be in the closed vocabulary`);
+  }
+});
+
+// Kills: `publicReason`/`publicCode` losing its membership test, and
+// `announcePushOutcome` persisting `extra.reason` raw again.
+test("F-2: a job status the vocabulary does not know becomes internal_error, not a new word", async () => {
+  const id = "unknownstatus001";
+  await stageHandoffForPush(id, { lastJobId: "job-unknown-1" });
+  const localEvents = captureLocalEvents();
+  const audited = auditWatch();
+
+  // A status the jobs engine does not emit today. The point is that this
+  // module is not the place where "the jobs engine only emits four statuses"
+  // is load-bearing: an added status must degrade to a vocabulary word.
+  const result = await completeHandoffJob(
+    { id: "job-unknown-1", status: "quarantined", workspaceId: "dir-handoff-x" },
+  );
+
+  assert.equal(result.reason, "internal_error", "the returned reason is a vocabulary word");
+  assert.equal(store.getHandoff(id).error, "internal_error", "and so is the one served to the phone");
+  const pushEvent = localEvents().find((event) => event.name === "handoff.push_failed");
+  assert.equal(pushEvent?.data?.error, "internal_error", "and so is the one on the SSE feed");
+  // Nothing is lost: the operator's channel still names the exact status.
+  const skipped = audited().find((entry) => entry.event === "handoff_push_failed");
+  assert.match(String(skipped?.detail), /job_quarantined/,
+    "the raw status stays visible in the local audit log, where attacker-influenced text is allowed");
+});
+
+// ---------------------------------------------------------------------------
+// The rest of the survivor cluster: cheap pins for guards that were carrying
+// no test at all.
+
+// Kills: `await git("reset", "-q")` deleted.
+test("guard: whatever the harness left staged is discarded before the policy chooses what to commit", async () => {
+  const id = "presetstaged0abc";
+  const { origin, checkout } = await stageHandoffForPush(id, { lastJobId: "job-reset-1" });
+  const SECRET = "sk-live-zqxPRESTAGEDzqx";
+  fs.writeFileSync(path.join(checkout, "work.txt"), "the agent's work\n");
+  fs.writeFileSync(path.join(checkout, ".env"), `OPENAI_API_KEY=${SECRET}\n`);
+  // The harness staged a secret itself before it exited. The index that gets
+  // committed must be the set THIS policy chose, not one it inherited.
+  await execFileAsync("git", ["-C", checkout, "add", "-f", ".env"]);
+
+  const result = await completeHandoffJob({ id: "job-reset-1", status: "succeeded", workspaceId: "dir-handoff-x" });
+
+  assert.equal(result.pushed, true, "the legitimate work still gets pushed");
+  const pushed = await branchFilesOnOrigin(origin, MANIFEST.branch);
+  assert.ok(pushed.includes("work.txt"));
+  assert.ok(!pushed.includes(".env"), "a pre-staged secret must not ride along on the harness's index");
+  const { stdout } = await execFileAsync("git", ["-C", origin, "log", "-p", "--all"], { maxBuffer: 32 * 1024 * 1024 });
+  assert.equal(stdout.includes(SECRET), false, "the secret value must not exist anywhere in the pushed history");
+});
+
+// Kills: the `handoff_push_withheld` audit call being removed.
+test("guard: what the push-back withheld is recorded, not silently dropped", async () => {
+  const id = "withheldaudit001";
+  const { checkout } = await stageHandoffForPush(id, { lastJobId: "job-withheld-1" });
+  fs.writeFileSync(path.join(checkout, "work.txt"), "work\n");
+  fs.writeFileSync(path.join(checkout, ".env"), "K=1\n");
+  fs.writeFileSync(path.join(checkout, "deploy.pem"), "-----BEGIN PRIVATE KEY-----\n");
+  const audited = auditWatch();
+
+  const result = await completeHandoffJob({ id: "job-withheld-1", status: "succeeded", workspaceId: "dir-handoff-x" });
+
+  assert.equal(result.withheld, 2);
+  const entry = audited().find((line) => line.event === "handoff_push_withheld");
+  assert.ok(entry, "withholding a file from the remote must leave a record of WHICH file");
+  assert.equal(entry.count, 2);
+  assert.deepEqual([...entry.withheld].sort(), [".env", "deploy.pem"]);
+});
+
+// Kills: `if (staged.length > 0) await commitGit(...)` becoming an
+// unconditional (or --allow-empty) commit.
+test("guard: a job that changed nothing produces no commit at all", async () => {
+  const id = "emptycommit00abc";
+  const { origin } = await stageHandoffForPush(id, { lastJobId: "job-empty-1" });
+  const head = async () => (await execFileAsync("git", ["-C", origin, "rev-parse", MANIFEST.branch])).stdout.trim();
+  const before = await head();
+
+  const result = await completeHandoffJob({ id: "job-empty-1", status: "succeeded", workspaceId: "dir-handoff-x" });
+
+  assert.equal(result.pushed, true);
+  assert.equal(await head(), before, "an empty run must not manufacture a commit on the user's branch");
+});
+
+// Kills: `baseRecord` echoing the descriptor's own repo/branch instead of
+// "(invalid)". The record is served to the phone by GET /v1/handoffs.
+test("guard: an unusable repo or branch is recorded as '(invalid)', never echoed back to the client", async () => {
+  const id = "invalidfields001";
+  const record = await importHandoff(
+    { id, repo: "../../etc/pwn", branch: "-oProxyCommand=id" },
+    deps("ignored", { execFileImpl: async () => ({ stdout: "", stderr: "" }) }),
+  );
+
+  assert.equal(record.state, "failed");
+  assert.equal(record.repo, "(invalid)", "attacker-supplied text must not be echoed through the record");
+  assert.equal(record.branch, "(invalid)");
+  assert.equal(store.getHandoff(id).repo, "(invalid)");
+});
+
+// Kills: `if (!Array.isArray(descriptors)) throw refuse("cloud_poll_invalid")`.
+// A string response would otherwise be iterated CHARACTER BY CHARACTER, each
+// character becoming an attempted import.
+test("guard: a poll response that is not a list is a poll failure, not a character-by-character import", async () => {
+  let polls = 0;
+  const cloud = {
+    async pollHandoffs() {
+      polls += 1;
+      return polls === 1 ? "not-a-list" : [];
+    },
+  };
+  const audited = auditWatch();
+
+  const loop = startHandoffLoop({ cloud, waitSec: 1 });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  loop.stop();
+
+  const events = audited().map((entry) => entry.event);
+  assert.ok(events.includes("handoff_poll_failed"), `expected a poll failure; saw ${JSON.stringify(events)}`);
+  assert.ok(!events.includes("handoff_failed"),
+    "no descriptor was offered, so nothing may be attempted as an import");
+});
+
+// Kills: `parseManifest`'s `Array.isArray(raw)` rejection. `typeof [] ===
+// "object"`, so an array walks straight past a bare typeof check and then
+// reads every field as undefined.
+test("guard: a manifest that is a JSON array is refused as invalid, not read as an empty object", async () => {
+  const id = "arraymanifest001";
+  const encPubkey = readEncPublicKeyB64(identityPaths(IDENTITY_DIR));
+  const origin = await makeOriginRepo({
+    manifest: { ...MANIFEST, id },
+    rawBlobs: [["manifest.enc", sealTo(encPubkey, Buffer.from("[]", "utf8"))]],
+  });
+
+  const record = await importHandoff({ id, repo: MANIFEST.repo, branch: MANIFEST.branch }, deps(origin));
+
+  assert.equal(record.state, "failed");
+  assert.equal(record.error, "manifest_invalid");
 });
