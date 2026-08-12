@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 
 const { discoverSessions, readSessionBytes, sessionExcerpt, claudeProjectSlug } = await import("../src/sessions.mjs");
 
@@ -198,4 +199,73 @@ test("codex cwd matching tolerates a trailing slash", () => {
 
   assert.equal(sessions.length, 1);
   assert.equal(sessions[0].id, "cccc3333");
+});
+
+// A directory can share a name with a session file (e.g. a stray mkdir, or a
+// harness bug). Nothing here should treat it as a valid session just because
+// its name ends in ".jsonl" — the type must be checked, not just the suffix.
+test("a directory named *.jsonl is skipped, not treated as a valid session", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-sessions-dirjsonl-"));
+  writeClaudeSession(home, "dddddddd-dddd-4ddd-8ddd-dddddddddddd", [
+    { type: "user", cwd: CWD, message: { content: "a valid session" } },
+  ]);
+  const dir = path.join(home, ".claude", "projects", claudeProjectSlug(CWD));
+  fs.mkdirSync(path.join(dir, "foo.jsonl"));
+
+  const sessions = discoverSessions({ cwd: CWD, home });
+
+  assert.equal(sessions.length, 1, "the directory must not be counted as a session");
+  assert.equal(sessions[0].id, "dddddddd-dddd-4ddd-8ddd-dddddddddddd");
+});
+
+// discoverSessions is entirely synchronous (fs.openSync/readSync under the
+// hood), so a hang inside it cannot be raced against a timer from within
+// this same process — node:test's own `timeout` option only marks a hung
+// test cancelled, it does not stop a still-blocked syscall (the same trap
+// documented on the login.test.mjs budget test, for the sync case instead
+// of the async one). The only reliable way to bound a genuinely synchronous
+// hang is to run the call in a child process and let Node's own spawnSync
+// `timeout` kill it from outside if it does not return in time.
+function runDiscoverSessionsInChild({ cwd, home }, { timeout = 4000 } = {}) {
+  const sessionsPath = new URL("../src/sessions.mjs", import.meta.url).pathname;
+  const script = [
+    `import { discoverSessions } from ${JSON.stringify(sessionsPath)};`,
+    `const sessions = discoverSessions({ cwd: ${JSON.stringify(cwd)}, home: ${JSON.stringify(home)} });`,
+    `process.stdout.write(JSON.stringify(sessions.map((s) => s.id)));`,
+  ].join("\n");
+  const scriptPath = path.join(home, "__probe.mjs");
+  fs.writeFileSync(scriptPath, script);
+  return spawnSync(process.execPath, [scriptPath], { timeout, killSignal: "SIGKILL", encoding: "utf8" });
+}
+
+test("a FIFO named *.jsonl in the Claude project dir does not hang discovery", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-sessions-fifo-claude-"));
+  writeClaudeSession(home, "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", [
+    { type: "user", cwd: CWD, message: { content: "a valid session next to a fifo" } },
+  ]);
+  const dir = path.join(home, ".claude", "projects", claudeProjectSlug(CWD));
+  const fifoPath = path.join(dir, "blocked.jsonl");
+  const mkfifo = spawnSync("mkfifo", [fifoPath]);
+  assert.equal(mkfifo.status, 0, "test setup requires mkfifo to succeed on this platform");
+
+  const result = runDiscoverSessionsInChild({ cwd: CWD, home });
+
+  assert.equal(result.signal, null, `discoverSessions hung and had to be killed (signal=${result.signal}); a FIFO must be skipped before it is ever opened`);
+  assert.equal(result.status, 0, `probe exited abnormally: ${result.stderr}`);
+  assert.deepEqual(JSON.parse(result.stdout), ["eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"], "the fifo must be skipped; the valid session is still discovered");
+});
+
+test("a FIFO named rollout-*.jsonl in the Codex sessions dir does not hang discovery", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-sessions-fifo-codex-"));
+  writeCodexRollout(home, "ffff4444", CWD, new Date("2026-08-11T09:00:00Z"));
+  const dir = path.join(home, ".codex", "sessions", "2026", "08");
+  const fifoPath = path.join(dir, "rollout-blocked.jsonl");
+  const mkfifo = spawnSync("mkfifo", [fifoPath]);
+  assert.equal(mkfifo.status, 0, "test setup requires mkfifo to succeed on this platform");
+
+  const result = runDiscoverSessionsInChild({ cwd: CWD, home });
+
+  assert.equal(result.signal, null, `discoverSessions hung and had to be killed (signal=${result.signal}); a FIFO must be skipped before it is ever opened`);
+  assert.equal(result.status, 0, `probe exited abnormally: ${result.stderr}`);
+  assert.deepEqual(JSON.parse(result.stdout), ["ffff4444"], "the fifo must be skipped; the valid session is still discovered");
 });
