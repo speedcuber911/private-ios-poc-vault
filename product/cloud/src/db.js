@@ -215,6 +215,44 @@ CREATE TABLE IF NOT EXISTS handoffs (
 CREATE INDEX IF NOT EXISTS idx_handoffs_node_state ON handoffs (node_id, state);
 CREATE INDEX IF NOT EXISTS idx_handoffs_account_repo ON handoffs (account_id, repo, created_at);
 
+-- Credential-sync notices: how a node learns that "relay sync-auth" left a
+-- sealed bundle in a rendezvous slot for it. Nothing lets a node discover a
+-- pending pairing session on its own (there is no route that lists them, and
+-- there must not be one), so the CLI announces one here and the node picks it
+-- up over the node-authenticated handoff long-poll it already holds open.
+--
+-- pairing_secret is the rendezvous secret, NOT the derived auth token: the
+-- node needs authTokenFor(secret) to authorize the slot GET *and*
+-- macKeyFor(secret) to verify the x-pairing-tag its sender computed, and the
+-- auth token is a one-way function of the secret so it cannot yield the MAC
+-- key. This row therefore grants slot access, and nothing else: the bundle in
+-- that slot is sealed to the node's X25519 key, so this table's contents can
+-- never open a credential. Rows are short-lived (they die with their
+-- rendezvous, plus a grace window) and are dropped with their node/account.
+--
+-- state/lease_token/lease_expires_at are the SAME delivery lease the handoffs
+-- table documents: a poll leases, POST /v1/node/handoffs/ack is the only path
+-- to 'delivered', and an unconfirmed lease expires so the row is claimable
+-- again. See registry.js's leaseSyncNotices/confirmSyncNoticeDelivery.
+CREATE TABLE IF NOT EXISTS sync_notices (
+  id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  node_id TEXT NOT NULL,
+  pairing_id TEXT NOT NULL,
+  pairing_secret TEXT NOT NULL,
+  state TEXT NOT NULL,
+  lease_token TEXT,
+  lease_expires_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  delivered_at INTEGER,
+  expires_at INTEGER NOT NULL
+);
+-- One rendezvous is one notice, however many times the CLI announces it.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_notices_pairing ON sync_notices (pairing_id);
+CREATE INDEX IF NOT EXISTS idx_sync_notices_node_state ON sync_notices (node_id, state);
+CREATE INDEX IF NOT EXISTS idx_sync_notices_expires ON sync_notices (expires_at);
+
 CREATE INDEX IF NOT EXISTS idx_devices_account ON devices (account_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_account ON nodes (account_id);
 CREATE INDEX IF NOT EXISTS idx_node_events_created ON node_events (created_at);

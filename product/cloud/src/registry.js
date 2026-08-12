@@ -223,6 +223,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       db.prepare("DELETE FROM device_codes WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM repos WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM handoffs WHERE account_id = ?").run(accountId);
+      db.prepare("DELETE FROM sync_notices WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM accounts WHERE id = ?").run(accountId);
       db.exec("COMMIT");
       return true;
@@ -462,6 +463,10 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       // previously left these rows behind forever; no sweep touches the
       // handoffs table at all. See Task 8 review, M-5.
       db.prepare("DELETE FROM handoffs WHERE node_id = ?").run(id);
+      // Same reasoning for a credential-sync notice, plus one of its own: the
+      // row holds a rendezvous secret, and nothing will ever poll for it
+      // again once its node is gone.
+      db.prepare("DELETE FROM sync_notices WHERE node_id = ?").run(id);
     }
   }
 
@@ -1086,6 +1091,97 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     return confirmed;
   }
 
+  // ── credential-sync notices ─────────────────────────────────────────────
+  //
+  // See the sync_notices comment in db.js for what a notice is and why it
+  // carries the rendezvous secret rather than the derived auth token. The
+  // lease/ack/reclaim trio below is deliberately the same mechanism the
+  // handoff functions above use — same reasoning, same failure mode, so a
+  // reader who understands one understands both.
+
+  // A notice that could not be delivered before its rendezvous expired is
+  // still worth keeping for a while: the node that comes back online inside
+  // this window collects, fails at the (now-gone) slot, and raises a visible
+  // "re-run relay sync-auth". Dropping the row at rendezvous expiry instead
+  // would make that same case silent, which is the worst outcome this feature
+  // has. Past the grace window nothing useful is left to say, so the row goes.
+  const SYNC_NOTICE_GRACE_MS = 60 * 60 * 1000;
+
+  function createSyncNotice({ accountId, nodeId, pairingId, secret, expiresAt }) {
+    const ts = now();
+    db.prepare(
+      "INSERT INTO sync_notices (id, account_id, node_id, pairing_id, pairing_secret, state, created_at, updated_at, expires_at) " +
+      "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+    ).run(randomUUID(), accountId, nodeId, pairingId, secret, ts, ts, expiresAt);
+    return getSyncNoticeByPairingId(pairingId);
+  }
+
+  function getSyncNoticeByPairingId(pairingId) {
+    return mapSyncNotice(db.prepare("SELECT * FROM sync_notices WHERE pairing_id = ?").get(pairingId));
+  }
+
+  function reclaimExpiredSyncNoticeLeases(nodeId) {
+    db.prepare(
+      "UPDATE sync_notices SET state = 'pending', lease_token = NULL, lease_expires_at = NULL, updated_at = ? " +
+      "WHERE node_id = ? AND state = 'leased' AND lease_expires_at <= ?",
+    ).run(now(), nodeId, now());
+  }
+
+  // Deliberately NOT filtered on expires_at: an expired rendezvous still has
+  // to reach the node, so the node can fail loudly instead of the user being
+  // left believing a sync landed. See SYNC_NOTICE_GRACE_MS above.
+  function listPendingSyncNotices(nodeId, limit = 50) {
+    reclaimExpiredSyncNoticeLeases(nodeId);
+    return db.prepare(
+      "SELECT * FROM sync_notices WHERE node_id = ? AND state = 'pending' ORDER BY created_at, rowid LIMIT ?",
+    ).all(nodeId, limit).map(mapSyncNotice);
+  }
+
+  function countPendingSyncNotices(nodeId) {
+    reclaimExpiredSyncNoticeLeases(nodeId);
+    return Number(db.prepare("SELECT COUNT(*) AS n FROM sync_notices WHERE node_id = ? AND state = 'pending'")
+      .get(nodeId).n);
+  }
+
+  function leaseSyncNotices(ids, nodeId, leaseMs) {
+    if (!Array.isArray(ids) || ids.length === 0) return [];
+    const expiresAt = now() + leaseMs;
+    const stmt = db.prepare(
+      "UPDATE sync_notices SET state = 'leased', lease_token = ?, lease_expires_at = ?, updated_at = ? " +
+      "WHERE id = ? AND node_id = ? AND state = 'pending'",
+    );
+    const leased = [];
+    for (const id of ids) {
+      const token = randomUUID();
+      const info = stmt.run(token, expiresAt, now(), id, nodeId);
+      if (info.changes > 0) {
+        leased.push(mapSyncNotice(db.prepare("SELECT * FROM sync_notices WHERE id = ?").get(id)));
+      }
+    }
+    return leased;
+  }
+
+  // The ONLY path to `delivered`, on the same compare-and-swap as
+  // confirmHandoffDelivery: an ack naming a token this node was never issued
+  // (or one already reclaimed) matches zero rows and is ignored.
+  function confirmSyncNoticeDelivery(nodeId, acks) {
+    if (!Array.isArray(acks) || acks.length === 0) return [];
+    const stmt = db.prepare(
+      "UPDATE sync_notices SET state = 'delivered', delivered_at = ?, lease_token = NULL, lease_expires_at = NULL, " +
+      "updated_at = ? WHERE id = ? AND node_id = ? AND state = 'leased' AND lease_token = ?",
+    );
+    const confirmed = [];
+    for (const { id, lease } of acks) {
+      const info = stmt.run(now(), now(), id, nodeId, lease);
+      if (info.changes > 0) confirmed.push(id);
+    }
+    return confirmed;
+  }
+
+  function sweepSyncNotices(nowMs) {
+    db.prepare("DELETE FROM sync_notices WHERE expires_at + ? <= ?").run(SYNC_NOTICE_GRACE_MS, nowMs);
+  }
+
   function updateHandoff(id, patch = {}) {
     const assignments = [];
     const values = [];
@@ -1179,6 +1275,13 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     leaseHandoffs,
     confirmHandoffDelivery,
     updateHandoff,
+    createSyncNotice,
+    getSyncNoticeByPairingId,
+    listPendingSyncNotices,
+    countPendingSyncNotices,
+    leaseSyncNotices,
+    confirmSyncNoticeDelivery,
+    sweepSyncNotices,
   };
 }
 
@@ -1248,6 +1351,27 @@ function mapDeviceCode(row) {
     expiresAt: Number(row.expires_at),
     createdAt: Number(row.created_at),
     clientIp: row.client_ip ?? null,
+  };
+}
+
+function mapSyncNotice(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    accountId: row.account_id,
+    nodeId: row.node_id,
+    pairingId: row.pairing_id,
+    // The rendezvous secret. Only the node-authenticated poll response is
+    // ever allowed to carry it onward — never a session-authed response, and
+    // never a log line.
+    secret: row.pairing_secret,
+    state: row.state,
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+    deliveredAt: row.delivered_at ?? null,
+    expiresAt: Number(row.expires_at),
+    leaseToken: row.lease_token ?? null,
+    leaseExpiresAt: row.lease_expires_at ?? null,
   };
 }
 

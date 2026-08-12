@@ -41,6 +41,25 @@ export const HANDOFF_MAX_WAITERS_PER_NODE = 8;
 // batch can ever need to name more ids than that.
 const HANDOFF_ACK_MAX_BATCH = 50;
 
+// Bounds how many undelivered credential-sync notices one node can hold.
+// The per-(account, kind) rendezvous quota does not bound this on its own:
+// pairing sessions expire and are swept, so a caller could mint five, wait
+// out the TTL, and mint five more, forever, while the notices they announced
+// pile up against a node that is offline. Rendezvous secrets are not
+// something to accumulate without a ceiling.
+export const SYNC_NOTICE_MAX_PENDING = 20;
+
+// Rendezvous kinds a credential-sync notice may name. `pair` is deliberately
+// absent: device pairing is redeemed on the node's own pairing listener with
+// a secret the user carries out of band, and must never become something the
+// control plane can hand to a node over this channel.
+const SYNC_NOTICE_KINDS = new Set(["sync-auth", "session-index"]);
+
+// Shape of a rendezvous secret, matching what the CLI mints
+// (base64url of 24 random bytes) and what pairing.js's AUTH_TOKEN_RE accepts
+// for the token derived from it.
+const SYNC_NOTICE_SECRET_RE = /^[A-Za-z0-9_-]{22,128}$/;
+
 export function createApp({
   config,
   db = createDb(config.dbPath),
@@ -241,6 +260,7 @@ export function createApp({
     pairing.sweep();
     notify.sweep();
     registry.sweepDeviceCodes(now());
+    registry.sweepSyncNotices(now());
     sweepTrials().catch((err) => console.error(`trial sweep failed: ${err?.message}`));
   }
 
@@ -552,7 +572,14 @@ export function createApp({
       const waitSec = Number.isSafeInteger(requested)
         ? Math.max(0, Math.min(requested, config.handoffPollMaxWaitSec))
         : 0;
-      if (waitSec > 0 && registry.countPendingHandoffs(nodeId) === 0) {
+      // Parked only when there is nothing of EITHER kind to hand over: a
+      // notice waiting behind an empty handoff list must not sit out the full
+      // wait window before the node hears about it.
+      if (
+        waitSec > 0 &&
+        registry.countPendingHandoffs(nodeId) === 0 &&
+        registry.countPendingSyncNotices(nodeId) === 0
+      ) {
         await waitForHandoff(nodeId, waitSec * 1000, req);
       }
       // A cheap fast path for a connection ALREADY OBSERVED closed — skip the
@@ -571,9 +598,22 @@ export function createApp({
 
       const pending = registry.listPendingHandoffs(nodeId);
       const leased = registry.leaseHandoffs(pending.map((h) => h.id), nodeId, config.handoffLeaseSec * 1000);
+      // Credential-sync notices ride the same response, the same lease and
+      // the same ack rather than a second long-poll: one held connection per
+      // node, one disconnect/waiter-leak/replay/lease mechanism to reason
+      // about. This is the one place the rendezvous secret is handed onward,
+      // and it is node-authenticated (ed25519 request signature) — never
+      // reachable with a session bearer.
+      const pendingNotices = registry.listPendingSyncNotices(nodeId);
+      const leasedNotices = registry.leaseSyncNotices(
+        pendingNotices.map((notice) => notice.id), nodeId, config.handoffLeaseSec * 1000,
+      );
       registry.touchNode(nodeId);
       return sendJson(res, 200, {
         handoffs: leased.map(({ id, repo, branch, leaseToken }) => ({ id, repo, branch, lease: leaseToken })),
+        notices: leasedNotices.map(({ id, pairingId, secret, leaseToken }) => ({
+          id, pairingId, secret, lease: leaseToken,
+        })),
       });
     }
 
@@ -596,9 +636,15 @@ export function createApp({
 
       const body = await readJson(req, config.jsonBodyMaxBytes);
       const acksRaw = Array.isArray(body?.acks) ? body.acks : [];
-      // Bounded by listPendingHandoffs' own per-poll cap: no legitimate ack
-      // batch can ever need to name more ids than a single poll can hand out.
-      if (acksRaw.length === 0 || acksRaw.length > HANDOFF_ACK_MAX_BATCH) {
+      const noticeAcksRaw = Array.isArray(body?.notices) ? body.notices : [];
+      // Both lists are bounded by the poll's own per-response caps: no
+      // legitimate batch can name more ids than a single poll handed out. An
+      // ack naming NOTHING at all stays a 400 — it can only be a bug or a
+      // probe, never a real confirmation.
+      if (acksRaw.length + noticeAcksRaw.length === 0) {
+        return sendJson(res, 400, { error: "invalid_ack" });
+      }
+      if (acksRaw.length > HANDOFF_ACK_MAX_BATCH || noticeAcksRaw.length > HANDOFF_ACK_MAX_BATCH) {
         return sendJson(res, 400, { error: "invalid_ack" });
       }
       const acks = [];
@@ -610,8 +656,21 @@ export function createApp({
         }
         acks.push({ id, lease });
       }
+      // Notice ids are randomUUID()s, not the hex handoff ids, so they get
+      // their own shape check rather than being forced through the handoff
+      // one.
+      const noticeAcks = [];
+      for (const entry of noticeAcksRaw) {
+        const id = strOrNull(entry?.id);
+        const lease = strOrNull(entry?.lease);
+        if (!id || id.length > 64 || !lease) {
+          return sendJson(res, 400, { error: "invalid_ack" });
+        }
+        noticeAcks.push({ id, lease });
+      }
       const confirmed = registry.confirmHandoffDelivery(verified.node.id, acks);
-      return sendJson(res, 200, { acked: confirmed });
+      const noticesAcked = registry.confirmSyncNoticeDelivery(verified.node.id, noticeAcks);
+      return sendJson(res, 200, { acked: confirmed, noticesAcked });
     }
 
     // ── session-authed registry endpoints ───────────────────────────────
@@ -774,6 +833,53 @@ export function createApp({
       const created = registry.createHandoff({ id: handoffId, accountId: account.id, nodeId, repo, branch });
       wakeHandoffWaiters(nodeId);
       return sendJson(res, 201, { handoff: publicHandoff(created) });
+    }
+
+    // ── credential-sync notices (session-authed: create only) ───────────
+    //
+    // `relay sync-auth` seals the user's own credentials to the node's X25519
+    // key and PUTs them into a rendezvous slot. Nothing lets the node discover
+    // that slot on its own, so the CLI announces it here and the node picks it
+    // up over the node-authenticated long-poll above.
+    //
+    // The body names a rendezvous the caller already created, so the secret
+    // here is one the caller minted and the cloud is merely relaying. What
+    // the cloud can do with it is bounded: authorize the slot, and therefore
+    // drop or refuse to relay the blob. What it cannot do is read a
+    // credential — the payload in that slot is sealed to the node's key. See
+    // the sync_notices comment in db.js.
+    if (method === "POST" && path === "/v1/sync-auth/notices") {
+      const body = await readJson(req, config.jsonBodyMaxBytes);
+      const pairingId = strOrNull(body?.pairingId);
+      const nodeId = strOrNull(body?.nodeId);
+      const secret = strOrNull(body?.secret);
+      if (!pairingId || !nodeId || !secret || !SYNC_NOTICE_SECRET_RE.test(secret)) {
+        return sendJson(res, 400, { error: "invalid_notice" });
+      }
+      const node = registry.getNode(nodeId);
+      if (!node || node.accountId !== account.id) return sendJson(res, 404, { error: "unknown_node" });
+      // The rendezvous must be this account's, and of a kind that is actually
+      // collected this way. One 404 for every refusal: nothing here tells a
+      // caller whether a pairing id belongs to someone else or never existed.
+      const session = registry.getPairingSession(pairingId);
+      if (!session || session.accountId !== account.id || !SYNC_NOTICE_KINDS.has(session.kind)) {
+        return sendJson(res, 404, { error: "unknown_pairing_session" });
+      }
+      // Idempotent on the rendezvous, exactly like POST /v1/handoffs is on
+      // handoffId: re-announcing one slot must not queue a second collection.
+      const existing = registry.getSyncNoticeByPairingId(pairingId);
+      if (existing) {
+        if (existing.accountId !== account.id) return sendJson(res, 404, { error: "unknown_pairing_session" });
+        return sendJson(res, 201, { notice: publicSyncNotice(existing) });
+      }
+      if (registry.countPendingSyncNotices(nodeId) >= SYNC_NOTICE_MAX_PENDING) {
+        return sendJson(res, 429, { error: "too_many_sync_notices" });
+      }
+      const created = registry.createSyncNotice({
+        accountId: account.id, nodeId, pairingId, secret, expiresAt: session.expiresAt,
+      });
+      wakeHandoffWaiters(nodeId);
+      return sendJson(res, 201, { notice: publicSyncNotice(created) });
     }
 
     if (method === "GET" && path === "/v1/handoffs") {
@@ -1082,6 +1188,21 @@ function publicHandoff(handoff) {
     createdAt: handoff.createdAt,
     updatedAt: handoff.updatedAt,
     deliveredAt: handoff.deliveredAt,
+  };
+}
+
+// Drops the rendezvous secret and the lease token. A session-authed caller
+// already knows the secret (it minted it) but has no business being handed it
+// back by the cloud, and the lease belongs to the node's poll alone — the
+// same reasoning publicHandoff applies to accountId and lease_token.
+function publicSyncNotice(notice) {
+  return {
+    id: notice.id,
+    nodeId: notice.nodeId,
+    pairingId: notice.pairingId,
+    state: notice.state,
+    createdAt: notice.createdAt,
+    expiresAt: notice.expiresAt,
   };
 }
 
