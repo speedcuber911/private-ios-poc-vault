@@ -32,7 +32,7 @@ test("login polls until approval, then pins the sandbox identity", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-login-"));
   let tokenCalls = 0;
   const cloud = fakeCloud({
-    "/v1/auth/device/start": { status: 201, json: { deviceCode: "dc", userCode: "ABCD-EFGH", verificationUri: "https://relay.test/cli-login", interval: 5, expiresIn: 900 } },
+    "/v1/auth/device/start": { status: 201, json: { deviceCode: "dc", userCode: "ABCD-EFGH", verificationUri: "https://relay.test/cli-login", verificationUriComplete: "https://relay.test/cli-login#code=ABCD-EFGH", interval: 5, expiresIn: 900 } },
     "/v1/auth/device/token": () => {
       tokenCalls += 1;
       return tokenCalls < 3
@@ -41,17 +41,18 @@ test("login polls until approval, then pins the sandbox identity", async () => {
     },
     "/v1/trial-nodes/current": { status: 200, json: TRIAL },
   });
-  const opened = [];
   const lines = [];
 
   await cmdLogin([], {
     home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl,
-    openBrowser: (url) => opened.push(url), log: (line) => lines.push(line), sleep: async () => {},
+    log: (line) => lines.push(line), sleep: async () => {},
+    stdout: { isTTY: false, columns: 80 },
   });
 
-  assert.deepEqual(opened, ["https://relay.test/cli-login"]);
   assert.ok(lines.some((line) => line.includes("ABCD-EFGH")), "the user code is shown");
   assert.equal(tokenCalls, 3, "polling continued until approval");
+  assert.equal(cloud.calls[0].body.machineName, os.hostname());
+  assert.ok(["macos", "linux", "windows", "other"].includes(cloud.calls[0].body.platform));
 
   const stored = readCredentials({ home });
   assert.equal(stored.sessionToken, "sess");
@@ -59,6 +60,28 @@ test("login polls until approval, then pins the sandbox identity", async () => {
   assert.equal(stored.nodeEncPubkey, TRIAL.trial.nodeEncPubkey);
   assert.ok(!lines.join("\n").includes("sess"), "the session token is never printed");
   assert.ok(!lines.join("\n").includes("dc"), "the device code is never printed");
+});
+
+test("login sends machineName and normalized platform, and --no-qr skips the QR", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-login-qr-"));
+  const cloud = fakeCloud({
+    "/v1/auth/device/start": { status: 201, json: { deviceCode: "dc", userCode: "ABCD-EFGH", verificationUri: "https://relay.test/cli-login", verificationUriComplete: "https://relay.test/cli-login#code=ABCD-EFGH", interval: 1, expiresIn: 900 } },
+    "/v1/auth/device/token": { status: 200, json: { sessionToken: "sess", refreshToken: "ref", accountId: "acct" } },
+    "/v1/trial-nodes/current": { status: 404, json: { error: "no_trial" } },
+  });
+  const lines = [];
+
+  await cmdLogin(["--no-qr"], {
+    home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl,
+    log: (line) => lines.push(line), sleep: async () => {},
+    hostname: () => "dev-box.local",
+    platform: "darwin",
+    stdout: { isTTY: true, columns: 120 },
+  });
+
+  assert.deepEqual(cloud.calls[0].body, { machineName: "dev-box.local", platform: "macos" });
+  assert.ok(!lines.some((line) => /[█▀▄]/.test(line)), "--no-qr must suppress the QR render");
+  assert.ok(lines.some((line) => line.includes("ABCD-EFGH")));
 });
 
 test("login reports plainly when the account has no sandbox yet", async () => {
@@ -71,7 +94,7 @@ test("login reports plainly when the account has no sandbox yet", async () => {
   const lines = [];
 
   await cmdLogin([], { home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl,
-    openBrowser: () => {}, log: (line) => lines.push(line), sleep: async () => {} });
+    log: (line) => lines.push(line), sleep: async () => {} });
 
   assert.equal(readCredentials({ home }).sessionToken, "sess", "the session is still saved");
   assert.equal(readCredentials({ home }).nodeId, null);
@@ -86,7 +109,7 @@ test("an expired device code aborts with a clear message", async () => {
   });
 
   await assert.rejects(() => cmdLogin([], { home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl,
-    openBrowser: () => {}, log: () => {}, sleep: async () => {} }), /login_expired/);
+    log: () => {}, sleep: async () => {} }), /login_expired/);
   assert.equal(readCredentials({ home }), null);
 });
 
@@ -103,7 +126,7 @@ test("a hostile negative poll interval from the server is clamped, never passed 
   const sleeps = [];
 
   await cmdLogin([], { home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl,
-    openBrowser: () => {}, log: () => {}, sleep: async (ms) => { sleeps.push(ms); } });
+    log: () => {}, sleep: async (ms) => { sleeps.push(ms); } });
 
   assert.ok(sleeps.length > 0, "the loop must have slept at least once");
   assert.ok(sleeps.every((ms) => ms >= 1000), `every sleep must be clamped to >= 1000ms, got ${JSON.stringify(sleeps)}`);
@@ -126,7 +149,7 @@ test("a huge or Infinity poll interval from the server is capped, never overflow
     const sleeps = [];
 
     await cmdLogin([], { home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl,
-      openBrowser: () => {}, log: () => {}, sleep: async (ms) => { sleeps.push(ms); } });
+      log: () => {}, sleep: async (ms) => { sleeps.push(ms); } });
 
     assert.ok(sleeps.length > 0, "the loop must have slept at least once");
     assert.ok(
@@ -157,7 +180,7 @@ test("polling stops with login_expired once the server's expiresIn budget elapse
 
   await assert.rejects(() => cmdLogin([], {
     home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl,
-    openBrowser: () => {}, log: () => {},
+    log: () => {},
     sleep: async () => {
       sleepCalls += 1;
       if (sleepCalls > 10) throw new Error("test_guard_exceeded: the poll loop did not stop at the expiresIn deadline");
@@ -176,7 +199,7 @@ test("a 200 response with an unparseable body fails cleanly, not with a raw Type
   });
 
   await assert.rejects(() => cmdLogin([], { home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl,
-    openBrowser: () => {}, log: () => {}, sleep: async () => {} }), /login_failed/);
+    log: () => {}, sleep: async () => {} }), /login_failed/);
 });
 
 test("fingerprint pins the SHA-256-over-decoded-bytes derivation to a literal value", () => {

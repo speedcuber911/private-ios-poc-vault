@@ -18,7 +18,13 @@ async function cmdStatus(args = [], deps = {}) {
   if (!credentials?.sessionToken) throw new Error("not_logged_in: run relay login first");
 
   const repo = await requireGitHubRepo({ cwd });
-  const api = createCloudApi({ baseUrl, sessionToken: credentials.sessionToken, fetchImpl });
+  const api = createCloudApi({
+    baseUrl,
+    sessionToken: credentials.sessionToken,
+    refreshToken: credentials.refreshToken,
+    home,
+    fetchImpl,
+  });
   const result = await api.listHandoffs(repo.fullName);
   if (result.status !== 200) throw new Error(`status_failed_${result.status}`);
 

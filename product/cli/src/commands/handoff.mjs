@@ -466,7 +466,13 @@ async function cmdHandoff(args = [], deps = {}) {
 
   if (!pushed) return { handoffId, branch, pushed: false };
 
-  const api = createCloudApi({ baseUrl, sessionToken: credentials.sessionToken, fetchImpl });
+  const api = createCloudApi({
+    baseUrl,
+    sessionToken: credentials.sessionToken,
+    refreshToken: credentials.refreshToken,
+    home,
+    fetchImpl,
+  });
   const ping = await api.createHandoff({ handoffId, repo: repo.fullName, branch, nodeId: credentials.nodeId });
   if (ping.status !== 201) {
     log(`  Pushed ${branch}, but the notification failed (${ping.json?.error || ping.status}).`);
