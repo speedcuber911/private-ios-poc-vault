@@ -5207,3 +5207,182 @@ localTest(
     }
   },
 );
+
+// ---------------------------------------------------------------------------
+// Handoff routes (API.md Part 2). These had no coverage anywhere — `grep -c
+// handoff test/conformance.test.mjs` returned 0 — so the projection, the id
+// handling and the continue guard were all free to change without a test
+// noticing. Each of the three routes is exercised through the real daemon.
+
+async function seedHandoffRecord(dataDir, record) {
+  const handoffsDir = path.join(dataDir, "handoffs");
+  await fs.mkdir(handoffsDir, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(handoffsDir, `${record.id}.json`), `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+}
+
+function handoffFixture(overrides = {}) {
+  return {
+    id: "aaaa1111bbbb2222",
+    state: "ready",
+    repo: "me/relay",
+    branch: "relay/handoff-aaaa1111bbbb",
+    workspaceId: "scratch",
+    provider: "codex",
+    resumeSessionId: null,
+    primedPrompt: "Continue this handed-off session: Fix the auth redirect",
+    title: "Fix the auth redirect",
+    manifest: { v: 1, id: "aaaa1111bbbb2222", title: "Fix the auth redirect", harness: "codex" },
+    lastJobId: null,
+    error: null,
+    createdAt: "2026-08-11T10:00:00.000Z",
+    updatedAt: "2026-08-11T10:00:00.000Z",
+    ...overrides,
+  };
+}
+
+test("serves handoffs with the public projection and never the primed prompt", async (t) => {
+  if (REMOTE) {
+    // Portable half: whatever handoffs the target has, the list is an array of
+    // the documented shape and never carries prompt scaffolding.
+    if (!(await requireRemoteApi(t))) return;
+    const response = await remoteFetch("/v1/handoffs");
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.ok(Array.isArray(body.handoffs), "handoffs must be an array");
+    for (const handoff of body.handoffs) {
+      assert.equal(typeof handoff.id, "string");
+      assert.equal(typeof handoff.state, "string");
+      assert.equal(typeof handoff.canResumeNatively, "boolean");
+      assert.equal("primedPrompt" in handoff, false, "primedPrompt is scaffolding, not user-facing content");
+    }
+    remoteRan();
+    return;
+  }
+
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const dataDir = path.join(tmpDir, "data");
+  const workspaceDir = path.join(tmpDir, "scratch");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  await seedHandoffRecord(dataDir, handoffFixture({ resumeSessionId: "11111111-2222-4333-8444-555555555555" }));
+  await seedHandoffRecord(dataDir, handoffFixture({
+    id: "cccc3333dddd4444",
+    state: "failed",
+    error: "clone_failed",
+    manifest: null,
+    resumeSessionId: null,
+    createdAt: "2026-08-11T09:00:00.000Z",
+  }));
+
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: dataDir,
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+  });
+  try {
+    const listResponse = await fetch(`${server.baseUrl}/v1/handoffs`);
+    assert.equal(listResponse.status, 200);
+    const list = (await listResponse.json()).handoffs;
+    assert.deepEqual(list.map((entry) => entry.id), ["aaaa1111bbbb2222", "cccc3333dddd4444"], "newest first");
+    assert.equal(list[0].canResumeNatively, true, "a staged session id is reported as natively resumable");
+    assert.equal(list[1].canResumeNatively, false);
+    assert.equal(list[1].error, "clone_failed", "a failed handoff carries its reason, so nothing fails silently");
+    for (const handoff of list) {
+      assert.equal("primedPrompt" in handoff, false, "primedPrompt must never be served");
+      assert.equal("manifest" in handoff, false, "the list projection omits the manifest");
+    }
+
+    const detailResponse = await fetch(`${server.baseUrl}/v1/handoffs/aaaa1111bbbb2222`);
+    assert.equal(detailResponse.status, 200);
+    const detail = (await detailResponse.json()).handoff;
+    assert.equal(detail.title, "Fix the auth redirect");
+    assert.deepEqual(detail.manifest, { v: 1, id: "aaaa1111bbbb2222", title: "Fix the auth redirect", harness: "codex" });
+    assert.equal("primedPrompt" in detail, false, "primedPrompt must never be served, detail route included");
+  } finally {
+    await server.stop();
+  }
+});
+
+localTest(
+  "handoff routes answer a malformed or unknown id with a clean 404, never a 500",
+  "needs a seeded handoff record on the server's own disk",
+  async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+    const dataDir = path.join(tmpDir, "data");
+    const workspaceDir = path.join(tmpDir, "scratch");
+    await fs.mkdir(workspaceDir, { recursive: true });
+    await seedHandoffRecord(dataDir, handoffFixture());
+
+    const server = await startServer({
+      CODEX_REQUIRE_MTLS: "false",
+      CODEX_DATA_DIR: dataDir,
+      CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    });
+    try {
+      // A handoff id is a URL path segment straight off the network. The
+      // encoded traversal is the live shape: an un-encoded ".." never reaches
+      // the route at all, because WHATWG URL normalises it away first.
+      for (const id of ["..%2Fetc%2Fpasswd", "%2e%2e%2fdevices", "no-such-handoff-000", "a%00b"]) {
+        const detail = await fetch(`${server.baseUrl}/v1/handoffs/${id}`);
+        const detailBody = await detail.text();
+        assert.equal(detail.status, 404, `GET ${id} must be a clean 404, got ${detail.status} / ${detailBody}`);
+        assert.doesNotMatch(detailBody, /record id is invalid/, "an internal validator's message must never be served");
+
+        const cont = await fetch(`${server.baseUrl}/v1/handoffs/${id}/continue`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "{}",
+        });
+        const contBody = await cont.text();
+        assert.equal(cont.status, 404, `POST ${id}/continue must be a clean 404, got ${cont.status} / ${contBody}`);
+        assert.doesNotMatch(contBody, /record id is invalid/, "an internal validator's message must never be served");
+      }
+    } finally {
+      await server.stop();
+    }
+  },
+);
+
+localTest(
+  "POST /v1/handoffs/:id/continue enqueues a job for a ready handoff and refuses one that is not",
+  "needs a seeded handoff record and a fake harness binary on the server",
+  async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+    const dataDir = path.join(tmpDir, "data");
+    const workspaceDir = path.join(tmpDir, "scratch");
+    await fs.mkdir(workspaceDir, { recursive: true });
+    await seedHandoffRecord(dataDir, handoffFixture());
+    await seedHandoffRecord(dataDir, handoffFixture({ id: "eeee5555ffff6666", state: "importing" }));
+
+    const server = await startServer({
+      CODEX_REQUIRE_MTLS: "false",
+      CODEX_DATA_DIR: dataDir,
+      CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+      CODEX_BIN: await makeFakeCodex(tmpDir),
+    });
+    try {
+      const accepted = await fetch(`${server.baseUrl}/v1/handoffs/aaaa1111bbbb2222/continue`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prompt: "  keep going  " }),
+      });
+      const acceptedBody = await accepted.json();
+      assert.equal(accepted.status, 202, `expected 202, got ${accepted.status} / ${JSON.stringify(acceptedBody)}`);
+      assert.equal(typeof acceptedBody.job.id, "string");
+      assert.equal(acceptedBody.job.workspaceId, "scratch");
+      assert.equal(acceptedBody.job.prompt, "keep going", "the caller's prompt is trimmed and used verbatim");
+
+      // The handoff now remembers the job, so a push-back can find it later.
+      const detail = await fetch(`${server.baseUrl}/v1/handoffs/aaaa1111bbbb2222`);
+      assert.equal((await detail.json()).handoff.lastJobId, acceptedBody.job.id);
+
+      const notReady = await fetch(`${server.baseUrl}/v1/handoffs/eeee5555ffff6666/continue`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+      assert.equal(notReady.status, 409, "a handoff that is still importing is not continuable");
+    } finally {
+      await server.stop();
+    }
+  },
+);
