@@ -7,6 +7,10 @@ struct RelayChatView: View {
     /// Set when the chat is presented as a folder's full-screen cover; shows the
     /// dismiss chevron in the top bar. Dismissing never cancels streams (VM-owned).
     var onDismiss: (() -> Void)? = nil
+    /// Raised by the root when a handoff push is tapped: open the threads list,
+    /// which is where handoff cards live. Lowered again once honored, so a second
+    /// push after the sheet was closed still opens it.
+    var threadsRequest: Binding<Bool> = .constant(false)
     @State private var showingThreads = false
     @State private var fullLogRequest: RelayFullLogRequest?
 
@@ -52,7 +56,11 @@ struct RelayChatView: View {
                 )
             }
             .task {
+                honorThreadsRequest()
                 await viewModel.bootstrap()
+            }
+            .onChange(of: threadsRequest.wrappedValue) { _, _ in
+                honorThreadsRequest()
             }
             .refreshable {
                 await viewModel.refreshThreads()
@@ -131,6 +139,16 @@ struct RelayChatView: View {
                     .font(AppTheme.uiFont(size: 14, weight: .medium))
                     .foregroundStyle(AppTheme.textPrimary)
 
+                // A session waiting to be picked up is the one thing in the
+                // drawer the user did not start here, so it is named out front.
+                if !viewModel.handoffs.isEmpty {
+                    RelayCapsLabel(
+                        text: "\(viewModel.handoffs.count) handed off",
+                        color: AppTheme.accent,
+                        size: 9
+                    )
+                }
+
                 Spacer()
 
                 Text("\(viewModel.historyItems.count)")
@@ -152,6 +170,12 @@ struct RelayChatView: View {
         .buttonStyle(.plain)
         .accessibilityLabel("Threads, \(viewModel.historyItems.count) conversations and invocations")
         .accessibilityIdentifier("relay-threads")
+    }
+
+    private func honorThreadsRequest() {
+        guard threadsRequest.wrappedValue else { return }
+        threadsRequest.wrappedValue = false
+        showingThreads = true
     }
 
     private func dismissKeyboard() {
@@ -801,6 +825,8 @@ private struct RelayThreadDrawer: View {
                     .listRowBackground(Color.clear)
                 }
 
+                handoffSection
+
                 if viewModel.historyItems.isEmpty {
                     Text("No conversations or invocations in this folder yet.")
                         .font(AppTheme.uiFont(size: 13))
@@ -823,13 +849,72 @@ private struct RelayThreadDrawer: View {
                             }
                     }
                 }
+
+                macSessionSection
             }
             .scrollContentBackground(.hidden)
             .background(AppTheme.bgCanvas)
             .navigationTitle("Threads")
             .navigationBarTitleDisplayMode(.inline)
-            .task { await viewModel.refreshThreads() }
+            .task {
+                await viewModel.refreshThreads()
+                await viewModel.refreshHandoffs()
+            }
             .preferredColorScheme(.dark)
+        }
+    }
+
+    /// Sessions handed over from a Mac. Above this folder's history because a
+    /// handoff is the thing the user was just pushed about.
+    @ViewBuilder private var handoffSection: some View {
+        if !viewModel.handoffs.isEmpty {
+            Section("Handed off") {
+                ForEach(viewModel.handoffs) { card in
+                    RelayHandoffCardView(
+                        card: card,
+                        manifest: viewModel.handoffManifests[card.id],
+                        isContinuing: viewModel.continuingHandoffIDs.contains(card.id),
+                        onContinue: {
+                            Task {
+                                await viewModel.continueHandoff(card)
+                                dismiss()
+                            }
+                        }
+                    )
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets(top: 6, leading: 8, bottom: 6, trailing: 8))
+                }
+            }
+        }
+    }
+
+    /// The Mac's own session index: browsable, metadata only, with the honest
+    /// affordances — start fresh here, or run `relay handoff` over there.
+    @ViewBuilder private var macSessionSection: some View {
+        if let index = viewModel.macSessions, !index.sessions.isEmpty {
+            Section {
+                ForEach(index.sessions) { session in
+                    RelayMacSessionRow(session: session, onStartFresh: {
+                        viewModel.prompt = "Continue the work from “\(session.displayTitle)”."
+                        dismiss()
+                    })
+                    .listRowBackground(Color.clear)
+                }
+            } header: {
+                HStack(spacing: 8) {
+                    Text(index.sectionTitle)
+                    Spacer()
+                    if let updatedAt = index.updatedAtDate {
+                        Text(RelayRelativeTime.string(for: updatedAt))
+                            .font(AppTheme.monoFont(size: 10))
+                            .foregroundStyle(AppTheme.textFaint)
+                    }
+                }
+            } footer: {
+                Text("Run relay handoff there to continue one of these exactly.")
+                    .font(AppTheme.uiFont(size: 12))
+                    .foregroundStyle(AppTheme.textFaint)
+            }
         }
     }
 
