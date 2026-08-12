@@ -17,6 +17,13 @@ export CODEX_RUN_HOME="${CODEX_RUN_HOME:-/home/relay}"
 export RELAYD_STORE="${RELAYD_STORE:-sqlite}"
 
 RELAYD_BIN=/opt/relayd/app/bin/relayd
+# Device-token authentication for this machine. Pairing derives the token from
+# the pairing secret and writes only its SHA-256 here; relayd then requires a
+# bearer token on every request instead of a client certificate, which iOS
+# cannot supply to a machine whose certificate it did not itself anchor. Until
+# pairing writes the file, every request is rejected — the machine is never
+# open.
+export RELAYD_DEVICE_TOKEN_HASH_FILE="${CODEX_DATA_DIR}/device-token.hash"
 ENROLL_MARKER="${CODEX_DATA_DIR}/enrolled"
 PAIR_MARKER="${CODEX_DATA_DIR}/paired"
 # Written into the running sandbox by relay-cloud through envd's file API.

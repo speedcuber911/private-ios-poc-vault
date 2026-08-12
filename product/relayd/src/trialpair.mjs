@@ -16,9 +16,32 @@ import { identityPaths, issueDeviceCert, getCaPem } from "./identity.mjs";
 
 const execFileAsync = promisify(execFile);
 const P12_LABEL = "relay-trial-p12-v1";
+const DEVICE_TOKEN_LABEL = "relay-device-token-v1";
 
 function p12Passphrase(secret) {
   return crypto.createHmac("sha256", Buffer.from(String(secret), "utf8")).update(P12_LABEL).digest("hex");
+}
+
+// The device's bearer token, derived from the same single-use pairing secret
+// both sides already hold. Deriving rather than transmitting means the pairing
+// protocol is untouched: no new field, no second blob, and nothing extra to
+// intercept. The phone computes the identical value from its copy of the
+// secret.
+function deviceToken(secret) {
+  return crypto.createHmac("sha256", Buffer.from(String(secret), "utf8")).update(DEVICE_TOKEN_LABEL).digest("hex");
+}
+
+// Records only the token's SHA-256, so a reader of the node's disk cannot
+// authenticate as the device. Written before the node blob is posted: the
+// phone can present the token the moment it has the secret, and a machine that
+// rejected it in the interval would look exactly like the failure this
+// replaces.
+function writeDeviceTokenHash(secret) {
+  const file = process.env.RELAYD_DEVICE_TOKEN_HASH_FILE;
+  if (!file) return;
+  const hash = crypto.createHash("sha256").update(deviceToken(secret), "utf8").digest("hex");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${hash}\n`, { mode: 0o600 });
 }
 
 function sleep(ms) {
@@ -102,6 +125,8 @@ export async function runTrialPairing({
       { env: { ...process.env, RELAY_P12_PASS: passphrase } },
     );
     const p12 = fs.readFileSync(p12Path);
+
+    writeDeviceTokenHash(secret);
 
     // 3. Post the node blob.
     const res = await fetchImpl(`${base}/node-blob`, {
