@@ -50,7 +50,22 @@ const { store } = await import("../src/store.mjs");
 const { handleAdditionRoutes } = await import("../src/additions.mjs");
 const { sendError } = await import("../src/util.mjs");
 const { currentEventCursor, replayEventsSince } = await import("../src/events.mjs");
-const { jobs } = await import("../src/jobs.mjs");
+const { jobs, activeChildren, createJob } = await import("../src/jobs.mjs");
+
+// Bounded wait for a real job (one that actually went through enqueueJob) to
+// reach a terminal state, so a test that lets one run does not leave a
+// dangling child behind for a later test to trip over. `/usr/bin/claude`
+// does not exist on the test machine, so a job that resumes for real here
+// fails fast with ENOENT rather than hanging.
+async function waitForTerminalJob(id, { timeoutMs = 2000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const job = jobs.get(id);
+    if (job && ["succeeded", "failed", "cancelled", "timeout"].includes(job.status)) return job;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`job ${id} did not reach a terminal state within ${timeoutMs}ms`);
+}
 
 const HANDOFF_MODULE = new URL("../src/handoff.mjs", import.meta.url).pathname;
 
@@ -833,14 +848,85 @@ test("M25: continue refuses an unknown handoff, one that is not ready, and one w
   );
 
   // A finished job must NOT block the next continue: the guard is about
-  // in-flight work, not about ever having run.
+  // in-flight work, not about ever having run. This used to be asserted as
+  // "rejects with anything other than 409", which happened to pass only
+  // because of the resume-validation bug below (every Claude continue was
+  // rejected 400 "session not found"); now that resuming a genuinely staged
+  // Claude session works, the correct assertion is that this call succeeds.
   jobs.set("job-inflight", { id: "job-inflight", status: "succeeded", workspaceId: "dir-x" });
-  await assert.rejects(
-    () => continueHandoff(id),
-    (error) => error.status !== 409,
-    "a terminal job must not block a new continue",
-  );
+  const resumed = await continueHandoff(id);
+  assert.equal(resumed.provider, "claude");
+  assert.equal(resumed.resumeSessionId, MANIFEST.sessionId, "a terminal job must not block a new continue");
+  await waitForTerminalJob(resumed.id);
   jobs.delete("job-inflight");
+  jobs.delete(resumed.id);
+});
+
+// ---------------------------------------------------------------------------
+// The Continue-button bug: createJob's resume validation only ever looked in
+// <codexHome>/sessions, so a freshly imported Claude handoff — staged by
+// sessionimport.mjs at <runHome>/.claude/projects/<slug>/<sessionId>.jsonl —
+// was invisible to it, and continueHandoff's correctly-passed
+// resumeSessionId was rejected 100% of the time with "session not found in
+// runner CODEX_HOME". This is the single most important user flow in the
+// product (phone taps Continue on a Claude handoff card); see
+// .superpowers/sdd/handoff/task-21-report.md for the full diagnosis.
+
+test("createJob resumes a freshly imported Claude handoff session (the Continue-button bug)", async () => {
+  const id = "resumeclaudebug1";
+  const origin = await makeOriginRepo({ manifest: { ...MANIFEST, id } });
+  const record = await importHandoff({ id, repo: MANIFEST.repo, branch: MANIFEST.branch }, deps(origin));
+  assert.equal(record.provider, "claude");
+  assert.equal(record.resumeSessionId, MANIFEST.sessionId, "the fixture must actually stage a resumable session");
+
+  // This is exactly the call continueHandoff makes internally. Before the
+  // fix this threw `{ status: 400, message: "session not found in runner
+  // CODEX_HOME" }` even though sessionimport.mjs had just staged the file
+  // moments earlier in this same call.
+  const job = await continueHandoff(id, { prompt: "keep going" });
+  assert.equal(job.provider, "claude");
+  assert.equal(job.resumeSessionId, MANIFEST.sessionId);
+  assert.equal(job.workspaceId, record.workspaceId, "the resumed job must target the imported checkout's workspace");
+
+  await waitForTerminalJob(job.id);
+  jobs.delete(job.id);
+});
+
+test("createJob still refuses to resume a Claude-shaped session id that was never staged anywhere", () => {
+  // The fix must stay strict: a session id that is neither an in-memory job,
+  // nor a Codex rollout, nor a staged Claude transcript must still be
+  // refused with a typed, visible error -- never silently downgraded to a
+  // fresh session the user did not ask for. This is createJob's own
+  // validation, exercised directly (no handoff involved) with an id shaped
+  // exactly like a real Claude session id but never staged by anything.
+  const neverStaged = "22222222-3333-4444-8555-666666666666";
+  assert.throws(
+    () => createJob({ workspaceId: "welcome", provider: "claude", prompt: "hi", resumeSessionId: neverStaged }),
+    (error) => error.status === 400 && /session not found/.test(error.message),
+    "an unstaged session id must still be refused, not silently accepted",
+  );
+});
+
+test("createJob refuses a Claude session staged under a sibling workspace it does not belong to", async () => {
+  // Mirrors the existing Codex coverage ("resumes only sessions that belong
+  // to the selected workspace" in conformance.test.mjs) for the Claude
+  // layout: finding the file is not enough, it must also resolve to the
+  // workspace the caller asked for.
+  const id = "resumeclaudebug3";
+  const origin = await makeOriginRepo({ manifest: { ...MANIFEST, id } });
+  const record = await importHandoff({ id, repo: MANIFEST.repo, branch: MANIFEST.branch }, deps(origin));
+  assert.equal(record.provider, "claude");
+
+  assert.throws(
+    () => createJob({
+      workspaceId: "welcome",
+      provider: "claude",
+      prompt: "hi",
+      resumeSessionId: record.resumeSessionId,
+    }),
+    (error) => error.status === 400 && /does not belong to workspace/.test(error.message),
+    "a session staged for the handoff's own dynamic workspace must not resolve against an unrelated one",
+  );
 });
 
 // ---------------------------------------------------------------------------
