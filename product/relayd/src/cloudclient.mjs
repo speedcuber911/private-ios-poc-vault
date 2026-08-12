@@ -1,7 +1,8 @@
 // relayd cloudclient.mjs — the node's outbound half of the control-plane link.
 //
-// Two operations, both authenticated with the node's ed25519 identity key:
-// a long-poll that collects pending handoffs, and a signed event post that the
+// Three operations, all authenticated with the node's ed25519 identity key:
+// a long-poll that collects pending handoffs, a signed ack that confirms
+// delivery of what that poll handed out, and a signed event post that the
 // cloud fans out to APNs. The cloud sees names and event types only — never
 // repository content, never transcripts.
 import crypto from "node:crypto";
@@ -16,6 +17,20 @@ const NODE_REQUEST_LABEL = "relay-node-req-v1";
 // Bounded, small, and deliberately does not touch node identity or key
 // material in its error path — every thrown message here is a static token.
 const POST_EVENT_MAX_ATTEMPTS = 3;
+
+// task-11: the cloud (commit 8bffba2) now leases a handoff on poll instead
+// of marking it delivered the instant it writes the response — a
+// partitioned node (no FIN, socket looks alive) used to have its handoff
+// marked delivered into a dead peer and lost for good, contradicting the
+// design's own promise that handoffs are rows, not messages. POST
+// /v1/node/handoffs/ack is the only path to `delivered`. Bounded, best-effort,
+// same shape as POST_EVENT_MAX_ATTEMPTS — no backoff loop that can hang the
+// poll cycle. An id/lease pair that never confirms is not a bug: the lease
+// simply expires and the row is redelivered on a later poll, which
+// importHandoff (handoff.mjs) already handles as a cheap no-op via its own
+// idempotent-on-id contract.
+const HANDOFF_ACK_MAX_ATTEMPTS = 3;
+const HANDOFF_ACK_PATH = "/v1/node/handoffs/ack";
 
 function nodeRequestSigningInput({ method, pathWithQuery, ts, nodeId }) {
   return Buffer.from(`${NODE_REQUEST_LABEL}\n${method.toUpperCase()}\n${pathWithQuery}\n${nodeId}\n${ts}`, "utf8");
@@ -115,6 +130,44 @@ function createCloudClient({ cloudUrl, baseDir = undefined, fetchImpl = fetch, n
     };
   }
 
+  // Confirms delivery of one poll response's worth of handoffs. This means
+  // "these bytes reached this node over a live connection" — exactly what
+  // the transport layer knows and the handoff-import loop does not, which
+  // is why the ack lives here rather than in handoff.mjs. Not gated on
+  // anything the caller does with the descriptors afterward: gating the ack
+  // on import succeeding would resurrect the lost-handoff bug this whole
+  // mechanism exists to close, just in a new shape.
+  async function ackHandoffsOnce(acks) {
+    const res = await fetchImpl(`${base}${HANDOFF_ACK_PATH}`, {
+      method: "POST",
+      headers: { ...signedHeaders("POST", HANDOFF_ACK_PATH), "content-type": "application/json" },
+      body: JSON.stringify({ acks }),
+    });
+    // The response body (`{ acked: [...] }`) is not consulted: an id/lease
+    // pair missing from `acked` just means that lease had already expired
+    // or was never valid, which is non-fatal and self-heals via redelivery.
+    // Still drained so the connection isn't left with an unread body.
+    await res.json().catch(() => null);
+    return res.status === 200;
+  }
+
+  async function ackHandoffs(handoffs) {
+    const acks = (Array.isArray(handoffs) ? handoffs : [])
+      .filter((h) => h && typeof h.id === "string" && typeof h.lease === "string")
+      .map((h) => ({ id: h.id, lease: h.lease }));
+    if (acks.length === 0) return;
+    for (let attempt = 1; attempt <= HANDOFF_ACK_MAX_ATTEMPTS; attempt++) {
+      try {
+        if (await ackHandoffsOnce(acks)) return;
+      } catch {
+        // Transport failure. Best-effort and bounded: never throw out of
+        // pollHandoffs, and never lose the handoffs it already parsed — a
+        // failed ack costs at most one redundant redelivery next cycle,
+        // via the cloud's own lease expiry, never data loss.
+      }
+    }
+  }
+
   async function pollHandoffs(waitSec) {
     const pathWithQuery = `/v1/node/handoffs?wait=${Number(waitSec) || 0}`;
     const res = await fetchImpl(`${base}${pathWithQuery}`, {
@@ -123,7 +176,12 @@ function createCloudClient({ cloudUrl, baseDir = undefined, fetchImpl = fetch, n
     });
     if (res.status !== 200) throw new Error(`cloud_poll_${res.status}`);
     const json = await res.json();
-    return Array.isArray(json?.handoffs) ? json.handoffs : [];
+    const handoffs = Array.isArray(json?.handoffs) ? json.handoffs : [];
+    // res.json() resolving is itself the evidence that matters — proof the
+    // bytes crossed a live connection — so ack right here, before returning
+    // descriptors to the caller, and before anything is done with them.
+    await ackHandoffs(handoffs);
+    return handoffs;
   }
 
   async function sendEventOnce(body, signatureB64) {
