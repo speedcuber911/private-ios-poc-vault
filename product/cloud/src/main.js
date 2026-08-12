@@ -20,6 +20,36 @@ if (config.appleClientIds.length === 0) {
 if (!config.adminToken) console.warn("ADMIN_TOKEN unset — /v1/admin/* disabled.");
 if (!config.brokerToken) console.warn("BROKER_TOKEN unset — /v1/tunnel/* disabled.");
 
+// A half-configured trial feature fails silently and plausibly instead of
+// loudly, which is the worst of both worlds:
+//   - without ENROLL_BASE_URL the sandbox is handed `http://127.0.0.1:<port>`
+//     and tries to enrol against ITSELF;
+//   - without TUNNEL_SUFFIX every trial's `sni` is null, so the phone gets no
+//     node URL and quietly falls back to whatever personal install it already
+//     had, talking to the wrong machine entirely.
+// Both look configured and produce a broken trial. Refuse to start instead.
+// Only checked when E2B_API_URL is set, so the deliberate dark launch (every
+// trial variable unset) still boots cleanly. Names only — never values.
+if (config.e2b.apiUrl) {
+  const missing = [
+    ["E2B_API_KEY", config.e2b.apiKey],
+    ["TRIAL_TEMPLATE_ID", config.e2b.templateId],
+    ["ENROLL_BASE_URL", config.enrollBaseUrl],
+    ["TUNNEL_HOST", config.tunnel.host],
+    ["TUNNEL_SUFFIX", config.tunnel.suffix],
+  ]
+    .filter(([, value]) => !value)
+    .map(([name]) => name);
+  if (missing.length > 0) {
+    console.error(
+      `E2B_API_URL is set but ${missing.join(", ")} ${missing.length === 1 ? "is" : "are"} missing; ` +
+        "refusing to start with a half-configured trial feature. " +
+        "Unset E2B_API_URL to disable trials entirely.",
+    );
+    process.exit(1);
+  }
+}
+
 const apnsTransport = apnsConfigured(config)
   ? createHttp2Transport()
   : createNoopTransport((msg) => console.warn(msg));

@@ -7,7 +7,18 @@ import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
 import { bearer, username } from "better-auth/plugins";
 import { ENTITLEMENT_MAX_NODES } from "./registry.js";
 
-export function createRelayBetterAuth({ db, registry, config }) {
+// `beforeAccountDelete` runs while the account's control-plane rows are still
+// readable and before any of them are dropped. It is where the caller releases
+// resources that outlive the database — today, the account's trial sandbox,
+// which keeps running (and keeps holding the user's files) unless something
+// explicitly destroys it. It must not throw: deletion has to complete even
+// when that cleanup cannot.
+export function createRelayBetterAuth({
+  db,
+  registry,
+  config,
+  beforeAccountDelete = async () => {},
+}) {
   const appleConfigured =
     config.appleClientIds.length > 0 && config.appleClientSecret.length > 0;
   const socialProviders = appleConfigured
@@ -39,10 +50,12 @@ export function createRelayBetterAuth({ db, registry, config }) {
     user: {
       deleteUser: {
         enabled: true,
-        afterDelete(user) {
+        async afterDelete(user) {
           const account =
             registry.getAccount(user.id) || registry.findAccountByEmail(user.email);
-          if (account) registry.deleteAccount(account.id);
+          if (!account) return;
+          await beforeAccountDelete(account.id);
+          registry.deleteAccount(account.id);
         },
       },
     },

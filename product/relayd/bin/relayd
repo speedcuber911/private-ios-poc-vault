@@ -93,28 +93,56 @@ async function cmdPair() {
   console.log("not need to keep this command open.");
 }
 
-// Non-interactive bootstrap for cloud-provisioned (trial) nodes: registers
-// the node identity with the control plane using a single-use enroll token,
-// then optionally runs trial device pairing if a pairing id/secret pair was
-// handed to us too. Everything sensitive (RELAYD_ENROLL_TOKEN,
-// RELAYD_ENROLL_PAIRING_SECRET) arrives via env, never argv, and is never
-// printed — only the resulting node id / sni / device id are logged.
-async function cmdEnroll() {
+// Non-interactive bootstrap for cloud-provisioned (trial) nodes. Two steps
+// that deliberately do NOT share a failure fate:
+//
+//   enrollment — registers the node identity with the control plane using a
+//                single-use token. Succeeds exactly ONCE: the cloud burns the
+//                token and flips the trial row to `ready`, so a second attempt
+//                can only ever 401. The caller must persist that it happened
+//                and never retry it.
+//   pairing    — hands the phone its device credential through the cloud
+//                rendezvous. Talks only to the cloud (never to the local
+//                daemon), so it is independent of `relayd run`, is retryable,
+//                and is allowed to fail without taking the node down.
+//
+// `--no-pair` runs enrollment alone; `--pair-only` runs pairing alone. The
+// trial bootstrap uses both, because running them in one all-or-nothing
+// process is what let a single dropped pairing poll brick a sandbox: under
+// `set -e` the pairing timeout aborted the boot before `relayd run`, and the
+// next boot re-ran the already-burned enroll token, 401'd, and exited — with
+// the cloud row stuck at `ready` so no new trial could be provisioned either.
+//
+// Everything sensitive (RELAYD_ENROLL_TOKEN, RELAYD_ENROLL_PAIRING_SECRET)
+// arrives via env, never argv, and is never printed — only the resulting node
+// id / sni / device id are logged.
+async function cmdEnroll(args) {
+  const noPair = args.includes("--no-pair");
+  const pairOnly = args.includes("--pair-only");
+  if (noPair && pairOnly) fail("--no-pair and --pair-only are mutually exclusive");
+
   const cloudUrl = (process.env.RELAYD_ENROLL_URL || "").trim();
   const token = (process.env.RELAYD_ENROLL_TOKEN || "").trim();
   const pairingId = (process.env.RELAYD_ENROLL_PAIRING_ID || "").trim();
   const pairingSecret = (process.env.RELAYD_ENROLL_PAIRING_SECRET || "").trim();
-  if (!cloudUrl || !token) {
+
+  if (!cloudUrl || (!pairOnly && !token)) {
     fail("enroll requires RELAYD_ENROLL_URL and RELAYD_ENROLL_TOKEN");
   }
   if (Boolean(pairingId) !== Boolean(pairingSecret)) {
     fail("RELAYD_ENROLL_PAIRING_ID and RELAYD_ENROLL_PAIRING_SECRET must be set together");
   }
+  if (pairOnly && !pairingId) {
+    fail("--pair-only requires RELAYD_ENROLL_PAIRING_ID and RELAYD_ENROLL_PAIRING_SECRET");
+  }
+
   try {
-    const { enrollWithCloud } = await import("../src/enroll.mjs");
-    const { nodeId, sni } = await enrollWithCloud({ cloudUrl, token, version: "0.1.0" });
-    console.log(`enrolled ${nodeId} sni=${sni}`);
-    if (pairingId) {
+    if (!pairOnly) {
+      const { enrollWithCloud } = await import("../src/enroll.mjs");
+      const { nodeId, sni } = await enrollWithCloud({ cloudUrl, token, version: "0.1.0" });
+      console.log(`enrolled ${nodeId} sni=${sni}`);
+    }
+    if (!noPair && pairingId) {
       const { runTrialPairing } = await import("../src/trialpair.mjs");
       const { deviceId } = await runTrialPairing({ cloudUrl, pairingId, secret: pairingSecret });
       console.log(`trial device paired: ${deviceId}`);
@@ -330,7 +358,12 @@ const usage = `usage: relayd <command>
                                start the node daemon (default: direct, or
                                RELAYD_LISTEN_MODE)
   pair                         print a pairing code + link (single use, 15 min)
-  enroll                       enroll with the control plane (env: RELAYD_ENROLL_URL, RELAYD_ENROLL_TOKEN[, RELAYD_ENROLL_PAIRING_ID, RELAYD_ENROLL_PAIRING_SECRET])
+  enroll [--no-pair|--pair-only]
+                               enroll with the control plane (env: RELAYD_ENROLL_URL,
+                               RELAYD_ENROLL_TOKEN[, RELAYD_ENROLL_PAIRING_ID,
+                               RELAYD_ENROLL_PAIRING_SECRET]). --no-pair enrolls
+                               without pairing a device; --pair-only pairs against
+                               an already-enrolled node (retryable)
   doctor                       run config/jail/identity/provider checks
   status                       query the running daemon
   devices list                 list enrolled devices
@@ -345,7 +378,7 @@ switch (command) {
     await cmdPair();
     break;
   case "enroll":
-    await cmdEnroll();
+    await cmdEnroll(rest);
     break;
   case "doctor":
     await cmdDoctor();

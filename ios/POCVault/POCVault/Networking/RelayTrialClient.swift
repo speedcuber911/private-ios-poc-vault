@@ -2,11 +2,13 @@ import Foundation
 
 enum RelayTrialClientError: Error, Equatable {
     case unavailable        // 404 trial_unavailable
-    case alreadyUsed        // 409
+    case alreadyUsed        // 409 trial_already_used
+    case pairingConflict    // 409 slot_already_written / node_exists / other
     case capacity           // 503
     case provisionFailed    // 502
     case noTrial             // 404 no_trial
     case blobPending        // 404 not_posted_yet
+    case tooManyAttempts    // 429 too_many_pairing_sessions
     case tagMismatch
     case server(status: Int)
 }
@@ -64,6 +66,24 @@ final class RelayTrialClient {
         try Self.throwIfError(response: response, data: data)
     }
 
+    /// Joins the paid-tier waitlist. Public endpoint (no session bearer):
+    /// `POST /v1/waitlist` with `{ "email": ... }`.
+    func joinWaitlist(email: String) async throws {
+        var request = URLRequest(url: endpoint("/v1/waitlist"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(origin, forHTTPHeaderField: "Origin")
+        request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["email": email])
+
+        let (data, rawResponse) = try await session.data(for: request)
+        guard let response = rawResponse as? HTTPURLResponse else {
+            throw RelayTrialClientError.server(status: 0)
+        }
+        try Self.throwIfError(response: response, data: data)
+    }
+
     func postDeviceBlob(pairingId: String, authToken: String, blob: Data, tag: String) async throws {
         let (data, response) = try await sendBlob(
             method: "POST",
@@ -95,9 +115,15 @@ final class RelayTrialClient {
         return try JSONDecoder().decode(TrialEnvelope.self, from: data).trial
     }
 
+    /// 409 is not one condition: only `trial_already_used` is the terminal
+    /// "this account has had its trial" answer. Pairing's `slot_already_written`
+    /// and enroll's `node_exists` are retryable conflicts and must not be
+    /// reported to the user as a spent trial.
     static func mapError(status: Int, code: String?) -> RelayTrialClientError {
         switch (status, code) {
-        case (409, _): return .alreadyUsed
+        case (409, "trial_already_used"): return .alreadyUsed
+        case (409, _): return .pairingConflict
+        case (429, _): return .tooManyAttempts
         case (503, _): return .capacity
         case (502, _): return .provisionFailed
         case (404, "trial_unavailable"): return .unavailable

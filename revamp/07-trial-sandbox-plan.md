@@ -23,6 +23,20 @@ item-by-item table and current test counts):
   single-use-token registration, and trial pairing (`src/trialpair.mjs`, see
   delta below). `product/trial/` holds the Cube/E2B template (Dockerfile,
   `start.sh` init without systemd, `e2b.toml`, `build.sh`).
+- iOS (`ios/POCVault`, 96/96 tests green): the "Try instantly" fork flow end
+  to end. `RelayTrialNode` DTO + `State` enum + countdown copy
+  (`Models/RelayTrialNode.swift`); pairing derivations byte-matched to
+  `product/relayd/src/pairing.mjs` (`Security/RelayTrialPairing.swift`,
+  cross-checked by fixtures in `POCVaultTests/TrialPairingTests.swift`); the
+  trial + pairing-rendezvous client (`Networking/RelayTrialClient.swift`);
+  the runtime-mutable active-node pointer (`Models/RelayNodeStore.swift`,
+  so the app can be pointed at a freshly provisioned trial node without a
+  relaunch); the flow model driving create → device-blob → poll-ready →
+  poll-node-blob → verify → PKCS#12 import (`Views/RelayTrialFlowModel.swift`)
+  and its Creating/Booting/Pairing/Ready progress sheet
+  (`Views/TrialProvisioningView.swift`); the trial badge/countdown and the
+  expiry banner with export + upsell actions (`Views/TrialStatusBanner.swift`);
+  and the "Trial machine" status/delete section in `AccountSettingsView`.
 
 Already satisfied by pre-existing code (§Dependencies item 2 needs no work):
 
@@ -35,23 +49,22 @@ Already satisfied by pre-existing code (§Dependencies item 2 needs no work):
 - **Workspace export** — `GET /v1/export.tar` is implemented
   (`relayd/src/fsapi.mjs:392`, routed in `src/additions.mjs`): mTLS-authed,
   jail-contained, denylist-filtered, 512 MiB cap → 413 `export_too_large`.
+  Consumed end to end: `CodexClient.downloadExport()` streams it to a temp
+  file, and the "Export my files" / "Share my files" action in
+  `Views/TrialStatusBanner.swift`'s expiry banner drives it via `ShareLink`.
 
 Pending:
 
-- **iOS**: fork-screen option, provisioning progress states, trial
-  badge/countdown, expiry/export/upsell screens (§Dependencies item 5). The
-  shared groundwork has landed — `POCVault/Models/RelayTrialNode.swift` and
-  `POCVault/Security/RelayTrialPairing.swift`, whose derivations are locked to
-  the Node implementation by cross-checked fixtures in
-  `POCVaultTests/TrialPairingTests.swift` — but no user-facing screens exist yet.
-- The in-app export button that consumes `/v1/export.tar`, and the post-M3
-  live-migration path — not built.
-- Load testing the Cube host capacity (§Open questions 1), the
-  reconciliation sweep comparing Cube's sandbox list to `trial_nodes`
-  (§Failure handling), and template build/boot/egress-preset verification
-  against a real Cube host (§Testing) — none of these have been run.
+- Live Cube-host verification: template build/boot/egress-preset
+  verification against a real Cube host (§Testing), load testing the Cube
+  host capacity (§Open questions 1), and the reconciliation sweep comparing
+  Cube's sandbox list to `trial_nodes` (§Failure handling) — none of these
+  have been run.
 - The T-24h expiry warning push — blocked on live APNs, which `cloud/main.js`
   still wires to a no-op transport.
+- The post-M3 live-migration path (Lifecycle table: "Keep this machine",
+  post-M3 row) — not built; pre-M3 "keep this machine" is the export path
+  above, which is built.
 
 **Delta from this plan: the trial pairing credential mechanism.** §Components
 says "server-mediated pairing" without specifying how the device gets its
@@ -62,21 +75,29 @@ no CSR stack today. Instead: the phone posts a small JSON blob
 **node** mints the EC keypair, issues the certificate from its own CA, and
 packages key+cert+CA as a passphrase-protected PKCS#12, delivered back
 through the same cloud rendezvous as the node-blob. The passphrase is
-`hmac-sha256(secret, "relay-trial-p12-v1")`, derivable by both peers from the
-pairing secret the same way `authToken`/`macKey` are derived in the BYO flow
-— so the cloud, which is told only `authToken`, never learns the passphrase
-either. Both blobs are still MAC-tagged and verified exactly as in BYO
-pairing.
+`hex(hmac-sha256(secret, "relay-trial-p12-v1"))`, derived the same way
+`authToken`/`macKey` are derived in the BYO flow. Both blobs are still
+MAC-tagged and verified exactly as in BYO pairing.
 
-This is an explicit, scoped trust delta, not a weakening of the general
-model: on the trial tier the cloud *already* mediates sandbox creation and,
-via `RELAYD_ENROLL_PAIRING_SECRET`, transports the pairing secret itself into
-the sandbox it just created — the operator-hosted trust this plan's own
-§Security section states plainly to the user ("Trial machines run on Relay
-infrastructure"). BYO must never receive a secret from the cloud this way;
-`trialpair.mjs` is therefore a module separate from the BYO `pairing.mjs`,
-reachable only through `relayd enroll` when trial pairing env vars are
-present.
+**Unlike BYO, the cloud is not zero-knowledge of this secret on the trial
+tier.** The pairing-*session* endpoint (`POST /v1/pairing/sessions`) is told
+only `authToken`, same as BYO. But `POST /v1/trial-nodes` is a second,
+trial-only call that takes the raw pairing `secret` directly in its body as
+`pairingSecret` (`cloud/src/server.js`) precisely so the cloud can hand that
+same secret to the sandbox as `RELAYD_ENROLL_PAIRING_SECRET` — the sandbox's
+`relayd enroll` needs the secret itself, not just `authToken`, to derive
+`macKey` and mint the p12 passphrase. So the cloud *can* compute both
+`macKey` and the passphrase for a trial node; nothing about this delta is
+zero-knowledge. This is an explicit, scoped trust delta, not a weakening of
+the general model: on the trial tier the cloud *already* mediates sandbox
+creation and transports the pairing secret itself into the sandbox it just
+created — the operator-hosted trust this plan's own §Security section states
+plainly to the user ("Trial machines run on Relay infrastructure"). BYO
+(`relayd/src/pairing.mjs`) must never receive a secret from the cloud this
+way — the cloud there is told only `authToken` and has no path to the raw
+secret at all; `trialpair.mjs` is therefore a module separate from the BYO
+`pairing.mjs`, reachable only through `relayd enroll` when trial pairing env
+vars are present.
 
 ## Decision summary (owner-resolved 2026-08-11)
 
