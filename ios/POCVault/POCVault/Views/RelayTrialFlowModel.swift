@@ -95,6 +95,15 @@ final class RelayTrialFlowModel: ObservableObject {
                 trialHost: readyTrial.sni
             )
 
+            // The bearer token this device authenticates to the machine with,
+            // derived from the same pairing secret the machine derives it from.
+            // Stored before the machine is adopted so the first request after
+            // adoption already carries it.
+            identityStore.storeDeviceToken(
+                RelayTrialPairing.deviceToken(secret: secret),
+                host: readyTrial.sni
+            )
+
             nodeStore.adoptTrial(readyTrial)
             step = .done
         } catch {

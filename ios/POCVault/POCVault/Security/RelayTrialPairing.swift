@@ -8,6 +8,7 @@ enum RelayTrialPairing {
     private static let authLabel = "relay-pair-auth-v1"
     private static let macLabel = "relay-pair-mac-v1"
     private static let p12Label = "relay-trial-p12-v1"
+    private static let deviceTokenLabel = "relay-device-token-v1"
 
     // Swift's SystemRandomNumberGenerator is cryptographically secure and, unlike
     // SecRandomCopyBytes, has no failure path that could hand back the all-zero
@@ -56,6 +57,26 @@ enum RelayTrialPairing {
 
     static func p12Passphrase(secret: String) -> String {
         let mac = HMAC<SHA256>.authenticationCode(for: Data(p12Label.utf8), using: SymmetricKey(data: Data(secret.utf8)))
+        return Data(mac).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// The bearer token this device authenticates to its machine with.
+    ///
+    /// Derived from the pairing secret rather than sent, exactly as
+    /// `p12Passphrase` is, so the pairing protocol carries no extra field and
+    /// nothing new crosses the rendezvous. The machine derives the identical
+    /// value and stores only its SHA-256
+    /// (`product/relayd/src/trialpair.mjs`), so both sides must keep using the
+    /// same label — changing it here locks every already-paired device out.
+    ///
+    /// This replaces the client certificate for trial machines: iOS will not
+    /// send one to a server whose certificate it did not itself anchor, and
+    /// declines silently, which is unfixable from the app.
+    static func deviceToken(secret: String) -> String {
+        let mac = HMAC<SHA256>.authenticationCode(
+            for: Data(deviceTokenLabel.utf8),
+            using: SymmetricKey(data: Data(secret.utf8))
+        )
         return Data(mac).map { String(format: "%02x", $0) }.joined()
     }
 }
