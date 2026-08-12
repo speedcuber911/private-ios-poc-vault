@@ -23,6 +23,15 @@ import { prepareJobWorkdir, completeJobWorktree } from "./worktree.mjs";
 
 const jobsState = { queuedJobIds: [] };
 
+// Set by index.mjs when the handoff loop starts. Default is a no-op so jobs.mjs
+// never depends on handoff.mjs and the module graph stays acyclic (handoff.mjs
+// imports enqueueJob from here).
+let handoffCompletionHook = async () => null;
+
+function setHandoffCompletionHook(hook) {
+  handoffCompletionHook = hook;
+}
+
 const jobs = new Map();
 
 const activeChildren = new Map();
@@ -1091,6 +1100,7 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
   // remote (never force) and prune the worktree. No-op when worktree mode is
   // off or the job did not run in a worktree.
   await completeJobWorktree(job);
+  await handoffCompletionHook(job).catch(() => null);
 
   touchJob(job, "job_finished", { code, signal });
   pruneRuntimeCachesIfIdle();
@@ -1278,6 +1288,7 @@ export {
   activeChildren,
   jobStreamSubscribers,
   activeJobStreamCount,
+  setHandoffCompletionHook,
   loadPersistedJobs,
   ensureLogPaths,
   jobPath,

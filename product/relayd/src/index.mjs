@@ -25,6 +25,9 @@ import {
   tunnelHeartbeatMs,
   tunnelBackoffBaseMs,
   tunnelBackoffMaxMs,
+  cloudUrl,
+  handoffEnabled,
+  handoffPollWaitSec,
 } from "./config.mjs";
 import { loadPersistedJobs, processQueue } from "./jobs.mjs";
 import { routeRequest } from "./server.mjs";
@@ -125,6 +128,34 @@ function startPairing() {
 }
 
 startPairing();
+
+// --- handoff pickup loop ----------------------------------------------------
+//
+// Long-polls the control plane for pending `relay handoff` pickups and, when
+// one lands, imports it (clone, decrypt, stage for --resume, register a
+// workspace). Optional and best-effort: unlike the data/pairing listeners,
+// this node is fully usable without it, so a missing node identity or a
+// cloud client that fails to construct is logged rather than fatal — it must
+// not take an otherwise healthy node (and its running jobs) offline.
+async function startHandoffPickup() {
+  if (!handoffEnabled || !cloudUrl) {
+    console.log("relayd: handoff loop disabled (RELAYD_HANDOFF_ENABLED=false or no RELAYD_CLOUD_URL)");
+    return;
+  }
+  try {
+    const { createCloudClient } = await import("./cloudclient.mjs");
+    const { startHandoffLoop, completeHandoffJob } = await import("./handoff.mjs");
+    const { setHandoffCompletionHook } = await import("./jobs.mjs");
+    setHandoffCompletionHook(completeHandoffJob);
+    startHandoffLoop({ cloud: createCloudClient({ cloudUrl }), waitSec: handoffPollWaitSec });
+    console.log(`relayd: handoff loop started against ${cloudUrl}`);
+  } catch (error) {
+    console.error(`relayd: handoff loop failed to start — ${error?.message || String(error)}`);
+    appendAudit("handoff_loop_start_failed", null, { error: error?.message || String(error) });
+  }
+}
+
+startHandoffPickup();
 
 // --- tunneled listen mode --------------------------------------------------
 

@@ -33,6 +33,10 @@ const claudeBin = process.env.CLAUDE_BIN || "/usr/bin/claude";
 
 const cursorBin = process.env.CURSOR_BIN || path.join(process.env.CODEX_RUN_HOME || process.env.HOME || "/home/ec2-user", ".local", "bin", "cursor-agent");
 
+// git binary used by worktree.mjs (job worktree push-back) and handoff.mjs
+// (handoff clone/commit/push). One definition so both stay in sync.
+const gitBin = process.env.RELAYD_GIT_BIN || "git";
+
 const runHome = process.env.CODEX_RUN_HOME || process.env.HOME || "/home/ec2-user";
 
 const codexHome = process.env.CODEX_HOME || path.join(runHome, ".codex");
@@ -791,6 +795,7 @@ export {
   codexBin,
   claudeBin,
   cursorBin,
+  gitBin,
   runHome,
   codexHome,
   claudeHome,

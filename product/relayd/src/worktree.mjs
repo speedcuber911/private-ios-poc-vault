@@ -19,12 +19,10 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
-import { parseBooleanEnv, workspaceBrowseRoot, realpathOrResolve } from "./config.mjs";
+import { parseBooleanEnv, workspaceBrowseRoot, realpathOrResolve, gitBin } from "./config.mjs";
 import { appendAudit } from "./audit.mjs";
 
 const worktreeMode = parseBooleanEnv("RELAYD_WORKTREE_MODE", false);
-
-const gitBin = process.env.RELAYD_GIT_BIN || "git";
 
 // Identity used for the autocommit so `git commit` never fails on a runner
 // without global git config. Placeholder identity, no real address.
