@@ -290,9 +290,25 @@ final class ClientIdentityStore: ObservableObject {
         cachedPinnedCA = nil
     }
 
+    /// The client credential, carrying the issuing CA alongside the identity
+    /// when we hold one.
+    ///
+    /// The chain is not decoration. A machine names exactly one acceptable
+    /// client CA in its certificate request, and iOS will only send a
+    /// certificate it can show chains to one of those names — with the leaf
+    /// alone and its issuer absent, it sends nothing and the connection fails
+    /// as -1206 (`requires a client certificate`), which is distinct from the
+    /// -1205 a server returns when it has seen a certificate and refused it.
+    /// Observed exactly that against a trial machine: the challenge fired, the
+    /// credential was supplied, and the machine still saw no certificate.
+    ///
+    /// `pinnedCACertificate` is that issuer — it arrives in the same PKCS#12 as
+    /// the identity — so it is the right chain to present even now that the
+    /// server certificate itself is publicly trusted and no longer pinned.
     func credential() -> URLCredential? {
         guard let identity = identity() else { return nil }
-        return URLCredential(identity: identity, certificates: nil, persistence: .forSession)
+        let chain = pinnedCACertificate.map { [$0] }
+        return URLCredential(identity: identity, certificates: chain, persistence: .forSession)
     }
 
     func identity() -> SecIdentity? {

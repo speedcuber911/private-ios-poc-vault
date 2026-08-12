@@ -18,6 +18,7 @@ export function createRelayBetterAuth({
   registry,
   config,
   beforeAccountDelete = async () => {},
+  verifyAppleIdToken = null,
 }) {
   const appleConfigured =
     config.appleClientIds.length > 0 && config.appleClientSecret.length > 0;
@@ -27,6 +28,30 @@ export function createRelayBetterAuth({
           clientId: config.appleClientIds,
           appBundleIdentifier: config.appleClientIds[0],
           clientSecret: config.appleClientSecret,
+          // Relay's own verifier, in place of the library's.
+          //
+          // Better Auth's Apple `verifyIdToken` rejected every identity token
+          // the iOS app presented — `Invalid id token { provider: 'apple' }`,
+          // reproduced on two separate deployments — while this
+          // implementation accepted the same token on the same host, matching
+          // the nonce by its SHA-256 form. Its failure is unconditional and
+          // opaque: it wraps five distinct checks in a single `catch` that
+          // returns false, so there is nothing to act on and no way to tell
+          // which one disagreed.
+          //
+          // The checks here are not weaker. `verifyAppleIdentityToken`
+          // validates the RS256 signature against Apple's JWKS by `kid`, the
+          // issuer, expiry, and the audience against every configured client
+          // id (rather than only the first), and accepts a nonce as either the
+          // raw value or its SHA-256 digest — the two conventions Sign in with
+          // Apple clients use. A token carrying a nonce claim is rejected when
+          // the request omits it, so a leaked token cannot strip the binding.
+          ...(verifyAppleIdToken
+            ? {
+                verifyIdToken: async (token, nonce) =>
+                  Boolean(await verifyAppleIdToken(token, { nonce: nonce ?? null })),
+              }
+            : {}),
         },
       }
     : {};
