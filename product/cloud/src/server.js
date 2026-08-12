@@ -511,6 +511,17 @@ export function createApp({
       }
     }
 
+    if (method === "POST" && path === "/v1/repos") {
+      const body = await readJson(req, config.jsonBodyMaxBytes);
+      const fullName = normalizeRepoFullName(body?.fullName);
+      if (!fullName) return sendJson(res, 400, { error: "invalid_repo" });
+      return sendJson(res, 201, { repo: registry.upsertRepo(account.id, fullName) });
+    }
+
+    if (method === "GET" && path === "/v1/repos") {
+      return sendJson(res, 200, { repos: registry.listRepos(account.id) });
+    }
+
     if (path === "/v1/trial-nodes" && method === "POST") {
       if (!provisioner) return sendJson(res, 404, { error: "trial_unavailable" });
       const body = await readJson(req, config.jsonBodyMaxBytes);
@@ -683,6 +694,14 @@ function bearerMatches(req, expectedToken) {
 
 function strOrNull(v) {
   return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+const REPO_FULL_NAME_RE = /^[A-Za-z0-9._-]{1,100}\/[A-Za-z0-9._-]{1,100}$/;
+
+function normalizeRepoFullName(value) {
+  const trimmed = String(value || "").trim();
+  if (!REPO_FULL_NAME_RE.test(trimmed)) return null;
+  return trimmed.toLowerCase();
 }
 
 function publicTrial(trial, config, registry) {
