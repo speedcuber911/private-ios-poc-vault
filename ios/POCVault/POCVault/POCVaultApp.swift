@@ -819,10 +819,14 @@ enum AppConfiguration {
         infoKey: "POCVaultCodexBaseURL",
         fallback: "https://codex.pocs.conformal.live"
     )
+    // The control plane that owns accounts AND trials. It must be the box the
+    // trial routes are deployed to — pointing this at a relay-cloud without
+    // trial config does not degrade to "no trial", it 403s from the mTLS-gated
+    // codex-api that answers /v1/* for unknown paths on that host.
     static let authBaseURL = configuredURL(
         supportValue: supportConfig?.authBaseURL,
         infoKey: "RelayAuthBaseURL",
-        fallback: "https://api.pocs.conformal.live"
+        fallback: "https://relay.ai-rocket-experiments.com"
     )
     static let runtimeMode = "Relay Cloud"
 #endif
