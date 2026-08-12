@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { PassThrough } from "node:stream";
 
 const execFileAsync = promisify(execFile);
 
@@ -23,6 +24,8 @@ const { initIdentity, identityPaths, readEncPublicKeyB64 } = await import("../sr
 const { sealTo } = await import("../src/seal.mjs");
 const { importHandoff } = await import("../src/handoff.mjs");
 const { store } = await import("../src/store.mjs");
+const { handleAdditionRoutes } = await import("../src/additions.mjs");
+const { sendError } = await import("../src/util.mjs");
 
 const IDENTITY_DIR = path.join(root, "identity");
 initIdentity({ baseDir: IDENTITY_DIR });
@@ -180,4 +183,119 @@ test("importing the same handoff twice is idempotent", async () => {
   assert.equal(first.state, "ready");
   assert.equal(second.state, "ready");
   assert.equal(second.workspaceId, first.workspaceId);
+});
+
+// ── GET /v1/handoffs/:id and POST /v1/handoffs/:id/continue (additions.mjs)
+// review-t13.md Minor-4: store.getHandoff throws "record id is invalid" for
+// any id that fails the store's own path-safety check (wrong charset, "..",
+// empty, ...), and neither route caught it, so a malformed id fell all the
+// way through to index.mjs's generic catch and came back as a 500 that
+// echoed the internal validator's message to the caller. A malformed id and
+// a genuinely-unknown id must be indistinguishable to the client: both are
+// "not here", never a 500. A REAL internal error must still be a 500 — and
+// must still be logged, not silently absorbed by whatever turns the id case
+// into a 404.
+
+function mockRes() {
+  return {
+    statusCode: null,
+    headers: null,
+    body: "",
+    writeHead(status, headers) { this.statusCode = status; this.headers = headers; },
+    end(chunk) { this.body += chunk || ""; },
+  };
+}
+
+function mockGetReq() {
+  return { method: "GET" };
+}
+
+function mockPostReq(bodyObj = {}) {
+  const req = new PassThrough();
+  req.method = "POST";
+  req.end(JSON.stringify(bodyObj));
+  return req;
+}
+
+// Mirrors index.mjs's routeRequest(...).catch(...) exactly, so these tests
+// observe the same status/body a real client would get — not just whatever
+// handleAdditionRoutes happens to leave in `res` before it throws.
+async function dispatch(req, res, url, auth = { subject: "test-node" }) {
+  try {
+    return await handleAdditionRoutes(req, res, url, auth);
+  } catch (error) {
+    const status = Number.isInteger(error.status) ? error.status : 500;
+    sendError(res, status, error.message || "internal error");
+    return true;
+  }
+}
+
+test("GET /v1/handoffs/:id: a traversal-shaped id is a clean 404, not a 500", async () => {
+  const res = mockRes();
+  // A single path segment (no literal "/", so it survives WHATWG URL
+  // normalization and reaches the route's [^/]+ id capture) that still
+  // decodes to a traversal attempt — the same shape store.test.mjs's
+  // path-traversal guard test uses at the store layer, exercised here
+  // through the actual HTTP-facing id capture.
+  const url = new URL("http://relayd.local/v1/handoffs/..%2Fetc%2Fpasswd");
+
+  const handled = await dispatch(mockGetReq(), res, url);
+
+  assert.equal(handled, true);
+  assert.equal(res.statusCode, 404, `expected a clean 404, got ${res.statusCode} / ${res.body}`);
+  assert.doesNotMatch(res.body, /record id is invalid/, "the internal validator's message must never reach the client");
+});
+
+test("GET /v1/handoffs/:id: a genuinely unknown, validly-shaped id is a clean 404", async () => {
+  const res = mockRes();
+  const url = new URL("http://relayd.local/v1/handoffs/no-such-handoff-0000000000");
+
+  const handled = await dispatch(mockGetReq(), res, url);
+
+  assert.equal(handled, true);
+  assert.equal(res.statusCode, 404);
+});
+
+test("GET /v1/handoffs/:id: a genuine internal error still surfaces as a logged 500, distinct from the 404 cases", async () => {
+  const res = mockRes();
+  const url = new URL("http://relayd.local/v1/handoffs/some-validly-shaped-id");
+
+  const originalGetHandoff = store.getHandoff;
+  const originalConsoleError = console.error;
+  const loggedLines = [];
+  store.getHandoff = () => { throw new Error("disk exploded"); };
+  console.error = (...args) => loggedLines.push(args.join(" "));
+
+  let handled;
+  try {
+    handled = await dispatch(mockGetReq(), res, url);
+  } finally {
+    store.getHandoff = originalGetHandoff;
+    console.error = originalConsoleError;
+  }
+
+  assert.equal(handled, true);
+  assert.equal(res.statusCode, 500, `a real failure must not be reclassified as a 404, got ${res.statusCode} / ${res.body}`);
+  assert.ok(loggedLines.some((line) => line.includes("disk exploded")), "a real failure must be logged, not silently swallowed like the invalid-id case");
+});
+
+test("POST /v1/handoffs/:id/continue: a traversal-shaped id is a clean 404, not a 500", async () => {
+  const res = mockRes();
+  const url = new URL("http://relayd.local/v1/handoffs/..%2Fetc%2Fpasswd/continue");
+
+  const handled = await dispatch(mockPostReq(), res, url);
+
+  assert.equal(handled, true);
+  assert.equal(res.statusCode, 404, `expected a clean 404, got ${res.statusCode} / ${res.body}`);
+  assert.doesNotMatch(res.body, /record id is invalid/, "the internal validator's message must never reach the client");
+});
+
+test("POST /v1/handoffs/:id/continue: a genuinely unknown, validly-shaped id is still the existing clean 404 (unchanged by the fix)", async () => {
+  const res = mockRes();
+  const url = new URL("http://relayd.local/v1/handoffs/no-such-handoff-0000000000/continue");
+
+  const handled = await dispatch(mockPostReq(), res, url);
+
+  assert.equal(handled, true);
+  assert.equal(res.statusCode, 404, `expected a clean 404, got ${res.statusCode} / ${res.body}`);
 });
