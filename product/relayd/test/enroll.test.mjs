@@ -64,3 +64,31 @@ test("enrollWithCloud surfaces cloud rejection", async () => {
     await cloud.close();
   }
 });
+
+test("enroll publishes the node encryption public key", async () => {
+  const cloud = await startFakeCloud((res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, sni: "node-x.tun.test" }));
+  });
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-enroll-enc-"));
+  try {
+    await enrollWithCloud({ cloudUrl: cloud.url, token: "tok-enc", baseDir });
+
+    const body = cloud.calls.at(-1).body;
+    assert.equal(Buffer.from(body.encPubkey, "base64").length, 32, "encPubkey is 32 raw bytes");
+    assert.match(body.pubkey, /BEGIN PUBLIC KEY/, "the ed25519 identity key is still sent as PEM");
+  } finally { await cloud.close(); }
+});
+
+test("re-enrolling reuses the same encryption key", async () => {
+  const cloud = await startFakeCloud((res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, sni: "node-x.tun.test" }));
+  });
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-enroll-enc2-"));
+  try {
+    await enrollWithCloud({ cloudUrl: cloud.url, token: "tok-one", baseDir });
+    await enrollWithCloud({ cloudUrl: cloud.url, token: "tok-two", baseDir });
+    assert.equal(cloud.calls[0].body.encPubkey, cloud.calls[1].body.encPubkey);
+  } finally { await cloud.close(); }
+});
