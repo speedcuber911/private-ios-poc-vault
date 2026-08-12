@@ -170,7 +170,13 @@ async function cmdSyncAuth(args = [], deps = {}) {
   const { bundle, skipped } = await collectCredentialBundle({ home: home || os.homedir(), execFileImpl });
   const installed = ["github", "claude", "codex"].filter((name) => bundle[name]);
 
-  const api = createCloudApi({ baseUrl, sessionToken: credentials.sessionToken, fetchImpl });
+  const api = createCloudApi({
+    baseUrl,
+    sessionToken: credentials.sessionToken,
+    refreshToken: credentials.refreshToken,
+    home,
+    fetchImpl,
+  });
   const pairingId = await deliverSealedBundle({
     api, nodeId: credentials.nodeId, nodeEncPubkey: credentials.nodeEncPubkey, kind: "sync-auth", payload: bundle,
   });

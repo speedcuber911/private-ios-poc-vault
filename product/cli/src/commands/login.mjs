@@ -1,16 +1,13 @@
-// relay login — browser device-code sign-in, then pin the sandbox this machine
-// hands off to. The session token and device code are never printed; only the
-// user code (which is meant to be read aloud) and the key fingerprint are.
+// relay login — device-code sign-in via QR (or typed code), then pin the
+// sandbox this machine hands off to. The session token and device code are
+// never printed; only the user code (which is meant to be read aloud) and the
+// key fingerprint are.
 import crypto from "node:crypto";
-import { execFile } from "node:child_process";
+import os from "node:os";
 
 import { createCloudApi, DEFAULT_BASE_URL } from "../cloud.mjs";
 import { writeCredentials } from "../creds.mjs";
-
-function defaultOpenBrowser(url) {
-  const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
-  execFile(opener, [url], () => {});
-}
+import { renderQrAnsi, qrAnsiWidth } from "../qr.mjs";
 
 // Canonical node-key fingerprint: SHA-256 over the 32 *decoded* key bytes
 // (never over the base64 text), first 16 hex characters. This is the
@@ -23,28 +20,60 @@ function fingerprint(encPubkeyB64) {
   return crypto.createHash("sha256").update(Buffer.from(String(encPubkeyB64), "base64")).digest("hex").slice(0, 16);
 }
 
+function normalizePlatform(platform = process.platform) {
+  if (platform === "darwin") return "macos";
+  if (platform === "linux") return "linux";
+  if (platform === "win32") return "windows";
+  return "other";
+}
+
 async function cmdLogin(args = [], deps = {}) {
   const {
     home = undefined,
     baseUrl = DEFAULT_BASE_URL,
     fetchImpl = fetch,
-    openBrowser = defaultOpenBrowser,
     log = console.log,
     sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     now = () => Date.now(),
+    hostname = () => os.hostname(),
+    platform = process.platform,
+    stdout = process.stdout,
   } = deps;
 
+  const noQr = args.includes("--no-qr");
   const anonymous = createCloudApi({ baseUrl, fetchImpl });
-  const start = await anonymous.startDeviceLogin();
+  const start = await anonymous.startDeviceLogin({
+    machineName: hostname(),
+    platform: normalizePlatform(platform),
+  });
   if (start.status !== 201) throw new Error(`login_start_failed_${start.status}`);
 
-  const { deviceCode, userCode, verificationUri, interval, expiresIn } = start.json;
+  const {
+    deviceCode,
+    userCode,
+    verificationUri,
+    verificationUriComplete,
+    interval,
+    expiresIn,
+  } = start.json;
+
+  const qrPayload = verificationUriComplete
+    || (verificationUri ? `${verificationUri}#code=${userCode}` : null);
+
   log("");
+  // QR above the human code. Skip when asked, when stdout isn't a TTY, or
+  // when the terminal is narrower than the rendered symbol (wrapping breaks
+  // finder patterns and cameras can't lock).
+  const columns = stdout.columns;
+  const canFit = columns == null || columns >= (qrPayload ? qrAnsiWidth(qrPayload) : Infinity);
+  if (!noQr && stdout.isTTY && qrPayload && canFit) {
+    log(renderQrAnsi(qrPayload));
+    log("");
+  }
   log(`  Your code:  ${userCode}`);
   log(`  Approve at: ${verificationUri}`);
   log("");
   log("  Waiting for approval…");
-  openBrowser(verificationUri);
 
   // A server bug or a network partition that keeps answering
   // authorization_pending must not hang this command forever — track our own
@@ -90,7 +119,13 @@ async function cmdLogin(args = [], deps = {}) {
   }, { home });
   log("  Signed in.");
 
-  const authed = createCloudApi({ baseUrl, sessionToken: session.sessionToken, fetchImpl });
+  const authed = createCloudApi({
+    baseUrl,
+    sessionToken: session.sessionToken,
+    refreshToken: session.refreshToken,
+    home,
+    fetchImpl,
+  });
   const trial = await authed.currentTrial();
   if (trial.status !== 200 || !trial.json?.trial?.nodeId) {
     log("  You have no machine yet — create one in the Relay app, then run relay login again.");
@@ -104,4 +139,4 @@ async function cmdLogin(args = [], deps = {}) {
   else log("  Machine has no encryption key yet — update it before handing off.");
 }
 
-export { cmdLogin, fingerprint };
+export { cmdLogin, fingerprint, normalizePlatform };
