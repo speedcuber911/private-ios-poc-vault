@@ -123,6 +123,7 @@ function createCloudApi({
     pollDeviceToken: (deviceCode) => request("POST", "/v1/auth/device/token", { body: { deviceCode } }),
     currentTrial: () => request("GET", "/v1/trial-nodes/current"),
     registerRepo: (fullName) => request("POST", "/v1/repos", { body: { fullName } }),
+    listRepos: () => request("GET", "/v1/repos"),
     createHandoff: (payload) => request("POST", "/v1/handoffs", { body: payload }),
     listHandoffs: (repo) => request("GET", `/v1/handoffs?repo=${encodeURIComponent(repo)}`),
     createPairingSession: (authToken, kind) => request("POST", "/v1/pairing/sessions", { body: { authToken, kind } }),
