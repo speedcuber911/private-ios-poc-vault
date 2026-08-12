@@ -395,9 +395,30 @@ export function createApp({
       if (!parseNodePubkey(body?.pubkey)) {
         return sendJson(res, 400, { error: "invalid_pubkey" });
       }
-      const encPubkey = strOrNull(body?.encPubkey);
-      if (encPubkey !== null && Buffer.from(encPubkey, "base64").length !== 32) {
+      // Present-but-wrong-typed must 400, never silently normalize to "no
+      // key" — a client bug (number/object/array/JSON null) would otherwise
+      // enroll a node with no encryption key at all, permanently unable to
+      // receive a sealed handoff, with nothing to explain why.
+      if (body?.encPubkey !== undefined && typeof body.encPubkey !== "string") {
         return sendJson(res, 400, { error: "invalid_enc_pubkey" });
+      }
+      const encPubkey = strOrNull(body?.encPubkey);
+      // Canonical base64 only — the exact rule product/relayd/src/seal.mjs's
+      // sealTo() enforces (decode, then require the bytes to re-encode back
+      // to the identical string). Node's base64 decoder is lenient: it
+      // accepts base64url characters, ignores embedded whitespace, and skips
+      // other junk spliced into the string, so a length-only check here would
+      // let a key through that seal.mjs later refuses to use. Rejecting the
+      // same malformed key at enroll — where the error is diagnosable —
+      // instead of at handoff time — where it would surface as an opaque
+      // decrypt failure on the user's phone — is the entire point of this
+      // check. Kept byte-for-byte identical to seal.mjs's rule because this
+      // key crosses a process boundary and the two sides must agree exactly.
+      if (encPubkey !== null) {
+        const raw = Buffer.from(encPubkey, "base64");
+        if (raw.length !== 32 || raw.toString("base64") !== encPubkey) {
+          return sendJson(res, 400, { error: "invalid_enc_pubkey" });
+        }
       }
       if (registry.getNode(nodeId)) {
         return sendJson(res, 409, { error: "node_exists" });
