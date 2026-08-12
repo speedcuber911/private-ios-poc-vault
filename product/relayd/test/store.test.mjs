@@ -46,6 +46,23 @@ const sampleChat = (id) => ({
   messages: [{ role: "user", text: "hi", timestamp: "2026-08-09T00:00:00.000Z" }],
 });
 
+const sampleHandoff = (id) => ({
+  id,
+  state: "ready",
+  repo: "me/relay",
+  branch: "relay/handoff-x",
+  workspaceId: "dir-handoff-abc123",
+  provider: "claude",
+  resumeSessionId: "11111111-2222-4333-8444-555555555555",
+  primedPrompt: null,
+  title: "Fix the auth redirect",
+  manifest: { v: 1, title: "Fix the auth redirect" },
+  lastJobId: null,
+  error: null,
+  createdAt: "2026-08-09T00:00:00.000Z",
+  updatedAt: "2026-08-09T00:00:00.000Z",
+});
+
 async function makeBackend(kind) {
   const dir = fs.mkdtempSync(path.join(tmpRoot, `${kind}-`));
   const jobsDir = path.join(dir, "jobs");
@@ -168,12 +185,20 @@ for (const kind of ["json", "sqlite"]) {
   });
 
   test(`${kind} backend: rejects path-traversal record ids`, async () => {
-    const { store, jobsDir } = await makeBackend(kind);
+    const { store, dir, jobsDir } = await makeBackend(kind);
     assert.throws(() => store.saveJob({ ...sampleJob("../evil"), id: "../evil" }));
     assert.throws(() => store.saveChatThread({ ...sampleChat("../evil"), id: "../evil" }));
     assert.equal(store.readChatThreadRecord("../../etc/passwd"), null);
     assert.equal(store.deleteChatThread("../../etc"), false);
     assert.equal(fs.existsSync(path.join(jobsDir, "..", "evil.json")), false);
+
+    // Handoff ids arrive straight from the network (a cloud-relayed
+    // descriptor), so this guard is the only thing between a remote id and
+    // the store's filesystem layout — same traversal shapes as above, plus a
+    // direct check that saveHandoff never escapes the handoffs directory.
+    assert.throws(() => store.saveHandoff({ ...sampleHandoff("../evil"), id: "../evil" }));
+    assert.throws(() => store.getHandoff("../../etc/passwd"));
+    assert.equal(fs.existsSync(path.join(dir, "evil.json")), false);
     store.close();
   });
 }
@@ -261,6 +286,34 @@ test("sqlite backend: threads table tracks task and chat threads", async () => {
   store.close();
 });
 
+// Minor-1 from the task-13 review: sqlite's upsertJob and upsertChat both
+// refresh created_at on conflict; the handoffs upsert deliberately left it
+// out. listHandoffs() ORDER BYs the created_at COLUMN while the record it
+// returns is the (fully refreshed) JSON blob, so a save that changes
+// createdAt on an existing id left the sqlite backend's ordering stuck on
+// the ORIGINAL value even though every other upsert in this file keeps the
+// column and the blob in lockstep.
+test("sqlite backend: listHandoffs ordering stays in sync with an updated createdAt", async () => {
+  const { store } = await makeBackend("sqlite");
+  const handoff = (id, createdAt) => ({
+    id, state: "ready", repo: "me/relay", branch: "relay/handoff-x",
+    workspaceId: "dir-handoff-abc123", provider: "claude",
+    resumeSessionId: "11111111-2222-4333-8444-555555555555", primedPrompt: null,
+    title: "t", manifest: null, lastJobId: null, error: null,
+    createdAt, updatedAt: createdAt,
+  });
+  store.saveHandoff(handoff("019e46a4-0000-7000-8000-00000000e001", "2026-08-11T09:00:00.000Z"));
+  store.saveHandoff(handoff("019e46a4-0000-7000-8000-00000000e002", "2026-08-11T10:00:00.000Z"));
+  // Re-save the first record with a LATER createdAt than the second.
+  store.saveHandoff(handoff("019e46a4-0000-7000-8000-00000000e001", "2026-08-11T11:00:00.000Z"));
+
+  assert.deepEqual(
+    store.listHandoffs().map((entry) => entry.id),
+    ["019e46a4-0000-7000-8000-00000000e001", "019e46a4-0000-7000-8000-00000000e002"],
+  );
+  store.close();
+});
+
 test("migrateJsonToSqlite moves jobs, chats, devices and revocations", async () => {
   const dataRoot = fs.mkdtempSync(path.join(tmpRoot, "migrate-"));
   fs.mkdirSync(path.join(dataRoot, "jobs"), { recursive: true });
@@ -305,6 +358,52 @@ test("migrateJsonToSqlite moves jobs, chats, devices and revocations", async () 
   assert.equal(migrated.listDevices()[0].certSerial, "CDEF");
   assert.equal(migrated.listRevocations()[0].serial, "CDEF");
   assert.equal(migrated.getHandoff(handoffId).title, "Migrate me");
+  migrated.close();
+});
+
+// The four sibling migration loops (jobs, chats, devices — revocations has no
+// id-shaped key to guard) all skip a damaged record rather than let it abort
+// the run: `if (!x || typeof x.id !== "string") continue` plus a try/catch
+// around the save. The handoff loop had neither, so one damaged file took the
+// whole migration down mid-run and lost every handoff already queued behind
+// it — including a healthy one sitting right next to it in the same
+// directory.
+test("migrateJsonToSqlite skips a damaged handoff and keeps its healthy neighbour", async () => {
+  const dataRoot = fs.mkdtempSync(path.join(tmpRoot, "migrate-handoff-"));
+  fs.mkdirSync(path.join(dataRoot, "jobs"), { recursive: true });
+  fs.mkdirSync(path.join(dataRoot, "chats"), { recursive: true });
+  const handoffsDir = path.join(dataRoot, "handoffs");
+  fs.mkdirSync(handoffsDir, { recursive: true });
+
+  const healthyId = "019e46a4-0000-7000-8000-00000000d001";
+  const jsonStore = await createStore("json", {
+    dataDir: dataRoot,
+    jobsDir: path.join(dataRoot, "jobs"),
+    chatsDir: path.join(dataRoot, "chats"),
+  });
+  jsonStore.saveHandoff({
+    id: healthyId, state: "ready", repo: "me/relay", branch: "relay/handoff-good",
+    workspaceId: "dir-handoff-good", provider: "claude",
+    resumeSessionId: "11111111-2222-4333-8444-555555555555", primedPrompt: null,
+    title: "Healthy neighbour", manifest: { v: 1, title: "Healthy neighbour" },
+    lastJobId: null, error: null, createdAt: "2026-08-09T00:04:00.000Z", updatedAt: "2026-08-09T00:04:00.000Z",
+  });
+
+  // Damaged in a way that still parses as JSON (listHandoffs' `.filter(Boolean)`
+  // only drops unparseable files) but has no id at all.
+  fs.writeFileSync(path.join(handoffsDir, "damaged-no-id.json"), JSON.stringify({}), "utf8");
+  // Damaged in a way that has a well-formed id but fails the store's
+  // acceptance contract (no branch) — exercises the try/catch, not just the
+  // id-shape guard.
+  fs.writeFileSync(path.join(handoffsDir, "damaged-no-branch.json"), JSON.stringify({
+    id: "019e46a4-0000-7000-8000-00000000d002", state: "importing", repo: "me/relay",
+    createdAt: "2026-08-09T00:05:00.000Z", updatedAt: "2026-08-09T00:05:00.000Z",
+  }), "utf8");
+
+  const dbPath = path.join(dataRoot, "migrated-handoffs.sqlite");
+  const { counts, store: migrated } = await migrateJsonToSqlite({ dataDir: dataRoot, dbPath });
+  assert.equal(counts.handoffs, 1, `only the healthy handoff should migrate, got counts=${JSON.stringify(counts)}`);
+  assert.equal(migrated.getHandoff(healthyId).title, "Healthy neighbour");
   migrated.close();
 });
 

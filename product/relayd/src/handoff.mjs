@@ -169,17 +169,34 @@ async function importHandoff(descriptor, options = {}) {
   const existing = store.getHandoff(id);
   if (existing && existing.state === "ready") return existing;
 
+  // Validated up front, same treatment as the id above and for the same
+  // reason: store.saveHandoff now enforces one acceptance contract on both
+  // backends (state/repo/branch/createdAt/updatedAt must be non-empty
+  // strings), so a repo/branch straight off the network must never reach the
+  // store — not even inside the transient "importing" record — before it is
+  // known safe.
+  let repo;
+  let branch;
+  try {
+    repo = assertSafeRepo(descriptor?.repo);
+    branch = assertSafeBranch(descriptor?.branch);
+  } catch (error) {
+    const reason = error?.message || "invalid_descriptor";
+    appendAudit("handoff_failed", { id }, { reason, repo: descriptor?.repo ?? null });
+    emitEvent("handoff.failed", { id, repo: descriptor?.repo ?? null, error: reason });
+    await cloud?.postEvent?.("handoff.failed").catch(() => {});
+    return { id, state: "failed", error: reason };
+  }
+
   let record = persist({
-    id, state: "importing", repo: descriptor.repo, branch: descriptor.branch,
+    id, state: "importing", repo, branch,
     workspaceId: null, provider: null, resumeSessionId: null, primedPrompt: null,
-    title: descriptor.branch, manifest: null, lastJobId: null, error: null,
+    title: branch, manifest: null, lastJobId: null, error: null,
     createdAt: existing?.createdAt || nowIso(), updatedAt: nowIso(),
   });
 
   let checkout;
   try {
-    const repo = assertSafeRepo(descriptor.repo);
-    const branch = assertSafeBranch(descriptor.branch);
     checkout = checkoutPathFor(id);
     // fs.rmSync on a symlink removes the link itself, never the directory it
     // points at, so a pre-planted symlink at this leaf is cleared here rather
