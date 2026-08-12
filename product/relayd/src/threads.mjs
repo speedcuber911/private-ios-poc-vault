@@ -7,7 +7,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 
-import { codexHome, threadSummaryCharacters, workspaceBrowseRoot, terminalStatuses, allowedThreadProviders, realpathOrResolve } from "./config.mjs";
+import { runHome, codexHome, threadSummaryCharacters, workspaceBrowseRoot, terminalStatuses, allowedThreadProviders, realpathOrResolve } from "./config.mjs";
 import { isSafeJobId, cleanApiText } from "./util.mjs";
 import { appendAudit } from "./audit.mjs";
 import { dynamicWorkspaces, workspaces, resolveWorkspaceById, browseWorkspaceForPath, cleanWorkspaceId, pathBelongsToRoot } from "./workspaces.mjs";
@@ -43,6 +43,72 @@ function findSessionMeta(sessionId) {
   return readSessionMeta(sessionFile, sessionId);
 }
 
+// sessionimport.mjs stages a resumable Claude transcript at
+// <runHome>/.claude/projects/<slug>/<sessionId>.jsonl (see its importSession
+// and stageSessionFile) -- the exact leaf name is always `${sessionId}.jsonl`,
+// never anything else. This walks that tree looking for it by exact name
+// (unlike findSessionFile's substring match for Codex rollout filenames,
+// which carry a timestamp prefix a Claude transcript never has) rather than
+// hardcoding the slug logic itself, so a future change to how sessionimport.mjs
+// derives the slug cannot silently desync this lookup from where sessions
+// actually land.
+//
+// A real Claude session id is a client-generated UUID scoped to one cwd, so
+// two DIFFERENT staged transcripts sharing one should never happen in
+// practice -- but nothing here enforces that uniqueness, so if it ever does
+// happen the most recently staged file is the one actually meant by "resume
+// this session now", and the workspace-membership check the caller runs
+// next still fails closed if even that guess lands on the wrong cwd.
+function findClaudeSessionFile(sessionId) {
+  const projectsDir = path.join(runHome, ".claude", "projects");
+  const wantedName = `${sessionId}.jsonl`;
+  let newest = null;
+  let newestMtimeMs = -Infinity;
+  for (const file of walkSessionFiles(projectsDir)) {
+    if (path.basename(file) !== wantedName) continue;
+    let stat;
+    try {
+      stat = fs.statSync(file);
+    } catch {
+      continue;
+    }
+    if (newest === null || stat.mtimeMs > newestMtimeMs) {
+      newest = file;
+      newestMtimeMs = stat.mtimeMs;
+    }
+  }
+  return newest;
+}
+
+// Claude's transcript format has no single "session_meta" line the way a
+// Codex rollout does; sessionimport.mjs's rewriteClaudeSession instead
+// rewrites a `cwd` field carried on every line to the sandbox checkout, so
+// the first line with a well-formed cwd is enough to place the session in a
+// workspace.
+function readClaudeSessionMeta(sessionFile) {
+  for (const line of readSessionLines(sessionFile)) {
+    if (!line.trim()) continue;
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const cwd = entry?.cwd;
+    if (typeof cwd === "string" && cwd.length > 0 && !/[\0\r\n]/.test(cwd)) {
+      return { cwd, provider: "claude", timestamp: cleanSessionTimestamp(entry.timestamp) };
+    }
+  }
+  return null;
+}
+
+
+function findClaudeSessionMeta(sessionId) {
+  const sessionFile = findClaudeSessionFile(sessionId);
+  if (!sessionFile) return null;
+  return readClaudeSessionMeta(sessionFile);
+}
+
 
 function findThreadResumeMeta(sessionId) {
   const relatedJobs = [...jobs.values()]
@@ -58,7 +124,12 @@ function findThreadResumeMeta(sessionId) {
     };
   }
 
-  const sessionMeta = findSessionMeta(sessionId);
+  // A session with no job yet is either a Codex rollout or a freshly staged
+  // Claude handoff transcript -- check both layouts sessionimport.mjs can
+  // have written before giving up. Cursor never stages a resumable session
+  // file (see importSession's summary-primed fallback), so there is no third
+  // layout to check: continueHandoff never sends a resumeSessionId for one.
+  const sessionMeta = findSessionMeta(sessionId) || findClaudeSessionMeta(sessionId);
   if (!sessionMeta) return null;
   return {
     provider: normalizeJobProvider(sessionMeta.provider),
@@ -665,6 +736,9 @@ export {
   cleanThreadProviderFilter,
   cleanOptionalSessionId,
   findSessionMeta,
+  findClaudeSessionFile,
+  readClaudeSessionMeta,
+  findClaudeSessionMeta,
   findThreadResumeMeta,
   resumeMetaBelongsToWorkspace,
   workspaceForJob,
