@@ -14,10 +14,18 @@
 // wire: the node's X25519 public key, and the {repo, branch, handoffId,
 // nodeId} descriptor the control plane relays.
 //
-// THE FIVE CLAIMS, one test each. Each was verified to be able to FAIL by
+// ALL THREE HARNESSES ARE COVERED HERE, and that is the point. Covering Claude
+// alone is exactly how F1 (Continue broken 100% of the time for Codex, three
+// independent ways) survived every review: each package's tests fake the other
+// package, so a seam is only ever checked where a test has both halves in the
+// room. This file is that room, so it has to hold every harness the product
+// ships, not the first one somebody wired up.
+//
+// THE CLAIMS, one test each. Each was verified to be able to FAIL by
 // deliberately breaking the thing it checks and re-running (see
 // `.superpowers/sdd/handoff/task-21-report.md`):
 //
+//   Claude (claims 1-5):
 //   1. The manifest the CLI seals is the manifest relayd opens — every field
 //      relayd reads, compared field-by-field against values this test derives
 //      independently, never by calling the CLI's own buildManifest().
@@ -30,18 +38,16 @@
 //   5. A fake harness is really resumed with the right session id, and its
 //      output streams back as an ordinary job.
 //
-// KNOWN RED — delete this paragraph when the product bug is fixed, not the
-// assertion. Claim 5 currently FAILS with `session not found in runner
-// CODEX_HOME` (jobs.mjs createJob -> threads.mjs findThreadResumeMeta). A
-// freshly-imported Claude handoff stages its transcript at
-// `<runHome>/.claude/projects/<slug>/<id>.jsonl`, but the resume validation
-// only recognises a session that already has a job in this process or a Codex
-// rollout under `<codexHome>/sessions`, so `Continue` on a Claude handoff —
-// the feature's primary action — is rejected 100% of the time. Verified to be
-// exactly this and nothing else: neutralising that one check in a throwaway
-// copy of relayd turns this file green 6/6 with no other change. This is the
-// contract drift the file exists to catch; do NOT weaken claim 5 to make the
-// suite green.
+//   Codex (codex claims 1-4) — the same four properties on a real rollout, plus
+//   the three specific things F1 got wrong: the rollout is read in the
+//   `session_meta`/`payload` shape the rest of the project uses, the id is
+//   `payload.id` and not the timestamped filename fragment, and the staged
+//   rollout's recorded cwd is retargeted to the sandbox checkout.
+//
+//   The summary-primed fallback (fallback claims 1-2) — a repo with no local
+//   session at all: no session blob is pushed, nothing pretends a resume is
+//   possible, and the harness relayd derives from the CLI's label really runs
+//   with the primed prompt.
 //
 // TWO TRAPS THIS FILE AVOIDS ON PURPOSE.
 //
@@ -126,7 +132,13 @@ const workspaceRoot = path.join(sandboxRoot, "workspaces");
 const runHome = path.join(sandboxRoot, "home");
 const identityDir = path.join(sandboxRoot, "identity");
 const harnessLog = path.join(root, "harness-invocation.json");
+const codexHarnessLog = path.join(root, "harness-invocation-codex.json");
+const cursorHarnessLog = path.join(root, "harness-invocation-cursor.json");
 const fakeClaude = path.join(root, "fake-claude");
+const fakeCodex = path.join(root, "fake-codex");
+const fakeCursor = path.join(root, "fake-cursor");
+const harnessLogFor = (provider) =>
+  ({ claude: harnessLog, codex: codexHarnessLog, cursor: cursorHarnessLog })[provider];
 
 for (const dir of [laptopHome, workspaceRoot, path.join(workspaceRoot, "welcome"), runHome]) {
   fs.mkdirSync(dir, { recursive: true });
@@ -166,9 +178,67 @@ process.stdin.on("end", () => {
   { mode: 0o755 },
 );
 
+// The Codex twin. Codex does NOT put its answer on stdout — relayd reads it
+// back out of the `-o <file>` path it passed (jobs.mjs finishJob), so a fake
+// that only printed to stdout would "succeed" with an empty result and hide a
+// broken resume. It records CODEX_HOME too, because that is where the rollout
+// it is resuming had to be staged.
+fs.writeFileSync(
+  fakeCodex,
+  `#!/usr/bin/env node
+const fs = require("node:fs");
+const chunks = [];
+process.stdin.on("data", (chunk) => chunks.push(chunk));
+process.stdin.on("end", () => {
+  const argv = process.argv.slice(2);
+  const outAt = argv.indexOf("-o");
+  fs.writeFileSync(${JSON.stringify(codexHarnessLog)}, JSON.stringify({
+    argv,
+    cwd: process.cwd(),
+    home: process.env.HOME,
+    codexHome: process.env.CODEX_HOME,
+    pid: process.pid,
+    prompt: Buffer.concat(chunks).toString("utf8"),
+  }));
+  if (outAt !== -1) fs.writeFileSync(argv[outAt + 1], "CODEX-RESUMED-OK\\n");
+  process.stdout.write("codex exec finished\\n");
+});
+`,
+  { mode: 0o755 },
+);
+
+// Cursor takes its prompt as an ARGV element, not on stdin, and relayd parses
+// its stdout as the documented `{type:"result",subtype:"success"}` envelope
+// (adapters/cursor.mjs parseCursorResult) — anything else is treated as no
+// output at all and the job FAILS. Faking the real envelope is what makes the
+// summary-primed path a real assertion instead of a shrug.
+fs.writeFileSync(
+  fakeCursor,
+  `#!/usr/bin/env node
+const fs = require("node:fs");
+const argv = process.argv.slice(2);
+fs.writeFileSync(${JSON.stringify(cursorHarnessLog)}, JSON.stringify({
+  argv,
+  cwd: process.cwd(),
+  home: process.env.HOME,
+  pid: process.pid,
+  prompt: argv[argv.length - 1],
+}));
+process.stdout.write(JSON.stringify({
+  type: "result",
+  subtype: "success",
+  result: "CURSOR-PRIMED-OK",
+  session_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+}) + "\\n");
+`,
+  { mode: 0o755 },
+);
+
 process.env.RELAY_ALLOW_LOCAL_REMOTE = "1";
 process.env.RELAY_E2E_HARNESS_LOG = harnessLog;
 process.env.CLAUDE_BIN = fakeClaude;
+process.env.CODEX_BIN = fakeCodex;
+process.env.CURSOR_BIN = fakeCursor;
 process.env.CODEX_DATA_DIR = path.join(sandboxRoot, "data");
 process.env.CODEX_WORKSPACE_BROWSE_ROOT = workspaceRoot;
 process.env.CODEX_WORKSPACES = JSON.stringify([
@@ -691,6 +761,407 @@ test("claim 5: continuing the handoff resumes the fake harness with the right se
   state.harnessPid = invocation.pid;
 });
 
+// ===========================================================================
+// CODEX — the same treatment, on the other harness.
+//
+// WHY THIS EXISTS. Claims 1-5 above cover Claude only, and that is exactly how
+// F1 survived: `codex-rollout` appeared in ONE assertion in the entire tree (a
+// discovery label in cli/test/sessions.test.mjs). Continue then failed 100% of
+// the time for Codex, in three independent ways, each sufficient on its own:
+//
+//   (a) the CLI read a rollout format nobody else uses — a TOP-LEVEL `cwd`,
+//       where a real rollout carries `payload.cwd` in a `session_meta` line —
+//       so a genuine Codex session was never discovered and the user silently
+//       fell through to the repo-state-only path;
+//   (b) the id the CLI derived came from the FILENAME
+//       (`2026-…-<uuid>`, 56 chars). sessionimport's allow-list accepted it and
+//       staged it; createJob's `isSafeJobId` (`^[a-f0-9-]{36}$`) then rejected
+//       it 400 `resumeSessionId is invalid`. Two validators, one value,
+//       100 characters apart in permissiveness;
+//   (c) even given a bare UUID, the staged rollout still recorded the LAPTOP
+//       cwd, so `resumeMetaBelongsToWorkspace` found no workspace and createJob
+//       threw 400 `session does not belong to workspace`.
+//
+// Every one of those is a seam between two packages, and every one of them is
+// invisible to a test that fakes the other half. So this section does the real
+// thing: a real rollout on a real laptop repo, a real seal, a real push, a real
+// clone, a real decrypt, a real staged file, and a real resumed job.
+
+const CODEX_SESSION_ID = "0199e1a2-1111-4222-8333-444455556666";
+// Same discipline as TRANSCRIPT_MARKER/TITLE_MARKER above: present in exactly
+// one place in the fixture, lowercase-alphanumeric so a slugged, lowercased
+// branch name cannot hide it from a case-insensitive scan.
+const CODEX_MARKER = "zqxe2ecodexmarkerzqx";
+const CODEX_TITLE_MARKER = "zqxcodextitlemarkerzqx";
+const CODEX_TITLE = `finish the migration ${CODEX_TITLE_MARKER}`;
+
+const codexState = { ready: false };
+const cursorState = { ready: false };
+
+const scenarioOf = (holder, label) => {
+  assert.ok(holder.ready, `the ${label} scenario did not complete: ${holder.error || "unknown reason"}`);
+  return holder;
+};
+
+// A laptop-shaped repo with a github-shaped (file://) origin, one commit
+// pushed, and one untracked file of uncommitted work.
+async function makeLaptopRepo(name) {
+  const bareRepo = path.join(root, `${name}.git`);
+  const workRepo = path.join(root, name);
+  await execFileAsync("git", ["init", "-q", "--bare", bareRepo]);
+  await execFileAsync("git", ["init", "-q", "-b", "main", workRepo]);
+  await git(workRepo, "config", "user.email", "t@example.com");
+  await git(workRepo, "config", "user.name", "T");
+  await git(workRepo, "config", "commit.gpgsign", "false");
+  await git(workRepo, "remote", "add", "origin", `file://${bareRepo}`);
+  fs.writeFileSync(path.join(workRepo, "README.md"), "# repo\n");
+  await git(workRepo, "add", "-A");
+  await git(workRepo, "commit", "-qm", "initial");
+  await git(workRepo, "push", "-q", "origin", "main");
+  fs.writeFileSync(path.join(workRepo, "wip.txt"), WIP_BODY);
+  return { bare: bareRepo, work: workRepo, real: fs.realpathSync(workRepo), fullName: `local/${name}` };
+}
+
+async function runHandoff(repo) {
+  const pings = [];
+  const otherCalls = [];
+  const handoff = await cmdHandoff([], {
+    home: laptopHome,
+    cwd: repo.work,
+    baseUrl: CLOUD_BASE_URL,
+    log: () => {},
+    machine: MACHINE,
+    now: () => CREATED_AT,
+    fetchImpl: async (url, options = {}) => {
+      const pathname = new URL(url).pathname;
+      if (pathname !== "/v1/handoffs") {
+        otherCalls.push({ pathname, body: typeof options.body === "string" ? options.body : null });
+        return { status: 500, json: async () => ({ error: "not_part_of_this_test" }) };
+      }
+      pings.push(JSON.parse(options.body));
+      return { status: 201, json: async () => ({ handoff: { id: pings.at(-1).handoffId, state: "pending" } }) };
+    },
+  });
+  return { handoff, pings, otherCalls };
+}
+
+// Only {id, repo, branch} crosses — exactly what the control plane relays. The
+// blobs are read back out of the pushed repository by relayd itself.
+async function importFrom(repo, ping) {
+  const events = [];
+  const record = await importHandoff(
+    { id: ping.handoffId, repo: ping.repo, branch: ping.branch },
+    {
+      cloud: {
+        postEvent: async (type) => {
+          events.push(type);
+          return { status: 202 };
+        },
+      },
+      baseDir: identityDir,
+      runHome,
+      remoteUrlFor: () => `file://${repo.bare}`,
+    },
+  );
+  return { record, events };
+}
+
+async function runToCompletion(job) {
+  return waitFor(`job ${job.id} to reach a terminal state`, () => {
+    const current = jobs.get(job.id);
+    return current && ["succeeded", "failed", "cancelled", "timeout"].includes(current.status) ? current : null;
+  });
+}
+
+// relayd's documented harness -> provider mapping (sessionimport.importSession).
+// Asserted rather than hardcoded per test, so this stays true if the CLI ever
+// changes which label it sends on the session-less path (finding F2, owned
+// elsewhere) — what must never change is that relayd runs the harness the CLI
+// named.
+const providerForHarness = (harness) => (harness === "codex" || harness === "cursor" ? harness : "claude");
+
+async function buildCodexScenario() {
+  const repo = await makeLaptopRepo("origin-codex");
+
+  // A rollout in the shape the whole rest of the project models: a
+  // `session_meta` line with `payload.id` and `payload.cwd`, inside a file
+  // whose NAME carries a timestamp prefix the id must NOT be taken from.
+  const rolloutName = `rollout-2026-08-11T09-00-00-${CODEX_SESSION_ID}.jsonl`;
+  const rollout =
+    `${JSON.stringify({
+      type: "session_meta",
+      timestamp: "2026-08-11T09:00:00.000Z",
+      payload: { id: CODEX_SESSION_ID, cwd: repo.real },
+    })}\n` +
+    `${JSON.stringify({
+      type: "response_item",
+      payload: { type: "message", role: "user", content: [{ type: "input_text", text: CODEX_TITLE }] },
+    })}\n` +
+    `${JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: `still editing ${repo.real}/src/db.ts, ${CODEX_MARKER}` }],
+      },
+    })}\n`;
+  const rolloutDir = path.join(laptopHome, ".codex", "sessions", "2026", "08");
+  fs.mkdirSync(rolloutDir, { recursive: true });
+  fs.writeFileSync(path.join(rolloutDir, rolloutName), rollout);
+
+  const { handoff, pings, otherCalls } = await runHandoff(repo);
+  const { record, events } = await importFrom(repo, pings[0]);
+
+  Object.assign(codexState, {
+    ready: true,
+    repo,
+    rollout,
+    rolloutName,
+    handoff,
+    pings,
+    otherCalls,
+    record,
+    events,
+    checkout: record.state === "ready" ? checkoutPathFor(record.id) : null,
+  });
+}
+
+test("codex claim 1: a real rollout is discovered, sealed and reopened with the id relayd can resume", async () => {
+  try {
+    await buildCodexScenario();
+  } catch (error) {
+    codexState.error = error?.stack || String(error);
+    throw error;
+  }
+  const s = scenarioOf(codexState, "codex");
+
+  assert.equal(s.record.state, "ready", `import failed: ${s.record.error}`);
+  assert.deepEqual(s.events, ["handoff.ready"]);
+
+  const persisted = store.getHandoff(s.record.id);
+  assert.deepEqual(
+    {
+      harness: persisted.manifest.harness,
+      sessionFormat: persisted.manifest.sessionFormat,
+      sessionId: persisted.manifest.sessionId,
+      cwd: persisted.manifest.cwd,
+      title: persisted.manifest.title,
+      repo: persisted.manifest.repo,
+    },
+    {
+      harness: "codex",
+      sessionFormat: "codex-rollout",
+      sessionId: CODEX_SESSION_ID,
+      cwd: s.repo.real,
+      title: CODEX_TITLE,
+      repo: "local/origin-codex",
+    },
+    "F1(a): a canonical rollout must be DISCOVERED — a silent fall-through to the repo-state-only path is the bug",
+  );
+  assert.equal(persisted.provider, providerForHarness(persisted.manifest.harness));
+  assert.equal(persisted.resumeSessionId, CODEX_SESSION_ID);
+  assert.equal(persisted.primedPrompt, null, "a resumable Codex session must not degrade to a primed prompt");
+
+  // F1(b), pinned on the value that actually crossed the wire: the id is
+  // `payload.id`, not the 56-character filename fragment the CLI used to send,
+  // and it satisfies the ONE contract both sides now share.
+  assert.match(persisted.manifest.sessionId, /^[a-f0-9-]{36}$/);
+  assert.ok(
+    !s.rolloutName.includes(`-${persisted.manifest.sessionId}-`),
+    "sanity: the fixture filename must really carry a timestamp prefix, or this claim proves nothing",
+  );
+  assert.notEqual(
+    persisted.manifest.sessionId,
+    s.rolloutName.slice("rollout-".length, -".jsonl".length),
+    "the id must not be the filename fragment — that string is 56 chars and createJob rejects it",
+  );
+
+  // The excerpt and title came from `response_item` turns, which is the only
+  // turn shape a rollout has. Reading only Claude's `{message:{content}}` gave
+  // every Codex card a generic title and an empty excerpt.
+  assert.match(persisted.manifest.excerpt, new RegExp(CODEX_MARKER));
+});
+
+test("codex claim 2: the rollout crosses byte-exact and is staged with the laptop cwd retargeted", async () => {
+  const s = scenarioOf(codexState, "codex");
+
+  // (a) byte-exact on the wire — sealed by product/cli/src/seal.mjs, opened by
+  //     product/relayd/src/seal.mjs, nothing shared but the node's public key.
+  const { stdout: sealed } = await execFileAsync(
+    "git",
+    ["-C", s.repo.bare, "show", `${s.handoff.branch}:.relay/handoff/${s.handoff.handoffId}/session.enc`],
+    { encoding: "buffer", maxBuffer: 64 * 1024 * 1024 },
+  );
+  assert.equal(sealed.subarray(0, 8).toString("latin1"), "RLYSEAL1");
+  const opened = openSealed(readEncPrivateKeyPem(identityPaths(identityDir)), sealed);
+  assert.deepEqual(opened, Buffer.from(s.rollout, "utf8"), "the rollout crossed the wire byte-for-byte");
+
+  // (b) staged where Codex's own resume looks: <CODEX_HOME>/sessions/<id>.jsonl.
+  const staged = path.join(process.env.CODEX_HOME, "sessions", `${CODEX_SESSION_ID}.jsonl`);
+  assert.ok(fs.existsSync(staged), `the rollout must be staged at ${path.relative(root, staged)}`);
+  const stagedText = fs.readFileSync(staged, "utf8");
+
+  // (c) F1(c). relayd used to stage a rollout BYTE-FOR-BYTE on the strength of
+  //     a header comment saying Codex "needs no rewriting". True of Codex's own
+  //     resume; false of relayd's, which reads THIS field back
+  //     (threads.readSessionMeta) and refuses the resume 400 `session does not
+  //     belong to workspace` when it names a laptop directory. It is also the
+  //     username leak the Claude branch has always rewritten away.
+  const stagedMeta = JSON.parse(stagedText.split("\n")[0]);
+  assert.equal(stagedMeta.payload.cwd, s.checkout, "the resume gate reads this field; it must name the sandbox checkout");
+  assert.equal(stagedMeta.payload.id, CODEX_SESSION_ID);
+  assert.ok(!stagedText.includes(s.repo.real), "the laptop path must not survive into the sandbox");
+  assert.equal(
+    stagedText.split(s.checkout).join(s.repo.real),
+    s.rollout,
+    "the rewrite must touch the cwd and nothing else",
+  );
+
+  // (d) the uncommitted work crossed too.
+  assert.equal(fs.readFileSync(path.join(s.checkout, "wip.txt"), "utf8"), WIP_BODY);
+});
+
+test("codex claim 3: no rollout plaintext exists anywhere in the pushed repository", async () => {
+  const s = scenarioOf(codexState, "codex");
+  const bytes = await pushedRepositoryBytes(s.repo.bare);
+
+  // Positive control on the same bytes, so the scan cannot be vacuous.
+  assert.ok(bytes.includes(WIP_BODY.trim()), "the plaintext scan must be able to find plaintext at all");
+
+  const searchable = bytes.toString("latin1").toLowerCase();
+  assert.ok(!searchable.includes(CODEX_MARKER), "the rollout marker must never appear in any pushed object, ref or file");
+  assert.ok(!searchable.includes(CODEX_TITLE_MARKER), "the session title must not reach the remote, raw or slugged");
+
+  const everythingSentToTheCloud = (JSON.stringify(s.pings) + JSON.stringify(s.otherCalls)).toLowerCase();
+  assert.ok(!everythingSentToTheCloud.includes(CODEX_MARKER));
+  assert.ok(!everythingSentToTheCloud.includes(CODEX_TITLE_MARKER));
+});
+
+test("codex claim 4: continuing the handoff really resumes the fake codex with the right rollout id", async () => {
+  const s = scenarioOf(codexState, "codex");
+
+  // THE claim. Before the fix this threw 400 at one of three places before a
+  // harness was ever spawned.
+  const job = await continueHandoff(s.record.id, { prompt: "keep going on the migration" });
+  assert.deepEqual(
+    { workspaceId: job.workspaceId, provider: job.provider, resumeSessionId: job.resumeSessionId },
+    { workspaceId: s.record.workspaceId, provider: "codex", resumeSessionId: CODEX_SESSION_ID },
+  );
+
+  const finished = await runToCompletion(job);
+  assert.equal(finished.status, "succeeded", `the resume job failed: ${finished.error}`);
+  assert.equal(finished.exitCode, 0);
+  assert.equal(finished.result, "CODEX-RESUMED-OK", "codex's answer comes from the -o file, not stdout");
+
+  const invocation = JSON.parse(await waitFor("the fake codex to record its invocation", () =>
+    (fs.existsSync(codexHarnessLog) ? fs.readFileSync(codexHarnessLog, "utf8") : null)));
+  assert.ok(invocation.argv.includes("resume"), `codex was not asked to resume: ${JSON.stringify(invocation.argv)}`);
+  assert.ok(
+    invocation.argv.includes(CODEX_SESSION_ID),
+    `codex resumed the wrong rollout: ${JSON.stringify(invocation.argv)}`,
+  );
+  assert.equal(invocation.cwd, s.checkout, "codex must run inside the imported checkout");
+  assert.equal(invocation.home, runHome);
+  assert.equal(invocation.codexHome, process.env.CODEX_HOME, "codex must see the CODEX_HOME the rollout was staged under");
+  assert.equal(invocation.prompt, "keep going on the migration");
+
+  assert.equal(store.getHandoff(s.record.id).lastJobId, job.id);
+  codexState.harnessPid = invocation.pid;
+});
+
+// ===========================================================================
+// CURSOR — the summary-primed fallback, which is the path EVERY session-less
+// handoff takes. Reachable end to end with no fixture trickery at all: a repo
+// with no local session at all is all it takes.
+//
+// This deliberately does not pin the harness LABEL the CLI writes on this path
+// (finding F2 — `harness: session?.harness || "cursor"` mislabels a
+// session-less Claude/Codex handoff as Cursor — is a separate defect in
+// commands/handoff.mjs, owned elsewhere). What it pins is the SEAM, which must
+// hold whatever that label becomes: relayd runs the harness the CLI named, and
+// it runs it with the primed prompt rather than pretending a resume happened.
+
+async function buildCursorScenario() {
+  const repo = await makeLaptopRepo("origin-cursor");
+  const { handoff, pings, otherCalls } = await runHandoff(repo);
+  const { record, events } = await importFrom(repo, pings[0]);
+  Object.assign(cursorState, {
+    ready: true,
+    repo,
+    handoff,
+    pings,
+    otherCalls,
+    record,
+    events,
+    checkout: record.state === "ready" ? checkoutPathFor(record.id) : null,
+  });
+}
+
+test("fallback claim 1: a session-less handoff ships no session blob and imports as summary-primed", async () => {
+  try {
+    await buildCursorScenario();
+  } catch (error) {
+    cursorState.error = error?.stack || String(error);
+    throw error;
+  }
+  const s = scenarioOf(cursorState, "summary-primed");
+
+  assert.equal(s.record.state, "ready", `import failed: ${s.record.error}`);
+  const persisted = store.getHandoff(s.record.id);
+
+  assert.equal(persisted.manifest.sessionFormat, "none");
+  assert.equal(persisted.manifest.sessionId, null);
+  assert.equal(persisted.resumeSessionId, null, "there is nothing to resume, and nothing may pretend otherwise");
+  assert.ok(persisted.primedPrompt, "the fallback must actually prime a prompt");
+  assert.match(persisted.primedPrompt, new RegExp(s.handoff.branch));
+  assert.match(persisted.primedPrompt, /local\/origin-cursor/);
+  assert.match(persisted.primedPrompt, /1 file changed/);
+
+  // The seam: relayd runs the harness the CLI labelled.
+  assert.equal(persisted.provider, providerForHarness(persisted.manifest.harness));
+
+  // Only the manifest is on the branch — no session.enc was written at all.
+  const { stdout: tracked } = await git(s.repo.bare, "ls-tree", "-r", "--name-only", s.handoff.branch);
+  assert.deepEqual(
+    tracked.split("\n").filter((name) => name.startsWith(".relay/")).sort(),
+    [`.relay/handoff/${s.handoff.handoffId}/manifest.enc`],
+    "a session-less handoff must not push an empty or fabricated session blob",
+  );
+});
+
+test("fallback claim 2: the labelled harness really runs, with the primed prompt and no resume flag", async () => {
+  const s = scenarioOf(cursorState, "summary-primed");
+  const provider = s.record.provider;
+  const logPath = harnessLogFor(provider);
+  assert.ok(logPath, `no fake harness is installed for provider ${provider}`);
+  // Start from a clean slate so "the log exists" cannot be satisfied by an
+  // earlier scenario's invocation.
+  fs.rmSync(logPath, { force: true });
+
+  const job = await continueHandoff(s.record.id);
+  assert.equal(job.provider, provider);
+  assert.equal(job.resumeSessionId, null, "the primed path must never send a resume id");
+  assert.equal(job.prompt, s.record.primedPrompt, "the primed prompt is what the harness is asked to act on");
+
+  const finished = await runToCompletion(job);
+  assert.equal(finished.status, "succeeded", `the primed job failed: ${finished.error}`);
+  assert.equal(
+    finished.result,
+    { cursor: "CURSOR-PRIMED-OK", codex: "CODEX-RESUMED-OK", claude: "RESUMED-OK" }[provider],
+  );
+
+  const invocation = JSON.parse(await waitFor(`the fake ${provider} to record its invocation`, () =>
+    (fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8") : null)));
+  assert.ok(!invocation.argv.includes("--resume"), `a primed run must not resume: ${JSON.stringify(invocation.argv)}`);
+  assert.ok(!invocation.argv.includes("resume"), `a primed run must not resume: ${JSON.stringify(invocation.argv)}`);
+  assert.equal(invocation.prompt, s.record.primedPrompt, "the primed prompt must reach the harness verbatim");
+  assert.ok(
+    invocation.cwd === s.checkout || invocation.argv.includes(s.checkout),
+    `the harness must be pointed at the imported checkout: ${JSON.stringify(invocation)}`,
+  );
+  cursorState.harnessPid = invocation.pid;
+});
+
 // ---------------------------------------------------------------------------
 // No strays. `node --test`'s own timeout would have left them running.
 
@@ -712,11 +1183,16 @@ test("the flow leaves no running children behind", async () => {
       }
     }
   }
-  if (state.harnessPid) {
+  for (const [label, pid] of [
+    ["claude", state.harnessPid],
+    ["codex", codexState.harnessPid],
+    ["cursor", cursorState.harnessPid],
+  ]) {
+    if (!pid) continue;
     assert.throws(
-      () => process.kill(state.harnessPid, 0),
+      () => process.kill(pid, 0),
       (error) => error.code === "ESRCH",
-      `the fake harness (pid ${state.harnessPid}) is still alive`,
+      `the fake ${label} harness (pid ${pid}) is still alive`,
     );
   }
   store.close?.();

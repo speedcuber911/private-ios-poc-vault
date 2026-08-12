@@ -7,9 +7,13 @@ import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 
 const {
-  importSession, rewriteClaudeSession, claudeProjectSlug, summaryPrompt,
+  importSession, rewriteSessionCwd, claudeProjectSlug, summaryPrompt,
   assertContained, SessionImportSecurityError,
 } = await import("../src/sessionimport.mjs");
+// The shared contract this module now stages by. Imported directly (it is
+// deliberately dependency-free) rather than through util.mjs, whose config.mjs
+// import creates directories at load time — a unit test must not do that.
+const { isResumableSessionId, RESUMABLE_SESSION_ID_RE } = await import("../src/sessionid.mjs");
 
 const FROM_CWD = "/Users/dev/code/relay";
 const TO_CWD = "/srv/relay-workspaces/handoff-abc123";
@@ -165,9 +169,9 @@ test("claudeProjectSlug matches Claude Code's directory naming", () => {
   assert.equal(claudeProjectSlug("/srv/relay-workspaces/handoff-abc"), "-srv-relay-workspaces-handoff-abc");
 });
 
-test("rewriteClaudeSession retargets the cwd without corrupting other text", () => {
+test("rewriteSessionCwd retargets the cwd without corrupting other text", () => {
   const line = JSON.stringify({ type: "user", cwd: FROM_CWD, message: `edit ${FROM_CWD}/src/a.ts and keep /Users/dev/other` });
-  const rewritten = rewriteClaudeSession(`${line}\n`, { fromCwd: FROM_CWD, toCwd: TO_CWD });
+  const rewritten = rewriteSessionCwd(`${line}\n`, { fromCwd: FROM_CWD, toCwd: TO_CWD });
   const parsed = JSON.parse(rewritten.trim());
 
   assert.equal(parsed.cwd, TO_CWD);
@@ -197,19 +201,59 @@ test("a claude session is staged where --resume finds it", () => {
   );
 });
 
-test("a codex rollout is staged under the codex home unmodified", () => {
+test("a codex rollout is staged under the codex home with its recorded cwd retargeted", () => {
+  // F1(c): this used to stage the rollout BYTE-FOR-BYTE, on the strength of a
+  // module-header claim that "Codex replays a rollout by id and needs no
+  // rewriting". True of Codex's own resume mechanism; false of relayd's, which
+  // reads `payload.cwd` back out of this very file
+  // (`threads.readSessionMeta`) and refuses the resume 400 `session does not
+  // belong to workspace` when it names a directory that does not exist on this
+  // machine. It also carried the laptop path — i.e. the user's real username —
+  // straight into the sandbox, which is the leak the whole
+  // PATH_TERMINATOR/CWD_BOUNDARY apparatus exists to stop.
   const { runHome, codexHome } = homes();
-  const rollout = Buffer.from(`${JSON.stringify({ record: "rollout", cwd: FROM_CWD })}\n`, "utf8");
+  const sessionId = "0199aaaa-bbbb-4ccc-8ddd-eeeeffff0000";
+  const metaLine = { type: "session_meta", timestamp: "2026-08-11T00:00:00.000Z", payload: { id: sessionId, cwd: FROM_CWD } };
+  const turnLine = { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: `edit ${FROM_CWD}/src/a.ts` }] } };
+  const rollout = Buffer.from(`${JSON.stringify(metaLine)}\n${JSON.stringify(turnLine)}\n`, "utf8");
 
   const result = importSession({
-    manifest: manifest({ harness: "codex", sessionFormat: "codex-rollout", sessionId: "0199aaaa-bbbb-4ccc-8ddd-eeeeffff0000" }),
+    manifest: manifest({ harness: "codex", sessionFormat: "codex-rollout", sessionId }),
     sessionBytes: rollout, runHome, codexHome, worktreePath: TO_CWD,
   });
 
-  const staged = path.join(codexHome, "sessions", "0199aaaa-bbbb-4ccc-8ddd-eeeeffff0000.jsonl");
-  assert.deepEqual(fs.readFileSync(staged), rollout, "codex rollouts are byte-preserved");
-  assert.equal(result.resumeSessionId, "0199aaaa-bbbb-4ccc-8ddd-eeeeffff0000");
+  const staged = path.join(codexHome, "sessions", `${sessionId}.jsonl`);
+  const stagedText = fs.readFileSync(staged, "utf8");
+  const stagedMeta = JSON.parse(stagedText.split("\n")[0]);
+
+  assert.equal(stagedMeta.payload.cwd, TO_CWD, "the resume gate reads THIS field; it must name the sandbox checkout");
+  assert.equal(stagedMeta.payload.id, sessionId, "the rollout must still declare the id it is resumed by");
+  assert.ok(!stagedText.includes(FROM_CWD), "the laptop path must not survive into the sandbox");
+  // ...and the rewrite touched the cwd and nothing else: substituting back
+  // reproduces the original rollout byte-for-byte.
+  assert.equal(stagedText.split(TO_CWD).join(FROM_CWD), rollout.toString("utf8"), "only the cwd may change");
+  assert.equal(result.resumeSessionId, sessionId);
   assert.equal(result.provider, "codex");
+});
+
+test("a codex rollout whose cwd already equals the worktree is staged byte-for-byte", () => {
+  // The rewrite is a no-op when there is nothing to retarget, so the "codex
+  // rollouts are byte-preserved" property this test used to assert
+  // unconditionally still holds wherever it is actually true. Guards against a
+  // rewrite that mangles a rollout it had no business touching.
+  const { runHome, codexHome } = homes();
+  const sessionId = "0199bbbb-cccc-4ddd-8eee-ffff00001111";
+  const rollout = Buffer.from(
+    `${JSON.stringify({ type: "session_meta", payload: { id: sessionId, cwd: TO_CWD } })}\n`,
+    "utf8",
+  );
+
+  importSession({
+    manifest: manifest({ harness: "codex", sessionFormat: "codex-rollout", sessionId, cwd: TO_CWD }),
+    sessionBytes: rollout, runHome, codexHome, worktreePath: TO_CWD,
+  });
+
+  assert.deepEqual(fs.readFileSync(path.join(codexHome, "sessions", `${sessionId}.jsonl`)), rollout);
 });
 
 test("re-importing over a session file we staged earlier replaces it", () => {
@@ -384,6 +428,14 @@ for (const [label, evilId] of [
   ["a sessionId containing a newline", "abc\ndef"],
   ["an over-long sessionId", "a".repeat(200)],
   ["a non-string sessionId", 12345],
+  // F1(b), the exact value the CLI used to derive from a rollout FILENAME.
+  // The old local allow-list here accepted it happily, staged the transcript,
+  // and `createJob` then rejected it 400 `resumeSessionId is invalid` — a
+  // handoff that imported cleanly and could never be continued. Refusing it
+  // at staging time is the honest answer; the CLI no longer produces it.
+  ["a Codex rollout FILENAME fragment (timestamp + uuid)", "2026-08-12T09-30-00-0199e1a2-1111-4222-8333-444455556666"],
+  ["an uppercase UUID", "11111111-2222-4333-8444-55555555555A"],
+  ["a 35-character near-miss", "1111111-2222-4333-8444-555555555555"],
 ]) {
   test(`importSession rejects ${label}, on both branches`, () => {
     for (const attack of [attackClaude, attackCodex]) {
@@ -395,6 +447,48 @@ for (const [label, evilId] of [
     }
   });
 }
+
+// F1(b): what this module STAGES and what `createJob` will RESUME must be the
+// same set of strings. They were not — this module's allow-list was
+// `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` and the resume gate's was
+// `^[a-f0-9-]{36}$` — so ids in the gap between them were staged successfully
+// and then rejected forever. There is now one definition (src/sessionid.mjs)
+// and this test is what stops a second one growing back here.
+test("what importSession stages is exactly what the shared contract calls resumable", () => {
+  const probes = [
+    "11111111-2222-4333-8444-555555555555",
+    "0199aaaa-bbbb-4ccc-8ddd-eeeeffff0000",
+    "------------------------------------",
+    "2026-08-12T09-30-00-0199e1a2-1111-4222-8333-444455556666",
+    "aaaa1111",
+    "rollout-2026-08-12",
+    "session.jsonl",
+    "11111111-2222-4333-8444-55555555555A",
+    // Deliberately no "" / null here: a falsy sessionId means "there is no
+    // session", which correctly takes the summary-primed path instead of the
+    // staging path, and that is a different question from this one.
+    "..",
+  ];
+  for (const probe of probes) {
+    const a = arena();
+    const staged = attempt(attackClaude(a, probe)) === null;
+    assert.equal(
+      staged,
+      isResumableSessionId(probe),
+      `importSession and isResumableSessionId disagree about ${JSON.stringify(probe)} ` +
+        `(staged=${staged}, resumable=${isResumableSessionId(probe)}) — that gap IS the Codex Continue bug`,
+    );
+  }
+});
+
+test("the shared session-id contract is the one createJob's gate applies, character for character", () => {
+  // Pinned as a literal, on purpose: `isSafeJobId` (util.mjs) and
+  // `cleanOptionalSessionId` (threads.mjs) both delegate to this regex, and
+  // neither can be imported here without dragging config.mjs's import-time
+  // mkdir into a unit test. If someone widens one of them, they have to come
+  // through this line.
+  assert.equal(String(RESUMABLE_SESSION_ID_RE), String(/^[a-f0-9-]{36}$/));
+});
 
 test("the refusal message never echoes back an unbounded slab of attacker input", () => {
   const a = arena();
@@ -1011,12 +1105,12 @@ test("an existing jail root with a loose mode is repaired to 0700, not just leve
 });
 
 // ---------------------------------------------------------------------------
-// rewriteClaudeSession
+// rewriteSessionCwd
 
-test("rewriteClaudeSession treats a $-bearing toCwd as a literal replacement, not a replace-pattern", () => {
+test("rewriteSessionCwd treats a $-bearing toCwd as a literal replacement, not a replace-pattern", () => {
   // String.prototype.replace gives $&, $`, $', $1... special meaning in a
   // *string* replacement (insert the match / pre-match / post-match / a
-  // capture group). rewriteClaudeSession must never interpret toCwd that way.
+  // capture group). rewriteSessionCwd must never interpret toCwd that way.
   const weirdCwds = {
     "$&": `${TO_CWD}-$&-marker`,
     "$`": "$`-" + TO_CWD,
@@ -1025,25 +1119,25 @@ test("rewriteClaudeSession treats a $-bearing toCwd as a literal replacement, no
   };
   for (const [label, weirdToCwd] of Object.entries(weirdCwds)) {
     const text = JSON.stringify({ cwd: FROM_CWD, message: `working in ${FROM_CWD}` });
-    const rewritten = rewriteClaudeSession(text, { fromCwd: FROM_CWD, toCwd: weirdToCwd });
+    const rewritten = rewriteSessionCwd(text, { fromCwd: FROM_CWD, toCwd: weirdToCwd });
     assert.ok(rewritten.includes(weirdToCwd), `[${label}] replacement text must appear verbatim, got: ${rewritten}`);
     assert.ok(!rewritten.includes(FROM_CWD), `[${label}] no laptop path should survive the rewrite`);
   }
 });
 
-test("rewriteClaudeSession does not corrupt sibling paths that share a prefix", () => {
+test("rewriteSessionCwd does not corrupt sibling paths that share a prefix", () => {
   // Real sibling directory names routinely start with these characters, so
   // they must NOT be treated as a path boundary.
   const siblings = ["-old", "ground", "+plus", "~1", "(copy)", "@2", ".bak", "_tmp", "#3", "[1]"];
   for (const suffix of siblings) {
     const sibling = `${FROM_CWD}${suffix}`;
     const text = JSON.stringify({ path: sibling });
-    const rewritten = rewriteClaudeSession(text, { fromCwd: FROM_CWD, toCwd: TO_CWD });
+    const rewritten = rewriteSessionCwd(text, { fromCwd: FROM_CWD, toCwd: TO_CWD });
     assert.equal(JSON.parse(rewritten).path, sibling, `sibling must survive untouched: ${sibling}`);
   }
 });
 
-test("rewriteClaudeSession leaves no laptop path behind in any realistic JSONL context", () => {
+test("rewriteSessionCwd leaves no laptop path behind in any realistic JSONL context", () => {
   // The laptop absolute path contains the user's real username, and the whole
   // point of the rewrite is that it does not reach the sandbox. A transcript
   // is mostly stack traces, grep output, shell lines and prose, so the
@@ -1077,13 +1171,13 @@ test("rewriteClaudeSession leaves no laptop path behind in any realistic JSONL c
     ["caret (shell job control)", `${FROM_CWD}^`],
   ];
   for (const [label, text] of contexts) {
-    const rewritten = rewriteClaudeSession(text, { fromCwd: FROM_CWD, toCwd: TO_CWD });
+    const rewritten = rewriteSessionCwd(text, { fromCwd: FROM_CWD, toCwd: TO_CWD });
     assert.ok(!rewritten.includes(FROM_CWD), `[${label}] laptop path leaked: ${rewritten}`);
     assert.ok(rewritten.includes(TO_CWD), `[${label}] sandbox path missing: ${rewritten}`);
   }
 });
 
-test("rewriteClaudeSession deliberately leaves `$` unterminated (documented trade-off, not a regression)", () => {
+test("rewriteSessionCwd deliberately leaves `$` unterminated (documented trade-off, not a regression)", () => {
   // M-2: `$` is the one character of the four flagged by the review that is
   // NOT added to PATH_TERMINATOR — a transcript showing shell-style
   // concatenation directly after the path ("${FROM_CWD}$SUFFIX") is at least
@@ -1093,11 +1187,11 @@ test("rewriteClaudeSession deliberately leaves `$` unterminated (documented trad
   // choice on purpose, not by accident.
   const sibling = `${FROM_CWD}$tmp`;
   const text = JSON.stringify({ path: sibling });
-  const rewritten = rewriteClaudeSession(text, { fromCwd: FROM_CWD, toCwd: TO_CWD });
+  const rewritten = rewriteSessionCwd(text, { fromCwd: FROM_CWD, toCwd: TO_CWD });
   assert.equal(JSON.parse(rewritten).path, sibling, "a `$`-prefixed continuation is left untouched, by design");
 });
 
-test("rewriteClaudeSession works LINE BY LINE, because the only real input is multi-line JSONL", () => {
+test("rewriteSessionCwd works LINE BY LINE, because the only real input is multi-line JSONL", () => {
   // The `m` flag is load-bearing: without it, the end-of-input clause is dead
   // code for every input this function actually sees in production, and a test
   // built on a single-line fixture asserts a behaviour that does not exist.
@@ -1109,20 +1203,20 @@ test("rewriteClaudeSession works LINE BY LINE, because the only real input is mu
     JSON.stringify({ type: "user", text: `cd ${FROM_CWD}; make` }),
   ].join("\n") + "\n";
 
-  const rewritten = rewriteClaudeSession(jsonl, { fromCwd: FROM_CWD, toCwd: TO_CWD });
+  const rewritten = rewriteSessionCwd(jsonl, { fromCwd: FROM_CWD, toCwd: TO_CWD });
   assert.ok(!rewritten.includes(FROM_CWD), `laptop path survived multi-line rewrite:\n${rewritten}`);
   assert.equal(rewritten.split("\n").length, jsonl.split("\n").length, "line structure must be preserved");
   assert.equal(JSON.parse(rewritten.split("\n")[0]).cwd, TO_CWD);
   assert.doesNotThrow(() => JSON.parse(rewritten.split("\n")[1]));
 });
 
-test("rewriteClaudeSession still rewrites all legitimate boundary cases and stays valid JSON", () => {
+test("rewriteSessionCwd still rewrites all legitimate boundary cases and stays valid JSON", () => {
   const text = JSON.stringify({
     subpath: `${FROM_CWD}/src/a.ts`,
     end: FROM_CWD,
     quoted: `prefix ${FROM_CWD}" suffix`,
   });
-  const rewritten = rewriteClaudeSession(text, { fromCwd: FROM_CWD, toCwd: TO_CWD });
+  const rewritten = rewriteSessionCwd(text, { fromCwd: FROM_CWD, toCwd: TO_CWD });
   assert.doesNotThrow(() => JSON.parse(rewritten), "output must still parse as JSON");
   const parsed = JSON.parse(rewritten);
 
@@ -1131,14 +1225,14 @@ test("rewriteClaudeSession still rewrites all legitimate boundary cases and stay
   assert.equal(parsed.quoted, `prefix ${TO_CWD}" suffix`);
 });
 
-test("rewriteClaudeSession escapes regex metacharacters in fromCwd", () => {
+test("rewriteSessionCwd escapes regex metacharacters in fromCwd", () => {
   const metaFrom = "/Users/dev/code/relay+old.checkout";
   const text = JSON.stringify({
     exact: metaFrom,
     sub: `${metaFrom}/file.ts`,
     sibling: `${metaFrom}-sibling`,
   });
-  const rewritten = rewriteClaudeSession(text, { fromCwd: metaFrom, toCwd: TO_CWD });
+  const rewritten = rewriteSessionCwd(text, { fromCwd: metaFrom, toCwd: TO_CWD });
   const parsed = JSON.parse(rewritten);
 
   assert.equal(parsed.exact, TO_CWD);
@@ -1146,9 +1240,9 @@ test("rewriteClaudeSession escapes regex metacharacters in fromCwd", () => {
   assert.equal(parsed.sibling, `${metaFrom}-sibling`, "sibling must survive even with metacharacters in fromCwd");
 });
 
-test("rewriteClaudeSession still rewrites a cwd immediately followed by sentence-ending punctuation", () => {
+test("rewriteSessionCwd still rewrites a cwd immediately followed by sentence-ending punctuation", () => {
   const text = `working in ${FROM_CWD}.`;
-  const rewritten = rewriteClaudeSession(text, { fromCwd: FROM_CWD, toCwd: TO_CWD });
+  const rewritten = rewriteSessionCwd(text, { fromCwd: FROM_CWD, toCwd: TO_CWD });
   assert.equal(rewritten, `working in ${TO_CWD}.`);
   assert.ok(!rewritten.includes(FROM_CWD), "no laptop path should survive the rewrite");
 });
@@ -1158,25 +1252,25 @@ test("a non-string manifest.cwd is a named refusal, not a raw TypeError", () => 
   // one used to reach `.replace()` and die with an implementation detail the
   // caller could not tell from a bug.
   for (const bad of [12345, {}, [], true]) {
-    assertRefused(() => rewriteClaudeSession("x", { fromCwd: bad, toCwd: TO_CWD }), "unsafe_manifest_cwd");
+    assertRefused(() => rewriteSessionCwd("x", { fromCwd: bad, toCwd: TO_CWD }), "unsafe_manifest_cwd");
   }
-  assertRefused(() => rewriteClaudeSession("x", { fromCwd: FROM_CWD, toCwd: 7 }), "unsafe_worktree_path");
+  assertRefused(() => rewriteSessionCwd("x", { fromCwd: FROM_CWD, toCwd: 7 }), "unsafe_worktree_path");
   // ...but an absent cwd is legitimate (a manifest with no cwd needs no rewrite).
-  assert.equal(rewriteClaudeSession("x", { fromCwd: undefined, toCwd: TO_CWD }), "x");
-  assert.equal(rewriteClaudeSession("x", { fromCwd: null, toCwd: TO_CWD }), "x");
-  assert.equal(rewriteClaudeSession("x", { fromCwd: "", toCwd: TO_CWD }), "x");
+  assert.equal(rewriteSessionCwd("x", { fromCwd: undefined, toCwd: TO_CWD }), "x");
+  assert.equal(rewriteSessionCwd("x", { fromCwd: null, toCwd: TO_CWD }), "x");
+  assert.equal(rewriteSessionCwd("x", { fromCwd: "", toCwd: TO_CWD }), "x");
 });
 
-test("rewriteClaudeSession is not an unbounded memory amplifier", () => {
+test("rewriteSessionCwd is not an unbounded memory amplifier", () => {
   const big = "x".repeat(200_000);
   // A one-character "cwd" would rewrite every single character of the
   // transcript — measured at 58x on a hostile manifest.
-  assert.equal(rewriteClaudeSession(big, { fromCwd: "x", toCwd: "y".repeat(60) }).length, big.length);
+  assert.equal(rewriteSessionCwd(big, { fromCwd: "x", toCwd: "y".repeat(60) }).length, big.length);
   // Anything that could still blow past the ceiling is refused up front.
   assertRefused(
-    () => rewriteClaudeSession(big, { fromCwd: "xx", toCwd: "y".repeat(4000) }),
+    () => rewriteSessionCwd(big, { fromCwd: "xx", toCwd: "y".repeat(4000) }),
     "session_rewrite_too_large",
   );
   // A realistic cwd/worktree pair is nowhere near the ceiling.
-  assert.doesNotThrow(() => rewriteClaudeSession(big, { fromCwd: FROM_CWD, toCwd: TO_CWD }));
+  assert.doesNotThrow(() => rewriteSessionCwd(big, { fromCwd: FROM_CWD, toCwd: TO_CWD }));
 });

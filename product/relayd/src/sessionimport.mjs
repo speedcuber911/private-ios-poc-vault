@@ -1,10 +1,20 @@
 // relayd sessionimport.mjs — stage a handed-off session so the harness's own
 // resume mechanism continues the conversation on this node.
 //
-// Claude Code keys sessions by the absolute working directory, so its transcript
-// is rewritten from the laptop path to the sandbox checkout. Codex replays a
-// rollout by id and needs no rewriting. Cursor has no portable session file, so
-// it takes the primed-prompt path — stated plainly rather than faked.
+// Claude Code keys sessions by the absolute working directory; Codex replays a
+// rollout by id but records the working directory in the rollout's
+// `session_meta` line. BOTH are rewritten from the laptop path to the sandbox
+// checkout, for two reasons that apply equally to both formats: relayd's own
+// resume gate (`threads.resumeMetaBelongsToWorkspace`, reached from
+// `jobs.createJob`) resolves that recorded cwd and refuses 400 `session does
+// not belong to workspace` when it names a directory that does not exist here,
+// and an un-rewritten laptop path carries the user's real username into the
+// sandbox — the exact leak the PATH_TERMINATOR/CWD_BOUNDARY apparatus below
+// exists to prevent. An earlier version of this header said Codex "needs no
+// rewriting"; that was true of Codex's own resume mechanism and false of
+// everything downstream of it, and it is why Continue was broken for every
+// Codex handoff. Cursor has no portable session file, so it takes the
+// primed-prompt path — stated plainly rather than faked.
 //
 // ---------------------------------------------------------------------------
 // THREAT MODEL — read this before changing anything below.
@@ -111,10 +121,17 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 
+// The ONE definition of a resumable session id, shared with `isSafeJobId` and
+// therefore with `threads.cleanOptionalSessionId` — the validator that used to
+// disagree with this module's own and made every Codex handoff unresumable.
+// sessionid.mjs is deliberately dependency-free so importing it here does not
+// drag relayd's runtime configuration into this jail module.
+import { isResumableSessionId } from "./sessionid.mjs";
+
 const HANDOFF_MANIFEST_VERSION = 1;
 
 // A rewritten transcript is bounded so a hostile manifest cannot turn a small
-// upload into a multi-hundred-megabyte allocation (see rewriteClaudeSession).
+// upload into a multi-hundred-megabyte allocation (see rewriteSessionCwd).
 const MAX_REWRITTEN_BYTES = 256 * 1024 * 1024;
 
 // Every refusal in this module is this one class, with a machine-readable
@@ -160,12 +177,6 @@ function guarded(code, detail, fn) {
   }
 }
 
-// Claude session ids are UUIDs; Codex rollout ids are hex-ish. Both fit this
-// shared allow-list. manifest.sessionId crossed a machine boundary, so it is
-// untrusted input — reject anything that isn't a plain, single-segment token
-// before it ever touches a filesystem path.
-const SAFE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-
 // The id is echoed back so an operator can see what was rejected, but it is
 // attacker-controlled and can be 4 KB long, so it is clipped first.
 function redactUntrusted(value) {
@@ -174,15 +185,23 @@ function redactUntrusted(value) {
   return JSON.stringify(clipped);
 }
 
+// `manifest.sessionId` crossed a machine boundary, so it is untrusted input:
+// reject anything that is not a resumable session id before it ever touches a
+// filesystem path.
+//
+// This used to be a LOCAL allow-list (`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+// that was ~100 characters more permissive than the one `createJob` applies to
+// the very same value moments later, so this module cheerfully staged ids that
+// could never be resumed. It now defers to the single shared contract in
+// sessionid.mjs, which makes "staged here" and "resumable there" the same set.
+//
+// That is a NARROWING, never a widening: the shared predicate is 36 lowercase
+// hex-or-dash characters, so it already excludes — by construction, not by a
+// second check bolted on top — `..`, `/`, `\`, NUL, newline, a leading `.`,
+// every non-ASCII byte, and anything longer than 36 bytes. The traversal tests
+// below assert exactly that, on both branches.
 function assertSafeSessionId(sessionId) {
-  if (
-    typeof sessionId !== "string" ||
-    sessionId === ".." ||
-    sessionId.includes("..") ||
-    sessionId.includes("/") ||
-    sessionId.includes("\\") ||
-    !SAFE_SESSION_ID.test(sessionId)
-  ) {
+  if (!isResumableSessionId(sessionId)) {
     throw refuse("unsafe_session_id", redactUntrusted(sessionId));
   }
   return sessionId;
@@ -282,7 +301,12 @@ const PATH_TERMINATOR = String.raw`[/"'\\\s\x60,;:!?=|&>)\]}*%^]`;
 // test for this case is deliberately written on multi-line input.
 const CWD_BOUNDARY = String.raw`(?=${PATH_TERMINATOR}|\.+(?:${PATH_TERMINATOR}|$)|$)`;
 
-function rewriteClaudeSession(text, { fromCwd, toCwd }) {
+// Named for what it does, not for one of its two callers: it retargets an
+// absolute cwd inside a transcript, and BOTH the Claude and the Codex branch
+// need that (see the module header). It was called `rewriteClaudeSession` while
+// the Codex branch skipped it entirely, which is how the laptop path kept
+// reaching the sandbox in a rollout.
+function rewriteSessionCwd(text, { fromCwd, toCwd }) {
   if (fromCwd === undefined || fromCwd === null || fromCwd === "") return text;
   // Every other untrusted manifest field gets a typed, named rejection; this
   // one used to reach `.replace()` unchecked and die with a raw TypeError a
@@ -680,7 +704,7 @@ function importSession({ manifest, sessionBytes, runHome, codexHome, worktreePat
 
   if (sessionBytes && manifest.sessionFormat === "claude-jsonl" && manifest.sessionId) {
     const sessionId = assertSafeSessionId(manifest.sessionId);
-    const rewritten = rewriteClaudeSession(sessionBytes.toString("utf8"), {
+    const rewritten = rewriteSessionCwd(sessionBytes.toString("utf8"), {
       fromCwd: manifest.cwd,
       toCwd: worktreePath,
     });
@@ -695,11 +719,21 @@ function importSession({ manifest, sessionBytes, runHome, codexHome, worktreePat
 
   if (sessionBytes && manifest.sessionFormat === "codex-rollout" && manifest.sessionId) {
     const sessionId = assertSafeSessionId(manifest.sessionId);
+    // A Codex rollout is resumed BY ID, so this rewrite is not what makes the
+    // resume work — but `threads.readSessionMeta` reads `payload.cwd` out of
+    // this very file and `jobs.createJob` refuses the resume 400 unless that
+    // path resolves to the workspace being resumed into. Leaving the laptop
+    // path here is therefore both a hard functional break and the same
+    // username leak the Claude branch has always rewritten away.
+    const rewritten = rewriteSessionCwd(sessionBytes.toString("utf8"), {
+      fromCwd: manifest.cwd,
+      toCwd: worktreePath,
+    });
     stageSessionFile({
       jailRoot: codexHome,
       components: ["sessions"],
       leafName: `${sessionId}.jsonl`,
-      contents: sessionBytes,
+      contents: rewritten,
     });
     return { provider: "codex", requestedHarness, resumeSessionId: sessionId, primedPrompt: null };
   }
@@ -712,7 +746,7 @@ export {
   SessionImportSecurityError,
   assertContained,
   claudeProjectSlug,
-  rewriteClaudeSession,
+  rewriteSessionCwd,
   summaryPrompt,
   importSession,
 };
