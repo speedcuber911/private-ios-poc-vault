@@ -38,6 +38,58 @@ function nodeRequestSigningInput({ method, pathWithQuery, ts, nodeId }) {
   return Buffer.from(`${NODE_REQUEST_LABEL}\n${method.toUpperCase()}\n${pathWithQuery}\n${nodeId}\n${ts}`, "utf8");
 }
 
+// Cloud commit 59ae640: POST /v1/node/handoffs/:id/fail (product/cloud/src/
+// server.js) accepts exactly these five HANDOFF_FAILURE_REASONS codes and
+// 400s anything else — a closed vocabulary, not a sanitiser, because the
+// cloud is content-free by design and a free-text reason from the node is
+// exactly the leak that allow-list exists to prevent. relayd's own
+// PUBLIC_REASONS (handoff.mjs) has 33 finer-grained codes; this table is the
+// one place that coarsens them down to the cloud's five, so it is
+// authoritative, not merely a convenience mirror of some other source.
+const RELAYD_TO_CLOUD_FAILURE_REASON = {
+  clone_failed: "clone_failed",
+
+  no_encryption_key: "decrypt_failed",
+  seal_bad_magic: "decrypt_failed",
+  seal_truncated: "decrypt_failed",
+  seal_decrypt_failed: "decrypt_failed",
+
+  invalid_handoff_id: "manifest_invalid",
+  invalid_repo: "manifest_invalid",
+  invalid_branch: "manifest_invalid",
+  manifest_missing: "manifest_invalid",
+  manifest_unreadable: "manifest_invalid",
+  manifest_too_large: "manifest_invalid",
+  manifest_invalid: "manifest_invalid",
+  manifest_id_mismatch: "manifest_invalid",
+  unsupported_manifest_version: "manifest_invalid",
+  blob_outside_checkout: "manifest_invalid",
+  blob_too_large: "manifest_invalid",
+  blob_unreadable: "manifest_invalid",
+
+  jail_root_unusable: "workspace_failed",
+  checkout_create_failed: "workspace_failed",
+  checkout_publish_failed: "workspace_failed",
+  checkout_escaped_jail: "workspace_failed",
+  checkout_missing: "workspace_failed",
+  session_staging_failed: "workspace_failed",
+  workspace_registration_failed: "workspace_failed",
+  store_write_failed: "workspace_failed",
+};
+
+// The default matters more than the table: everything not listed above —
+// internal_error itself, the push-back codes, the jobs-engine job_* codes, a
+// code relayd coins later that this table has never seen, a non-string,
+// null, undefined, or "" — becomes internal_error rather than being sent
+// raw or skipped. Sending a raw unmapped code gets a 400 from the cloud's
+// allow-list; skipping the report leaves the handoff `delivered` forever.
+// Either way the terminal state is lost, which is the exact failure this
+// function exists to close.
+function mapFailureReason(relaydCode) {
+  if (typeof relaydCode !== "string") return "internal_error";
+  return RELAYD_TO_CLOUD_FAILURE_REASON[relaydCode] ?? "internal_error";
+}
+
 function createCloudClient({
   cloudUrl,
   baseDir = undefined,
@@ -187,6 +239,47 @@ function createCloudClient({
     }
   }
 
+  async function reportHandoffFailureOnce(handoffId, cloudReason) {
+    const pathWithQuery = `/v1/node/handoffs/${handoffId}/fail`;
+    const res = await fetchImpl(`${base}${pathWithQuery}`, {
+      method: "POST",
+      headers: { ...signedHeaders("POST", pathWithQuery), "content-type": "application/json" },
+      body: JSON.stringify({ reason: cloudReason }),
+    });
+    // The response body (`{handoff:{...}}` on success) is not consulted,
+    // same as ackHandoffsOnce: the status code alone decides the outcome
+    // here. Still drained so the connection isn't left with an unread body.
+    await res.json().catch(() => null);
+    return res.status;
+  }
+
+  // Deliberately different from ackDelivery/ackHandoffsOnce above, which
+  // this is otherwise modeled on: the ack has no permanent-failure response
+  // to distinguish, so it retries any non-200 unconditionally. This route
+  // does — `400 invalid_reason` and `404 unknown_handoff` are terminal
+  // outcomes of this exact (handoffId, reason) pair, not transient
+  // conditions, and retrying one burns the replay guard's budget for a
+  // request that cannot succeed. Only a thrown transport error or a 5xx is
+  // worth another attempt, bounded by the same ceiling the ack uses. Never
+  // throws: the caller (part B, dispatched separately) is already on a
+  // failure path, and an exception here would replace a reported failure
+  // with an unreported crash.
+  async function reportHandoffFailure(handoffId, reason) {
+    const cloudReason = mapFailureReason(reason);
+    for (let attempt = 1; attempt <= HANDOFF_ACK_MAX_ATTEMPTS; attempt++) {
+      try {
+        const status = await reportHandoffFailureOnce(handoffId, cloudReason);
+        if (status === 200) return true;
+        if (status >= 400 && status < 500) return false;
+        // Anything else (5xx, or a malformed status this code has not seen)
+        // falls through to the next bounded attempt.
+      } catch {
+        // Transport failure: bounded by the loop, same as ackDelivery.
+      }
+    }
+    return false;
+  }
+
   function ackableFrom(entries) {
     return (Array.isArray(entries) ? entries : [])
       .filter((entry) => entry && typeof entry.id === "string" && typeof entry.lease === "string")
@@ -302,7 +395,7 @@ function createCloudClient({
     return result;
   }
 
-  return { nodeId, pollHandoffs, postEvent };
+  return { nodeId, pollHandoffs, postEvent, reportHandoffFailure };
 }
 
-export { createCloudClient, nodeRequestSigningInput };
+export { createCloudClient, nodeRequestSigningInput, mapFailureReason };

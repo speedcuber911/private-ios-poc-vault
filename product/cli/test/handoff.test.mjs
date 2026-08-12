@@ -9,12 +9,26 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-const { cmdHandoff, handoffBranchName } = await import("../src/commands/handoff.mjs");
+const { cmdHandoff, handoffBranchName, isSecretPath } = await import("../src/commands/handoff.mjs");
 const { writeCredentials } = await import("../src/creds.mjs");
 const { generateEncKeyPair, openSealed, SEAL_MAGIC } = await import("../src/seal.mjs");
 const { claudeProjectSlug } = await import("../src/sessions.mjs");
 
 process.env.RELAY_ALLOW_LOCAL_REMOTE = "1";
+
+// F-5 — private TMPDIR for the whole run, the same fix the sibling e2e file
+// already carries and whose comment names THIS file as the other half that
+// still needed it. `cmdHandoff` builds its commit against a throwaway index in
+// `fs.mkdtemp(os.tmpdir(), "relay-handoff-index-")`, and two tests below
+// assert on what is present in os.tmpdir() while a handoff is in flight. Run
+// under `node --test test/` those tests watch the SHARED /tmp and see the
+// e2e file's own transient index directory, created concurrently by another
+// process — measured at 6 failures in 60 runs. `os.tmpdir()` re-reads TMPDIR
+// on every call, so pointing it at a directory only this process writes to
+// makes the observation about this flow and nothing else. Set before any test
+// runs, and before anything here calls os.tmpdir().
+const privateTmp = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-handoff-tmp-"));
+process.env.TMPDIR = privateTmp;
 
 // A marker distinctive enough that it can only have come from the raw
 // transcript, used to prove the pushed session.enc blob is ciphertext (I3):
@@ -587,4 +601,267 @@ test("a failed session-index publish is reported to the user without failing the
   assert.equal(result.pushed, true, "the handoff itself is still reported as succeeded");
   assert.match(lines.join("\n"), /could not update the "On your Mac" session list/i,
     "the failure is visible to the user, not silently swallowed");
+});
+
+// ---------------------------------------------------------------------------
+// F-1 — secret-shaped files must not leave the laptop.
+//
+// The whole-branch security review pushed three files to a real remote with
+// the previous `git add -A`: an untracked `.env`, a TRACKED `.env.example`
+// the developer had filled in locally, and an `.ssh/id_rsa`. GitHub history is
+// not revocable, so this was the worst possible destination. Every test below
+// follows this file's own rule for escape assertions: the marker is searched
+// for across EVERY OBJECT in the pushed repository, never against a list of
+// expected paths, because a name-based assertion can be dodged by a name it
+// did not think of.
+
+const SECRET_CANARY = "zqxHANDOFFSECRETzqx-4c71e";
+
+// The reviewer's exact demonstration, rebuilt: a repo with no .gitignore, one
+// tracked-and-modified secret-shaped file and two untracked ones.
+async function scenarioWithSecrets() {
+  const s = await scenario({ withSession: false });
+  const git = (...args) => execFileAsync("git", ["-C", s.work, ...args]);
+
+  // Tracked and committed with a benign value — this is the file `.gitignore`
+  // can never protect, because `git add -A` stages a TRACKED file's
+  // modifications regardless of any ignore rule.
+  fs.writeFileSync(path.join(s.work, ".env.example"), "API_KEY=\n");
+  await git("add", "-A");
+  await git("commit", "-qm", "track .env.example");
+  await git("push", "-q", "origin", "main");
+
+  fs.writeFileSync(path.join(s.work, ".env.example"), `API_KEY=${SECRET_CANARY}\n`);
+  fs.writeFileSync(path.join(s.work, ".env"), `LIVE_KEY=${SECRET_CANARY}\n`);
+  fs.mkdirSync(path.join(s.work, ".ssh"), { recursive: true });
+  fs.writeFileSync(path.join(s.work, ".ssh", "id_rsa"), `-----BEGIN OPENSSH PRIVATE KEY-----\n${SECRET_CANARY}\n`);
+  return s;
+}
+
+// Every object in the repository — blobs, trees, commits, tags — dumped and
+// searched for `marker`. Not "is .env in ls-tree": a leak under any other name,
+// in a tree entry, or in a commit message is caught by the same call.
+async function repoObjectsContain(bare, marker) {
+  const { stdout } = await execFileAsync(
+    "git", ["-C", bare, "cat-file", "--batch-all-objects", "--batch"],
+    { encoding: "buffer", maxBuffer: 128 * 1024 * 1024 },
+  );
+  return stdout.includes(Buffer.from(marker, "utf8"));
+}
+
+async function namedLeaks(bare, marker) {
+  const { stdout } = await execFileAsync(
+    "git", ["-C", bare, "cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)"],
+  );
+  const leaks = [];
+  for (const line of stdout.split("\n").filter(Boolean)) {
+    const [sha, type] = line.split(" ");
+    if (type !== "blob") continue;
+    const { stdout: body } = await execFileAsync("git", ["-C", bare, "cat-file", "blob", sha], { encoding: "buffer" });
+    if (body.includes(Buffer.from(marker, "utf8"))) leaks.push(sha);
+  }
+  return leaks;
+}
+
+async function branchFileList(bare, branch) {
+  const { stdout } = await execFileAsync("git", ["-C", bare, "ls-tree", "-r", "--name-only", branch]);
+  return stdout.split("\n").filter(Boolean);
+}
+
+test("F-1: an untracked .env, a tracked-and-modified .env.example and an .ssh/id_rsa never reach the remote", async () => {
+  const s = await scenarioWithSecrets();
+  const before = await repoSnapshot(s.work);
+  const lines = [];
+
+  const result = await cmdHandoff([], {
+    home: s.home, cwd: s.work, baseUrl: "https://cloud.test", fetchImpl: s.fetchImpl,
+    log: (line) => lines.push(line), machine: "MacBook-Pro",
+  });
+
+  // Withholding, not refusing: a repo with a .env is the ordinary case, and a
+  // handoff that fails outright on the shut-the-laptop path is a handoff that
+  // gets worked around.
+  assert.equal(result.pushed, true, "the handoff still succeeds");
+
+  assert.equal(await repoObjectsContain(s.bare, SECRET_CANARY), false,
+    "the canary must not appear in ANY object of the pushed repository");
+  assert.deepEqual(await namedLeaks(s.bare, SECRET_CANARY), [], "no pushed blob carries the canary");
+
+  const pushed = await branchFileList(s.bare, result.branch);
+  assert.ok(!pushed.includes(".env"), ".env must not be in the pushed tree");
+  assert.ok(!pushed.includes(".ssh/id_rsa"), ".ssh/id_rsa must not be in the pushed tree");
+  assert.ok(pushed.includes("wip.txt"), "the legitimate work still travelled");
+  // .env.example is already a committed file, so the branch necessarily
+  // carries HEAD's version of it — the whole point is that the local
+  // modification (the only place the canary lives) did not travel.
+  const { stdout: onRemote } = await execFileAsync("git", ["-C", s.bare, "show", `${result.branch}:.env.example`]);
+  assert.equal(onRemote, "API_KEY=\n", "the remote still has HEAD's benign version, not the filled-in one");
+
+  // Withholding must never mean deleting, and the command must still not
+  // disturb the tree it was run in.
+  assert.equal(fs.readFileSync(path.join(s.work, ".env"), "utf8"), `LIVE_KEY=${SECRET_CANARY}\n`);
+  const after = await repoSnapshot(s.work);
+  assert.equal(after.symbolicRef, before.symbolicRef, "HEAD still points at the same branch ref");
+  assert.equal(after.head, before.head, "the starting branch's commit did not move");
+  assert.equal(after.porcelain.toString(), before.porcelain.toString(), "git status is byte-identical before and after");
+  assert.deepEqual(after.files, before.files, "every file's content hash on disk is unchanged");
+});
+
+test("F-1: what was withheld is reported to the user, never silently dropped", async () => {
+  const s = await scenarioWithSecrets();
+  const lines = [];
+
+  await cmdHandoff([], {
+    home: s.home, cwd: s.work, baseUrl: "https://cloud.test", fetchImpl: s.fetchImpl,
+    log: (line) => lines.push(line), machine: "MacBook-Pro",
+  });
+
+  const output = lines.join("\n");
+  assert.match(output, /Withheld 3 secret-shaped files/, "the count is stated");
+  for (const withheld of [".env", ".env.example", ".ssh/id_rsa"]) {
+    assert.ok(output.split("\n").some((line) => line.trim() === withheld),
+      `${withheld} must be named in the report — a handoff that quietly drops a file is its own failure`);
+  }
+  assert.match(output, /NOT committed and NOT pushed/);
+});
+
+test("F-1: --no-push reports the withheld files too, before anything is committed", async () => {
+  const s = await scenarioWithSecrets();
+  const lines = [];
+
+  const result = await cmdHandoff(["--no-push"], {
+    home: s.home, cwd: s.work, baseUrl: "https://cloud.test", fetchImpl: s.fetchImpl,
+    log: (line) => lines.push(line), machine: "MacBook-Pro",
+  });
+
+  assert.equal(result.pushed, false);
+  assert.match(lines.join("\n"), /Withheld 3 secret-shaped files/);
+});
+
+// Layer 2. Layer 1 filters the paths `git status` reported, once; this checks
+// the paths that ACTUALLY reached the index, which is a different input — a
+// path reported as a plain file can be a directory full of secrets by the time
+// `git add` reaches it (the user's editor, a build, the agent that is still
+// running are all writing to this tree). Driven deterministically with a `git`
+// shim first on PATH that performs the swap the instant the real `git status`
+// returns, so the window does not have to be won by racing.
+test("F-1 layer 2: a secret that reaches the index by a path layer 1 never saw aborts the handoff", async () => {
+  const s = await scenario({ withSession: false });
+  const { stdout: realGit } = await execFileAsync("which", ["git"]);
+  const shimDir = path.join(s.root, "shim");
+  fs.mkdirSync(shimDir, { recursive: true });
+  const trap = path.join(s.work, "wip.txt"); // reported by status as a plain file
+  fs.writeFileSync(
+    path.join(shimDir, "git"),
+    `#!/usr/bin/env node
+const { spawnSync } = require("node:child_process");
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const result = spawnSync(${JSON.stringify(realGit.trim())}, args, { stdio: "inherit" });
+if (args.includes("status")) {
+  fs.rmSync(${JSON.stringify(trap)}, { force: true });
+  fs.mkdirSync(${JSON.stringify(trap)});
+  fs.writeFileSync(${JSON.stringify(path.join(trap, ".env"))}, "LIVE_KEY=${SECRET_CANARY}\\n");
+}
+process.exit(result.status === null ? 1 : result.status);
+`,
+    { mode: 0o755 },
+  );
+  const env = { ...process.env, PATH: `${shimDir}:${process.env.PATH}` };
+  const lines = [];
+
+  await assert.rejects(
+    () => cmdHandoff([], {
+      home: s.home, cwd: s.work, baseUrl: "https://cloud.test", fetchImpl: s.fetchImpl,
+      log: (line) => lines.push(line), machine: "MacBook-Pro", env,
+    }),
+    /refusing_to_push_secret/,
+    "reaching layer 2 means the policy was defeated, not applied — the command ends",
+  );
+
+  assert.deepEqual(s.handoffPings(), [], "nothing was announced to the control plane");
+  const { stdout: branches } = await execFileAsync("git", ["-C", s.bare, "branch", "--list"]);
+  assert.ok(!branches.includes("handoff"), "no handoff branch reached the remote");
+  assert.equal(await repoObjectsContain(s.bare, SECRET_CANARY), false,
+    "the canary must not appear in ANY object of the remote");
+  assert.match(lines.join("\n"), /would have committed: wip\.txt\/\.env/);
+});
+
+// GIT_LITERAL_PATHSPECS. Staging an explicit list instead of `-A` means the
+// paths git status printed are handed back to git as arguments — and without
+// this they are PATHSPECS, not filenames. Both shapes below were live bugs on
+// the sandbox half before the same flag was added there.
+test("F-1: a file named '*' cannot re-glob a withheld secret back into the commit", async () => {
+  const s = await scenario({ withSession: false });
+  fs.writeFileSync(path.join(s.work, ".env"), `LIVE_KEY=${SECRET_CANARY}\n`);
+  fs.writeFileSync(path.join(s.work, "*"), "a file whose name is a glob\n");
+
+  const result = await cmdHandoff([], {
+    home: s.home, cwd: s.work, baseUrl: "https://cloud.test", fetchImpl: s.fetchImpl,
+    log: () => {}, machine: "MacBook-Pro",
+  });
+
+  assert.equal(result.pushed, true);
+  const pushed = await branchFileList(s.bare, result.branch);
+  assert.ok(pushed.includes("*"), "the file literally named '*' is staged as a filename");
+  assert.ok(!pushed.includes(".env"), ".env stays withheld");
+  assert.equal(await repoObjectsContain(s.bare, SECRET_CANARY), false,
+    "a glob-shaped filename must not pull the withheld secret back in");
+});
+
+test("F-1: a file named ':!wip.txt' cannot silently empty the handoff commit", async () => {
+  const s = await scenario({ withSession: false });
+  fs.writeFileSync(path.join(s.work, ":!wip.txt"), "a file whose name is an exclude pathspec\n");
+
+  const result = await cmdHandoff([], {
+    home: s.home, cwd: s.work, baseUrl: "https://cloud.test", fetchImpl: s.fetchImpl,
+    log: () => {}, machine: "MacBook-Pro",
+  });
+
+  const pushed = await branchFileList(s.bare, result.branch);
+  assert.ok(pushed.includes("wip.txt"),
+    "an exclude-shaped filename must not silently cancel the staging of real work");
+  assert.ok(pushed.includes(":!wip.txt"), "and the oddly-named file itself travels as a filename");
+  const { stdout: wipContent } = await execFileAsync("git", ["-C", s.bare, "show", `${result.branch}:wip.txt`]);
+  assert.equal(wipContent, "unfinished work\n");
+});
+
+// The contract itself. Two spellings of "what may leave the machine" WILL
+// drift, and the drift is a live key in unrevocable history — so the rule text
+// is vendored byte-for-byte from relayd's canonical copy, exactly as
+// src/seal.mjs is, and this fails the moment the two stop matching.
+test("F-1: the vendored secret-path policy is byte-identical to relayd's canonical copy", () => {
+  const BEGIN = "// >>> BEGIN SHARED SECRET-PATH POLICY";
+  const END = "// <<< END SHARED SECRET-PATH POLICY <<<";
+  const region = (file) => {
+    const text = fs.readFileSync(file, "utf8");
+    const from = text.indexOf(BEGIN);
+    const to = text.indexOf(END);
+    assert.ok(from !== -1 && to > from, `${file} no longer contains the shared secret-path policy markers`);
+    return text.slice(from, to + END.length);
+  };
+  const here = path.dirname(new URL(import.meta.url).pathname);
+  const vendored = region(path.join(here, "..", "src", "commands", "handoff.mjs"));
+  const canonical = region(path.join(here, "..", "..", "relayd", "src", "handoff.mjs"));
+
+  assert.ok(vendored.includes("SECRET_PATH_RULES"), "the region must actually contain the rules");
+  assert.ok(vendored.includes("function isSecretPath"), "the region must actually contain the predicate");
+  assert.equal(vendored, canonical,
+    "product/cli/src/commands/handoff.mjs has drifted from product/relayd/src/handoff.mjs — copy the canonical region over");
+});
+
+test("F-1: the vendored policy matches by shape, not by the three names that were reported", () => {
+  const denied = [
+    ".env", ".env.local", ".env.example", "sub/dir/.env.production", ".envrc",
+    ".secrets/harness-token.json", "config/secrets.yaml", ".git-credentials", ".netrc",
+    ".npmrc", "app/.aws/credentials", ".ssh/id_ed25519", ".ssh/id_rsa", "keys/server.pem",
+    "certs/tls.key", "svc/service-account-prod.json", ".claude/.credentials.json",
+    "infra/terraform.tfstate",
+  ];
+  const allowed = [
+    "src/index.mjs", "README.md", "environment.md", "docs/env-setup.md", "src/secretsauce.ts",
+    "test/fixtures/keyboard.ts", "pemberton.txt", ".github/workflows/ci.yml", "wip.txt",
+  ];
+  for (const entry of denied) assert.equal(isSecretPath(entry), true, `${entry} must be denied`);
+  for (const entry of allowed) assert.equal(isSecretPath(entry), false, `${entry} must be allowed`);
 });
