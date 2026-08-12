@@ -190,12 +190,12 @@ test("nextSeq persists the seq file via an atomic rename, not an in-place trunca
 // writes remove that collapse mechanism; every seq is seeded from the clock,
 // so a real collision can only tie two writers at a large, clock-plausible
 // value — never a reset to a small one. This test asserts BOTH: the
-// blackhole/reset pattern is gone (deterministic), and collisions are rare
-// compared to the pre-fix collapse (bounded, not zero — this fix does not
-// take a cross-process lock on the seq file, which is out of scope here:
-// see product/relayd/src/config.mjs's own withFileLock, used for exactly
-// this class of problem on the files config.mjs owns, but not exported for
-// this client to reuse).
+// blackhole/reset pattern is gone (deterministic), and — as of the task-11
+// review follow-up wiring nextSeq() through config.mjs's withFileLock — the
+// residual cross-process tie window (independently measured at 57.5%-87.5%
+// distinct across 19 trials of this exact scenario when nextSeq() was
+// unsynchronized) is closed: every event now gets a distinct seq, verified
+// below rather than merely logged.
 test("concurrent postEvent calls from multiple processes never reset to a small/blackhole seq", async () => {
   const node = freshNode();
   const cloud = await startFakeCloud(respondAccepted);
@@ -237,18 +237,21 @@ test("concurrent postEvent calls from multiple processes never reset to a small/
       `no seq may fall back into a small/blackhole range; smallest observed was ${minSeq}, test started at ${testStartedAt}`,
     );
 
-    // Informational, not asserted: real OS process-scheduling timing makes
-    // the exact collision count too noisy to gate the suite on (observed
-    // 57%-91% distinct across repeated local runs). Pre-fix this same
-    // workload collapsed to ~37-47% distinct (45-56/120) because of torn
-    // reads resetting multiple writers to the same small number; post-fix
-    // that collapse mechanism is gone (proved deterministically above and by
-    // the atomic-rename test), and what residual contention remains is the
-    // narrower, inherent read-modify-write race of a lock-free file counter.
+    // Now asserted, not just logged: nextSeq()'s read-modify-write is
+    // serialized across processes with config.mjs's withFileLock (task-11
+    // review follow-up), so every one of the 120 events gets a genuinely
+    // distinct seq — no cross-process tie survives. Pre-fix this same
+    // workload collapsed to ~37-47% distinct (45-56/120) from torn reads
+    // resetting multiple writers to the same small number; that collapse
+    // mechanism was already gone once seq writes became atomic (proved
+    // deterministically above and by the atomic-rename test) but the file
+    // lock is what actually eliminates the READ-then-WRITE race itself,
+    // rather than just narrowing its blast radius.
     const distinct = new Set(seqs).size;
     if (process.env.RELAYD_TEST_VERBOSE) {
       console.log(`[cloudclient race] ${distinct}/${seqs.length} distinct seqs`);
     }
+    assert.equal(distinct, seqs.length, "every concurrent event must get a distinct seq now that nextSeq() is file-locked");
     fs.rmSync(workerPath, { force: true });
   } finally { await cloud.close(); }
 });
@@ -302,6 +305,21 @@ test("postEvent reports accepted:false for a dropped duplicate and accepted:true
 
   const accepted = await client.postEvent("handoff.ready");
   assert.equal(accepted.accepted, true);
+});
+
+// MINOR (task-11 review follow-up): a 202 whose body fails to parse as JSON
+// used to read as accepted:true (parsedBody was null, and `!null?.duplicate`
+// is true) — a malformed-but-202 response was indistinguishable from a
+// genuine accept. It must now read as not-accepted instead.
+test("postEvent reports accepted:false for a 202 whose body fails to parse as JSON", async () => {
+  const node = freshNode();
+  const fetchImpl = async () => ({ status: 202, json: async () => { throw new Error("invalid json"); } });
+  const client = createCloudClient({ cloudUrl: "http://127.0.0.1:1", baseDir: node.baseDir, fetchImpl });
+
+  const result = await client.postEvent("handoff.ready");
+  assert.equal(result.status, 202);
+  assert.equal(result.body, null);
+  assert.equal(result.accepted, false, "an unparseable 202 body must not read as a genuine accept");
 });
 
 test("postEvent reports accepted:false (and does not throw) for a signature or unknown-node rejection", async () => {

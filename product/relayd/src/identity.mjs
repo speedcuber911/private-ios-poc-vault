@@ -270,9 +270,17 @@ function throwEncKeyStateError(paths, state) {
 // uniquely-named temp files (created with the correct mode) and publishes
 // with rename (atomic on the same filesystem, guaranteed by keeping the
 // temp files in baseDir alongside their destinations). A process that
-// loses the race for the lock blocks until the winner is done, then
+// loses the race for the LOCK blocks until the winner is done, then
 // re-checks and adopts whatever the winner published instead of
-// generating its own — a mismatched pair is impossible, not just unlikely.
+// generating its own — so a process that reaches the lock never produces
+// a mismatched pair. What this does NOT cover: the plain encKeyPairState()
+// check just above, at the very top of this function, runs UNLOCKED. If it
+// lands during another process's in-flight generation (the narrow window
+// between that process's two renameSync calls), it observes `partial` and
+// throwEncKeyStateError()s immediately, without ever attempting the lock —
+// a real, reproducible (if sub-millisecond and rare) transient error, not
+// the "impossible" this comment used to claim. No caller of initIdentity()
+// retries on it today.
 function ensureEncKeyPair(paths) {
   const state = encKeyPairState(paths);
   if (state.kind === "valid") {

@@ -407,6 +407,61 @@ test("migrateJsonToSqlite skips a damaged handoff and keeps its healthy neighbou
   migrated.close();
 });
 
+// task-13 re-review, Important: assertSafeRecordId used to sit OUTSIDE
+// getHandoffRecord's try/catch, so a file with a damaged *filename* (never
+// producible via saveHandoff itself, which validates the id before ever
+// creating a file — this simulates a hand-planted or foreign file) made
+// listHandoffs() throw INSIDE its own .map(), uncaught — before
+// migrateJsonToSqlite's loop, or its per-record try/catch, ever ran once.
+// One bad filename aborted the whole migration and lost every healthy
+// neighbour, which is the exact failure the damaged-CONTENT fix believed it
+// had already closed. This plants damage in the FILENAME, not the content.
+test("migrateJsonToSqlite is not abortable by a damaged handoff FILENAME (as opposed to content)", async () => {
+  const dataRoot = fs.mkdtempSync(path.join(tmpRoot, "migrate-badname-"));
+  fs.mkdirSync(path.join(dataRoot, "jobs"), { recursive: true });
+  fs.mkdirSync(path.join(dataRoot, "chats"), { recursive: true });
+  const handoffsDir = path.join(dataRoot, "handoffs");
+  fs.mkdirSync(handoffsDir, { recursive: true });
+
+  const healthyId = "019e46a4-0000-7000-8000-00000000e001";
+  const jsonStore = await createStore("json", {
+    dataDir: dataRoot,
+    jobsDir: path.join(dataRoot, "jobs"),
+    chatsDir: path.join(dataRoot, "chats"),
+  });
+  jsonStore.saveHandoff({
+    id: healthyId, state: "ready", repo: "me/relay", branch: "relay/handoff-good",
+    workspaceId: "dir-handoff-good", provider: "claude",
+    resumeSessionId: "11111111-2222-4333-8444-555555555555", primedPrompt: null,
+    title: "Healthy neighbour (bad filename sibling)", manifest: { v: 1, title: "Healthy neighbour" },
+    lastJobId: null, error: null, createdAt: "2026-08-09T00:06:00.000Z", updatedAt: "2026-08-09T00:06:00.000Z",
+  });
+
+  // Perfectly well-formed CONTENT — the previous round's own damaged-content
+  // test already proves content alone can't reach this — but a FILENAME
+  // that fails SAFE_RECORD_ID (leading dot, and a literal ".." segment).
+  // Planted directly on disk: saveHandoff can never produce either shape.
+  const wellFormedContent = JSON.stringify({
+    id: "irrelevant-the-filename-is-what-is-damaged",
+    state: "ready", repo: "me/relay", branch: "relay/handoff-badname",
+    createdAt: "2026-08-09T00:07:00.000Z", updatedAt: "2026-08-09T00:07:00.000Z",
+  });
+  fs.writeFileSync(path.join(handoffsDir, "..escape.json"), wellFormedContent, "utf8");
+  fs.writeFileSync(path.join(handoffsDir, ".hidden.json"), wellFormedContent, "utf8");
+
+  // Sanity: listHandoffs() itself (not just migration) must not throw and
+  // must not lose the healthy record either — this bug affects every caller
+  // of listHandoffs() on the json backend, not just migration.
+  const listed = jsonStore.listHandoffs();
+  assert.deepEqual(listed.map((entry) => entry.id), [healthyId]);
+
+  const dbPath = path.join(dataRoot, "migrated-badname.sqlite");
+  const { counts, store: migrated } = await migrateJsonToSqlite({ dataDir: dataRoot, dbPath });
+  assert.equal(counts.handoffs, 1, `only the healthy handoff should migrate, got counts=${JSON.stringify(counts)}`);
+  assert.equal(migrated.getHandoff(healthyId).title, "Healthy neighbour (bad filename sibling)");
+  migrated.close();
+});
+
 test("server on RELAYD_STORE=sqlite persists jobs across restarts", async () => {
   const serverEntry = path.join(path.dirname(new URL(import.meta.url).pathname), "..", "src", "index.mjs");
   const dir = fs.mkdtempSync(path.join(tmpRoot, "sqlite-server-"));

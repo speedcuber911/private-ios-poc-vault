@@ -46,6 +46,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
+import { appendAudit } from "./audit.mjs";
+
 const SUPPORTED_VERSION = 1;
 
 // Ensures `root` exists (0700) and returns its REAL (symlink-resolved) path,
@@ -80,6 +82,26 @@ function removeStagingFile(staging, dev, ino) {
 function writeStagedFile(dir, filename, contents) {
   const target = path.join(dir, filename);
   const staging = path.join(dir, `.syncauth-${crypto.randomBytes(16).toString("hex")}.tmp`);
+
+  // Best-effort, pre-write snapshot of whatever currently occupies `target`
+  // — used only for the audit line below, never for any decision about
+  // whether to proceed. A race here can't affect the write itself: rename()
+  // further down is what actually determines the outcome, and it always
+  // replaces the directory entry rather than writing through it (see the
+  // module header). This is deliberately silent for the routine case (no
+  // prior entry, or a prior regular file this module itself last wrote —
+  // e.g. re-syncing credentials that already landed here before) and only
+  // speaks up for the cases an operator would actually want to know about:
+  // a pre-existing symlink or hard link at a credential destination.
+  let priorKind = null;
+  try {
+    const prior = fs.lstatSync(target);
+    if (prior.isSymbolicLink()) priorKind = "symlink";
+    else if (prior.isFile() && prior.nlink > 1) priorKind = "hardlink";
+    else if (!prior.isFile()) priorKind = "other";
+  } catch {
+    priorKind = null; // nothing there yet — the routine first-install case.
+  }
 
   let fd;
   try {
@@ -144,6 +166,14 @@ function writeStagedFile(dir, filename, contents) {
     (published.mode & 0o777) !== 0o600
   ) {
     throw new Error("credential_publish_verification_failed");
+  }
+
+  // The write itself is already correct either way (rename replaces the
+  // entry, never writes through it) — this is purely a signal for whoever
+  // is watching the audit log. Path and category only, exactly like this
+  // codebase's other appendAudit call sites; never contents.
+  if (priorKind) {
+    appendAudit("credential_destination_replaced", null, { path: target, priorKind });
   }
 }
 

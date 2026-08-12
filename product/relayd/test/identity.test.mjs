@@ -352,15 +352,36 @@ test("M1: a pre-existing encryption key with insecure mode is corrected to 0600"
   assert.equal(fs.statSync(paths.encPubPath).mode & 0o777, 0o600, "public key mode corrected on next init");
 });
 
-// C2: a real multi-OS-process reproduction, not an argument that the fix
-// "should" be safe. Two separate `node` processes race initIdentity on the
-// same fresh baseDir. Process A is deterministically paused *inside* its
-// write path (via a stdout marker the parent waits on, not a timing guess)
-// so process B's entire run genuinely overlaps A's still-in-progress
-// critical section — reproducing exactly the interleaving review-t2.md
-// demonstrated ("process A writes encKeyPath ... B also generates and
-// overwrites encKeyPath ... then A writes encPubPath from its own orphaned
-// generation").
+// C2 re-review (review-relayd-fixes.md, Important): the ORIGINAL version of
+// this test paused process A right after its FIRST tmp-file write — before
+// either renameSync — which never forced the two windows that actually
+// matter to interleave. Two non-benign mutants survived 18/18 green there:
+// removing withEncKeyLock entirely, and removing the lock-loser's re-check/
+// adopt logic inside it. Both are now forced directly with real OS
+// processes, synchronized by marker FILES on the shared baseDir (never a
+// sleep guess about ordering — only the WIDTH of an already-guaranteed
+// window uses a duration) so each test pins exactly which interleaving
+// happens, not just that something eventually does:
+//
+//   - B's role (both tests): its outer, UNLOCKED encKeyPairState() check
+//     must observe "absent" — the same precondition a real racing
+//     `relayd enroll` would hit — so B is spawned only after it has fully
+//     imported identity.mjs and is about to call initIdentity() (the
+//     "b-ready" marker), guaranteeing B's outer check runs before A does
+//     anything. B's *continuation* past that check is then held (via a
+//     one-shot fs.existsSync hook on the outer check's own second call, so
+//     the already-true "absent" reading is untouched) until a later marker
+//     A writes — pinning WHEN B resumes without ever touching WHAT B reads.
+//   - A's role (both tests): a one-shot fs.renameSync hook fires the
+//     "rename1-done" marker the instant the private key is renamed onto its
+//     real destination — i.e. exactly between the two renames, the window
+//     review-relayd-fixes.md identifies as the one that matters. Test 1
+//     additionally sleeps there (still holding the lock, in real code) so
+//     B's hold can expire mid-window; test 2 leaves A to run straight
+//     through and instead gates B on A's full completion ("a-done").
+//
+// Every wait below is bounded and kills every tracked child on timeout —
+// node:test's own per-test `timeout` cannot kill a hung synchronous child.
 const raceChildPath = path.join(tmpRoot, "race-child.mjs");
 fs.writeFileSync(
   raceChildPath,
@@ -368,37 +389,97 @@ fs.writeFileSync(
 import fs from "node:fs";
 import path from "node:path";
 
-const delayMs = Number(process.env.RACE_DELAY_MS || 0);
-if (delayMs > 0) {
-  const targetPrefix = "node-enc.key.pem";
+const role = process.env.RACE_ROLE;
+const baseDir = process.env.RACE_BASE_DIR;
+const encKeyBasename = "node-enc.key.pem";
+const encPubBasename = "node-enc.pub.b64";
+
+function markerPath(name) {
+  return path.join(baseDir, ".race-marker-" + name);
+}
+function writeMarker(name) {
+  fs.writeFileSync(markerPath(name), String(process.pid));
+}
+function napSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+function waitForMarker(name, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (!fs.existsSync(markerPath(name))) {
+    if (Date.now() > deadline) throw new Error("RACE_TIMEOUT waiting for marker " + name);
+    napSync(10);
+  }
+}
+
+if (role === "A") {
+  // Fires exactly once, right after the private key is renamed onto its
+  // REAL destination (not the .tmp- source, which never matches this exact
+  // basename) — precisely between the two renames. If a pause is
+  // requested, it happens here, still inside withEncKeyLock's callback in
+  // the real (unmutated) code, so A still holds the lock throughout.
+  const pauseMs = Number(process.env.RACE_PAUSE_AFTER_RENAME1_MS || 0);
   let fired = false;
-  const widen = () => {
-    if (fired) return;
-    fired = true;
-    console.log("RACE_WIDEN_FIRED");
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
-  };
-  const origWrite = fs.writeFileSync;
-  fs.writeFileSync = function (file, ...rest) {
-    const result = origWrite.call(fs, file, ...rest);
-    if (typeof file === "string" && path.basename(file).startsWith(targetPrefix)) widen();
-    return result;
-  };
   const origRename = fs.renameSync;
   fs.renameSync = function (oldPath, newPath, ...rest) {
     const result = origRename.call(fs, oldPath, newPath, ...rest);
-    if (typeof newPath === "string" && path.basename(newPath).startsWith(targetPrefix)) widen();
+    if (!fired && typeof newPath === "string" && path.basename(newPath) === encKeyBasename) {
+      fired = true;
+      writeMarker("rename1-done");
+      if (pauseMs > 0) napSync(pauseMs);
+    }
+    return result;
+  };
+} else if (role === "B") {
+  const waitForMarkerName = process.env.RACE_WAIT_FOR_MARKER || null;
+  const waitTimeoutMs = Number(process.env.RACE_WAIT_TIMEOUT_MS || 5000);
+  // initIdentity() does real work before ever reaching ensureEncKeyPair
+  // (requireOpenssl() alone spawns and waits on a real "openssl version"
+  // subprocess, plus an ed25519 keygen and several mkdir calls) — all of
+  // unpredictable, non-negligible duration. A "b-ready" marker written
+  // right after import (before calling initIdentity() at all) does NOT
+  // pin B ahead of A: A can win that race outright depending on how long
+  // B's own openssl subprocess spawn happens to take. So "b-ready" is
+  // instead written from INSIDE this hook, on the FIRST call anywhere in
+  // this process to check encKeyPath's existence — encKeyPairState()'s
+  // FIRST existsSync call, i.e. the very start of the OUTER, unlocked
+  // check at the top of ensureEncKeyPair. That is the earliest point at
+  // which B has genuinely arrived at the code this test is about, so the
+  // parent (which waits for this marker before ever spawning A) cannot
+  // spawn A too early. The second existsSync call (encPubPath) is where
+  // this test actually blocks: both booleans encKeyPairState reads are
+  // already captured (correctly, both false — A hasn't started yet)
+  // before that block, so waiting there only delays what the code does
+  // WITH an already-true "absent" reading; it never changes what was read.
+  let firedReady = false;
+  let firedWait = false;
+  const origExists = fs.existsSync;
+  fs.existsSync = function (p) {
+    const result = origExists.call(fs, p);
+    if (typeof p === "string") {
+      const base = path.basename(p);
+      if (!firedReady && base === encKeyBasename) {
+        firedReady = true;
+        writeMarker("b-ready");
+      } else if (!firedWait && base === encPubBasename) {
+        firedWait = true;
+        if (waitForMarkerName) waitForMarker(waitForMarkerName, waitTimeoutMs);
+      }
+    }
     return result;
   };
 }
 
-const { initIdentity } = await import(process.env.RACE_IDENTITY_MODULE_URL);
+const { initIdentity, readEncPublicKeyB64, identityPaths } = await import(process.env.RACE_IDENTITY_MODULE_URL);
 try {
-  const status = initIdentity({ baseDir: process.env.RACE_BASE_DIR });
-  console.log("RACE_RESULT_OK " + JSON.stringify({ hasEncKey: status.hasEncKey }));
+  const status = initIdentity({ baseDir });
+  const paths = identityPaths(baseDir);
+  const pub = readEncPublicKeyB64(paths);
+  console.log("RACE_RESULT_OK " + JSON.stringify({ hasEncKey: status.hasEncKey, pub }));
 } catch (error) {
-  console.log("RACE_RESULT_ERR " + JSON.stringify({ message: error.message }));
+  console.log("RACE_RESULT_ERR " + JSON.stringify({ message: error.message, code: error.code || null }));
   process.exitCode = 1;
+} finally {
+  if (role === "A") writeMarker("a-done");
 }
 `,
   "utf8",
@@ -414,53 +495,144 @@ function spawnRaceChild(env) {
   return { child, exited, output: () => ({ stdout, stderr }) };
 }
 
-test("C2: two real concurrent node processes racing initIdentity never leave a mismatched encryption keypair", async () => {
-  const baseDir = fs.mkdtempSync(path.join(tmpRoot, "race-"));
-  const raceDataDir = fs.mkdtempSync(path.join(tmpRoot, "race-data-"));
-  const paths = identity.identityPaths(baseDir);
+function parseRaceResult(stdout) {
+  const okMatch = /RACE_RESULT_OK (\{.*\})/.exec(stdout);
+  if (okMatch) return { ok: true, ...JSON.parse(okMatch[1]) };
+  const errMatch = /RACE_RESULT_ERR (\{.*\})/.exec(stdout);
+  if (errMatch) return { ok: false, ...JSON.parse(errMatch[1]) };
+  return { ok: false, message: "no RACE_RESULT marker found in child stdout", stdout };
+}
+
+async function waitForFile(filePath, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (!fs.existsSync(filePath)) {
+    if (Date.now() > deadline) throw new Error(`timed out after ${timeoutMs}ms waiting for ${filePath}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+// Spawns B, waits for its readiness marker, then spawns A — so B's outer
+// state check always runs before A does anything — and waits for both to
+// exit. The whole sequence is bounded by one hard wall-clock timeout that
+// SIGKILLs every child spawned so far if exceeded, so a broken interleaving
+// (or a genuinely hung mutant) fails loudly and leaves no stray process
+// instead of hanging the suite — node:test's own `timeout` cannot do this
+// for a blocked synchronous child.
+async function raceTwoProcesses({ baseDir, commonEnv, bEnv = {}, aEnv = {}, hardTimeoutMs = 8000 }) {
+  const children = [];
+  let timer;
+  const timedOut = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      for (const child of children) {
+        try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      }
+      reject(new Error(`race harness exceeded its ${hardTimeoutMs}ms hard bound — children killed`));
+    }, hardTimeoutMs);
+  });
+  const run = async () => {
+    const b = spawnRaceChild({ ...commonEnv, ...bEnv, RACE_ROLE: "B" });
+    children.push(b.child);
+    await waitForFile(path.join(baseDir, ".race-marker-b-ready"), hardTimeoutMs);
+
+    const a = spawnRaceChild({ ...commonEnv, ...aEnv, RACE_ROLE: "A" });
+    children.push(a.child);
+
+    const [codeA, codeB] = await Promise.all([a.exited, b.exited]);
+    return { a, b, codeA, codeB };
+  };
+  try {
+    return await Promise.race([run(), timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function raceEnv(baseDir, raceDataDir) {
   const identityModuleUrl = pathToFileURL(
     path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "identity.mjs"),
   ).href;
-
-  const commonEnv = {
+  return {
     ...process.env,
     CODEX_DATA_DIR: raceDataDir,
     RACE_BASE_DIR: baseDir,
     RACE_IDENTITY_MODULE_URL: identityModuleUrl,
   };
+}
 
-  const a = spawnRaceChild({ ...commonEnv, RACE_DELAY_MS: "300" });
-  const aWidened = new Promise((resolve) => {
-    a.child.stdout.on("data", (chunk) => {
-      if (String(chunk).includes("RACE_WIDEN_FIRED")) resolve();
-    });
+test("regression (lock-removed mutant): a forced pause exactly between the two renames never leaves a mismatched on-disk pair", async () => {
+  const baseDir = fs.mkdtempSync(path.join(tmpRoot, "race-lock-"));
+  const raceDataDir = fs.mkdtempSync(path.join(tmpRoot, "race-lock-data-"));
+  const paths = identity.identityPaths(baseDir);
+  const commonEnv = raceEnv(baseDir, raceDataDir);
+
+  const { a, b, codeA, codeB } = await raceTwoProcesses({
+    baseDir,
+    commonEnv,
+    bEnv: { RACE_WAIT_FOR_MARKER: "rename1-done", RACE_WAIT_TIMEOUT_MS: "5000" },
+    aEnv: { RACE_PAUSE_AFTER_RENAME1_MS: "300" },
   });
-
-  // Deterministic interleaving: don't start B until A is verifiably
-  // mid-critical-section. This is what makes the repro reliable rather
-  // than a timing guess.
-  await Promise.race([
-    aWidened,
-    a.exited.then(() => { throw new Error(`child A exited before widening: ${JSON.stringify(a.output())}`); }),
-  ]);
-
-  const b = spawnRaceChild({ ...commonEnv, RACE_DELAY_MS: "0" });
-
-  const [codeA, codeB] = await Promise.all([a.exited, b.exited]);
   assert.equal(codeA, 0, `child A failed: ${JSON.stringify(a.output())}`);
   assert.equal(codeB, 0, `child B failed: ${JSON.stringify(b.output())}`);
 
+  // The real assertion is two-layered, because a lock-removed mutant has
+  // two different ways to fail here and this forced window can trigger
+  // either depending on exact scheduling: (1) B's own INNER re-check
+  // (inside what would be the lock's callback) runs immediately instead of
+  // waiting for A, sees the same "partial" state a genuinely mismatched
+  // pair would leave behind, and throws — codeB is non-zero, caught by the
+  // codeA/codeB asserts above; review-relayd-fixes.md's own repro instead
+  // landed on (2): B's inner check observes "absent" (not yet "partial")
+  // and proceeds to generate and publish its OWN complete pair inside the
+  // window, which A's still-pending second rename then partially overwrites
+  // — leaving a private key from one generation paired with a public key
+  // from the other (seal_decrypt_failed), caught by the self-consistency
+  // check below. Under the shipped lock neither can happen: B blocks on the
+  // lock file for as long as A holds it (through both renames), so B's own
+  // inner check only ever runs once A is completely done and already
+  // "valid" — B exits 0 having adopted, and the pair stays self-consistent.
   const finalPub = identity.readEncPublicKeyB64(paths);
   const finalPriv = identity.readEncPrivateKeyPem(paths);
   assert.ok(finalPub, "public key present after the race");
   assert.ok(finalPriv, "private key present after the race");
   assert.equal(identity.identityStatus({ baseDir }).hasEncKey, true);
-
-  // The real assertion: the on-disk pair is internally consistent. A
-  // mismatched pair (private from one generation, public from the other)
-  // fails exactly like this — seal_decrypt_failed — which is what
-  // review-t2.md reproduced against the unfixed code.
-  const plaintext = Buffer.from("race regression probe", "utf8");
+  const plaintext = Buffer.from("lock-removed regression probe", "utf8");
   const sealed = sealTo(finalPub, plaintext);
   assert.deepEqual(openSealed(finalPriv, sealed), plaintext, "on-disk keypair must not be mismatched");
+});
+
+test("regression (adopt-logic-removed mutant): the lock loser adopts the winner's already-published keypair instead of regenerating over it", async () => {
+  const baseDir = fs.mkdtempSync(path.join(tmpRoot, "race-adopt-"));
+  const raceDataDir = fs.mkdtempSync(path.join(tmpRoot, "race-adopt-data-"));
+  const paths = identity.identityPaths(baseDir);
+  const commonEnv = raceEnv(baseDir, raceDataDir);
+
+  // B is held until A has FULLY finished (both renames, lock released) —
+  // the ordinary "arrived second, waited out the whole winner" case the
+  // adopt branch exists for. A runs with no pause of its own.
+  const { a, b, codeA, codeB } = await raceTwoProcesses({
+    baseDir,
+    commonEnv,
+    bEnv: { RACE_WAIT_FOR_MARKER: "a-done", RACE_WAIT_TIMEOUT_MS: "5000" },
+  });
+  assert.equal(codeA, 0, `child A failed: ${JSON.stringify(a.output())}`);
+  assert.equal(codeB, 0, `child B failed: ${JSON.stringify(b.output())}`);
+
+  const resultA = parseRaceResult(a.output().stdout);
+  const resultB = parseRaceResult(b.output().stdout);
+  assert.ok(resultA.ok && resultA.pub, `A must have generated a real pubkey: ${JSON.stringify(resultA)}`);
+  assert.ok(resultB.ok && resultB.pub, `B must have adopted a real pubkey: ${JSON.stringify(resultB)}`);
+
+  // The real assertion: B losing the race must mean it ADOPTED A's
+  // already-published keypair rather than silently regenerating its own
+  // over it — checked against what A itself observed the instant its OWN
+  // initIdentity() call returned, captured inside A's own process before B
+  // could have raced ahead and changed anything. This is exactly the
+  // "a caller's own return value silently goes stale" failure class C1
+  // fixed, reintroduced through the concurrency path if the adopt branch
+  // is ever removed — undetectable by only checking the final on-disk
+  // pair's self-consistency, since an unconditionally-regenerating loser
+  // still leaves a self-consistent (just DIFFERENT) pair behind.
+  assert.equal(resultB.pub, resultA.pub, "the loser must report adopting, not regenerating, the winner's pubkey");
+  const finalPub = identity.readEncPublicKeyB64(paths);
+  assert.equal(finalPub, resultA.pub, "the winner's own already-published keypair must not be silently replaced");
 });
