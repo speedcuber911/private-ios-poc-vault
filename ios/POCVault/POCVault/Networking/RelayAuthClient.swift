@@ -151,6 +151,38 @@ final class RelayAuthClient {
         guard response.success else { throw RelayAuthClientError.invalidResponse }
     }
 
+    func deviceInspect(userCode: String, bearerToken: String) async throws -> DeviceCodeInspectResult {
+        struct Payload: Decodable {
+            let machineName: String?
+            let platform: String?
+            let createdAt: Int64
+            let expiresAt: Int64
+        }
+        guard let response: Payload = try await request(
+            method: "POST",
+            path: "/v1/auth/device/inspect",
+            body: ["userCode": userCode],
+            bearerToken: bearerToken
+        ) else { throw RelayAuthClientError.invalidResponse }
+        return DeviceCodeInspectResult(
+            machineName: response.machineName,
+            platform: response.platform,
+            createdAt: response.createdAt,
+            expiresAt: response.expiresAt
+        )
+    }
+
+    func deviceApprove(userCode: String, bearerToken: String) async throws {
+        struct Payload: Decodable { let ok: Bool? }
+        guard let response: Payload = try await request(
+            method: "POST",
+            path: "/v1/auth/device/approve",
+            body: ["userCode": userCode],
+            bearerToken: bearerToken
+        ) else { throw RelayAuthClientError.invalidResponse }
+        guard response.ok == true else { throw RelayAuthClientError.invalidResponse }
+    }
+
     private func sessionToken(_ bodyToken: String?) throws -> String {
         guard let token = lastResponseToken ?? bodyToken, !token.isEmpty else {
             throw RelayAuthClientError.missingSessionToken
