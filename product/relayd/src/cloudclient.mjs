@@ -1,10 +1,12 @@
 // relayd cloudclient.mjs — the node's outbound half of the control-plane link.
 //
 // Three operations, all authenticated with the node's ed25519 identity key:
-// a long-poll that collects pending handoffs, a signed ack that confirms
-// delivery of what that poll handed out, and a signed event post that the
-// cloud fans out to APNs. The cloud sees names and event types only — never
-// repository content, never transcripts.
+// a long-poll that collects pending handoffs AND credential-sync notices, a
+// signed ack that confirms delivery of everything that poll handed out, and a
+// signed event post that the cloud fans out to APNs. The cloud sees names and
+// event types only — never repository content, never transcripts, and never a
+// credential: a notice names a rendezvous slot whose payload is sealed to this
+// node's X25519 key.
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -36,7 +38,17 @@ function nodeRequestSigningInput({ method, pathWithQuery, ts, nodeId }) {
   return Buffer.from(`${NODE_REQUEST_LABEL}\n${method.toUpperCase()}\n${pathWithQuery}\n${nodeId}\n${ts}`, "utf8");
 }
 
-function createCloudClient({ cloudUrl, baseDir = undefined, fetchImpl = fetch, now = () => Date.now() }) {
+function createCloudClient({
+  cloudUrl,
+  baseDir = undefined,
+  fetchImpl = fetch,
+  now = () => Date.now(),
+  // Invoked once per credential-sync notice the poll hands back (see
+  // dispatchNotices). Optional: a node wired without one simply
+  // acknowledges notices and does nothing with them, which is what an older
+  // daemon build would do anyway.
+  onNotice = null,
+} = {}) {
   const paths = baseDir ? identityPaths(baseDir) : identityPaths();
   const nodeId = readNodeId(paths);
   let privateKey = null;
@@ -137,11 +149,11 @@ function createCloudClient({ cloudUrl, baseDir = undefined, fetchImpl = fetch, n
   // anything the caller does with the descriptors afterward: gating the ack
   // on import succeeding would resurrect the lost-handoff bug this whole
   // mechanism exists to close, just in a new shape.
-  async function ackHandoffsOnce(acks) {
+  async function ackHandoffsOnce(payload) {
     const res = await fetchImpl(`${base}${HANDOFF_ACK_PATH}`, {
       method: "POST",
       headers: { ...signedHeaders("POST", HANDOFF_ACK_PATH), "content-type": "application/json" },
-      body: JSON.stringify({ acks }),
+      body: JSON.stringify(payload),
     });
     // The response body (`{ acked: [...] }`) is not consulted: an id/lease
     // pair missing from `acked` just means that lease had already expired
@@ -151,19 +163,60 @@ function createCloudClient({ cloudUrl, baseDir = undefined, fetchImpl = fetch, n
     return res.status === 200;
   }
 
-  async function ackHandoffs(handoffs) {
-    const acks = (Array.isArray(handoffs) ? handoffs : [])
-      .filter((h) => h && typeof h.id === "string" && typeof h.lease === "string")
-      .map((h) => ({ id: h.id, lease: h.lease }));
-    if (acks.length === 0) return;
+  // One ack request per poll response, covering both lists. `acks` and
+  // `notices` are separate fields on the wire because the cloud confirms them
+  // against two different tables, but they share this one round trip: the
+  // whole point of putting notices on the existing long-poll was not to
+  // double the connections a node holds.
+  async function ackDelivery({ acks, noticeAcks }) {
+    if (acks.length === 0 && noticeAcks.length === 0) return;
+    const payload = {};
+    if (acks.length > 0) payload.acks = acks;
+    if (noticeAcks.length > 0) payload.notices = noticeAcks;
     for (let attempt = 1; attempt <= HANDOFF_ACK_MAX_ATTEMPTS; attempt++) {
       try {
-        if (await ackHandoffsOnce(acks)) return;
+        if (await ackHandoffsOnce(payload)) return;
       } catch {
         // Transport failure. Best-effort and bounded: never throw out of
         // pollHandoffs, and never lose the handoffs it already parsed — a
         // failed ack costs at most one redundant redelivery next cycle,
-        // via the cloud's own lease expiry, never data loss.
+        // via the cloud's own lease expiry, never data loss. A notice is
+        // redelivered on the same terms, and installing one twice is a
+        // rewrite of the same credential files, not a second effect.
+      }
+    }
+  }
+
+  function ackableFrom(entries) {
+    return (Array.isArray(entries) ? entries : [])
+      .filter((entry) => entry && typeof entry.id === "string" && typeof entry.lease === "string")
+      .map((entry) => ({ id: entry.id, lease: entry.lease }));
+  }
+
+  // A notice is only actionable with all four fields; a partial one is
+  // skipped rather than half-processed or acked into oblivion, so the cloud
+  // redelivers it if it was a transport truncation and nothing pretends a
+  // malformed row was handled.
+  function actionableNotices(entries) {
+    return (Array.isArray(entries) ? entries : []).filter((entry) =>
+      entry && typeof entry.id === "string" && typeof entry.lease === "string" &&
+      typeof entry.pairingId === "string" && typeof entry.secret === "string");
+  }
+
+  // Dispatch is deliberately AFTER the ack and never gates it: the ack means
+  // "these bytes reached this node", which is exactly what the transport
+  // layer knows and what the cloud's lease is waiting to hear. Gating it on
+  // the install succeeding would resurrect the lost-delivery bug the lease
+  // exists to close. The handler reports its own outcome (audit line +
+  // credentials.installed/failed event); a handler that throws must not take
+  // down the poll cycle or the handoffs parsed alongside it.
+  async function dispatchNotices(notices) {
+    if (!onNotice) return;
+    for (const notice of notices) {
+      try {
+        await onNotice(notice);
+      } catch {
+        /* the handler owns reporting its own failure; the loop goes on */
       }
     }
   }
@@ -177,10 +230,14 @@ function createCloudClient({ cloudUrl, baseDir = undefined, fetchImpl = fetch, n
     if (res.status !== 200) throw new Error(`cloud_poll_${res.status}`);
     const json = await res.json();
     const handoffs = Array.isArray(json?.handoffs) ? json.handoffs : [];
+    const notices = actionableNotices(json?.notices);
     // res.json() resolving is itself the evidence that matters — proof the
     // bytes crossed a live connection — so ack right here, before returning
     // descriptors to the caller, and before anything is done with them.
-    await ackHandoffs(handoffs);
+    await ackDelivery({ acks: ackableFrom(handoffs), noticeAcks: ackableFrom(notices) });
+    await dispatchNotices(notices);
+    // Unchanged on purpose: handoff.mjs's import loop consumes this return
+    // value and knows nothing about notices.
     return handoffs;
   }
 

@@ -689,3 +689,164 @@ test("the injected now() drives both x-relay-ts and the event body ts", async ()
     assert.equal(body.ts, FIXED_TS);
   } finally { await eventCloud.close(); }
 });
+
+// ---------------------------------------------------------------------------
+// Credential-sync notices ride the SAME long-poll and the SAME ack as
+// handoffs (cloud commit 8d8fadc): `{ handoffs: [...], notices: [...] }` and
+// `{ acks: [...], notices: [...] }`. relayd's transport layer is where they
+// are acknowledged — the only layer that knows the bytes crossed a live
+// connection — and where they are handed to whatever the daemon wired up to
+// install them. pollHandoffs' return value is unchanged: handoff.mjs's import
+// loop must keep seeing exactly the handoff descriptors it always saw.
+
+test("pollHandoffs acks notices in the same signed batch as handoffs and hands them to onNotice", async () => {
+  const node = freshNode();
+  const cloud = await startFakeCloud((res, call) => {
+    if (call.method === "GET") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        handoffs: [{ id: "abc123", repo: "me/relay", branch: "relay/handoff-x", lease: "lease-h" }],
+        notices: [
+          { id: "notice-1", pairingId: "pair-1", secret: "secret-one-0123456789abcd", lease: "lease-n1" },
+          { id: "notice-2", pairingId: "pair-2", secret: "secret-two-0123456789abcd", lease: "lease-n2" },
+        ],
+      }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ acked: ["abc123"], noticesAcked: ["notice-1", "notice-2"] }));
+  });
+  const seen = [];
+  try {
+    const client = createCloudClient({
+      cloudUrl: cloud.url, baseDir: node.baseDir, onNotice: async (notice) => { seen.push(notice); },
+    });
+    const handoffs = await client.pollHandoffs(20);
+
+    assert.deepEqual(handoffs, [{ id: "abc123", repo: "me/relay", branch: "relay/handoff-x", lease: "lease-h" }],
+      "the caller's view of a poll is unchanged: handoff descriptors only");
+
+    assert.equal(cloud.calls.length, 2, "one poll, one ack — notices must not open a second round trip");
+    const body = JSON.parse(cloud.calls[1].raw.toString("utf8"));
+    assert.deepEqual(body, {
+      acks: [{ id: "abc123", lease: "lease-h" }],
+      notices: [{ id: "notice-1", lease: "lease-n1" }, { id: "notice-2", lease: "lease-n2" }],
+    });
+
+    const input = Buffer.from(
+      `${SIGNING_LABEL}\nPOST\n/v1/node/handoffs/ack\n${node.nodeId}\n${cloud.calls[1].headers["x-relay-ts"]}`, "utf8");
+    assert.ok(crypto.verify(null, input, node.publicKey,
+      Buffer.from(cloud.calls[1].headers["x-relay-signature"], "base64url")));
+
+    assert.deepEqual(seen, [
+      { id: "notice-1", pairingId: "pair-1", secret: "secret-one-0123456789abcd", lease: "lease-n1" },
+      { id: "notice-2", pairingId: "pair-2", secret: "secret-two-0123456789abcd", lease: "lease-n2" },
+    ], "every notice in the response must be handed on, in order");
+  } finally { await cloud.close(); }
+});
+
+test("a poll carrying only notices still acks, and a poll with neither acks nothing", async () => {
+  const node = freshNode();
+  const cloud = await startFakeCloud((res, call) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    if (call.method === "GET" && cloud.calls.filter((c) => c.method === "GET").length === 1) {
+      res.end(JSON.stringify({ handoffs: [], notices: [{ id: "n1", pairingId: "p1", secret: "s1", lease: "l1" }] }));
+      return;
+    }
+    if (call.method === "GET") {
+      res.end(JSON.stringify({ handoffs: [], notices: [] }));
+      return;
+    }
+    res.end(JSON.stringify({ acked: [], noticesAcked: ["n1"] }));
+  });
+  const seen = [];
+  try {
+    const client = createCloudClient({
+      cloudUrl: cloud.url, baseDir: node.baseDir, onNotice: async (notice) => { seen.push(notice.id); },
+    });
+
+    assert.deepEqual(await client.pollHandoffs(5), []);
+    assert.equal(cloud.calls.length, 2, "a notice-only response must still be acked");
+    assert.deepEqual(JSON.parse(cloud.calls[1].raw.toString("utf8")), { notices: [{ id: "n1", lease: "l1" }] });
+    assert.deepEqual(seen, ["n1"]);
+
+    await client.pollHandoffs(5);
+    assert.equal(cloud.calls.length, 3, "an empty poll must not trigger an ack call");
+  } finally { await cloud.close(); }
+});
+
+// An install that fails is the notice handler's problem to report (it writes
+// an audit line and emits credentials.failed itself). It must not take down
+// the poll loop, and — exactly like the handoff ack — the ack must NOT be
+// gated on it: the ack means "these bytes reached this node", nothing more.
+test("a notice handler that throws neither fails the poll nor withholds the ack", async () => {
+  const node = freshNode();
+  const cloud = await startFakeCloud((res, call) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    if (call.method === "GET") {
+      res.end(JSON.stringify({
+        handoffs: [{ id: "abc123", repo: "me/relay", branch: "relay/handoff-x", lease: "lease-h" }],
+        notices: [{ id: "n1", pairingId: "p1", secret: "s1", lease: "l1" }],
+      }));
+      return;
+    }
+    res.end(JSON.stringify({ acked: ["abc123"], noticesAcked: ["n1"] }));
+  });
+  try {
+    const client = createCloudClient({
+      cloudUrl: cloud.url, baseDir: node.baseDir,
+      onNotice: async () => { throw new Error("simulated_install_explosion"); },
+    });
+    const handoffs = await withHardTimeout(client.pollHandoffs(5), 2000, "poll with an exploding notice handler");
+    assert.equal(handoffs.length, 1, "the handoffs from this poll must survive a failing notice handler");
+    const ackBody = JSON.parse(cloud.calls[1].raw.toString("utf8"));
+    assert.deepEqual(ackBody.notices, [{ id: "n1", lease: "l1" }],
+      "the ack is evidence of delivery, never a verdict on the install");
+  } finally { await cloud.close(); }
+});
+
+test("a malformed notice is skipped rather than dispatched or acked", async () => {
+  const node = freshNode();
+  const cloud = await startFakeCloud((res, call) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    if (call.method === "GET") {
+      res.end(JSON.stringify({
+        handoffs: [],
+        notices: [
+          { id: "n1", pairingId: "p1", lease: "l1" },              // no secret
+          { pairingId: "p2", secret: "s2", lease: "l2" },          // no id
+          { id: "n3", pairingId: "p3", secret: "s3" },             // no lease
+          { id: "n4", pairingId: "p4", secret: "s4", lease: "l4" }, // the only good one
+          "not-an-object",
+        ],
+      }));
+      return;
+    }
+    res.end(JSON.stringify({ acked: [], noticesAcked: ["n4"] }));
+  });
+  const seen = [];
+  try {
+    const client = createCloudClient({
+      cloudUrl: cloud.url, baseDir: node.baseDir, onNotice: async (notice) => { seen.push(notice.id); },
+    });
+    await client.pollHandoffs(5);
+    assert.deepEqual(seen, ["n4"], "only a complete notice may be acted on");
+    assert.deepEqual(JSON.parse(cloud.calls[1].raw.toString("utf8")).notices, [{ id: "n4", lease: "l4" }]);
+  } finally { await cloud.close(); }
+});
+
+test("a client with no notice handler ignores notices instead of crashing the poll", async () => {
+  const node = freshNode();
+  const cloud = await startFakeCloud((res, call) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    if (call.method === "GET") {
+      res.end(JSON.stringify({ handoffs: [], notices: [{ id: "n1", pairingId: "p1", secret: "s1", lease: "l1" }] }));
+      return;
+    }
+    res.end(JSON.stringify({ acked: [], noticesAcked: ["n1"] }));
+  });
+  try {
+    const client = createCloudClient({ cloudUrl: cloud.url, baseDir: node.baseDir });
+    assert.deepEqual(await withHardTimeout(client.pollHandoffs(5), 2000, "poll with no notice handler"), []);
+  } finally { await cloud.close(); }
+});

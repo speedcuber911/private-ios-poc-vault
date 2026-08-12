@@ -4,10 +4,14 @@
 // Credentials arrive sealed to this node's key over the pairing rendezvous
 // (see product/cloud/src/pairing.js, kind "sync-auth"/"session-index"): the
 // control plane relays opaque ciphertext bytes and never sees a token.
-// Opening the seal (openSealed + readEncPrivateKeyPem) happens in the caller
-// that wires collectRendezvousBlob to installCredentialBundle — this module
-// only ever sees already-decrypted JS values, and only ever WRITES them,
-// never logs, echoes, or returns them from any function or route here.
+//
+// This module owns the WHOLE path, end to end — installFromNotice at the
+// bottom is the caller the earlier round left unwritten: collect the slot,
+// verify its MAC tag, read this node's X25519 private key
+// (readEncPrivateKeyPem), openSealed, and install. Decrypted values are only
+// ever WRITTEN to disk from here; nothing in this file logs, echoes, or
+// returns a credential from any function, audit line, event or route, and
+// every failure reason is one of a closed set of static tokens.
 //
 // Every destination path below is a literal this module chose itself, never
 // a name or path fragment taken from bundle content — the bundle only ever
@@ -47,6 +51,13 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { appendAudit } from "./audit.mjs";
+import { identityPaths, readEncPrivateKeyPem } from "./identity.mjs";
+import { openSealed } from "./seal.mjs";
+import { emitEvent } from "./events.mjs";
+// The node's canonical protocol-v2 derivations. Deliberately imported rather
+// than re-implemented here: the CLI keeps an independent third copy on
+// purpose (so a shared bug is visible), but relayd must have exactly one.
+import { pairingAuthToken, pairingMacKey, verifyBlobTag, DEVICE_SLOT } from "./pairing.mjs";
 
 const SUPPORTED_VERSION = 1;
 
@@ -208,17 +219,35 @@ function stringField(value) {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
-// GETs the `device-blob` rendezvous slot (Task 10, product/cloud/src/pairing.js
-// kind "sync-auth"/"session-index"). Returns the raw sealed bytes as-is —
-// opening the seal is the caller's job (openSealed + readEncPrivateKeyPem),
-// not this module's. The slot is put-once and TTL'd on the cloud side; this
-// function does a single GET and neither retries around a 409/404 nor tries
-// to make the slot behave like anything other than put-once.
-async function collectRendezvousBlob({ cloudUrl, pairingId, authToken, fetchImpl = fetch }) {
+// GETs the `device-blob` rendezvous slot (product/cloud/src/pairing.js kinds
+// "sync-auth"/"session-index") and returns the bytes ONLY once their MAC tag
+// verifies under `macKey`.
+//
+// The tag is the integrity half of pairing protocol v2: the cloud stores
+// {blob, tag} verbatim and can check neither, so the receiving peer is the
+// only party that can. An earlier revision of this function returned a bare
+// Buffer and dropped the x-pairing-tag response header entirely, which left
+// that half of the protocol unimplemented — bytes from the slot were trusted
+// on the cloud's say-so. Verification happens HERE, before the caller can
+// see a single byte, so no caller can forget to do it.
+//
+// The slot is put-once and TTL'd on the cloud side; this is a single GET that
+// neither retries around a 409/404 nor tries to make the slot behave like
+// anything other than put-once. A non-200 throws `rendezvous_<status>`, which
+// is what turns an expired (401) or never-written (404) slot into a visible
+// failure rather than an empty install.
+async function collectRendezvousBlob({ cloudUrl, pairingId, authToken, macKey, fetchImpl = fetch }) {
   const base = `${String(cloudUrl).replace(/\/+$/, "")}/v1/pairing/sessions/${encodeURIComponent(pairingId)}`;
   const res = await fetchImpl(`${base}/device-blob`, { headers: { "x-pairing-auth": authToken } });
   if (res.status !== 200) throw new Error(`rendezvous_${res.status}`);
-  return Buffer.from(await res.arrayBuffer());
+  const blob = Buffer.from(await res.arrayBuffer());
+  const tag = res.headers?.get?.("x-pairing-tag") ?? null;
+  // A missing header is a mismatch, not a reason to skip the check: "no tag
+  // was sent" and "the tag was wrong" are the same failure from here, and
+  // treating the first as a pass would make the whole check optional for
+  // anyone able to strip a header.
+  if (!verifyBlobTag(macKey, DEVICE_SLOT, blob, tag)) throw new Error("rendezvous_tag_mismatch");
+  return blob;
 }
 
 // Installs an already-decrypted sync-auth bundle into the runner home.
@@ -302,4 +331,141 @@ function readMacSessions({ dataDir }) {
   }
 }
 
-export { collectRendezvousBlob, installCredentialBundle, saveMacSessions, readMacSessions };
+// ---------------------------------------------------------------------------
+// The caller. collectRendezvousBlob, installCredentialBundle and
+// saveMacSessions existed for a whole round with nothing calling any of them,
+// so `relay sync-auth` sealed the user's credentials into a rendezvous slot
+// that was never read and GET /v1/mac-sessions could only ever answer
+// {index: null}. This is the function the cloud's notice long-poll drives:
+// it owns the whole path — collect, verify the MAC, read this node's X25519
+// private key, unseal, and install — and it is the one place the seal is
+// opened.
+//
+// It never throws. It is driven from the poll loop, where a throw would be
+// reported as a transport failure and mislabel a credential problem as a
+// network one; and every outcome, success or failure, has to be REPORTED
+// rather than propagated. It returns {ok:true, kind, installed, skipped} or
+// {ok:false, reason}, and in the failure case it has already written an audit
+// line and emitted a user-visible event telling the operator to re-run
+// `relay sync-auth`. A credential sync that quietly did nothing is the worst
+// outcome this feature has: the user believes their sandbox is authenticated
+// when it is not.
+//
+// `reason` is always one of a closed set of static tokens (below). No
+// credential, no rendezvous secret, no ciphertext and no underlying error
+// message — in particular not seal.mjs's `.cause` — is ever put into a
+// reason, an audit line, an event or a return value.
+
+// Maps a thrown error to one of the closed reason tokens. Anything
+// unrecognised becomes "install_failed" rather than leaking a message.
+function reasonFor(error) {
+  const message = String(error?.message || "");
+  if (/^rendezvous_tag_mismatch$/.test(message)) return "tag_mismatch";
+  if (/^rendezvous_\d+$/.test(message)) return message;
+  if (message.startsWith("seal_")) return "decrypt_failed";
+  if (message === "unsupported_bundle_version") return "unsupported_bundle_version";
+  if (message === "unexpected_bundle_kind") return "unexpected_bundle_kind";
+  if (message === "bundle_unreadable") return "bundle_unreadable";
+  if (message === "node_enc_key_missing") return "node_enc_key_missing";
+  return "install_failed";
+}
+
+async function installFromNotice(notice, {
+  cloudUrl,
+  runHome,
+  codexHome,
+  dataDir,
+  identityBaseDir = undefined,
+  fetchImpl = fetch,
+  emit = emitEvent,
+  // The cloud client's postEvent, so the failure also reaches the user's
+  // phone. Optional and best-effort: a node with no cloud client still gets
+  // the audit line and the local event.
+  postEvent = null,
+} = {}) {
+  const pairingId = typeof notice?.pairingId === "string" ? notice.pairingId : "";
+  const secret = typeof notice?.secret === "string" ? notice.secret : "";
+
+  // Announces the outcome once, on every path out of this function: an audit
+  // line, a local event, and (when a cloud client was wired in) a push. `data`
+  // carries the pairing id, a reason token and credential NAMES only.
+  async function report(event, data) {
+    try {
+      appendAudit(event === "credentials.installed" ? "credential_sync_installed" : "credential_sync_failed", null, data);
+    } catch {
+      /* audit is best-effort; it must not turn a success into a failure */
+    }
+    try {
+      await emit(event, data);
+    } catch {
+      /* the event bus must not be able to fail a completed install */
+    }
+    if (postEvent) {
+      try {
+        await postEvent(event, {});
+      } catch {
+        /* push is best-effort and bounded inside the cloud client */
+      }
+    }
+  }
+
+  async function fail(reason) {
+    await report("credentials.failed", {
+      pairingId: pairingId || null,
+      reason,
+      action: "run relay sync-auth again on your Mac",
+    });
+    return { ok: false, reason };
+  }
+
+  if (!pairingId || !secret) return fail("invalid_notice");
+
+  let bundle;
+  try {
+    const blob = await collectRendezvousBlob({
+      cloudUrl,
+      pairingId,
+      authToken: pairingAuthToken(secret),
+      macKey: pairingMacKey(secret),
+      fetchImpl,
+    });
+    const privateKeyPem = readEncPrivateKeyPem(
+      identityBaseDir ? identityPaths(identityBaseDir) : identityPaths(),
+    );
+    if (!privateKeyPem) throw new Error("node_enc_key_missing");
+    const opened = openSealed(privateKeyPem, blob);
+    try {
+      bundle = JSON.parse(opened.toString("utf8"));
+    } catch {
+      // Deliberately not chained to the JSON error: its message quotes the
+      // offending input, which here is decrypted plaintext.
+      throw new Error("bundle_unreadable");
+    }
+  } catch (error) {
+    return fail(reasonFor(error));
+  }
+
+  // The BUNDLE decides what this was, not the notice and not the cloud: the
+  // kind travels inside the sealed, MAC'd payload, so nothing on the control
+  // plane can relabel a session index as a credential install.
+  try {
+    if (bundle?.kind === "session-index") {
+      saveMacSessions(bundle, { dataDir });
+      await report("credentials.installed", { pairingId, kind: "session-index", installed: [], skipped: [] });
+      return { ok: true, kind: "session-index", installed: [], skipped: [] };
+    }
+    const { installed, skipped } = installCredentialBundle(bundle, { runHome, codexHome });
+    await report("credentials.installed", { pairingId, kind: "sync-auth", installed, skipped });
+    return { ok: true, kind: "sync-auth", installed, skipped };
+  } catch (error) {
+    return fail(reasonFor(error));
+  }
+}
+
+export {
+  collectRendezvousBlob,
+  installCredentialBundle,
+  installFromNotice,
+  saveMacSessions,
+  readMacSessions,
+};
