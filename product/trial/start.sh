@@ -83,6 +83,33 @@ if [ -f "${ENROLL_CONFIG}" ]; then
   set +a
 fi
 
+# ── server TLS material ──────────────────────────────────────────────────────
+# The control plane may supply a publicly-trusted certificate for this node's
+# name. relayd prefers it over signing its own, because a phone that has to
+# override server trust gets no client-certificate challenge from iOS at all,
+# and mTLS to this node then cannot complete.
+#
+# Written by node rather than the shell so the PEMs survive verbatim; the key
+# is created 0600 before anything is written into it, and both are removed if
+# either is missing so relayd never starts on half a pair.
+TLS_DIR="${CODEX_DATA_DIR}/tls"
+mkdir -p "${TLS_DIR}"
+chmod 700 "${TLS_DIR}"
+if node -e '
+  const fs = require("node:fs");
+  const cfg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  if (!cfg.tlsCert || !cfg.tlsKey) process.exit(1);
+  fs.writeFileSync(process.argv[2], cfg.tlsCert, { mode: 0o644 });
+  fs.writeFileSync(process.argv[3], cfg.tlsKey, { mode: 0o600 });
+' "${ENROLL_CONFIG}" "${TLS_DIR}/server.cert.pem" "${TLS_DIR}/server.key.pem" 2>/dev/null; then
+  export RELAYD_TLS_CERT_FILE="${TLS_DIR}/server.cert.pem"
+  export RELAYD_TLS_KEY_FILE="${TLS_DIR}/server.key.pem"
+  echo "relay: using control-plane server certificate" >&2
+else
+  rm -f "${TLS_DIR}/server.cert.pem" "${TLS_DIR}/server.key.pem"
+  echo "relay: no server certificate supplied; relayd will sign its own" >&2
+fi
+
 # ── device pairing ───────────────────────────────────────────────────────────
 # Best-effort, and deliberately NOT part of the boot's success condition.
 # Pairing polls the cloud rendezvous for the phone's device blob with a 120 s

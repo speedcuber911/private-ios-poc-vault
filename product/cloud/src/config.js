@@ -144,6 +144,16 @@ export function loadConfig(env = process.env) {
       suffix: env.TUNNEL_SUFFIX || "",
     },
 
+    // Wildcard certificate covering every trial node's hostname, handed to
+    // each node at provision time. Unset means nodes sign their own — which
+    // works, but forces the phone to override server trust, and iOS then
+    // performs no client-certificate authentication on that connection, so
+    // mTLS to the node cannot complete.
+    nodeTls: {
+      certFile: env.NODE_TLS_CERT_FILE || "",
+      keyFile: env.NODE_TLS_KEY_FILE || "",
+    },
+
     // Public cloud URL the trial sandbox reaches to enroll. Empty in tests,
     // where the fallback (host:port) is used instead.
     enrollBaseUrl: env.ENROLL_BASE_URL || "",

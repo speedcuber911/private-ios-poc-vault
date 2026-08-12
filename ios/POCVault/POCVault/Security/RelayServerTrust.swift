@@ -51,6 +51,18 @@ enum RelayServerTrust {
         return SecTrustEvaluateWithError(trust, nil)
     }
 
+    /// Whether the system trust store validates `trust` for `host` on its own.
+    ///
+    /// Evaluated against a fresh SSL policy for the host, with no anchors of
+    /// ours attached, so this answers only "would the system have accepted
+    /// this?" — the same question default handling asks.
+    static func systemTrusts(_ trust: SecTrust, host: String) -> Bool {
+        guard SecTrustSetPolicies(trust, SecPolicyCreateSSL(true, host as CFString)) == errSecSuccess else {
+            return false
+        }
+        return SecTrustEvaluateWithError(trust, nil)
+    }
+
     /// Shared `NSURLAuthenticationMethodServerTrust` handling for every delegate
     /// (URLSession or WKWebView) that can be pointed at a trial machine.
     static func handleServerTrustChallenge(
@@ -76,6 +88,37 @@ enum RelayServerTrust {
             completionHandler(.performDefaultHandling, nil)
 
         case .pinned:
+            // A machine whose certificate the SYSTEM already trusts must be
+            // left to the system, even though we hold a pinned CA for it.
+            //
+            // This is not an optimisation. Answering a server-trust challenge
+            // with `.useCredential` stops URLSession performing client
+            // certificate authentication on that connection at all: it never
+            // raises NSURLAuthenticationMethodClientCertificate, sends no
+            // certificate, and the machine — which requires one — drops the
+            // handshake as -1200. Verified on device against three machines,
+            // and against a publicly-trusted host in the same build, where
+            // trust fell to default handling and the client-certificate
+            // challenge did fire. Pinning and mTLS cannot both work over one
+            // URLSession connection; system trust is what makes mTLS possible.
+            //
+            // Nothing is weakened by preferring it: the chain still has to
+            // validate against the system store for the host being dialled.
+            // The pinned CA remains the fallback for a machine issued a
+            // private certificate, so older nodes keep working unchanged.
+            if let serverTrust = challenge.protectionSpace.serverTrust,
+               systemTrusts(serverTrust, host: host) {
+                CodexDiagnostics.log("codex_server_trust_challenge", fields: [
+                    "host": host,
+                    "scope": scope,
+                    "mode": "system",
+                    "result": "trusted",
+                    "note": "publicly-trusted; pinning skipped so mTLS can proceed"
+                ])
+                completionHandler(.performDefaultHandling, nil)
+                return
+            }
+
             guard let serverTrust = challenge.protectionSpace.serverTrust, let pinnedCA else {
                 CodexDiagnostics.log("codex_server_trust_challenge", fields: [
                     "host": host,
