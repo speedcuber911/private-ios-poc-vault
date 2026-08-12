@@ -9,7 +9,6 @@ import path from "node:path";
 
 import { host, port, requireMtls, allowedCertSubjects, maxConcurrent, maxBodyBytes, maxTranscriptionAudioBytes, proxyBaseUrl, proxyClientCertPath, proxyClientKeyPath } from "./config.mjs";
 import { sendJson, sendHtml, sendError, readBody, readBinaryBody, headerValue, clampLimit, isSafeJobId } from "./util.mjs";
-import { appendAudit } from "./audit.mjs";
 import { workspaces, workspaceList, publicWorkspace, workspaceDirectoryResponse, selectWorkspaceDirectory, createWorkspaceDirectory } from "./workspaces.mjs";
 import { publicModelCatalog } from "./catalog.mjs";
 import { fsListResponse, serveFsFile } from "./fsapi.mjs";
@@ -18,7 +17,7 @@ import { cleanThreadProviderFilter, workspaceForJob, listWorkspaceSessions, list
 import { handleChatRequest } from "./chat.mjs";
 import { isSafeArtifactId, serveJobArtifact } from "./artifacts.mjs";
 import { transcribeAudio, cleanAudioContentType, cleanAudioFilename } from "./transcribe.mjs";
-import { jobsState, jobs, activeChildren, persistJob, responseShape, wantsFullLogs, createJob, cleanJobProviderFilter, normalizeJobProvider, cancelJob, processQueue, streamJobEvents, toJobResponse, emitJobStateEvent } from "./jobs.mjs";
+import { jobsState, jobs, activeChildren, responseShape, wantsFullLogs, enqueueJob, cleanJobProviderFilter, normalizeJobProvider, cancelJob, streamJobEvents, toJobResponse } from "./jobs.mjs";
 import { codexThreadUiHtml } from "./ui.mjs";
 import { handleAdditionRoutes } from "./additions.mjs";
 
@@ -189,13 +188,7 @@ async function routeRequest(req, res) {
 
   if (req.method === "POST" && url.pathname === "/v1/codex/jobs") {
     const body = await readBody(req);
-    const job = createJob(body, auth.subject);
-    jobs.set(job.id, job);
-    jobsState.queuedJobIds.push(job.id);
-    persistJob(job);
-    appendAudit("job_created", job);
-    emitJobStateEvent(job);
-    processQueue();
+    const job = enqueueJob(body, auth.subject);
     return sendJson(res, 202, await toJobResponse(job, responseShape("preview")));
   }
 
