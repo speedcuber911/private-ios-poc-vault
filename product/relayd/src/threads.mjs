@@ -9,6 +9,7 @@ import path from "node:path";
 
 import { runHome, codexHome, threadSummaryCharacters, workspaceBrowseRoot, terminalStatuses, allowedThreadProviders, realpathOrResolve } from "./config.mjs";
 import { isSafeJobId, cleanApiText } from "./util.mjs";
+import { isResumableSessionId } from "./sessionid.mjs";
 import { appendAudit } from "./audit.mjs";
 import { dynamicWorkspaces, workspaces, resolveWorkspaceById, browseWorkspaceForPath, cleanWorkspaceId, pathBelongsToRoot } from "./workspaces.mjs";
 import { listChatThreads, chatThreadDetailResponse, deleteChatThread } from "./chat.mjs";
@@ -27,9 +28,15 @@ function cleanThreadProviderFilter(value) {
 }
 
 
+// The gate every resume passes through, including the handoff Continue path
+// (`handoff.continueHandoff` -> `jobs.enqueueJob` -> `jobs.createJob`). It
+// applies the SHARED contract from sessionid.mjs — the same one
+// `sessionimport.mjs` now stages by — rather than a second opinion of its own.
+// While the two disagreed, a Codex handoff was staged successfully and then
+// rejected here 400 `resumeSessionId is invalid`, every single time.
 function cleanOptionalSessionId(value) {
   if (value === undefined || value === null || value === "") return null;
-  if (typeof value !== "string" || !isSafeJobId(value)) {
+  if (!isResumableSessionId(value)) {
     throw Object.assign(new Error("resumeSessionId is invalid"), { status: 400 });
   }
   return value;
@@ -81,10 +88,11 @@ function findClaudeSessionFile(sessionId) {
 }
 
 // Claude's transcript format has no single "session_meta" line the way a
-// Codex rollout does; sessionimport.mjs's rewriteClaudeSession instead
+// Codex rollout does; sessionimport.mjs's rewriteSessionCwd instead
 // rewrites a `cwd` field carried on every line to the sandbox checkout, so
 // the first line with a well-formed cwd is enough to place the session in a
-// workspace.
+// workspace. (The Codex branch of the same function rewrites `payload.cwd` in
+// the rollout's session_meta line, which is what readSessionMeta below reads.)
 function readClaudeSessionMeta(sessionFile) {
   for (const line of readSessionLines(sessionFile)) {
     if (!line.trim()) continue;

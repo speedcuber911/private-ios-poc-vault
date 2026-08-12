@@ -8,6 +8,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 
 import { maxBodyBytes } from "./config.mjs";
+import { isResumableSessionId } from "./sessionid.mjs";
 
 function nowIso() {
   return new Date().toISOString();
@@ -149,8 +150,13 @@ function clampLimit(value) {
 }
 
 
+// Job ids are `crypto.randomUUID()`s and resumable SESSION ids have exactly
+// the same shape, so there is one predicate for both and it lives in
+// sessionid.mjs — see the long note there for why the two used to disagree and
+// what that cost. The regex is no longer written out here: a second copy of it
+// is precisely the drift this consolidation removes.
 function isSafeJobId(id) {
-  return /^[a-f0-9-]{36}$/.test(id);
+  return isResumableSessionId(id);
 }
 
 
