@@ -4,7 +4,7 @@ import crypto from "node:crypto";
 
 import { createDb } from "../src/db.js";
 import { createRegistry } from "../src/registry.js";
-import { verifyNodeRequest, nodeRequestSigningInput } from "../src/nodeauth.js";
+import { verifyNodeRequest, nodeRequestSigningInput, createReplayGuard } from "../src/nodeauth.js";
 
 const NODE_ID = "node-00112233445566aa";
 
@@ -69,4 +69,42 @@ test("missing headers and unknown nodes are reported distinctly", () => {
     "missing_signature");
   const req = signedRequest({ privateKey, ts: clock.t, nodeId: "node-ffffffffffffffff" });
   assert.equal(verifyNodeRequest(req, "/v1/node/handoffs?wait=5", { registry, now: () => clock.t }).error, "unknown_node");
+});
+
+// Task 8 review, I-3: a captured (nodeId, ts, signature) triple is otherwise
+// a pure bearer credential for the whole 10-minute freshness window. A
+// replayGuard makes a byte-identical replay of it fail the second time.
+test("a replay guard allows the first use of a signature and rejects an identical replay", () => {
+  const { clock, registry, privateKey } = setup();
+  const guard = createReplayGuard();
+  const req = signedRequest({ privateKey, ts: clock.t });
+
+  const first = verifyNodeRequest(req, "/v1/node/handoffs?wait=5", { registry, now: () => clock.t, replayGuard: guard });
+  assert.equal(first.node.id, NODE_ID);
+
+  const replay = verifyNodeRequest(req, "/v1/node/handoffs?wait=5", { registry, now: () => clock.t, replayGuard: guard });
+  assert.equal(replay.error, "replayed");
+});
+
+// The guard is opt-in per call site: without one, verifyNodeRequest behaves
+// exactly as before (a future read-only node-signed GET may choose not to
+// pay for replay tracking).
+test("without a replayGuard, verifyNodeRequest does not track replays", () => {
+  const { clock, registry, privateKey } = setup();
+  const req = signedRequest({ privateKey, ts: clock.t });
+  assert.equal(verifyNodeRequest(req, "/v1/node/handoffs?wait=5", { registry, now: () => clock.t }).node.id, NODE_ID);
+  assert.equal(verifyNodeRequest(req, "/v1/node/handoffs?wait=5", { registry, now: () => clock.t }).node.id, NODE_ID);
+});
+
+// A different node id, timestamp, or signature is a distinct claim even if
+// one of the three fields matches a previously-seen request.
+test("a replay guard's claim is keyed on the full (nodeId, ts, signature) triple", () => {
+  const { clock, registry, privateKey } = setup();
+  const guard = createReplayGuard();
+  const req1 = signedRequest({ privateKey, ts: clock.t });
+  assert.equal(verifyNodeRequest(req1, "/v1/node/handoffs?wait=5", { registry, now: () => clock.t, replayGuard: guard }).node.id, NODE_ID);
+
+  const req2 = signedRequest({ privateKey, ts: clock.t + 1 });
+  assert.equal(verifyNodeRequest(req2, "/v1/node/handoffs?wait=5", { registry, now: () => clock.t, replayGuard: guard }).node.id, NODE_ID,
+    "a different ts (and therefore a different signature) is not a replay");
 });

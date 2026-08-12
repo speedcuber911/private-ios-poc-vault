@@ -131,8 +131,9 @@ export async function startTestApp(overrides = {}) {
 }
 
 // ── tiny HTTP client ──────────────────────────────────────────────────────
-export async function api(baseUrl, method, path, { body, headers = {}, raw } = {}) {
+export async function api(baseUrl, method, path, { body, headers = {}, raw, signal } = {}) {
   const init = { method, headers: { ...headers } };
+  if (signal) init.signal = signal;
   if (raw !== undefined) {
     init.body = raw;
     init.headers["content-type"] ||= "application/octet-stream";

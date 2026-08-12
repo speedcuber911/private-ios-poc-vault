@@ -193,3 +193,30 @@ test("healthz is public; unknown routes 404; unauthed registry routes 401", asyn
     await t.close();
   }
 });
+
+// Task 8 review, M-5: a handoff row whose node no longer exists can never be
+// delivered — nothing will ever poll for it again. deleteAccount already
+// clears every handoff for an account in one transaction; deleteNode
+// (single-node removal — BYO/managed delete, or the trial reaper's
+// past-grace path) previously left these rows behind forever.
+test("deleting a node also deletes its orphan handoff rows", async () => {
+  const t = await startTestApp();
+  try {
+    const session = await signIn(t);
+    const identity = makeNodeIdentity();
+    const nodeId = "node-00112233445566aa";
+    t.app.registry.createNode(session.accountId, { id: nodeId, kind: "trial", name: "Trial", pubkey: identity.pubkeyPem });
+    await api(t.baseUrl, "POST", "/v1/repos", { body: { fullName: "me/relay" }, ...authed(session.sessionToken) });
+
+    const handoffId = "a1b2c3d4e5f60718";
+    t.app.registry.createHandoff({
+      id: handoffId, accountId: session.accountId, nodeId, repo: "me/relay", branch: "relay/handoff-fix-auth",
+    });
+    assert.equal(t.app.registry.getHandoff(handoffId)?.state, "pending");
+
+    t.app.registry.deleteNode(session.accountId, nodeId);
+    assert.equal(t.app.registry.getHandoff(handoffId), null, "handoff rows for a deleted node must not be orphaned");
+  } finally {
+    await t.close();
+  }
+});

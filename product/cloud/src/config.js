@@ -132,10 +132,13 @@ export function loadConfig(env = process.env) {
     jsonBodyMaxBytes: intFrom(env.JSON_BODY_MAX_BYTES, 32 * 1024),
 
     // Cap on how long GET /v1/node/handoffs holds a long-poll open, in
-    // seconds. Kept comfortably inside nginx's 300 s proxy_read_timeout and
-    // Node's 60 s default headersTimeout for the next request on the
-    // connection.
-    handoffPollMaxWaitSec: intFrom(env.HANDOFF_POLL_MAX_WAIT_SEC, 25),
+    // seconds. Kept comfortably inside nginx's 300 s proxy_read_timeout
+    // (deploy/relay-cloud.nginx.conf.template) and Node's 60 s default
+    // headersTimeout for the next request on the connection. Hard-clamped to
+    // 290 s regardless of the env value so a misconfigured operator setting
+    // can never make a held request outlive the reverse proxy's own timeout
+    // — see Task 8 review, M-1.
+    handoffPollMaxWaitSec: Math.min(intFrom(env.HANDOFF_POLL_MAX_WAIT_SEC, 25), 290),
   };
 }
 
