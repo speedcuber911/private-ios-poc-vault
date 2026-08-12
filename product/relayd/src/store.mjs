@@ -42,9 +42,30 @@ const SAFE_RECORD_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$/;
 // Suffix of the pairing claim marker written by the JSON backend.
 const CLAIM_SUFFIX = ".claim";
 
+// A record id that fails the path-safety check is a caller/input problem, not
+// an internal failure, and every HTTP-facing caller has to be able to tell the
+// two apart (a bad id and an unknown id are both a clean 404; a real failure is
+// a logged 500). That distinction used to be made by string-matching this
+// error's message from additions.mjs, which coupled an HTTP status to a
+// sentence. The type and the `code` are the contract now; the message is kept
+// identical so existing logs and assertions read the same.
+class InvalidRecordIdError extends Error {
+  constructor() {
+    super("record id is invalid");
+    this.name = "InvalidRecordIdError";
+    this.code = "invalid_record_id";
+  }
+}
+
+// Predicate rather than a bare `instanceof`: the check stays true for an error
+// that crossed a module boundary or was re-created from a serialized form.
+function isInvalidRecordIdError(error) {
+  return error instanceof InvalidRecordIdError || error?.code === "invalid_record_id";
+}
+
 function assertSafeRecordId(id) {
   if (typeof id !== "string" || !SAFE_RECORD_ID.test(id) || id.includes("..")) {
-    throw new Error("record id is invalid");
+    throw new InvalidRecordIdError();
   }
   return id;
 }
@@ -1004,4 +1025,11 @@ async function migrateJsonToSqlite({ dataDir: dataRoot, dbPath }) {
 const storeKind = (process.env.RELAYD_STORE || "json").trim().toLowerCase();
 const store = await createStore(storeKind);
 
-export { store, storeKind, createStore, migrateJsonToSqlite };
+export {
+  store,
+  storeKind,
+  createStore,
+  migrateJsonToSqlite,
+  InvalidRecordIdError,
+  isInvalidRecordIdError,
+};

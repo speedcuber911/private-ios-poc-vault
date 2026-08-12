@@ -11,7 +11,7 @@ import { listDevices, revokeDevice, publicDevice } from "./identity.mjs";
 import { listHarnesses, getOp, listOps, publicOp, startLoginOp, startSmokeOp } from "./harness.mjs";
 import { serveExportTar } from "./fsapi.mjs";
 import { continueHandoff } from "./handoff.mjs";
-import { store } from "./store.mjs";
+import { store, isInvalidRecordIdError } from "./store.mjs";
 import { toJobResponse, responseShape } from "./jobs.mjs";
 import { readMacSessions } from "./syncauth.mjs";
 import { dataDir } from "./config.mjs";
@@ -132,23 +132,25 @@ async function handleAdditionRoutes(req, res, url, auth) {
 }
 
 // store.getHandoff/continueHandoff both route through store.mjs's
-// (unexported) assertSafeRecordId, which throws this exact message for any
-// id that fails its own path-safety check — wrong charset, "..", empty,
-// too long, ... A handoff id arrives straight off the network as a URL
-// path segment, so this is reachable by any caller, not just a buggy
-// client: a traversal-shaped id like "../etc/passwd" hits it too. From the
-// client's side a bad id and a real-but-unknown id must be indistinguishable
-// — both mean "not here" — so this is a clean 404, never a 500 that echoes
-// an internal validator's message back out. Anything else thrown is a
-// genuine failure: still surfaced as a 500 (via the caller's rethrow), but
-// logged here first so it is never silently absorbed along with the id
-// case. Already-typed errors (continueHandoff's own 404/409) carry a
-// numeric `.status` and are deliberately left alone — they already produce
-// the right response and don't need re-logging as if they were a bug.
-const INVALID_RECORD_ID_MESSAGE = "record id is invalid";
-
+// assertSafeRecordId, which throws its typed InvalidRecordIdError for any id
+// that fails its own path-safety check — wrong charset, "..", empty, too
+// long, ... A handoff id arrives straight off the network as a URL path
+// segment, so this is reachable by any caller, not just a buggy client: a
+// traversal-shaped id like "../etc/passwd" hits it too. From the client's
+// side a bad id and a real-but-unknown id must be indistinguishable — both
+// mean "not here" — so this is a clean 404, never a 500 that echoes an
+// internal validator's message back out. Anything else thrown is a genuine
+// failure: still surfaced as a 500 (via the caller's rethrow), but logged
+// here first so it is never silently absorbed along with the id case.
+// Already-typed errors (continueHandoff's own 404/409) carry a numeric
+// `.status` and are deliberately left alone — they already produce the right
+// response and don't need re-logging as if they were a bug.
+//
+// The test for this predicate is the type, not the sentence: matching
+// store.mjs's message text from here made an HTTP status depend on a string
+// two modules away that nothing stopped anyone from rewording.
 function handleHandoffLookupError(res, route, error) {
-  if (error?.message === INVALID_RECORD_ID_MESSAGE) {
+  if (isInvalidRecordIdError(error)) {
     sendError(res, 404, "handoff not found");
     return true;
   }
