@@ -30,11 +30,15 @@ function assertSafeSessionId(sessionId) {
   return sessionId;
 }
 
-// Second layer of defense: even after validating the id, confirm the resolved
+// First layer of defense: even after validating the id, confirm the resolved
 // file actually lands inside the intended base directory before writing.
 // Compare against `base + path.sep` rather than a bare startsWith(base), so a
 // sibling directory that merely shares a prefix (e.g. base "/srv/relay" vs
-// "/srv/relay-evil") cannot pass the check.
+// "/srv/relay-evil") cannot pass the check. This is purely lexical
+// (path.resolve never touches the filesystem) — see writeContainedFile below
+// for the symlink-aware second layer that a lexical check alone can't provide.
+// Exported so this layer has a direct test, independent of whatever
+// (currently) reaches it through importSession.
 function assertContained(baseDir, filePath) {
   const resolvedBase = path.resolve(baseDir);
   const resolvedFile = path.resolve(filePath);
@@ -50,24 +54,70 @@ function claudeProjectSlug(cwd) {
 
 function rewriteClaudeSession(text, { fromCwd, toCwd }) {
   if (!fromCwd || fromCwd === toCwd) return text;
-  // Boundary-aware: only substitute when the match is not immediately
-  // followed by a filename-continuation character, so a sibling directory
-  // that shares a prefix (e.g. "relay-old" or "relayground" next to "relay")
-  // is left untouched instead of silently corrupted.
+  // Boundary-aware: only substitute when the match is followed by a real
+  // path/word boundary — a path separator, a quote, a backslash (an
+  // embedded quote inside a JSON string value is serialized as `\"`, so the
+  // character right after the cwd is the escaping backslash, not the quote
+  // itself), whitespace, or end-of-string (optionally through one trailing
+  // period, so ordinary prose like "...in /path/to/relay." still gets
+  // rewritten instead of leaking the laptop path) — so a sibling that
+  // merely shares a prefix ("relay+plus", "relay~1", "relay(copy)",
+  // "relay@2", "relay-old") is left untouched instead of silently corrupted.
   const escaped = fromCwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return text.replace(new RegExp(`${escaped}(?![A-Za-z0-9._-])`, "g"), toCwd);
+  const boundary = String.raw`(?=[/"'\\\s]|\.?$)`;
+  // The replacement is a function, not a string: String.prototype.replace
+  // gives $&, $\`, $', $1... special meaning in a *string* replacement, so a
+  // toCwd containing one of those sequences would get reinterpreted instead
+  // of inserted literally — toCwd is built from a remote-supplied handoff
+  // id, so this is reachable, not theoretical. A function replacement is
+  // always used as-is.
+  return text.replace(new RegExp(`${escaped}${boundary}`, "g"), () => toCwd);
 }
 
-function writePrivateFile(filePath, contents) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(filePath, contents, { mode: 0o600 });
+// Second layer of defense: mkdirSync/writeFileSync follow symlinks, so a
+// symlinked ancestor anywhere between jailRoot and the leaf — or the leaf
+// itself — can silently redirect a write outside the intended directory even
+// though assertContained's lexical check above passed. After creating the
+// directory, compare the REAL (symlink-resolved) directory against the REAL
+// (symlink-resolved) jail root; only if it still nests inside does the write
+// proceed. Finally, open the leaf ourselves with O_NOFOLLOW so a pre-planted
+// symlink at the leaf position fails closed instead of being followed (and
+// potentially clobbering whatever it points at).
+function writeContainedFile({ jailRoot, dir, target, contents }) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+
+  const resolvedRoot = fs.realpathSync(jailRoot);
+  const resolvedDir = fs.realpathSync(dir);
+  if (resolvedDir !== resolvedRoot && !resolvedDir.startsWith(resolvedRoot + path.sep)) {
+    throw new Error(`unsafe_session_id: resolved directory escapes jail via symlink`);
+  }
+
+  let fd;
+  try {
+    fd = fs.openSync(
+      target,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW,
+      0o600,
+    );
+  } catch (err) {
+    if (err.code === "ELOOP") {
+      throw new Error(`unsafe_session_id: refusing to follow a symlink at the session file path`);
+    }
+    throw err;
+  }
+  try {
+    fs.writeFileSync(fd, contents);
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 function summaryPrompt(manifest) {
+  const title = manifest.title || "an untitled session";
   const repo = manifest.repo || "an unknown repo";
   const branch = manifest.branch || "an unknown branch";
   const lines = [
-    `Continue this handed-off session: ${manifest.title}`,
+    `Continue this handed-off session: ${title}`,
     "",
     `It was running on ${manifest.machine || "another machine"} in ${repo}, on branch ${branch}.`,
   ];
@@ -91,16 +141,22 @@ function importSession({ manifest, sessionBytes, runHome, codexHome, worktreePat
       fromCwd: manifest.cwd,
       toCwd: worktreePath,
     });
+    // The base passed to assertContained is the actual write directory
+    // (projectDir), not the wider runHome: runHome would still permit
+    // escaping into home/.claude/settings.local.jsonl, an unrelated file in
+    // home directly, or — worst — a sibling workspace's transcript
+    // directory (transcript poisoning).
     const projectDir = path.join(runHome, ".claude", "projects", claudeProjectSlug(worktreePath));
-    const target = assertContained(runHome, path.join(projectDir, `${manifest.sessionId}.jsonl`));
-    writePrivateFile(target, rewritten);
+    const target = assertContained(projectDir, path.join(projectDir, `${manifest.sessionId}.jsonl`));
+    writeContainedFile({ jailRoot: runHome, dir: projectDir, target, contents: rewritten });
     return { provider: "claude", requestedHarness, resumeSessionId: manifest.sessionId, primedPrompt: null };
   }
 
   if (sessionBytes && manifest.sessionFormat === "codex-rollout" && manifest.sessionId) {
     assertSafeSessionId(manifest.sessionId);
-    const target = assertContained(codexHome, path.join(codexHome, "sessions", `${manifest.sessionId}.jsonl`));
-    writePrivateFile(target, sessionBytes);
+    const sessionsDir = path.join(codexHome, "sessions");
+    const target = assertContained(sessionsDir, path.join(sessionsDir, `${manifest.sessionId}.jsonl`));
+    writeContainedFile({ jailRoot: codexHome, dir: sessionsDir, target, contents: sessionBytes });
     return { provider: "codex", requestedHarness, resumeSessionId: manifest.sessionId, primedPrompt: null };
   }
 
@@ -109,6 +165,7 @@ function importSession({ manifest, sessionBytes, runHome, codexHome, worktreePat
 
 export {
   HANDOFF_MANIFEST_VERSION,
+  assertContained,
   claudeProjectSlug,
   rewriteClaudeSession,
   summaryPrompt,
