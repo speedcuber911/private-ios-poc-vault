@@ -424,6 +424,13 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     // with the node cannot resurrect a replay window.
     if (Number(result.changes) > 0) {
       db.prepare("DELETE FROM node_event_cursors WHERE node_id = ?").run(id);
+      // A handoff row whose node no longer exists can never be delivered —
+      // nothing will ever poll for it again. deleteAccount already clears
+      // every handoff for an account in one transaction, but a single-node
+      // delete (BYO/managed removal, or the trial reaper's past-grace path)
+      // previously left these rows behind forever; no sweep touches the
+      // handoffs table at all. See Task 8 review, M-5.
+      db.prepare("DELETE FROM handoffs WHERE node_id = ?").run(id);
     }
   }
 
@@ -901,14 +908,26 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     return mapHandoff(db.prepare("SELECT * FROM handoffs WHERE id = ?").get(id));
   }
 
+  // `rowid` is the tiebreaker on both queries below: `created_at` is
+  // millisecond-resolution, so two handoffs minted in the same millisecond
+  // would otherwise sort nondeterministically (SQLite makes no ordering
+  // guarantee among rows with an equal ORDER BY key). rowid reflects
+  // insertion order, so ties resolve to "most/least recently created" the
+  // same way the millisecond column intends. See Task 8 review, M-7.
   function listHandoffsForRepo(accountId, repo, limit = 50) {
-    return db.prepare("SELECT * FROM handoffs WHERE account_id = ? AND repo = ? ORDER BY created_at DESC LIMIT ?")
-      .all(accountId, repo, limit).map(mapHandoff);
+    return db.prepare(
+      "SELECT * FROM handoffs WHERE account_id = ? AND repo = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+    ).all(accountId, repo, limit).map(mapHandoff);
   }
 
-  function listPendingHandoffs(nodeId) {
-    return db.prepare("SELECT * FROM handoffs WHERE node_id = ? AND state = 'pending' ORDER BY created_at")
-      .all(nodeId).map(mapHandoff);
+  // Capped so a node that was offline for a long stretch — during which many
+  // pings landed — cannot be handed one unbounded JSON response; a node past
+  // the cap simply finds the rest still `pending` on its next poll. See Task
+  // 8 review, M-6.
+  function listPendingHandoffs(nodeId, limit = 50) {
+    return db.prepare(
+      "SELECT * FROM handoffs WHERE node_id = ? AND state = 'pending' ORDER BY created_at, rowid LIMIT ?",
+    ).all(nodeId, limit).map(mapHandoff);
   }
 
   function countPendingHandoffs(nodeId) {

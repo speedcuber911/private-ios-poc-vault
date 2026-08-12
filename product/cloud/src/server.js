@@ -24,9 +24,17 @@ import { createPairing } from "./pairing.js";
 import { createNotify, parseNodePubkey } from "./notify.js";
 import { createApnsClient, createNoopTransport } from "./apns.js";
 import { createProvisioner } from "./provisioner.js";
-import { verifyNodeRequest } from "./nodeauth.js";
+import { verifyNodeRequest, createReplayGuard } from "./nodeauth.js";
 
 const NODE_KINDS = new Set(["byo", "managed"]);
+
+// Bounds how many polls from ONE node can be parked at once on
+// GET /v1/node/handoffs. A client that connects, signs a valid request, and
+// immediately disconnects still costs a Set entry, a timer, and a live
+// req/res pair until something releases it; uncapped, a flood of such
+// clients pins unbounded resources for up to handoffPollMaxWaitSec each. See
+// Task 8 review, I-2.
+export const HANDOFF_MAX_WAITERS_PER_NODE = 8;
 
 export function createApp({
   config,
@@ -112,27 +120,70 @@ export function createApp({
   // Waiters for GET /v1/node/handoffs, keyed by node id. Lives inside
   // createApp (not module-global) so each app instance — and therefore each
   // test — owns its own waiters instead of leaking state across instances.
+  //
+  // Each entry is `{ settle, timer }`. Keeping `timer` alongside `settle`
+  // (rather than firing-and-forgetting it) lets a disconnecting client be
+  // released immediately instead of pinning the waiter until the wait
+  // deadline (I-2), and keeps the Timeout object inspectable from tests
+  // (`Timeout#hasRef()`) without spawning a child process to observe
+  // process-exit timing.
   const handoffWaiters = new Map();
+
+  // A per-app-instance replay guard for the node long-poll: see I-3. Kept
+  // per instance, like handoffWaiters, so tests don't leak claimed
+  // (nodeId, ts, signature) triples across app instances.
+  const handoffReplayGuard = createReplayGuard();
 
   function wakeHandoffWaiters(nodeId) {
     const waiters = handoffWaiters.get(nodeId);
     if (!waiters) return;
     handoffWaiters.delete(nodeId);
-    for (const resolve of waiters) resolve();
+    for (const entry of waiters) entry.settle();
   }
 
-  function waitForHandoff(nodeId, timeoutMs) {
+  // `req` is the parked long-poll's own request; a "close" on it — the
+  // client disconnecting, a proxy dropping the connection, anything short of
+  // a normal response — releases the waiter immediately rather than pinning
+  // its timer/Set entry/req/res for the rest of `timeoutMs` (I-2). The
+  // route handler is responsible for checking `req.destroyed` after this
+  // resolves and skipping the delivery flip when it is set (C-1) — this
+  // function only manages the wait itself.
+  //
+  // A node already at HANDOFF_MAX_WAITERS_PER_NODE parked polls does not
+  // park a new one at all; it resolves immediately so the caller falls
+  // through to an ordinary (typically empty) response instead of holding a
+  // socket it has no budget for (I-2).
+  function waitForHandoff(nodeId, timeoutMs, req) {
     return new Promise((resolve) => {
-      const waiters = handoffWaiters.get(nodeId) || new Set();
-      const settle = () => {
-        clearTimeout(timer);
-        waiters.delete(settle);
+      let waiters = handoffWaiters.get(nodeId);
+      if (waiters && waiters.size >= HANDOFF_MAX_WAITERS_PER_NODE) {
         resolve();
+        return;
+      }
+      if (!waiters) {
+        waiters = new Set();
+        handoffWaiters.set(nodeId, waiters);
+      }
+
+      const entry = {
+        timer: null,
+        settle() {
+          clearTimeout(entry.timer);
+          req.removeListener("close", onClose);
+          waiters.delete(entry);
+          // The empty Set left behind by a natural timeout is never removed
+          // by anything else — dropping it here is what keeps
+          // handoffWaiters from growing without bound over the process
+          // lifetime as trial nodes churn (I-1).
+          if (waiters.size === 0) handoffWaiters.delete(nodeId);
+          resolve();
+        },
       };
-      const timer = setTimeout(settle, timeoutMs);
-      timer.unref?.();
-      waiters.add(settle);
-      handoffWaiters.set(nodeId, waiters);
+      const onClose = () => entry.settle();
+      entry.timer = setTimeout(() => entry.settle(), timeoutMs);
+      entry.timer.unref?.();
+      req.on("close", onClose);
+      waiters.add(entry);
     });
   }
 
@@ -457,7 +508,7 @@ export function createApp({
     // node-signed GETs in nodeauth.js.
     if (method === "GET" && path === "/v1/node/handoffs") {
       const pathWithQuery = `${path}${url.search}`;
-      const verified = verifyNodeRequest(req, pathWithQuery, { registry, now });
+      const verified = verifyNodeRequest(req, pathWithQuery, { registry, now, replayGuard: handoffReplayGuard });
       if (verified.error) return sendJson(res, 401, { error: "unauthorized" });
 
       const nodeId = verified.node.id;
@@ -466,8 +517,16 @@ export function createApp({
         ? Math.max(0, Math.min(requested, config.handoffPollMaxWaitSec))
         : 0;
       if (waitSec > 0 && registry.countPendingHandoffs(nodeId) === 0) {
-        await waitForHandoff(nodeId, waitSec * 1000);
+        await waitForHandoff(nodeId, waitSec * 1000, req);
       }
+      // A client that vanished — mid-wait, at the per-node cap, or in the
+      // instant between the wait resolving and this line — must never have a
+      // handoff flipped to `delivered` on its behalf: the bytes would go
+      // nowhere and the row would be gone for good, with no log line and no
+      // recovery but a brand-new handoff id. Leaving it `pending` here is
+      // what makes "the node catches up on reconnect" — the design's own
+      // failure-mode promise — actually true. See Task 8 review, C-1.
+      if (req.destroyed) return;
 
       const pending = registry.listPendingHandoffs(nodeId);
       for (const handoff of pending) {
@@ -616,8 +675,8 @@ export function createApp({
       const repo = normalizeRepoFullName(body?.repo);
       const branch = strOrNull(body?.branch);
       const nodeId = strOrNull(body?.nodeId);
-      if (!handoffId || !/^[a-f0-9]{16,64}$/.test(handoffId) || !repo || !branch ||
-          !branch.startsWith("relay/handoff-") || branch.length > 200 || !nodeId) {
+      if (!handoffId || !/^[a-f0-9]{16,64}$/.test(handoffId) || !repo ||
+          !isValidHandoffBranch(branch) || !nodeId) {
         return sendJson(res, 400, { error: "invalid_handoff" });
       }
       if (!registry.getRepo(account.id, repo)) return sendJson(res, 404, { error: "unknown_repo" });
@@ -770,7 +829,12 @@ export function createApp({
     return sendJson(res, 404, { error: "not_found" });
   }
 
-  return { server, registry, auth, pairing, notify, runSweeps, sweepTrials, db, config, provisioner };
+  // handoffWaiters is exposed for test observability only (leak/cap/release
+  // assertions — see the Task 8 review, I-1/I-2) — not a public API.
+  return {
+    server, registry, auth, pairing, notify, runSweeps, sweepTrials, db, config, provisioner,
+    handoffWaiters,
+  };
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
@@ -861,6 +925,35 @@ function normalizeRepoFullName(value) {
   const trimmed = String(value || "").trim();
   if (!REPO_FULL_NAME_RE.test(trimmed)) return null;
   return trimmed.toLowerCase();
+}
+
+// What a git ref may actually hold, restricted to Relay's own namespace.
+// Charset alone is not enough — "../../etc/passwd" is built entirely from
+// characters in [A-Za-z0-9._-/] — so the extra checks below mirror
+// `git check-ref-format`'s structural rules: no ".." component anywhere, no
+// "@{", no component starting with "." or ending in ".lock", and the whole
+// ref cannot end with ".". branch crosses a trust boundary here: relayd
+// feeds it to `git` and to worktree path construction on a node, and the
+// cloud is the one choke point where an illegal value can be refused before
+// it gets there. A value that fails this check could never be a real git
+// branch, so rejecting it costs nothing legitimate.
+//
+// A NUL byte anywhere fails the charset test outright (it is not in the
+// allowed class), which matters because node:sqlite — like most C string
+// storage — silently truncates a TEXT value at the first NUL: without this,
+// the string that passed validation would not be the string that got
+// stored. See Task 8 review, I-4.
+const HANDOFF_BRANCH_PREFIX = "relay/handoff-";
+const HANDOFF_BRANCH_RE = /^relay\/handoff-[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/;
+
+function isValidHandoffBranch(branch) {
+  if (typeof branch !== "string") return false;
+  if (branch.length <= HANDOFF_BRANCH_PREFIX.length || branch.length > 200) return false;
+  if (!HANDOFF_BRANCH_RE.test(branch)) return false;
+  if (branch.includes("..") || branch.includes("@{")) return false;
+  if (branch.endsWith(".")) return false;
+  if (branch.split("/").some((segment) => segment.startsWith(".") || segment.endsWith(".lock"))) return false;
+  return true;
 }
 
 function publicTrial(trial, config, registry) {
