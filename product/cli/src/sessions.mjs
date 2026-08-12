@@ -160,10 +160,45 @@ function roleOf(record) {
   return null;
 }
 
+// Both harnesses record turns with role "user" that the user never typed: the
+// caveat that precedes local command output, the slash-command wrappers, system
+// reminders, hook output, Codex's injected context blocks. Reading the first
+// "user" record literally is how a real handoff ended up titled
+//   Handed off: <local-command-caveat>Caveat: The messages below were generated…
+// and how the same text reached the excerpt the phone renders on its card.
+const SYNTHETIC_TAGS = [
+  "local-command-caveat",
+  "local-command-stdout",
+  "local-command-stderr",
+  "command-name",
+  "command-message",
+  "command-args",
+  "system-reminder",
+  "user-prompt-submit-hook",
+  "environment_context",
+  "user_instructions",
+];
+const SYNTHETIC_BLOCK_RE = new RegExp(`<(${SYNTHETIC_TAGS.join("|")})>[\\s\\S]*?</\\1>`, "gi");
+const SYNTHETIC_OPEN_RE = new RegExp(`<(?:${SYNTHETIC_TAGS.join("|")})>`, "i");
+const SYNTHETIC_STRAY_RE = new RegExp(`</?(?:${SYNTHETIC_TAGS.join("|")})>`, "gi");
+
+// Returns the human-written part of a turn, or "" when the whole turn was
+// machine-generated.
+function stripSyntheticMarkup(value) {
+  let text = String(value ?? "").replace(SYNTHETIC_BLOCK_RE, "");
+  // An unclosed opener is the common case, not an edge case — the caveat that
+  // broke this arrives with no closing tag, and everything after it belongs to
+  // the machine. Cutting to the end is what keeps that text out of the title;
+  // stripping only the tag would leave the caveat body behind as the title.
+  const unclosed = text.search(SYNTHETIC_OPEN_RE);
+  if (unclosed !== -1) text = text.slice(0, unclosed);
+  return text.replace(SYNTHETIC_STRAY_RE, "").trim();
+}
+
 function titleFrom(records, fallback) {
   for (const record of records) {
     if (roleOf(record) !== "user") continue;
-    const text = firstText(messageContentOf(record)).trim();
+    const text = stripSyntheticMarkup(firstText(messageContentOf(record)));
     if (text) return text.split("\n")[0].slice(0, 120);
   }
   return fallback;
@@ -303,7 +338,11 @@ function sessionExcerpt(session, { maxChars = 600 } = {}) {
   const records = readJsonLines(session.filePath, { limit: 400, fromEnd: true });
   const texts = [];
   for (const record of records.slice(-12)) {
-    const text = firstText(messageContentOf(record)).trim();
+    // Same filter as the title, and for a stronger reason: this text is what
+    // the phone renders on the handoff card, so a system-reminder or a block
+    // of local command output would be shown to the user as if it were part
+    // of their conversation.
+    const text = stripSyntheticMarkup(firstText(messageContentOf(record)));
     if (text) texts.push(text);
   }
   return texts.join("\n").slice(-maxChars);
@@ -313,6 +352,7 @@ export {
   discoverSessions,
   readSessionBytes,
   sessionExcerpt,
+  stripSyntheticMarkup,
   claudeProjectSlug,
   isResumableSessionId,
   RESUMABLE_SESSION_ID_RE,

@@ -865,3 +865,129 @@ test("F-1: the vendored policy matches by shape, not by the three names that wer
   for (const entry of denied) assert.equal(isSecretPath(entry), true, `${entry} must be denied`);
   for (const entry of allowed) assert.equal(isSecretPath(entry), false, `${entry} must be allowed`);
 });
+
+// ── pre-flight: the repository must be registered before anything is pushed ──
+//
+// This shipped broken and cost a real handoff. `relay handoff` did all of its
+// work — sealed the transcript, built the commit, pushed the branch to GitHub —
+// and only then asked the cloud to record it. When the cloud answered
+// `unknown_repo`, the branch was already on the remote, the handoff was never
+// recorded, and the user was told "your machine will still pick it up on its
+// next poll", which cannot happen: the node leases handoff ROWS, and no row
+// existed.
+
+const { requireGitHubRepo } = await import("../src/repo.mjs");
+
+// Wraps the scenario's stub so /v1/repos can answer, which it otherwise does
+// not — the base stub 500s every path it does not know.
+function withRepoList(s, responder) {
+  return async (url, options = {}) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/v1/repos" && (options.method || "GET") === "GET") {
+      s.calls.push({ pathname, body: null });
+      return responder();
+    }
+    return s.fetchImpl(url, options);
+  };
+}
+
+async function bareHandoffRefs(bare) {
+  const { stdout } = await execFileAsync("git", ["-C", bare, "for-each-ref", "--format=%(refname)", "refs/heads/relay/"]);
+  return stdout.split("\n").filter(Boolean);
+}
+
+test("an unregistered repository fails before anything is pushed", async () => {
+  const s = await scenario();
+  const fetchImpl = withRepoList(s, () => ({ status: 200, json: async () => ({ repos: [] }) }));
+
+  await assert.rejects(
+    cmdHandoff([], { home: s.home, cwd: s.work, baseUrl: "https://cloud.test", fetchImpl, log: () => {}, machine: "MacBook-Pro" }),
+    /repo_not_registered/,
+  );
+
+  // The whole point: the remote must be untouched. Asserting only on the
+  // thrown message would pass even if the branch had already been pushed,
+  // which is exactly the bug.
+  assert.deepEqual(await bareHandoffRefs(s.bare), [],
+    "nothing may reach the remote when the cloud could never accept the handoff");
+  assert.equal(s.handoffPings().length, 0, "and the create call must never be attempted");
+});
+
+test("a registered repository proceeds and pushes", async () => {
+  const s = await scenario();
+  const repo = await requireGitHubRepo({ cwd: s.work });
+  const fetchImpl = withRepoList(s, () => ({
+    status: 200, json: async () => ({ repos: [{ fullName: repo.fullName }] }),
+  }));
+
+  const result = await cmdHandoff([], {
+    home: s.home, cwd: s.work, baseUrl: "https://cloud.test", fetchImpl, log: () => {}, machine: "MacBook-Pro",
+  });
+
+  assert.equal(result.pushed, true);
+  assert.deepEqual(await bareHandoffRefs(s.bare), [`refs/heads/${result.branch}`]);
+});
+
+// The probe exists to catch one predictable misconfiguration, not to add a new
+// way for handoff to fail. A cloud that is unhappy for some unrelated reason
+// must not block a handoff the create call might well have accepted.
+test("a probe that does not answer 200 does not block the handoff", async () => {
+  const s = await scenario();
+  const fetchImpl = withRepoList(s, () => ({ status: 503, json: async () => ({ error: "unavailable" }) }));
+
+  const result = await cmdHandoff([], {
+    home: s.home, cwd: s.work, baseUrl: "https://cloud.test", fetchImpl, log: () => {}, machine: "MacBook-Pro",
+  });
+
+  assert.equal(result.pushed, true);
+});
+
+test("--no-push never probes, because it never contacts the cloud", async () => {
+  const s = await scenario();
+  let probed = false;
+  const fetchImpl = withRepoList(s, () => {
+    probed = true;
+    return { status: 200, json: async () => ({ repos: [] }) };
+  });
+
+  const result = await cmdHandoff(["--no-push"], {
+    home: s.home, cwd: s.work, baseUrl: "https://cloud.test", fetchImpl, log: () => {}, machine: "MacBook-Pro",
+  });
+
+  assert.equal(result.pushed, false);
+  assert.equal(probed, false, "an unregistered repo is irrelevant when nothing is sent");
+});
+
+test("a rejected handoff says the machine will NOT pick it up, and how to clean up", async () => {
+  const s = await scenario();
+  const repo = await requireGitHubRepo({ cwd: s.work });
+  const lines = [];
+  // Registered at probe time, rejected at create time — the ordering that
+  // produced the original report, and the only way to reach this branch.
+  const fetchImpl = async (url, options = {}) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === "/v1/repos") {
+      return { status: 200, json: async () => ({ repos: [{ fullName: repo.fullName }] }) };
+    }
+    if (pathname === "/v1/handoffs") {
+      s.calls.push({ pathname, body: null });
+      return { status: 404, json: async () => ({ error: "unknown_repo" }) };
+    }
+    return s.fetchImpl(url, options);
+  };
+
+  const result = await cmdHandoff([], {
+    home: s.home, cwd: s.work, baseUrl: "https://cloud.test", fetchImpl,
+    log: (line) => lines.push(line), machine: "MacBook-Pro",
+  });
+
+  const output = lines.join("\n");
+  assert.equal(result.notified, false);
+  assert.equal(result.reason, "unknown_repo");
+  assert.match(output, /will NOT pick this up/);
+  assert.match(output, /relay init/);
+  assert.match(output, new RegExp(`git push origin --delete ${result.branch}`));
+  // The regression itself: the old text promised a recovery that cannot occur.
+  assert.doesNotMatch(output, /still pick it up/,
+    "the node leases handoff rows; a rejected create wrote none, so nothing can collect it");
+});

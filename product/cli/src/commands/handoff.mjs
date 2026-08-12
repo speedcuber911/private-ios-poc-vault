@@ -278,6 +278,37 @@ async function cmdHandoff(args = [], deps = {}) {
 
   const repo = await requireGitHubRepo({ cwd, execFileImpl });
   const realRoot = fs.realpathSync(repo.root);
+  const willPush = !args.includes("--no-push");
+
+  const api = createCloudApi({
+    baseUrl,
+    sessionToken: credentials.sessionToken,
+    refreshToken: credentials.refreshToken,
+    home,
+    fetchImpl,
+  });
+
+  // Pre-flight, before ANY work: an unregistered repo makes the cloud reject
+  // the handoff at the very last step, after a branch has already been pushed
+  // to GitHub — and a rejected handoff is never recorded, so nothing will ever
+  // collect it. That is not a recoverable state, it is litter on the remote
+  // plus a user told to wait for something that cannot arrive. Skipped for
+  // --no-push, which never contacts the cloud at all.
+  if (willPush) {
+    const repos = await progress.run("Checking this repository is registered",
+      () => api.listRepos());
+    if (repos.status === 200) {
+      const known = (repos.json?.repos || []).some((entry) => entry?.fullName === repo.fullName);
+      if (!known) {
+        throw new Error(`repo_not_registered: run \`relay init\` in this repository first (${repo.fullName})`);
+      }
+    }
+    // A non-200 is deliberately NOT fatal: the probe is here to catch the
+    // predictable misconfiguration, not to add a new way for handoff to fail.
+    // If the cloud is unhappy for some other reason, the create call below
+    // reports it with the real error rather than this one guessing.
+  }
+
   const wip = await progress.run("Inspecting your working tree",
     () => workingTreeSummary({ root: repo.root, execFileImpl }));
 
@@ -318,7 +349,6 @@ async function cmdHandoff(args = [], deps = {}) {
   if (await refExistsLocally(repo.root, ref, execFileImpl)) {
     throw new Error(`branch_collision: ${branch} already exists locally`);
   }
-  const willPush = !args.includes("--no-push");
   // A network round trip to origin, and the first place a handoff can stall
   // for a noticeable time (a slow remote, an ssh key prompt, a VPN).
   if (willPush && await progress.run("Checking origin for a name collision",
@@ -492,19 +522,22 @@ async function cmdHandoff(args = [], deps = {}) {
 
   if (!pushed) return { handoffId, branch, pushed: false };
 
-  const api = createCloudApi({
-    baseUrl,
-    sessionToken: credentials.sessionToken,
-    refreshToken: credentials.refreshToken,
-    home,
-    fetchImpl,
-  });
   const ping = await progress.run("Notifying your machine",
     () => api.createHandoff({ handoffId, repo: repo.fullName, branch, nodeId: credentials.nodeId }));
   if (ping.status !== 201) {
-    log(`  Pushed ${branch}, but the notification failed (${ping.json?.error || ping.status}).`);
-    log("  Your machine will still pick it up on its next poll.");
-    return { handoffId, branch, pushed: true };
+    // This used to say "Your machine will still pick it up on its next poll."
+    // It cannot. The node's poll leases handoff ROWS from the cloud, and a
+    // rejected create wrote no row — so there is nothing to lease, now or
+    // ever. Saying otherwise left a user waiting on a phone that was never
+    // going to light up, with a branch on GitHub that nothing would consume.
+    const reason = ping.json?.error || ping.status;
+    log(`  Pushed ${branch}, but the cloud rejected the handoff (${reason}).`);
+    log("  Your machine will NOT pick this up — it only ever collects handoffs");
+    log("  the cloud recorded, and this one was not recorded.");
+    if (reason === "unknown_repo") log("  Run `relay init` in this repository, then hand off again.");
+    if (reason === "unknown_node") log("  Run `relay login` to re-pin this machine, then hand off again.");
+    log(`  The pushed branch is unused; delete it with: git push origin --delete ${branch}`);
+    return { handoffId, branch, pushed: true, notified: false, reason: String(reason) };
   }
 
   // Keep the phone's "On your Mac" list current. Best-effort by design: the

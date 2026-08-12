@@ -22,6 +22,8 @@ import net from "node:net";
 import tls from "node:tls";
 import http from "node:http";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { Duplex } from "node:stream";
 
 const SIGNATURE_CONTEXT = "relay-tunnel-auth-v1";
@@ -278,12 +280,22 @@ function startTunnelClient({
   // semantics (requestCert + rejectUnauthorized enforcement, proper fatal
   // alerts, `authorized` bookkeeping) that a hand-rolled TLSSocket lacks.
   // Mux streams are fed to it as raw "connections".
+  // A device-token node does not demand a certificate at the handshake.
+  //
+  // Requiring one makes the machine unreachable from iOS, which will not send
+  // a client certificate on a connection whose server certificate it did not
+  // itself anchor — it declines silently, so the handshake fails with nothing
+  // for either side to report. Authentication moves up a layer: authorize()
+  // in server.mjs requires a bearer token on every request and rejects with
+  // 401 until pairing has written one, so the machine is never open. Nodes
+  // without a token file keep certificate authentication exactly as before.
+  const usesDeviceToken = Boolean(process.env.RELAYD_DEVICE_TOKEN_HASH_FILE);
   const tlsServer = new tls.Server({
     cert: tlsCertPem,
     key: tlsKeyPem,
     ca: deviceCaPem,
-    requestCert: true,
-    rejectUnauthorized: true,
+    requestCert: !usesDeviceToken,
+    rejectUnauthorized: !usesDeviceToken,
   });
   tlsServer.on("secureConnection", (secureSocket) => {
     if (typeof isRevokedSerial === "function") {
@@ -298,7 +310,44 @@ function startTunnelClient({
     }
     httpServer.emit("connection", secureSocket);
   });
-  tlsServer.on("tlsClientError", (_error, socket) => {
+  tlsServer.on("tlsClientError", (error, socket) => {
+    // Record why, then destroy. Discarding this error left every failed mTLS
+    // handshake indistinguishable from every other: a client that sent no
+    // certificate, one whose certificate did not chain to this node's CA, and
+    // one that hung up mid-handshake all looked identical from here, and
+    // nothing on the client says which either — iOS reports the same opaque
+    // -1200/-1206 for all of them. Node names them apart
+    // (ERR_SSL_PEER_DID_NOT_RETURN_A_CERTIFICATE vs
+    // ERR_SSL_TLSV1_ALERT_UNKNOWN_CA and friends), so this is the only place
+    // the distinction exists.
+    //
+    // Written to a file as well as stderr because a sandbox's stdout is
+    // captured only while it boots; by the time a phone connects, nothing is
+    // listening. Bounded to the last few entries so it cannot grow without
+    // limit, and it carries no key material — an error code and, when the
+    // peer sent one, the certificate's subject and issuer.
+    try {
+      const peer = typeof socket?.getPeerCertificate === "function"
+        ? socket.getPeerCertificate()
+        : null;
+      const entry = JSON.stringify({
+        at: new Date().toISOString(),
+        code: error?.code || error?.name || "unknown",
+        message: String(error?.message || "").slice(0, 200),
+        peerSubject: peer?.subject?.CN ?? null,
+        peerIssuer: peer?.issuer?.CN ?? null,
+      });
+      console.error(`relayd: tls client error ${entry}`);
+      const logPath = path.join(process.env.CODEX_DATA_DIR || "/var/lib/relayd", "tls-errors.log");
+      let previous = "";
+      try {
+        previous = fs.readFileSync(logPath, "utf8");
+      } catch {}
+      const lines = `${previous}${entry}\n`.trim().split("\n").slice(-20);
+      fs.writeFileSync(logPath, `${lines.join("\n")}\n`, { mode: 0o600 });
+    } catch {
+      // Diagnostics must never be able to take the listener down.
+    }
     socket?.destroy();
   });
 
