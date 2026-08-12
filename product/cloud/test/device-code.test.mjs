@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { createDb } from "../src/db.js";
 import { createRegistry } from "../src/registry.js";
 import { startTestApp, api, signIn, authed } from "./helpers.mjs";
+import { mintUserCode, USER_CODE_ALPHABET } from "../src/server.js";
 
 const start = (t) => api(t.baseUrl, "POST", "/v1/auth/device/start", { body: {} });
 const poll = (t, deviceCode) => api(t.baseUrl, "POST", "/v1/auth/device/token", { body: { deviceCode } });
@@ -336,6 +337,75 @@ test("unauthenticated callers cannot grow the device-code table without bound", 
     t.clock.t += 16 * 60 * 1000;
     assert.equal((await start(t)).status, 201);
   } finally { await t.close(); }
+});
+
+// Correction to a previously accepted residual: the global ceiling alone
+// bounds the TABLE but not who fills it. An attacker holding
+// DEVICE_CODE_MAX_LIVE codes could deny every other caller a code for the
+// rest of the TTL window. nginx sets `X-Real-IP $remote_addr`
+// (deploy/relay-cloud.nginx.conf.template) and the app binds 127.0.0.1, so
+// nginx is the only possible peer and the header is a trustworthy per-IP
+// signal — this test presents it exactly as nginx would, over the app's own
+// HTTP surface, the same trust boundary as production.
+test("a per-IP ceiling stops one caller from denying every other caller a code", async () => {
+  const t = await startTestApp({ env: { DEVICE_CODE_MAX_LIVE: "50", DEVICE_CODE_MAX_LIVE_PER_IP: "3" } });
+  try {
+    const startFrom = (ip) => api(t.baseUrl, "POST", "/v1/auth/device/start", { body: {}, headers: { "x-real-ip": ip } });
+
+    for (let i = 0; i < 3; i++) assert.equal((await startFrom("203.0.113.5")).status, 201);
+    const refused = await startFrom("203.0.113.5");
+    assert.equal(refused.status, 429, "the per-IP ceiling did not hold");
+    assert.equal(refused.json.error, "slow_down");
+    assert.equal(refused.json.deviceCode, undefined);
+
+    // The whole point: a DIFFERENT IP is unaffected by the first one's usage.
+    const other = await startFrom("198.51.100.9");
+    assert.equal(other.status, 201, "a different IP must not be denied by another IP's usage");
+
+    // Reclaim applies per-IP too, exactly like the global ceiling above.
+    t.clock.t += 16 * 60 * 1000;
+    assert.equal((await startFrom("203.0.113.5")).status, 201);
+  } finally { await t.close(); }
+});
+
+// A caller with no trusted X-Real-IP (direct-to-app, no proxy in front —
+// exactly this test harness) must not be denied by the per-IP ceiling: a
+// null IP counts against nothing, and the global ceiling remains the
+// backstop for that case. Proves the per-IP check is additive, not a
+// replacement that could fail closed for every signal-less caller.
+test("a per-IP ceiling of 0 does not block callers with no trusted IP signal", async () => {
+  const t = await startTestApp({ env: { DEVICE_CODE_MAX_LIVE_PER_IP: "0" } });
+  try {
+    assert.equal((await start(t)).status, 201, "no X-Real-IP header must not be denied by the per-IP ceiling");
+  } finally { await t.close(); }
+});
+
+// Finding 6 (review): mintUserCode's rejection sampling was untested —
+// dropping `if (byte >= USER_CODE_MAX_UNBIASED) continue;` (keeping the
+// plain modulo) survives the suite. A statistical test of the real entropy
+// source would need a large sample to detect a ~1.14x bias reliably, which
+// is either flaky (small sample) or slow (large sample) — exactly the shape
+// of test this project keeps having to fix. `mintUserCode` instead takes an
+// injectable byte source (test-only; every real call site uses the
+// default), so this is deterministic: a full 8-byte batch entirely OUT of
+// range (252-255, all >= USER_CODE_MAX_UNBIASED=252) must be skipped in its
+// entirety rather than folded in via modulo, forcing a second draw.
+test("mintUserCode's rejection sampling skips out-of-range bytes instead of folding them in", () => {
+  let calls = 0;
+  const scripted = [
+    Buffer.from([252, 253, 254, 255, 252, 253, 254, 255]), // every byte out of range
+    Buffer.from([0, 1, 2, 3, 4, 5, 6, 7]), // every byte in range, deterministic
+  ];
+  const fakeRandomBytes = (n) => {
+    assert.equal(n, 8, "mintUserCode must keep asking for 8 bytes at a time");
+    return scripted[calls++];
+  };
+  const code = mintUserCode(fakeRandomBytes);
+
+  assert.equal(calls, 2,
+    "an all-out-of-range batch produced a character — the rejection guard is not filtering, it's folding via modulo");
+  const expected = USER_CODE_ALPHABET.slice(0, 8);
+  assert.equal(code, `${expected.slice(0, 4)}-${expected.slice(4)}`);
 });
 
 // ── registry-level invariants ─────────────────────────────────────────────

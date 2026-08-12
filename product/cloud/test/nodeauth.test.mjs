@@ -137,6 +137,30 @@ test("a non-numeric timestamp is refused as a bad timestamp, not as a bad signat
   assert.equal(verify(req, { registry, clock }).error, "bad_ts");
 });
 
+// Finding 4 (review correction): the task-7 report's N9 equivalence claim —
+// "dropping `Number.isSafeInteger(ts)` is equivalent, because every
+// non-safe-integer that survives the canonicality check is far outside the
+// freshness window" — is FALSE, and "abc" above does not disprove it: for
+// `tsHeader = "abc"`, `Number.parseInt("abc", 10)` is NaN, but
+// `String(NaN) !== "abc"`, so the SEPARATE canonicality check
+// (`String(ts) !== tsHeader`) already rejects it before isSafeInteger's
+// guard would ever matter — that test passes for the wrong reason and would
+// keep passing even with the guard deleted. `tsHeader = "NaN"` is the one
+// input where this masking does NOT happen: `Number.parseInt("NaN", 10)` is
+// NaN, and `String(NaN) === "NaN"` — the canonicality check is satisfied —
+// so `Number.isSafeInteger(ts)` is the ONLY thing standing between this
+// header and authentication. Without it: every `<`/`>` freshness comparison
+// against NaN is false (so the window check cannot reject it either), and
+// the replay guard evicts it on the very next claim (`NaN + TS_MAX_AGE_MS`
+// is NaN, and `NaN > nowMs` is false), making it unboundedly replayable.
+test("x-relay-ts: NaN is refused as a bad timestamp — the one non-numeric spelling canonicality alone cannot catch", () => {
+  const { clock, registry, privateKey } = setup();
+  const req = signedRequest({ privateKey, ts: clock.t, tsHeader: "NaN" });
+  assert.equal(String(Number.parseInt("NaN", 10)), "NaN",
+    "test premise: NaN's own string form is indistinguishable from its parse — this is what canonicality cannot catch");
+  assert.equal(verify(req, { registry, clock }).error, "bad_ts");
+});
+
 // T7-M2: `Number.parseInt` accepts leading whitespace, a leading `+`, leading
 // zeros, an exponent and arbitrary trailing junk — eight spellings of one
 // timestamp, all authenticating under one signature. relayd sends
@@ -285,18 +309,39 @@ test("a replay guard allows the first use of a signature and rejects an identica
 test("a captured signature cannot be replayed by re-spelling its base64", () => {
   const { clock, registry, privateKey } = setup();
   const guard = createReplayGuard();
-  const ts = clock.t;
-  const signature = crypto.sign(
-    null, nodeRequestSigningInput({ method: "GET", pathWithQuery: PATH, ts, nodeId: NODE_ID }), privateKey,
-  );
-  const canonical = signature.toString("base64url");
+
+  // `stdBase64Stripped` below is a DIFFERENT spelling of the same signature
+  // bytes only when the signature's standard-base64 encoding contains a '+'
+  // or a '/' (~93.3% of 64-byte signatures). When it doesn't,
+  // `stdBase64Stripped` IS the canonical base64url spelling — byte-identical
+  // to what was already claimed above — so the correct, uninteresting
+  // answer is `replayed`, not `bad_signature`, and the assertion's premise
+  // silently evaporates. Measured at 6.7% of runs (2/40) on the pristine
+  // tree. Rather than hope a single draw has the property, retry with a
+  // fresh `ts` — a different EdDSA signing input yields an unpredictable
+  // signature — until it is GUARANTEED true. 64 attempts at a 6.7% failure
+  // rate leaves a false-negative probability on the order of 1e-79.
+  let ts, signature, canonical, stdBase64Stripped;
+  for (let attempt = 0; attempt < 64; attempt++) {
+    ts = clock.t + attempt;
+    signature = crypto.sign(
+      null, nodeRequestSigningInput({ method: "GET", pathWithQuery: PATH, ts, nodeId: NODE_ID }), privateKey,
+    );
+    canonical = signature.toString("base64url");
+    stdBase64Stripped = signature.toString("base64").replace(/=+$/, "");
+    if (stdBase64Stripped !== canonical) break;
+  }
+  assert.notEqual(stdBase64Stripped, canonical,
+    "could not find a signature whose standard-base64 spelling differs from its canonical base64url spelling " +
+    "after 64 attempts — the test premise is broken, not the code under test");
+
   const hdr = (s) => ({ method: "GET", headers: { "x-relay-node": NODE_ID, "x-relay-ts": String(ts), "x-relay-signature": s } });
 
   assert.equal(verify(hdr(canonical), { registry, clock, replayGuard: guard }).node.id, NODE_ID);
 
   const respellings = {
     stdBase64: signature.toString("base64"),
-    stdBase64Stripped: signature.toString("base64").replace(/=+$/, ""),
+    stdBase64Stripped,
     trailingEquals: `${canonical}=`,
     trailingEqualsEquals: `${canonical}==`,
     embeddedSpace: `${canonical.slice(0, 10)} ${canonical.slice(10)}`,

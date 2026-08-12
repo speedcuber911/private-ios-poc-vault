@@ -36,6 +36,11 @@ const NODE_KINDS = new Set(["byo", "managed"]);
 // Task 8 review, I-2.
 export const HANDOFF_MAX_WAITERS_PER_NODE = 8;
 
+// Bounds a single POST /v1/node/handoffs/ack batch. listPendingHandoffs never
+// hands out more than 50 rows in one poll response, so no legitimate ack
+// batch can ever need to name more ids than that.
+const HANDOFF_ACK_MAX_BATCH = 50;
+
 export function createApp({
   config,
   db = createDb(config.dbPath),
@@ -305,12 +310,23 @@ export function createApp({
     // session, lives below the session-auth boundary because only a
     // signed-in human may approve a pending code.
     if (method === "POST" && path === "/v1/auth/device/start") {
-      // Reclaim first, then check the ceiling: expired and redeemed rows are
+      // Reclaim first, then check the ceilings: expired and redeemed rows are
       // not live capacity, and reclaiming here (rather than only on the 60 s
       // sweep tick) is what stops a burst that has already aged out from
       // pinning the gate shut. The DELETE rides idx_device_codes_expires.
       registry.sweepDeviceCodes(now());
       if (registry.countLiveDeviceCodes(now()) >= config.deviceCodeMaxLive) {
+        return sendJson(res, 429, { error: "slow_down" });
+      }
+      // Per-IP ceiling, checked in addition to (not instead of) the global
+      // one above: the global cap alone bounds the table but not who fills
+      // it, and one caller holding DEVICE_CODE_MAX_LIVE codes used to deny
+      // every other caller a code for the rest of the TTL window. `clientIp`
+      // is null when no trusted signal is available (see clientIpOf), which
+      // counts against nothing rather than failing closed for every
+      // signal-less caller — the global ceiling remains the backstop.
+      const clientIp = clientIpOf(req);
+      if (clientIp && registry.countLiveDeviceCodesForIp(clientIp, now()) >= config.deviceCodeMaxLivePerIp) {
         return sendJson(res, 429, { error: "slow_down" });
       }
       const deviceCode = randomBytes(32).toString("base64url");
@@ -324,6 +340,7 @@ export function createApp({
             deviceCodeHash: sha256Hex(deviceCode),
             userCode: mintUserCode(),
             expiresAt: now() + config.deviceCodeTtlSec * 1000,
+            clientIp,
           });
           break;
         } catch (err) {
@@ -538,23 +555,63 @@ export function createApp({
       if (waitSec > 0 && registry.countPendingHandoffs(nodeId) === 0) {
         await waitForHandoff(nodeId, waitSec * 1000, req);
       }
-      // A client that vanished — mid-wait, at the per-node cap, or in the
-      // instant between the wait resolving and this line — must never have a
-      // handoff flipped to `delivered` on its behalf: the bytes would go
-      // nowhere and the row would be gone for good, with no log line and no
-      // recovery but a brand-new handoff id. Leaving it `pending` here is
-      // what makes "the node catches up on reconnect" — the design's own
-      // failure-mode promise — actually true. See Task 8 review, C-1.
+      // A cheap fast path for a connection ALREADY OBSERVED closed — skip the
+      // DB round trip rather than lease work nobody can ever confirm. This is
+      // no longer what makes a vanished client safe, though: a partitioned
+      // peer (no FIN observed, socket looks alive for the whole poll) sails
+      // straight past this check exactly as it always did. What makes THAT
+      // case safe is that the response below is a LEASE, not a delivery —
+      // see leaseHandoffs/confirmHandoffDelivery/reclaimExpiredLeases in
+      // registry.js. An unconfirmed lease expires and the row becomes
+      // claimable again, which is what makes "the node catches up on
+      // reconnect" — the design's own failure-mode promise — actually true
+      // under a silent partition, not only under an observed disconnect.
+      // See Task 8 review, Finding 1 / IMPORTANT 1.
       if (req.destroyed) return;
 
       const pending = registry.listPendingHandoffs(nodeId);
-      for (const handoff of pending) {
-        registry.updateHandoff(handoff.id, { state: "delivered", deliveredAt: now() });
-      }
+      const leased = registry.leaseHandoffs(pending.map((h) => h.id), nodeId, config.handoffLeaseSec * 1000);
       registry.touchNode(nodeId);
       return sendJson(res, 200, {
-        handoffs: pending.map(({ id, repo, branch }) => ({ id, repo, branch })),
+        handoffs: leased.map(({ id, repo, branch, leaseToken }) => ({ id, repo, branch, lease: leaseToken })),
       });
+    }
+
+    // ── node handoff delivery ack (signature-authed) ─────────────────────
+    //
+    // Confirms that a leased handoff's poll response actually reached the
+    // node — the only path to `delivered`. relayd calls this immediately
+    // after successfully parsing a poll response, before handing the
+    // descriptors to the import loop: `res.json()` resolving is itself
+    // evidence the bytes crossed a live connection, which is exactly what a
+    // partitioned socket cannot produce. An ack that is never sent — crash,
+    // partition, anything — just lets the lease expire; the row becomes
+    // claimable again and is redelivered on a later poll. See Task 8 review,
+    // Finding 1 / IMPORTANT 1, and the relayd contract note in
+    // task-8-report.md.
+    if (method === "POST" && path === "/v1/node/handoffs/ack") {
+      const pathWithQuery = `${path}${url.search}`;
+      const verified = verifyNodeRequest(req, pathWithQuery, { registry, now, replayGuard: handoffReplayGuard });
+      if (verified.error) return sendJson(res, 401, { error: "unauthorized" });
+
+      const body = await readJson(req, config.jsonBodyMaxBytes);
+      const acksRaw = Array.isArray(body?.acks) ? body.acks : [];
+      // Bounded by listPendingHandoffs' own per-poll cap: no legitimate ack
+      // batch can ever need to name more ids than a single poll can hand out.
+      if (acksRaw.length === 0 || acksRaw.length > HANDOFF_ACK_MAX_BATCH) {
+        return sendJson(res, 400, { error: "invalid_ack" });
+      }
+      const acks = [];
+      for (const entry of acksRaw) {
+        const id = strOrNull(entry?.id);
+        const lease = strOrNull(entry?.lease);
+        if (!id || !/^[a-f0-9]{16,64}$/.test(id) || !lease) {
+          return sendJson(res, 400, { error: "invalid_ack" });
+        }
+        acks.push({ id, lease });
+      }
+      const confirmed = registry.confirmHandoffDelivery(verified.node.id, acks);
+      return sendJson(res, 200, { acked: confirmed });
     }
 
     // ── session-authed registry endpoints ───────────────────────────────
@@ -932,6 +989,23 @@ async function readJson(req, maxBytes) {
   }
 }
 
+// The trusted client IP for rate-limiting decisions. nginx's
+// `proxy_set_header X-Real-IP $remote_addr` (deploy/relay-cloud.nginx.conf.template)
+// REPLACES whatever this header held on the inbound connection with the
+// proxy's own view of $remote_addr — a caller cannot forge it on its way
+// through nginx — and the app binds 127.0.0.1 (config.host), so nginx is the
+// only process that can ever reach this server. Deliberately does NOT fall
+// back to the raw socket address: a direct-to-app caller with no header
+// (tests, local dev without nginx in front, or a misconfigured proxy) has no
+// trustworthy per-IP signal at all — the raw socket peer is nginx itself,
+// not the real client — so this returns null and callers must treat that as
+// "no signal", not as a shared substitute identity.
+function clientIpOf(req) {
+  const header = req.headers["x-real-ip"];
+  const value = Array.isArray(header) ? header[0] : header;
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
 function bearerMatches(req, expectedToken) {
   if (!expectedToken) return false; // unset token ⇒ endpoint disabled
   const header = req.headers.authorization || "";
@@ -1020,7 +1094,7 @@ function sha256Hex(value) {
 // are still confusable in most terminal fonts, so this alphabet reduces
 // retypes rather than eliminating them. A misread costs a 404 and a retype,
 // never a wrong approval.
-const USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ23456789";
+export const USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ23456789";
 
 // Rejection sampling, not `% 28`: 256 % 28 = 4, so a plain modulo would hand
 // the first four characters a 10/256 chance against 9/256 for the rest. The
@@ -1029,10 +1103,18 @@ const USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ23456789";
 // uniform, and the loop is three lines.
 const USER_CODE_MAX_UNBIASED = 256 - (256 % USER_CODE_ALPHABET.length);
 
-function mintUserCode() {
+// `randomBytesImpl` is injectable (defaulting to the real `randomBytes`)
+// purely so a test can script a deterministic byte sequence and prove the
+// rejection-sampling guard actually filters out-of-range bytes rather than
+// folding them in via a plain modulo — a statistical test of the real,
+// unmocked entropy source would be either flaky or too weak to catch a
+// 1.14x bias against a 28^8 space, exactly the kind of test this project
+// keeps finding and fixing. Every real call site relies solely on the
+// default.
+export function mintUserCode(randomBytesImpl = randomBytes) {
   let code = "";
   while (code.length < 8) {
-    for (const byte of randomBytes(8)) {
+    for (const byte of randomBytesImpl(8)) {
       if (byte >= USER_CODE_MAX_UNBIASED) continue;
       code += USER_CODE_ALPHABET[byte % USER_CODE_ALPHABET.length];
       if (code.length === 8) break;

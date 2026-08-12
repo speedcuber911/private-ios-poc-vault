@@ -140,6 +140,39 @@ test("encPubkey must be canonical base64 — seal.mjs's exact rule, not merely 3
   } finally { await t.close(); }
 });
 
+// Finding 5 (review): the `raw.length !== 32` half of the check was
+// untested — dropping it (keeping only the canonicality half) survives the
+// suite. A canonical base64 string of the WRONG length passes canonicality
+// trivially (Node's own encoder produced it, so it round-trips), so only
+// the length check catches it. Without it, a wrong-sized string is stored
+// as an X25519 recipient key and fails opaquely at seal time — the exact
+// failure mode ae0db9e was written to prevent (see the comment above this
+// check in server.js).
+test("encPubkey of the wrong length is rejected even when canonically encoded", async () => {
+  const provisioner = makeFakeProvisioner();
+  const t = await startTestApp({ env: TRIAL_ENV, provisioner });
+  try {
+    await createTrial(t);
+    const token = provisioner.created[0].envVars.RELAYD_ENROLL_TOKEN;
+    const identity = makeNodeIdentity();
+
+    for (const length of [16, 31, 33, 64]) {
+      const raw = crypto.randomBytes(length);
+      const canonical = raw.toString("base64");
+      assert.equal(
+        Buffer.from(canonical, "base64").toString("base64"), canonical,
+        `${length}-byte fixture must be canonical (otherwise this isn't testing the length check specifically)`,
+      );
+      const res = await api(t.baseUrl, "POST", "/v1/trial-nodes/enroll", {
+        body: { token, nodeId: NODE_ID, pubkey: identity.pubkeyPem, encPubkey: canonical },
+      });
+      assert.equal(res.status, 400, `a canonical ${length}-byte encPubkey must be rejected`);
+      assert.equal(res.json.error, "invalid_enc_pubkey");
+      assert.equal(t.app.registry.getNode(NODE_ID), null, `a wrong-length key must not create a node (length ${length})`);
+    }
+  } finally { await t.close(); }
+});
+
 // A present-but-wrong-typed encPubkey must be a 400, never a silent null.
 // strOrNull() previously turned anything non-string into null, so a client
 // bug that sent a number/object/array/JSON-null for encPubkey would enroll

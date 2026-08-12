@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { request as httpRequest } from "node:http";
+import { createServer as createTcpServer, createConnection } from "node:net";
 
 import { startTestApp, api, signIn, authed } from "./helpers.mjs";
 import { nodeRequestSigningInput } from "../src/nodeauth.js";
@@ -51,6 +52,33 @@ function waitUntil(predicate, timeoutMs, intervalMs = 15) {
   });
 }
 
+// A real network-partition proxy, not a simulated close — the shape the
+// review's reproduction used. Sits in front of the real app's TCP port and
+// forwards CLIENT -> SERVER bytes normally (so the app fully receives and
+// processes the request, exactly as it would over a live connection), but
+// NEVER forwards SERVER -> CLIENT bytes: they are drained into the void
+// instead of being piped back. This is what a silent packet black-hole looks
+// like from the server's side — the proxy<->app socket is never destroyed,
+// never FINs, never errors, so `req.destroyed`/`close` never fire on it —
+// while "the node" (whatever is on the other side of the proxy) receives
+// nothing, ever. No timing race is needed: the black hole is unconditional
+// from the first byte, not something toggled mid-flight.
+function startBlackholeProxy(targetPort) {
+  return new Promise((resolve) => {
+    const legs = [];
+    const proxy = createTcpServer((clientSocket) => {
+      const serverSocket = createConnection({ port: targetPort, host: "127.0.0.1" }, () => {
+        clientSocket.pipe(serverSocket); // request bytes: forwarded normally
+        serverSocket.resume(); // response bytes: read and discarded, never forwarded
+      });
+      clientSocket.on("error", () => {});
+      serverSocket.on("error", () => {});
+      legs.push({ clientSocket, serverSocket });
+    });
+    proxy.listen(0, "127.0.0.1", () => resolve({ proxy, legs, port: proxy.address().port }));
+  });
+}
+
 async function setup() {
   const t = await startTestApp();
   const session = await signIn(t);
@@ -62,7 +90,12 @@ async function setup() {
 
 const PING = { handoffId: HANDOFF_ID, repo: "me/relay", branch: "relay/handoff-fix-auth", nodeId: NODE_ID };
 
-test("a ping creates a pending handoff the node then collects", async () => {
+// A poll response is a LEASE, not a delivery — see IMPORTANT 1 / Finding 1:
+// flipping straight to `delivered` the instant the cloud WRITES the response
+// cannot tell a live socket from a partitioned one, so a handoff written into
+// a dead peer was lost for good. The node must explicitly confirm receipt via
+// POST /v1/node/handoffs/ack before the row becomes `delivered`.
+test("a ping creates a pending handoff the node leases, then acks, then it is delivered", async () => {
   const { t, session, identity } = await setup();
   try {
     const ping = await api(t.baseUrl, "POST", "/v1/handoffs", { body: PING, ...authed(session.sessionToken) });
@@ -77,14 +110,26 @@ test("a ping creates a pending handoff the node then collects", async () => {
       { id: poll.json.handoffs[0].id, repo: poll.json.handoffs[0].repo, branch: poll.json.handoffs[0].branch },
       { id: HANDOFF_ID, repo: "me/relay", branch: "relay/handoff-fix-auth" },
     );
-    assert.equal(t.app.registry.getHandoff(HANDOFF_ID).state, "delivered");
+    const lease = poll.json.handoffs[0].lease;
+    assert.equal(typeof lease, "string", "a poll response must carry a lease token to ack against");
+    assert.equal(t.app.registry.getHandoff(HANDOFF_ID).state, "leased", "a bare poll must not itself mark delivery");
 
     // A fresh ts for the second poll: it's a distinct logical request, not a
     // replay of the first (see the I-3 replay-guard tests below), and the
     // guard would otherwise refuse a byte-identical repeat.
     t.clock.t += 1;
     const again = await api(t.baseUrl, "GET", pathWithQuery, nodeHeaders(identity, { pathWithQuery, ts: t.clock.t }));
-    assert.deepEqual(again.json.handoffs, [], "a delivered handoff is not handed out twice");
+    assert.deepEqual(again.json.handoffs, [], "a live, unexpired lease is not handed out twice");
+
+    t.clock.t += 1;
+    const ackPath = "/v1/node/handoffs/ack";
+    const ack = await api(t.baseUrl, "POST", ackPath, {
+      body: { acks: [{ id: HANDOFF_ID, lease }] },
+      ...nodeHeaders(identity, { method: "POST", pathWithQuery: ackPath, ts: t.clock.t }),
+    });
+    assert.equal(ack.status, 200);
+    assert.deepEqual(ack.json.acked, [HANDOFF_ID]);
+    assert.equal(t.app.registry.getHandoff(HANDOFF_ID).state, "delivered", "an acked lease is the only way to reach delivered");
   } finally { await t.close(); }
 });
 
@@ -122,7 +167,7 @@ test("the ping is content-free at the raw row level, not just through the mapper
     const columns = t.app.db.prepare("PRAGMA table_info(handoffs)").all().map((c) => c.name).sort();
     assert.deepEqual(columns, [
       "account_id", "branch", "created_at", "delivered_at", "id",
-      "node_id", "reason", "repo", "state", "updated_at",
+      "lease_expires_at", "lease_token", "node_id", "reason", "repo", "state", "updated_at",
     ], "the handoffs table must carry no content columns");
 
     const raw = t.app.db.prepare("SELECT * FROM handoffs WHERE id = ?").get(HANDOFF_ID);
@@ -433,6 +478,49 @@ test("HANDOFF_POLL_MAX_WAIT_SEC is clamped below nginx's proxy_read_timeout", ()
   assert.equal(normal.handoffPollMaxWaitSec, 25, "the default must be unaffected by the clamp");
 });
 
+// A lease of 0s (or negative, from a misconfigured operator env) would expire
+// before any real ack could ever arrive, silently degrading every handoff to
+// "redelivered on the very next poll forever" — never actually confirmable.
+// Mirrors the HANDOFF_POLL_MAX_WAIT_SEC clamp test above.
+test("HANDOFF_LEASE_SEC has a floor of 1s regardless of operator input", () => {
+  const config = loadConfig({ SESSION_SECRET: "x".repeat(40), HANDOFF_LEASE_SEC: "0" });
+  assert.ok(config.handoffLeaseSec >= 1, `expected a floor of at least 1s, got ${config.handoffLeaseSec}`);
+  const negative = loadConfig({ SESSION_SECRET: "x".repeat(40), HANDOFF_LEASE_SEC: "-5" });
+  assert.ok(negative.handoffLeaseSec >= 1, `expected a floor of at least 1s, got ${negative.handoffLeaseSec}`);
+  const normal = loadConfig({ SESSION_SECRET: "x".repeat(40) });
+  assert.equal(normal.handoffLeaseSec, 30, "the default must be unaffected by the floor");
+});
+
+// Mirrors the M-6 pending-poll cap: an ack batch is bounded the same way the
+// poll response that produced it is (listPendingHandoffs never hands out
+// more than 50), so no legitimate batch can ever need more than that.
+test("POST /v1/node/handoffs/ack rejects an empty batch", async () => {
+  const { t, identity } = await setup();
+  try {
+    const ackPath = "/v1/node/handoffs/ack";
+    const res = await api(t.baseUrl, "POST", ackPath, {
+      body: { acks: [] },
+      ...nodeHeaders(identity, { method: "POST", pathWithQuery: ackPath, ts: t.clock.t }),
+    });
+    assert.equal(res.status, 400);
+    assert.equal(res.json.error, "invalid_ack");
+  } finally { await t.close(); }
+});
+
+test("POST /v1/node/handoffs/ack rejects an oversized batch", async () => {
+  const { t, identity } = await setup();
+  try {
+    const ackPath = "/v1/node/handoffs/ack";
+    const acks = Array.from({ length: 51 }, (_, i) => ({ id: i.toString(16).padStart(16, "0"), lease: "x" }));
+    const res = await api(t.baseUrl, "POST", ackPath, {
+      body: { acks },
+      ...nodeHeaders(identity, { method: "POST", pathWithQuery: ackPath, ts: t.clock.t }),
+    });
+    assert.equal(res.status, 400);
+    assert.equal(res.json.error, "invalid_ack");
+  } finally { await t.close(); }
+});
+
 // I-1: the empty Set a natural timeout leaves behind is never removed by
 // anything else. Left unfixed, `handoffWaiters` grows by one entry per
 // timed-out poll for the rest of the process lifetime.
@@ -484,7 +572,7 @@ test("a client disconnect while parked releases its waiter immediately and never
       hardTimeout(5000, "reconnect poll"),
     ]);
     assert.deepEqual(reconnect.json.handoffs.map((h) => h.id), [HANDOFF_ID], "the reconnected node catches up");
-    assert.equal(t.app.registry.getHandoff(HANDOFF_ID).state, "delivered");
+    assert.equal(t.app.registry.getHandoff(HANDOFF_ID).state, "leased", "leased, not delivered, until the node acks it");
   } finally { await t.close(); }
 });
 
@@ -589,4 +677,181 @@ test("listPendingHandoffs caps a single poll's response", async () => {
     const remaining = t.app.registry.countPendingHandoffs(NODE_ID) - first.length;
     assert.ok(remaining > 0, "the rest must still be pending for the next poll");
   } finally { await t.close(); }
+});
+
+// Finding 2: `ORDER BY created_at, rowid` on listPendingHandoffs was
+// untested — dropping it (keeping the LIMIT) survived the full suite.
+// created_at is set out of insertion order here specifically so a plain
+// table/index scan (what SQLite does absent an ORDER BY, which tends to
+// enumerate in rowid/insertion order) would return a DIFFERENT subset than
+// "oldest created_at first", not merely the same rows in a different order —
+// the strongest observable difference available at limit=2 of 3.
+test("listPendingHandoffs returns the oldest-created rows first, not insertion order", async () => {
+  const { t, session } = await setup();
+  try {
+    const ids = ["1111111111111111", "2222222222222222", "3333333333333333"];
+    for (const id of ids) {
+      t.app.registry.createHandoff({ id, accountId: session.accountId, nodeId: NODE_ID, repo: "me/relay", branch: `relay/handoff-${id}` });
+    }
+    // Rewrite created_at directly so it runs OPPOSITE to insertion (rowid)
+    // order: the LAST-inserted row gets the SMALLEST created_at.
+    const createdAt = { "1111111111111111": 3000, "2222222222222222": 2000, "3333333333333333": 1000 };
+    for (const [id, ts] of Object.entries(createdAt)) {
+      t.app.db.prepare("UPDATE handoffs SET created_at = ? WHERE id = ?").run(ts, id);
+    }
+    const page = t.app.registry.listPendingHandoffs(NODE_ID, 2);
+    assert.deepEqual(page.map((h) => h.id), ["3333333333333333", "2222222222222222"],
+      "expected the two oldest-by-created_at rows, in ascending created_at order — " +
+      "a plain rowid-order scan (what dropping ORDER BY falls back to) would return the two EARLIEST-INSERTED rows instead");
+  } finally { await t.close(); }
+});
+
+test("POST /v1/node/handoffs/ack requires a valid node signature", async () => {
+  const { t } = await setup();
+  try {
+    const res = await api(t.baseUrl, "POST", "/v1/node/handoffs/ack", {
+      body: { acks: [{ id: HANDOFF_ID, lease: "whatever" }] },
+    });
+    assert.equal(res.status, 401);
+  } finally { await t.close(); }
+});
+
+// The CAS proof: an ack naming the right id but the WRONG lease token — a
+// stale token from an earlier, superseded lease, or a guess — must not be
+// able to confirm delivery. This is what makes confirmHandoffDelivery a
+// capability check rather than a bare "does this id exist for this node".
+test("an ack with the wrong lease token is a no-op, not a confirmation", async () => {
+  const { t, session, identity } = await setup();
+  try {
+    await api(t.baseUrl, "POST", "/v1/handoffs", { body: PING, ...authed(session.sessionToken) });
+    const pollPath = "/v1/node/handoffs?wait=0";
+    const poll = await api(t.baseUrl, "GET", pollPath, nodeHeaders(identity, { pathWithQuery: pollPath, ts: t.clock.t }));
+    const realLease = poll.json.handoffs[0].lease;
+    assert.equal(typeof realLease, "string");
+
+    t.clock.t += 1;
+    const ackPath = "/v1/node/handoffs/ack";
+    const ack = await api(t.baseUrl, "POST", ackPath, {
+      body: { acks: [{ id: HANDOFF_ID, lease: "not-the-real-lease-token" }] },
+      ...nodeHeaders(identity, { method: "POST", pathWithQuery: ackPath, ts: t.clock.t }),
+    });
+    assert.equal(ack.status, 200, "a wrong token is refused silently, not with an error status");
+    assert.deepEqual(ack.json.acked, [], "nothing was actually confirmed");
+    assert.equal(t.app.registry.getHandoff(HANDOFF_ID).state, "leased", "the row must remain leased, not flip to delivered");
+
+    // The REAL token still works afterward — a wrong guess must not consume
+    // or invalidate the row's actual lease.
+    t.clock.t += 1;
+    const realAck = await api(t.baseUrl, "POST", ackPath, {
+      body: { acks: [{ id: HANDOFF_ID, lease: realLease }] },
+      ...nodeHeaders(identity, { method: "POST", pathWithQuery: ackPath, ts: t.clock.t }),
+    });
+    assert.deepEqual(realAck.json.acked, [HANDOFF_ID]);
+    assert.equal(t.app.registry.getHandoff(HANDOFF_ID).state, "delivered");
+  } finally { await t.close(); }
+});
+
+// IMPORTANT 1 core behavior, isolated from socket mechanics: an unconfirmed
+// lease must become claimable again once it expires, using the same fake
+// clock the rest of the suite uses for logical time (see helpers.mjs).
+test("an unconfirmed lease expires and the row becomes claimable again", async () => {
+  const t = await startTestApp({ env: { HANDOFF_LEASE_SEC: "5" } });
+  try {
+    const session = await signIn(t);
+    const identity = nodeIdentity();
+    t.app.registry.createNode(session.accountId, { id: NODE_ID, kind: "trial", name: "Trial", pubkey: identity.pubkeyPem });
+    await api(t.baseUrl, "POST", "/v1/repos", { body: { fullName: "me/relay" }, ...authed(session.sessionToken) });
+    await api(t.baseUrl, "POST", "/v1/handoffs", { body: PING, ...authed(session.sessionToken) });
+
+    const pathWithQuery = "/v1/node/handoffs?wait=0";
+    const first = await api(t.baseUrl, "GET", pathWithQuery, nodeHeaders(identity, { pathWithQuery, ts: t.clock.t }));
+    assert.deepEqual(first.json.handoffs.map((h) => h.id), [HANDOFF_ID]);
+    assert.equal(t.app.registry.getHandoff(HANDOFF_ID).state, "leased");
+
+    // Still inside the lease window: not handed out again, and not yet
+    // reclaimed.
+    t.clock.t += 4000;
+    const stillLeased = await api(t.baseUrl, "GET", pathWithQuery, nodeHeaders(identity, { pathWithQuery, ts: t.clock.t }));
+    assert.deepEqual(stillLeased.json.handoffs, [], "must not be redelivered before the lease expires");
+
+    // Past the lease window, still no ack: the row must be claimable again.
+    t.clock.t += 2000; // total 6000ms since the lease was handed out > 5000ms
+    const reclaimed = await api(t.baseUrl, "GET", pathWithQuery, nodeHeaders(identity, { pathWithQuery, ts: t.clock.t }));
+    assert.deepEqual(reclaimed.json.handoffs.map((h) => h.id), [HANDOFF_ID],
+      "an unconfirmed lease must expire and become claimable again — nothing may be permanently lost");
+    assert.equal(t.app.registry.getHandoff(HANDOFF_ID).state, "leased", "re-leased under a fresh lease, not left dangling");
+    assert.notEqual(reclaimed.json.handoffs[0].lease, first.json.handoffs[0].lease, "expiry must mint a fresh, distinct lease token");
+  } finally { await t.close(); }
+});
+
+// IMPORTANT 1 / Finding 1, end to end: a REAL partitioned connection (a TCP
+// proxy that forwards the request but silently drops the response — see
+// startBlackholeProxy above), not a simulated `.destroy()`. This reproduces
+// exactly the reviewer's finding: `req.destroyed` never fires because the
+// server<->proxy socket is never closed, so the old code (flip straight to
+// `delivered`) would lose the handoff permanently and silently. The fix
+// makes this recoverable structurally: the row is leased, not delivered, and
+// an unconfirmed lease expires.
+test("a partitioned node (no FIN observed, socket looks alive) still recovers its handoff once the lease expires", async () => {
+  const t = await startTestApp({ env: { HANDOFF_LEASE_SEC: "5" } });
+  let proxy;
+  try {
+    const session = await signIn(t);
+    const identity = nodeIdentity();
+    t.app.registry.createNode(session.accountId, { id: NODE_ID, kind: "trial", name: "Trial", pubkey: identity.pubkeyPem });
+    await api(t.baseUrl, "POST", "/v1/repos", { body: { fullName: "me/relay" }, ...authed(session.sessionToken) });
+    t.app.registry.createHandoff({ id: HANDOFF_ID, accountId: session.accountId, nodeId: NODE_ID, repo: "me/relay", branch: "relay/handoff-fix-auth" });
+
+    const targetPort = Number(new URL(t.baseUrl).port);
+    const started = await startBlackholeProxy(targetPort);
+    proxy = started;
+
+    const pathWithQuery = "/v1/node/handoffs?wait=0";
+    const { headers } = nodeHeaders(identity, { pathWithQuery, ts: t.clock.t });
+    const req = httpRequest({ host: "127.0.0.1", port: started.port, path: pathWithQuery, method: "GET", headers });
+    // No 'response' listener: the whole point is that no response ever
+    // reaches this side of the black hole. Only guard against the raw
+    // socket erroring noisily when the test tears the proxy down.
+    req.on("error", () => {});
+    req.end();
+
+    // The server fully receives and processes the request over what looks,
+    // from its side, like a perfectly live connection — proven by the row
+    // actually transitioning to `leased` (not staying `pending`, which is
+    // what `req.destroyed` skipping the work would look like).
+    await Promise.race([
+      waitUntil(() => t.app.registry.getHandoff(HANDOFF_ID)?.state === "leased", 3000),
+      hardTimeout(6000, "blackholed poll processed"),
+    ]);
+    assert.equal(t.app.registry.getHandoff(HANDOFF_ID).state, "leased",
+      "handed out into what the server believes is a live socket — exactly the C-1 precondition");
+
+    // No FIN, no close, no error ever reached the server for this
+    // connection — it is still just sitting there, proxy<->app, exactly as
+    // a real partition would leave it. Advance the fake clock past the
+    // lease window with no ack ever sent (the node is genuinely gone).
+    t.clock.t += 5001;
+
+    // A fresh, REAL connection (bypassing the proxy entirely) recovers it.
+    const pathWithQuery2 = "/v1/node/handoffs?wait=0";
+    const reconnect = await api(t.baseUrl, "GET", pathWithQuery2, nodeHeaders(identity, { pathWithQuery: pathWithQuery2, ts: t.clock.t }));
+    assert.deepEqual(reconnect.json.handoffs.map((h) => h.id), [HANDOFF_ID],
+      "an unconfirmed lease left behind by a genuine partition must become claimable again — nothing was lost");
+
+    const lease = reconnect.json.handoffs[0].lease;
+    t.clock.t += 1;
+    const ackPath = "/v1/node/handoffs/ack";
+    const ack = await api(t.baseUrl, "POST", ackPath, {
+      body: { acks: [{ id: HANDOFF_ID, lease }] },
+      ...nodeHeaders(identity, { method: "POST", pathWithQuery: ackPath, ts: t.clock.t }),
+    });
+    assert.deepEqual(ack.json.acked, [HANDOFF_ID]);
+    assert.equal(t.app.registry.getHandoff(HANDOFF_ID).state, "delivered", "the recovered delivery can still reach a real, confirmed terminal state");
+  } finally {
+    if (proxy) {
+      proxy.proxy.close();
+      for (const leg of proxy.legs) { leg.clientSocket.destroy(); leg.serverSocket.destroy(); }
+    }
+    await t.close();
+  }
 });
