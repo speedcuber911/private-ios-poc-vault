@@ -56,6 +56,22 @@ const SLOTS = new Set(["node", "device"]);
 // and session-index simply never write "node".
 const KINDS = new Set(["pair", "sync-auth", "session-index"]);
 
+// `sync-auth` and `session-index` are one-directional: only the "device"
+// slot is ever written (by the CLI) or read (by the node) — nothing ever
+// touches "node" for these kinds. getBlob's close condition below was
+// written for the two-sided `pair` protocol ("close once BOTH slots have
+// been read") and for these kinds `nodeReadAt` can therefore never become
+// non-null, so the close never fires — not on failure only, on EVERY
+// exchange, success included. The session then rides its full TTL
+// (config.pairingTtlSec) instead of closing the instant its one slot is
+// consumed, which matters because live sessions are capped per (account,
+// kind): a user who runs `relay handoff` or `relay sync-auth` enough times
+// inside one TTL window starts getting 429 too_many_pairing_sessions with
+// budget sitting idle in already-fully-read rows. See handoff.mjs and
+// syncauth.mjs on the relayd/CLI side for the one-directional read pattern
+// this describes.
+const ONE_WAY_KINDS = new Set(["sync-auth", "session-index"]);
+
 // Max live (unexpired, unclosed) sessions per (account, kind).
 const DEFAULT_MAX_SESSIONS_PER_ACCOUNT = 5;
 
@@ -152,7 +168,16 @@ export function createPairing({ registry, config, now = () => Date.now() }) {
 
     registry.markPairingBlobRead(id, slot);
     const after = registry.getPairingSession(id);
-    if (after && after.nodeReadAt !== null && after.deviceReadAt !== null) {
+    const bothSlotsRead = after && after.nodeReadAt !== null && after.deviceReadAt !== null;
+    // One-directional kinds never write or read the "node" slot, so
+    // `bothSlotsRead` above can never become true for them — close as soon
+    // as the ONLY slot they use has been read instead, on every read
+    // (there is no separate success/failure signal at this layer; a read
+    // that happened at all is the one and only delivery event these kinds
+    // have). A genuinely two-sided `pair` session is untouched: it is not in
+    // ONE_WAY_KINDS, so it keeps requiring both reads exactly as before.
+    const oneWaySlotRead = after && ONE_WAY_KINDS.has(session.kind) && slot === "device" && after.deviceReadAt !== null;
+    if (bothSlotsRead || oneWaySlotRead) {
       registry.closePairingSession(id);
     }
     return { blob: Buffer.from(b64, "base64"), tag };
