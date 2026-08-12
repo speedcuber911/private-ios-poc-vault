@@ -73,6 +73,12 @@ const MUTABLE_TYPES = new Set([
   "job.failed",
   "handoff.ready",
   "handoff.failed",
+  // A credential sync that did not land has to be seen: without a push, the
+  // user goes on believing their sandbox is authenticated and only finds out
+  // when a job fails to fetch their repo. The success side stays silent
+  // (background sync) — `relay sync-auth` already reported it at the
+  // terminal.
+  "credentials.failed",
 ]);
 
 const KNOWN_TYPES = new Set([
@@ -84,6 +90,8 @@ const KNOWN_TYPES = new Set([
   "node.health",
   "handoff.ready",
   "handoff.failed",
+  "credentials.installed",
+  "credentials.failed",
 ]);
 
 const PROTOCOL_VERSION = 1;
@@ -438,6 +446,8 @@ function categoryFor(type) {
       return "RELAY_HANDOFF_READY";
     case "handoff.failed":
       return "RELAY_HANDOFF_FAILED";
+    case "credentials.failed":
+      return "RELAY_CREDENTIALS_FAILED";
     default:
       return "RELAY_EVENT";
   }
