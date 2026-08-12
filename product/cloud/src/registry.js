@@ -186,6 +186,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       }
       db.prepare("DELETE FROM device_codes WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM repos WHERE account_id = ?").run(accountId);
+      db.prepare("DELETE FROM handoffs WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM accounts WHERE id = ?").run(accountId);
       db.exec("COMMIT");
       return true;
@@ -876,6 +877,53 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     db.prepare("DELETE FROM node_events WHERE created_at < ?").run(cutoffMs);
   }
 
+  // ── handoffs ────────────────────────────────────────────────────────────
+  //
+  // A handoff record is a content-free pointer — repo, branch, node id — that
+  // lets a node long-poll pick up work with no content ever transiting the
+  // cloud. `createHandoff` is the write half of `POST /v1/handoffs`;
+  // idempotency on `id` is enforced by the caller via getHandoff, not here.
+  const HANDOFF_PATCH_COLUMNS = { state: "state", reason: "reason", deliveredAt: "delivered_at" };
+
+  function createHandoff({ id, accountId, nodeId, repo, branch }) {
+    const ts = now();
+    db.prepare(
+      "INSERT INTO handoffs (id, account_id, node_id, repo, branch, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+    ).run(id, accountId, nodeId, repo, branch, ts, ts);
+    return getHandoff(id);
+  }
+
+  function getHandoff(id) {
+    return mapHandoff(db.prepare("SELECT * FROM handoffs WHERE id = ?").get(id));
+  }
+
+  function listHandoffsForRepo(accountId, repo, limit = 50) {
+    return db.prepare("SELECT * FROM handoffs WHERE account_id = ? AND repo = ? ORDER BY created_at DESC LIMIT ?")
+      .all(accountId, repo, limit).map(mapHandoff);
+  }
+
+  function listPendingHandoffs(nodeId) {
+    return db.prepare("SELECT * FROM handoffs WHERE node_id = ? AND state = 'pending' ORDER BY created_at")
+      .all(nodeId).map(mapHandoff);
+  }
+
+  function countPendingHandoffs(nodeId) {
+    return Number(db.prepare("SELECT COUNT(*) AS n FROM handoffs WHERE node_id = ? AND state = 'pending'")
+      .get(nodeId).n);
+  }
+
+  function updateHandoff(id, patch = {}) {
+    const assignments = [];
+    const values = [];
+    for (const [key, column] of Object.entries(HANDOFF_PATCH_COLUMNS)) {
+      if (key in patch) { assignments.push(`${column} = ?`); values.push(patch[key]); }
+    }
+    assignments.push("updated_at = ?");
+    values.push(now(), id);
+    db.prepare(`UPDATE handoffs SET ${assignments.join(", ")} WHERE id = ?`).run(...values);
+    return getHandoff(id);
+  }
+
   return {
     createAccount,
     ensureAccount,
@@ -947,6 +995,12 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     insertNodeEvent,
     countNodeEvents,
     sweepNodeEvents,
+    createHandoff,
+    getHandoff,
+    listHandoffsForRepo,
+    listPendingHandoffs,
+    countPendingHandoffs,
+    updateHandoff,
   };
 }
 
@@ -1007,6 +1061,22 @@ function mapDeviceCode(row) {
     consumedAt: row.consumed_at ?? null,
     expiresAt: row.expires_at,
     createdAt: row.created_at,
+  };
+}
+
+function mapHandoff(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    accountId: row.account_id,
+    nodeId: row.node_id,
+    repo: row.repo,
+    branch: row.branch,
+    state: row.state,
+    reason: row.reason ?? null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deliveredAt: row.delivered_at ?? null,
   };
 }
 

@@ -130,6 +130,12 @@ export function loadConfig(env = process.env) {
 
     // General request body cap for JSON endpoints.
     jsonBodyMaxBytes: intFrom(env.JSON_BODY_MAX_BYTES, 32 * 1024),
+
+    // Cap on how long GET /v1/node/handoffs holds a long-poll open, in
+    // seconds. Kept comfortably inside nginx's 300 s proxy_read_timeout and
+    // Node's 60 s default headersTimeout for the next request on the
+    // connection.
+    handoffPollMaxWaitSec: intFrom(env.HANDOFF_POLL_MAX_WAIT_SEC, 25),
   };
 }
 
