@@ -201,6 +201,21 @@ function createJob(body, certSubject) {
 }
 
 
+// The seven steps every new job needs, in one place: validate, register in the
+// live map, queue it, persist, audit, publish, and drain. Both the HTTP route
+// and the handoff continue-path go through here so they cannot drift.
+function enqueueJob(body, certSubject) {
+  const job = createJob(body, certSubject);
+  jobs.set(job.id, job);
+  jobsState.queuedJobIds.push(job.id);
+  persistJob(job);
+  appendAudit("job_created", job);
+  emitJobStateEvent(job);
+  processQueue();
+  return job;
+}
+
+
 function cleanProviderModel(provider, value) {
   const model = cleanOptionalModel(value);
   if (provider !== "claude") return model;
@@ -1270,6 +1285,7 @@ export {
   responseShape,
   wantsFullLogs,
   createJob,
+  enqueueJob,
   cleanProviderModel,
   cleanOptionalProvider,
   cleanJobProviderFilter,

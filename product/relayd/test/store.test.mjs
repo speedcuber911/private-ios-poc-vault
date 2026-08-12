@@ -286,16 +286,25 @@ test("migrateJsonToSqlite moves jobs, chats, devices and revocations", async () 
     revokedAt: null,
   });
   jsonStore.addRevocation({ serial: "CDEF", deviceId: "019e46a4-0000-7000-8000-000000000009", revokedAt: "2026-08-09T00:02:00.000Z" });
+  const handoffId = "019e46a4-0000-7000-8000-00000000000a";
+  jsonStore.saveHandoff({
+    id: handoffId, state: "ready", repo: "me/relay", branch: "relay/handoff-migrate",
+    workspaceId: "dir-handoff-migrate", provider: "claude",
+    resumeSessionId: "11111111-2222-4333-8444-555555555555", primedPrompt: null,
+    title: "Migrate me", manifest: { v: 1, title: "Migrate me" },
+    lastJobId: null, error: null, createdAt: "2026-08-09T00:03:00.000Z", updatedAt: "2026-08-09T00:03:00.000Z",
+  });
   // A malformed file must be skipped, not crash the migration.
   fs.writeFileSync(path.join(dataRoot, "jobs", "corrupt.json"), "{not json", "utf8");
 
   const dbPath = path.join(dataRoot, "migrated.sqlite");
   const { counts, store: migrated } = await migrateJsonToSqlite({ dataDir: dataRoot, dbPath });
-  assert.deepEqual(counts, { jobs: 1, chats: 1, devices: 1, revocations: 1 });
+  assert.deepEqual(counts, { jobs: 1, chats: 1, devices: 1, revocations: 1, handoffs: 1 });
   assert.equal(migrated.loadJobRecords()[0].job.id, jobId);
   assert.equal(migrated.readChatThreadRecord(chatId).id, chatId);
   assert.equal(migrated.listDevices()[0].certSerial, "CDEF");
   assert.equal(migrated.listRevocations()[0].serial, "CDEF");
+  assert.equal(migrated.getHandoff(handoffId).title, "Migrate me");
   migrated.close();
 });
 

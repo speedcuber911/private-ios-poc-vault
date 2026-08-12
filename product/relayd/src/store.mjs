@@ -163,6 +163,7 @@ function createJsonStore({ jobsDir: jobsRoot, chatsDir: chatsRoot, dataDir: data
   const devicesPath = path.join(dataRoot, "devices.json");
   const revocationsPath = path.join(dataRoot, "revocations.json");
   const pairingSessionsRoot = pairingRoot || path.join(dataRoot, "pairing");
+  const handoffsDir = path.join(dataRoot, "handoffs");
 
   function readListFile(file) {
     try {
@@ -449,6 +450,36 @@ function createJsonStore({ jobsDir: jobsRoot, chatsDir: chatsRoot, dataDir: data
       return removed;
     },
 
+    // ── handoffs (laptop -> cloud sandbox session handoff records) ──
+
+    saveHandoff(handoff) {
+      assertSafeRecordId(handoff.id);
+      fs.mkdirSync(handoffsDir, { recursive: true });
+      writeJsonFileAtomic(path.join(handoffsDir, `${handoff.id}.json`), handoff, { mode: 0o600 });
+    },
+
+    getHandoff(id) {
+      assertSafeRecordId(id);
+      try {
+        return JSON.parse(fs.readFileSync(path.join(handoffsDir, `${id}.json`), "utf8"));
+      } catch {
+        return null;
+      }
+    },
+
+    listHandoffs() {
+      let names = [];
+      try {
+        names = fs.readdirSync(handoffsDir).filter((name) => name.endsWith(".json"));
+      } catch {
+        return [];
+      }
+      return names
+        .map((name) => this.getHandoff(name.slice(0, -".json".length)))
+        .filter(Boolean)
+        .sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt)));
+    },
+
     close() {},
   };
 }
@@ -515,9 +546,19 @@ CREATE TABLE IF NOT EXISTS pairing_sessions (
   created_at TEXT,
   expires_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS handoffs (
+  id TEXT PRIMARY KEY,
+  state TEXT NOT NULL,
+  repo TEXT NOT NULL,
+  branch TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  record TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs (created_at);
 CREATE INDEX IF NOT EXISTS idx_events_name ON events (name);
 CREATE INDEX IF NOT EXISTS idx_pairing_expires ON pairing_sessions (expires_at);
+CREATE INDEX IF NOT EXISTS idx_handoffs_created ON handoffs (created_at);
 `;
 
 async function openSqlite(dbPath) {
@@ -609,6 +650,13 @@ function createSqliteStore(db) {
     INSERT INTO pairing_sessions (id, code, token, node_id, node_name, created_at, expires_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `);
+  const saveHandoffStatement = db.prepare(
+    `INSERT INTO handoffs (id, state, repo, branch, created_at, updated_at, record)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       state = excluded.state, repo = excluded.repo, branch = excluded.branch,
+       updated_at = excluded.updated_at, record = excluded.record`,
+  );
 
   return {
     kind: "sqlite",
@@ -800,6 +848,25 @@ function createSqliteStore(db) {
       );
     },
 
+    // ── handoffs (laptop -> cloud sandbox session handoff records) ──
+
+    saveHandoff(handoff) {
+      assertSafeRecordId(handoff.id);
+      saveHandoffStatement.run(handoff.id, handoff.state, handoff.repo, handoff.branch,
+        handoff.createdAt, handoff.updatedAt, JSON.stringify(handoff));
+    },
+
+    getHandoff(id) {
+      assertSafeRecordId(id);
+      const row = db.prepare("SELECT record FROM handoffs WHERE id = ?").get(id);
+      return row ? JSON.parse(row.record) : null;
+    },
+
+    listHandoffs() {
+      return db.prepare("SELECT record FROM handoffs ORDER BY created_at DESC")
+        .all().map((row) => JSON.parse(row.record));
+    },
+
     close() {
       db.close();
     },
@@ -835,7 +902,7 @@ async function migrateJsonToSqlite({ dataDir: dataRoot, dbPath }) {
   const source = createJsonStore({ jobsDir: sourceJobsDir, chatsDir: sourceChatsDir, dataDir: dataRoot });
   const target = await createStore("sqlite", { dataDir: dataRoot, dbPath });
 
-  const counts = { jobs: 0, chats: 0, devices: 0, revocations: 0 };
+  const counts = { jobs: 0, chats: 0, devices: 0, revocations: 0, handoffs: 0 };
   for (const { job } of source.loadJobRecords()) {
     if (!job || typeof job.id !== "string") continue;
     try {
@@ -868,6 +935,10 @@ async function migrateJsonToSqlite({ dataDir: dataRoot, dbPath }) {
     if (!revocation || typeof revocation.serial !== "string") continue;
     target.addRevocation(revocation);
     counts.revocations += 1;
+  }
+  for (const handoff of source.listHandoffs()) {
+    target.saveHandoff(handoff);
+    counts.handoffs += 1;
   }
   return { counts, store: target };
 }
