@@ -313,9 +313,13 @@ export function createApp({
       const outcome = pairing.createSession({
         accountId: account.id,
         authToken: typeof body?.authToken === "string" ? body.authToken : null,
+        kind: body?.kind ?? "pair",
       });
       if (outcome === "invalid_auth_token") {
         return sendJson(res, 400, { error: "auth_token_required" });
+      }
+      if (outcome === "invalid_kind") {
+        return sendJson(res, 400, { error: "invalid_kind" });
       }
       if (outcome === "too_many_sessions") {
         return sendJson(res, 429, { error: "too_many_pairing_sessions" });

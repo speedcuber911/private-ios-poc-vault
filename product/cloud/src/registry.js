@@ -739,15 +739,15 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
   // The cloud stores sha256(authToken) — never a pairing secret, which it is
   // never given — plus two opaque blobs and the MAC tags their senders
   // computed. Blobs and tags are bytes to this layer.
-  function insertPairingSession({ id, accountId, authTokenHash, expiresAt }) {
+  function insertPairingSession({ id, accountId, kind, authTokenHash, expiresAt }) {
     db.prepare(
       `INSERT INTO pairing_sessions
-         (id, account_id, auth_token_hash,
+         (id, account_id, kind, auth_token_hash,
           node_blob, node_tag, node_read_at,
           device_blob, device_tag, device_read_at,
           closed_at, expires_at, created_at)
-       VALUES (?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)`,
-    ).run(id, accountId, authTokenHash, expiresAt, now());
+       VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)`,
+    ).run(id, accountId, kind, authTokenHash, expiresAt, now());
   }
 
   function getPairingSession(id) {
@@ -758,6 +758,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     return {
       id: row.id,
       accountId: row.account_id,
+      kind: row.kind,
       authTokenHash: row.auth_token_hash,
       nodeBlob: row.node_blob,
       nodeTag: row.node_tag,
@@ -805,15 +806,13 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     ).run(now(), id);
   }
 
-  // Live (unexpired, unclosed) sessions for one account — the anti-pinning cap.
-  function countLivePairingSessions(accountId, nowMs) {
-    const row = db
-      .prepare(
-        `SELECT COUNT(*) AS n FROM pairing_sessions
-         WHERE account_id = ? AND expires_at > ? AND closed_at IS NULL`,
-      )
-      .get(accountId, nowMs);
-    return Number(row.n);
+  // Live (unexpired, unclosed) sessions for one (account, kind) — the
+  // anti-pinning cap. Scoped per kind so a stuck backlog in one kind (e.g. a
+  // sync-auth handoff nobody picked up) can never block another (e.g. pair).
+  function countLivePairingSessions(accountId, kind, nowMs) {
+    return Number(db.prepare(
+      "SELECT COUNT(*) AS n FROM pairing_sessions WHERE account_id = ? AND kind = ? AND closed_at IS NULL AND expires_at > ?",
+    ).get(accountId, kind, nowMs).n);
   }
 
   function sweepPairingSessions(nowMs) {

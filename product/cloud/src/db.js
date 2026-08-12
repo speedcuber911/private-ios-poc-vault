@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS magic_links (
 CREATE TABLE IF NOT EXISTS pairing_sessions (
   id              TEXT PRIMARY KEY,
   account_id      TEXT NOT NULL,
+  kind            TEXT NOT NULL DEFAULT 'pair',
   auth_token_hash TEXT NOT NULL,
   node_blob       TEXT,
   node_tag        TEXT,
@@ -196,6 +197,11 @@ function migratePairingSessions(db) {
     return;
   }
   if (columns.length === 0) return; // fresh database
-  if (columns.some((column) => column.name === "auth_token_hash")) return; // already v2
-  db.exec("DROP TABLE pairing_sessions;");
+  if (!columns.some((column) => column.name === "auth_token_hash")) {
+    db.exec("DROP TABLE pairing_sessions;");
+    return;
+  }
+  if (!columns.some((column) => column.name === "kind")) {
+    db.exec("DROP TABLE pairing_sessions");
+  }
 }
