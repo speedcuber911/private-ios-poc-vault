@@ -31,7 +31,17 @@ enum ClientIdentityStoreError: Error, LocalizedError {
 final class ClientIdentityStore: ObservableObject {
     static let supportDirectoryName = "support"
     static let defaultP12Name = "client.p12"
-    private static let preferredClientCertificateNames = ["iphone"]
+    /// Common names this app will adopt an already-installed keychain identity
+    /// under, when the persistent reference that normally locates it is gone
+    /// (restore to a new device, app reinstall).
+    ///
+    /// "trial-device" is the CN a trial machine issues — see
+    /// `product/relayd/src/trialpair.mjs`, which signs the device CSR with
+    /// `-subj "/CN=trial-device"`. Without it here, a trial identity sitting in
+    /// the keychain could never be recovered, and the trial cannot simply be
+    /// re-run: the pairing slots are put-once and the account gets one trial
+    /// for its lifetime.
+    private static let preferredClientCertificateNames = ["iphone", "trial-device"]
 
     @Published private(set) var lastImportedCertificateName: String?
 

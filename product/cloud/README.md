@@ -62,8 +62,8 @@ ExperimentalWarning on Node 22 is expected.
 | `GET/DELETE /v1/trial-nodes/current` | session | poll trial state, or tear it down early (kills the sandbox, deletes the node) |
 | `POST /v1/trial-nodes/enroll` | single-use enroll token (`{token}` in body) | the sandbox's own bootstrap call — registers its node identity, burns the token, returns `{ok, sni}` |
 | `POST /v1/pairing/sessions` | session | → `{pairingId, secret, expiresAt}`; only the sha256 of the secret is stored |
-| `POST/GET /v1/pairing/sessions/:id/device-blob` | `X-Pairing-Secret` | opaque bytes (CSR direction); ≤64 KiB |
-| `POST/GET /v1/pairing/sessions/:id/node-blob` | `X-Pairing-Secret` | opaque bytes (issued-cert direction); ≤64 KiB |
+| `POST/GET /v1/pairing/sessions/:id/device-blob` | `X-Pairing-Auth` | opaque bytes (CSR direction); ≤64 KiB |
+| `POST/GET /v1/pairing/sessions/:id/node-blob` | `X-Pairing-Auth` | opaque bytes (issued-cert direction); ≤64 KiB |
 | `POST /v1/node-events` | ed25519 body signature | see below |
 | `GET /v1/tunnel/nodes/:nodeId` | `Bearer $BROKER_TOKEN` | broker authorization hook, see contract |
 | `GET /v1/admin/nodes` | `Bearer $ADMIN_TOKEN` | ops-only; response omits pubkeys |
