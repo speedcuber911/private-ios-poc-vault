@@ -335,6 +335,120 @@ test("a clone failure is recorded and announced, never silent", async () => {
   );
 });
 
+// ---------------------------------------------------------------------------
+// F7-relayd part B: the cloud's terminal-failure route is now called from the
+// import failure path, so `relay status` and the phone learn a handoff died
+// instead of showing it in flight forever.
+
+test("F7B-1: an import failure reports to the cloud exactly once, with relayd's own reason code", async () => {
+  const reported = [];
+  const options = deps("/nonexistent/repo.git", {
+    cloud: {
+      postEvent: async () => ({ status: 202 }),
+      async reportHandoffFailure(id, reason) { reported.push({ id, reason }); return true; },
+    },
+  });
+
+  const record = await importHandoff({ id: "f7b1handoff01", repo: "me/relay", branch: "relay/handoff-x" }, options);
+
+  assert.equal(record.state, "failed");
+  // The mapping down to the cloud's five codes happens INSIDE
+  // reportHandoffFailure (part A's job) — this call site must hand over
+  // relayd's own code unmapped, so this checks the report carries exactly
+  // the record's own `error`, not some translated value.
+  assert.deepEqual(reported, [{ id: "f7b1handoff01", reason: record.error }]);
+});
+
+test("F7B-2: the failure report reaches the cloud strictly before the handoff.failed event post", async () => {
+  const order = [];
+  const options = deps("/nonexistent/repo.git", {
+    cloud: {
+      async postEvent(type) { order.push(["postEvent", type]); return { status: 202 }; },
+      async reportHandoffFailure(id, reason) { order.push(["reportHandoffFailure", id, reason]); return true; },
+    },
+  });
+
+  await importHandoff({ id: "f7b2handoff01", repo: "me/relay", branch: "relay/handoff-x" }, options);
+
+  // Both calls landed in ONE shared array, in call order — not two separate
+  // arrays each merely checked for presence, which would pass even if the
+  // post happened first.
+  assert.equal(order.length, 2, `expected exactly one report and one post, got ${JSON.stringify(order)}`);
+  assert.equal(order[0][0], "reportHandoffFailure",
+    "the cloud must already hold state=failed before the post that wakes the phone's push, or a fast refetch still sees it in flight");
+  assert.equal(order[1][0], "postEvent");
+});
+
+test("F7B-3: an unrecordable descriptor (id not path-safe) never reports to the cloud, but still posts handoff.failed", async () => {
+  const reported = [];
+  const posted = [];
+  const options = deps("/nonexistent/repo.git", {
+    cloud: {
+      async postEvent(type) { posted.push(type); return { status: 202 }; },
+      async reportHandoffFailure(id, reason) { reported.push({ id, reason }); return true; },
+    },
+  });
+
+  const record = await importHandoff({ id: "../../etc/pwn", repo: "me/relay", branch: "b" }, options);
+
+  assert.equal(record.state, "failed");
+  assert.deepEqual(reported, [], "the cloud's fail route is keyed by handoff id; the raw attacker-supplied id must never leave this process");
+  assert.deepEqual(posted, ["handoff.failed"], "the failure is still announced even though it cannot be recorded or reported");
+});
+
+test("F7B-4a: a cloud.reportHandoffFailure that throws SYNCHRONOUSLY still leaves a persisted failed record and still posts", async () => {
+  const posted = [];
+  const options = deps("/nonexistent/repo.git", {
+    cloud: {
+      async postEvent(type) { posted.push(type); return { status: 202 }; },
+      // No `async` — this throws before returning a promise at all, the case
+      // a trailing `.catch()` on the call would miss entirely.
+      reportHandoffFailure() { throw new Error("boom: synchronous"); },
+    },
+  });
+
+  const id = "f7b4ahandoff01";
+  const record = await importHandoff({ id, repo: "me/relay", branch: "relay/handoff-x" }, options);
+
+  assert.equal(record.state, "failed");
+  assert.equal(store.getHandoff(id).state, "failed", "the local record must survive a synchronous throw from the cloud call");
+  assert.deepEqual(posted, ["handoff.failed"], "the event post must still be attempted after a synchronous throw");
+});
+
+test("F7B-4b: a cloud.reportHandoffFailure whose returned promise REJECTS still leaves a persisted failed record and still posts", async () => {
+  const posted = [];
+  const options = deps("/nonexistent/repo.git", {
+    cloud: {
+      async postEvent(type) { posted.push(type); return { status: 202 }; },
+      async reportHandoffFailure() { throw new Error("boom: async rejection"); },
+    },
+  });
+
+  const id = "f7b4bhandoff01";
+  const record = await importHandoff({ id, repo: "me/relay", branch: "relay/handoff-x" }, options);
+
+  assert.equal(record.state, "failed");
+  assert.equal(store.getHandoff(id).state, "failed", "the local record must survive a rejected promise from the cloud call");
+  assert.deepEqual(posted, ["handoff.failed"], "the event post must still be attempted after a rejected promise");
+});
+
+test("F7B-5: a successful import never calls reportHandoffFailure", async () => {
+  const reported = [];
+  const manifest = { ...MANIFEST, id: "f7b5handoff001" };
+  const origin = await makeOriginRepo({ manifest });
+  const options = deps(origin, {
+    cloud: {
+      postEvent: async () => ({ status: 202 }),
+      async reportHandoffFailure(id, reason) { reported.push({ id, reason }); return true; },
+    },
+  });
+
+  const record = await importHandoff({ id: manifest.id, repo: manifest.repo, branch: manifest.branch }, options);
+
+  assert.equal(record.state, "ready");
+  assert.deepEqual(reported, [], "a successful import has nothing to report as failed");
+});
+
 test("a blob sealed to another node is refused, and the attacker's clone is removed", async () => {
   const strangerDir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-handoff-stranger-"));
   initIdentity({ baseDir: strangerDir });

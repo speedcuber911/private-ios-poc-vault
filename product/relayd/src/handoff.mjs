@@ -835,6 +835,20 @@ async function safePostEvent(cloud, type) {
   }
 }
 
+// Same shape as safePostEvent and for the same reason: cloudclient signs and
+// writes before it returns a promise, so a synchronous throw would escape a
+// trailing `.catch()` if the call sat outside the try. Best-effort — the
+// local `failed` record and audit line are already the record of truth;
+// this is a courtesy copy for `relay status` and the phone, and re-reporting
+// a dropped one is part A's job, not this call site's.
+async function safeReportFailure(cloud, id, reason) {
+  try {
+    await cloud?.reportHandoffFailure?.(id, reason);
+  } catch {
+    /* best-effort; the local record and audit line already landed */
+  }
+}
+
 function persist(record) {
   try {
     store.saveHandoff(record);
@@ -902,6 +916,13 @@ async function announceFailed(base, reason, detail, cloud) {
   persist(failed);
   safeAudit("handoff_failed", { handoffId: base.id, repo: base.repo, reason, detail });
   safeEmit("handoff.failed", { id: base.id, repo: base.repo, error: reason });
+  // Reported to the cloud BEFORE the event post, not after: the post is what
+  // triggers the phone's push, and the phone refetches GET /v1/handoffs the
+  // moment that push arrives. If the cloud were told second, a fast enough
+  // phone would refetch while the cloud still held `state=delivered` and
+  // render a handoff that looks in-flight until some unrelated later
+  // refresh finally caught it up.
+  await safeReportFailure(cloud, base.id, reason);
   await safePostEvent(cloud, "handoff.failed");
   return failed;
 }
@@ -918,6 +939,10 @@ async function announceUnrecordable(descriptor, error, cloud) {
     repo: isSafeRepo(descriptor?.repo) ? descriptor.repo : null,
   });
   safeEmit("handoff.failed", { id: null, repo: null, error: reason });
+  // No safeReportFailure here, deliberately: the cloud's fail route is keyed
+  // by handoff id, and the only "id" this path has is descriptor.id, which
+  // just failed assertSafeHandoffId — raw, attacker-supplied, and not a store
+  // key. There is no safe id to send, so nothing is sent.
   await safePostEvent(cloud, "handoff.failed");
   return { id: null, state: "failed", error: reason };
 }
