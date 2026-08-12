@@ -13,13 +13,36 @@
 // a name or path fragment taken from bundle content — the bundle only ever
 // supplies file *contents*. writePrivateFile still resolves the real
 // (symlink-following) path of the parent directory and compares it against
-// the real path of the root it was told to write under, and opens the leaf
-// with O_NOFOLLOW, so a pre-planted symlink anywhere under the root (a
-// poisoned .claude dir left by a prior tenant, say) fails closed instead of
-// silently redirecting a credential write outside the runner home. That is
-// the same defense-in-depth sessionimport.mjs's writeContainedFile uses for
-// bundle-chosen names; here it guards a root that must never move, even
-// though nothing here lets the bundle choose the name.
+// the real path of the root it was told to write under, so a pre-planted
+// symlink ANCESTOR (a poisoned .claude dir left by a prior tenant, say)
+// fails closed instead of silently redirecting a credential write outside
+// the runner home. That is the same defense-in-depth sessionimport.mjs's
+// writeContainedFile uses for bundle-chosen names; here it guards a root
+// that must never move, even though nothing here lets the bundle choose
+// the name.
+//
+// The leaf itself gets a stronger guarantee than O_NOFOLLOW can offer.
+// O_NOFOLLOW rejects a symlink at the final path component, but it says
+// nothing about a HARD LINK: a hard link is not a distinct filesystem
+// object with link-ness visible at the path level, it is a second name for
+// the same inode, so opening an existing leaf — even with O_NOFOLLOW — can
+// still write straight through a pre-planted hard link into a file the
+// attacker already controls (and POSIX ignores the `mode` argument to
+// `open` for a file that already existed, so its original, possibly
+// world-readable permissions survive too). The fix is to never open an
+// existing leaf name for writing at all: create a fresh file at a
+// uniquely-named path with O_CREAT|O_EXCL|O_NOFOLLOW (which guarantees we
+// created the inode — a hard link or symlink pre-planted at that exact
+// random name is astronomically unlikely, and O_EXCL refuses to open
+// through one anyway), set its mode and write its contents through the fd
+// (a path-based redirect after open cannot touch an fd), fsync, and only
+// then `rename` it onto the real leaf name. `rename` replaces whatever
+// directory ENTRY was there — pre-existing file, hard link, or symlink —
+// with our fresh inode; it never writes through it. A poisoned leaf ends
+// up harmlessly replaced by a correctly-permissioned file this module
+// itself created, instead of being written into. Same shape
+// sessionimport.mjs's writeStagedFile uses for this exact reason.
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -35,11 +58,101 @@ function ensurePrivateRoot(root) {
   return fs.realpathSync(root);
 }
 
+// Never unlink anything that is not still the exact inode we created —
+// `unlink` is path-based, so identity is checked (by dev+ino) before it
+// runs. If the path no longer leads to our staging file, it is left alone
+// rather than deleting whatever a racing process put there instead.
+function removeStagingFile(staging, dev, ino) {
+  try {
+    const leftover = fs.lstatSync(staging);
+    if (leftover.isFile() && leftover.dev === dev && leftover.ino === ino) {
+      fs.unlinkSync(staging);
+    }
+  } catch {
+    /* already gone, or never existed */
+  }
+}
+
+// Writes `contents` to `path.join(dir, filename)` in a way that can never
+// deliver a single byte anywhere else, and never lands on an inode this
+// call did not itself create. See the module header for why O_NOFOLLOW on
+// the final leaf is not enough on its own.
+function writeStagedFile(dir, filename, contents) {
+  const target = path.join(dir, filename);
+  const staging = path.join(dir, `.syncauth-${crypto.randomBytes(16).toString("hex")}.tmp`);
+
+  let fd;
+  try {
+    fd = fs.openSync(
+      staging,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+      0o600,
+    );
+  } catch {
+    throw new Error("credential_staging_failed");
+  }
+
+  let ok = false;
+  let stagedDev = null;
+  let stagedIno = null;
+  try {
+    const opened = fs.fstatSync(fd);
+    stagedDev = opened.dev;
+    stagedIno = opened.ino;
+    if (!opened.isFile() || opened.nlink !== 1) {
+      // Vanishingly unlikely given the random name, but if it ever happens
+      // this is exactly the class of bug this whole function exists to
+      // rule out — refuse loudly instead of writing.
+      throw new Error("credential_staging_race");
+    }
+
+    // From here on, everything writes through the fd — an inode, not a
+    // name — so nothing that happens to the path can redirect it.
+    fs.fchmodSync(fd, 0o600);
+    fs.writeFileSync(fd, contents);
+    fs.fsyncSync(fd);
+
+    const written = fs.fstatSync(fd);
+    if (written.nlink !== 1 || written.dev !== stagedDev || written.ino !== stagedIno) {
+      throw new Error("credential_staging_race");
+    }
+    ok = true;
+  } finally {
+    fs.closeSync(fd);
+    if (!ok) removeStagingFile(staging, stagedDev, stagedIno);
+  }
+
+  // `rename` replaces the destination directory ENTRY — file, hard link, or
+  // symlink — with our fresh inode. It never writes through whatever was
+  // there, so a poisoned pre-existing leaf ends up harmlessly replaced.
+  try {
+    fs.renameSync(staging, target);
+  } catch {
+    removeStagingFile(staging, stagedDev, stagedIno);
+    throw new Error("credential_publish_failed");
+  }
+
+  // Verify what actually landed: still a regular file, still a single
+  // link, still the exact inode we staged, still 0600. This is what makes
+  // a lost race at the very last instant loud instead of silent.
+  const published = fs.lstatSync(target);
+  if (
+    !published.isFile() ||
+    published.nlink !== 1 ||
+    published.dev !== stagedDev ||
+    published.ino !== stagedIno ||
+    (published.mode & 0o777) !== 0o600
+  ) {
+    throw new Error("credential_publish_verification_failed");
+  }
+}
+
 // Writes `contents` to `path.join(root, ...segments)`. `segments` are path
 // components chosen entirely by the CALLER of this function (i.e. by this
 // module's own code) — never by bundle content. Real-path-checks the parent
-// directory against `root` and opens the leaf with O_NOFOLLOW so a symlink
-// anywhere in between, or at the leaf itself, cannot redirect the write.
+// directory against `root` so a symlinked ancestor cannot redirect the
+// write outside the root, then delegates the leaf write to writeStagedFile,
+// which is hardened against a poisoned leaf itself (symlink or hard link).
 function writePrivateFile(root, segments, contents) {
   const resolvedRoot = ensurePrivateRoot(root);
   const dir = segments.length > 1 ? path.join(root, ...segments.slice(0, -1)) : root;
@@ -54,26 +167,7 @@ function writePrivateFile(root, segments, contents) {
   }
 
   const filename = segments[segments.length - 1];
-  const target = path.join(dir, filename);
-
-  let fd;
-  try {
-    fd = fs.openSync(
-      target,
-      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW,
-      0o600,
-    );
-  } catch (err) {
-    if (err.code === "ELOOP") {
-      throw new Error("credential_write_refused_symlink");
-    }
-    throw err;
-  }
-  try {
-    fs.writeFileSync(fd, contents);
-  } finally {
-    fs.closeSync(fd);
-  }
+  writeStagedFile(resolvedDir, filename, contents);
 }
 
 // A non-empty string, or null. Bundle members are attacker-controlled until
