@@ -289,6 +289,20 @@ test("an unrecognized harness degrades to claude observably", () => {
   assert.equal(result.requestedHarness, "some-future-harness", "the originally-requested harness is still visible");
 });
 
+test("importSession refuses an empty worktreePath component instead of staging one level too high", () => {
+  // M-3 (review-t12-r4.md): `assertSafeComponent` was commented as "can never
+  // fire today", but `claudeProjectSlug("") === ""` makes it fire for real —
+  // an empty component would otherwise stage the transcript at
+  // `projects/<id>.jsonl` instead of `projects/<slug>/<id>.jsonl`. Still
+  // inside the jail (not an escape), but wrong, and previously untested.
+  const { runHome, codexHome } = homes();
+  const sessionBytes = Buffer.from(`${JSON.stringify({ type: "user", cwd: FROM_CWD })}\n`, "utf8");
+  assertRefused(
+    () => importSession({ manifest: manifest(), sessionBytes, runHome, codexHome, worktreePath: "" }),
+    "unsafe_path_component",
+  );
+});
+
 // ---------------------------------------------------------------------------
 // The detector, and the assertions that depend on it
 
@@ -435,6 +449,31 @@ const LINK_ATTACKS = [
     setup: (a) => {
       fs.mkdirSync(a.runHome, { recursive: true, mode: 0o700 });
       fs.symlinkSync(path.join("..", "..", "outside"), path.join(a.runHome, ".claude"));
+      return attackClaude(a);
+    },
+  },
+  {
+    // M-4 (review-t12-r4.md): pins the code so mutant M3 (a single
+    // recursive mkdirSync for one component, in place of the non-recursive
+    // form) is no longer equivalent — that mutant downgrades this case to
+    // `jail_mkdir_failed` (ENOENT), a generic mkdir failure instead of a
+    // named jail-escape refusal.
+    name: "a DANGLING symlink at `.claude` (intermediate component, claude branch)",
+    code: "jail_escape_symlinked_component",
+    setup: (a) => {
+      fs.mkdirSync(a.runHome, { recursive: true, mode: 0o700 });
+      fs.symlinkSync(path.join(a.outside, "does-not-exist-at-all"), path.join(a.runHome, ".claude"));
+      return attackClaude(a);
+    },
+  },
+  {
+    // M-4: the self-referential counterpart. Mutant M3 downgrades this one
+    // to `jail_mkdir_failed` (ELOOP) instead of the named jail-escape code.
+    name: "a SELF-REFERENTIAL symlink at `.claude` (intermediate component, claude branch)",
+    code: "jail_escape_symlinked_component",
+    setup: (a) => {
+      fs.mkdirSync(a.runHome, { recursive: true, mode: 0o700 });
+      fs.symlinkSync(path.join(a.runHome, ".claude"), path.join(a.runHome, ".claude"));
       return attackClaude(a);
     },
   },
@@ -702,16 +741,17 @@ function withHookWhen(name, predicate, action, body) {
 }
 
 test("RACE: a staging component swapped for a symlink after it was verified is caught, and leaves nothing behind", () => {
-  // `projects` is verified (open #2), and the attacker replaces it with a
-  // symlink out of the jail before the next level is created. Path-based
-  // re-resolution cannot be made atomic in Node — so the requirement is that
-  // this ends loudly and leaves no residue, not that it is impossible.
+  // `projects` is verified at open #3 (#1 is resolveJailRoot's own root-fd
+  // open, #2 is `.claude`), and the attacker replaces it with a symlink out
+  // of the jail before the next level is created. Path-based re-resolution
+  // cannot be made atomic in Node — so the requirement is that this ends
+  // loudly and leaves no residue, not that it is impossible.
   const a = arena();
   const projects = path.join(a.runHome, ".claude", "projects");
   fs.mkdirSync(projects, { recursive: true, mode: 0o700 });
   const before = snapshot(a.root);
 
-  const err = withHook("openSync", 2, () => {
+  const err = withHook("openSync", 3, () => {
     fs.renameSync(projects, `${projects}.stashed`);
     fs.symlinkSync(a.outside, projects);
   }, () => attempt(attackClaude(a)));
@@ -731,7 +771,7 @@ test("RACE: a component swapped for a symlink to a directory that does not exist
   fs.mkdirSync(projects, { recursive: true, mode: 0o700 });
   const before = snapshot(a.root);
 
-  const err = withHook("openSync", 2, () => {
+  const err = withHook("openSync", 3, () => {
     fs.renameSync(projects, `${projects}.stashed`);
     fs.symlinkSync(path.join(a.outside, "does-not-exist-yet"), projects);
   }, () => attempt(attackClaude(a)));
@@ -816,6 +856,160 @@ test("RACE: a published file that is not the inode we staged is caught", () => {
   });
 });
 
+test("RACE (I-1): swap-then-restore-with-link-back never lets session content leave the jail", () => {
+  // review-t12-r4.md finding I-1. The two checks that ran here before this
+  // fix (`landed`, `realpathSync`) are both PATH-based, and this attack
+  // defeats them BOTH by construction: swap the staging directory for a
+  // symlink to `outside/` right before the O_CREAT (so the new, empty file
+  // is created on the far side), then — once it exists — hard-link it back
+  // into the RESTORED real directory and put the real directory back. Every
+  // subsequent path-based check now sees a fully legitimate in-jail path,
+  // because it genuinely is one: the inode has two names, the original
+  // outside one and the new in-jail one. Only an fd-based check (nlink read
+  // straight off the open fd, with no fs call between that read and the
+  // write) can see through this, because it does not depend on any path at
+  // all. Detect escape by scanning the WHOLE outside directory for the
+  // attack's own marker (never a predicted path) — this is exactly the shape
+  // of vacuity warned about elsewhere in this file.
+  const a = arena();
+  fs.mkdirSync(a.projectDir, { recursive: true, mode: 0o700 });
+
+  const originalOpenSync = fs.openSync;
+  const originalFstatSync = fs.fstatSync;
+  let stashedDir = null;
+  let createdFd = null;
+  let restored = false;
+
+  fs.openSync = (...args) => {
+    if (!stashedDir && typeof args[0] === "string" && path.basename(args[0]).startsWith(".relayd-import-")) {
+      stashedDir = `${a.projectDir}.stashed`;
+      fs.renameSync(a.projectDir, stashedDir);
+      fs.symlinkSync(a.outside, a.projectDir);
+    }
+    const fd = originalOpenSync(...args);
+    if (stashedDir && !restored) createdFd = fd;
+    return fd;
+  };
+  fs.fstatSync = (...args) => {
+    const result = originalFstatSync(...args);
+    // First post-open fstat: link the newly-created outside file back into
+    // the restored real directory, then restore the directory itself.
+    if (args[0] === createdFd && !restored) {
+      const tmpName = fs.readdirSync(a.outside).find((n) => n.startsWith(".relayd-import-"));
+      if (tmpName) {
+        fs.unlinkSync(a.projectDir);
+        fs.renameSync(stashedDir, a.projectDir);
+        fs.linkSync(path.join(a.outside, tmpName), path.join(a.projectDir, tmpName));
+      }
+      restored = true;
+    }
+    return result;
+  };
+
+  let err;
+  try {
+    err = attempt(attackClaude(a));
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.fstatSync = originalFstatSync;
+  }
+
+  // The canary: claudeBytes embeds `evil: "POISON"`. No file outside the
+  // jail may ever carry it, whatever the refusal code turns out to be.
+  for (const name of fs.readdirSync(a.outside)) {
+    if (name === "VICTIM.txt") continue;
+    const full = path.join(a.outside, name);
+    if (!fs.lstatSync(full).isFile()) continue;
+    const body = fs.readFileSync(full, "utf8");
+    assert.ok(!body.includes("POISON"), `session content must never reach a file outside the jail, found in ${name}: ${body}`);
+  }
+  assert.equal(fs.readFileSync(a.victim, "utf8"), "ssh-rsa ORIGINAL\n", "the victim file must be untouched");
+  assertRefusal(err, "jail_escape_staging_race");
+});
+
+// ---------------------------------------------------------------------------
+// I-2: unwrapped fs calls reachable with no race at all (ENOSPC/EIO on a
+// real deployment), which used to surface as a raw `Error` carrying an
+// absolute host path in its message instead of a typed refusal.
+
+test("a non-race I/O failure while verifying the staging file surfaces as a typed refusal, not a raw fs Error", () => {
+  // No race needed: this is what an ordinary ENOSPC/EIO from a real disk
+  // looks like. `fs.fstatSync` on the staging fd used to be unwrapped.
+  const a = arena();
+  fs.mkdirSync(a.projectDir, { recursive: true, mode: 0o700 });
+
+  const originalOpenSync = fs.openSync;
+  const originalFstatSync = fs.fstatSync;
+  let stagingFd = null;
+  fs.openSync = (...args) => {
+    const fd = originalOpenSync(...args);
+    if (typeof args[0] === "string" && path.basename(args[0]).startsWith(".relayd-import-")) stagingFd = fd;
+    return fd;
+  };
+  fs.fstatSync = (...args) => {
+    if (args[0] === stagingFd) {
+      const err = new Error("ENOSPC: no space left on device, fstat");
+      err.code = "ENOSPC";
+      throw err;
+    }
+    return originalFstatSync(...args);
+  };
+
+  let caught;
+  try {
+    caught = attempt(attackClaude(a));
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.fstatSync = originalFstatSync;
+  }
+
+  assertRefusal(caught, "jail_verify_failed");
+  assert.ok(!caught.message.includes(a.root), "the message must not carry an absolute host path");
+  assert.ok(!/ENOENT: no such file or directory/.test(caught.message), "must not be a raw Node fs error message");
+  assert.match(caught.message, /ENOSPC/, "the underlying errno must still be visible");
+});
+
+test("a disk-full failure during the staging write surfaces as a typed refusal, not a raw fs Error", () => {
+  // The single most realistic non-race failure: the write itself hits
+  // ENOSPC. `fs.writeFileSync(fd, ...)` used to be unwrapped.
+  const a = arena();
+  fs.mkdirSync(a.projectDir, { recursive: true, mode: 0o700 });
+
+  const original = fs.writeFileSync;
+  fs.writeFileSync = () => {
+    const err = new Error("ENOSPC: no space left on device, write");
+    err.code = "ENOSPC";
+    throw err;
+  };
+
+  let caught;
+  try {
+    caught = attempt(attackClaude(a));
+  } finally {
+    fs.writeFileSync = original;
+  }
+
+  assertRefusal(caught, "jail_staging_io_failed");
+  assert.ok(!caught.message.includes(a.root), "the message must not carry an absolute host path");
+  assert.match(caught.message, /ENOSPC/, "the underlying errno must still be visible");
+  assert.deepEqual(fs.readdirSync(a.projectDir), [],
+    "an abandoned staging file must be cleaned up after a disk-full write, not left as a partial transcript");
+});
+
+test("an existing jail root with a loose mode is repaired to 0700, not just levels created below it", () => {
+  // M-7: `resolveJailRoot` only set the mode on a root IT created; an
+  // ADOPTED root (the common case — relayd's own HOME already exists on any
+  // real run) kept whatever mode it already had.
+  const { runHome, codexHome } = homes();
+  fs.mkdirSync(runHome, { recursive: true, mode: 0o755 });
+  const sessionBytes = Buffer.from(`${JSON.stringify({ type: "user", cwd: FROM_CWD })}\n`, "utf8");
+
+  importSession({ manifest: manifest(), sessionBytes, runHome, codexHome, worktreePath: TO_CWD });
+
+  assert.equal(fs.statSync(runHome).mode & 0o777, 0o700,
+    "an adopted jail root must be re-tightened, exactly like every component below it");
+});
+
 // ---------------------------------------------------------------------------
 // rewriteClaudeSession
 
@@ -874,12 +1068,33 @@ test("rewriteClaudeSession leaves no laptop path behind in any realistic JSONL c
     ["bare, end of input", `working in ${FROM_CWD}`],
     ["trailing period, end of input", `working in ${FROM_CWD}.`],
     ["embedded quote as JSON serializes it", JSON.stringify({ m: `prefix ${FROM_CWD}" suffix` })],
+    // M-2 (review-t12-r4.md): these three were neither in the terminator
+    // class nor in the documented "real sibling names start with these"
+    // exclusion list — simply unlisted, and all three leaked. None of them
+    // is a plausible way for a real sibling directory NAME to start.
+    ["star glob", `rm -rf ${FROM_CWD}*`],
+    ["percent-encoded byte", `${FROM_CWD}%20`],
+    ["caret (shell job control)", `${FROM_CWD}^`],
   ];
   for (const [label, text] of contexts) {
     const rewritten = rewriteClaudeSession(text, { fromCwd: FROM_CWD, toCwd: TO_CWD });
     assert.ok(!rewritten.includes(FROM_CWD), `[${label}] laptop path leaked: ${rewritten}`);
     assert.ok(rewritten.includes(TO_CWD), `[${label}] sandbox path missing: ${rewritten}`);
   }
+});
+
+test("rewriteClaudeSession deliberately leaves `$` unterminated (documented trade-off, not a regression)", () => {
+  // M-2: `$` is the one character of the four flagged by the review that is
+  // NOT added to PATH_TERMINATOR — a transcript showing shell-style
+  // concatenation directly after the path ("${FROM_CWD}$SUFFIX") is at least
+  // as plausible as a sibling name starting with `$`, so this is grouped
+  // with the other deliberately-excluded characters rather than "fixed".
+  // Pinned here so a future change to PATH_TERMINATOR has to make this
+  // choice on purpose, not by accident.
+  const sibling = `${FROM_CWD}$tmp`;
+  const text = JSON.stringify({ path: sibling });
+  const rewritten = rewriteClaudeSession(text, { fromCwd: FROM_CWD, toCwd: TO_CWD });
+  assert.equal(JSON.parse(rewritten).path, sibling, "a `$`-prefixed continuation is left untouched, by design");
 });
 
 test("rewriteClaudeSession works LINE BY LINE, because the only real input is multi-line JSONL", () => {
