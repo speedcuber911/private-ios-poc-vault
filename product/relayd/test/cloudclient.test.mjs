@@ -410,6 +410,259 @@ test("postEvent gives up after a bounded number of attempts rather than retrying
 });
 
 // ---------------------------------------------------------------------------
+// task-11: relayd's half of the delivery-lease contract. The cloud (commit
+// 8bffba2, .superpowers/sdd/handoff/task-8-report.md) now hands out a LEASE
+// on poll rather than marking a handoff delivered the instant it writes the
+// response — a partitioned node (no FIN, socket looks alive) used to have
+// its handoff marked delivered into a dead peer and lost for good. The ack
+// below is the only path to `delivered`; it belongs in pollHandoffs (the
+// transport layer, which is the only place that actually knows the bytes
+// crossed a live connection), not in the handoff-import loop, and it must
+// never be gated on import succeeding — that would resurrect the same
+// lost-handoff bug in a new shape.
+
+// A minimal per-test guard against the documented trap: node:test's per-test
+// `timeout` does not kill a hung async loop underneath it, it just marks the
+// test cancelled while the loop keeps running — which is how a broken bound
+// leaves an orphaned process behind instead of a fast, clean failure.
+function withHardTimeout(promise, ms, label) {
+  let timer;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`hard guard: ${label} exceeded ${ms}ms`)), ms);
+    timer.unref?.();
+  });
+  return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
+}
+
+// A faithful-enough model of the cloud's lease semantics (poll hands out a
+// pending row with a fresh random token and a short visibility timeout; an
+// unconfirmed lease expires and becomes claimable again; POST .../ack is the
+// only path to `delivered`), entirely self-contained in this test file —
+// cloudclient.mjs's job ends at making the poll/ack HTTP calls correctly, so
+// this fake does not verify signatures (that is covered directly, below, by
+// checking the ack request against nodeRequestSigningInput).
+function startLeasingFakeCloud({ handoffs, leaseMs, clock }) {
+  const state = new Map(handoffs.map((h) => [h.id, { ...h, state: "pending", lease: null, leaseExpiresAt: 0 }]));
+  return new Promise((resolve) => {
+    const server = createServer((req, res) => {
+      const chunks = [];
+      req.on("data", (chunk) => chunks.push(chunk));
+      req.on("end", () => {
+        const url = new URL(req.url, "http://fake-cloud");
+        if (req.method === "GET" && url.pathname === "/v1/node/handoffs") {
+          const nowMs = clock.t;
+          const due = [];
+          for (const h of state.values()) {
+            if (h.state === "pending" || (h.state === "leased" && h.leaseExpiresAt <= nowMs)) {
+              h.state = "leased";
+              h.lease = crypto.randomUUID();
+              h.leaseExpiresAt = nowMs + leaseMs;
+              due.push(h);
+            }
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ handoffs: due.map(({ id, repo, branch, lease }) => ({ id, repo, branch, lease })) }));
+          return;
+        }
+        if (req.method === "POST" && url.pathname === "/v1/node/handoffs/ack") {
+          let body = {};
+          try { body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"); } catch { body = {}; }
+          const acked = [];
+          for (const entry of Array.isArray(body.acks) ? body.acks : []) {
+            const h = state.get(entry?.id);
+            if (h && h.state === "leased" && h.lease === entry.lease) {
+              h.state = "delivered";
+              acked.push(entry.id);
+            }
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ acked }));
+          return;
+        }
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "not_found" }));
+      });
+    });
+    server.listen(0, "127.0.0.1", () =>
+      resolve({ state, url: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((r) => server.close(r)) }));
+  });
+}
+
+test("pollHandoffs sends a batched, signed ack for every handoff in the poll response", async () => {
+  const node = freshNode();
+  const cloud = await startFakeCloud((res, call) => {
+    if (call.method === "GET") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        handoffs: [
+          { id: "abc123", repo: "me/relay", branch: "relay/handoff-x", lease: "lease-token-1" },
+          { id: "def456", repo: "me/relay", branch: "relay/handoff-y", lease: "lease-token-2" },
+        ],
+      }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ acked: ["abc123", "def456"] }));
+  });
+  try {
+    const client = createCloudClient({ cloudUrl: cloud.url, baseDir: node.baseDir });
+    const handoffs = await client.pollHandoffs(20);
+
+    // The ack must not alter what the caller receives back.
+    assert.deepEqual(handoffs, [
+      { id: "abc123", repo: "me/relay", branch: "relay/handoff-x", lease: "lease-token-1" },
+      { id: "def456", repo: "me/relay", branch: "relay/handoff-y", lease: "lease-token-2" },
+    ]);
+
+    assert.equal(cloud.calls.length, 2, "a poll response must be followed by exactly one ack request");
+    const ackCall = cloud.calls[1];
+    assert.equal(ackCall.method, "POST");
+    assert.equal(ackCall.url, "/v1/node/handoffs/ack");
+    const body = JSON.parse(ackCall.raw.toString("utf8"));
+    assert.deepEqual(body, {
+      acks: [
+        { id: "abc123", lease: "lease-token-1" },
+        { id: "def456", lease: "lease-token-2" },
+      ],
+    });
+
+    // Signed exactly the same way as the poll: same header names, same
+    // canonical signing string, method="POST" this time.
+    assert.equal(ackCall.headers["x-relay-node"], node.nodeId);
+    const input = Buffer.from(
+      `${SIGNING_LABEL}\nPOST\n/v1/node/handoffs/ack\n${node.nodeId}\n${ackCall.headers["x-relay-ts"]}`, "utf8");
+    const signature = Buffer.from(ackCall.headers["x-relay-signature"], "base64url");
+    assert.ok(crypto.verify(null, input, node.publicKey, signature), "the ack signature verifies against the node key");
+  } finally { await cloud.close(); }
+});
+
+test("a poll that returns no handoffs sends no ack", async () => {
+  const node = freshNode();
+  const cloud = await startFakeCloud((res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ handoffs: [] }));
+  });
+  try {
+    const client = createCloudClient({ cloudUrl: cloud.url, baseDir: node.baseDir });
+    const handoffs = await client.pollHandoffs(5);
+    assert.deepEqual(handoffs, []);
+    assert.equal(cloud.calls.length, 1, "an empty poll must not trigger an ack call");
+  } finally { await cloud.close(); }
+});
+
+test("an ack that fails at the transport layer does not throw out of pollHandoffs or lose the handoffs", async () => {
+  const node = freshNode();
+  let ackAttempts = 0;
+  const fetchImpl = async (_url, opts) => {
+    if (opts.method === "GET") {
+      return {
+        status: 200,
+        json: async () => ({ handoffs: [{ id: "abc123", repo: "me/relay", branch: "relay/handoff-x", lease: "lease-1" }] }),
+      };
+    }
+    ackAttempts += 1;
+    throw new Error("simulated_ack_transport_failure");
+  };
+  const client = createCloudClient({ cloudUrl: "http://127.0.0.1:1", baseDir: node.baseDir, fetchImpl });
+
+  const handoffs = await withHardTimeout(client.pollHandoffs(5), 2000, "pollHandoffs with a failing ack");
+  assert.deepEqual(handoffs, [{ id: "abc123", repo: "me/relay", branch: "relay/handoff-x", lease: "lease-1" }],
+    "the handoffs must still be returned even though every ack attempt failed");
+  assert.ok(ackAttempts >= 1, "at least one ack attempt must have been made");
+});
+
+test("the ack retry is bounded — it gives up rather than retrying forever", async () => {
+  const node = freshNode();
+  let ackAttempts = 0;
+  const fetchImpl = async (_url, opts) => {
+    if (opts.method === "GET") {
+      return {
+        status: 200,
+        json: async () => ({ handoffs: [{ id: "abc123", repo: "me/relay", branch: "relay/handoff-x", lease: "lease-1" }] }),
+      };
+    }
+    ackAttempts += 1;
+    throw new Error("simulated_ack_transport_failure");
+  };
+  const client = createCloudClient({ cloudUrl: "http://127.0.0.1:1", baseDir: node.baseDir, fetchImpl });
+
+  await withHardTimeout(client.pollHandoffs(5), 2000, "bounded ack retry");
+  assert.ok(ackAttempts >= 1 && ackAttempts <= 5, `expected a small bounded retry count, saw ${ackAttempts} attempts`);
+});
+
+// The point of the whole exercise: an ack that never arrives (crash,
+// partition, anything transport-level — indistinguishable to relayd) must
+// not lose the handoff. The cloud's lease expires, the SAME handoff is
+// redelivered on a later poll, and — per importHandoff's own
+// idempotent-on-id contract, which this test models without touching
+// handoff.mjs — the redelivery is a safe no-op to import.
+test("a handoff whose ack never arrives is redelivered on the next poll and imports cleanly", async () => {
+  const node = freshNode();
+  const clock = { t: 1755100000000 };
+  const LEASE_MS = 5000;
+  const cloud = await startLeasingFakeCloud({
+    handoffs: [{ id: "deadbeefcafef00d", repo: "me/relay", branch: "relay/handoff-recover" }],
+    leaseMs: LEASE_MS,
+    clock,
+  });
+  try {
+    // This client's acks always fail at the transport layer — standing in
+    // for "the ack never arrives" (crash, partition, anything).
+    const brokenAckFetch = async (url, opts) => {
+      if (opts.method === "POST" && String(url).endsWith("/v1/node/handoffs/ack")) {
+        throw new Error("simulated_ack_never_arrives");
+      }
+      return fetch(url, opts);
+    };
+    const flaky = createCloudClient({
+      cloudUrl: cloud.url, baseDir: node.baseDir, fetchImpl: brokenAckFetch, now: () => clock.t,
+    });
+
+    const first = await withHardTimeout(flaky.pollHandoffs(0), 3000, "first poll");
+    assert.equal(first.length, 1);
+    assert.equal(first[0].id, "deadbeefcafef00d");
+    assert.equal(cloud.state.get("deadbeefcafef00d").state, "leased", "an un-acked lease must not become delivered");
+
+    const stillLeased = await withHardTimeout(flaky.pollHandoffs(0), 3000, "second poll, still inside the lease window");
+    assert.deepEqual(stillLeased, [], "a live, unexpired lease is not handed out twice");
+
+    // Past the lease window with no successful ack ever sent: the row must
+    // become claimable again.
+    clock.t += LEASE_MS + 1;
+
+    // A healthy client (default fetch, acks succeed) polls next and must see
+    // the SAME handoff redelivered.
+    const healthy = createCloudClient({ cloudUrl: cloud.url, baseDir: node.baseDir, now: () => clock.t });
+    const second = await withHardTimeout(healthy.pollHandoffs(0), 3000, "third poll, after lease expiry");
+    assert.equal(second.length, 1, "an unconfirmed lease must expire and become claimable again — nothing may be lost");
+    assert.equal(second[0].id, "deadbeefcafef00d", "the redelivered handoff is the same logical handoff");
+    assert.deepEqual(
+      { repo: second[0].repo, branch: second[0].branch },
+      { repo: "me/relay", branch: "relay/handoff-recover" },
+      "redelivery preserves the exact same content",
+    );
+    assert.notEqual(second[0].lease, first[0].lease, "redelivery mints a fresh lease token, not a stale one");
+    assert.equal(cloud.state.get("deadbeefcafef00d").state, "delivered", "a healthy ack reaches delivered on the next poll");
+
+    // "Imports cleanly": modeled here (not in handoff.mjs, which this task
+    // does not touch) per importHandoff's own documented contract —
+    // `readHandoff(id)` already `ready` short-circuits, so a redelivery is a
+    // cheap no-op, never a duplicate import.
+    const imported = new Set();
+    function simulateIdempotentImport(descriptor) {
+      if (imported.has(descriptor.id)) return "already-imported-noop";
+      imported.add(descriptor.id);
+      return "imported";
+    }
+    assert.equal(simulateIdempotentImport(first[0]), "imported");
+    assert.equal(
+      simulateIdempotentImport(second[0]), "already-imported-noop",
+      "the redelivered handoff must import as a cheap no-op",
+    );
+  } finally { await cloud.close(); }
+});
+
+// ---------------------------------------------------------------------------
 // MINOR 4: the injected `now` must actually be exercised at both call sites
 // (x-relay-ts header AND the event body's ts). Hardcoding Date.now() at
 // either site must fail this test.
