@@ -13,6 +13,14 @@ export function makeFakeProvisioner() {
       created.push(opts);
       return { sandboxId: `sbx_${created.length}` };
     },
+    // The real delivery path: Cube restores sandboxes from a template
+    // snapshot, so the boot script never sees create-time envVars and is
+    // configured by this file instead.
+    writes: [],
+    async writeSandboxFile(sandboxId, filePath, content) {
+      this.writes.push({ sandboxId, filePath, content });
+      return true;
+    },
     killed: [],
     async killSandbox(id) { this.killed.push(id); return true; },
     paused: [],
@@ -52,6 +60,66 @@ test("trial create: 201, sandbox env carries enroll+pairing+tunnel, poll shows c
     await t.close();
   }
 });
+
+// The envVars asserted above are a fallback for a directly-booted node. On
+// Cube the sandbox is RESTORED from a snapshot of the template's running
+// machine, so its init process is already up with a frozen environment and
+// never observes them — a live sandbox ran ten minutes with the enroll token
+// set at create and the control plane saw zero enroll attempts. This file,
+// written through envd after the sandbox exists, is what actually configures
+// it, so it carries the same contract the boot script reads.
+test("trial create delivers enroll.json into the running sandbox", async () => {
+  const provisioner = makeFakeProvisioner();
+  const t = await startTestApp({ env: TRIAL_ENV, provisioner });
+  try {
+    const session = await signIn(t);
+    const res = await api(t.baseUrl, "POST", "/v1/trial-nodes", { body: PAIRING, ...authed(session.sessionToken) });
+    assert.equal(res.status, 201);
+
+    assert.equal(provisioner.writes.length, 1);
+    const write = provisioner.writes[0];
+    assert.equal(write.sandboxId, "sbx_1");
+    assert.equal(write.filePath, "/var/lib/relayd/enroll.json");
+
+    const cfg = JSON.parse(write.content);
+    assert.equal(cfg.pairingId, PAIRING.pairingId);
+    assert.equal(cfg.pairingSecret, PAIRING.pairingSecret);
+    assert.equal(cfg.tunnelHost, "broker.test");
+    assert.equal(cfg.tunnelPort, "80");
+    assert.equal(cfg.tunnelSuffix, ".tun.test");
+    assert.match(cfg.token, /^[A-Za-z0-9_-]{43}$/);
+    assert.match(cfg.cloudUrl, /^http:\/\/127\.0\.0\.1:\d+$/);
+  } finally {
+    await t.close();
+  }
+});
+
+// Failing after the sandbox exists is the dangerous case: the reaper's
+// due-list covers only `creating` and `ready`, so a `failed` row that still
+// held a sandbox id would never be revisited and the machine would run to its
+// platform timeout — days of a stranded VM per failed signup.
+test("a failed config delivery destroys the sandbox instead of stranding it", async () => {
+  const provisioner = makeFakeProvisioner();
+  provisioner.writeSandboxFile = async function () {
+    throw new Error("provisioner_http_502");
+  };
+  const t = await startTestApp({ env: TRIAL_ENV, provisioner });
+  try {
+    const session = await signIn(t);
+    let res = await api(t.baseUrl, "POST", "/v1/trial-nodes", { body: PAIRING, ...authed(session.sessionToken) });
+    assert.equal(res.status, 502);
+    assert.equal(res.json.error, "provision_failed");
+
+    assert.deepEqual(provisioner.killed, ["sbx_1"]);
+
+    res = await api(t.baseUrl, "GET", "/v1/trial-nodes/current", authed(session.sessionToken));
+    assert.equal(res.status, 200);
+    assert.equal(res.json.trial.state, "failed");
+  } finally {
+    await t.close();
+  }
+});
+
 
 test("trial create: lifetime one per account (409), capacity 503, disabled 404, failure 502", async () => {
   const provisioner = makeFakeProvisioner();

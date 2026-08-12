@@ -27,6 +27,8 @@ function fakeProvisioner(overrides = {}) {
     created: [],
     paused: [],
     killed: [],
+    writes: [],
+    async writeSandboxFile(sandboxId, filePath, content) { this.writes.push({ sandboxId, filePath, content }); return true; },
     async createSandbox(opts) {
       this.created.push(opts);
       return { sandboxId: `sbx_${this.created.length}` };
