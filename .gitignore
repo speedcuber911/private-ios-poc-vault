@@ -24,3 +24,4 @@ ios/POCVault/Package.resolved
 .superpowers/
 __pycache__/
 *.pyc
+node_modules/
