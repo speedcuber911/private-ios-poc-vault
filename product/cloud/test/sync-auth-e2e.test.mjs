@@ -211,10 +211,16 @@ test("a credential collected by relay sync-auth on the laptop ends up installed 
     // ── second leg: the session index the phone renders ───────────────────
     const repoRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "relay-e2e-repo-")));
     const { claudeProjectSlug } = await import("../../cli/src/sessions.mjs");
-    const sessionFile = path.join(laptopHome, ".claude", "projects", claudeProjectSlug(repoRoot), "s1.jsonl");
+    // discoverClaudeSessions (product/cli/src/sessions.mjs) only offers a
+    // transcript whose filename matches RESUMABLE_SESSION_ID_RE and whose own
+    // records declare the matching `cwd` — a bare "s1.jsonl" with no `cwd`
+    // satisfies neither, so discoverSessions would find nothing and
+    // index.sessions[0] below would be undefined.
+    const sessionFile = path.join(
+      laptopHome, ".claude", "projects", claudeProjectSlug(repoRoot), "11111111-1111-1111-1111-111111111111.jsonl");
     fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
     fs.writeFileSync(sessionFile,
-      `${JSON.stringify({ type: "user", message: { content: "fix the auth bug" } })}\n`);
+      `${JSON.stringify({ type: "user", cwd: repoRoot, message: { content: "fix the auth bug" } })}\n`);
 
     await cmdSyncAuth([], {
       home: laptopHome, baseUrl: t.baseUrl, log: () => {},
@@ -299,4 +305,81 @@ test("a sync the sandbox slept through ends in a visible failure, not a silent o
   } finally {
     await t.close();
   }
+});
+
+// FINDING 2 SIBLING: the happy-path test above runs the real CLI against the
+// real cloud, but never independently checks the authToken's alphabet — so it
+// is blind in exactly the same ~26.4% of runs as
+// product/cli/test/syncauth.test.mjs (see there for the mechanism:
+// authTokenFor is base64url of a sha256 digest, and a regression to
+// `.digest("base64").replace(/=+$/,"")` is byte-identical to the correct
+// spelling whenever the digest needs neither a `+` nor a `/`). The cloud's
+// own AUTH_TOKEN_RE (product/cloud/src/pairing.js) hard-rejects the other
+// alphabet, so on a genuinely distinguishing draw a regression 400s the real
+// POST /v1/pairing/sessions and the happy-path test's own `installed.ok ===
+// true` assertion already catches it — but on the byte-identical 26.4% the
+// cloud cannot tell the two spellings apart either, and nothing here checked
+// the alphabet directly. This test observes the actual token the real cloud
+// accepted for a real `relay sync-auth` run against a real server, retrying
+// with a fresh throwaway account/node/app each attempt until a
+// substitution-character draw proves the check has teeth (or a visibly wrong
+// draw proves a regression immediately), and asserts the premise so a stuck
+// loop fails loudly instead of silently passing.
+test("the real cloud sees (and accepts) a base64url-safe authToken, not just a hoped-for one", async () => {
+  let sessionBody = null;
+  let sessionStatus = null;
+  for (let attempt = 0; attempt < 40 && !sessionBody; attempt++) {
+    const t = await startTestApp();
+    try {
+      const identity = sandboxIdentity();
+      const session = await signIn(t);
+      t.app.registry.createNode(session.accountId, {
+        id: NODE_ID, kind: "trial", name: "Trial machine",
+        pubkey: identity.pubkeyPem, encPubkey: identity.encPubkeyB64,
+      });
+      const laptopHome = fs.mkdtempSync(path.join(os.tmpdir(), "relay-e2e-alphabet-laptop-"));
+      writeCredentials({
+        sessionToken: session.sessionToken, accountId: session.accountId,
+        nodeId: NODE_ID, nodeEncPubkey: identity.encPubkeyB64,
+      }, { home: laptopHome });
+
+      const captured = [];
+      const capturingFetch = async (url, opts = {}) => {
+        const res = await fetch(url, opts);
+        if (opts.method === "POST" && String(url).endsWith("/v1/pairing/sessions")) {
+          captured.push({ status: res.status, body: typeof opts.body === "string" ? JSON.parse(opts.body) : null });
+        }
+        return res;
+      };
+
+      try {
+        await cmdSyncAuth([], {
+          home: laptopHome, baseUrl: t.baseUrl, fetchImpl: capturingFetch, log: () => {},
+          execFileImpl: async () => { throw new Error("no gh"); },
+          requireGitHubRepoImpl: async () => { throw new Error("not a repo"); },
+        });
+      } catch {
+        // A session the real cloud rejects makes cmdSyncAuth throw — the
+        // capture above already has what this test needs either way.
+      }
+
+      const candidate = captured[0];
+      // Stop as soon as either the draw is distinguishing (needs -/_, so a
+      // regression to std-base64 would visibly differ) OR the cloud already
+      // visibly refused it (a real regression manifesting as a 400) — the
+      // latter fails immediately and legibly via the asserts below instead
+      // of spinning to the attempt cap first.
+      if (candidate && (candidate.status !== 201 || /[-_]/.test(candidate.body?.authToken || ""))) {
+        sessionBody = candidate.body;
+        sessionStatus = candidate.status;
+      }
+    } finally {
+      await t.close();
+    }
+  }
+  assert.ok(sessionBody,
+    "could not find a real-cloud-accepted authToken needing a base64url substitution character after 40 attempts — the test premise is broken, not the code under test");
+  assert.equal(sessionStatus, 201, "the real cloud must accept the derived token (AUTH_TOKEN_RE), not 400 it");
+  assert.match(sessionBody.authToken, /^[A-Za-z0-9_-]{43}$/,
+    "the real cloud must see a base64url-safe derived token — a regression to std base64 would 400 here on a distinguishing draw");
 });

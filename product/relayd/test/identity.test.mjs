@@ -47,6 +47,25 @@ test("initIdentity generates node id, ed25519 identity, and a CA with private mo
   assert.equal(status.hasIdentityKey, true);
   assert.equal(status.hasCa, true);
 
+  // nodeId is `node-${randomBytes(8).toString("hex")}` — 16 hex chars,
+  // lowercase. The regex above only pins lowercase when the draw contains a
+  // letter a-f; an all-digit draw (~0.0546% of draws) can't distinguish a
+  // regression to uppercase from the correct lowercase output, since digits
+  // are case-invariant. Retry with fresh identities (a fresh baseDir each
+  // time, so a genuinely new random draw is made rather than reading back an
+  // already-persisted id) until a letter appears, and assert the premise so
+  // a stuck loop fails loudly instead of silently passing.
+  let letterNodeId = null;
+  for (let attempt = 0; attempt < 32; attempt++) {
+    const probe = identity.initIdentity({ baseDir: fs.mkdtempSync(path.join(tmpRoot, "nodeid-probe-")) });
+    if (/[a-f]/.test(probe.nodeId)) { letterNodeId = probe.nodeId; break; }
+  }
+  assert.ok(letterNodeId,
+    "could not mint a nodeId containing a hex letter after 32 attempts — the test premise is broken, not the code under test");
+  assert.match(letterNodeId, /^node-[a-f0-9]{16}$/);
+  assert.doesNotMatch(letterNodeId, /^node-[A-F0-9]{16}$/,
+    "sanity: this fixture must actually be capable of catching an uppercase regression");
+
   const paths = identity.identityPaths();
   assert.equal(fs.statSync(paths.baseDir).mode & 0o777, 0o700);
   assert.equal(fs.statSync(paths.caKeyPath).mode & 0o777, 0o600);
@@ -75,6 +94,37 @@ test("issues a P-256 device cert that verifies against the node CA", () => {
   assert.match(issued.certSerial, /^[0-9A-F]{18}$/);
   assert.ok(issued.notAfter && !Number.isNaN(Date.parse(issued.notAfter)));
   assert.match(issued.nodeId, /^node-/);
+
+  // certSerial is `randomBytes(9).toString("hex").toUpperCase()`. The regex
+  // above only proves .toUpperCase() ran when the draw contains a letter
+  // a-f; an all-digit 18-char draw (~0.0204% of draws) matches
+  // /^[0-9A-F]{18}$/ whether or not .toUpperCase() was ever called, which
+  // makes it the ONLY thing in this suite pinning that call — and it is
+  // load-bearing: tunnel.mjs upper-cases the peer's serial before comparing
+  // it against isRevokedSerial's exact-string CRL check, so a silently
+  // dropped .toUpperCase() means every revoked device keeps working.
+  // issueDeviceCert mints a fresh random serial on every call regardless of
+  // the CSR, so retry against the same CSR (cheap: no new keypair/CSR
+  // needed) until a letter appears, and assert the premise so a stuck loop
+  // fails loudly instead of silently passing.
+  let serialWithLetter = null;
+  for (let attempt = 0; attempt < 64; attempt++) {
+    const candidate = identity.issueDeviceCert({ csrPem, deviceName: "Serial probe", platform: "cli" });
+    if (/[A-Fa-f]/.test(candidate.certSerial)) { serialWithLetter = candidate.certSerial; }
+    // Every probe registers a new active device (issueDeviceCert always
+    // does), and the later revocation test relies on an exact active-device
+    // count ("revoking the last device would lock out this node"). Revoke
+    // each probe immediately so it never lingers as a spurious active
+    // device — force is safe here since `issued` above is always still active.
+    identity.revokeDevice(candidate.deviceId, { force: true });
+    if (serialWithLetter) break;
+  }
+  assert.ok(serialWithLetter,
+    "could not mint a certSerial containing a hex letter after 64 attempts — the test premise is broken, not the code under test");
+  assert.match(serialWithLetter, /^[0-9A-F]{18}$/,
+    "certSerial must be upper-cased hex — tunnel.mjs compares it against an upper-cased peer serial");
+  assert.doesNotMatch(serialWithLetter.toLowerCase(), /^[0-9A-F]{18}$/,
+    "sanity: this fixture must actually be capable of catching a dropped .toUpperCase()");
 
   // openssl verify against the CA — the real chain check.
   const certPath = path.join(workDir, "issued.cert.pem");
@@ -118,8 +168,13 @@ test("ed25519 CSRs are accepted; RSA CSRs are rejected with 400", () => {
 });
 
 test("revocation: serial lands on the CRL, guards enforced", () => {
-  const devices = identity.listDevices();
-  assert.ok(devices.length >= 2, "expected devices from earlier tests");
+  // Filter to ACTIVE devices: an earlier test may have minted and immediately
+  // revoked throwaway devices (the certSerial-fixture retry above mints and
+  // revokes "Serial probe" devices to guarantee a hex letter in the draw),
+  // so this needs two devices that are actually still active, not merely the
+  // first two ever created.
+  const devices = identity.listDevices().filter((device) => !device.revoked);
+  assert.ok(devices.length >= 2, "expected active devices from earlier tests");
   const [first, second] = devices;
 
   const result = identity.revokeDevice(first.id);
@@ -198,16 +253,22 @@ function freshEncBase() {
   return fs.mkdtempSync(path.join(tmpRoot, "enc-"));
 }
 
-function keyBytesLeaked(haystack, paths) {
+function keyBytesLeaked(haystack, paths, { knownPub } = {}) {
   // No key material may reach an error message: neither the PEM body nor
-  // the published base64 public key may appear verbatim.
+  // the published base64 public key may appear verbatim. `knownPub` lets a
+  // caller that has already deleted encPubPath (to provoke the error in the
+  // first place) supply the content it captured beforehand — reading it back
+  // from disk here would always ENOENT into the catch below and silently
+  // skip this half of the check.
   if (/BEGIN (PRIVATE|PUBLIC) KEY/.test(haystack)) return true;
-  try {
-    const pub = fs.readFileSync(paths.encPubPath, "utf8").trim();
-    if (pub && haystack.includes(pub)) return true;
-  } catch {
-    /* file may not exist / not be readable as the planted value */
-  }
+  const pub = knownPub ?? (() => {
+    try {
+      return fs.readFileSync(paths.encPubPath, "utf8").trim();
+    } catch {
+      return null;
+    }
+  })();
+  if (pub && haystack.includes(pub)) return true;
   return false;
 }
 
@@ -261,6 +322,11 @@ test("C1 (reverse): public key alone missing is a hard error, not silent regener
   identity.initIdentity({ baseDir });
   const paths = identity.identityPaths(baseDir);
   const originalKeyPem = fs.readFileSync(paths.encKeyPath, "utf8");
+  // Captured BEFORE deletion: keyBytesLeaked would otherwise try to re-read
+  // this exact file to check for a leak, ENOENT into its own catch, and
+  // silently treat the public-key half of the check as passed no matter what
+  // the error message actually contains.
+  const originalPub = fs.readFileSync(paths.encPubPath, "utf8").trim();
 
   fs.rmSync(paths.encPubPath);
 
@@ -268,7 +334,7 @@ test("C1 (reverse): public key alone missing is a hard error, not silent regener
     () => identity.initIdentity({ baseDir }),
     (error) => {
       assert.match(error.message, /encryption keypair is half-present/);
-      assert.equal(keyBytesLeaked(error.message, paths), false, "error message must not contain key bytes");
+      assert.equal(keyBytesLeaked(error.message, paths, { knownPub: originalPub }), false, "error message must not contain key bytes");
       return true;
     },
   );

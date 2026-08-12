@@ -12,7 +12,6 @@ const execFileAsync = promisify(execFile);
 const relaydBin = fileURLToPath(new URL("../bin/relayd", import.meta.url));
 
 test("relayd enroll registers via env config and exits 0", async () => {
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-cli-data-"));
   const calls = [];
   const cloud = await new Promise((resolve) => {
     const server = createServer((req, res) => {
@@ -27,17 +26,36 @@ test("relayd enroll registers via env config and exits 0", async () => {
     server.listen(0, "127.0.0.1", () => resolve({ server, url: `http://127.0.0.1:${server.address().port}` }));
   });
   try {
-    const { stdout } = await execFileAsync(process.execPath, [relaydBin, "enroll"], {
-      env: {
-        ...process.env,
-        CODEX_DATA_DIR: dataDir,
-        RELAYD_ENROLL_URL: cloud.url,
-        RELAYD_ENROLL_TOKEN: "tok-cli",
-      },
-    });
-    assert.match(stdout, /enrolled node-[0-9a-f]{16} sni=node-[0-9a-f]{16}\.tun\.test/);
-    assert.ok(!stdout.includes("tok-cli"), "token must never be printed");
-    assert.equal(calls[0].token, "tok-cli");
+    // Two independent regressions this loop guards against:
+    //  1. nodeId is lowercase hex; a plain shape check only pins that when
+    //     the draw contains a letter a-f (~0.0546% of all-digit 16-char
+    //     draws can't distinguish a case regression, since digits are
+    //     case-invariant) — so retry with a fresh identity dir each attempt
+    //     until a letter appears.
+    //  2. The two `node-[0-9a-f]{16}` groups below are captured and compared
+    //     explicitly: a single non-backreferenced regex would accept stdout
+    //     where the printed SNI does not actually derive from the printed
+    //     node id.
+    let nodeId = null;
+    let stdout = null;
+    let expectedToken = null;
+    for (let attempt = 0; attempt < 8 && !nodeId; attempt++) {
+      const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-cli-data-"));
+      const token = `tok-cli-${attempt}`;
+      const result = await execFileAsync(process.execPath, [relaydBin, "enroll"], {
+        env: { ...process.env, CODEX_DATA_DIR: dataDir, RELAYD_ENROLL_URL: cloud.url, RELAYD_ENROLL_TOKEN: token },
+      });
+      const match = /enrolled (node-[0-9a-f]{16}) sni=(node-[0-9a-f]{16})\.tun\.test/.exec(result.stdout);
+      assert.ok(match, `stdout did not match the expected shape: ${result.stdout}`);
+      assert.equal(match[2], match[1], "the printed SNI must derive from the printed node id, not an independent value");
+      if (/[a-f]/.test(match[1])) { nodeId = match[1]; stdout = result.stdout; expectedToken = token; }
+    }
+    assert.ok(nodeId,
+      "could not mint a nodeId containing a hex letter after 8 attempts — the test premise is broken, not the code under test");
+    assert.doesNotMatch(nodeId, /^node-[0-9A-F]{16}$/,
+      "sanity: this fixture must actually be capable of catching an uppercase regression");
+    assert.ok(!stdout.includes(expectedToken), "token must never be printed");
+    assert.equal(calls.at(-1).token, expectedToken);
   } finally {
     cloud.server.close();
   }
@@ -52,7 +70,6 @@ test("relayd enroll registers via env config and exits 0", async () => {
 // re-ran the spent token and exited. These two flags are what let the trial
 // bootstrap keep them apart.
 test("relayd enroll --no-pair enrolls and never attempts pairing", async () => {
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-cli-nopair-"));
   const paths = [];
   const cloud = await new Promise((resolve) => {
     const server = createServer((req, res) => {
@@ -67,20 +84,38 @@ test("relayd enroll --no-pair enrolls and never attempts pairing", async () => {
     server.listen(0, "127.0.0.1", () => resolve({ server, url: `http://127.0.0.1:${server.address().port}` }));
   });
   try {
-    const { stdout } = await execFileAsync(process.execPath, [relaydBin, "enroll", "--no-pair"], {
-      env: {
-        ...process.env,
-        CODEX_DATA_DIR: dataDir,
-        RELAYD_ENROLL_URL: cloud.url,
-        RELAYD_ENROLL_TOKEN: "tok-nopair",
-        // Deliberately present: --no-pair must win over them.
-        RELAYD_ENROLL_PAIRING_ID: "11111111-1111-4111-8111-111111111111",
-        RELAYD_ENROLL_PAIRING_SECRET: "c2VjcmV0LXNlY3JldC1zZWNyZXQ",
-      },
-    });
-    assert.match(stdout, /enrolled node-[0-9a-f]{16}/);
+    // Same lowercase-hex vacuity as the test above: retry with a fresh
+    // identity dir until the nodeId draw contains a letter. `paths` is reset
+    // per attempt so the "only one call" assertion below reflects only the
+    // successful attempt, not every retry.
+    let nodeId = null;
+    let stdout = null;
+    let expectedToken = null;
+    for (let attempt = 0; attempt < 8 && !nodeId; attempt++) {
+      const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-cli-nopair-"));
+      const token = `tok-nopair-${attempt}`;
+      paths.length = 0;
+      const result = await execFileAsync(process.execPath, [relaydBin, "enroll", "--no-pair"], {
+        env: {
+          ...process.env,
+          CODEX_DATA_DIR: dataDir,
+          RELAYD_ENROLL_URL: cloud.url,
+          RELAYD_ENROLL_TOKEN: token,
+          // Deliberately present: --no-pair must win over them.
+          RELAYD_ENROLL_PAIRING_ID: "11111111-1111-4111-8111-111111111111",
+          RELAYD_ENROLL_PAIRING_SECRET: "c2VjcmV0LXNlY3JldC1zZWNyZXQ",
+        },
+      });
+      const match = /enrolled (node-[0-9a-f]{16})/.exec(result.stdout);
+      assert.ok(match, `stdout did not match the expected shape: ${result.stdout}`);
+      if (/[a-f]/.test(match[1])) { nodeId = match[1]; stdout = result.stdout; expectedToken = token; }
+    }
+    assert.ok(nodeId,
+      "could not mint a nodeId containing a hex letter after 8 attempts — the test premise is broken, not the code under test");
+    assert.doesNotMatch(nodeId, /^node-[0-9A-F]{16}$/,
+      "sanity: this fixture must actually be capable of catching an uppercase regression");
     assert.ok(!stdout.includes("trial device paired"), "pairing must not run under --no-pair");
-    assert.ok(!stdout.includes("tok-nopair"), "token must never be printed");
+    assert.ok(!stdout.includes(expectedToken), "token must never be printed");
     assert.deepEqual(
       paths.filter((p) => p.includes("/v1/pairing/")),
       [],
@@ -182,7 +217,6 @@ test("relayd enroll fails cleanly without env", async () => {
 // as a file written into the running sandbox through envd, and this is the
 // path the trial bootstrap actually takes.
 test("relayd enroll reads its inputs from RELAYD_ENROLL_CONFIG", async () => {
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-cli-cfg-"));
   const calls = [];
   const cloud = await new Promise((resolve) => {
     const server = createServer((req, res) => {
@@ -196,25 +230,39 @@ test("relayd enroll reads its inputs from RELAYD_ENROLL_CONFIG", async () => {
     });
     server.listen(0, "127.0.0.1", () => resolve({ server, url: `http://127.0.0.1:${server.address().port}` }));
   });
-  const configPath = path.join(dataDir, "enroll.json");
-  fs.writeFileSync(
-    configPath,
-    JSON.stringify({ cloudUrl: cloud.url, token: "tok-from-file" }),
-    { mode: 0o600 },
-  );
   try {
-    const { stdout } = await execFileAsync(process.execPath, [relaydBin, "enroll", "--no-pair"], {
-      env: {
-        ...process.env,
-        CODEX_DATA_DIR: dataDir,
-        RELAYD_ENROLL_CONFIG: configPath,
-        // Deliberately absent from the environment: the file is the source.
-        RELAYD_ENROLL_URL: "",
-        RELAYD_ENROLL_TOKEN: "",
-      },
-    });
-    assert.match(stdout, /enrolled node-[0-9a-f]{16}/);
-    assert.equal(calls[0].token, "tok-from-file");
+    // Same lowercase-hex vacuity as the tests above: retry with a fresh
+    // identity dir (and its own config file) until the nodeId draw contains
+    // a letter.
+    let nodeId = null;
+    let stdout = null;
+    for (let attempt = 0; attempt < 8 && !nodeId; attempt++) {
+      const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-cli-cfg-"));
+      const configPath = path.join(dataDir, "enroll.json");
+      fs.writeFileSync(
+        configPath,
+        JSON.stringify({ cloudUrl: cloud.url, token: "tok-from-file" }),
+        { mode: 0o600 },
+      );
+      const result = await execFileAsync(process.execPath, [relaydBin, "enroll", "--no-pair"], {
+        env: {
+          ...process.env,
+          CODEX_DATA_DIR: dataDir,
+          RELAYD_ENROLL_CONFIG: configPath,
+          // Deliberately absent from the environment: the file is the source.
+          RELAYD_ENROLL_URL: "",
+          RELAYD_ENROLL_TOKEN: "",
+        },
+      });
+      const match = /enrolled (node-[0-9a-f]{16})/.exec(result.stdout);
+      assert.ok(match, `stdout did not match the expected shape: ${result.stdout}`);
+      if (/[a-f]/.test(match[1])) { nodeId = match[1]; stdout = result.stdout; }
+    }
+    assert.ok(nodeId,
+      "could not mint a nodeId containing a hex letter after 8 attempts — the test premise is broken, not the code under test");
+    assert.doesNotMatch(nodeId, /^node-[0-9A-F]{16}$/,
+      "sanity: this fixture must actually be capable of catching an uppercase regression");
+    assert.equal(calls.at(-1).token, "tok-from-file");
     assert.ok(!stdout.includes("tok-from-file"), "token must never be printed");
   } finally {
     cloud.server.close();

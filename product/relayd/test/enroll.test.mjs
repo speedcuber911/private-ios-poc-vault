@@ -37,6 +37,25 @@ test("enrollWithCloud initializes identity and registers the pubkey", async () =
     assert.match(out.nodeId, /^node-[0-9a-f]{16}$/);
     assert.equal(out.sni, `${out.nodeId}.tun.test`);
 
+    // nodeId is lowercase hex (`node-${randomBytes(8).toString("hex")}`); the
+    // regex above only pins lowercase when the draw contains a letter a-f —
+    // an all-digit 16-char draw (~0.0546% of draws) can't distinguish a case
+    // regression, since digits are case-invariant. Retry with fresh
+    // identities against the same fake cloud until a letter appears, and
+    // assert the premise so a stuck loop fails loudly instead of silently
+    // passing.
+    let letterNodeId = null;
+    for (let attempt = 0; attempt < 32; attempt++) {
+      const probeDir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-enroll-nodeid-probe-"));
+      const probe = await enrollWithCloud({ cloudUrl: cloud.url, token: `tok-probe-${attempt}`, baseDir: probeDir });
+      if (/[a-f]/.test(probe.nodeId)) { letterNodeId = probe.nodeId; break; }
+    }
+    assert.ok(letterNodeId,
+      "could not mint a nodeId containing a hex letter after 32 attempts — the test premise is broken, not the code under test");
+    assert.match(letterNodeId, /^node-[0-9a-f]{16}$/);
+    assert.doesNotMatch(letterNodeId, /^node-[0-9A-F]{16}$/,
+      "sanity: this fixture must actually be capable of catching an uppercase regression");
+
     const call = cloud.calls[0];
     assert.equal(call.method, "POST");
     assert.equal(call.url, "/v1/trial-nodes/enroll");
