@@ -185,6 +185,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
         db.prepare("DELETE FROM magic_links WHERE email = ?").run(account.email);
       }
       db.prepare("DELETE FROM device_codes WHERE account_id = ?").run(accountId);
+      db.prepare("DELETE FROM repos WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM accounts WHERE id = ?").run(accountId);
       db.exec("COMMIT");
       return true;
@@ -543,6 +544,27 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     return Number(result.changes) > 0;
   }
 
+  // ── repos ───────────────────────────────────────────────────────────────
+  function upsertRepo(accountId, fullName) {
+    const existing = getRepo(accountId, fullName);
+    if (existing) return existing;
+    try {
+      db.prepare("INSERT INTO repos (id, account_id, full_name, created_at) VALUES (?, ?, ?, ?)")
+        .run(randomUUID(), accountId, fullName, now());
+    } catch (err) {
+      if (!isUniqueViolation(err)) throw err;
+    }
+    return getRepo(accountId, fullName);
+  }
+
+  function getRepo(accountId, fullName) {
+    return mapRepo(db.prepare("SELECT * FROM repos WHERE account_id = ? AND full_name = ?").get(accountId, fullName));
+  }
+
+  function listRepos(accountId) {
+    return db.prepare("SELECT * FROM repos WHERE account_id = ? ORDER BY full_name").all(accountId).map(mapRepo);
+  }
+
   // ── waitlist ────────────────────────────────────────────────────────────
   function addToWaitlist(email) {
     const normalized = normalizeEmail(email);
@@ -891,6 +913,9 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     recordSandboxOrphan,
     listSandboxOrphans,
     clearSandboxOrphan,
+    upsertRepo,
+    getRepo,
+    listRepos,
     addToWaitlist,
     insertRefreshToken,
     findRefreshToken,
@@ -965,6 +990,11 @@ function mapNode(row) {
     lastSeen: row.last_seen == null ? null : Number(row.last_seen),
     createdAt: Number(row.created_at),
   };
+}
+
+function mapRepo(row) {
+  if (!row) return null;
+  return { id: row.id, fullName: row.full_name, createdAt: row.created_at };
 }
 
 function mapDeviceCode(row) {
