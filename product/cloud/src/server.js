@@ -158,6 +158,27 @@ export function createApp({
   // (nodeId, ts, signature) triples across app instances.
   const handoffReplayGuard = createReplayGuard();
 
+  // Per-account sliding window for POST /v1/auth/device/inspect. Mirrors the
+  // spirit of the per-IP live-code ceiling on /device/start, but inspect is
+  // session-authed so the bucket key is accountId (an unauthenticated caller
+  // never reaches this counter). 30/min is enough for a human tapping retry
+  // and far below what an enumeration sweep would need.
+  const DEVICE_INSPECT_RATE_LIMIT = 30;
+  const DEVICE_INSPECT_RATE_WINDOW_MS = 60_000;
+  const deviceInspectHits = new Map(); // accountId -> number[] of timestamps
+
+  function allowDeviceInspect(accountId, nowMs) {
+    let hits = deviceInspectHits.get(accountId) || [];
+    hits = hits.filter((ts) => nowMs - ts < DEVICE_INSPECT_RATE_WINDOW_MS);
+    if (hits.length >= DEVICE_INSPECT_RATE_LIMIT) {
+      deviceInspectHits.set(accountId, hits);
+      return false;
+    }
+    hits.push(nowMs);
+    deviceInspectHits.set(accountId, hits);
+    return true;
+  }
+
   function wakeHandoffWaiters(nodeId) {
     const waiters = handoffWaiters.get(nodeId);
     if (!waiters) return;
@@ -349,6 +370,9 @@ export function createApp({
       if (clientIp && registry.countLiveDeviceCodesForIp(clientIp, now()) >= config.deviceCodeMaxLivePerIp) {
         return sendJson(res, 429, { error: "slow_down" });
       }
+      const body = await readJson(req, config.jsonBodyMaxBytes);
+      const machineName = sanitizeMachineName(body?.machineName);
+      const platform = normalizeDevicePlatform(body?.platform);
       const deviceCode = randomBytes(32).toString("base64url");
       // A user_code collision is a UNIQUE constraint violation that would
       // otherwise reach the top-level handler as 500 {"error":"internal"}.
@@ -361,16 +385,23 @@ export function createApp({
             userCode: mintUserCode(),
             expiresAt: now() + config.deviceCodeTtlSec * 1000,
             clientIp,
+            machineName,
+            platform,
           });
           break;
         } catch (err) {
           if (attempt >= 5) throw err;
         }
       }
+      // verificationUriComplete puts the user code in the URL hash fragment
+      // so a future real page (or system-camera / universal-link scan) never
+      // ships the code to server access logs. The redeeming secret
+      // (deviceCode) is NEVER included here — only the approval handle.
       return sendJson(res, 201, {
         deviceCode,
         userCode: record.userCode,
         verificationUri: config.deviceLoginUrl,
+        verificationUriComplete: `${config.deviceLoginUrl}#code=${record.userCode}`,
         interval: config.deviceCodePollIntervalSec,
         expiresIn: config.deviceCodeTtlSec,
       });
@@ -721,6 +752,35 @@ export function createApp({
     // ── session-authed registry endpoints ───────────────────────────────
     const account = await auth.authenticate(req);
     if (!account) return sendJson(res, 401, { error: "unauthorized" });
+
+    if (method === "POST" && path === "/v1/auth/device/inspect") {
+      // Read-only twin of /device/approve: returns the CLI-reported machine
+      // name so the phone can show a confirm sheet before approving. Same
+      // anti-enumeration posture as approve — unknown, expired, and already-
+      // approved all return the identical 404. Always performs the user-code
+      // lookup (no short-circuit that would skip the hash/index read on a
+      // malformed code) so timing does not separate failure classes.
+      if (!allowDeviceInspect(account.id, now())) {
+        return sendJson(res, 429, { error: "rate_limited" });
+      }
+      const body = await readJson(req, config.jsonBodyMaxBytes);
+      const userCode = normalizeUserCode(body?.userCode);
+      const record = registry.getDeviceCodeByUserCode(userCode);
+      if (
+        !record
+        || record.consumedAt !== null
+        || record.expiresAt <= now()
+        || record.accountId !== null
+      ) {
+        return sendJson(res, 404, { error: "unknown_user_code" });
+      }
+      return sendJson(res, 200, {
+        machineName: record.machineName,
+        platform: record.platform,
+        createdAt: record.createdAt,
+        expiresAt: record.expiresAt,
+      });
+    }
 
     if (method === "POST" && path === "/v1/auth/device/approve") {
       const body = await readJson(req, config.jsonBodyMaxBytes);
@@ -1337,4 +1397,25 @@ function normalizeUserCode(value) {
   const cleaned = String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
   if (cleaned.length !== 8) return null;
   return `${cleaned.slice(0, 4)}-${cleaned.slice(4)}`;
+}
+
+// CLI-reported hostname shown on the phone confirm sheet. Strip control
+// characters (and anything else outside printable-ish Unicode whitespace +
+// text), trim, and cap length so a hostile start cannot pad the confirm UI.
+function sanitizeMachineName(value) {
+  if (typeof value !== "string") return null;
+  const cleaned = value.replace(/[\u0000-\u001F\u007F]/g, "").trim().slice(0, 64);
+  return cleaned.length > 0 ? cleaned : null;
+}
+
+// Closed set matching what the CLI sends after mapping process.platform.
+// Omitted / empty stays null (shown as unknown on the phone); anything else
+// unrecognized — including raw "darwin" — collapses to "other". The CLI is
+// responsible for the darwin→macos mapping before the request leaves the box.
+function normalizeDevicePlatform(value) {
+  if (typeof value !== "string") return null;
+  const raw = value.trim().toLowerCase();
+  if (!raw) return null;
+  if (raw === "macos" || raw === "linux" || raw === "windows" || raw === "other") return raw;
+  return "other";
 }
