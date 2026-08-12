@@ -237,6 +237,13 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         // hang. `timeoutIntervalForResource` still bounds long file listings.
         configuration.timeoutIntervalForRequest = 15
         configuration.timeoutIntervalForResource = 60
+        // Needed so `registerClientCredential` has somewhere to put the
+        // identity that this session will actually consult. An ephemeral
+        // configuration gets its own private store, which nothing outside the
+        // session can reach, and `session.configuration` hands back a copy —
+        // so a credential registered after the session exists would go
+        // nowhere.
+        configuration.urlCredentialStorage = URLCredentialStorage.shared
         return URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
     }()
 
@@ -247,6 +254,49 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         CodexDiagnostics.log("codex_client_init", fields: [
             "baseURL": baseURL.absoluteString,
             "hasClientIdentity": String(identityStore.hasStoredIdentity)
+        ])
+        registerClientCredential(for: baseURL)
+    }
+
+    /// Pre-registers the client identity for a machine, instead of waiting to
+    /// be asked for it.
+    ///
+    /// A trial machine requires a client certificate, and against one iOS never
+    /// raises `NSURLAuthenticationMethodClientCertificate` at all: the only
+    /// challenge delivered is the server-trust one, and once that is answered
+    /// with `.useCredential` — which pinning a private CA requires — the
+    /// handshake ends with -1200, the machine's signature for a client that
+    /// sent no certificate. The same build against a publicly-trusted host,
+    /// where trust is left to `.performDefaultHandling`, does get the
+    /// client-certificate challenge. Waiting to be asked therefore cannot work
+    /// wherever the CA is pinned.
+    ///
+    /// A default credential on the protection space is the supported way to
+    /// supply one unprompted. The challenge handler stays exactly as it is:
+    /// it remains correct for hosts that do ask, and this is scoped to one
+    /// host and port, so no other server can be handed this identity.
+    private func registerClientCredential(for baseURL: URL) {
+        guard let host = baseURL.host, let credential = identityStore.credential() else {
+            CodexDiagnostics.log("codex_client_credential_registration", fields: [
+                "host": baseURL.host ?? "",
+                "registered": "false"
+            ])
+            return
+        }
+        let port = baseURL.port ?? (baseURL.scheme == "http" ? 80 : 443)
+        let space = URLProtectionSpace(
+            host: host,
+            port: port,
+            protocol: baseURL.scheme,
+            realm: nil,
+            authenticationMethod: NSURLAuthenticationMethodClientCertificate
+        )
+        URLCredentialStorage.shared.setDefaultCredential(credential, for: space)
+        CodexDiagnostics.log("codex_client_credential_registration", fields: [
+            "host": host,
+            "port": String(port),
+            "registered": "true",
+            "identity": identityStore.storedIdentityDescription
         ])
     }
 
@@ -264,6 +314,7 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         CodexDiagnostics.log("codex_client_retarget", fields: [
             "baseURL": baseURL.absoluteString
         ])
+        registerClientCredential(for: baseURL)
     }
 
     var hasClientIdentity: Bool {
