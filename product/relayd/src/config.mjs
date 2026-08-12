@@ -331,6 +331,17 @@ if (pairingEnabled && pairingPort !== 0 && pairingPort === port && pairingHost =
 // pair` and a second daemon started against the same CODEX_DATA_DIR all touch
 // these paths concurrently.
 //
+// withFileLock/writeFileAtomic are exported so cloudclient.mjs can reuse rule
+// 2 for its own per-call cloud-event-seq counter (task-11 review follow-up):
+// this lock FAILS OPEN (degrades to unsynchronized rather than blocking
+// indefinitely) and self-heals a lock left behind by a crashed holder (the
+// staleMs check below) — the right failure mode for a lock taken on every
+// outbound push in a long-running daemon, where a stuck lock would silently
+// blackhole every future event exactly like the bug this lock exists to
+// avoid. identity.mjs's withEncKeyLock is deliberately the opposite (fails
+// closed, no staleness recovery) because it guards one-time, irreversible
+// keypair generation instead — do not swap the two.
+//
 // 1. UNIQUE TEMP NAME. A fixed `<file>.tmp` is shared mutable state between
 //    processes: the interleaving is write(A) -> write(B) -> rename(A) ->
 //    rename(B), where A's rename moves the temp away and B's rename fails with
@@ -786,6 +797,7 @@ export {
   recordPairingListener,
   readPairingListener,
   writeFileAtomic,
+  withFileLock,
   pairingDir,
   dataDir,
   jobsDir,

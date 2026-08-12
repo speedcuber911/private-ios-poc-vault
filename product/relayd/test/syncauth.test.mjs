@@ -7,6 +7,29 @@ import path from "node:path";
 process.env.CODEX_DATA_DIR ||= fs.mkdtempSync(path.join(os.tmpdir(), "relayd-syncauth-data-"));
 
 const { installCredentialBundle, saveMacSessions, readMacSessions } = await import("../src/syncauth.mjs");
+const { auditPath } = await import("../src/config.mjs");
+
+// Reads audit.jsonl entries appended since `sinceLength` (the file's own
+// byte length at some earlier point, from readAuditLength()) and parses
+// each as JSON — the same before/after-length pattern test/handoff.test.mjs
+// and test/pairing.test.mjs already use to isolate one action's audit lines
+// from everything else appended to the same shared log by other tests.
+function readAuditLength() {
+  try {
+    return fs.readFileSync(auditPath, "utf8").length;
+  } catch {
+    return 0;
+  }
+}
+function readAuditSince(sinceLength) {
+  let text = "";
+  try {
+    text = fs.readFileSync(auditPath, "utf8");
+  } catch {
+    return [];
+  }
+  return text.slice(sinceLength).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+}
 
 function homes() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-syncauth-"));
@@ -150,11 +173,24 @@ test("a pre-planted hard link at .git-credentials is never written through", () 
   fs.linkSync(outsideCanary, path.join(runHome, ".git-credentials"));
   assert.equal(fs.statSync(path.join(runHome, ".git-credentials")).ino, beforeIno, "setup: same inode");
 
+  const auditSince = readAuditLength();
   const attackToken = "ghp_hardlink_attack_token_MARKER";
   const result = installCredentialBundle(
     { v: 1, kind: "sync-auth", github: { token: attackToken } },
     { runHome, codexHome },
   );
+
+  // task-15 review follow-up (Recommendation 2): replacing a poisoned leaf
+  // is the right call for the write itself, but it must not be entirely
+  // silent — an operator watching the audit log needs to know a hard link
+  // sat at a credential destination and was replaced, without the log ever
+  // carrying the credential itself.
+  const auditEntries = readAuditSince(auditSince);
+  const replaced = auditEntries.filter((entry) => entry.event === "credential_destination_replaced");
+  assert.equal(replaced.length, 1, `expected exactly one audit line, got ${JSON.stringify(auditEntries)}`);
+  assert.equal(replaced[0].priorKind, "hardlink");
+  assert.equal(replaced[0].path, path.join(fs.realpathSync(runHome), ".git-credentials"));
+  assert.ok(!JSON.stringify(replaced[0]).includes(attackToken), "audit line must never carry credential content");
 
   // The outside file must be byte-for-byte untouched: no token, no truncation.
   assert.equal(fs.readFileSync(outsideCanary, "utf8"), marker);
@@ -250,11 +286,22 @@ test("a pre-planted symlink at .git-credentials is never written through", () =>
   fs.writeFileSync(outsideTarget, marker);
   fs.symlinkSync(outsideTarget, path.join(runHome, ".git-credentials"));
 
+  const auditSince = readAuditLength();
   const attackToken = "ghp_symlink_attack_token_MARKER";
   const result = installCredentialBundle(
     { v: 1, kind: "sync-auth", github: { token: attackToken } },
     { runHome, codexHome },
   );
+
+  // task-15 review follow-up (Recommendation 2): same audit signal as the
+  // hard-link case, for the symlink case the review specifically asked
+  // about ("a deliberately-placed operator symlink ... would now vanish
+  // with zero trace").
+  const auditEntries = readAuditSince(auditSince);
+  const replaced = auditEntries.filter((entry) => entry.event === "credential_destination_replaced");
+  assert.equal(replaced.length, 1, `expected exactly one audit line, got ${JSON.stringify(auditEntries)}`);
+  assert.equal(replaced[0].priorKind, "symlink");
+  assert.equal(replaced[0].path, path.join(fs.realpathSync(runHome), ".git-credentials"));
 
   // The symlink's target must be untouched, and the attack token must land
   // in EXACTLY the legitimate destination, nowhere else in the tree.
@@ -271,6 +318,27 @@ test("a pre-planted symlink at .git-credentials is never written through", () =>
     `https://x-access-token:${attackToken}@github.com`,
   );
   assert.deepEqual(result.installed, ["github"]);
+});
+
+// --- Pin: the routine case (no prior entry, or re-syncing over a plain ---
+// --- file this module already wrote) stays silent — only a symlink or ---
+// --- hard link at the destination is audit-worthy, per the review's own ---
+// --- framing ("not acceptable that it is *entirely* silent", not "must ---
+// --- log every write"). A credential sync can happen often; logging the ---
+// --- routine case every time would bury the signal that actually matters. ---
+test("re-syncing credentials over a plain file (no prior symlink/hard link) does not audit-log", () => {
+  const { runHome, codexHome } = homes();
+  installCredentialBundle({ v: 1, kind: "sync-auth", github: { token: "ghp_first" } }, { runHome, codexHome });
+
+  const auditSince = readAuditLength();
+  installCredentialBundle({ v: 1, kind: "sync-auth", github: { token: "ghp_second" } }, { runHome, codexHome });
+  const auditEntries = readAuditSince(auditSince).filter((entry) => entry.event === "credential_destination_replaced");
+  assert.deepEqual(auditEntries, []);
+
+  assert.equal(
+    fs.readFileSync(path.join(runHome, ".git-credentials"), "utf8").trim(),
+    "https://x-access-token:ghp_second@github.com",
+  );
 });
 
 // --- Pin: a symlinked ancestor directory must be refused, not followed. ---

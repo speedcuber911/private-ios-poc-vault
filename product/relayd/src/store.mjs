@@ -246,9 +246,39 @@ function createJsonStore({ jobsDir: jobsRoot, chatsDir: chatsRoot, dataDir: data
   // instant it is destructured off the object. Every other list method in
   // this backend (listDevices, listPairingSessions, ...) already reaches for
   // a closure helper instead of `this` for the same reason.
+  //
+  // assertSafeRecordId stays OUTSIDE the try here deliberately: getHandoff is
+  // called with a CALLER-supplied id, and the sqlite backend's getHandoff
+  // throws InvalidRecordIdError for a bad one too (that parity is what the
+  // path-traversal tests pin) — swallowing it here would make the two
+  // backends disagree.
   function getHandoffRecord(id) {
     assertSafeRecordId(id);
     try {
+      return JSON.parse(fs.readFileSync(path.join(handoffsDir, `${id}.json`), "utf8"));
+    } catch {
+      return null;
+    }
+  }
+
+  // listHandoffs (below) iterates on-disk FILENAMES, not caller-supplied ids.
+  // saveHandoff always validates the id before a file is ever created, so no
+  // *file this module wrote* can have an unsafe name — but a foreign or
+  // hand-planted file (e.g. `..escape.json`, `.hidden.json`) can still be
+  // sitting in handoffsDir. Previously assertSafeRecordId lived only in
+  // getHandoffRecord (called with the id outside any try/catch of its own
+  // caller), so listHandoffs' `.map()` would throw INSIDE the map on the
+  // first such name — uncaught, aborting the caller's entire listing before
+  // its own damaged-content guard (the `.filter(Boolean)` below, or
+  // migrateJsonToSqlite's per-record try/catch) ever got a chance to run.
+  // One bad filename took every healthy handoff down with it — the same
+  // failure class the damaged-content fix was supposed to have already
+  // closed. This variant returns null instead, exactly like a corrupt-
+  // content file already does, so listHandoffs only ever skips the one bad
+  // entry.
+  function getHandoffRecordForListing(id) {
+    try {
+      assertSafeRecordId(id);
       return JSON.parse(fs.readFileSync(path.join(handoffsDir, `${id}.json`), "utf8"));
     } catch {
       return null;
@@ -541,7 +571,7 @@ function createJsonStore({ jobsDir: jobsRoot, chatsDir: chatsRoot, dataDir: data
         return [];
       }
       return names
-        .map((name) => getHandoffRecord(name.slice(0, -".json".length)))
+        .map((name) => getHandoffRecordForListing(name.slice(0, -".json".length)))
         .filter(Boolean)
         .sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt)));
     },

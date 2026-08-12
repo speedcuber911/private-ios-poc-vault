@@ -9,7 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { identityPaths, readNodeId } from "./identity.mjs";
-import { writeFileAtomic } from "./config.mjs";
+import { writeFileAtomic, withFileLock } from "./config.mjs";
 
 const NODE_REQUEST_LABEL = "relay-node-req-v1";
 
@@ -65,27 +65,44 @@ function createCloudClient({ cloudUrl, baseDir = undefined, fetchImpl = fetch, n
   // protects against a persisted MAX_SAFE_INTEGER (current + 1 rolling out
   // of the safe integer range, which the cloud would 400 on) — falling back
   // to the clock is safe there too.
+  //
+  // IMPORTANT (task-11 review follow-up): the read-modify-write below is
+  // now serialized with config.mjs's own withFileLock, the same primitive
+  // store.mjs and allowCertSubject already use for this exact class of
+  // problem — closing the cross-process tie window this function's own
+  // dedicated race test measured (two concurrent callers could both read
+  // the same `current`, so both compute and persist the same `next`,
+  // silently dropping one event as a cloud-side duplicate). withFileLock
+  // (not identity.mjs's withEncKeyLock) is the deliberate choice: it fails
+  // OPEN — degrades to unsynchronized rather than blocking indefinitely —
+  // and self-heals a lock left behind by a crashed holder. This runs on
+  // every postEvent for the daemon's entire lifetime, so a fail-closed lock
+  // with no staleness recovery would let one crash-while-holding wedge
+  // every future push behind a stuck lock file forever — reintroducing a
+  // variant of the exact blackhole this fix exists to close.
   function nextSeq() {
-    let raw = "";
-    try {
-      raw = fs.readFileSync(seqPath, "utf8").trim();
-    } catch {
-      raw = "";
-    }
-    const parsed = Number.parseInt(raw, 10);
-    const current = Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 0;
-    let next = Math.max(current + 1, now());
-    if (!Number.isSafeInteger(next)) next = now();
-    // CRITICAL fix, part 1: write atomically (unique temp name + rename,
-    // reusing config.mjs's own writeFileAtomic rather than a second
-    // implementation). fs.writeFileSync opens O_TRUNC, which is neither
-    // crash-atomic nor safe against a concurrent reader — a reader could
-    // observe a half-written value (a torn read) mid-write, which the old
-    // code above would then treat as a fresh unreadable/garbage state and
-    // reset from. rename() is atomic for readers: they see the whole old
-    // file or the whole new one, never a partial one.
-    writeFileAtomic(seqPath, String(next), { mode: 0o600 });
-    return next;
+    return withFileLock(seqPath, () => {
+      let raw = "";
+      try {
+        raw = fs.readFileSync(seqPath, "utf8").trim();
+      } catch {
+        raw = "";
+      }
+      const parsed = Number.parseInt(raw, 10);
+      const current = Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 0;
+      let next = Math.max(current + 1, now());
+      if (!Number.isSafeInteger(next)) next = now();
+      // CRITICAL fix, part 1: write atomically (unique temp name + rename,
+      // reusing config.mjs's own writeFileAtomic rather than a second
+      // implementation). fs.writeFileSync opens O_TRUNC, which is neither
+      // crash-atomic nor safe against a concurrent reader — a reader could
+      // observe a half-written value (a torn read) mid-write, which the old
+      // code above would then treat as a fresh unreadable/garbage state and
+      // reset from. rename() is atomic for readers: they see the whole old
+      // file or the whole new one, never a partial one.
+      writeFileAtomic(seqPath, String(next), { mode: 0o600 });
+      return next;
+    });
   }
 
   function signedHeaders(method, pathWithQuery) {
@@ -121,7 +138,15 @@ function createCloudClient({ cloudUrl, baseDir = undefined, fetchImpl = fetch, n
     // {status,body} level. `accepted` is the one field callers can actually
     // check to tell "the cloud pushed this" from "the cloud silently
     // dropped this", without this ever throwing (push stays best-effort).
-    return { status: res.status, body: parsedBody, accepted: res.status === 202 && !parsedBody?.duplicate };
+    //
+    // MINOR (task-11 review follow-up): a 202 whose body fails to parse as
+    // JSON left parsedBody null, and `!null?.duplicate` is `true` — a
+    // malformed-but-202 response read as accepted, indistinguishable from a
+    // genuine accept. Requiring parsedBody to actually be a (non-null)
+    // object before trusting its `duplicate` field makes an unparseable 202
+    // body read as not-accepted (the honest "unknown" answer) instead.
+    const bodyIsObject = parsedBody !== null && typeof parsedBody === "object";
+    return { status: res.status, body: parsedBody, accepted: res.status === 202 && bodyIsObject && !parsedBody.duplicate };
   }
 
   // MINOR 3: the seq is consumed once, at body-build time, in postEvent
