@@ -13,6 +13,8 @@ import { serveExportTar } from "./fsapi.mjs";
 import { continueHandoff } from "./handoff.mjs";
 import { store } from "./store.mjs";
 import { toJobResponse, responseShape } from "./jobs.mjs";
+import { readMacSessions } from "./syncauth.mjs";
+import { dataDir } from "./config.mjs";
 
 // Returns true when the request was handled.
 async function handleAdditionRoutes(req, res, url, auth) {
@@ -43,6 +45,15 @@ async function handleAdditionRoutes(req, res, url, auth) {
     const result = revokeDevice(deviceId, { force });
     emitEvent("device.revoked", publicDevice(result.device));
     sendJson(res, 200, { id: result.id, revoked: true, revokedAt: result.revokedAt });
+    return true;
+  }
+
+  // "On your Mac" session index the phone renders (Task 15). Index metadata
+  // only — harness, title, repo, last-active. Never a transcript, never a
+  // credential: readMacSessions only ever returns what saveMacSessions wrote,
+  // and that allow-lists the fields it copies in.
+  if (req.method === "GET" && url.pathname === "/v1/mac-sessions") {
+    sendJson(res, 200, { index: readMacSessions({ dataDir }) });
     return true;
   }
 
