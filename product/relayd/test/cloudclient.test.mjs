@@ -10,7 +10,7 @@ import { spawn } from "node:child_process";
 process.env.CODEX_DATA_DIR ||= fs.mkdtempSync(path.join(os.tmpdir(), "relayd-cloudclient-data-"));
 
 const { initIdentity, identityPaths } = await import("../src/identity.mjs");
-const { createCloudClient } = await import("../src/cloudclient.mjs");
+const { createCloudClient, mapFailureReason } = await import("../src/cloudclient.mjs");
 
 const SIGNING_LABEL = "relay-node-req-v1";
 
@@ -858,4 +858,148 @@ test("a client with no notice handler ignores notices instead of crashing the po
     const client = createCloudClient({ cloudUrl: cloud.url, baseDir: node.baseDir });
     assert.deepEqual(await withHardTimeout(client.pollHandoffs(5), 2000, "poll with no notice handler"), []);
   } finally { await cloud.close(); }
+});
+
+// ---------------------------------------------------------------------------
+// task-f7 (part A): the cloud (commit 59ae640) added POST
+// /v1/node/handoffs/:id/fail — the terminal-failure state for a handoff —
+// but nothing in relayd ever called it, so a handoff that failed during
+// import stayed `delivered` on the cloud forever. reportHandoffFailure and
+// mapFailureReason close the transport half of that gap. The caller
+// (announceFailed in handoff.mjs) is a separate, later task; these tests
+// exercise cloudclient.mjs's contribution in isolation.
+
+test("mapFailureReason coarsens relayd's codes into the cloud's closed five, defaulting anything unknown to internal_error", () => {
+  // One representative code from each of the five rows in the mapping table.
+  assert.equal(mapFailureReason("clone_failed"), "clone_failed");
+  assert.equal(mapFailureReason("seal_bad_magic"), "decrypt_failed");
+  assert.equal(mapFailureReason("manifest_too_large"), "manifest_invalid");
+  assert.equal(mapFailureReason("checkout_escaped_jail"), "workspace_failed");
+  assert.equal(mapFailureReason("internal_error"), "internal_error");
+
+  // The default matters more than the table: an unmapped code, "", null,
+  // undefined, and a non-string must all still land on internal_error rather
+  // than being sent raw (the cloud 400s it) or skipped (the handoff never
+  // reaches a terminal state).
+  assert.equal(mapFailureReason("some_future_code_this_table_has_never_seen"), "internal_error");
+  assert.equal(mapFailureReason(""), "internal_error");
+  assert.equal(mapFailureReason(null), "internal_error");
+  assert.equal(mapFailureReason(undefined), "internal_error");
+  assert.equal(mapFailureReason(42), "internal_error");
+});
+
+test("reportHandoffFailure posts exactly one signed request with the mapped reason", async () => {
+  const node = freshNode();
+  const cloud = await startFakeCloud((res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ handoff: { id: "deadbeefcafef00d", state: "failed" } }));
+  });
+  try {
+    const client = createCloudClient({ cloudUrl: cloud.url, baseDir: node.baseDir });
+    const ok = await client.reportHandoffFailure("deadbeefcafef00d", "seal_bad_magic");
+
+    assert.equal(ok, true);
+    assert.equal(cloud.calls.length, 1, "exactly one POST for a successful report");
+    const call = cloud.calls[0];
+    assert.equal(call.method, "POST");
+    assert.equal(call.url, "/v1/node/handoffs/deadbeefcafef00d/fail");
+    assert.equal(call.headers["x-relay-node"], node.nodeId);
+    assert.ok(call.headers["x-relay-ts"], "x-relay-ts header must be present");
+    assert.ok(call.headers["x-relay-signature"], "x-relay-signature header must be present");
+    assert.equal(call.headers["content-type"], "application/json");
+    assert.deepEqual(JSON.parse(call.raw.toString("utf8")), { reason: "decrypt_failed" },
+      "the body must carry the MAPPED cloud code, never the raw relayd code");
+  } finally { await cloud.close(); }
+});
+
+// Golden-vector style, mirroring the cloud-side test 59ae640 added: the
+// expected signature is built from a hand-written literal here, never by
+// calling the module's own signing helper (nodeRequestSigningInput). A test
+// that derives its expectation from the code under test passes through any
+// drift in the signing contract — the exact hole the cloud's golden-vector
+// test was added to close. Mirrored here for the same reason.
+test("reportHandoffFailure signs the exact canonical string the cloud verifies", async () => {
+  const node = freshNode();
+  const cloud = await startFakeCloud((res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ handoff: { id: "deadbeefcafef00d", state: "failed" } }));
+  });
+  try {
+    const client = createCloudClient({ cloudUrl: cloud.url, baseDir: node.baseDir });
+    await client.reportHandoffFailure("deadbeefcafef00d", "clone_failed");
+
+    const call = cloud.calls[0];
+    const literal =
+      "relay-node-req-v1\n" +
+      "POST\n" +
+      "/v1/node/handoffs/deadbeefcafef00d/fail\n" +
+      `${node.nodeId}\n` +
+      `${call.headers["x-relay-ts"]}`;
+    const input = Buffer.from(literal, "utf8");
+    const signature = Buffer.from(call.headers["x-relay-signature"], "base64url");
+    assert.ok(crypto.verify(null, input, node.publicKey, signature),
+      "the signature must verify against the hand-written canonical string");
+  } finally { await cloud.close(); }
+});
+
+test("reportHandoffFailure does not retry a 400 or a 404 — both are permanent for this (id, reason)", async () => {
+  const node = freshNode();
+  for (const status of [400, 404]) {
+    let calls = 0;
+    const fetchImpl = async () => {
+      calls += 1;
+      return { status, json: async () => ({ error: status === 400 ? "invalid_reason" : "unknown_handoff" }) };
+    };
+    const client = createCloudClient({ cloudUrl: "http://127.0.0.1:1", baseDir: node.baseDir, fetchImpl });
+    const ok = await withHardTimeout(
+      client.reportHandoffFailure("deadbeefcafef00d", "clone_failed"), 2000, `reportHandoffFailure ${status}`);
+    assert.equal(ok, false, `a ${status} must resolve false`);
+    assert.equal(calls, 1, `a ${status} must not be retried — exactly one request`);
+  }
+});
+
+test("reportHandoffFailure retries a 500 and succeeds on a subsequent 200", async () => {
+  const node = freshNode();
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    if (calls === 1) return { status: 500, json: async () => ({ error: "internal" }) };
+    return { status: 200, json: async () => ({ handoff: { id: "deadbeefcafef00d", state: "failed" } }) };
+  };
+  const client = createCloudClient({ cloudUrl: "http://127.0.0.1:1", baseDir: node.baseDir, fetchImpl });
+  const ok = await withHardTimeout(
+    client.reportHandoffFailure("deadbeefcafef00d", "clone_failed"), 2000, "reportHandoffFailure 500-then-200");
+  assert.equal(ok, true);
+  assert.equal(calls, 2, "the first 500 must be retried exactly once before the 200 arrives");
+});
+
+// A hard iteration guard, not a test `timeout`: node:test's per-test timeout
+// does not kill a hung async loop underneath it (it marks the test cancelled
+// while the loop keeps spinning, orphaning the process) — withHardTimeout
+// (defined above) races a real bound instead. reportHandoffFailure's own
+// retry loop is internally bounded by HANDOFF_ACK_MAX_ATTEMPTS regardless;
+// this is defense in depth against a regression in that bound.
+test("reportHandoffFailure gives up after the bounded ceiling on a persistent 500, without throwing", async () => {
+  const node = freshNode();
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    return { status: 500, json: async () => ({ error: "internal" }) };
+  };
+  const client = createCloudClient({ cloudUrl: "http://127.0.0.1:1", baseDir: node.baseDir, fetchImpl });
+  const ok = await withHardTimeout(
+    client.reportHandoffFailure("deadbeefcafef00d", "clone_failed"), 2000, "reportHandoffFailure persistent 500");
+  assert.equal(ok, false);
+  assert.ok(calls >= 1 && calls <= 5, `expected a small bounded retry count, saw ${calls} attempts`);
+});
+
+test("reportHandoffFailure returns false (and does not throw) for a thrown transport error", async () => {
+  const node = freshNode();
+  let calls = 0;
+  const fetchImpl = async () => { calls += 1; throw new Error("simulated_transport_failure"); };
+  const client = createCloudClient({ cloudUrl: "http://127.0.0.1:1", baseDir: node.baseDir, fetchImpl });
+  const ok = await withHardTimeout(
+    client.reportHandoffFailure("deadbeefcafef00d", "clone_failed"), 2000, "reportHandoffFailure transport error");
+  assert.equal(ok, false);
+  assert.ok(calls >= 1 && calls <= 5, `expected a small bounded retry count, saw ${calls} attempts`);
 });
