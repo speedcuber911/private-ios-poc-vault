@@ -49,6 +49,26 @@ function assertSafeRecordId(id) {
   return id;
 }
 
+// Handoffs are the only record the sqlite backend enforces NOT NULL on
+// beyond the id (state/repo/branch/created_at/updated_at) — the json backend
+// used to validate nothing but the id, so a record json saved silently could
+// throw a raw, backend-specific TypeError the moment the same data hit
+// sqlite (RELAYD_STORE=sqlite is not the default, so this only surfaced in
+// that configuration). Calling this from both backends' saveHandoff gives
+// callers ONE acceptance contract: a record either saves on both backends or
+// throws this same typed error on both, regardless of which is configured.
+const HANDOFF_REQUIRED_STRING_FIELDS = ["state", "repo", "branch", "createdAt", "updatedAt"];
+
+function assertValidHandoff(handoff) {
+  assertSafeRecordId(handoff?.id);
+  for (const field of HANDOFF_REQUIRED_STRING_FIELDS) {
+    if (typeof handoff[field] !== "string" || handoff[field] === "") {
+      throw new Error(`handoff ${field} is invalid`);
+    }
+  }
+  return handoff;
+}
+
 // Same containment-checked removal as jobs.removePathInsideRoot (duplicated
 // here to avoid a jobs.mjs <-> store.mjs import cycle).
 function removeInsideRoot(target, rootDir) {
@@ -182,6 +202,36 @@ function createJsonStore({ jobsDir: jobsRoot, chatsDir: chatsRoot, dataDir: data
       // Best effort: a pre-existing dir with looser modes still works.
     }
     return pairingSessionsRoot;
+  }
+
+  // Same treatment as pairingSessionsRoot: handoff records carry
+  // primedPrompt and resumeSessionId, so the directory gets 0700 rather than
+  // the process umask default, and the check is repeated on every save in
+  // case a pre-existing directory was created with looser permissions.
+  function ensureHandoffsRoot() {
+    fs.mkdirSync(handoffsDir, { recursive: true, mode: 0o700 });
+    try {
+      fs.chmodSync(handoffsDir, 0o700);
+    } catch {
+      // Best effort: a pre-existing dir with looser modes still works.
+    }
+    return handoffsDir;
+  }
+
+  // A closure function, not an object method: listHandoffs below calls this
+  // directly rather than through `this.getHandoff`, because the store's
+  // methods are handed out individually (`store.close?.()`, `const {
+  // listHandoffs } = store`, etc.) and a `this`-dependent method breaks the
+  // instant it is destructured off the object. Every other list method in
+  // this backend (listDevices, listPairingSessions, ...) already reaches for
+  // a closure helper instead of `this` for the same reason.
+  function getHandoffRecord(id) {
+    assertSafeRecordId(id);
+    try {
+      return JSON.parse(fs.readFileSync(path.join(handoffsDir, `${id}.json`), "utf8"));
+    } catch {
+      return null;
+    }
   }
 
   function pairingSessionPath(id) {
@@ -453,18 +503,13 @@ function createJsonStore({ jobsDir: jobsRoot, chatsDir: chatsRoot, dataDir: data
     // ── handoffs (laptop -> cloud sandbox session handoff records) ──
 
     saveHandoff(handoff) {
-      assertSafeRecordId(handoff.id);
-      fs.mkdirSync(handoffsDir, { recursive: true });
+      assertValidHandoff(handoff);
+      ensureHandoffsRoot();
       writeJsonFileAtomic(path.join(handoffsDir, `${handoff.id}.json`), handoff, { mode: 0o600 });
     },
 
     getHandoff(id) {
-      assertSafeRecordId(id);
-      try {
-        return JSON.parse(fs.readFileSync(path.join(handoffsDir, `${id}.json`), "utf8"));
-      } catch {
-        return null;
-      }
+      return getHandoffRecord(id);
     },
 
     listHandoffs() {
@@ -475,7 +520,7 @@ function createJsonStore({ jobsDir: jobsRoot, chatsDir: chatsRoot, dataDir: data
         return [];
       }
       return names
-        .map((name) => this.getHandoff(name.slice(0, -".json".length)))
+        .map((name) => getHandoffRecord(name.slice(0, -".json".length)))
         .filter(Boolean)
         .sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt)));
     },
@@ -650,12 +695,17 @@ function createSqliteStore(db) {
     INSERT INTO pairing_sessions (id, code, token, node_id, node_name, created_at, expires_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `);
+  // created_at is refreshed on conflict for the same reason upsertJob and
+  // upsertChat above both refresh it: listHandoffs() ORDER BYs this column
+  // while the record it returns is the freshly-written JSON blob. Leaving
+  // the column frozen at the original insert would let the ordering drift
+  // out of sync with the blob's own createdAt the moment a save changed it.
   const saveHandoffStatement = db.prepare(
     `INSERT INTO handoffs (id, state, repo, branch, created_at, updated_at, record)
      VALUES (?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        state = excluded.state, repo = excluded.repo, branch = excluded.branch,
-       updated_at = excluded.updated_at, record = excluded.record`,
+       created_at = excluded.created_at, updated_at = excluded.updated_at, record = excluded.record`,
   );
 
   return {
@@ -851,7 +901,7 @@ function createSqliteStore(db) {
     // ── handoffs (laptop -> cloud sandbox session handoff records) ──
 
     saveHandoff(handoff) {
-      assertSafeRecordId(handoff.id);
+      assertValidHandoff(handoff);
       saveHandoffStatement.run(handoff.id, handoff.state, handoff.repo, handoff.branch,
         handoff.createdAt, handoff.updatedAt, JSON.stringify(handoff));
     },
@@ -937,8 +987,16 @@ async function migrateJsonToSqlite({ dataDir: dataRoot, dbPath }) {
     counts.revocations += 1;
   }
   for (const handoff of source.listHandoffs()) {
-    target.saveHandoff(handoff);
-    counts.handoffs += 1;
+    if (!handoff || typeof handoff.id !== "string") continue;
+    try {
+      target.saveHandoff(handoff);
+      counts.handoffs += 1;
+    } catch {
+      // Skip malformed record ids or a record that fails the store's
+      // acceptance contract (e.g. a missing branch/state); everything valid
+      // migrates, and one damaged handoff must not take its healthy
+      // neighbours down with it.
+    }
   }
   return { counts, store: target };
 }
