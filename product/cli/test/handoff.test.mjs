@@ -238,6 +238,39 @@ test("handoff refuses without a login or a pinned node key", async () => {
     fetchImpl: s.fetchImpl, log: () => {} }), /no_machine_pinned/);
 });
 
+// Minor m6 (review's G3): no test previously drove `cmdHandoff` outside a
+// github.com-origin repo — removing the requireGitHubRepo call from
+// cmdHandoff entirely still passed the whole suite (verified behaviourally
+// by the review, never by a unit test). This pins that a non-GitHub origin
+// is refused before cmdHandoff touches the network at all. Deliberately does
+// NOT use RELAY_ALLOW_LOCAL_REMOTE's bare-local-path form — gitlab.com is
+// refused by parseGitHubRemote regardless of that env var, so this exercises
+// the real guard cmdHandoff relies on in production, not the test bypass.
+test("cmdHandoff refuses outside a github.com-origin repo, before touching the network (G3)", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-handoff-g3-"));
+  const work = path.join(root, "repo");
+  const home = path.join(root, "home");
+  fs.mkdirSync(home, { recursive: true });
+  await execFileAsync("git", ["init", "-q", "-b", "main", work]);
+  const git = (...args) => execFileAsync("git", ["-C", work, ...args]);
+  await git("config", "user.email", "t@example.com");
+  await git("config", "user.name", "T");
+  await git("remote", "add", "origin", "https://gitlab.com/me/relay.git");
+  fs.writeFileSync(path.join(work, "README.md"), "# repo\n");
+  await git("add", "-A");
+  await git("commit", "-qm", "initial");
+
+  const node = generateEncKeyPair();
+  writeCredentials({ sessionToken: "sess", accountId: "acct", nodeId: "node-1", nodeEncPubkey: node.publicKeyB64 }, { home });
+
+  let networkTouched = false;
+  const fetchImpl = async () => { networkTouched = true; return { status: 500, json: async () => ({}) }; };
+
+  await assert.rejects(() => cmdHandoff([], { home, cwd: work, baseUrl: "https://cloud.test", fetchImpl, log: () => {} }),
+    /origin_not_github/);
+  assert.equal(networkTouched, false, "the guard must fire before any network call");
+});
+
 test("--no-push stops before publishing and says so", async () => {
   const s = await scenario();
   const lines = [];
@@ -391,6 +424,72 @@ test("the throwaway index is cleaned up afterward, on both success and failure",
 
   const tmpAfterFailure = new Set(fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith("relay-handoff-index-")));
   assert.deepEqual(tmpAfterFailure, tmpBefore, "no leftover temp index file after a failed handoff either");
+});
+
+// Important I1: the code comment used to claim chmod-ing the throwaway index
+// to 0600 "actually sticks" because it runs after the last git write. That is
+// false — the very next call, `git write-tree`, rewrites the index via its
+// own lock-then-rename (it stores the cache-tree extension) and hands it
+// back at the process umask, typically 0644. Fixed step by step against real
+// git and confirmed dead: the chmod is not merely narrow, it does nothing at
+// all. This is deliberately not asserted here as "the file is 0600" (that
+// claim is false both before and after the fix); it is asserted as the
+// property that actually holds:  the index never sits as a loose,
+// group/other-readable file directly in the ambient (possibly-shared, e.g.
+// Linux's 1777) TMPDIR at any point during the run. It lives inside a
+// dedicated 0700 directory for its whole lifetime, so the file's own mode
+// stops mattering regardless of what git does to it.
+//
+// Note this cannot rely on macOS's TMPDIR already being 0700 per-user (the
+// review's own explanation for why the leak went unnoticed) — that would
+// pass "by accident" on this dev machine even without the fix. Instead it
+// polls os.tmpdir() with a real timer, concurrently with a real in-flight
+// handoff, and checks the *structural* location (dedicated directory vs. a
+// bare file dropped straight in TMPDIR), which differs before and after the
+// fix regardless of the platform's ambient TMPDIR mode.
+test("the throwaway index lives inside its own private 0700 directory for its entire lifetime (I1)", async () => {
+  const s = await scenario();
+  // Modes are captured at observation time, not re-stat'd afterward: by the
+  // time the poll loop stops, cmdHandoff's own `finally` may have already
+  // removed the directory, and re-statting it then would race a real cleanup
+  // (ENOENT), not prove anything false about the mode it actually had.
+  const seenDirModes = new Map();
+  const seenLooseFiles = new Set();
+  const poll = setInterval(() => {
+    let names;
+    try {
+      names = fs.readdirSync(os.tmpdir());
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (!name.startsWith("relay-handoff-index-")) continue;
+      const full = path.join(os.tmpdir(), name);
+      let stat;
+      try {
+        stat = fs.statSync(full);
+      } catch {
+        continue; // removed between readdir and stat; not a leak
+      }
+      if (stat.isDirectory()) seenDirModes.set(full, stat.mode & 0o777);
+      else seenLooseFiles.add(full);
+    }
+  }, 5);
+
+  try {
+    await cmdHandoff([], { home: s.home, cwd: s.work, baseUrl: "https://cloud.test",
+      fetchImpl: s.fetchImpl, log: () => {}, machine: "MacBook-Pro" });
+  } finally {
+    clearInterval(poll);
+  }
+
+  assert.equal(seenLooseFiles.size, 0,
+    `the throwaway index must never be a loose file directly in TMPDIR: saw ${[...seenLooseFiles]}`);
+  assert.ok(seenDirModes.size >= 1,
+    "expected to observe the throwaway index's private directory at least once while the handoff was in flight");
+  for (const [dir, mode] of seenDirModes) {
+    assert.equal(mode, 0o700, `private index directory ${dir} must be 0700, got ${mode.toString(8)}`);
+  }
 });
 
 // Minor m12: two hostile-but-realistic repo states surfaced a raw git fatal

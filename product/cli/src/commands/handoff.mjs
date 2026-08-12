@@ -190,7 +190,23 @@ async function cmdHandoff(args = [], deps = {}) {
     throw new Error(`branch_collision: ${branch} already exists on origin`);
   }
 
-  const tmpIndex = path.join(os.tmpdir(), `relay-handoff-index-${crypto.randomUUID()}`);
+  // The throwaway index is not file content — no plaintext, no credential —
+  // but it does carry every path in the user's tree plus blob SHAs, and it
+  // must not be readable by another local user. fs.chmodSync-ing the index
+  // file itself does not work: `git write-tree` (below) rewrites the index
+  // one more time to store its cache-tree extension, via git's own
+  // lock-then-rename, which hands the file back at the process umask
+  // (typically 0644) regardless of any chmod applied before it. Measured
+  // against real git: the file is 0644 for its entire meaningful lifetime.
+  // The fix is structural instead: put the index inside a directory created
+  // with fs.mkdtempSync, which POSIX mkdtemp(3) always creates at 0700
+  // regardless of umask. The directory's mode is what actually protects the
+  // file — its own mode stops mattering — and removing the whole directory
+  // in the `finally` below also sweeps up any other file git or a hook wrote
+  // into this scope (a lock file, a split-index shard, ...), not just the
+  // one exact filename this code happens to know about.
+  const tmpIndexDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-handoff-index-"));
+  const tmpIndex = path.join(tmpIndexDir, "index");
   const env = { ...(envOverride || process.env), GIT_INDEX_FILE: tmpIndex };
   let pushed = false;
 
@@ -229,16 +245,6 @@ async function cmdHandoff(args = [], deps = {}) {
       }
     }
 
-    // The throwaway index has held the manifest/session blob SHAs (never
-    // their plaintext — those went straight into the object database via
-    // hash-object) since the update-index calls above; it needs no further
-    // writes after this point, so this is the one point where tightening its
-    // mode actually sticks. Every prior git write used git's own
-    // lock-then-rename, which re-creates the file at the process umask
-    // (typically 0644) — an fs.chmodSync before this point would just be
-    // clobbered by the next rename.
-    try { fs.chmodSync(tmpIndex, 0o600); } catch { /* best-effort hardening, not load-bearing */ }
-
     const treeSha = await gitPlumbingText(repo.root, ["write-tree"], { env });
 
     let commitSha;
@@ -270,7 +276,7 @@ async function cmdHandoff(args = [], deps = {}) {
       pushed = true;
     }
   } finally {
-    fs.rmSync(tmpIndex, { force: true });
+    fs.rmSync(tmpIndexDir, { recursive: true, force: true });
   }
 
   if (!pushed) return { handoffId, branch, pushed: false };
