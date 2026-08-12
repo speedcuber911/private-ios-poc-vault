@@ -11,6 +11,7 @@ struct AuthenticationView: View {
     @State private var email = ""
     @State private var password = ""
     @State private var appleNonce = ""
+    @State private var appleSignInPending = false
 
     private enum Mode: String, CaseIterable, Identifiable {
         case signIn = "Sign in"
@@ -140,7 +141,9 @@ struct AuthenticationView: View {
     private var actions: some View {
         VStack(spacing: 12) {
             Button(action: submitCredentials) {
-                if accountStore.isWorking {
+                // During Apple finish, keep the label and only disable — the Apple
+                // slot owns the spinner so two busy indicators don't compete.
+                if accountStore.isWorking && !appleSignInPending {
                     ProgressView().tint(AppTheme.onEmber)
                 } else {
                     Text(mode.rawValue)
@@ -150,23 +153,45 @@ struct AuthenticationView: View {
             .disabled(!credentialsAreValid || accountStore.isWorking)
             .accessibilityIdentifier("relay-credential-submit")
 
-            SignInWithAppleButton(.continue) { request in
-                let nonce = Self.randomNonce()
-                appleNonce = nonce
-                request.requestedScopes = [.fullName, .email]
-                request.nonce = Self.sha256(nonce)
-            } onCompletion: { result in
-                handleAppleCompletion(result)
+            if appleSignInPending {
+                appleSigningInStatus
+            } else {
+                SignInWithAppleButton(.continue) { request in
+                    let nonce = Self.randomNonce()
+                    appleNonce = nonce
+                    request.requestedScopes = [.fullName, .email]
+                    request.nonce = Self.sha256(nonce)
+                } onCompletion: { result in
+                    handleAppleCompletion(result)
+                }
+                // Black-on-dark keeps Apple's button quieter than the ember CTA; the white
+                // variants outrank the brand's own primary action on this canvas.
+                .signInWithAppleButtonStyle(.black)
+                .overlay(Capsule().stroke(AppTheme.hairlineStrong, lineWidth: 1))
+                .frame(height: 50)
+                .clipShape(Capsule())
+                .disabled(accountStore.isWorking)
+                .accessibilityIdentifier("relay-sign-in-with-apple")
             }
-            // Black-on-dark keeps Apple's button quieter than the ember CTA; the white
-            // variants outrank the brand's own primary action on this canvas.
-            .signInWithAppleButtonStyle(.black)
-            .overlay(Capsule().stroke(AppTheme.hairlineStrong, lineWidth: 1))
-            .frame(height: 50)
-            .clipShape(Capsule())
-            .disabled(accountStore.isWorking)
-            .accessibilityIdentifier("relay-sign-in-with-apple")
         }
+    }
+
+    private var appleSigningInStatus: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+                .tint(AppTheme.textPrimary)
+            Text("Signing in…")
+                .font(AppTheme.uiFont(size: 15, weight: .medium))
+                .foregroundStyle(AppTheme.textPrimary)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 50)
+        .background(Color.black, in: Capsule())
+        .overlay(Capsule().stroke(AppTheme.hairlineStrong, lineWidth: 1))
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("relay-sign-in-with-apple-pending")
+        .accessibilityLabel("Signing in")
     }
 
     private var modeSwitch: some View {
@@ -231,7 +256,9 @@ struct AuthenticationView: View {
                 return
             }
             let components = credential.fullName
+            appleSignInPending = true
             Task {
+                defer { appleSignInPending = false }
                 await accountStore.signInWithApple(
                     identityToken: identityToken,
                     nonce: appleNonce,
