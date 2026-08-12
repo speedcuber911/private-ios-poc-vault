@@ -479,8 +479,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 
-import { startTestApp, api, signIn, authed } from "./helpers.mjs";
+import { startTestApp, api, signIn, authed, makeNodeIdentity } from "./helpers.mjs";
 import { makeFakeProvisioner } from "./trial-api.test.mjs";
+
+// The enroll route validates `pubkey` with parseNodePubkey before it reaches any
+// new code, so this must be a real ed25519 SPKI PEM. (A placeholder string like
+// "pk-pem" only works in trial-api.test.mjs, which calls registry.createNode
+// directly and bypasses HTTP validation.) `pubkey` and `encPubkey` are two
+// different keys in two different formats — ed25519 PEM vs base64 of 32 raw
+// X25519 bytes — and must never be interchanged.
+const NODE_PUBKEY_PEM = makeNodeIdentity().pubkeyPem;
 
 const TRIAL_ENV = {
   E2B_API_URL: "http://cube.invalid", E2B_API_KEY: "k", TRIAL_TEMPLATE_ID: "relay-trial",
@@ -4888,39 +4896,58 @@ async function cmdHandoff(args = [], deps = {}) {
   if (!sessionBytes) { manifest.sessionFormat = "none"; manifest.sessionId = null; }
   manifest.title = title;
 
-  const startingBranch = repo.branch;
-  const run = (...gitArgs) => git(repo.root, gitArgs);
+  // Build the handoff commit with plumbing against a THROWAWAY INDEX. We never
+  // check out a branch, never write into the user's working tree, and never
+  // touch .git/index — so there is nothing to restore afterwards and no way to
+  // lose their uncommitted work. See the note below for why the obvious
+  // checkout-based version is wrong.
+  const ref = `refs/heads/${branch}`;
+  if (!ref.startsWith("refs/heads/relay/handoff-")) throw new Error("refusing_to_write_blobs_off_handoff_branch");
+
+  const tmpIndex = path.join(os.tmpdir(), `relay-handoff-index-${crypto.randomUUID()}`);
+  const run = (...gitArgs) => git(repo.root, gitArgs, { env: { ...process.env, GIT_INDEX_FILE: tmpIndex } });
+  const runStdin = (input, ...gitArgs) => git(repo.root, gitArgs, { input });
   let pushed = false;
 
-  await run("checkout", "-q", "-b", branch);
   try {
-    const currentBranch = (await run("rev-parse", "--abbrev-ref", "HEAD")).trim();
-    if (!currentBranch.startsWith("relay/handoff-")) throw new Error("refusing_to_write_blobs_off_handoff_branch");
+    // Seed the throwaway index from HEAD, then stage every WIP change into it.
+    // `git add -A` reads the working tree and writes only the index plus new
+    // objects: it modifies no file on disk, and it honours .gitignore, so
+    // ignored secrets never reach the branch we are about to push to GitHub.
+    await run("read-tree", "HEAD");
+    await run("add", "-A");
 
-    const blobDir = path.join(repo.root, BLOB_PATH_PREFIX, handoffId);
-    fs.mkdirSync(blobDir, { recursive: true });
-    fs.writeFileSync(path.join(blobDir, "manifest.enc"),
+    // Sealed blobs go straight into the object database — they are never
+    // written into the user's checkout at all.
+    const addBlob = async (relPath, bytes) => {
+      const sha = (await runStdin(bytes, "hash-object", "-w", "--stdin")).trim();
+      await run("update-index", "--add", "--cacheinfo", `100644,${sha},${relPath}`);
+    };
+    await addBlob(`${BLOB_PATH_PREFIX}/${handoffId}/manifest.enc`,
       sealTo(credentials.nodeEncPubkey, Buffer.from(JSON.stringify(manifest), "utf8")));
     if (sessionBytes) {
-      fs.writeFileSync(path.join(blobDir, "session.enc"), sealTo(credentials.nodeEncPubkey, sessionBytes));
+      await addBlob(`${BLOB_PATH_PREFIX}/${handoffId}/session.enc`,
+        sealTo(credentials.nodeEncPubkey, sessionBytes));
     }
 
-    await run("add", "-A");
-    await run("-c", "user.name=relay", "-c", "user.email=relay@localhost", "commit", "-q", "-m",
-      `relay: handoff ${handoffId}`);
+    const tree = (await run("write-tree")).trim();
+    let commit;
+    try {
+      commit = (await git(repo.root, ["-c", "user.name=relay", "-c", "user.email=relay@localhost",
+        "commit-tree", tree, "-p", "HEAD", "-m", `relay: handoff ${handoffId}`])).trim();
+    } catch (err) {
+      throw new Error("no_git_identity", { cause: err });
+    }
+    await git(repo.root, ["update-ref", ref, commit]);
 
     if (args.includes("--no-push")) {
       log(`  Prepared ${branch} locally. Nothing was pushed and no notification was sent.`);
     } else {
-      await run("push", "-q", "origin", branch);
+      await git(repo.root, ["push", "-q", "origin", `${ref}:${ref}`]);
       pushed = true;
     }
   } finally {
-    await run("checkout", "-q", startingBranch);
-    // The blobs live only on the handoff branch; restore the tree the user left.
-    await run("checkout", "-q", "--", ".");
-    fs.rmSync(path.join(repo.root, BLOB_PATH_PREFIX), { recursive: true, force: true });
-    await run("reset", "-q", "HEAD");
+    fs.rmSync(tmpIndex, { force: true });
   }
 
   if (!pushed) return { handoffId, branch, pushed: false };
@@ -4957,7 +4984,13 @@ async function cmdHandoff(args = [], deps = {}) {
 export { cmdHandoff, buildManifest, handoffBranchName };
 ```
 
-The `finally` block restores the user's branch **and** their uncommitted work: the WIP commit lives on the handoff branch, so `checkout <startingBranch>` followed by restoring the tree leaves the original files exactly as they were.
+**Why plumbing instead of `git checkout -b`.** An earlier draft of this task created the branch, committed the WIP onto it, and then restored the user with `git checkout <startingBranch>` followed by `git checkout -- .`. That silently **destroys uncommitted work**, and it was caught only because the implementer ran a standalone repro when a test failed.
+
+The mechanism: an untracked file such as `wip.txt` becomes tracked-and-clean once it is committed onto the handoff branch. When git then checks out the original branch, it sees a file that is clean on the branch being left and absent from the target tree — so it **deletes it**, with no data-loss warning, because from git's point of view the content is safely committed elsewhere. `git checkout -- .` cannot bring it back either: the file was never in the original branch's index or tree, so there is nothing to restore it from.
+
+The plumbing version above sidesteps the whole class of problem. It never moves HEAD, never checks out a branch, never writes a byte into the working tree, and writes only to a throwaway index in `$TMPDIR`. There is nothing to restore because nothing was disturbed. It also makes the "handoff blobs live only on `relay/handoff-*` branches" invariant **structural** rather than asserted — the blobs are reachable only from the ref we just created — and the `git add -A` honours `.gitignore`, so an ignored `.env` never reaches GitHub, where history is not revocable.
+
+Two things the tests must get right. Assert the working tree is untouched by comparing `git status --porcelain -z`, `git rev-parse HEAD`, `git symbolic-ref HEAD`, and a content hash of every file, before and after; the unchanged `symbolic-ref HEAD` is what proves no checkout happened. But do **not** assert that `.git/index` is byte-identical — building the WIP summary runs `git status`, which refreshes the index stat cache and rewrites the file with no semantic change. And pair every "nothing was lost" assertion with a positive one: `git ls-tree -r <branch>` must actually contain the WIP file and both `.enc` paths, because proving nothing broke is worthless without proving the work was captured.
 
 - [ ] **Step 4: Run tests to verify they pass**
 

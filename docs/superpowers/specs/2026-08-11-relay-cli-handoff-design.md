@@ -225,7 +225,7 @@ session." New work fired from the phone always targets the sandbox.
 | Sandbox fetch fails (missing/expired GitHub cred) | `handoff.failed(reason)` → push + `relay status` says "needs `relay sync-auth`" |
 | Decrypt failure | Audit entry + `handoff.failed` |
 | Long-poll gap / node offline | Handoffs are rows, not messages; node catches up on reconnect |
-| Branch name collision | Numeric suffix |
+| Branch name collision | **Refuse loudly** (`branch_exists`), checking both locally and on `origin`. Owner decision 2026-08-12, overriding this table's original "numeric suffix": a handoff must never silently write near an existing branch, and the user is at the terminal and can choose. |
 | Duplicate ping | Idempotent on `handoffId` |
 
 ## 11. Testing
