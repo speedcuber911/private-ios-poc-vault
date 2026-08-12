@@ -436,6 +436,38 @@ test("transcript/apiKey/prompt fields on a session cannot reach the stored index
   assert.equal(treeContainsMarker(dataDir, marker), false);
 });
 
+// --- Pin: machine/updatedAt are bounded to plain strings too, not just the ---
+// --- per-session fields — a compromised/buggy sender cannot smuggle an    ---
+// --- object (e.g. {transcript, token}) through either top-level field by  ---
+// --- relying on the old `bundle.machine || null` verbatim copy.          ---
+test("machine and updatedAt are bounded to strings — an object planted there never reaches disk", () => {
+  const { dataDir } = homes();
+  const marker = "SECRET_MACHINE_FIELD_MARKER";
+  saveMacSessions({
+    v: 1, kind: "session-index",
+    machine: { transcript: `leaked ${marker}`, token: `ghp_live_${marker}` },
+    updatedAt: { anything: ["also", "unbounded", marker] },
+    sessions: [{ id: "s1", harness: "claude", title: "t", repo: "r", lastActive: "l" }],
+  }, { dataDir });
+
+  const index = readMacSessions({ dataDir });
+  assert.equal(index.machine, null, "an object is not a string — it is dropped to null, not copied verbatim");
+  assert.equal(index.updatedAt, null);
+  assert.equal(treeContainsMarker(dataDir, marker), false);
+});
+
+test("machine and updatedAt still round-trip when they are, correctly, plain strings", () => {
+  const { dataDir } = homes();
+  saveMacSessions({
+    v: 1, kind: "session-index", machine: "MacBook-Pro", updatedAt: "2026-08-12T00:00:00.000Z",
+    sessions: [],
+  }, { dataDir });
+
+  const index = readMacSessions({ dataDir });
+  assert.equal(index.machine, "MacBook-Pro");
+  assert.equal(index.updatedAt, "2026-08-12T00:00:00.000Z");
+});
+
 // ---------------------------------------------------------------------------
 // Wiring the two halves: a notice arrives over the node long-poll, and the
 // node collects the sealed bundle, VERIFIES THE MAC, unseals it with its own
