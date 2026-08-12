@@ -12,8 +12,15 @@ function defaultOpenBrowser(url) {
   execFile(opener, [url], () => {});
 }
 
+// Canonical node-key fingerprint: SHA-256 over the 32 *decoded* key bytes
+// (never over the base64 text), first 16 hex characters. This is the
+// representation both the CLI and the cloud can agree on — the cloud stores
+// whatever base64 the enrolling node submitted verbatim and never
+// re-canonicalizes it, so hashing the wire string would make the fingerprint
+// depend on incidental base64 formatting (padding, alphabet). The iOS side
+// (a later, deferred task) must decode-then-hash exactly this way to match.
 function fingerprint(encPubkeyB64) {
-  return crypto.createHash("sha256").update(String(encPubkeyB64)).digest("hex").slice(0, 16);
+  return crypto.createHash("sha256").update(Buffer.from(String(encPubkeyB64), "base64")).digest("hex").slice(0, 16);
 }
 
 async function cmdLogin(args = [], deps = {}) {
@@ -24,13 +31,14 @@ async function cmdLogin(args = [], deps = {}) {
     openBrowser = defaultOpenBrowser,
     log = console.log,
     sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    now = () => Date.now(),
   } = deps;
 
   const anonymous = createCloudApi({ baseUrl, fetchImpl });
   const start = await anonymous.startDeviceLogin();
   if (start.status !== 201) throw new Error(`login_start_failed_${start.status}`);
 
-  const { deviceCode, userCode, verificationUri, interval } = start.json;
+  const { deviceCode, userCode, verificationUri, interval, expiresIn } = start.json;
   log("");
   log(`  Your code:  ${userCode}`);
   log(`  Approve at: ${verificationUri}`);
@@ -38,11 +46,32 @@ async function cmdLogin(args = [], deps = {}) {
   log("  Waiting for approval…");
   openBrowser(verificationUri);
 
+  // A server bug or a network partition that keeps answering
+  // authorization_pending must not hang this command forever — track our own
+  // deadline from the budget the server handed us at start time, and give up
+  // once it passes regardless of what subsequent polls say. If the server
+  // didn't send a usable expiresIn, don't impose an invented ceiling.
+  const expiresInSeconds = Number(expiresIn);
+  const deadline = Number.isFinite(expiresInSeconds) && expiresInSeconds > 0
+    ? now() + expiresInSeconds * 1000
+    : Infinity;
+  // The server-supplied interval is untrusted: Node clamps a negative
+  // setTimeout delay to 0, so a hostile or buggy `interval` could otherwise
+  // drive this into a hot loop against the auth server. Floor it at 1s.
+  const intervalMs = Math.max(1, Number(interval) || 5) * 1000;
+
   let session = null;
   for (;;) {
-    await sleep((interval || 5) * 1000);
+    await sleep(intervalMs);
+    if (now() >= deadline) throw new Error("login_expired: the code timed out — run relay login again");
     const poll = await anonymous.pollDeviceToken(deviceCode);
-    if (poll.status === 200) { session = poll.json; break; }
+    if (poll.status === 200) {
+      if (!poll.json || typeof poll.json.sessionToken !== "string") {
+        throw new Error("login_failed_bad_response: the server returned an unexpected response");
+      }
+      session = poll.json;
+      break;
+    }
     const error = poll.json?.error;
     if (error === "authorization_pending") continue;
     if (error === "expired_token") throw new Error("login_expired: the code timed out — run relay login again");
