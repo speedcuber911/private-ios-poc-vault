@@ -15,6 +15,7 @@
 // authenticates relayed blobs — see pairing.js for the full rationale.
 
 import { createServer } from "node:http";
+import { readFileSync } from "node:fs";
 import { timingSafeEqual, randomBytes, createHash } from "node:crypto";
 import { createDb } from "./db.js";
 import { createRegistry } from "./registry.js";
@@ -27,6 +28,28 @@ import { createProvisioner } from "./provisioner.js";
 import { verifyNodeRequest, createReplayGuard } from "./nodeauth.js";
 
 const NODE_KINDS = new Set(["byo", "managed"]);
+
+// Reads the wildcard certificate handed to every trial node, or {} when none
+// is configured. Read per provision rather than cached at boot so a certbot
+// renewal is picked up without restarting the control plane — the files are
+// symlinks into letsencrypt's archive and are replaced, not rewritten.
+//
+// Returns {} on any read failure instead of throwing: a node that self-signs
+// still works, where a failed provision leaves the user with nothing.
+function nodeTlsMaterial(config) {
+  const { certFile, keyFile } = config.nodeTls ?? {};
+  if (!certFile || !keyFile) return {};
+  try {
+    return {
+      tlsCert: readFileSync(certFile, "utf8"),
+      tlsKey: readFileSync(keyFile, "utf8"),
+    };
+  } catch (error) {
+    // Path and error code only; never the key.
+    console.error(`node TLS material unreadable at ${certFile}: ${error.code || "unknown"} — node will self-sign`);
+    return {};
+  }
+}
 
 // Bounds how many polls from ONE node can be parked at once on
 // GET /v1/node/handoffs. A client that connects, signs a valid request, and
@@ -1081,6 +1104,13 @@ export function createApp({
             tunnelHost: config.tunnel.host,
             tunnelPort: String(config.tunnel.port),
             tunnelSuffix: config.tunnel.suffix,
+            // A certificate the phone's system trust store already accepts,
+            // for this node's name under the wildcard. Without it the node
+            // signs its own, the app has to override server trust, and iOS
+            // then refuses to perform client-certificate authentication at
+            // all — so mTLS cannot complete. Absent (no wildcard configured),
+            // the node falls back to self-signing and nothing else changes.
+            ...nodeTlsMaterial(config),
           }),
         );
       } catch {
