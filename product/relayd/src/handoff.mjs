@@ -116,6 +116,16 @@
 // `GET /v1/handoffs`, so they never reach a record — they go to the local
 // audit log, clipped and credential-redacted. The GitHub credential lives in
 // `<runHome>/.git-credentials` (helper = store) and is never named in argv.
+//
+// BOTH writers of `record.error` go through the same membership gate, and the
+// second one had to be fixed to make that true: the import path via
+// `publicReason(error)`, the push-back path via `publicCode(reason)` inside
+// `announcePushOutcome`. A reviewer found this claim asserted while
+// `announcePushOutcome` persisted its caller's string verbatim — seven values
+// that were not in the set. It was safe only because all seven happened to be
+// static literals, which is an accident, not a guarantee. If you add a writer
+// of `record.error`, route it through `publicCode` or this paragraph becomes
+// false again.
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -262,11 +272,36 @@ const PUBLIC_REASONS = new Set([
   "workspace_registration_failed",
   "store_write_failed",
   "internal_error",
+  // The PUSH-BACK half of the vocabulary. These were persisted into
+  // `record.error` for a release without being in this set and without going
+  // through publicCode — the header above claimed the guarantee was
+  // structural while the only thing holding it was that all seven happened to
+  // be static literals. No live leak, but the gate that would catch the next
+  // edit adding a detail to a push reason did not exist. It does now: every
+  // one of these is a member, and announcePushOutcome routes through
+  // publicCode, so this set really is the whole vocabulary.
+  "push_failed",
+  "push_blocked_secret",
+  "checkout_missing",
+  "record_missing",
+  // `job_<status>` for the jobs engine's own terminal statuses. Any other
+  // status — one added later, or a non-string — becomes internal_error rather
+  // than coining a vocabulary word at runtime.
+  "job_failed",
+  "job_cancelled",
+  "job_timeout",
+  "job_unknown",
 ]);
 
-function publicReason(error) {
-  const code = error?.code;
+// The membership test itself, taking the code directly. `publicReason` is the
+// error-shaped door onto it; the push-back path has reasons that never were an
+// Error, and both must pass through the SAME gate or the set is not closed.
+function publicCode(code) {
   return typeof code === "string" && PUBLIC_REASONS.has(code) ? code : "internal_error";
+}
+
+function publicReason(error) {
+  return publicCode(error?.code);
 }
 
 // Credential shapes that must never reach even the LOCAL audit log. The
@@ -1200,6 +1235,18 @@ async function continueHandoff(id, { prompt = null, certSubject = null } = {}) {
 // is pushed. Both are inherent to matching by shape rather than reading
 // every byte of every file; worth knowing before assuming this list is a
 // content-aware secret scanner.
+//
+// >>> BEGIN SHARED SECRET-PATH POLICY — CANONICAL COPY >>>
+// One policy, one spelling. This is the answer to "what may leave the
+// machine", and BOTH halves of the handoff need it: the sandbox pushing back
+// (below) and the laptop pushing out (`relay handoff`, which reached GitHub
+// with a .env, a tracked-and-modified .env.example and an .ssh/id_rsa before
+// this text existed there). product/cli/src/commands/handoff.mjs vendors
+// everything between these two markers BYTE FOR BYTE — the same arrangement
+// seal.mjs already uses — and product/cli/test/handoff.test.mjs fails loudly
+// if the two copies drift. Edit this copy, then paste it over the other one;
+// two spellings of this contract WILL diverge, and the divergence is a live
+// key in unrevocable history.
 const SECRET_PATH_RULES = [
   /(^|\/)\.env($|[.\-_])/i,
   /(^|\/)\.envrc$/i,
@@ -1226,6 +1273,7 @@ const SECRET_PATH_RULES = [
 function isSecretPath(candidate) {
   return SECRET_PATH_RULES.some((rule) => rule.test(candidate));
 }
+// <<< END SHARED SECRET-PATH POLICY <<<
 
 function splitNulList(text) {
   return String(text)
@@ -1282,6 +1330,12 @@ function verifiedCheckout(handoffId) {
 
 function announcePushOutcome(record, outcome, extra = {}) {
   const pushed = outcome === "pushed";
+  // The one gate. Everything this function can put in front of a client — the
+  // local SSE event and `record.error`, which additions.mjs serves verbatim to
+  // the phone — is drawn from PUBLIC_REASONS here, so a caller that invents a
+  // reason (or interpolates a detail into one) gets `internal_error` instead
+  // of a route to the phone. This used to persist `extra.reason` raw.
+  const reason = pushed ? null : publicCode(extra.reason || "push_failed");
   safeAudit(pushed ? "handoff_pushed" : "handoff_push_failed", {
     handoffId: record.id,
     branch: record.branch,
@@ -1295,7 +1349,7 @@ function announcePushOutcome(record, outcome, extra = {}) {
     // A push failure is not a handoff failure: the checkout is still there and
     // still resumable. The record stays `ready` and carries the reason, so the
     // phone stops being told the work was pushed when it was not.
-    error: pushed ? null : extra.reason || "push_failed",
+    error: reason,
   });
   // Re-read rather than spread the `record` snapshot the caller captured at
   // the top of completeHandoffJob: a `continue` landing while `git push` was
@@ -1305,7 +1359,7 @@ function announcePushOutcome(record, outcome, extra = {}) {
   // owns (error, updatedAt) are ever changed; everything else reflects
   // whatever is actually in the store right now.
   const current = readHandoff(record.id) || record;
-  persist({ ...current, error: pushed ? null : extra.reason || "push_failed", updatedAt: nowIso() });
+  persist({ ...current, error: reason, updatedAt: nowIso() });
   // The cloud's node-event schema knows only handoff.ready / handoff.failed
   // (cloud/src/notify.js KNOWN_TYPES), so a push result has no push channel; it
   // reaches the phone over the local SSE feed and the record instead.
@@ -1326,8 +1380,18 @@ async function completeHandoffJob(job, options = {}) {
     return { branch: null, pushed: false, reason: "record_missing" };
   }
   if (job.status !== "succeeded") {
-    const reason = `job_${typeof job.status === "string" ? job.status : "unknown"}`;
-    announcePushOutcome(record, "skipped", { jobId, reason });
+    // Through the gate here as well as in announcePushOutcome, so the value
+    // this function RETURNS is the same closed-vocabulary word it persisted —
+    // `job.status` comes from the jobs engine's own set today, and this module
+    // must not be the place where that assumption is load-bearing.
+    const raw = `job_${typeof job.status === "string" ? job.status : "unknown"}`;
+    const reason = publicCode(raw);
+    // Nothing is LOST by closing the vocabulary: when the gate had to rewrite
+    // the reason, the exact status still reaches the operator's channel, which
+    // is where attacker-influenced text is allowed to go.
+    announcePushOutcome(record, "skipped", {
+      jobId, reason, ...(reason === raw ? {} : { detail: redactUntrusted(raw) }),
+    });
     return { branch: record.branch, pushed: false, reason };
   }
 

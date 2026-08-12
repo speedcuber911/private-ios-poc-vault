@@ -51,6 +51,134 @@ function handoffBranchName(handoffId) {
   return `relay/handoff-${String(handoffId).slice(0, 12)}`;
 }
 
+// ---------------------------------------------------------------------------
+// WHAT MAY NOT LEAVE THE LAPTOP.
+//
+// The WIP commit used to be `git add -A` with `.gitignore` as the only filter,
+// and a reviewer pushed three files to a real remote with it: an untracked
+// `.env` (no ignore rule in that repo), a TRACKED `.env.example` the developer
+// had filled in locally (`git add -A` stages a tracked file's modifications
+// regardless of any ignore rule), and an `.ssh/id_rsa` nobody had thought to
+// ignore. The destination is a branch on the user's own GitHub repository, and
+// GitHub history is not revocable — so this is the worst possible destination
+// for a live key, reached on the shut-the-laptop path where the user is by
+// definition not watching.
+//
+// The sandbox half of this same feature (relayd's push-back) already refuses
+// all three, and its own comment says in as many words that `.gitignore`
+// "is not sufficient" — reason 3 there (`git add -A` stages a tracked file's
+// modifications regardless of any ignore rule) is equally true here. So the
+// laptop runs the SAME policy, in the same two layers, with the rule text
+// vendored byte-for-byte rather than re-spelled:
+//
+//   layer 1  withhold every secret-shaped path `git status` reports, and TELL
+//            THE USER which ones, because unlike the sandbox there is a human
+//            here who can decide what to do about it.
+//   layer 2  re-check what ACTUALLY reached the index — a different input from
+//            layer 1's, because a path git status reported as a plain file can
+//            become a directory full of secrets before `git add` runs — and
+//            abort the whole handoff if anything got through.
+//
+// Withhold-and-report on layer 1, abort on layer 2, deliberately:
+//
+//  - A repo with a `.env` is the ordinary case, not the exception. Refusing
+//    outright would fail nearly every handoff and push people toward whatever
+//    `--force`-shaped escape got added next, which is how the key reaches
+//    GitHub anyway. Withholding costs the sandbox agent a file it must not
+//    have (relayd installs its own credentials into the run home; the
+//    laptop's `.env` is exactly the thing that must not travel).
+//  - The failure mode that makes withholding wrong is doing it SILENTLY, so
+//    this does not: every withheld path is printed, on the push path and the
+//    --no-push path alike, before anything is committed.
+//  - Layer 2 tripping means the policy was DEFEATED rather than applied.
+//    There is no partial-but-correct handoff to report at that point, so it
+//    ends the command and nothing is pushed.
+//
+// The same two honest limits as the sandbox side apply, and for the same
+// reason: this matches by NAME, so a secret pasted into notes.md still
+// travels, and a symlink whose own name is not secret-shaped is committed as
+// a symlink object carrying its target path. Neither is a content scanner and
+// neither pretends to be.
+//
+// >>> BEGIN SHARED SECRET-PATH POLICY — CANONICAL COPY >>>
+// One policy, one spelling. This is the answer to "what may leave the
+// machine", and BOTH halves of the handoff need it: the sandbox pushing back
+// (below) and the laptop pushing out (`relay handoff`, which reached GitHub
+// with a .env, a tracked-and-modified .env.example and an .ssh/id_rsa before
+// this text existed there). product/cli/src/commands/handoff.mjs vendors
+// everything between these two markers BYTE FOR BYTE — the same arrangement
+// seal.mjs already uses — and product/cli/test/handoff.test.mjs fails loudly
+// if the two copies drift. Edit this copy, then paste it over the other one;
+// two spellings of this contract WILL diverge, and the divergence is a live
+// key in unrevocable history.
+const SECRET_PATH_RULES = [
+  /(^|\/)\.env($|[.\-_])/i,
+  /(^|\/)\.envrc$/i,
+  /(^|\/)\.secrets?(\/|$)/i,
+  /(^|\/)secrets?\.(json|ya?ml|toml|ini|txt|env|enc)$/i,
+  /(^|\/)\.git-credentials$/i,
+  /(^|\/)\.netrc$/i,
+  /(^|\/)\.npmrc$/i,
+  /(^|\/)\.pypirc$/i,
+  /(^|\/)\.aws(\/|$)/i,
+  /(^|\/)\.ssh(\/|$)/i,
+  /(^|\/)\.gnupg(\/|$)/i,
+  /(^|\/)\.docker\/config\.json$/i,
+  /(^|\/)\.config\/gh(\/|$)/i,
+  /(^|\/)\.claude\/\.credentials\.json$/i,
+  /(^|\/)\.codex\/auth\.json$/i,
+  /(^|\/)id_(rsa|dsa|ecdsa|ed25519)($|\.)/i,
+  /\.(pem|key|p12|pfx|jks|keystore|kdbx)$/i,
+  /(^|\/)credentials(\.[A-Za-z0-9]+)?$/i,
+  /(^|\/)service-account[^/]*\.json$/i,
+  /(^|\/)[^/]*\.tfstate($|\.)/i,
+];
+
+function isSecretPath(candidate) {
+  return SECRET_PATH_RULES.some((rule) => rule.test(candidate));
+}
+// <<< END SHARED SECRET-PATH POLICY <<<
+
+function splitNulList(text) {
+  return String(text)
+    .split("\0")
+    .filter((entry) => entry.length > 0);
+}
+
+// `git status --porcelain=v1 -z` records are `XY<space><path>`, and a rename or
+// copy carries a second NUL-separated origin path. -z means paths are literal,
+// never quoted, so there is nothing to unescape.
+function parsePorcelainZ(text) {
+  const fields = String(text).split("\0");
+  const paths = [];
+  for (let index = 0; index < fields.length; index += 1) {
+    const field = fields[index];
+    if (field.length < 4) continue;
+    const status = field.slice(0, 2);
+    paths.push(field.slice(3));
+    if (status[0] === "R" || status[0] === "C") index += 1; // consume the origin path
+  }
+  return paths;
+}
+
+// What the user is told when layer 1 withholds something. Bounded, because a
+// repo can have thousands of matching paths (an untracked `.ssh` tree, say)
+// and the point is that the user NOTICES, not that they scroll.
+const MAX_REPORTED_WITHHELD = 20;
+
+function reportWithheld(withheld, log) {
+  if (withheld.length === 0) return;
+  log("");
+  log(`  Withheld ${withheld.length} secret-shaped file${withheld.length === 1 ? "" : "s"} from this handoff.`);
+  log("  These were NOT committed and NOT pushed — nothing in them reached GitHub:");
+  for (const entry of withheld.slice(0, MAX_REPORTED_WITHHELD)) log(`    ${entry}`);
+  if (withheld.length > MAX_REPORTED_WITHHELD) {
+    log(`    ... and ${withheld.length - MAX_REPORTED_WITHHELD} more`);
+  }
+  log("  (Matched by name. If your agent needs one of these on the other side,");
+  log("   put it there deliberately — a handoff branch is not the way.)");
+}
+
 function buildManifest({ repo, session, wip, excerpt, handoffId, branch, machine, now }) {
   return {
     v: 1,
@@ -207,7 +335,22 @@ async function cmdHandoff(args = [], deps = {}) {
   // one exact filename this code happens to know about.
   const tmpIndexDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-handoff-index-"));
   const tmpIndex = path.join(tmpIndexDir, "index");
-  const env = { ...(envOverride || process.env), GIT_INDEX_FILE: tmpIndex };
+  // GIT_LITERAL_PATHSPECS=1 turns off ALL pathspec magic — globs, and the
+  // ":(...)"/"!"/leading-":" syntax — for every plumbing call below, which is
+  // mandatory now that `git add` is given a list of paths that came out of the
+  // user's own working tree instead of a blanket `-A`. Without it those paths
+  // are PATHSPECS, not filenames: a file named ":!wip.txt" makes the add
+  // stage nothing at all (the exclusion wins) and the handoff pushes an empty
+  // commit while claiming success, and a file named "*" re-globs a path layer
+  // 1 just withheld straight back into the add list. relayd's push-back
+  // carries the identical guard for the identical reason. (The ref-only calls
+  // that go through repo.mjs's `git` — rev-parse, ls-remote, update-ref,
+  // push — take no pathspec argument at all.)
+  const env = {
+    ...(envOverride || process.env),
+    GIT_INDEX_FILE: tmpIndex,
+    GIT_LITERAL_PATHSPECS: "1",
+  };
   let pushed = false;
 
   try {
@@ -215,7 +358,28 @@ async function cmdHandoff(args = [], deps = {}) {
     // tracked modifications, deletions, and (.gitignore-respecting) untracked
     // files — without writing anything to the user's real .git/index.
     await gitPlumbing(repo.root, ["read-tree", "HEAD"], { env });
-    await gitPlumbing(repo.root, ["add", "-A"], { env });
+
+    // Layer 1 of the secret-path policy (see SECRET_PATH_RULES above): stage
+    // an explicit, filtered list rather than `git add -A`. `.gitignore` is
+    // still a first filter — git status honours it — but it is no longer the
+    // control, because it cannot be: it does not know about a key the user
+    // never thought to ignore, and it does not apply at all to a tracked file
+    // that was filled in locally.
+    const candidates = parsePorcelainZ(
+      (await gitPlumbing(repo.root,
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { env })).toString("utf8"),
+    );
+    const allowed = candidates.filter((entry) => !isSecretPath(entry));
+    const withheld = candidates.filter((entry) => isSecretPath(entry));
+    // Said before anything is committed, and said on every path out of here —
+    // a handoff that quietly leaves a file behind is its own kind of failure.
+    reportWithheld(withheld, log);
+
+    // Batched so a repo with tens of thousands of changed paths cannot blow
+    // the argv limit; 200 matches relayd's own batch size.
+    for (let index = 0; index < allowed.length; index += 200) {
+      await gitPlumbing(repo.root, ["add", "--", ...allowed.slice(index, index + 200)], { env });
+    }
 
     const manifestSha = await gitPlumbingText(repo.root, ["hash-object", "-w", "--stdin"], {
       env, input: sealTo(credentials.nodeEncPubkey, Buffer.from(JSON.stringify(manifest), "utf8")),
@@ -243,6 +407,27 @@ async function cmdHandoff(args = [], deps = {}) {
             "handoff_path_conflict: a file named .relay/handoff already exists in this repository and blocks the handoff blob path"],
         ]);
       }
+    }
+
+    // Layer 2, and load-bearing rather than belt-and-braces: layer 1 filtered
+    // the paths `git status` reported, once; this asks the index what is
+    // ACTUALLY about to be committed. Those are not the same input. A path
+    // status reported as a plain file can have become a directory by the time
+    // `git add` reached it — the user's editor, a running agent, a build, all
+    // write to this tree while the command runs — and git then stages
+    // everything under it, under names layer 1 never saw and so never
+    // filtered. This is also the only check that sees the sealed blobs added
+    // by `update-index` above. Reaching here with a match means the policy was
+    // defeated, not applied, so the command ends and nothing is pushed.
+    const stagedPaths = splitNulList(
+      (await gitPlumbing(repo.root, ["diff", "--cached", "--name-only", "-z"], { env })).toString("utf8"),
+    );
+    const leaked = stagedPaths.filter((entry) => isSecretPath(entry));
+    if (leaked.length > 0) {
+      for (const entry of leaked.slice(0, MAX_REPORTED_WITHHELD)) log(`    would have committed: ${entry}`);
+      throw new Error(
+        `refusing_to_push_secret: ${leaked.length} secret-shaped path(s) reached the handoff commit; nothing was pushed`,
+      );
     }
 
     const treeSha = await gitPlumbingText(repo.root, ["write-tree"], { env });
@@ -324,4 +509,4 @@ async function cmdHandoff(args = [], deps = {}) {
   return { handoffId, branch, pushed: true };
 }
 
-export { cmdHandoff, buildManifest, handoffBranchName };
+export { cmdHandoff, buildManifest, handoffBranchName, isSecretPath };
