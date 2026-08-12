@@ -23,6 +23,12 @@
 //   filesystem mechanism (symlink at any path component, hard link, race, or
 //   directory creation), and no failure of that guarantee may be silent.
 //
+// "Write" here is precise and is defined exactly in the RESIDUAL section
+// below, because a fourth round of this module already shipped an inaccurate
+// version of that sentence ("leaves nothing outside the jail", "residue
+// unwound") that a reviewer's two-window race falsified. Read RESIDUAL before
+// trusting any summary of what this module guarantees, including this one.
+//
 // Three previous rounds tried to hold it by bolting a check onto a
 // path-then-write sequence, and each round left a different mechanism open
 // (unsanitised id -> lexical check; symlinked leaf -> O_NOFOLLOW; symlinked
@@ -65,12 +71,42 @@
 // (`openat`, `mkdirat`, `renameat`), so steps 2, 3 and 5 still name their
 // parent by path and are not formally atomic. What is left is a race an
 // attacker wins only by swapping a directory component inside the window
-// between our O_DIRECTORY|O_NOFOLLOW verification and the very next syscall,
-// AND then mirroring a name it has to read out of the directory first. Every
-// such attempt is caught by the post-write fd checks and ends in a thrown
-// `SessionImportSecurityError` — it cannot end silently. Closing it completely
-// needs a native `openat` binding, which the zero-dependency constraint rules
-// out.
+// between our O_DIRECTORY|O_NOFOLLOW verification and the very next syscall.
+// The exact guarantee that survives that race — no more, no less, and
+// deliberately not rounded up to something tidier:
+//
+//   - No EXISTING file is ever overwritten or truncated. O_EXCL means this
+//     module can only ever CREATE a new inode, and O_TRUNC appears nowhere
+//     in it.
+//   - No SESSION CONTENT ever reaches a file outside the jail. Immediately
+//     before the content write (see writeStagedFile), the staged fd's own
+//     link count is re-checked with NO fs call in between that check and the
+//     write itself. That is what actually stops the two-window attack —
+//     swap the staging directory for a symlink out of the jail, let the
+//     O_CREAT land outside, hard-link the new (still empty) file back into
+//     the restored real directory, restore the directory — because that
+//     attack defeats every PATH-based check in this sequence (the swapped
+//     directory resolves back to a real, in-jail-looking path by the time
+//     they run) but cannot defeat an fd-based nlink check with nothing for
+//     the attacker to act between: fstat(fd) reads live kernel state, so a
+//     hard link created at ANY earlier point is already visible here.
+//   - What this module cannot always prevent: a lost race can still leave an
+//     EMPTY file (0 bytes, created by this module, never written to)
+//     outside the jail, because the O_CREAT that makes it is still named by
+//     a path. When that happens, this module's only handle on the file is
+//     the in-jail name it was given; if a race severs that name from the
+//     inode before cleanup runs, cleanup cannot find it (see
+//     removeStagingFile) and the empty file is left behind. This is a
+//     hygiene residue, not a confidentiality one — the file carries no
+//     session content and never did.
+//   - Every one of the above — the ones this module prevents and the one it
+//     cannot fully unwind — ends in a thrown `SessionImportSecurityError`
+//     with a pinned `code`, never a raw fs error and never silently.
+//
+// Closing the empty-file residue completely needs a native `openat` binding
+// (so the create, every verification and the write are one fd from the
+// start, never a second path resolution), which the zero-dependency
+// constraint rules out.
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -105,6 +141,25 @@ const refuse = (code, detail, cause) =>
 const wrapFsError = (code, detail, err) =>
   refuse(code, `${detail} (${err?.code || "unknown"})`, err);
 
+// Runs a single raw `fs` call and turns ANY failure it produces into a typed
+// `SessionImportSecurityError`. This exists because several `fs` calls in the
+// staging/verification path used to be unwrapped: reachable with no race at
+// all (an ordinary ENOSPC or EIO from a real disk hits any of them), and each
+// one that fired surfaced as a bare `Error` with an absolute host path in its
+// message — falsifying the "every refusal is typed, no absolute path ever
+// reaches a message" contract on a path a real deployment will actually hit.
+// A `SessionImportSecurityError` thrown by the callback (one of this
+// module's own refusals, e.g. a nlink/identity check) passes straight
+// through unwrapped — this only ever touches genuinely raw fs errors.
+function guarded(code, detail, fn) {
+  try {
+    return fn();
+  } catch (err) {
+    if (err instanceof SessionImportSecurityError) throw err;
+    throw wrapFsError(code, detail, err);
+  }
+}
+
 // Claude session ids are UUIDs; Codex rollout ids are hex-ish. Both fit this
 // shared allow-list. manifest.sessionId crossed a machine boundary, so it is
 // untrusted input — reject anything that isn't a plain, single-segment token
@@ -134,10 +189,13 @@ function assertSafeSessionId(sessionId) {
 }
 
 // A single path component we are about to create. `.claude`/`projects`/
-// `sessions` are literals and `claudeProjectSlug` can only emit [A-Za-z0-9-],
-// so this can never fire today — it is here so the descent's guarantee ("each
-// step descends exactly one level") is enforced rather than assumed by whoever
-// adds the next component.
+// `sessions` are literals, and `claudeProjectSlug` can only emit
+// [A-Za-z0-9-] for a NON-EMPTY cwd — but it can fire today: an empty
+// `worktreePath` makes `claudeProjectSlug("") === ""`, and an empty
+// component here is refused rather than silently descending one level too
+// few (which would stage the transcript at `projects/<id>.jsonl` instead of
+// `projects/<slug>/<id>.jsonl` — still inside the jail, so not an escape,
+// but wrong). Covered directly by a test, not just assumed.
 function assertSafeComponent(component, position) {
   if (
     typeof component !== "string" ||
@@ -153,15 +211,22 @@ function assertSafeComponent(component, position) {
   return component;
 }
 
-// First layer of defense: even after validating the id, confirm the resolved
-// file actually lands inside the intended base directory before writing.
-// Compare against `base + path.sep` rather than a bare startsWith(base), so a
-// sibling directory that merely shares a prefix (e.g. base "/srv/relay" vs
-// "/srv/relay-evil") cannot pass the check. This is purely lexical
-// (path.resolve never touches the filesystem) — it is a cheap sanity net in
-// front of stageSessionFile below, which is the layer that actually holds the
-// jail. Exported so this layer has a direct test, independent of whatever
-// (currently) reaches it through importSession.
+// A lexical containment check: resolves both paths (never touches the
+// filesystem) and requires the file to be `base` itself or a genuine child of
+// it. Compares against `base + path.sep` rather than a bare startsWith(base),
+// so a sibling directory that merely shares a prefix (e.g. base "/srv/relay"
+// vs "/srv/relay-evil") cannot pass. Exported and directly unit-tested below.
+//
+// Honest note on the one call site in this module (inside stageSessionFile):
+// `leafName` there is always `${sessionId}.jsonl` with `sessionId` already
+// through `assertSafeSessionId`'s allow-list, so the joined path is provably
+// always a child of `stagingDir` — that call can never actually refuse
+// anything (confirmed by mutation testing: deleting it leaves the suite
+// green). It is not a "layer of defense" there; the per-component descent in
+// buildStagingDir/ensureRealChildDir is what actually holds the jail. The
+// call is kept only so this exported helper has a call site inside the
+// module that uses it, should a future change to leafName's construction
+// ever make the check meaningful again.
 function assertContained(baseDir, filePath) {
   const resolvedBase = path.resolve(baseDir);
   const resolvedFile = path.resolve(filePath);
@@ -191,11 +256,19 @@ function claudeProjectSlug(cwd) {
 // STARTS with (closing brackets, prose punctuation, shell operators), and do
 // not terminate on characters that real sibling names routinely start with
 // (`-` in "relay-old", `+` in "relay+plus", `~` in "relay~1", `(` in
-// "relay(copy)", `@` in "relay@2", `.` in "relay.bak", and of course
-// alphanumerics). Redacting the laptop path is weighted above preserving a
-// pathological sibling name, because the leak is a real privacy regression and
-// the sibling is at worst a corrupted line in the attacker's own transcript.
-const PATH_TERMINATOR = String.raw`[/"'\\\s\x60,;:!?=|&>)\]}]`;
+// "relay(copy)", `@` in "relay@2", `.` in "relay.bak", `#` in "relay#3", and
+// of course alphanumerics), nor on `$` (a transcript showing shell-style
+// concatenation directly after the path — "${FROM_CWD}$SUFFIX" — is at least
+// as plausible as a sibling name starting with `$`, and splitting that
+// concatenation would be a worse mistake than leaking it, so `$` is left as a
+// deliberate, documented leak alongside `(`, `#` and `@` above). Redacting the
+// laptop path is weighted above preserving a pathological sibling name,
+// because the leak is a real privacy regression and the sibling is at worst a
+// corrupted line in the attacker's own transcript — which is also why `*`,
+// `%` and `^` (a shell glob, a URL-encoded byte, a shell job-control
+// operator — none of them a plausible way for a real sibling NAME to START)
+// DO terminate below, even though round 4 left them unlisted.
+const PATH_TERMINATOR = String.raw`[/"'\\\s\x60,;:!?=|&>)\]}*%^]`;
 // ...plus a run of periods that is itself followed by a terminator or the end
 // of the line, so "working in /path/to/relay." and "…/relay... and then" are
 // rewritten while the sibling "/path/to/relay.bak" is not.
@@ -279,6 +352,25 @@ function resolveJailRoot(jailRoot) {
   if (!stat.isDirectory()) {
     throw refuse("jail_root_not_a_directory", "the jail root is not a directory");
   }
+  // Repair the root's own mode the same way every component below it is
+  // repaired: through an O_NOFOLLOW fd, not the path. Without this, an
+  // ADOPTED jail root — the common case, since relayd's own HOME already
+  // exists on every real run — was accepted at whatever mode it already had
+  // and never brought back to 0700, even though every level below it was.
+  let rootFd;
+  try {
+    rootFd = fs.openSync(jailRoot, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  } catch (err) {
+    throw wrapFsError("jail_root_unusable", "cannot open the jail root", err);
+  }
+  try {
+    const rootStat = guarded("jail_verify_failed", "cannot verify the jail root", () => fs.fstatSync(rootFd));
+    if ((rootStat.mode & 0o777) !== 0o700) {
+      guarded("jail_staging_io_failed", "cannot repair the jail root's mode", () => fs.fchmodSync(rootFd, 0o700));
+    }
+  } finally {
+    try { fs.closeSync(rootFd); } catch { /* fd is ours; nothing more to do */ }
+  }
   try {
     return fs.realpathSync(jailRoot);
   } catch (err) {
@@ -330,13 +422,19 @@ function ensureRealChildDir(parentReal, component, position, created) {
     throw wrapFsError("jail_open_dir_failed", `cannot open staging path component ${position}`, err);
   }
   try {
-    const stat = fs.fstatSync(fd);
+    const stat = guarded("jail_verify_failed", `cannot verify staging path component ${position}`, () => fs.fstatSync(fd));
     if (!stat.isDirectory()) {
       throw refuse("jail_escape_not_a_directory", `staging path component ${position} is not a directory`);
     }
-    if ((stat.mode & 0o777) !== 0o700) fs.fchmodSync(fd, 0o700);
+    if ((stat.mode & 0o777) !== 0o700) {
+      guarded("jail_staging_io_failed", `cannot repair the mode of staging path component ${position}`, () => fs.fchmodSync(fd, 0o700));
+    }
   } finally {
-    fs.closeSync(fd);
+    // Best-effort: release our own fd promptly. Must never replace whichever
+    // error (typed refusal or otherwise) is already propagating out of this
+    // block, and close(2) on an fd we just successfully used is not a
+    // realistic failure mode worth its own typed code.
+    try { fs.closeSync(fd); } catch { /* fd is ours; nothing more to do */ }
   }
   return child;
 }
@@ -452,7 +550,7 @@ function writeStagedFile(stagingDir, leafName, contents) {
   let stagedDev = null;
   let stagedIno = null;
   try {
-    const opened = fs.fstatSync(fd);
+    const opened = guarded("jail_verify_failed", "cannot verify the staging file after creation", () => fs.fstatSync(fd));
     stagedDev = opened.dev;
     stagedIno = opened.ino;
     if (!opened.isFile() || opened.nlink !== 1) {
@@ -462,27 +560,52 @@ function writeStagedFile(stagingDir, leafName, contents) {
     // directory we are about to write into) tells us where the bytes will
     // actually land. Compare by inode as well as by path: a path comparison
     // alone can be satisfied by a swapped-back symlink.
-    const landed = fs.lstatSync(staging);
+    const landed = guarded("jail_verify_failed", "cannot verify the staging file's location", () => fs.lstatSync(staging));
     if (landed.dev !== opened.dev || landed.ino !== opened.ino) {
       throw refuse("jail_escape_staging_race", "the staging file was replaced between creation and validation");
     }
-    if (fs.realpathSync(staging) !== staging) {
+    const resolvedStaging = guarded("jail_verify_failed", "cannot resolve the staging file's real path", () => fs.realpathSync(staging));
+    if (resolvedStaging !== staging) {
       throw refuse("jail_escape_staging_race", "the staging file is no longer where it was created");
     }
 
-    // From here on the fd — an inode, not a name — is the only thing written
-    // to, so no later swap can redirect the bytes.
-    fs.fchmodSync(fd, 0o600);
-    fs.writeFileSync(fd, contents);
+    guarded("jail_staging_io_failed", "cannot set the staging file's mode", () => fs.fchmodSync(fd, 0o600));
 
-    const written = fs.fstatSync(fd);
+    // Last look at the fd's own link count, immediately before the write and
+    // with NO fs call in between this check and it. The two checks above are
+    // still path-based (they re-resolve `staging` from `/`), so a two-window
+    // race — swap the staging directory for a symlink out of the jail before
+    // the open above, hard-link the resulting (still empty) file back into
+    // the restored real directory, then restore the directory — defeats them
+    // both: by the time they run, `staging` genuinely does resolve in-jail,
+    // to the same inode as `fd`, because it now IS one of that inode's two
+    // links. What that race cannot defeat is this: fstat(fd) reads the
+    // inode's live link count with no dependency on any path, and the extra
+    // link created by that attack exists well before this instant, so it is
+    // already visible here — BEFORE a single byte of session content is
+    // written. This is the check that keeps a lost race here to "an empty
+    // file the module created may be left outside the jail" rather than "the
+    // transcript itself may be left outside the jail" (see the module header
+    // RESIDUAL section for the guarantee this leaves in place).
+    const preWrite = guarded("jail_verify_failed", "cannot verify the staging file immediately before the write", () => fs.fstatSync(fd));
+    if (preWrite.nlink !== 1) {
+      throw refuse("jail_escape_staging_race", "the staging file was linked or replaced before the write could start");
+    }
+
+    guarded("jail_staging_io_failed", "cannot write the staging file", () => fs.writeFileSync(fd, contents));
+
+    const written = guarded("jail_verify_failed", "cannot verify the staging file after the write", () => fs.fstatSync(fd));
     if (written.nlink !== 1 || written.dev !== opened.dev || written.ino !== opened.ino) {
       // Someone hard-linked or replaced our staging file while we wrote it.
       throw refuse("jail_escape_staging_race", "the staging file was linked or replaced during the write");
     }
     ok = true;
   } finally {
-    fs.closeSync(fd);
+    // Best-effort: release our own fd promptly. Must never replace whichever
+    // error (typed refusal or otherwise) is already propagating out of this
+    // block, and close(2) on an fd we just successfully used is not a
+    // realistic failure mode worth its own typed code.
+    try { fs.closeSync(fd); } catch { /* fd is ours; nothing more to do */ }
     if (!ok) removeStagingFile(staging, stagedDev, stagedIno);
   }
 
@@ -523,8 +646,10 @@ function writeStagedFile(stagingDir, leafName, contents) {
 function stageSessionFile({ jailRoot, components, leafName, contents }) {
   const realRoot = resolveJailRoot(jailRoot);
   const stagingDir = buildStagingDir(realRoot, components);
-  // Cheap lexical net in front of the real machinery (and the layer
-  // `assertContained` is unit-tested through).
+  // See the note on `assertContained` above: for the current, fixed shape of
+  // `leafName` this call is unreachable by construction and cannot refuse
+  // anything. The real containment guarantee is the per-component descent in
+  // buildStagingDir/ensureRealChildDir above.
   assertContained(stagingDir, path.join(stagingDir, leafName));
   writeStagedFile(stagingDir, leafName, contents);
   return path.join(stagingDir, leafName);
