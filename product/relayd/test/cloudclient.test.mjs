@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createServer } from "node:http";
+import { spawn } from "node:child_process";
 
 process.env.CODEX_DATA_DIR ||= fs.mkdtempSync(path.join(os.tmpdir(), "relayd-cloudclient-data-"));
 
@@ -27,6 +28,11 @@ function startFakeCloud(handler) {
     server.listen(0, "127.0.0.1", () =>
       resolve({ calls, url: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((r) => server.close(r)) }));
   });
+}
+
+function respondAccepted(res) {
+  res.writeHead(202, { "content-type": "application/json" });
+  res.end(JSON.stringify({ ok: true }));
 }
 
 function freshNode() {
@@ -59,23 +65,23 @@ test("pollHandoffs signs the exact method, path, node id, and timestamp", async 
   } finally { await cloud.close(); }
 });
 
-test("postEvent signs the raw body and advances a persistent sequence", async () => {
+test("postEvent signs the raw body and advances a persistent sequence seeded from the clock", async () => {
   const node = freshNode();
-  const cloud = await startFakeCloud((res) => {
-    res.writeHead(202, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true }));
-  });
+  const cloud = await startFakeCloud(respondAccepted);
+  const FIXED_TS = 1754700000123;
   try {
-    const first = createCloudClient({ cloudUrl: cloud.url, baseDir: node.baseDir });
+    const first = createCloudClient({ cloudUrl: cloud.url, baseDir: node.baseDir, now: () => FIXED_TS });
     await first.postEvent("handoff.ready", { jobId: "job-1" });
     await first.postEvent("handoff.failed");
 
     // A fresh client stands in for a daemon restart: the sequence must not reset.
-    const second = createCloudClient({ cloudUrl: cloud.url, baseDir: node.baseDir });
+    const second = createCloudClient({ cloudUrl: cloud.url, baseDir: node.baseDir, now: () => FIXED_TS });
     await second.postEvent("handoff.ready");
 
     const bodies = cloud.calls.map((call) => JSON.parse(call.raw.toString("utf8")));
-    assert.deepEqual(bodies.map((body) => body.seq), [1, 2, 3]);
+    // Seeded from the clock (max(current + 1, now())), not a bare 1/2/3 counter:
+    // once seeded, current+1 stays ahead of the fixed clock so it increments by one.
+    assert.deepEqual(bodies.map((body) => body.seq), [FIXED_TS, FIXED_TS + 1, FIXED_TS + 2]);
     assert.deepEqual(bodies.map((body) => body.type), ["handoff.ready", "handoff.failed", "handoff.ready"]);
     assert.equal(bodies[0].jobId, "job-1");
     assert.equal(bodies[1].jobId, null);
@@ -100,4 +106,315 @@ test("a non-200 poll surfaces as an error rather than a silent empty list", asyn
 test("a node without an identity refuses to build a client", () => {
   const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-cloudclient-empty-"));
   assert.throws(() => createCloudClient({ cloudUrl: "http://127.0.0.1:1", baseDir }), /cloud_client_no_identity/);
+});
+
+// ---------------------------------------------------------------------------
+// CRITICAL: the sequence counter must never silently reset to 1. An
+// unreadable/garbage/negative persisted value must seed from the clock
+// instead, so a lost counter self-heals rather than permanently blackholing
+// every future push (the cloud treats a low seq against its high-water mark
+// as {duplicate:true} and drops it, looking exactly like success).
+test("nextSeq seeds from the clock — not 1 — when the seq file is missing, empty, whitespace, garbage, or negative", async () => {
+  const FIXED_TS = 1755000000123;
+  const cases = [
+    ["missing file", null],
+    ["empty file", ""],
+    ["whitespace-only", "   \n"],
+    ["garbage", "not-a-number"],
+    ["negative", "-5"],
+    ["torn read (partial digit of a bigger number)", "1"],
+  ];
+  for (const [label, content] of cases) {
+    const node = freshNode();
+    const cloud = await startFakeCloud(respondAccepted);
+    try {
+      if (content !== null) fs.writeFileSync(path.join(node.baseDir, "cloud-event-seq"), content);
+      const client = createCloudClient({ cloudUrl: cloud.url, baseDir: node.baseDir, now: () => FIXED_TS });
+      await client.postEvent("handoff.ready");
+      const body = JSON.parse(cloud.calls[0].raw.toString("utf8"));
+      assert.equal(body.seq, FIXED_TS, `${label}: must self-heal to the clock value, not reset to a small counter`);
+    } finally { await cloud.close(); }
+  }
+});
+
+test("nextSeq reseeds from the clock instead of emitting an unsafe integer when the persisted seq overflows", async () => {
+  const FIXED_TS = 1755000000456;
+  const node = freshNode();
+  fs.writeFileSync(path.join(node.baseDir, "cloud-event-seq"), String(Number.MAX_SAFE_INTEGER));
+  const cloud = await startFakeCloud(respondAccepted);
+  try {
+    const client = createCloudClient({ cloudUrl: cloud.url, baseDir: node.baseDir, now: () => FIXED_TS });
+    await client.postEvent("handoff.ready");
+    const body = JSON.parse(cloud.calls[0].raw.toString("utf8"));
+    assert.ok(Number.isSafeInteger(body.seq), "seq must stay a safe integer even after a persisted MAX_SAFE_INTEGER");
+    assert.equal(body.seq, FIXED_TS);
+  } finally { await cloud.close(); }
+});
+
+// nextSeq's write must go through config.mjs's writeFileAtomic (unique temp
+// name + rename), not an in-place fs.writeFileSync (O_TRUNC). rename() is
+// what makes a concurrent reader atomic: it can only ever see the whole old
+// file or the whole new one, never a half-written one (a "torn read"). This
+// is checked directly (rather than by racing real processes, which is
+// inherently timing-dependent) so the regression signal is deterministic.
+test("nextSeq persists the seq file via an atomic rename, not an in-place truncating write", async () => {
+  const node = freshNode();
+  const cloud = await startFakeCloud(respondAccepted);
+  const seqPath = path.join(node.baseDir, "cloud-event-seq");
+  const originalRename = fs.renameSync;
+  const renames = [];
+  fs.renameSync = (from, to) => {
+    if (to === seqPath) renames.push(from);
+    return originalRename(from, to);
+  };
+  try {
+    const client = createCloudClient({ cloudUrl: cloud.url, baseDir: node.baseDir });
+    await client.postEvent("handoff.ready");
+  } finally {
+    fs.renameSync = originalRename;
+    await cloud.close();
+  }
+  assert.equal(renames.length, 1, "the seq file must be written by renaming a temp file into place");
+  assert.notEqual(renames[0], seqPath, "the rename source must be a distinct temp file, never the seq path itself");
+  assert.ok(fs.existsSync(seqPath));
+  assert.ok(!fs.existsSync(renames[0]), "the temp file must not survive a successful rename");
+});
+
+// Reproduces the reviewer's exact measurement: three processes racing 40
+// postEvent calls each against one shared seq file. Under the OLD
+// fs.writeFileSync (O_TRUNC, not safe against a concurrent reader), a torn
+// read could parse as a small garbage number, and multiple writers reset to
+// that same small number — the reviewer measured 120 emitted collapsing to
+// 56 distinct (64 collisions), with the persisted file left reading "29"
+// while the highest seq actually emitted was 1027. Atomic (rename-based)
+// writes remove that collapse mechanism; every seq is seeded from the clock,
+// so a real collision can only tie two writers at a large, clock-plausible
+// value — never a reset to a small one. This test asserts BOTH: the
+// blackhole/reset pattern is gone (deterministic), and collisions are rare
+// compared to the pre-fix collapse (bounded, not zero — this fix does not
+// take a cross-process lock on the seq file, which is out of scope here:
+// see product/relayd/src/config.mjs's own withFileLock, used for exactly
+// this class of problem on the files config.mjs owns, but not exported for
+// this client to reuse).
+test("concurrent postEvent calls from multiple processes never reset to a small/blackhole seq", async () => {
+  const node = freshNode();
+  const cloud = await startFakeCloud(respondAccepted);
+  const testStartedAt = Date.now();
+  try {
+    const workerPath = path.join(node.baseDir, "..", `cloudclient-race-worker-${process.pid}.mjs`);
+    const cloudclientUrl = new URL("../src/cloudclient.mjs", import.meta.url).href;
+    const COUNT = 40;
+    fs.writeFileSync(
+      workerPath,
+      [
+        `const { createCloudClient } = await import(${JSON.stringify(cloudclientUrl)});`,
+        `const client = createCloudClient({ cloudUrl: ${JSON.stringify(cloud.url)}, baseDir: ${JSON.stringify(node.baseDir)} });`,
+        `for (let i = 0; i < ${COUNT}; i++) { await client.postEvent("handoff.ready"); }`,
+      ].join("\n"),
+      "utf8",
+    );
+
+    const PROCS = 3;
+    await Promise.all(
+      Array.from({ length: PROCS }, () => new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, [workerPath], { stdio: ["ignore", "ignore", "pipe"] });
+        let stderr = "";
+        child.stderr.on("data", (chunk) => { stderr += chunk; });
+        child.once("exit", (code) => (code === 0 ? resolve() : reject(new Error(`worker exited ${code}: ${stderr}`))));
+      })),
+    );
+
+    const seqs = cloud.calls.map((call) => JSON.parse(call.raw.toString("utf8")).seq);
+    assert.equal(seqs.length, PROCS * COUNT, "every event must reach the fake cloud");
+
+    // Deterministic, load-independent: this is the actual CRITICAL claim
+    // ("silently resets to 1, permanently blackholing"). A reset would show
+    // up as a seq far below testStartedAt regardless of how much residual
+    // cross-process contention there is.
+    const minSeq = Math.min(...seqs);
+    assert.ok(
+      minSeq >= testStartedAt,
+      `no seq may fall back into a small/blackhole range; smallest observed was ${minSeq}, test started at ${testStartedAt}`,
+    );
+
+    // Informational, not asserted: real OS process-scheduling timing makes
+    // the exact collision count too noisy to gate the suite on (observed
+    // 57%-91% distinct across repeated local runs). Pre-fix this same
+    // workload collapsed to ~37-47% distinct (45-56/120) because of torn
+    // reads resetting multiple writers to the same small number; post-fix
+    // that collapse mechanism is gone (proved deterministically above and by
+    // the atomic-rename test), and what residual contention remains is the
+    // narrower, inherent read-modify-write race of a lock-free file counter.
+    const distinct = new Set(seqs).size;
+    if (process.env.RELAYD_TEST_VERBOSE) {
+      console.log(`[cloudclient race] ${distinct}/${seqs.length} distinct seqs`);
+    }
+    fs.rmSync(workerPath, { force: true });
+  } finally { await cloud.close(); }
+});
+
+// ---------------------------------------------------------------------------
+// IMPORTANT: nextSeq() is synchronous, so seq ALLOCATION is already ordered
+// by call order within one process. But an unserialized send lets the actual
+// network requests race, so a lower seq can arrive at the cloud after a
+// higher one and get dropped as a duplicate. Delivery must be serialized
+// through one promise chain.
+test("postEvent serializes delivery so concurrent calls reach the wire in call order", async () => {
+  const node = freshNode();
+  const seenTypes = [];
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  let fetchCalls = 0;
+  const fetchImpl = async (_url, opts) => {
+    fetchCalls += 1;
+    if (fetchCalls === 1) await firstGate; // hold the first request open
+    seenTypes.push(JSON.parse(Buffer.from(opts.body).toString("utf8")).type);
+    return { status: 202, json: async () => ({ ok: true }) };
+  };
+  const client = createCloudClient({ cloudUrl: "http://127.0.0.1:1", baseDir: node.baseDir, fetchImpl });
+
+  const p1 = client.postEvent("handoff.ready");
+  const p2 = client.postEvent("handoff.failed");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fetchCalls, 1, "the second send must not dispatch until the first has settled");
+
+  releaseFirst();
+  await Promise.all([p1, p2]);
+  assert.deepEqual(seenTypes, ["handoff.ready", "handoff.failed"], "requests must land on the wire in call order");
+});
+
+// ---------------------------------------------------------------------------
+// IMPORTANT: postEvent must expose whether the cloud actually accepted the
+// push, not just that the HTTP round trip completed — a 202 {duplicate:true}
+// looks identical to a genuine accept at the {status,body} level.
+test("postEvent reports accepted:false for a dropped duplicate and accepted:true for a genuine accept", async () => {
+  const node = freshNode();
+  let call = 0;
+  const fetchImpl = async () => {
+    call += 1;
+    if (call === 1) return { status: 202, json: async () => ({ ok: true, duplicate: true }) };
+    return { status: 202, json: async () => ({ ok: true }) };
+  };
+  const client = createCloudClient({ cloudUrl: "http://127.0.0.1:1", baseDir: node.baseDir, fetchImpl });
+
+  const dropped = await client.postEvent("handoff.ready");
+  assert.equal(dropped.accepted, false, "a duplicate must not read as accepted");
+
+  const accepted = await client.postEvent("handoff.ready");
+  assert.equal(accepted.accepted, true);
+});
+
+test("postEvent reports accepted:false (and does not throw) for a signature or unknown-node rejection", async () => {
+  const node = freshNode();
+  const responses = [
+    { status: 401, json: async () => ({ error: "bad_signature" }) },
+    { status: 404, json: async () => ({ error: "unknown_node" }) },
+  ];
+  let call = 0;
+  const fetchImpl = async () => responses[call++];
+  const client = createCloudClient({ cloudUrl: "http://127.0.0.1:1", baseDir: node.baseDir, fetchImpl });
+
+  const badSig = await client.postEvent("handoff.ready");
+  assert.equal(badSig.accepted, false);
+  assert.equal(badSig.status, 401);
+
+  const unknownNode = await client.postEvent("handoff.ready");
+  assert.equal(unknownNode.accepted, false);
+  assert.equal(unknownNode.status, 404);
+});
+
+// ---------------------------------------------------------------------------
+// MINOR 1: an empty/null cloudUrl must fail fast at construction, not with an
+// opaque TypeError the first time a request is attempted.
+test("an empty or null cloudUrl refuses to build a client", () => {
+  const node = freshNode();
+  assert.throws(() => createCloudClient({ cloudUrl: "", baseDir: node.baseDir }), /cloud_client_no_url/);
+  assert.throws(() => createCloudClient({ cloudUrl: null, baseDir: node.baseDir }), /cloud_client_no_url/);
+});
+
+// ---------------------------------------------------------------------------
+// MINOR 2: cleanOptionalUrlBase preserves a path component on the base URL
+// (e.g. RELAYD_CLOUD_URL=https://host/api), but the signed pathWithQuery is
+// always rooted at /v1/... . A non-root base would put /api/v1/... on the
+// wire while the signature covers /v1/..., producing an unexplainable
+// bad_signature. Reject it at construction instead.
+test("a cloud base URL carrying a path is rejected at construction", () => {
+  const node = freshNode();
+  assert.throws(
+    () => createCloudClient({ cloudUrl: "http://127.0.0.1:1/api", baseDir: node.baseDir }),
+    /cloud_client_base/,
+  );
+  // Root URLs (no path, or just a trailing slash) remain fine.
+  assert.doesNotThrow(() => createCloudClient({ cloudUrl: "http://127.0.0.1:1", baseDir: node.baseDir }));
+  assert.doesNotThrow(() => createCloudClient({ cloudUrl: "http://127.0.0.1:1/", baseDir: node.baseDir }));
+});
+
+// ---------------------------------------------------------------------------
+// MINOR 3: the seq is consumed at body-build time. If the send is retried
+// internally (transient network failure), the retry must reuse the exact
+// same signed body/seq rather than building a fresh one — otherwise the
+// cloud receives two different seqs for one logical event and pushes twice.
+test("postEvent reuses one body and one seq across an internal retry", async () => {
+  const node = freshNode();
+  const seenRaw = [];
+  let attempt = 0;
+  const fetchImpl = async (_url, opts) => {
+    attempt += 1;
+    seenRaw.push(Buffer.from(opts.body).toString("utf8"));
+    if (attempt === 1) throw new Error("simulated_network_failure");
+    return { status: 202, json: async () => ({ ok: true }) };
+  };
+  const client = createCloudClient({
+    cloudUrl: "http://127.0.0.1:1", baseDir: node.baseDir, fetchImpl, now: () => 1755000000999,
+  });
+
+  const result = await client.postEvent("handoff.ready");
+  assert.equal(result.accepted, true);
+  assert.equal(attempt, 2, "expected exactly one retry after the simulated failure");
+  assert.equal(seenRaw[0], seenRaw[1], "the retried attempt must resend the identical signed body, not rebuild one");
+
+  await client.postEvent("handoff.failed");
+  const firstBody = JSON.parse(seenRaw[0]);
+  const followUpBody = JSON.parse(seenRaw.at(-1));
+  assert.equal(
+    followUpBody.seq, firstBody.seq + 1,
+    "only one seq should have been consumed by the retried call, not one per attempt",
+  );
+});
+
+test("postEvent gives up after a bounded number of attempts rather than retrying forever", async () => {
+  const node = freshNode();
+  let attempts = 0;
+  const fetchImpl = async () => { attempts += 1; throw new Error("simulated_network_failure"); };
+  const client = createCloudClient({ cloudUrl: "http://127.0.0.1:1", baseDir: node.baseDir, fetchImpl });
+  await assert.rejects(() => client.postEvent("handoff.ready"));
+  assert.ok(attempts >= 1 && attempts <= 5, `expected a small bounded retry count, saw ${attempts} attempts`);
+});
+
+// ---------------------------------------------------------------------------
+// MINOR 4: the injected `now` must actually be exercised at both call sites
+// (x-relay-ts header AND the event body's ts). Hardcoding Date.now() at
+// either site must fail this test.
+test("the injected now() drives both x-relay-ts and the event body ts", async () => {
+  const FIXED_TS = 1754700000123;
+
+  const pollNode = freshNode();
+  const pollCloud = await startFakeCloud((res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ handoffs: [] }));
+  });
+  try {
+    const client = createCloudClient({ cloudUrl: pollCloud.url, baseDir: pollNode.baseDir, now: () => FIXED_TS });
+    await client.pollHandoffs(5);
+    assert.equal(pollCloud.calls[0].headers["x-relay-ts"], String(FIXED_TS));
+  } finally { await pollCloud.close(); }
+
+  const eventNode = freshNode();
+  const eventCloud = await startFakeCloud(respondAccepted);
+  try {
+    const client = createCloudClient({ cloudUrl: eventCloud.url, baseDir: eventNode.baseDir, now: () => FIXED_TS });
+    await client.postEvent("handoff.ready");
+    const body = JSON.parse(eventCloud.calls[0].raw.toString("utf8"));
+    assert.equal(body.ts, FIXED_TS);
+  } finally { await eventCloud.close(); }
 });

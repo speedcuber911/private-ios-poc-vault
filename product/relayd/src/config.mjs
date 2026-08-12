@@ -785,6 +785,7 @@ export {
   pairingListenerStatePath,
   recordPairingListener,
   readPairingListener,
+  writeFileAtomic,
   pairingDir,
   dataDir,
   jobsDir,
