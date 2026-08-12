@@ -28,6 +28,9 @@ import {
   cloudUrl,
   handoffEnabled,
   handoffPollWaitSec,
+  dataDir,
+  runHome,
+  codexHome,
 } from "./config.mjs";
 import { loadPersistedJobs, processQueue } from "./jobs.mjs";
 import { routeRequest } from "./server.mjs";
@@ -129,26 +132,53 @@ function startPairing() {
 
 startPairing();
 
-// --- handoff pickup loop ----------------------------------------------------
+// --- handoff + credential-sync pickup loop ----------------------------------
 //
 // Long-polls the control plane for pending `relay handoff` pickups and, when
 // one lands, imports it (clone, decrypt, stage for --resume, register a
-// workspace). Optional and best-effort: unlike the data/pairing listeners,
-// this node is fully usable without it, so a missing node identity or a
-// cloud client that fails to construct is logged rather than fatal — it must
-// not take an otherwise healthy node (and its running jobs) offline.
+// workspace). The same poll also carries credential-sync notices: `relay
+// sync-auth` seals the operator's GitHub token and harness logins to this
+// node's X25519 key, drops them in a rendezvous slot and announces it, and
+// installFromNotice collects, verifies the MAC, unseals and installs them.
+// One held connection carries both.
+//
+// Optional and best-effort: unlike the data/pairing listeners, this node is
+// fully usable without it, so a missing node identity or a cloud client that
+// fails to construct is logged rather than fatal — it must not take an
+// otherwise healthy node (and its running jobs) offline. It does mean
+// RELAYD_HANDOFF_ENABLED=false switches off credential sync too, which the
+// message below says out loud rather than leaving the operator to discover.
 async function startHandoffPickup() {
   if (!handoffEnabled || !cloudUrl) {
-    console.log("relayd: handoff loop disabled (RELAYD_HANDOFF_ENABLED=false or no RELAYD_CLOUD_URL)");
+    console.log(
+      "relayd: handoff + credential-sync loop disabled (RELAYD_HANDOFF_ENABLED=false or no RELAYD_CLOUD_URL); " +
+        "`relay sync-auth` credentials will never be collected while it is off",
+    );
     return;
   }
   try {
     const { createCloudClient } = await import("./cloudclient.mjs");
     const { startHandoffLoop, completeHandoffJob } = await import("./handoff.mjs");
     const { setHandoffCompletionHook } = await import("./jobs.mjs");
+    const { installFromNotice } = await import("./syncauth.mjs");
     setHandoffCompletionHook(completeHandoffJob);
-    startHandoffLoop({ cloud: createCloudClient({ cloudUrl }), waitSec: handoffPollWaitSec });
-    console.log(`relayd: handoff loop started against ${cloudUrl}`);
+    // `cloud` is referenced inside the handler, which only ever runs after
+    // createCloudClient has returned and this binding is initialized.
+    const cloud = createCloudClient({
+      cloudUrl,
+      onNotice: (notice) =>
+        installFromNotice(notice, {
+          cloudUrl,
+          runHome,
+          codexHome,
+          dataDir,
+          // So a failed sync also reaches the user's phone, not just this
+          // node's audit log and event feed.
+          postEvent: (type) => cloud.postEvent(type),
+        }),
+    });
+    startHandoffLoop({ cloud, waitSec: handoffPollWaitSec });
+    console.log(`relayd: handoff + credential-sync loop started against ${cloudUrl}`);
   } catch (error) {
     console.error(`relayd: handoff loop failed to start — ${error?.message || String(error)}`);
     appendAudit("handoff_loop_start_failed", null, { error: error?.message || String(error) });
