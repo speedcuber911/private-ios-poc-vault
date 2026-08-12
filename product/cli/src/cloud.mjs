@@ -4,7 +4,19 @@
 // which prints a fixed re-login hint and exits when the refresh token is dead.
 import { readCredentials, writeCredentials } from "./creds.mjs";
 
-const DEFAULT_BASE_URL = process.env.RELAY_CLOUD_URL || "https://api.relay.example";
+// The control plane this CLI ships pointed at. Baked in rather than required
+// from the environment: a tool that cannot find its own service until the user
+// exports a variable nobody documents is broken on first run, and the first
+// thing it does — `relay login` — is exactly where a new user has the least
+// context to debug it. This is the same host the iOS app carries as its
+// `authBaseURL` fallback (POCVaultApp.swift), and the two must agree: the CLI
+// and the phone approve the same device code, so a CLI pointed at a different
+// control plane cannot be approved at all.
+//
+// RELAY_CLOUD_URL overrides it for local development against a cloud on
+// 127.0.0.1. That is the exception, so it reads as one.
+const PRODUCTION_BASE_URL = "https://relay.ai-rocket-experiments.com";
+const DEFAULT_BASE_URL = process.env.RELAY_CLOUD_URL || PRODUCTION_BASE_URL;
 const REFRESH_SKEW_MS = 60_000;
 
 function decodeJwtPayload(token) {
@@ -47,7 +59,19 @@ function createCloudApi({
       init.headers["content-type"] = "application/json";
       init.body = JSON.stringify(body);
     }
-    const res = await fetchImpl(`${base}${pathname}`, init);
+    // fetch rejects with a bare "fetch failed" for every transport failure —
+    // DNS, refused connection, TLS — and bin/relay prints error.message
+    // verbatim, so the one error a misconfigured install hits most is also the
+    // least diagnosable. Name the host we actually tried; without it the user
+    // cannot tell a down control plane from a stale RELAY_CLOUD_URL. The
+    // pathname is deliberately omitted: it tells the user nothing and leaks
+    // the route into terminal scrollback.
+    let res;
+    try {
+      res = await fetchImpl(`${base}${pathname}`, init);
+    } catch (error) {
+      throw new Error(`cannot_reach_cloud: ${base} did not respond`, { cause: error });
+    }
     const json = await res.json().catch(() => null);
     return { status: res.status, json };
   }
@@ -117,4 +141,4 @@ function createCloudApi({
   };
 }
 
-export { createCloudApi, DEFAULT_BASE_URL, decodeJwtPayload, sessionExpiringSoon };
+export { createCloudApi, DEFAULT_BASE_URL, PRODUCTION_BASE_URL, decodeJwtPayload, sessionExpiringSoon };
