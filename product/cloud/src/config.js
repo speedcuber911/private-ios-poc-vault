@@ -48,6 +48,13 @@ export function loadConfig(env = process.env) {
     deviceCodeTtlSec: intFrom(env.DEVICE_CODE_TTL_SEC, 900),
     deviceCodePollIntervalSec: intFrom(env.DEVICE_CODE_POLL_INTERVAL_SEC, 5),
     deviceLoginUrl: env.DEVICE_LOGIN_URL || "https://relay.example/cli-login",
+    // Ceiling on simultaneously redeemable device codes. POST
+    // /v1/auth/device/start is unauthenticated by construction — the CLI has no
+    // session yet — so without a cap anyone can grow the table for free and
+    // every poll pays for it. Sized well above real demand: the deployed edge
+    // allows ~9,000 starts per IP per code lifetime, so this is the difference
+    // between a bounded table and an unbounded one, not a per-user quota.
+    deviceCodeMaxLive: intFrom(env.DEVICE_CODE_MAX_LIVE, 2000),
 
     // Pairing rendezvous
     pairingTtlSec: intFrom(env.PAIRING_TTL_SEC, 15 * 60),

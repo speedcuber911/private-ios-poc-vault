@@ -108,22 +108,64 @@ const ALERT_INTERVAL_MS = 60 * 1000;
 
 const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 
+// Points whose order divides 8. For every one of these a signature can be
+// constructed with NO private key: taking the identity point A, the pair
+// (R = A, S = 0) collapses the verification equation to A = A and therefore
+// verifies against any message whatsoever. A node registered with such a
+// pubkey is an auth boundary that returns a node for a request nobody
+// signed, and a node whose key material is zeroed or corrupted to one of
+// these values fails OPEN rather than closed.
+//
+// OpenSSL does not refuse these on import, so we refuse them here. The list
+// is libsodium's ed25519_small_order() blacklist: 0, 1, the two order-8
+// points, and p-1 / p / p+1. relayd's seal.mjs applies the equivalent rule to
+// the X25519 half of a node's identity (a non-canonical or degenerate
+// recipient key is `seal_bad_public_key`); the two key types live on the same
+// node row and are set by the same enrolment paths, so a key shape rejected
+// on one side must not be accepted on the other.
+const ED25519_SMALL_ORDER_POINTS = [
+  "0000000000000000000000000000000000000000000000000000000000000000",
+  "0100000000000000000000000000000000000000000000000000000000000000",
+  "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+  "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+  "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+  "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+  "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+].map((hex) => Buffer.from(hex, "hex"));
+
+// Byte 31's high bit is the x-coordinate sign, which does not change a
+// point's order — mask it before comparing, exactly as libsodium does, so the
+// sign-bit variant of each encoding is refused too. Public keys are not
+// secret, so a plain compare is fine here.
+function isSmallOrderEd25519(raw) {
+  const probe = Buffer.from(raw);
+  probe[31] &= 0x7f;
+  return ED25519_SMALL_ORDER_POINTS.some((point) => probe.equals(point));
+}
+
 // Accepts either an SPKI PEM ("-----BEGIN PUBLIC KEY-----…") or base64 of the
 // raw 32-byte ed25519 public key. Returns a KeyObject or null.
 export function parseNodePubkey(pubkey) {
   try {
     if (typeof pubkey !== "string" || !pubkey) return null;
+    let key;
     if (pubkey.includes("BEGIN PUBLIC KEY")) {
-      const key = createPublicKey(pubkey);
-      return key.asymmetricKeyType === "ed25519" ? key : null;
+      key = createPublicKey(pubkey);
+      if (key.asymmetricKeyType !== "ed25519") return null;
+    } else {
+      const raw = Buffer.from(pubkey, "base64");
+      if (raw.length !== 32) return null;
+      key = createPublicKey({
+        key: Buffer.concat([ED25519_SPKI_PREFIX, raw]),
+        format: "der",
+        type: "spki",
+      });
     }
-    const raw = Buffer.from(pubkey, "base64");
-    if (raw.length !== 32) return null;
-    return createPublicKey({
-      key: Buffer.concat([ED25519_SPKI_PREFIX, raw]),
-      format: "der",
-      type: "spki",
-    });
+    // Re-export rather than trusting the input encoding: both branches end up
+    // holding the same 32 raw bytes, and only those bytes decide the order.
+    const raw = key.export({ type: "spki", format: "der" }).subarray(ED25519_SPKI_PREFIX.length);
+    if (raw.length !== 32 || isSmallOrderEd25519(raw)) return null;
+    return key;
   } catch {
     return null;
   }

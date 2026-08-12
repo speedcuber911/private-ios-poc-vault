@@ -305,12 +305,31 @@ export function createApp({
     // session, lives below the session-auth boundary because only a
     // signed-in human may approve a pending code.
     if (method === "POST" && path === "/v1/auth/device/start") {
+      // Reclaim first, then check the ceiling: expired and redeemed rows are
+      // not live capacity, and reclaiming here (rather than only on the 60 s
+      // sweep tick) is what stops a burst that has already aged out from
+      // pinning the gate shut. The DELETE rides idx_device_codes_expires.
+      registry.sweepDeviceCodes(now());
+      if (registry.countLiveDeviceCodes(now()) >= config.deviceCodeMaxLive) {
+        return sendJson(res, 429, { error: "slow_down" });
+      }
       const deviceCode = randomBytes(32).toString("base64url");
-      const record = registry.createDeviceCode({
-        deviceCodeHash: sha256Hex(deviceCode),
-        userCode: mintUserCode(),
-        expiresAt: now() + config.deviceCodeTtlSec * 1000,
-      });
+      // A user_code collision is a UNIQUE constraint violation that would
+      // otherwise reach the top-level handler as 500 {"error":"internal"}.
+      // Vanishingly unlikely, but retrying removes the class.
+      let record;
+      for (let attempt = 1; ; attempt++) {
+        try {
+          record = registry.createDeviceCode({
+            deviceCodeHash: sha256Hex(deviceCode),
+            userCode: mintUserCode(),
+            expiresAt: now() + config.deviceCodeTtlSec * 1000,
+          });
+          break;
+        } catch (err) {
+          if (attempt >= 5) throw err;
+        }
+      }
       return sendJson(res, 201, {
         deviceCode,
         userCode: record.userCode,
@@ -549,7 +568,14 @@ export function createApp({
       if (!record || record.consumedAt !== null || record.expiresAt <= now()) {
         return sendJson(res, 404, { error: "unknown_user_code" });
       }
-      registry.approveDeviceCode(record.id, account.id);
+      // Approval is one-shot, and the decision is the registry's atomic
+      // UPDATE, not the read above: a code already bound to an account — this
+      // one or anyone else's — must fail rather than be silently rebound.
+      // Same 404 as every other refusal, so nothing here tells a caller
+      // whether the code exists, is already approved, or was never real.
+      if (!registry.approveDeviceCode(record.id, account.id)) {
+        return sendJson(res, 404, { error: "unknown_user_code" });
+      }
       return sendJson(res, 200, { ok: true });
     }
 
@@ -989,14 +1015,29 @@ function sha256Hex(value) {
   return createHash("sha256").update(String(value)).digest("hex");
 }
 
-// No vowels — no accidental words; no 0/O/1/I — no misreads over a phone or
-// a squinted-at terminal.
+// No vowels, so no code ever spells a word. The 0/O and 1/I pairs are gone,
+// which removes the two worst misreads — but S/5, Z/2, B/8 and G/6 remain and
+// are still confusable in most terminal fonts, so this alphabet reduces
+// retypes rather than eliminating them. A misread costs a 404 and a retype,
+// never a wrong approval.
 const USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ23456789";
 
+// Rejection sampling, not `% 28`: 256 % 28 = 4, so a plain modulo would hand
+// the first four characters a 10/256 chance against 9/256 for the rest. The
+// entropy cost of the bias is 0.0065 bits over the whole 8-character code, so
+// this is hygiene rather than a fix — but an auth code should be exactly
+// uniform, and the loop is three lines.
+const USER_CODE_MAX_UNBIASED = 256 - (256 % USER_CODE_ALPHABET.length);
+
 function mintUserCode() {
-  const bytes = randomBytes(8);
   let code = "";
-  for (const byte of bytes) code += USER_CODE_ALPHABET[byte % USER_CODE_ALPHABET.length];
+  while (code.length < 8) {
+    for (const byte of randomBytes(8)) {
+      if (byte >= USER_CODE_MAX_UNBIASED) continue;
+      code += USER_CODE_ALPHABET[byte % USER_CODE_ALPHABET.length];
+      if (code.length === 8) break;
+    }
+  }
   return `${code.slice(0, 4)}-${code.slice(4)}`;
 }
 
