@@ -706,8 +706,47 @@ export function createApp({
         const sandboxId = typeof created?.sandboxId === "string" ? created.sandboxId : "";
         if (!sandboxId) throw new Error("provisioner_missing_sandbox_id");
         registry.updateTrial(trial.id, { sandboxId });
+
+        // The envVars above are NOT how the sandbox is configured. Cube
+        // restores every sandbox from a snapshot of the template's running
+        // machine, so its init process is already up with a frozen
+        // environment and never observes them; they are kept only because a
+        // directly-booted node (and the in-process test mock) still reads
+        // them. The real delivery is this file, written into the running
+        // sandbox through envd, which the boot script is waiting for.
+        //
+        // It is written AFTER sandboxId is recorded, so a crash in between
+        // leaves a reapable trial rather than an unreferenced machine.
+        await provisioner.writeSandboxFile(
+          sandboxId,
+          "/var/lib/relayd/enroll.json",
+          JSON.stringify({
+            cloudUrl: config.enrollBaseUrl || `http://${config.host}:${config.port}`,
+            token: enrollToken,
+            pairingId,
+            pairingSecret,
+            tunnelHost: config.tunnel.host,
+            tunnelPort: String(config.tunnel.port),
+            tunnelSuffix: config.tunnel.suffix,
+          }),
+        );
       } catch {
-        registry.updateTrial(trial.id, { state: "failed", enrollTokenHash: null });
+        // A failure AFTER the sandbox exists (config delivery is the likely
+        // one) would otherwise strand it: the reaper's due-list covers only
+        // `creating` and `ready`, so a `failed` row still holding a sandbox id
+        // is never revisited and the machine runs to its platform timeout.
+        // Destroy it best-effort and clear the id, so the row that remains
+        // describes nothing rather than something unreachable.
+        const stranded = registry.getTrialById(trial.id)?.sandboxId;
+        if (stranded) {
+          try {
+            await provisioner.killSandbox(stranded);
+          } catch {
+            // Nothing further to try here; metadata.trialId is set on the
+            // sandbox so reconciliation can still find it.
+          }
+        }
+        registry.updateTrial(trial.id, { state: "failed", enrollTokenHash: null, sandboxId: null });
         return sendJson(res, 502, { error: "provision_failed" });
       }
       return sendJson(res, 201, { trial: publicTrial(registry.getTrialById(trial.id), config, registry) });

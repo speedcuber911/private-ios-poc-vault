@@ -16,7 +16,7 @@ async function createTrial(t) {
 
 function fakeProvisioner() {
   const created = [];
-  return { created, async createSandbox(o) { created.push(o); return { sandboxId: "sbx_1" }; }, async killSandbox() { return true; }, async pauseSandbox() { return true; } };
+  return { created, async createSandbox(o) { created.push(o); return { sandboxId: "sbx_1" }; }, async writeSandboxFile() { return true; }, async killSandbox() { return true; }, async pauseSandbox() { return true; } };
 }
 
 test("enroll: valid token registers the node and burns the token", async () => {

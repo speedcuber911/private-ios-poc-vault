@@ -116,15 +116,55 @@ async function cmdPair() {
 // Everything sensitive (RELAYD_ENROLL_TOKEN, RELAYD_ENROLL_PAIRING_SECRET)
 // arrives via env, never argv, and is never printed — only the resulting node
 // id / sni / device id are logged.
+// Enrollment inputs come from the environment for a directly-launched node,
+// or from a JSON file named by RELAYD_ENROLL_CONFIG.
+//
+// The file exists because of how Cube (and E2B) actually start a machine: a
+// sandbox is RESTORED FROM A TEMPLATE SNAPSHOT rather than booted from the
+// image, so this process is already running — captured mid-boot in the
+// snapshot — before the control plane knows which trial it belongs to.
+// Environment variables supplied at sandbox-create time therefore never reach
+// it; they only apply to processes started afterwards. The control plane
+// writes this file into the running sandbox instead, and the values are read
+// straight out of it rather than being spliced into process.env, so they
+// cannot be inherited by anything the daemon later spawns.
+function enrollInputs() {
+  const str = (value) => (typeof value === "string" ? value.trim() : "");
+  const configPath = str(process.env.RELAYD_ENROLL_CONFIG);
+  if (!configPath) {
+    return {
+      cloudUrl: str(process.env.RELAYD_ENROLL_URL),
+      token: str(process.env.RELAYD_ENROLL_TOKEN),
+      pairingId: str(process.env.RELAYD_ENROLL_PAIRING_ID),
+      pairingSecret: str(process.env.RELAYD_ENROLL_PAIRING_SECRET),
+    };
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  } catch (error) {
+    // Deliberately reports only the path and the failure kind: the file's
+    // contents are the enroll token and pairing secret.
+    fail(`cannot read enroll config ${configPath}: ${error.code || error.name}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    fail(`enroll config ${configPath} is not a JSON object`);
+  }
+  return {
+    cloudUrl: str(parsed.cloudUrl),
+    token: str(parsed.token),
+    pairingId: str(parsed.pairingId),
+    pairingSecret: str(parsed.pairingSecret),
+  };
+}
+
 async function cmdEnroll(args) {
   const noPair = args.includes("--no-pair");
   const pairOnly = args.includes("--pair-only");
   if (noPair && pairOnly) fail("--no-pair and --pair-only are mutually exclusive");
 
-  const cloudUrl = (process.env.RELAYD_ENROLL_URL || "").trim();
-  const token = (process.env.RELAYD_ENROLL_TOKEN || "").trim();
-  const pairingId = (process.env.RELAYD_ENROLL_PAIRING_ID || "").trim();
-  const pairingSecret = (process.env.RELAYD_ENROLL_PAIRING_SECRET || "").trim();
+  const { cloudUrl, token, pairingId, pairingSecret } = enrollInputs();
 
   if (!cloudUrl || (!pairOnly && !token)) {
     fail("enroll requires RELAYD_ENROLL_URL and RELAYD_ENROLL_TOKEN");

@@ -72,5 +72,37 @@ export function createProvisioner(config) {
       if (!res.ok && res.status !== 204) throw new Error(`provisioner_http_${res.status}`);
       return true;
     },
+
+    // Writes a file into a RUNNING sandbox through envd, the in-container
+    // daemon the platform reaches on :49983.
+    //
+    // This is the only way to configure a sandbox, because Cube does not boot
+    // the image per sandbox: it snapshots the template's running machine and
+    // restores every sandbox from that snapshot, so the init process is
+    // already running with a frozen environment before we know which trial it
+    // belongs to. Create-time `envVars` reach only processes started
+    // afterwards — verified live: a sandbox ran for ten minutes with the
+    // enroll token set at create and the control plane saw zero enroll
+    // attempts.
+    //
+    // The path is `/envd/<sandboxId>/...` on the same API-key-gated endpoint
+    // as the rest of this client; the gate rewrites the Host header to the
+    // per-sandbox name envd is addressed by. Body bytes are sent raw.
+    async writeSandboxFile(sandboxId, filePath, content) {
+      if (typeof sandboxId !== "string" || !/^[0-9a-f]+$/.test(sandboxId)) {
+        throw new Error("provisioner_invalid_sandbox_id");
+      }
+      const res = await fetch(
+        `${apiUrl}/envd/${sandboxId}/files?path=${encodeURIComponent(filePath)}`,
+        {
+          method: "POST",
+          headers: { "x-api-key": apiKey, "content-type": "application/octet-stream" },
+          body: content,
+          signal: AbortSignal.timeout(config.trial.provisionerTimeoutMs),
+        },
+      );
+      if (!res.ok) throw new Error(`provisioner_http_${res.status}`);
+      return true;
+    },
   };
 }

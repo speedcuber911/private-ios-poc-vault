@@ -11,6 +11,7 @@ test("reaper: expiry pauses, grace destroys, idempotent", async () => {
   const killed = [];
   const provisioner = {
     async createSandbox() { return { sandboxId: "sbx_1" }; },
+    async writeSandboxFile() { return true; },
     async pauseSandbox(id) { paused.push(id); return true; },
     async killSandbox(id) { killed.push(id); return true; },
   };

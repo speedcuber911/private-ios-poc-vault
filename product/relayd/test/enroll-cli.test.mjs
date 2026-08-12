@@ -174,3 +174,79 @@ test("relayd enroll fails cleanly without env", async () => {
     },
   );
 });
+
+// Cube restores every sandbox from a snapshot of the template's running
+// machine, so the boot process is already up with a frozen environment before
+// the control plane knows which trial it serves — create-time env vars only
+// ever reach processes started afterwards. Enrollment inputs therefore arrive
+// as a file written into the running sandbox through envd, and this is the
+// path the trial bootstrap actually takes.
+test("relayd enroll reads its inputs from RELAYD_ENROLL_CONFIG", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-cli-cfg-"));
+  const calls = [];
+  const cloud = await new Promise((resolve) => {
+    const server = createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        calls.push(JSON.parse(body));
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, sni: `${JSON.parse(body).nodeId}.tun.test` }));
+      });
+    });
+    server.listen(0, "127.0.0.1", () => resolve({ server, url: `http://127.0.0.1:${server.address().port}` }));
+  });
+  const configPath = path.join(dataDir, "enroll.json");
+  fs.writeFileSync(
+    configPath,
+    JSON.stringify({ cloudUrl: cloud.url, token: "tok-from-file" }),
+    { mode: 0o600 },
+  );
+  try {
+    const { stdout } = await execFileAsync(process.execPath, [relaydBin, "enroll", "--no-pair"], {
+      env: {
+        ...process.env,
+        CODEX_DATA_DIR: dataDir,
+        RELAYD_ENROLL_CONFIG: configPath,
+        // Deliberately absent from the environment: the file is the source.
+        RELAYD_ENROLL_URL: "",
+        RELAYD_ENROLL_TOKEN: "",
+      },
+    });
+    assert.match(stdout, /enrolled node-[0-9a-f]{16}/);
+    assert.equal(calls[0].token, "tok-from-file");
+    assert.ok(!stdout.includes("tok-from-file"), "token must never be printed");
+  } finally {
+    cloud.server.close();
+  }
+});
+
+test("relayd enroll fails clearly on an unreadable config, without leaking it", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-cli-badcfg-"));
+  const missing = path.join(dataDir, "absent.json");
+  await assert.rejects(
+    () =>
+      execFileAsync(process.execPath, [relaydBin, "enroll", "--no-pair"], {
+        env: { ...process.env, CODEX_DATA_DIR: dataDir, RELAYD_ENROLL_CONFIG: missing },
+      }),
+    (error) => {
+      assert.match(error.stderr, /cannot read enroll config/);
+      assert.match(error.stderr, /ENOENT/);
+      return true;
+    },
+  );
+
+  const malformed = path.join(dataDir, "bad.json");
+  fs.writeFileSync(malformed, '{"token": "s3cr3t-should-not-appear"');
+  await assert.rejects(
+    () =>
+      execFileAsync(process.execPath, [relaydBin, "enroll", "--no-pair"], {
+        env: { ...process.env, CODEX_DATA_DIR: dataDir, RELAYD_ENROLL_CONFIG: malformed },
+      }),
+    (error) => {
+      // The parse failure must name the file, never echo its contents.
+      assert.ok(!error.stderr.includes("s3cr3t-should-not-appear"), "config contents must not be printed");
+      return true;
+    },
+  );
+});
