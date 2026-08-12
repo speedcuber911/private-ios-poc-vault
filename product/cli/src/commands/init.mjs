@@ -8,6 +8,7 @@ import path from "node:path";
 
 import { createCloudApi, DEFAULT_BASE_URL } from "../cloud.mjs";
 import { readCredentials } from "../creds.mjs";
+import { noopProgress } from "../progress.mjs";
 import { requireGitHubRepo, git } from "../repo.mjs";
 import { fingerprint } from "./login.mjs";
 
@@ -17,7 +18,10 @@ async function resolveGitDir(root) {
 }
 
 async function cmdInit(args = [], deps = {}) {
-  const { home = undefined, cwd = process.cwd(), baseUrl = DEFAULT_BASE_URL, fetchImpl = fetch, log = console.log } = deps;
+  const {
+    home = undefined, cwd = process.cwd(), baseUrl = DEFAULT_BASE_URL, fetchImpl = fetch,
+    log = console.log, progress = noopProgress,
+  } = deps;
 
   const credentials = readCredentials({ home });
   if (!credentials?.sessionToken) throw new Error("not_logged_in: run relay login first");
@@ -30,7 +34,8 @@ async function cmdInit(args = [], deps = {}) {
     home,
     fetchImpl,
   });
-  const registered = await api.registerRepo(repo.fullName);
+  const registered = await progress.run(`Registering ${repo.fullName}`,
+    () => api.registerRepo(repo.fullName));
   if (registered.status !== 201) throw new Error(`repo_registration_failed_${registered.status}`);
 
   const gitDir = await resolveGitDir(repo.root);

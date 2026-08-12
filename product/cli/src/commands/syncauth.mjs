@@ -19,6 +19,7 @@ import { promisify } from "node:util";
 
 import { createCloudApi, DEFAULT_BASE_URL } from "../cloud.mjs";
 import { readCredentials } from "../creds.mjs";
+import { noopProgress } from "../progress.mjs";
 import { sealTo } from "../seal.mjs";
 import { discoverSessions } from "../sessions.mjs";
 
@@ -156,6 +157,7 @@ async function cmdSyncAuth(args = [], deps = {}) {
     // Deliberately lazy (dynamic import) in the default so a plain `import`
     // at module load time can't create a require-cycle with repo.mjs.
     requireGitHubRepoImpl = async (opts) => (await import("../repo.mjs")).requireGitHubRepo(opts),
+    progress = noopProgress,
   } = deps;
 
   const credentials = readCredentials({ home });
@@ -167,7 +169,9 @@ async function cmdSyncAuth(args = [], deps = {}) {
     throw new Error("no_machine_pinned: run relay login after creating a machine");
   }
 
-  const { bundle, skipped } = await collectCredentialBundle({ home: home || os.homedir(), execFileImpl });
+  // Shells out to `gh` and reads harness config; slow enough to look stuck.
+  const { bundle, skipped } = await progress.run("Collecting your local logins",
+    () => collectCredentialBundle({ home: home || os.homedir(), execFileImpl }));
   const installed = ["github", "claude", "codex"].filter((name) => bundle[name]);
 
   const api = createCloudApi({
@@ -177,18 +181,18 @@ async function cmdSyncAuth(args = [], deps = {}) {
     home,
     fetchImpl,
   });
-  const pairingId = await deliverSealedBundle({
+  const pairingId = await progress.run("Sending them to your machine", () => deliverSealedBundle({
     api, nodeId: credentials.nodeId, nodeEncPubkey: credentials.nodeEncPubkey, kind: "sync-auth", payload: bundle,
-  });
+  }));
 
   // Best-effort, and skipped outside a repo: a stale index must never fail a
   // credential sync that otherwise succeeded.
   try {
     const repo = await requireGitHubRepoImpl({ cwd });
-    const count = await publishSessionIndex({
+    const count = await progress.run("Updating the session list", () => publishSessionIndex({
       repoFullName: repo.fullName, root: fs.realpathSync(repo.root), home: home || os.homedir(),
       api, nodeId: credentials.nodeId, nodeEncPubkey: credentials.nodeEncPubkey, machine,
-    });
+    }));
     if (count > 0) log(`  Shared ${count} local session${count === 1 ? "" : "s"} with your machine.`);
   } catch {
     // Not in a repo, or the index could not be delivered. Credentials still landed.

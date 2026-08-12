@@ -7,6 +7,7 @@ import os from "node:os";
 
 import { createCloudApi, DEFAULT_BASE_URL } from "../cloud.mjs";
 import { writeCredentials } from "../creds.mjs";
+import { noopProgress } from "../progress.mjs";
 import { renderQrAnsi, qrAnsiWidth } from "../qr.mjs";
 
 // Canonical node-key fingerprint: SHA-256 over the 32 *decoded* key bytes
@@ -38,14 +39,15 @@ async function cmdLogin(args = [], deps = {}) {
     hostname = () => os.hostname(),
     platform = process.platform,
     stdout = process.stdout,
+    progress = noopProgress,
   } = deps;
 
   const noQr = args.includes("--no-qr");
   const anonymous = createCloudApi({ baseUrl, fetchImpl });
-  const start = await anonymous.startDeviceLogin({
+  const start = await progress.run("Requesting a login code", () => anonymous.startDeviceLogin({
     machineName: hostname(),
     platform: normalizePlatform(platform),
-  });
+  }));
   if (start.status !== 201) throw new Error(`login_start_failed_${start.status}`);
 
   const {
@@ -73,7 +75,10 @@ async function cmdLogin(args = [], deps = {}) {
   log(`  Your code:  ${userCode}`);
   log(`  Approve at: ${verificationUri}`);
   log("");
-  log("  Waiting for approval…");
+  // A step rather than a static line: this is the longest wait in the CLI, and
+  // it is the one place a user genuinely cannot tell "polling" from "hung".
+  // Without a TTY it degrades to the exact line this used to print.
+  progress.start("Waiting for approval");
 
   // A server bug or a network partition that keeps answering
   // authorization_pending must not hang this command forever — track our own
@@ -95,21 +100,29 @@ async function cmdLogin(args = [], deps = {}) {
   const intervalMs = Math.min(MAX_POLL_INTERVAL_SECONDS, Math.max(1, Number(interval) || 5)) * 1000;
 
   let session = null;
-  for (;;) {
-    await sleep(intervalMs);
-    if (now() >= deadline) throw new Error("login_expired: the code timed out — run relay login again");
-    const poll = await anonymous.pollDeviceToken(deviceCode);
-    if (poll.status === 200) {
-      if (!poll.json || typeof poll.json.sessionToken !== "string") {
-        throw new Error("login_failed_bad_response: the server returned an unexpected response");
+  // Every exit from this loop except the break is a throw, and bin/relay turns
+  // a throw straight into process.exit — so without this finally, a timed-out
+  // or rejected login would leave the cursor hidden for the rest of the
+  // terminal session.
+  try {
+    for (;;) {
+      await sleep(intervalMs);
+      if (now() >= deadline) throw new Error("login_expired: the code timed out — run relay login again");
+      const poll = await anonymous.pollDeviceToken(deviceCode);
+      if (poll.status === 200) {
+        if (!poll.json || typeof poll.json.sessionToken !== "string") {
+          throw new Error("login_failed_bad_response: the server returned an unexpected response");
+        }
+        session = poll.json;
+        break;
       }
-      session = poll.json;
-      break;
+      const error = poll.json?.error;
+      if (error === "authorization_pending") continue;
+      if (error === "expired_token") throw new Error("login_expired: the code timed out — run relay login again");
+      throw new Error(`login_failed: ${error || poll.status}`);
     }
-    const error = poll.json?.error;
-    if (error === "authorization_pending") continue;
-    if (error === "expired_token") throw new Error("login_expired: the code timed out — run relay login again");
-    throw new Error(`login_failed: ${error || poll.status}`);
+  } finally {
+    progress.stop();
   }
 
   writeCredentials({
