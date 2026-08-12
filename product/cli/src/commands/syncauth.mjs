@@ -92,10 +92,23 @@ async function collectCredentialBundle({ home = os.homedir(), execFileImpl = exe
 }
 
 // Originates a fresh pairing secret on this side, seals payload to the node's
-// key, and delivers it through the rendezvous device slot. The cloud sees
-// only authTokenFor(secret) and the sealed ciphertext plus its MAC tag — never
-// the secret, the derived macKey, or the plaintext.
-async function deliverSealedBundle({ api, nodeEncPubkey, kind, payload }) {
+// key, delivers it through the rendezvous device slot, and TELLS THE MACHINE
+// it is there.
+//
+// That last step is not optional bookkeeping: nothing on the node can
+// discover a pending rendezvous session — there is no route that lists them —
+// so a bundle put in a slot with no notice is never collected and expires
+// with the session 15 minutes later, having reported success. The notice
+// carries the secret rather than the derived auth token because the node
+// needs both halves of the protocol: authTokenFor(secret) to open the slot,
+// and macKeyFor(secret) to verify the tag below.
+//
+// Being precise about what that hands the control plane: the secret lets it
+// open, and compute a tag for, a slot whose bytes it is already storing. What
+// it does NOT give it is the contents — the payload is sealed to the node's
+// X25519 key, so a credential never exists in cleartext anywhere on the
+// control plane, which is the property this transport is chosen for.
+async function deliverSealedBundle({ api, nodeId, nodeEncPubkey, kind, payload }) {
   const secret = generateSecret();
   const authToken = authTokenFor(secret);
   const created = await api.createPairingSession(authToken, kind);
@@ -103,18 +116,30 @@ async function deliverSealedBundle({ api, nodeEncPubkey, kind, payload }) {
 
   const sealed = sealTo(nodeEncPubkey, Buffer.from(JSON.stringify(payload), "utf8"));
   const tag = blobTagFor(macKeyFor(secret), DEVICE_SLOT, sealed);
-  const put = await api.putDeviceBlob(created.json.pairingId, authToken, tag, sealed);
+  const pairingId = created.json.pairingId;
+  const put = await api.putDeviceBlob(pairingId, authToken, tag, sealed);
   if (put.status !== 204) throw new Error(`rendezvous_put_failed_${put.status}`);
-  return created.json.pairingId;
+
+  const notice = await api.postSyncAuthNotice({ pairingId, nodeId, secret });
+  if (notice.status !== 201) {
+    // Loud, and actionable. A silent failure here is the worst outcome this
+    // command has: the bundle is sealed and stored, the user is told their
+    // logins are on the sandbox, and nothing ever collects them. The status
+    // is the only detail carried — never the secret, never a credential.
+    throw new Error(
+      `sync_notice_failed_${notice.status}: your machine was never told where to collect these logins — run relay sync-auth again`,
+    );
+  }
+  return pairingId;
 }
 
-async function publishSessionIndex({ repoFullName, root, home, api, nodeEncPubkey, machine }) {
+async function publishSessionIndex({ repoFullName, root, home, api, nodeId, nodeEncPubkey, machine }) {
   const sessions = discoverSessions({ cwd: root, home }).slice(0, 50).map((session) => ({
     id: session.id, harness: session.harness, title: session.title,
     repo: repoFullName, lastActive: session.lastActive,
   }));
   await deliverSealedBundle({
-    api, nodeEncPubkey, kind: "session-index",
+    api, nodeId, nodeEncPubkey, kind: "session-index",
     payload: { v: 1, kind: "session-index", machine, updatedAt: new Date().toISOString(), sessions },
   });
   return sessions.length;
@@ -135,13 +160,20 @@ async function cmdSyncAuth(args = [], deps = {}) {
 
   const credentials = readCredentials({ home });
   if (!credentials?.sessionToken) throw new Error("not_logged_in: run relay login first");
-  if (!credentials.nodeEncPubkey) throw new Error("no_machine_pinned: run relay login after creating a machine");
+  // Both halves of the pin are needed: the key to seal TO, and the id of the
+  // machine to announce the slot to. One without the other can only produce a
+  // bundle nothing will ever collect.
+  if (!credentials.nodeEncPubkey || !credentials.nodeId) {
+    throw new Error("no_machine_pinned: run relay login after creating a machine");
+  }
 
   const { bundle, skipped } = await collectCredentialBundle({ home: home || os.homedir(), execFileImpl });
   const installed = ["github", "claude", "codex"].filter((name) => bundle[name]);
 
   const api = createCloudApi({ baseUrl, sessionToken: credentials.sessionToken, fetchImpl });
-  const pairingId = await deliverSealedBundle({ api, nodeEncPubkey: credentials.nodeEncPubkey, kind: "sync-auth", payload: bundle });
+  const pairingId = await deliverSealedBundle({
+    api, nodeId: credentials.nodeId, nodeEncPubkey: credentials.nodeEncPubkey, kind: "sync-auth", payload: bundle,
+  });
 
   // Best-effort, and skipped outside a repo: a stale index must never fail a
   // credential sync that otherwise succeeded.
@@ -149,7 +181,7 @@ async function cmdSyncAuth(args = [], deps = {}) {
     const repo = await requireGitHubRepoImpl({ cwd });
     const count = await publishSessionIndex({
       repoFullName: repo.fullName, root: fs.realpathSync(repo.root), home: home || os.homedir(),
-      api, nodeEncPubkey: credentials.nodeEncPubkey, machine,
+      api, nodeId: credentials.nodeId, nodeEncPubkey: credentials.nodeEncPubkey, machine,
     });
     if (count > 0) log(`  Shared ${count} local session${count === 1 ? "" : "s"} with your machine.`);
   } catch {

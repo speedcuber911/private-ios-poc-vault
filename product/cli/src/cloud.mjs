@@ -33,6 +33,15 @@ function createCloudApi({ baseUrl = DEFAULT_BASE_URL, sessionToken = null, fetch
     putDeviceBlob: (pairingId, authToken, tag, raw) =>
       request("POST", `/v1/pairing/sessions/${encodeURIComponent(pairingId)}/device-blob`,
         { raw, headers: { "x-pairing-auth": authToken, "x-pairing-tag": tag } }),
+    // Tells the machine a sealed blob is waiting for it. Nothing on the node
+    // can discover a pending rendezvous on its own, so without this the slot
+    // is never read and the sync silently expires. `secret` (not the derived
+    // auth token) is what the node needs: it authorizes the slot AND derives
+    // the MAC key that authenticates the blob. The payload it unlocks is
+    // sealed to the node's X25519 key, so the cloud relays ciphertext it
+    // cannot open.
+    postSyncAuthNotice: ({ pairingId, nodeId, secret }) =>
+      request("POST", "/v1/sync-auth/notices", { body: { pairingId, nodeId, secret } }),
   };
 }
 
