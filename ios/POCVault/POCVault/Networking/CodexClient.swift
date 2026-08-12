@@ -203,7 +203,41 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
     }
 
     private lazy var session: URLSession = {
-        URLSession(configuration: .ephemeral, delegate: self, delegateQueue: nil)
+        let configuration = URLSessionConfiguration.ephemeral
+        // TLS 1.2 ceiling, and it is mTLS that needs it — not a downgrade for
+        // its own sake.
+        //
+        // A trial machine requires a client certificate. Against TLS 1.3 the
+        // phone held exactly the right identity (`trial-device`, issued by the
+        // CA the machine names as its only acceptable one) and URLSession never
+        // asked for it: the ONLY challenge delivered was
+        // NSURLAuthenticationMethodServerTrust, and the handshake then died
+        // with -1200 — the same failure the machine gives a client that sends
+        // no certificate at all (verified against it: no certificate resets
+        // immediately, a wrong-CA certificate hangs; the phone reset in ~1s).
+        //
+        // The difference is where the certificate request sits in the
+        // handshake. In TLS 1.2 it arrives before the server is done, so
+        // URLSession has a point at which it can ask the delegate. In TLS 1.3
+        // it arrives in the server's final flight and the client must answer
+        // straight away — and no client-certificate challenge is raised.
+        //
+        // TLS 1.2 with a pinned CA and a required client certificate is what
+        // this app has always used against a personal install; the security
+        // property is unchanged, and mTLS is still enforced by the machine.
+        configuration.tlsMaximumSupportedProtocolVersion = .TLSv12
+        // URLSession's 60-second default is far too long for a machine that is
+        // simply not there. Losing a trial (sign-out, or the server answering
+        // `no_trial`) reverts the app to the personal install's configured base
+        // URL — which for a trial-only user can be a host that no longer
+        // exists. That produced a spinner that sat for a full minute before
+        // saying "the request timed out", with no indication of which machine
+        // was being waited on. Fifteen seconds is well past a slow mobile
+        // round-trip to a live node and short enough to report rather than
+        // hang. `timeoutIntervalForResource` still bounds long file listings.
+        configuration.timeoutIntervalForRequest = 15
+        configuration.timeoutIntervalForResource = 60
+        return URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
     }()
 
     init(baseURL: URL, identityStore: ClientIdentityStore) {
