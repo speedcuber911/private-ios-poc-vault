@@ -273,13 +273,23 @@ test("no decrypted plaintext is written anywhere in the checkout or the jail", a
 
   // The real assertion: nothing under the checkout — or anywhere else in the
   // browse root — contains the decrypted transcript, whatever it is named.
+  // pathsContaining walks every file under the given root (walkTree, above),
+  // which already includes .relay/handoff/<id>/session.enc itself, so this
+  // single check covers that file along with everything else in the tree.
   assert.deepEqual(pathsContaining(checkout, PLAINTEXT_MARKER), [],
     "the decrypted transcript must never be written into the checkout");
   assert.deepEqual(pathsContaining(workspaceRoot, PLAINTEXT_MARKER), [],
     "the decrypted transcript must never be written anywhere in the jail");
 
-  const sealed = fs.readFileSync(path.join(checkout, ".relay", "handoff", MANIFEST.id, "session.enc"));
-  assert.ok(!sealed.includes(Buffer.from(PLAINTEXT_MARKER, "utf8")), "the committed session blob stays ciphertext");
+  // DELETED (again): a trailing check that session.enc "stays ciphertext" by
+  // re-reading the exact bytes this test's own makeOriginRepo() wrote via
+  // sealTo() — src/handoff.mjs only ever READS this file, so nothing the
+  // code under test does can change whether it is vacuous. It is precisely
+  // what this file's own header (see the top of this file) already
+  // documents as removed once for being vacuous, and it came back. The
+  // pathsContaining(checkout, ...) assertion two lines up already walks
+  // session.enc as part of the whole checkout, so no coverage is lost by
+  // deleting this instead of re-adding it a second time.
 });
 
 test("a handoff with no session blob still lands as ready with a primed prompt", async () => {
