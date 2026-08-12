@@ -18,6 +18,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 import { createCloudApi, DEFAULT_BASE_URL } from "../cloud.mjs";
+import { noopProgress } from "../progress.mjs";
 import { readCredentials } from "../creds.mjs";
 import { requireGitHubRepo, workingTreeSummary, git } from "../repo.mjs";
 import { discoverSessions, readSessionBytes, sessionExcerpt } from "../sessions.mjs";
@@ -260,6 +261,9 @@ async function cmdHandoff(args = [], deps = {}) {
     home = undefined, cwd = process.cwd(), baseUrl = DEFAULT_BASE_URL, fetchImpl = fetch,
     log = console.log, machine = os.hostname(), now = () => Date.now(),
     execFileImpl = execFileAsync, env: envOverride = undefined,
+    // Silent by default so every existing test stays quiet; bin/relay passes a
+    // real one. Progress writes to stderr and never through `log`.
+    progress = noopProgress,
     // Test-only: force a specific handoff id so a collision (local or
     // remote) can be constructed deterministically instead of waiting on a
     // crypto.randomBytes clash that is never expected to happen for real.
@@ -274,7 +278,8 @@ async function cmdHandoff(args = [], deps = {}) {
 
   const repo = await requireGitHubRepo({ cwd, execFileImpl });
   const realRoot = fs.realpathSync(repo.root);
-  const wip = await workingTreeSummary({ root: repo.root, execFileImpl });
+  const wip = await progress.run("Inspecting your working tree",
+    () => workingTreeSummary({ root: repo.root, execFileImpl }));
 
   const requestedId = flagValue(args, "--session");
   const sessions = discoverSessions({ cwd: realRoot, home });
@@ -314,7 +319,10 @@ async function cmdHandoff(args = [], deps = {}) {
     throw new Error(`branch_collision: ${branch} already exists locally`);
   }
   const willPush = !args.includes("--no-push");
-  if (willPush && await refExistsOnRemote(repo.root, branch, execFileImpl)) {
+  // A network round trip to origin, and the first place a handoff can stall
+  // for a noticeable time (a slow remote, an ssh key prompt, a VPN).
+  if (willPush && await progress.run("Checking origin for a name collision",
+    () => refExistsOnRemote(repo.root, branch, execFileImpl))) {
     throw new Error(`branch_collision: ${branch} already exists on origin`);
   }
 
@@ -365,22 +373,32 @@ async function cmdHandoff(args = [], deps = {}) {
     // control, because it cannot be: it does not know about a key the user
     // never thought to ignore, and it does not apply at all to a tracked file
     // that was filled in locally.
-    const candidates = parsePorcelainZ(
+    const candidates = await progress.run("Scanning changed files", async () => parsePorcelainZ(
       (await gitPlumbing(repo.root,
         ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { env })).toString("utf8"),
-    );
+    ));
     const allowed = candidates.filter((entry) => !isSecretPath(entry));
     const withheld = candidates.filter((entry) => isSecretPath(entry));
+    // Deliberately outside any progress step: reportWithheld writes to stdout
+    // while the spinner is on stderr, and on a terminal that is one screen —
+    // printing into a live animation interleaves the two.
     // Said before anything is committed, and said on every path out of here —
     // a handoff that quietly leaves a file behind is its own kind of failure.
     reportWithheld(withheld, log);
 
+    // Phase markers from here down use start() rather than run(): each phase's
+    // results are consts the following phases read, and wrapping them in
+    // closures would mean re-scoping half this function to add a spinner. A
+    // later start() supersedes the previous one, and the finally below stops
+    // whichever was last.
+    progress.start("Staging your working tree");
     // Batched so a repo with tens of thousands of changed paths cannot blow
     // the argv limit; 200 matches relayd's own batch size.
     for (let index = 0; index < allowed.length; index += 200) {
       await gitPlumbing(repo.root, ["add", "--", ...allowed.slice(index, index + 200)], { env });
     }
 
+    progress.start("Sealing your session");
     const manifestSha = await gitPlumbingText(repo.root, ["hash-object", "-w", "--stdin"], {
       env, input: sealTo(credentials.nodeEncPubkey, Buffer.from(JSON.stringify(manifest), "utf8")),
     });
@@ -430,6 +448,7 @@ async function cmdHandoff(args = [], deps = {}) {
       );
     }
 
+    progress.start("Preparing the handoff branch");
     const treeSha = await gitPlumbingText(repo.root, ["write-tree"], { env });
 
     let commitSha;
@@ -453,14 +472,21 @@ async function cmdHandoff(args = [], deps = {}) {
     }
 
     if (!willPush) {
+      // stop() before any log: the spinner is on stderr and this is stdout,
+      // but on a terminal they share one screen.
+      progress.stop();
       log(`  Prepared ${branch} locally. Nothing was pushed and no notification was sent.`);
     } else {
+      // The slowest step by far, and the one that made the command look hung.
+      progress.start(`Pushing ${branch} to GitHub`);
       // No --force, ever: a rejected (non-fast-forward) push must fail
       // loudly rather than overwrite whatever is already on the remote ref.
       await git(repo.root, ["push", "-q", "origin", `${ref}:${ref}`], execFileImpl);
       pushed = true;
     }
   } finally {
+    // Whichever phase was last, running or failed, ends here.
+    progress.stop();
     fs.rmSync(tmpIndexDir, { recursive: true, force: true });
   }
 
@@ -473,7 +499,8 @@ async function cmdHandoff(args = [], deps = {}) {
     home,
     fetchImpl,
   });
-  const ping = await api.createHandoff({ handoffId, repo: repo.fullName, branch, nodeId: credentials.nodeId });
+  const ping = await progress.run("Notifying your machine",
+    () => api.createHandoff({ handoffId, repo: repo.fullName, branch, nodeId: credentials.nodeId }));
   if (ping.status !== 201) {
     log(`  Pushed ${branch}, but the notification failed (${ping.json?.error || ping.status}).`);
     log("  Your machine will still pick it up on its next poll.");
@@ -497,10 +524,12 @@ async function cmdHandoff(args = [], deps = {}) {
   // something fixable from here.
   try {
     const { publishSessionIndex } = await import("./syncauth.mjs");
-    await publishSessionIndex({
+    // run(), so the spinner is already stopped by the time the catch below
+    // logs.
+    await progress.run("Updating the session list", () => publishSessionIndex({
       repoFullName: repo.fullName, root: realRoot, home: home || os.homedir(),
       api, nodeId: credentials.nodeId, nodeEncPubkey: credentials.nodeEncPubkey, machine,
-    });
+    }));
   } catch (err) {
     log(`  Note: could not update the "On your Mac" session list (${err?.message || "unknown error"}).`);
     log("  Your handoff still succeeded; run `relay sync-auth` to refresh the index.");
