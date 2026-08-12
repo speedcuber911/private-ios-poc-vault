@@ -27,6 +27,18 @@ final class RelayNodeStore: ObservableObject {
         activeNodeURL ?? AppConfiguration.codexBaseURL
     }
 
+    /// Whether there is actually a machine to talk to: an adopted trial, or a
+    /// personal install someone deliberately configured.
+    ///
+    /// `effectiveBaseURL` can never answer this — it falls back to the build
+    /// default, so it always yields *a* URL whether or not a machine exists.
+    /// Callers that would otherwise send requests into that default, and
+    /// report the resulting TLS failure as the user's machine misbehaving,
+    /// check this first.
+    var hasMachine: Bool {
+        activeNodeURL != nil || AppConfiguration.hasConfiguredPersonalInstall
+    }
+
     /// Adopts a newly created/paired trial node: persists it and points the app at it.
     func adoptTrial(_ trial: RelayTrialNode) {
         self.trial = trial
