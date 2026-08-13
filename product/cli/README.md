@@ -37,6 +37,15 @@ the device code by scanning the QR in the iOS app. The production control plane
 is compiled in, so no environment variable is needed; `RELAY_CLOUD_URL`
 overrides it for development.
 
+A login **replaces** this machine's identity rather than merging into it. The
+pinned machine is always cleared first and re-derived from the newly signed-in
+account, so a stale pin can never outlive the account it belonged to. If the
+approving account differs from the one this machine used before, `relay login`
+says so explicitly — approval is anonymous by construction, so whoever scans
+the QR is who this CLI becomes, and that must never happen quietly. The iOS app
+shows a confirm sheet naming the machine before approving, so check the machine
+name matches the terminal you are sitting at.
+
 `relay init` registers the current repository for handoffs. A repository that
 was never registered is rejected by `relay handoff` up front, before anything
 is pushed.
