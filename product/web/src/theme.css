@@ -317,6 +317,127 @@ a {
   text-transform: uppercase;
 }
 
+.canvas-page {
+  align-items: flex-start;
+  justify-content: flex-start;
+  padding-top: 48px;
+}
+
+.page {
+  width: min(100%, 560px);
+}
+
+.page-title {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-size: 32px;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+}
+
+.status-word {
+  margin: 14px 0 0;
+  color: var(--ink-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.status-live {
+  color: var(--ember-bright);
+}
+
+.status-error {
+  color: var(--status-error);
+}
+
+.muted {
+  margin: 18px 0 0;
+  color: var(--ink-secondary);
+  font-size: 14px;
+}
+
+.kind-word {
+  color: var(--ink-tertiary);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.machine-list {
+  list-style: none;
+  margin: 28px 0 0;
+  padding: 0;
+}
+
+.machine-list li + li {
+  border-top: 1px solid var(--hairline);
+}
+
+.machine-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-rows: auto auto;
+  column-gap: 12px;
+  width: 100%;
+  margin: 0;
+  padding: 15px 0;
+  border: 0;
+  background: none;
+  text-align: left;
+}
+
+.machine-row-name {
+  grid-column: 1;
+  font-size: 15px;
+  font-weight: 500;
+}
+
+.machine-row .kind-word {
+  grid-column: 1;
+  grid-row: 2;
+  margin-top: 4px;
+}
+
+.machine-row .status-word {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  margin: 0;
+  align-self: center;
+}
+
+.activity-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 15px 0;
+}
+
+.activity-row .status-word {
+  margin: 0;
+}
+
+.duration {
+  font-family: var(--font-mono);
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.last-event {
+  color: var(--ink-tertiary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.btn-text.back {
+  align-self: flex-start;
+  margin: 18px 0 0;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .underline,
   .btn-primary {
