@@ -93,7 +93,17 @@ export function createRelayBetterAuth({
         },
       },
     },
-    trustedOrigins: [config.betterAuthBaseURL],
+    trustedOrigins: [
+      config.betterAuthBaseURL,
+      ...(config.trustedWebOrigins || []),
+    ],
+    advanced: {
+      defaultCookieAttributes: {
+        sameSite: "none",
+        secure: config.betterAuthBaseURL.startsWith("https://"),
+        httpOnly: true,
+      },
+    },
   };
 
   const auth = betterAuth(options);
