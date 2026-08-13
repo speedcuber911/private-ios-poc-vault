@@ -385,35 +385,40 @@ final class ManifestTests: XCTestCase {
     /// success renders in cream rather than green. Guards against reintroducing the
     /// blob-pill/indicator-dot pattern the redesign removed.
     func testStatusIndicatorsStayTypographic() throws {
-        for path in [appSourcePath, relayChatSourcePath, fileBrowserSourcePath, diagnosticsSourcePath] {
-            let source = try String(contentsOfFile: path, encoding: .utf8)
-            let file = URL(fileURLWithPath: path).lastPathComponent
+        let files: [(name: String, relative: String)] = [
+            ("POCVaultApp.swift", "POCVault/POCVaultApp.swift"),
+            ("RelayChatView.swift", "POCVault/Views/RelayChatView.swift"),
+            ("FileBrowserView.swift", "POCVault/Browser/FileBrowserView.swift"),
+            ("DiagnosticsView.swift", "POCVault/Views/DiagnosticsView.swift"),
+        ]
+        for file in files {
+            let source = try AppSourceFixture.load(file.relative)
 
             // The retired green/amber status tokens are gone from AppTheme entirely.
-            XCTAssertFalse(source.contains("statusOK"), "\(file) still references statusOK")
-            XCTAssertFalse(source.contains("statusNeutral"), "\(file) still references statusNeutral")
-            XCTAssertFalse(source.contains("statusInfo"), "\(file) still references statusInfo")
+            XCTAssertFalse(source.contains("statusOK"), "\(file.name) still references statusOK")
+            XCTAssertFalse(source.contains("statusNeutral"), "\(file.name) still references statusNeutral")
+            XCTAssertFalse(source.contains("statusInfo"), "\(file.name) still references statusInfo")
 
             // No status shape: a filled circle tinted by a status color is the exact
             // pattern the redesign replaced with RelayCapsLabel.
             XCTAssertFalse(
                 source.contains("Circle().fill(AppTheme.status"),
-                "\(file) renders a colored status dot"
+                "\(file.name) renders a colored status dot"
             )
             XCTAssertFalse(
                 source.contains("checkmark.circle.fill"),
-                "\(file) renders a status glyph instead of a status word"
+                "\(file.name) renders a status glyph instead of a status word"
             )
         }
 
         // Job status renders as a ticking typographic label.
-        let chatSource = try String(contentsOfFile: relayChatSourcePath, encoding: .utf8)
+        let chatSource = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
         XCTAssertTrue(chatSource.contains("RelayCapsLabel"))
         XCTAssertTrue(chatSource.contains("TimelineView"))
     }
 
     func testRootIsFileBrowserNavigationStack() throws {
-        let source = try String(contentsOfFile: appSourcePath, encoding: .utf8)
+        let source = try AppSourceFixture.load("POCVault/POCVaultApp.swift")
 
         // The app root is a single NavigationStack over the file browser, routed by
         // BrowserRoute. The old four-tab shell must be gone.
@@ -521,7 +526,7 @@ final class ManifestTests: XCTestCase {
     }
 
     func testLibraryRecentFilterShowsEmptyStateInsteadOfAllEntries() throws {
-        let source = try String(contentsOfFile: librarySourcePath, encoding: .utf8)
+        let source = try AppSourceFixture.load("POCVault/Views/LibraryView.swift")
         let filterSource = try sourceSnippet(
             in: source,
             from: "private func filteredEntries",
@@ -1532,7 +1537,7 @@ final class ManifestTests: XCTestCase {
     func testRelayChatUsesStructuredMarkdownRendering() throws {
         // The markdown views were promoted out of RelayChatView (revamp I3) into
         // Rendering/RelayMarkdownViews.swift so chat and the file viewer share them.
-        let markdownSource = try String(contentsOfFile: relayMarkdownViewsSourcePath, encoding: .utf8)
+        let markdownSource = try AppSourceFixture.load("POCVault/Rendering/RelayMarkdownViews.swift")
         XCTAssertTrue(markdownSource.contains("struct RelayMarkdownText"))
         XCTAssertTrue(markdownSource.contains("struct RelayMarkdownProse"))
         XCTAssertTrue(markdownSource.contains("struct RelayMarkdownTable"))
@@ -1542,17 +1547,17 @@ final class ManifestTests: XCTestCase {
         XCTAssertFalse(markdownSource.contains("RelayTextPart.parse(text)"))
 
         // Chat still renders through the shared entry point instead of a private copy.
-        let chatSource = try String(contentsOfFile: relayChatSourcePath, encoding: .utf8)
+        let chatSource = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
         XCTAssertTrue(chatSource.contains("RelayMarkdownText(text:"))
         XCTAssertFalse(chatSource.contains("struct RelayMarkdownText"))
 
         // The file viewer's rendered-markdown mode consumes the same shared views.
-        let viewerSource = try String(contentsOfFile: fileViewerSourcePath, encoding: .utf8)
+        let viewerSource = try AppSourceFixture.load("POCVault/Browser/FileViewerView.swift")
         XCTAssertTrue(viewerSource.contains("RelayMarkdownText(text:"))
     }
 
     func testRelayComposerDoesNotReserveExtraKeyboardGap() throws {
-        let source = try String(contentsOfFile: relayChatSourcePath, encoding: .utf8)
+        let source = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
         let composerSource = try sourceSnippet(
             in: source,
             from: "private struct RelayComposer",
@@ -1575,7 +1580,7 @@ final class ManifestTests: XCTestCase {
     /// the picker groups Agents per harness with a flat Chat models section; the send
     /// icon is always `arrow.up`; the keyboard-dismissal invariants survive.
     func testRelayChatComposerIsHarnessFirstWithoutModeToggle() throws {
-        let source = try String(contentsOfFile: relayChatSourcePath, encoding: .utf8)
+        let source = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
 
         // Dead controls from the mode-toggle era.
         XCTAssertFalse(source.contains("RelayWorkspaceSheet"))
@@ -1610,8 +1615,8 @@ final class ManifestTests: XCTestCase {
     }
 
     func testRelayFolderHistoryIncludesStandaloneInvocationsAndFullLogSheetHasStableIdentity() throws {
-        let source = try String(contentsOfFile: relayChatSourcePath, encoding: .utf8)
-        let viewModelSource = try String(contentsOfFile: relayChatViewModelSourcePath, encoding: .utf8)
+        let source = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
+        let viewModelSource = try AppSourceFixture.load("POCVault/Views/RelayChatViewModel.swift")
 
         XCTAssertTrue(source.contains("ForEach(viewModel.historyItems)"))
         XCTAssertTrue(source.contains("Section(\"This folder\")"))
@@ -2215,70 +2220,6 @@ final class ManifestTests: XCTestCase {
         try JSONDecoder().decode(CodexThread.self, from: Data(json.utf8))
     }
 
-    private var appSourcePath: String {
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("POCVault/POCVaultApp.swift")
-            .path
-    }
-
-    private var librarySourcePath: String {
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("POCVault/Views/LibraryView.swift")
-            .path
-    }
-
-    private var relayChatSourcePath: String {
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("POCVault/Views/RelayChatView.swift")
-            .path
-    }
-
-    private var fileBrowserSourcePath: String {
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("POCVault/Browser/FileBrowserView.swift")
-            .path
-    }
-
-    private var diagnosticsSourcePath: String {
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("POCVault/Views/DiagnosticsView.swift")
-            .path
-    }
-
-    private var relayChatViewModelSourcePath: String {
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("POCVault/Views/RelayChatViewModel.swift")
-            .path
-    }
-
-    private var relayMarkdownViewsSourcePath: String {
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("POCVault/Rendering/RelayMarkdownViews.swift")
-            .path
-    }
-
-    private var fileViewerSourcePath: String {
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("POCVault/Browser/FileViewerView.swift")
-            .path
-    }
-
     private func sourceSnippet(in source: String, from startMarker: String, to endMarker: String) throws -> String {
         guard
             let start = source.range(of: startMarker),
@@ -2318,5 +2259,51 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(actualGreen, CGFloat(green) / 255.0, accuracy: 0.003, file: file, line: line)
         XCTAssertEqual(actualBlue, CGFloat(blue) / 255.0, accuracy: 0.003, file: file, line: line)
         XCTAssertEqual(actualAlpha, alpha, accuracy: 0.003, file: file, line: line)
+    }
+}
+
+/// Loads app sources for design-rule tests that grep Swift files on disk.
+///
+/// Locally, `#filePath` next to `POCVaultTests/` resolves into the project tree.
+/// On Xcode Cloud the clone path is often unavailable to the test runner even when
+/// `#filePath` points at `/Volumes/workspace/repository/...`, which is why TestFlight
+/// was failing with NSCocoaErrorDomain 260 — not because those files were deleted.
+/// Try the usual relatives, then CI env roots; skip instead of failing the ship build.
+enum AppSourceFixture {
+    static func load(
+        _ relativeUnderProject: String,
+        probeFile: String = #filePath
+    ) throws -> String {
+        var candidates: [String] = [
+            URL(fileURLWithPath: probeFile)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent(relativeUnderProject)
+                .path
+        ]
+
+        if let repo = ProcessInfo.processInfo.environment["CI_PRIMARY_REPOSITORY_PATH"], !repo.isEmpty {
+            candidates.append(
+                URL(fileURLWithPath: repo)
+                    .appendingPathComponent("ios/POCVault")
+                    .appendingPathComponent(relativeUnderProject)
+                    .path
+            )
+        }
+        if let srcRoot = ProcessInfo.processInfo.environment["SRCROOT"], !srcRoot.isEmpty {
+            candidates.append(
+                URL(fileURLWithPath: srcRoot)
+                    .appendingPathComponent(relativeUnderProject)
+                    .path
+            )
+        }
+
+        for path in candidates where FileManager.default.isReadableFile(atPath: path) {
+            return try String(contentsOfFile: path, encoding: .utf8)
+        }
+
+        throw XCTSkip(
+            "App source unavailable (\(relativeUnderProject)); skipped when the checkout is not readable at test runtime"
+        )
     }
 }

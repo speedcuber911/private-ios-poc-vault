@@ -308,7 +308,7 @@ final class HandoffTests: XCTestCase {
     // MARK: - Design rules (Editorial Ember)
 
     func testCardViewSourceUsesTheEditorialEmberIdiom() throws {
-        let source = try String(contentsOfFile: handoffCardSourcePath, encoding: .utf8)
+        let source = try AppSourceFixture.load("POCVault/Views/RelayHandoffCardView.swift")
         XCTAssertTrue(source.contains("RelayCapsLabel"), "status and badges use the caps-label primitive")
         XCTAssertTrue(source.contains("AppTheme.monoFont"), "the branch renders in the mono face")
         XCTAssertTrue(source.contains("AppTheme.textSecondary"), "a ready state uses cream, not a success color")
@@ -316,7 +316,7 @@ final class HandoffTests: XCTestCase {
     }
 
     func testHandoffCardNeverRendersADotOrGlyphForStatus() throws {
-        let source = try String(contentsOfFile: handoffCardSourcePath, encoding: .utf8)
+        let source = try AppSourceFixture.load("POCVault/Views/RelayHandoffCardView.swift")
         XCTAssertFalse(source.contains("Circle().fill(AppTheme.status"), "handoff card renders a colored status dot")
         XCTAssertFalse(source.contains("checkmark.circle.fill"), "handoff card renders a status glyph")
         XCTAssertFalse(source.contains("statusOK"))
@@ -334,14 +334,6 @@ final class HandoffTests: XCTestCase {
 
     private func decodeCard(_ json: String) throws -> RelayHandoffCard {
         try decoder.decode(RelayHandoffCard.self, from: Data(json.utf8))
-    }
-
-    private var handoffCardSourcePath: String {
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("POCVault/Views/RelayHandoffCardView.swift")
-            .path
     }
 
     /// Port 9 (discard) is closed on the loopback interface, so every request
