@@ -158,19 +158,28 @@ export function createApp({
   // Web device-code redemption: Better Auth 1.6.26 has no auth.api.createSession.
   // The same user id as registry.getAccount is the Better Auth user id for
   // password sign-ups (ensureRelayAccount). Cookie name is better-auth.session_token.
+  // Confirm the Better Auth user exists before createSession: Apple-only
+  // accounts have a registry row and no `user` row, and createSession then
+  // 500s on a foreign key after the device code is already gone.
   async function mintBetterAuthSessionCookie(userId) {
-    const ctx = await auth.betterAuth.$context;
-    const session = await ctx.internalAdapter.createSession(userId);
-    if (!session?.token) return null;
-    return serializeSignedCookie(
-      ctx.authCookies.sessionToken.name,
-      session.token,
-      ctx.secret,
-      {
-        ...ctx.authCookies.sessionToken.attributes,
-        maxAge: ctx.sessionConfig.expiresIn,
-      },
-    );
+    try {
+      const ctx = await auth.betterAuth.$context;
+      const user = await ctx.internalAdapter.findUserById(userId);
+      if (!user) return null;
+      const session = await ctx.internalAdapter.createSession(userId);
+      if (!session?.token) return null;
+      return serializeSignedCookie(
+        ctx.authCookies.sessionToken.name,
+        session.token,
+        ctx.secret,
+        {
+          ...ctx.authCookies.sessionToken.attributes,
+          maxAge: ctx.sessionConfig.expiresIn,
+        },
+      );
+    } catch {
+      return null;
+    }
   }
 
   // Second chance at sandboxes an earlier pass could not destroy. Cheap and
@@ -353,6 +362,21 @@ export function createApp({
     const method = req.method;
     const seg = path.split("/").filter(Boolean);
 
+    // Cross-origin SPA (`RELAY_WEB_ORIGINS`) sends credentials: include.
+    // OPTIONS must be answered before the session-auth boundary or preflight
+    // is 401 and the browser never issues the real request.
+    if (method === "OPTIONS") {
+      res.writeHead(204, {
+        ...baseHeaders(),
+        ...corsHeaders(originOf(req), config.trustedWebOrigins),
+        "access-control-allow-methods": "GET, POST, PATCH, DELETE, OPTIONS",
+        "access-control-allow-headers": "content-type, authorization, accept",
+        "access-control-max-age": "600",
+      });
+      return res.end();
+    }
+    attachCors(req, res, config.trustedWebOrigins);
+
     // ── health ──────────────────────────────────────────────────────────
     if (method === "GET" && path === "/healthz") {
       return sendJson(res, 200, { ok: true });
@@ -468,12 +492,12 @@ export function createApp({
       if (record.expiresAt <= now()) return sendJson(res, 400, { error: "expired_token" });
       if (record.accountId === null) return sendJson(res, 400, { error: "authorization_pending" });
       if (record.client === "web") {
-        const consumed = registry.consumeDeviceCode(record.id);
-        if (!consumed) return sendJson(res, 400, { error: "invalid_grant" });
-        const account = registry.getAccount(consumed.accountId);
+        const account = registry.getAccount(record.accountId);
         if (!account) return sendJson(res, 400, { error: "invalid_grant" });
         const cookie = await mintBetterAuthSessionCookie(account.id);
-        if (!cookie) return sendJson(res, 400, { error: "invalid_grant" });
+        if (!cookie) return sendJson(res, 400, { error: "web_session_unavailable" });
+        const consumed = registry.consumeDeviceCode(record.id);
+        if (!consumed) return sendJson(res, 400, { error: "invalid_grant" });
         return sendJson(res, 200, { accountId: account.id }, { "set-cookie": cookie });
       }
       const connected = registry.connectCliComputer(record.id);
@@ -1335,6 +1359,56 @@ function baseHeaders() {
   return {
     "cache-control": "no-store",
     "x-content-type-options": "nosniff",
+  };
+}
+
+function originOf(req) {
+  const value = req.headers.origin;
+  return typeof value === "string" ? value : "";
+}
+
+// Exact-origin allowlist from config.trustedWebOrigins (RELAY_WEB_ORIGINS).
+// Never "*": credentialed fetches require a specific origin plus
+// Access-Control-Allow-Credentials.
+function corsHeaders(origin, origins) {
+  if (!origin || !Array.isArray(origins) || !origins.includes(origin)) return {};
+  return {
+    "access-control-allow-origin": origin,
+    "access-control-allow-credentials": "true",
+    vary: "Origin",
+  };
+}
+
+function mergeCorsInto(headers, extra) {
+  if (!extra || Object.keys(extra).length === 0) return headers;
+  if (Array.isArray(headers)) {
+    const out = headers ? [...headers] : [];
+    for (const [key, value] of Object.entries(extra)) out.push([key, value]);
+    return out;
+  }
+  const current = headers && typeof headers === "object" ? headers : {};
+  const existingVary = current.vary || current.Vary;
+  const vary = extra.vary && existingVary && !String(existingVary).includes("Origin")
+    ? `${existingVary}, ${extra.vary}`
+    : extra.vary || existingVary;
+  return { ...current, ...extra, ...(vary ? { vary } : {}) };
+}
+
+function attachCors(req, res, origins) {
+  const extra = corsHeaders(originOf(req), origins);
+  if (Object.keys(extra).length === 0) return;
+  const orig = res.writeHead;
+  res.writeHead = function patchedWriteHead(statusCode, arg2, arg3) {
+    if (typeof arg2 === "object" && arg2 !== null) {
+      return orig.call(this, statusCode, mergeCorsInto(arg2, extra));
+    }
+    if (typeof arg3 === "object" && arg3 !== null) {
+      return orig.call(this, statusCode, arg2, mergeCorsInto(arg3, extra));
+    }
+    if (typeof arg2 === "string") {
+      return orig.call(this, statusCode, arg2, extra);
+    }
+    return orig.call(this, statusCode, extra);
   };
 }
 

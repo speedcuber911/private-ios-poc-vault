@@ -1,6 +1,6 @@
 // Entrypoint: env-configured server + periodic sweeps.
 
-import { loadConfig } from "./config.js";
+import { loadConfig, webOriginsRequireHttps } from "./config.js";
 import { createApp } from "./server.js";
 import { createHttp2Transport, createNoopTransport, apnsConfigured } from "./apns.js";
 
@@ -65,6 +65,14 @@ if (grantMissing.length > 0 && grantMissing.length < 3) {
     `browser grants are half-configured; missing ${grantMissing.join(", ")}. ` +
       "Set BROWSER_GRANT_PRIVATE_KEY, BROWSER_GRANT_PUBLIC_KEY, and GRANT_GATEWAY_URL together, " +
       "or unset all three to disable grants.",
+  );
+  process.exit(1);
+}
+
+if (webOriginsRequireHttps(config)) {
+  console.error(
+    "RELAY_WEB_ORIGINS is set but BETTER_AUTH_URL is not https; refusing to start. " +
+      "Set BETTER_AUTH_URL to the public https API origin, or unset RELAY_WEB_ORIGINS.",
   );
   process.exit(1);
 }

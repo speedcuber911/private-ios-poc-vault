@@ -928,7 +928,32 @@ test("web device code does not create a cli computer link", async () => {
     const granted = await poll(t, started.json.deviceCode);
     assert.equal(granted.status, 200);
     assert.equal(granted.json.cliLinkId, undefined);
-    assert.match(granted.headers.get("set-cookie") || "", /better-auth|session/i);
+    const setCookie = granted.headers.get("set-cookie") || "";
+    const cookie = setCookie.split(";")[0];
+    assert.match(cookie, /better-auth|session/i);
+    const me = await api(t.baseUrl, "GET", "/v1/account", {
+      headers: { cookie },
+    });
+    assert.equal(me.status, 200);
+    assert.equal(me.json.account.email, "web-device@example.com");
+    assert.equal(me.json.account.id, granted.json.accountId);
+  } finally { await t.close(); }
+});
+
+test("Apple-only web token is web_session_unavailable and does not consume the code", async () => {
+  const t = await startTestApp();
+  try {
+    const session = await signIn(t);
+    const started = await api(t.baseUrl, "POST", "/v1/auth/device/start", {
+      body: { client: "web", platform: "web" },
+    });
+    assert.equal((await approve(t, session.sessionToken, started.json.userCode)).status, 200);
+    const first = await poll(t, started.json.deviceCode);
+    assert.equal(first.status, 400);
+    assert.equal(first.json.error, "web_session_unavailable");
+    const retry = await poll(t, started.json.deviceCode);
+    assert.equal(retry.status, 400);
+    assert.equal(retry.json.error, "web_session_unavailable");
   } finally { await t.close(); }
 });
 
