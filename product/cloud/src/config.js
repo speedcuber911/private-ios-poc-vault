@@ -199,6 +199,18 @@ export function loadConfig(env = process.env) {
   };
 }
 
+// Same shape as the grant half-config check in main.js: a live web console
+// with RELAY_WEB_ORIGINS needs an https BETTER_AUTH_URL so SameSite=None
+// cookies can be Secure. Checked at process start, not inside createApp, so
+// in-process tests may still use http://127.0.0.1.
+export function webOriginsRequireHttps(config) {
+  return (
+    Array.isArray(config.trustedWebOrigins) &&
+    config.trustedWebOrigins.length > 0 &&
+    !String(config.betterAuthBaseURL || "").startsWith("https://")
+  );
+}
+
 function intFrom(value, fallback) {
   const n = Number.parseInt(value, 10);
   return Number.isFinite(n) && n >= 0 ? n : fallback;
