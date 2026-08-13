@@ -215,9 +215,12 @@ sets a Better Auth cookie (`SameSite=None`; `Secure` only when
 origins) is appended to Better Auth `trustedOrigins` and is the CORS
 allowlist for credentialed JSON (`Access-Control-Allow-Credentials: true`,
 echoed `Origin`, `Vary: Origin`; never `*`). A non-allowlisted origin gets
-no `Access-Control-Allow-Origin`. Apple-only accounts (no Better Auth user)
-return `400 { "error": "web_session_unavailable" }` and do not consume the
-code.
+no `Access-Control-Allow-Origin`. Apple-only accounts (phone Sign in with
+Apple, no Better Auth `user` row yet) get a Better Auth user created with
+the same id as the Relay account on first web-token redemption, then the
+cookie. `400 { "error": "web_session_unavailable" }` is only if that link
+cannot be minted (no email, or the email is already a different Better Auth
+user); the device code is not consumed.
 
 If `RELAY_WEB_ORIGINS` is set, `main.js` refuses to start unless
 `BETTER_AUTH_URL` is https — SameSite=None cookies are otherwise unusable

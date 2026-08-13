@@ -156,17 +156,28 @@ export function createApp({
   }
 
   // Web device-code redemption: Better Auth 1.6.26 has no auth.api.createSession.
-  // The same user id as registry.getAccount is the Better Auth user id for
-  // password sign-ups (ensureRelayAccount). Cookie name is better-auth.session_token.
-  // Confirm the Better Auth user exists before createSession: Apple-only
-  // accounts have a registry row and no `user` row, and createSession then
-  // 500s on a foreign key after the device code is already gone.
-  async function mintBetterAuthSessionCookie(userId) {
+  // Password sign-ups already share the registry id (ensureRelayAccount).
+  // Apple-only accounts have a registry row and no `user` row — create one
+  // with that same id so the phone QR lands on the existing account, not a
+  // second empty one. Cookie name is better-auth.session_token.
+  async function mintBetterAuthSessionCookie(account) {
     try {
       const ctx = await auth.betterAuth.$context;
-      const user = await ctx.internalAdapter.findUserById(userId);
+      let user = await ctx.internalAdapter.findUserById(account.id);
+      if (!user) {
+        const email = typeof account.email === "string" && account.email.includes("@")
+          ? account.email
+          : null;
+        if (!email) return null;
+        user = await ctx.internalAdapter.createUser({
+          id: account.id,
+          email,
+          name: email.split("@")[0],
+          emailVerified: true,
+        });
+      }
       if (!user) return null;
-      const session = await ctx.internalAdapter.createSession(userId);
+      const session = await ctx.internalAdapter.createSession(account.id);
       if (!session?.token) return null;
       return serializeSignedCookie(
         ctx.authCookies.sessionToken.name,
@@ -494,7 +505,7 @@ export function createApp({
       if (record.client === "web") {
         const account = registry.getAccount(record.accountId);
         if (!account) return sendJson(res, 400, { error: "invalid_grant" });
-        const cookie = await mintBetterAuthSessionCookie(account.id);
+        const cookie = await mintBetterAuthSessionCookie(account);
         if (!cookie) return sendJson(res, 400, { error: "web_session_unavailable" });
         const consumed = registry.consumeDeviceCode(record.id);
         if (!consumed) return sendJson(res, 400, { error: "invalid_grant" });
