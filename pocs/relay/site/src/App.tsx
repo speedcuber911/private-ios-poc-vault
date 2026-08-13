@@ -317,8 +317,8 @@ function SurfaceSection() {
   return (
     <section className="surface-v3" id="product">
       <div className="surface-v3-topline">
-        <span>02 — THE CONTROL SURFACE</span>
-        <small>NOT A REMOTE DESKTOP</small>
+        <span>02 — THE LIVE THREAD</span>
+        <small>START · WATCH · STEER · OPEN</small>
       </div>
       <Reveal className="surface-v3-heading">
         <h2>The whole run.<br /><em>In your hand.</em></h2>
@@ -450,92 +450,74 @@ export default function App() {
               <p>Launch, watch, and continue agent work from your iPhone while the machine with your files does the execution.</p>
             </div>
             <div className="hero-product-line" aria-hidden="true"><span>WORKSPACE</span><i /><strong>RELAY</strong><i /><span>IPHONE</span></div>
-            <div className="hero-proof" aria-label="Relay product highlights">
-              <span><strong>03</strong> agent runtimes</span>
-              <span><strong>01</strong> continuous thread</span>
-              <span><strong>∞</strong> away from the desk</span>
-            </div>
             <a className="hero-scroll" href="#system"><span>See the handoff</span><ArrowDown size={16} /></a>
-            <div className="hero-count">01 / 04</div>
           </motion.div>
         </section>
 
         <HandoffStory reducedMotion={reducedMotion} />
         <SurfaceSection />
 
-        <section className="boundary-v2" id="privacy">
-          <div className="boundary-v2-topline">
-            <span>03 — PRIVATE BY DESIGN</span>
-            <small>AUTHENTICATED CONTROL / BOUNDED EXECUTION</small>
+        <section className="story-v6" id="privacy">
+          <div className="story-v6-topline">
+            <span>03 — PRIVATE EXECUTION</span>
+            <small>PHONE → WORKSPACE → RESULT</small>
           </div>
-          <Reveal className="boundary-v2-heading">
-            <h2>Only the signal<br /><em>moves.</em></h2>
-          </Reveal>
 
-          <Reveal className="boundary-v2-field">
-            <div className="boundary-v2-local">
-              <div className="boundary-v2-rings" aria-hidden="true"><i /><i /><i /></div>
-              <span className="boundary-v2-label label-files">FILES</span>
-              <span className="boundary-v2-label label-tools">TOOLS</span>
-              <span className="boundary-v2-label label-auth">AUTH</span>
-              <div className="boundary-v2-core">
-                <small>EXECUTION</small>
-                <strong>RUNNER</strong>
-                <span><i /> LOCAL / ACTIVE</span>
-              </div>
-            </div>
-
-            <div className="boundary-v2-lanes" aria-label="Prompts, live state, and results cross the authenticated boundary">
-              <div><span>PROMPTS</span><i><b /></i></div>
-              <div><span>LIVE STATE</span><i><b /></i></div>
-              <div><span>RESULTS</span><i><b /></i></div>
-            </div>
-
-            <div className="boundary-v2-gate">
-              <span>AUTHENTICATED</span>
-              <i><b /></i>
-              <small>CONTROL ONLY</small>
-            </div>
-
-            <div className="boundary-v2-portable">
-              <div className="boundary-v2-portable-rings" aria-hidden="true"><i /><i /></div>
-              <div className="boundary-v2-relay-core">
-                <small>CONTROL</small>
-                <strong>RELAY</strong>
-                <span><i /> CONNECTED</span>
-              </div>
-              <div className="boundary-v2-device">IPHONE</div>
+          <Reveal className="story-v6-canvas">
+            <img
+              src="/relay-private-compute-v1.webp"
+              alt="A phone sending a task into a protected private workspace and receiving the finished result"
+              loading="lazy"
+              decoding="async"
+            />
+            <div className="story-v6-copy">
+              <h2>A whole machine.<br /><em>Just for your task.</em></h2>
+              <p>Relay opens a private cloud workspace, lets your agent do the work there, then sends the finished result back to your phone.</p>
             </div>
           </Reveal>
 
-          <div className="boundary-v2-legend">
-            <Reveal delay={0.04}><small>STAYS ON THE RUNNER</small><strong>FILES · TOOLS · AUTH</strong></Reveal>
-            <Reveal delay={0.1}><small>MOVES WITH YOU</small><strong>PROMPTS · STATE · RESULTS</strong></Reveal>
+          <div className="story-v6-flow" aria-label="How Relay cloud execution works">
+            <div><small>01</small><strong>Send a task</strong><span>From your phone</span></div>
+            <i aria-hidden="true" />
+            <div><small>02</small><strong>Work privately</strong><span>Inside your workspace</span></div>
+            <i aria-hidden="true" />
+            <div><small>03</small><strong>Get the result</strong><span>Back on your phone</span></div>
+          </div>
+
+          <div className="story-v6-proof">
+            <span><i /> One workspace per user</span>
+            <span><i /> Encrypted connection</span>
+            <span><i /> Cleared after the trial</span>
           </div>
         </section>
 
-        <section className="closing closing-v2">
-          <div className="closing-v2-grid" aria-hidden="true" />
-          <div className="closing-v2-orbit" aria-hidden="true"><i /></div>
-          <div className="closing-v2-top">
+        <section className="closing-v4" id="start-relay">
+          <div className="closing-v4-topline">
             <span>04 — KEEP MOVING</span>
             <small>RELAY / PRIVATE BETA</small>
           </div>
-          <Reveal className="closing-v2-copy">
-            <h2>Leave the desk.<br /><em>Not the work.</em></h2>
-            <p>Install Relay on the machine that holds your work. Carry the live thread from iPhone.</p>
-          </Reveal>
-          <Reveal className="closing-v2-action" delay={0.08}>
-            <div>
-              <small>INSTALL RELAY CLI</small>
-              <code><i>$</i> curl -fsSL get.openrelay.sh/install.sh | sh</code>
+          <div className="closing-v4-layout">
+            <div className="closing-v4-copy">
+              <Reveal><h2>One command.<br /><em>Then walk away.</em></h2></Reveal>
+              <p>Install Relay on the machine that holds your work. Start the agent there. Keep the live thread on iPhone.</p>
+              <Reveal className="closing-v4-action" delay={0.08}>
+                <div>
+                  <small>INSTALL RELAY CLI</small>
+                  <code><i>$</i> curl -fsSL get.openrelay.sh/install.sh | sh</code>
+                </div>
+                <button type="button" onClick={copyInstallCommand} aria-label={installCopied ? 'Install command copied' : 'Copy install command'}>
+                  {installCopied ? <Check size={16} /> : <Copy size={16} />}
+                  <span>{installCopied ? 'COPIED' : 'COPY'}</span>
+                </button>
+              </Reveal>
+              <div className="closing-v4-note"><i /><span>Files and execution stay on your machine.</span></div>
             </div>
-            <button type="button" onClick={copyInstallCommand}>
-              {installCopied ? <Check size={16} /> : <Copy size={16} />}
-              <span>{installCopied ? 'COPIED' : 'COPY'}</span>
-            </button>
-          </Reveal>
-          <div className="closing-v2-bottom">
+            <Reveal className="closing-v4-device" delay={0.1}>
+              <div className="closing-v4-halo" aria-hidden="true"><i /><i /></div>
+              <PhoneVisual mode="open" />
+            </Reveal>
+          </div>
+          <div className="closing-v4-bottom">
             <strong>RELAY</strong>
             <a href="#top" className="return-link">Back to top <RotateCcw size={14} /></a>
           </div>
