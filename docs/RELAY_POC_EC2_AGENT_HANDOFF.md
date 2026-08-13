@@ -85,8 +85,20 @@ do not belong on it.
 | Security group | existing POC EC2 group | Public 22/80/443 only; no 8790 ingress added |
 | Route 53 zone | `Z080645839I5BO3TEQ366` | Public zone `ai-rocket-experiments.com` |
 
-`conformal.live` is not hosted in this AWS account. That is why the final API
-host is `relay.ai-rocket-experiments.com`, not a `conformal.live` name.
+The final API host is `relay.ai-rocket-experiments.com`, not a `conformal.live`
+name, because Route 53 holds the `ai-rocket-experiments.com` zone here.
+
+Correcting an earlier claim in this document, which said `conformal.live` is
+not hosted in this AWS account: as of 2026-08-13 it is. `codex.pocs.conformal.live`
+and `vault.pocs.conformal.live` resolve to `3.111.143.88`, an Elastic IP in
+account `507121383669` (tagged `Project: Relay`) attached to `pariksj-dev`
+(`i-0364bb0f31f506e7c`) — the owner's personal development box, still serving
+200 on `/healthz` behind a valid certificate.
+
+That matters because it is not the product, and it was the checked-in default
+for `POC_VAULT_CODEX_BASE_URL`: an unconfigured build did not fail, it quietly
+talked to that dev box. The default is now empty and the in-code fallback is
+`https://unconfigured.invalid`, so an unconfigured build fails at DNS instead.
 
 ### Recovery and backup resources created
 
