@@ -265,9 +265,18 @@ final class HandoffTests: XCTestCase {
 
     // MARK: - Push routing
 
+    /// The `aps` block here is the shape the cloud actually sends (see
+    /// `cloud/src/notify.js` `bannerFor`): a real title and body naming the
+    /// repo and branch, not the `loc-key` placeholder it used to carry. Routing
+    /// reads only `relay` and is indifferent to the banner — which is the point
+    /// of including a realistic one.
     func testHandoffPushRoutesToTheHandoffSection() {
         let route = RelayPushService.route(from: [
-            "aps": ["alert": ["loc-key": "RELAY_EVENT"], "category": "RELAY_HANDOFF_READY"],
+            "aps": [
+                "alert": ["title": "Session ready", "body": "acme/widgets · relay/handoff-da52e722"],
+                "category": "RELAY_HANDOFF_READY",
+                "mutable-content": 1
+            ],
             "relay": ["nodeId": "node-1", "jobId": NSNull(), "type": "handoff.ready", "ts": 1, "seq": 1]
         ])
         XCTAssertEqual(route, .handoff(nodeID: "node-1"))
