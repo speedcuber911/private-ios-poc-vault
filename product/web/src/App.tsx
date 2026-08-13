@@ -1,7 +1,10 @@
 import { useEffect, useState } from "react";
 import { parseUserCodeFromHash } from "./api/device.js";
+import { Activity } from "./pages/Activity";
 import { CliLogin } from "./pages/CliLogin";
 import { Login } from "./pages/Login";
+import { Machines } from "./pages/Machines";
+import { Provisioning } from "./pages/Provisioning";
 
 function currentPath() {
   return window.location.pathname.replace(/\/$/, "") || "/";
@@ -11,13 +14,9 @@ function go(to: string) {
   window.history.pushState({}, "", to + window.location.hash);
 }
 
-function Stub({ title, status }: { title: string; status: string }) {
-  return (
-    <div className="stub">
-      <h1>{title}</h1>
-      <p className="stub-status">{status}</p>
-    </div>
-  );
+function machineIdFrom(route: string) {
+  const match = /^\/machines\/([^/]+)$/.exec(route);
+  return match ? decodeURIComponent(match[1]) : null;
 }
 
 export default function App() {
@@ -38,6 +37,9 @@ export default function App() {
     setRoute(currentPath());
   }
 
+  const machineId = machineIdFrom(route);
+  const authRoute = route === "/login" || route === "/cli-login";
+
   let screen = (
     <Login
       onSignedIn={() => {
@@ -55,10 +57,23 @@ export default function App() {
       />
     );
   } else if (route === "/provisioning") {
-    screen = <Stub title="Your machine" status="Creating" />;
+    screen = (
+      <Provisioning
+        onReady={(nodeId) => navigate(nodeId ? `/machines/${nodeId}` : "/machines")}
+        onNeedLogin={() => navigate("/login")}
+      />
+    );
+  } else if (machineId) {
+    screen = <Activity nodeId={machineId} onBack={() => navigate("/machines")} />;
   } else if (route === "/machines") {
-    screen = <Stub title="Machines" status="No machines yet" />;
+    screen = (
+      <Machines
+        onOpen={(id) => navigate(`/machines/${id}`)}
+        onProvision={() => navigate("/provisioning")}
+        onNeedLogin={() => navigate("/login")}
+      />
+    );
   }
 
-  return <main className="canvas">{screen}</main>;
+  return <main className={authRoute ? "canvas" : "canvas canvas-page"}>{screen}</main>;
 }
