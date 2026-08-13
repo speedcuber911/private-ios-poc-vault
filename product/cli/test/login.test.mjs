@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const { cmdLogin, fingerprint } = await import("../src/commands/login.mjs");
+const { cmdLogin, fingerprint, qrRenderMode } = await import("../src/commands/login.mjs");
 const { readCredentials } = await import("../src/creds.mjs");
 
 function fakeCloud(script) {
@@ -82,6 +82,53 @@ test("login sends machineName and normalized platform, and --no-qr skips the QR"
   assert.deepEqual(cloud.calls[0].body, { machineName: "dev-box.local", platform: "macos" });
   assert.ok(!lines.some((line) => /[█▀▄]/.test(line)), "--no-qr must suppress the QR render");
   assert.ok(lines.some((line) => line.includes("ABCD-EFGH")));
+});
+
+test("Terminal.app uses the glyph-free square QR renderer while iTerm stays compact", async () => {
+  assert.equal(qrRenderMode({ TERM_PROGRAM: "Apple_Terminal" }), "square");
+  assert.equal(qrRenderMode({ TERM_PROGRAM: "iTerm.app" }), "compact");
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-login-terminal-qr-"));
+  const cloud = fakeCloud({
+    "/v1/auth/device/start": { status: 201, json: { deviceCode: "dc", userCode: "ABCD-EFGH", verificationUri: "https://relay.test/cli-login", verificationUriComplete: "https://relay.test/cli-login#code=ABCD-EFGH", interval: 1, expiresIn: 900 } },
+    "/v1/auth/device/token": { status: 200, json: { sessionToken: "sess", refreshToken: "ref", accountId: "acct" } },
+    "/v1/trial-nodes/current": { status: 404, json: { error: "no_trial" } },
+  });
+  const lines = [];
+
+  await cmdLogin([], {
+    home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl,
+    log: (line) => lines.push(line), sleep: async () => {},
+    env: { TERM_PROGRAM: "Apple_Terminal" },
+    stdout: { isTTY: true, columns: 120 },
+  });
+
+  const output = lines.join("\n");
+  assert.match(output, /\x1b\[48;5;16m/);
+  assert.match(output, /\x1b\[48;5;231m/);
+  assert.doesNotMatch(output, /[█▀▄]/);
+});
+
+test("Terminal.app skips a square QR that would wrap in a narrow window", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-login-terminal-narrow-"));
+  const cloud = fakeCloud({
+    "/v1/auth/device/start": { status: 201, json: { deviceCode: "dc", userCode: "ABCD-EFGH", verificationUri: "https://relay.test/cli-login", verificationUriComplete: "https://relay.test/cli-login#code=ABCD-EFGH", interval: 1, expiresIn: 900 } },
+    "/v1/auth/device/token": { status: 200, json: { sessionToken: "sess", refreshToken: "ref", accountId: "acct" } },
+    "/v1/trial-nodes/current": { status: 404, json: { error: "no_trial" } },
+  });
+  const lines = [];
+
+  await cmdLogin([], {
+    home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl,
+    log: (line) => lines.push(line), sleep: async () => {},
+    env: { TERM_PROGRAM: "Apple_Terminal" },
+    stdout: { isTTY: true, columns: 60 },
+  });
+
+  const output = lines.join("\n");
+  assert.doesNotMatch(output, /\x1b\[48;5;(?:16|231)m/);
+  assert.match(output, /Your code:\s+ABCD-EFGH/);
+  assert.match(output, /Approve at:\s+https:\/\/relay\.test\/cli-login/);
 });
 
 test("login reports plainly when the account has no sandbox yet", async () => {

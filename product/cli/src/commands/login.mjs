@@ -28,6 +28,12 @@ function normalizePlatform(platform = process.platform) {
   return "other";
 }
 
+function qrRenderMode(env = process.env) {
+  // iTerm renders the compact Unicode half-block QR cleanly. Terminal.app can
+  // render seams between those glyphs, so use font-independent square cells.
+  return env.TERM_PROGRAM === "Apple_Terminal" ? "square" : "compact";
+}
+
 async function cmdLogin(args = [], deps = {}) {
   const {
     home = undefined,
@@ -39,6 +45,7 @@ async function cmdLogin(args = [], deps = {}) {
     hostname = () => os.hostname(),
     platform = process.platform,
     stdout = process.stdout,
+    env = process.env,
     progress = noopProgress,
   } = deps;
 
@@ -66,10 +73,11 @@ async function cmdLogin(args = [], deps = {}) {
   // QR above the human code. Skip when asked, when stdout isn't a TTY, or
   // when the terminal is narrower than the rendered symbol (wrapping breaks
   // finder patterns and cameras can't lock).
+  const qrMode = qrRenderMode(env);
   const columns = stdout.columns;
-  const canFit = columns == null || columns >= (qrPayload ? qrAnsiWidth(qrPayload) : Infinity);
+  const canFit = columns == null || columns >= (qrPayload ? qrAnsiWidth(qrPayload, { mode: qrMode }) : Infinity);
   if (!noQr && stdout.isTTY && qrPayload && canFit) {
-    log(renderQrAnsi(qrPayload));
+    log(renderQrAnsi(qrPayload, { mode: qrMode }));
     log("");
   }
   log(`  Your code:  ${userCode}`);
@@ -191,4 +199,4 @@ async function cmdLogin(args = [], deps = {}) {
   else log("  Machine has no encryption key yet — update it before handing off.");
 }
 
-export { cmdLogin, fingerprint, normalizePlatform };
+export { cmdLogin, fingerprint, normalizePlatform, qrRenderMode };
