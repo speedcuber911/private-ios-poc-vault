@@ -39,6 +39,14 @@ export async function deriveAuthToken(secret) {
   return bytesToBase64url(digest);
 }
 
+export function isProvisioningTerminal(state) {
+  return state === "ready" || state === "failed" || state === "expired" || state === "destroyed";
+}
+
+export function isRetryableProvisioning(state) {
+  return state === "failed";
+}
+
 /**
  * @param {{ state?: string, nodeId?: string | null } | null | undefined} trial
  */
@@ -46,6 +54,8 @@ export function provisioningStage(trial) {
   const state = trial?.state;
   if (state === "failed") return { stage: "failed", label: "Failed" };
   if (state === "ready") return { stage: "ready", label: "Ready" };
+  if (state === "expired") return { stage: "expired", label: "Expired" };
+  if (state === "destroyed") return { stage: "destroyed", label: "Destroyed" };
   if (state === "creating" && trial?.nodeId) return { stage: "booting", label: "Booting" };
   return { stage: "creating", label: "Creating" };
 }
@@ -132,15 +142,22 @@ export function createTrial({
   }
 
   /**
-   * @param {{ interval?: number, signal?: AbortSignal }} [opts]
+   * @param {{
+   *   interval?: number,
+   *   signal?: AbortSignal,
+   *   onTrial?: (trial: { state?: string, nodeId?: string | null }) => void,
+   * }} [opts]
    */
-  async function pollUntilSettled({ interval = 2, signal } = {}) {
+  async function pollUntilSettled({ interval = 2, signal, onTrial } = {}) {
     const waitMs = Math.max(1, Number(interval) || 2) * 1000;
     for (;;) {
       if (signal?.aborted) return { ok: false, status: 0, json: { error: "aborted" } };
       const current = await getCurrent();
-      const state = current.json?.trial?.state;
-      if (current.ok && (state === "ready" || state === "failed")) return current;
+      if (signal?.aborted) return { ok: false, status: 0, json: { error: "aborted" } };
+      const trial = current.json?.trial;
+      const state = trial?.state;
+      if (current.ok && trial) onTrial?.(trial);
+      if (current.ok && isProvisioningTerminal(state)) return current;
       if (!current.ok && current.status !== 404) return current;
       await sleep(waitMs);
     }

@@ -6,6 +6,8 @@ import {
   createTrial,
   decideMachineAction,
   deriveAuthToken,
+  isProvisioningTerminal,
+  isRetryableProvisioning,
   kindWord,
   machineStatusWord,
   mintPairingSecret,
@@ -189,6 +191,93 @@ test("pollUntilSettled GETs current until ready or failed", async () => {
   assert.deepEqual(sleeps, [2000, 2000]);
 });
 
+test("pollUntilSettled observes Creating then Booting then Ready via onTrial", async () => {
+  let n = 0;
+  const seen = [];
+  const api = trialWith(
+    () => {
+      n += 1;
+      if (n === 1) {
+        return { status: 200, json: { trial: { id: "t1", state: "creating", nodeId: null } } };
+      }
+      if (n === 2) {
+        return { status: 200, json: { trial: { id: "t1", state: "creating", nodeId: "node-1" } } };
+      }
+      return { status: 200, json: { trial: { id: "t1", state: "ready", nodeId: "node-1" } } };
+    },
+    { sleep: async () => {} },
+  );
+
+  const result = await api.pollUntilSettled({
+    interval: 2,
+    onTrial: (trial) => seen.push(provisioningStage(trial).label),
+  });
+  assert.equal(result.json.trial.state, "ready");
+  assert.deepEqual(seen, ["Creating", "Booting", "Ready"]);
+  assert.equal(seen.includes("Booting"), true);
+});
+
+test("pollUntilSettled treats expired as terminal and does not keep polling", async () => {
+  let polls = 0;
+  const api = trialWith(
+    () => {
+      polls += 1;
+      return { status: 200, json: { trial: { id: "t1", state: "expired", nodeId: "node-1" } } };
+    },
+    {
+      sleep: async () => {
+        throw new Error("pollUntilSettled must not sleep after expired");
+      },
+    },
+  );
+
+  const result = await api.pollUntilSettled({ interval: 2 });
+  assert.equal(result.json.trial.state, "expired");
+  assert.equal(polls, 1);
+});
+
+test("pollUntilSettled treats destroyed as terminal and does not keep polling", async () => {
+  let polls = 0;
+  const api = trialWith(
+    () => {
+      polls += 1;
+      return { status: 200, json: { trial: { id: "t1", state: "destroyed", nodeId: null } } };
+    },
+    {
+      sleep: async () => {
+        throw new Error("pollUntilSettled must not sleep after destroyed");
+      },
+    },
+  );
+
+  const result = await api.pollUntilSettled({ interval: 2 });
+  assert.equal(result.json.trial.state, "destroyed");
+  assert.equal(polls, 1);
+});
+
+test("pollUntilSettled does not invoke onTrial after abort", async () => {
+  const ac = new AbortController();
+  const seen = [];
+  const api = trialWith(
+    () => {
+      ac.abort();
+      return { status: 200, json: { trial: { id: "t1", state: "creating", nodeId: "node-1" } } };
+    },
+    {
+      sleep: async () => {
+        throw new Error("pollUntilSettled must not sleep after abort");
+      },
+    },
+  );
+  const result = await api.pollUntilSettled({
+    interval: 2,
+    signal: ac.signal,
+    onTrial: (trial) => seen.push(trial.state),
+  });
+  assert.equal(result.json.error, "aborted");
+  assert.deepEqual(seen, []);
+});
+
 test("provisioningStage maps creating/nodeId/ready/failed and has no Pairing row", () => {
   assert.deepEqual(provisioningStage({ state: "creating", nodeId: null }), {
     stage: "creating",
@@ -213,6 +302,32 @@ test("provisioningStage maps creating/nodeId/ready/failed and has no Pairing row
     true,
   );
   assert.notEqual(provisioningStage({ state: "creating", nodeId: "x" }).label, "Pairing");
+});
+
+test("provisioningStage maps expired and destroyed to terminal stages, not Creating", () => {
+  assert.deepEqual(provisioningStage({ state: "expired", nodeId: "node-1" }), {
+    stage: "expired",
+    label: "Expired",
+  });
+  assert.deepEqual(provisioningStage({ state: "destroyed", nodeId: null }), {
+    stage: "destroyed",
+    label: "Destroyed",
+  });
+  assert.notEqual(provisioningStage({ state: "expired", nodeId: "node-1" }).stage, "creating");
+  assert.notEqual(provisioningStage({ state: "destroyed", nodeId: null }).stage, "creating");
+});
+
+test("failed is retryable; expired and destroyed are spent terminals that do not poll", () => {
+  assert.equal(isProvisioningTerminal("ready"), true);
+  assert.equal(isProvisioningTerminal("failed"), true);
+  assert.equal(isProvisioningTerminal("expired"), true);
+  assert.equal(isProvisioningTerminal("destroyed"), true);
+  assert.equal(isProvisioningTerminal("creating"), false);
+  assert.equal(isRetryableProvisioning("failed"), true);
+  assert.equal(isRetryableProvisioning("expired"), false);
+  assert.equal(isRetryableProvisioning("destroyed"), false);
+  assert.equal(isRetryableProvisioning("ready"), false);
+  assert.equal(isRetryableProvisioning("creating"), false);
 });
 
 test("kindWord is TRIAL for trial and YOUR MACHINE otherwise", () => {

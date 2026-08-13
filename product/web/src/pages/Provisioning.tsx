@@ -1,8 +1,22 @@
 import { useEffect, useRef, useState } from "react";
 import { RelayMark } from "./Login";
-import { provisioningStage, trial as defaultTrial } from "../api/trial.js";
+import {
+  isProvisioningTerminal,
+  isRetryableProvisioning,
+  provisioningStage,
+  trial as defaultTrial,
+} from "../api/trial.js";
 
-type Stage = "creating" | "booting" | "ready" | "failed";
+type Stage = "creating" | "booting" | "ready" | "failed" | "expired" | "destroyed";
+
+const STAGE_LABEL: Record<Stage, string> = {
+  creating: "Creating",
+  booting: "Booting",
+  ready: "Ready",
+  failed: "Failed",
+  expired: "Expired",
+  destroyed: "Destroyed",
+};
 
 const CAPACITY_COPY = "No trial machines are available.";
 
@@ -24,6 +38,7 @@ export function Provisioning({
   const [error, setError] = useState<string | null>(null);
   const [working, setWorking] = useState(false);
   const onNeedLoginRef = useRef(onNeedLogin);
+  const abortRef = useRef<AbortController | null>(null);
   onNeedLoginRef.current = onNeedLogin;
 
   function applyTrial(trial: { state?: string; nodeId?: string | null } | null) {
@@ -58,9 +73,14 @@ export function Provisioning({
         }
       }
       applyTrial(current.json?.trial);
-      const state = current.json?.trial?.state;
-      if (state === "ready" || state === "failed") return;
-      const settled = await defaultTrial.pollUntilSettled({ interval: 2, signal });
+      if (isProvisioningTerminal(current.json?.trial?.state)) return;
+      const settled = await defaultTrial.pollUntilSettled({
+        interval: 2,
+        signal,
+        onTrial: (trial) => {
+          if (!signal.aborted) applyTrial(trial);
+        },
+      });
       if (signal.aborted || settled.json?.error === "aborted") return;
       if (settled.status === 401) {
         onNeedLoginRef.current();
@@ -84,18 +104,22 @@ export function Provisioning({
 
   useEffect(() => {
     const ac = new AbortController();
+    abortRef.current = ac;
     void begin(ac.signal, false);
-    return () => ac.abort();
+    return () => {
+      abortRef.current?.abort();
+    };
   }, []);
 
   function retry() {
+    abortRef.current?.abort();
     const ac = new AbortController();
+    abortRef.current = ac;
     void begin(ac.signal, true);
   }
 
-  const live = stage !== "failed";
-  const label =
-    stage === "booting" ? "Booting" : stage === "ready" ? "Ready" : stage === "failed" ? "Failed" : "Creating";
+  const live = stage === "creating" || stage === "booting" || stage === "ready";
+  const label = STAGE_LABEL[stage];
 
   return (
     <div className="page">
@@ -118,7 +142,7 @@ export function Provisioning({
           </button>
         </div>
       ) : null}
-      {stage === "failed" ? (
+      {isRetryableProvisioning(stage) ? (
         <div className="actions">
           <button type="button" className="btn-primary" disabled={working} onClick={() => retry()}>
             {working ? "Retrying…" : "Retry"}
