@@ -125,3 +125,19 @@ test("renderQrAnsi uses half-blocks, a quiet zone, and explicit ANSI colors", ()
   assert.match(ansi, /[█▀▄]/);
   assert.equal(qrAnsiWidth(text), qrModules(text).length + 4);
 });
+
+test("square rendering uses background-color spaces instead of font-dependent block glyphs", () => {
+  const text = "https://relay.example/cli-login#code=ABCD-EFGH";
+  const ansi = renderQrAnsi(text, { mode: "square" });
+  const dim = qrModules(text).length + 4;
+
+  assert.match(ansi, /\x1b\[48;5;16m/);
+  assert.match(ansi, /\x1b\[48;5;231m/);
+  assert.doesNotMatch(ansi, /[█▀▄]/);
+  assert.equal(ansi.split("\n").length, dim);
+  assert.equal(qrAnsiWidth(text, { mode: "square" }), dim * 2);
+});
+
+test("renderQrAnsi rejects unknown render modes", () => {
+  assert.throws(() => renderQrAnsi("relay", { mode: "wide-ish" }), /unsupported_qr_render_mode/);
+});

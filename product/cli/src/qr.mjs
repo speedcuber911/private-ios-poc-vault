@@ -884,7 +884,7 @@ function moduleAt(modules, x, y) {
  * Uses explicit ANSI fg+bg so the symbol stays scannable on both dark and
  * light terminal themes (dark modules always paint as black-on-white cells).
  */
-function renderQrAnsi(text) {
+function renderQrAnsi(text, { mode = "compact" } = {}) {
   const modules = qrModules(text);
   const size = modules.length;
   const dim = size + QUIET_ZONE * 2;
@@ -894,6 +894,32 @@ function renderQrAnsi(text) {
   const on = "\x1b[38;5;16;48;5;231m";
   const reset = "\x1b[0m";
   const lines = [];
+
+  // Terminal.app can leave seams or distort the Unicode half-block glyphs
+  // used by the compact renderer. In square mode, paint each module as a
+  // two-column background-color cell made only from ASCII spaces. Terminal
+  // cells are roughly twice as tall as they are wide, so this produces square
+  // QR modules without depending on any font's block-element metrics.
+  if (mode === "square") {
+    const dark = "\x1b[48;5;16m";
+    const light = "\x1b[48;5;231m";
+    for (let y = 0; y < dim; y++) {
+      let line = "";
+      let active = null;
+      for (let x = 0; x < dim; x++) {
+        const next = moduleAt(modules, x, y) ? dark : light;
+        if (next !== active) {
+          line += next;
+          active = next;
+        }
+        line += "  ";
+      }
+      lines.push(line + reset);
+    }
+    return lines.join("\n");
+  }
+
+  if (mode !== "compact") throw new Error(`unsupported_qr_render_mode:${mode}`);
   for (let y = 0; y < dim; y += 2) {
     let line = on;
     for (let x = 0; x < dim; x++) {
@@ -911,8 +937,9 @@ function renderQrAnsi(text) {
 }
 
 /** Width in terminal columns of a rendered QR for `text` (quiet zone included). */
-function qrAnsiWidth(text) {
-  return qrModules(text).length + QUIET_ZONE * 2;
+function qrAnsiWidth(text, { mode = "compact" } = {}) {
+  const dim = qrModules(text).length + QUIET_ZONE * 2;
+  return mode === "square" ? dim * 2 : dim;
 }
 
 export { qrModules, renderQrAnsi, qrAnsiWidth };
