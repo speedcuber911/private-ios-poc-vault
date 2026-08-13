@@ -280,8 +280,16 @@ final class TrialPairingTests: XCTestCase {
         XCTAssertNil(RelayNodeStore(defaults: defaults).trial)
     }
 
+    // This test used to assert the opposite — that a refresh never drops the
+    // node URL — and it was renamed with the behaviour it pinned. updateTrial
+    // now follows the server's answer about whether there is a usable machine
+    // at all: an expired/destroyed/failed trial clears the pointer, because a
+    // dead one is worse than none. Keeping it made the phone dial a destroyed
+    // node forever while the banner read "Trial expired", with every request
+    // failing at TLS and nothing connecting the two. `hasMachine` can now route
+    // to the trial flow instead.
     @MainActor
-    func testTrialRefreshSuccessUpdatesStateWithoutDroppingTheNodeURL() throws {
+    func testTrialRefreshClearsTheNodeURLOnceTheTrialIsNoLongerUsable() throws {
         let suite = "trial-refresh-success-tests"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defaults.removePersistentDomain(forName: suite)
@@ -291,8 +299,27 @@ final class TrialPairingTests: XCTestCase {
         store.applyRefresh(.success(try Self.expiredTrial()))
 
         XCTAssertEqual(store.trial?.state, .expired)
-        XCTAssertEqual(store.activeNodeURL, URL(string: "https://node-0011223344556677.tun.test"))
+        XCTAssertNil(store.activeNodeURL, "an expired trial's node is gone; dialling it can only fail at TLS")
+        XCTAssertFalse(store.hasMachine, "and with no usable machine the app must route to the trial flow")
         XCTAssertEqual(RelayNodeStore(defaults: defaults).trial?.state, .expired)
+    }
+
+    // The other half of the same rule, which nothing covered: while the trial
+    // IS usable the pointer must be kept, or a refresh would knock a working
+    // machine out from under the app.
+    @MainActor
+    func testTrialRefreshKeepsTheNodeURLWhileTheTrialIsUsable() throws {
+        let suite = "trial-refresh-usable-tests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+
+        let store = RelayNodeStore(defaults: defaults)
+        store.adoptTrial(try Self.readyTrial())
+        store.applyRefresh(.success(try Self.readyTrial()))
+
+        XCTAssertEqual(store.trial?.state, .ready)
+        XCTAssertEqual(store.activeNodeURL, URL(string: "https://node-0011223344556677.tun.test"))
+        XCTAssertTrue(store.hasMachine)
     }
 
     // MARK: - Fixtures
