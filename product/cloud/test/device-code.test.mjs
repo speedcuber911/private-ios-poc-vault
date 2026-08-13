@@ -518,3 +518,138 @@ test("mapDeviceCode returns numbers for the integer columns", () => {
   assert.equal(record.approvedAt, null);
   assert.equal(record.consumedAt, null);
 });
+
+// ── QR CLI auth handoff: machine metadata + inspect ───────────────────────
+
+const inspect = (t, sessionToken, userCode) =>
+  api(t.baseUrl, "POST", "/v1/auth/device/inspect", { body: { userCode }, ...authed(sessionToken) });
+
+test("device/start stores sanitized machineName and normalized platform, and returns verificationUriComplete", async () => {
+  const t = await startTestApp();
+  try {
+    const res = await api(t.baseUrl, "POST", "/v1/auth/device/start", {
+      body: {
+        machineName: "  Mac\u0000Book\u0007 Pro  ",
+        platform: "darwin",
+      },
+    });
+    assert.equal(res.status, 201);
+    assert.match(res.json.userCode, /^[BCDFGHJKLMNPQRSTVWXZ2-9]{4}-[BCDFGHJKLMNPQRSTVWXZ2-9]{4}$/);
+    assert.equal(
+      res.json.verificationUriComplete,
+      `${res.json.verificationUri}#code=${res.json.userCode}`,
+    );
+
+    const session = await signIn(t);
+    const looked = await inspect(t, session.sessionToken, res.json.userCode);
+    assert.equal(looked.status, 200);
+    assert.equal(looked.json.machineName, "MacBook Pro");
+    assert.equal(looked.json.platform, "other", "unrecognized platform values normalize to other");
+    assert.equal(typeof looked.json.createdAt, "number");
+    assert.equal(typeof looked.json.expiresAt, "number");
+    assert.equal(looked.json.deviceCode, undefined);
+  } finally { await t.close(); }
+});
+
+test("device/start truncates machineName to 64 chars and accepts known platforms", async () => {
+  const t = await startTestApp();
+  try {
+    const long = "x".repeat(80);
+    const res = await api(t.baseUrl, "POST", "/v1/auth/device/start", {
+      body: { machineName: long, platform: "macos" },
+    });
+    assert.equal(res.status, 201);
+    const session = await signIn(t);
+    const looked = await inspect(t, session.sessionToken, res.json.userCode);
+    assert.equal(looked.json.machineName, "x".repeat(64));
+    assert.equal(looked.json.platform, "macos");
+
+    for (const [raw, expected] of [
+      ["linux", "linux"],
+      ["windows", "windows"],
+      ["other", "other"],
+      ["FreeBSD", "other"],
+      ["", null],
+    ]) {
+      const started = await api(t.baseUrl, "POST", "/v1/auth/device/start", {
+        body: { platform: raw },
+      });
+      const info = await inspect(t, session.sessionToken, started.json.userCode);
+      assert.equal(info.json.platform, expected, `platform ${JSON.stringify(raw)}`);
+    }
+  } finally { await t.close(); }
+});
+
+test("device/inspect returns machine metadata for a pending code", async () => {
+  const t = await startTestApp();
+  try {
+    const started = await api(t.baseUrl, "POST", "/v1/auth/device/start", {
+      body: { machineName: "dev-box", platform: "linux" },
+    });
+    const session = await signIn(t);
+    const looked = await inspect(t, session.sessionToken, started.json.userCode.toLowerCase());
+    assert.equal(looked.status, 200);
+    assert.deepEqual(
+      { machineName: looked.json.machineName, platform: looked.json.platform },
+      { machineName: "dev-box", platform: "linux" },
+    );
+  } finally { await t.close(); }
+});
+
+test("device/inspect unknown, expired, and approved codes are byte-identical 404s", async () => {
+  // Short code TTL so expiry does not also kill the approver's session.
+  const t = await startTestApp({ env: { DEVICE_CODE_TTL_SEC: "1" } });
+  try {
+    const session = await signIn(t);
+    const unknown = await inspect(t, session.sessionToken, "ZZZZ-ZZZZ");
+    assert.equal(unknown.status, 404);
+    assert.equal(JSON.stringify(unknown.json), JSON.stringify({ error: "unknown_user_code" }));
+
+    const toExpire = await start(t);
+    t.clock.t += 2000;
+    const expired = await inspect(t, session.sessionToken, toExpire.json.userCode);
+    assert.equal(expired.status, 404);
+    assert.equal(JSON.stringify(expired.json), JSON.stringify(unknown.json));
+    assert.equal(expired.buf.toString("utf8"), unknown.buf.toString("utf8"));
+
+    const live = await start(t);
+    assert.equal((await approve(t, session.sessionToken, live.json.userCode)).status, 200);
+    const approved = await inspect(t, session.sessionToken, live.json.userCode);
+    assert.equal(approved.status, 404);
+    assert.equal(JSON.stringify(approved.json), JSON.stringify(unknown.json));
+    assert.equal(approved.buf.toString("utf8"), unknown.buf.toString("utf8"));
+
+    // Regression: approve remains one-shot after an inspect miss on an approved code.
+    const again = await start(t);
+    assert.equal((await approve(t, session.sessionToken, again.json.userCode)).status, 200);
+    assert.equal((await approve(t, session.sessionToken, again.json.userCode)).status, 404);
+  } finally { await t.close(); }
+});
+
+test("device/inspect is rate-capped per account at 30/min", async () => {
+  const t = await startTestApp();
+  try {
+    const started = await start(t);
+    const session = await signIn(t);
+    for (let i = 0; i < 30; i++) {
+      const ok = await inspect(t, session.sessionToken, started.json.userCode);
+      assert.equal(ok.status, 200, `request ${i + 1} should be allowed`);
+    }
+    const limited = await inspect(t, session.sessionToken, started.json.userCode);
+    assert.equal(limited.status, 429);
+    assert.equal(limited.json.error, "rate_limited");
+
+    // A different account has its own budget.
+    const other = await signIn(t, { sub: "other", email: "other@example.com" });
+    assert.equal((await inspect(t, other.sessionToken, started.json.userCode)).status, 200);
+  } finally { await t.close(); }
+});
+
+test("device/inspect requires a session", async () => {
+  const t = await startTestApp();
+  try {
+    const started = await start(t);
+    const res = await api(t.baseUrl, "POST", "/v1/auth/device/inspect", { body: { userCode: started.json.userCode } });
+    assert.equal(res.status, 401);
+  } finally { await t.close(); }
+});

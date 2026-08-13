@@ -15,6 +15,7 @@
 // authenticates relayed blobs — see pairing.js for the full rationale.
 
 import { createServer } from "node:http";
+import { readFileSync } from "node:fs";
 import { timingSafeEqual, randomBytes, createHash } from "node:crypto";
 import { createDb } from "./db.js";
 import { createRegistry } from "./registry.js";
@@ -27,6 +28,28 @@ import { createProvisioner } from "./provisioner.js";
 import { verifyNodeRequest, createReplayGuard } from "./nodeauth.js";
 
 const NODE_KINDS = new Set(["byo", "managed"]);
+
+// Reads the wildcard certificate handed to every trial node, or {} when none
+// is configured. Read per provision rather than cached at boot so a certbot
+// renewal is picked up without restarting the control plane — the files are
+// symlinks into letsencrypt's archive and are replaced, not rewritten.
+//
+// Returns {} on any read failure instead of throwing: a node that self-signs
+// still works, where a failed provision leaves the user with nothing.
+function nodeTlsMaterial(config) {
+  const { certFile, keyFile } = config.nodeTls ?? {};
+  if (!certFile || !keyFile) return {};
+  try {
+    return {
+      tlsCert: readFileSync(certFile, "utf8"),
+      tlsKey: readFileSync(keyFile, "utf8"),
+    };
+  } catch (error) {
+    // Path and error code only; never the key.
+    console.error(`node TLS material unreadable at ${certFile}: ${error.code || "unknown"} — node will self-sign`);
+    return {};
+  }
+}
 
 // Bounds how many polls from ONE node can be parked at once on
 // GET /v1/node/handoffs. A client that connects, signs a valid request, and
@@ -81,6 +104,9 @@ export function createApp({
     // orphan instead of an account that cannot be deleted.
     beforeAccountDelete: (accountId) =>
       releaseSandbox(registry.getTrialByAccount(accountId), "account_deleted"),
+    // Shared with the legacy /v1/auth/apple route, so both paths accept
+    // exactly the same tokens and there is one Apple verifier to reason about.
+    verifyAppleIdToken: legacyAuth.verifyAppleIdentityToken,
   });
   const auth = {
     ...legacyAuth,
@@ -157,6 +183,27 @@ export function createApp({
   // per instance, like handoffWaiters, so tests don't leak claimed
   // (nodeId, ts, signature) triples across app instances.
   const handoffReplayGuard = createReplayGuard();
+
+  // Per-account sliding window for POST /v1/auth/device/inspect. Mirrors the
+  // spirit of the per-IP live-code ceiling on /device/start, but inspect is
+  // session-authed so the bucket key is accountId (an unauthenticated caller
+  // never reaches this counter). 30/min is enough for a human tapping retry
+  // and far below what an enumeration sweep would need.
+  const DEVICE_INSPECT_RATE_LIMIT = 30;
+  const DEVICE_INSPECT_RATE_WINDOW_MS = 60_000;
+  const deviceInspectHits = new Map(); // accountId -> number[] of timestamps
+
+  function allowDeviceInspect(accountId, nowMs) {
+    let hits = deviceInspectHits.get(accountId) || [];
+    hits = hits.filter((ts) => nowMs - ts < DEVICE_INSPECT_RATE_WINDOW_MS);
+    if (hits.length >= DEVICE_INSPECT_RATE_LIMIT) {
+      deviceInspectHits.set(accountId, hits);
+      return false;
+    }
+    hits.push(nowMs);
+    deviceInspectHits.set(accountId, hits);
+    return true;
+  }
 
   function wakeHandoffWaiters(nodeId) {
     const waiters = handoffWaiters.get(nodeId);
@@ -349,6 +396,9 @@ export function createApp({
       if (clientIp && registry.countLiveDeviceCodesForIp(clientIp, now()) >= config.deviceCodeMaxLivePerIp) {
         return sendJson(res, 429, { error: "slow_down" });
       }
+      const body = await readJson(req, config.jsonBodyMaxBytes);
+      const machineName = sanitizeMachineName(body?.machineName);
+      const platform = normalizeDevicePlatform(body?.platform);
       const deviceCode = randomBytes(32).toString("base64url");
       // A user_code collision is a UNIQUE constraint violation that would
       // otherwise reach the top-level handler as 500 {"error":"internal"}.
@@ -361,16 +411,23 @@ export function createApp({
             userCode: mintUserCode(),
             expiresAt: now() + config.deviceCodeTtlSec * 1000,
             clientIp,
+            machineName,
+            platform,
           });
           break;
         } catch (err) {
           if (attempt >= 5) throw err;
         }
       }
+      // verificationUriComplete puts the user code in the URL hash fragment
+      // so a future real page (or system-camera / universal-link scan) never
+      // ships the code to server access logs. The redeeming secret
+      // (deviceCode) is NEVER included here — only the approval handle.
       return sendJson(res, 201, {
         deviceCode,
         userCode: record.userCode,
         verificationUri: config.deviceLoginUrl,
+        verificationUriComplete: `${config.deviceLoginUrl}#code=${record.userCode}`,
         interval: config.deviceCodePollIntervalSec,
         expiresIn: config.deviceCodeTtlSec,
       });
@@ -722,6 +779,35 @@ export function createApp({
     const account = await auth.authenticate(req);
     if (!account) return sendJson(res, 401, { error: "unauthorized" });
 
+    if (method === "POST" && path === "/v1/auth/device/inspect") {
+      // Read-only twin of /device/approve: returns the CLI-reported machine
+      // name so the phone can show a confirm sheet before approving. Same
+      // anti-enumeration posture as approve — unknown, expired, and already-
+      // approved all return the identical 404. Always performs the user-code
+      // lookup (no short-circuit that would skip the hash/index read on a
+      // malformed code) so timing does not separate failure classes.
+      if (!allowDeviceInspect(account.id, now())) {
+        return sendJson(res, 429, { error: "rate_limited" });
+      }
+      const body = await readJson(req, config.jsonBodyMaxBytes);
+      const userCode = normalizeUserCode(body?.userCode);
+      const record = registry.getDeviceCodeByUserCode(userCode);
+      if (
+        !record
+        || record.consumedAt !== null
+        || record.expiresAt <= now()
+        || record.accountId !== null
+      ) {
+        return sendJson(res, 404, { error: "unknown_user_code" });
+      }
+      return sendJson(res, 200, {
+        machineName: record.machineName,
+        platform: record.platform,
+        createdAt: record.createdAt,
+        expiresAt: record.expiresAt,
+      });
+    }
+
     if (method === "POST" && path === "/v1/auth/device/approve") {
       const body = await readJson(req, config.jsonBodyMaxBytes);
       const userCode = normalizeUserCode(body?.userCode);
@@ -1021,6 +1107,13 @@ export function createApp({
             tunnelHost: config.tunnel.host,
             tunnelPort: String(config.tunnel.port),
             tunnelSuffix: config.tunnel.suffix,
+            // A certificate the phone's system trust store already accepts,
+            // for this node's name under the wildcard. Without it the node
+            // signs its own, the app has to override server trust, and iOS
+            // then refuses to perform client-certificate authentication at
+            // all — so mTLS cannot complete. Absent (no wildcard configured),
+            // the node falls back to self-signing and nothing else changes.
+            ...nodeTlsMaterial(config),
           }),
         );
       } catch {
@@ -1337,4 +1430,25 @@ function normalizeUserCode(value) {
   const cleaned = String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
   if (cleaned.length !== 8) return null;
   return `${cleaned.slice(0, 4)}-${cleaned.slice(4)}`;
+}
+
+// CLI-reported hostname shown on the phone confirm sheet. Strip control
+// characters (and anything else outside printable-ish Unicode whitespace +
+// text), trim, and cap length so a hostile start cannot pad the confirm UI.
+function sanitizeMachineName(value) {
+  if (typeof value !== "string") return null;
+  const cleaned = value.replace(/[\u0000-\u001F\u007F]/g, "").trim().slice(0, 64);
+  return cleaned.length > 0 ? cleaned : null;
+}
+
+// Closed set matching what the CLI sends after mapping process.platform.
+// Omitted / empty stays null (shown as unknown on the phone); anything else
+// unrecognized — including raw "darwin" — collapses to "other". The CLI is
+// responsible for the darwin→macos mapping before the request leaves the box.
+function normalizeDevicePlatform(value) {
+  if (typeof value !== "string") return null;
+  const raw = value.trim().toLowerCase();
+  if (!raw) return null;
+  if (raw === "macos" || raw === "linux" || raw === "windows" || raw === "other") return raw;
+  return "other";
 }

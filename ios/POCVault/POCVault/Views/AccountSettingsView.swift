@@ -11,6 +11,7 @@ struct AccountSettingsView: View {
     @State private var deletionPassword = ""
     @State private var isDeletingTrial = false
     @State private var trialDeleteError: String?
+    @State private var showingCLILink = false
 
     var body: some View {
         NavigationStack {
@@ -26,6 +27,17 @@ struct AccountSettingsView: View {
                             "Sign-in method",
                             value: user.usesPassword ? "Username and password" : "Apple"
                         )
+                    }
+
+                    Section {
+                        Button("Link a computer") {
+                            showingCLILink = true
+                        }
+                        .accessibilityIdentifier("relay-link-computer")
+                    } header: {
+                        Text("Computers")
+                    } footer: {
+                        Text("Scan the QR code from `relay login` on your Mac or Linux machine to approve CLI access.")
                     }
 
                     Section {
@@ -120,6 +132,14 @@ struct AccountSettingsView: View {
                         Color.black.opacity(0.28).ignoresSafeArea()
                         ProgressView().tint(AppTheme.accent)
                     }
+                }
+            }
+            .sheet(isPresented: $showingCLILink) {
+                if let bearer = accountStore.currentSessionToken {
+                    CLILinkScannerView(
+                        authClient: RelayAuthClient(baseURL: AppConfiguration.authBaseURL),
+                        bearerToken: bearer
+                    )
                 }
             }
         }

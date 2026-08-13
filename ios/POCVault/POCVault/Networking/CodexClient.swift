@@ -203,7 +203,53 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
     }
 
     private lazy var session: URLSession = {
-        URLSession(configuration: .ephemeral, delegate: self, delegateQueue: nil)
+        let configuration = URLSessionConfiguration.ephemeral
+        // TLS 1.2 ceiling, and it is mTLS that needs it — not a downgrade for
+        // its own sake.
+        //
+        // A trial machine requires a client certificate. Against TLS 1.3 the
+        // phone held exactly the right identity (`trial-device`, issued by the
+        // CA the machine names as its only acceptable one) and URLSession never
+        // asked for it: the ONLY challenge delivered was
+        // NSURLAuthenticationMethodServerTrust, and the handshake then died
+        // with -1200 — the same failure the machine gives a client that sends
+        // no certificate at all (verified against it: no certificate resets
+        // immediately, a wrong-CA certificate hangs; the phone reset in ~1s).
+        //
+        // The difference is where the certificate request sits in the
+        // handshake. In TLS 1.2 it arrives before the server is done, so
+        // URLSession has a point at which it can ask the delegate. In TLS 1.3
+        // it arrives in the server's final flight and the client must answer
+        // straight away — and no client-certificate challenge is raised.
+        //
+        // TLS 1.2 with a pinned CA and a required client certificate is what
+        // this app has always used against a personal install; the security
+        // property is unchanged, and mTLS is still enforced by the machine.
+        // No TLS ceiling. One was set while chasing the missing
+        // client-certificate challenge, on the theory that TLS 1.3 delivers
+        // the certificate request too late for URLSession to ask the delegate.
+        // That was wrong — the challenge was suppressed by answering server
+        // trust with `.useCredential`, not by the protocol version — so the
+        // cap fixed nothing and left a constraint nobody had reason to want.
+        // URLSession's 60-second default is far too long for a machine that is
+        // simply not there. Losing a trial (sign-out, or the server answering
+        // `no_trial`) reverts the app to the personal install's configured base
+        // URL — which for a trial-only user can be a host that no longer
+        // exists. That produced a spinner that sat for a full minute before
+        // saying "the request timed out", with no indication of which machine
+        // was being waited on. Fifteen seconds is well past a slow mobile
+        // round-trip to a live node and short enough to report rather than
+        // hang. `timeoutIntervalForResource` still bounds long file listings.
+        configuration.timeoutIntervalForRequest = 15
+        configuration.timeoutIntervalForResource = 60
+        // Needed so `registerClientCredential` has somewhere to put the
+        // identity that this session will actually consult. An ephemeral
+        // configuration gets its own private store, which nothing outside the
+        // session can reach, and `session.configuration` hands back a copy —
+        // so a credential registered after the session exists would go
+        // nowhere.
+        configuration.urlCredentialStorage = URLCredentialStorage.shared
+        return URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
     }()
 
     init(baseURL: URL, identityStore: ClientIdentityStore) {
@@ -213,6 +259,49 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         CodexDiagnostics.log("codex_client_init", fields: [
             "baseURL": baseURL.absoluteString,
             "hasClientIdentity": String(identityStore.hasStoredIdentity)
+        ])
+        registerClientCredential(for: baseURL)
+    }
+
+    /// Pre-registers the client identity for a machine, instead of waiting to
+    /// be asked for it.
+    ///
+    /// A trial machine requires a client certificate, and against one iOS never
+    /// raises `NSURLAuthenticationMethodClientCertificate` at all: the only
+    /// challenge delivered is the server-trust one, and once that is answered
+    /// with `.useCredential` — which pinning a private CA requires — the
+    /// handshake ends with -1200, the machine's signature for a client that
+    /// sent no certificate. The same build against a publicly-trusted host,
+    /// where trust is left to `.performDefaultHandling`, does get the
+    /// client-certificate challenge. Waiting to be asked therefore cannot work
+    /// wherever the CA is pinned.
+    ///
+    /// A default credential on the protection space is the supported way to
+    /// supply one unprompted. The challenge handler stays exactly as it is:
+    /// it remains correct for hosts that do ask, and this is scoped to one
+    /// host and port, so no other server can be handed this identity.
+    private func registerClientCredential(for baseURL: URL) {
+        guard let host = baseURL.host, let credential = identityStore.credential() else {
+            CodexDiagnostics.log("codex_client_credential_registration", fields: [
+                "host": baseURL.host ?? "",
+                "registered": "false"
+            ])
+            return
+        }
+        let port = baseURL.port ?? (baseURL.scheme == "http" ? 80 : 443)
+        let space = URLProtectionSpace(
+            host: host,
+            port: port,
+            protocol: baseURL.scheme,
+            realm: nil,
+            authenticationMethod: NSURLAuthenticationMethodClientCertificate
+        )
+        URLCredentialStorage.shared.setDefaultCredential(credential, for: space)
+        CodexDiagnostics.log("codex_client_credential_registration", fields: [
+            "host": host,
+            "port": String(port),
+            "registered": "true",
+            "identity": identityStore.storedIdentityDescription
         ])
     }
 
@@ -230,6 +319,7 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         CodexDiagnostics.log("codex_client_retarget", fields: [
             "baseURL": baseURL.absoluteString
         ])
+        registerClientCredential(for: baseURL)
     }
 
     var hasClientIdentity: Bool {
@@ -516,6 +606,7 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
                     }
 
                     var request = URLRequest(url: url)
+                    applyDeviceToken(to: &request, url: url)
                     request.httpMethod = "POST"
                     request.timeoutInterval = 300
                     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -590,6 +681,7 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
                     }
 
                     var request = URLRequest(url: url)
+                    applyDeviceToken(to: &request, url: url)
                     request.httpMethod = "GET"
                     request.timeoutInterval = 300
                     request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
@@ -691,6 +783,7 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         ])
 
         var request = URLRequest(url: url)
+        applyDeviceToken(to: &request, url: url)
         request.httpMethod = method
         request.timeoutInterval = 45
         request.setValue(accept, forHTTPHeaderField: "Accept")
@@ -708,6 +801,13 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
             (data, response) = try await session.data(for: request)
         } catch {
             let nsError = error as NSError
+            // NSURLErrorDomain -1200 is the same opaque code for every TLS
+            // failure. The underlying error carries the actual OSStatus (a
+            // handshake abort and a rejected client certificate are different
+            // numbers), and the identity description says what we would have
+            // offered had iOS asked — together they separate "we sent the wrong
+            // certificate" from "we were never asked for one".
+            let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError
             CodexDiagnostics.log("codex_request_error", fields: [
                 "method": method,
                 "path": path,
@@ -715,7 +815,10 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
                 "domain": nsError.domain,
                 "code": String(nsError.code),
                 "description": error.localizedDescription,
-                "hasClientIdentity": String(identityStore.hasStoredIdentity)
+                "hasClientIdentity": String(identityStore.hasStoredIdentity),
+                "underlyingDomain": underlying?.domain ?? "",
+                "underlyingCode": underlying.map { String($0.code) } ?? "",
+                "identity": identityStore.storedIdentityDescription
             ])
             throw error
         }
@@ -751,6 +854,7 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
     func downloadExport() async throws -> URL {
         let url = endpoint(path: "/v1/export.tar", queryItems: [])
         var request = URLRequest(url: url)
+        applyDeviceToken(to: &request, url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = 600
         request.setValue("application/x-tar", forHTTPHeaderField: "Accept")
@@ -884,18 +988,51 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         handleAuthenticationChallenge(challenge, scope: "task", completionHandler: completionHandler)
     }
 
+
+    /// Adds the machine's bearer token, when this device has one for that host.
+    ///
+    /// Trial machines authenticate the device with a token instead of a client
+    /// certificate: iOS will not send a certificate to a server whose
+    /// certificate it did not itself anchor, and declines silently, so mTLS to
+    /// a trial machine cannot complete from the app. The token is scoped to one
+    /// host, so no other server ever receives it, and a personal install
+    /// continues to authenticate with its certificate untouched.
+    private func applyDeviceToken(to request: inout URLRequest, url: URL) {
+        guard let host = url.host, let token = identityStore.deviceToken(for: host) else { return }
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    }
+
     private func handleAuthenticationChallenge(
         _ challenge: URLAuthenticationChallenge,
         scope: String,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
+        // Logged for EVERY challenge, before the switch. A trial machine failed
+        // with -1200 after the server-trust challenge succeeded, and the
+        // question that could not be answered from the existing events was
+        // whether iOS ever asked for a client certificate at all — the
+        // per-branch logs below cannot distinguish "not asked" from "asked and
+        // we declined". They are still emitted; this one establishes the set.
+        CodexDiagnostics.log("codex_auth_challenge_received", fields: [
+            "host": challenge.protectionSpace.host,
+            "method": challenge.protectionSpace.authenticationMethod,
+            "scope": scope,
+            "previousFailureCount": String(challenge.previousFailureCount)
+        ])
+
         switch challenge.protectionSpace.authenticationMethod {
         case NSURLAuthenticationMethodClientCertificate:
             if let credential = identityStore.credential() {
                 CodexDiagnostics.log("codex_client_cert_challenge", fields: [
                     "host": challenge.protectionSpace.host,
                     "scope": scope,
-                    "hasCredential": "true"
+                    "hasCredential": "true",
+                    // What we are about to hand iOS, and how many CAs the
+                    // machine said it would accept. iOS silently declines to
+                    // send a certificate it cannot match to that list, and
+                    // says nothing about why.
+                    "identity": identityStore.storedIdentityDescription,
+                    "acceptableCAs": String(challenge.protectionSpace.distinguishedNames?.count ?? -1)
                 ])
                 completionHandler(.useCredential, credential)
             } else {

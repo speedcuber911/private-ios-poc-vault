@@ -103,8 +103,11 @@ final class RelayAccountStore: ObservableObject {
     }
 
     func signOut() async {
+        // Deliberately NOT purging: see `accept(user:token:)`. The machine
+        // outlives the session and its pairing cannot be repeated, so the
+        // credentials are kept until a different account signs in here.
         guard let token = sessionToken else {
-            clearLocalSession(purgingDeviceAccess: true)
+            clearLocalSession()
             return
         }
         isWorking = true
@@ -116,7 +119,7 @@ final class RelayAccountStore: ObservableObject {
             // A local sign-out must remain possible during an outage. Better
             // Auth sessions expire server-side and are not retained by Relay.
         }
-        clearLocalSession(purgingDeviceAccess: true)
+        clearLocalSession()
     }
 
     func deleteAccount(password: String?) async -> Bool {
@@ -164,10 +167,31 @@ final class RelayAccountStore: ObservableObject {
     }
 
     private func accept(user: RelayAccountUser, token: String) {
+        // Machine access is purged when the account CHANGES, not when a session
+        // ends. Signing out used to purge, which is safe but permanent: a
+        // trial's pairing slots are put-once, so the moment this device drops
+        // the identity, the machine it belongs to — still running, still paid
+        // for, still holding the user's files — can never be reached from here
+        // again. Signing back in cannot undo it, and the control plane answers
+        // `trial_already_used` to every attempt to replace it, leaving the
+        // account with a machine it cannot open and no way to get another.
+        //
+        // Doing it here keeps the property that mattered: a DIFFERENT account
+        // signing in on this phone still inherits nothing.
+        if let previousOwner = defaults.string(forKey: Self.trialOwnerKey), previousOwner != user.id {
+            nodeStore?.clear()
+            identityStore.discardTrialMaterial()
+        }
+        defaults.set(user.id, forKey: Self.trialOwnerKey)
+
         self.user = user
         sessionToken = token
         phase = defaults.bool(forKey: onboardingKey(for: user.id)) ? .ready : .onboarding
     }
+
+    /// The account whose trial machine this device currently holds credentials
+    /// for. Compared on sign-in to decide whether they must be dropped.
+    private static let trialOwnerKey = "com.parikshit.pocvault.trial.owner"
 
     /// `purgingDeviceAccess` is set only when the user deliberately leaves the
     /// account (sign out, delete account). Then this device's access to that

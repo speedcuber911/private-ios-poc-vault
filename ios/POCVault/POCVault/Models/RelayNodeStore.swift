@@ -27,6 +27,18 @@ final class RelayNodeStore: ObservableObject {
         activeNodeURL ?? AppConfiguration.codexBaseURL
     }
 
+    /// Whether there is actually a machine to talk to: an adopted trial, or a
+    /// personal install someone deliberately configured.
+    ///
+    /// `effectiveBaseURL` can never answer this — it falls back to the build
+    /// default, so it always yields *a* URL whether or not a machine exists.
+    /// Callers that would otherwise send requests into that default, and
+    /// report the resulting TLS failure as the user's machine misbehaving,
+    /// check this first.
+    var hasMachine: Bool {
+        activeNodeURL != nil || AppConfiguration.hasConfiguredPersonalInstall
+    }
+
     /// Adopts a newly created/paired trial node: persists it and points the app at it.
     func adoptTrial(_ trial: RelayTrialNode) {
         self.trial = trial
@@ -45,8 +57,19 @@ final class RelayNodeStore: ObservableObject {
     func updateTrial(_ trial: RelayTrialNode) {
         self.trial = trial
         persist(trial)
-        if activeNodeURL == nil {
+
+        // Follow the server's answer about WHICH machine, and whether there is
+        // a usable one at all. Previously this adopted a node URL only when
+        // none was set, so a machine that had been replaced or torn down was
+        // dialled forever: the phone kept hammering a destroyed node while the
+        // banner read "Trial expired", and every request failed at TLS with
+        // nothing connecting the two. A dead pointer is worse than none —
+        // `hasMachine` can then route to the trial flow instead.
+        switch trial.state {
+        case .ready, .creating:
             activeNodeURL = trial.nodeURL
+        case .expired, .destroyed, .failed:
+            activeNodeURL = nil
         }
     }
 

@@ -193,6 +193,28 @@ startHandoffPickup();
 // keys, the node CA and the revocation list) and dials the broker. Throws a
 // plain, actionable error when anything required is missing — a node that
 // cannot serve its only listener must not come up half-started.
+/// A server certificate and key placed on disk by the control plane, or null
+/// when this node signs its own.
+///
+/// Both must be present and non-empty; a half-written pair falls back to the
+/// self-signed certificate rather than starting a listener with no usable
+/// identity. The paths come from the environment, so a node that was never
+/// issued one behaves exactly as before.
+function readExternalServerCert() {
+  const certPath = process.env.RELAYD_TLS_CERT_FILE;
+  const keyPath = process.env.RELAYD_TLS_KEY_FILE;
+  if (!certPath || !keyPath) return null;
+  try {
+    if (!fs.readFileSync(certPath, "utf8").trim()) return null;
+    if (!fs.readFileSync(keyPath, "utf8").trim()) return null;
+  } catch (error) {
+    // Path only — the contents are a private key.
+    console.error(`relayd: ignoring unusable TLS material at ${certPath}: ${error.code || "unreadable"}`);
+    return null;
+  }
+  return { certPath, keyPath };
+}
+
 function startTunnel() {
   if (!tunnelHost) {
     throw new Error(`RELAYD_LISTEN_MODE=${listenMode} requires RELAYD_TUNNEL_HOST (the broker endpoint)`);
@@ -210,7 +232,20 @@ function startTunnel() {
   // The broker routes on SNI, so the server cert must carry the public name
   // as a SAN. ensureServerCert is idempotent per SAN.
   const san = tunnelSni || `${nodeId}${tunnelSuffix}`;
-  const serverCert = ensureServerCert({ san });
+
+  // A publicly-trusted certificate for this node's name, when the control
+  // plane supplied one, in preference to signing our own.
+  //
+  // It is not about trust for its own sake: iOS will not perform client
+  // certificate authentication on a connection whose server trust the app
+  // overrode, so a privately-signed certificate and mTLS cannot both work
+  // over one URLSession connection. A certificate the phone's system store
+  // already accepts removes the need to override, and mTLS proceeds.
+  //
+  // Client verification is untouched — `deviceCaPem` below is still this
+  // node's own CA, so only devices it paired with can connect.
+  const externalCert = readExternalServerCert();
+  const serverCert = externalCert ?? ensureServerCert({ san });
 
   const service = startTunnelService({
     brokerHost: tunnelHost,

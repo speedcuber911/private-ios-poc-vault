@@ -69,6 +69,19 @@ struct POCVaultApp: App {
                         identityStore: identityStore,
                         trialClient: trialClient
                     )
+                case .ready where !nodeStore.hasMachine:
+                    // Signed in, but nothing to talk to: the trial was lost or
+                    // never adopted and no personal install was configured.
+                    // Falling through to the browser here is what made a
+                    // machine-less account look broken rather than empty — it
+                    // fired requests at the baked-in default host and reported
+                    // that host's TLS failure. Offer the machine instead.
+                    RelayOnboardingView(
+                        accountStore: accountStore,
+                        nodeStore: nodeStore,
+                        identityStore: identityStore,
+                        trialClient: trialClient
+                    )
                 case .ready:
                     POCVaultRootView(
                         libraryViewModel: libraryViewModel,
@@ -819,13 +832,38 @@ enum AppConfiguration {
         infoKey: "POCVaultCodexBaseURL",
         fallback: "https://codex.pocs.conformal.live"
     )
+    // The control plane that owns accounts AND trials. It must be the box the
+    // trial routes are deployed to — pointing this at a relay-cloud without
+    // trial config does not degrade to "no trial", it 403s from the mTLS-gated
+    // codex-api that answers /v1/* for unknown paths on that host.
     static let authBaseURL = configuredURL(
         supportValue: supportConfig?.authBaseURL,
         infoKey: "RelayAuthBaseURL",
-        fallback: "https://api.pocs.conformal.live"
+        fallback: "https://relay.ai-rocket-experiments.com"
     )
     static let runtimeMode = "Relay Cloud"
 #endif
+
+    /// True only when someone deliberately pointed this install at a personal
+    /// machine, via `support/vault-config.json`.
+    ///
+    /// `codexBaseURL` always resolves to something, because the build setting
+    /// is its last resort — so "we have a base URL" has never meant "we have a
+    /// machine". A trial user who signs out reverts to that build default and
+    /// the app then talks to whatever host happens to be baked in, reporting
+    /// its failures as if the user's own machine were broken. It surfaced as
+    /// `The server "codex.pocs.conformal.live" did not accept the certificate`
+    /// on an account whose only machine was a trial, against a host that had
+    /// been decommissioned.
+    ///
+    /// Declared OUTSIDE the build branches, not inside `#else`: it reads only
+    /// `supportConfig`, which both branches share, and `RelayNodeStore.hasMachine`
+    /// references it unconditionally. Defined in one branch only, it compiled
+    /// for the device and broke every simulator build — which is also the
+    /// build the handoff states get exercised from.
+    static let hasConfiguredPersonalInstall: Bool = {
+        (supportConfig?.codexBaseURL?.trimmedNonEmpty) != nil
+    }()
 
     static let trustedManifestPublicKey = configuredPublicKey(
         supportValue: supportConfig?.manifestPublicKey,

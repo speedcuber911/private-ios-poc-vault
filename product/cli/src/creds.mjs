@@ -24,12 +24,20 @@ function readCredentials({ home } = {}) {
 
 function writeCredentials(values, { home } = {}) {
   const filePath = credentialsPath(home);
-  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  fs.chmodSync(path.dirname(filePath), 0o700);
+  const dir = path.dirname(filePath);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
   const merged = { ...(readCredentials({ home }) || {}), ...values };
   const output = {};
   for (const field of FIELDS) if (merged[field] != null) output[field] = merged[field];
-  fs.writeFileSync(filePath, `${JSON.stringify(output, null, 2)}\n`, { mode: 0o600 });
+  // Atomic replace: write a temp file in the same directory (so rename stays
+  // on one filesystem) then rename over the destination. Mode 0600 on both
+  // the temp and the final path — the rename itself does not change mode on
+  // every platform, so chmod the destination too.
+  const tmp = path.join(dir, `.credentials.${process.pid}.${Date.now()}.tmp`);
+  fs.writeFileSync(tmp, `${JSON.stringify(output, null, 2)}\n`, { mode: 0o600 });
+  fs.chmodSync(tmp, 0o600);
+  fs.renameSync(tmp, filePath);
   fs.chmodSync(filePath, 0o600);
 }
 
