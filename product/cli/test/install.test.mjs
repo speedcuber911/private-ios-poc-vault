@@ -36,7 +36,7 @@ test("the installer pins the reviewed Relay release public key", () => {
   const der = crypto.createPublicKey(reviewed).export({ type: "spki", format: "der" });
   assert.equal(
     crypto.createHash("sha256").update(der).digest("hex"),
-    "24859f7b1f980b45effea926cbc777edc434951af184e9027a5a4a2c2351eebc",
+    "1348607d18ade24d12957e72745292e289e6703762426f684f022ff7ad5722c6",
   );
 });
 

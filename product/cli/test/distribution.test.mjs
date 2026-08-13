@@ -8,6 +8,17 @@ import test from "node:test";
 
 const cliRoot = fileURLToPath(new URL("..", import.meta.url));
 const bootstrap = path.join(cliRoot, "deploy", "bootstrap.sh");
+const distributionTemplate = path.join(cliRoot, "deploy", "distribution.yml");
+
+test("distribution uses AWS's current managed cache policies", () => {
+  const source = fs.readFileSync(distributionTemplate, "utf8");
+  assert.match(source, /658327ea-f89d-4fab-a63d-7e88639e58f6/);
+  assert.equal(
+    source.match(/4135ea2d-6df8-44a3-9df3-4b5a84be39ad/g)?.length,
+    2,
+  );
+  assert.doesNotMatch(source, /413f160b-31d3-4ca6-9dd5-1f56774e25d5/);
+});
 
 test("distribution bootstrap refuses the wrong AWS account before CloudFormation", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-bootstrap-"));

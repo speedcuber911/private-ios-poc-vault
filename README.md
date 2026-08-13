@@ -196,7 +196,7 @@ On macOS or Linux with Node.js 20 or newer:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL \
-  https://get.relay.ai-rocket-experiments.com/install.sh | sh
+  https://get.openrelay.sh/install.sh | sh
 ```
 
 The URL becomes active after the distribution stack is deployed in the intended
