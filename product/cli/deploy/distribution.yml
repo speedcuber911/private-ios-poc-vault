@@ -4,7 +4,7 @@ Description: Relay CLI downloads on private S3 through CloudFront and Route 53
 Parameters:
   DistributionDomain:
     Type: String
-    Default: get.relay.ai-rocket-experiments.com
+    Default: get.openrelay.sh
   HostedZoneId:
     Type: AWS::Route53::HostedZone::Id
   GitHubRepository:
@@ -89,7 +89,7 @@ Resources:
             AllowedMethods: [GET, HEAD, OPTIONS]
             CachedMethods: [GET, HEAD, OPTIONS]
             Compress: true
-            CachePolicyId: 413f160b-31d3-4ca6-9dd5-1f56774e25d5
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
             ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
           - PathPattern: latest.txt
             TargetOriginId: RelayCliBucketOrigin
@@ -97,7 +97,7 @@ Resources:
             AllowedMethods: [GET, HEAD, OPTIONS]
             CachedMethods: [GET, HEAD, OPTIONS]
             Compress: true
-            CachePolicyId: 413f160b-31d3-4ca6-9dd5-1f56774e25d5
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
             ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
         PriceClass: PriceClass_100
         ViewerCertificate:

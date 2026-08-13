@@ -10,7 +10,7 @@ After the infrastructure owner deploys the download distribution:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL \
-  https://get.relay.ai-rocket-experiments.com/install.sh | sh
+  https://get.openrelay.sh/install.sh | sh
 ```
 
 This is a per-user install. The versioned package lands under
@@ -50,7 +50,7 @@ overwrite `install.sh` or its pinned public key. The private Ed25519 signing key
 never enters this repository or AWS. The reviewed public-key fingerprint is:
 
 ```text
-SHA-256 24859f7b1f980b45effea926cbc777edc434951af184e9027a5a4a2c2351eebc
+SHA-256 1348607d18ade24d12957e72745292e289e6703762426f684f022ff7ad5722c6
 ```
 
 This signature protects release archives if the download origin or publisher

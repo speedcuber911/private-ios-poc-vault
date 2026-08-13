@@ -5,7 +5,7 @@ set -eu
 # versioned archives and checksums live in the private S3 origin.
 
 product_name="Relay CLI"
-default_base_url="https://get.relay.ai-rocket-experiments.com"
+default_base_url="https://get.openrelay.sh"
 base_url="${RELAY_INSTALL_BASE_URL:-$default_base_url}"
 install_root="${RELAY_INSTALL_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/relay}"
 bin_dir="${RELAY_BIN_DIR:-$HOME/.local/bin}"
@@ -14,7 +14,7 @@ bin_dir="${RELAY_BIN_DIR:-$HOME/.local/bin}"
 # dist/release-public-key.pem. A release is not installed unless Node's Ed25519
 # verifier accepts the detached signature over the exact archive bytes.
 release_public_key='-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAnWhXUnY3p8nP+bHk1ZeKVv0V3o2FVHY5BI1YwblhRLM=
+MCowBQYDK2VwAyEAZH3GefgaF6Yix3n7RSlaSO/1KjzZxXYfVxto3PViFVE=
 -----END PUBLIC KEY-----'
 
 say() {
