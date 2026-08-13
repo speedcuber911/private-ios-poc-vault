@@ -64,6 +64,13 @@ ExperimentalWarning on Node 22 is expected.
 | `POST /v1/pairing/sessions` | session | → `{pairingId, secret, expiresAt}`; only the sha256 of the secret is stored |
 | `POST/GET /v1/pairing/sessions/:id/device-blob` | `X-Pairing-Auth` | opaque bytes (CSR direction); ≤64 KiB |
 | `POST/GET /v1/pairing/sessions/:id/node-blob` | `X-Pairing-Auth` | opaque bytes (issued-cert direction); ≤64 KiB |
+| `POST/GET /v1/repos` | session | register a `owner/name` GitHub repo for handoffs, or list the account's |
+| `POST /v1/handoffs` | session | `{handoffId, repo, branch, nodeId}`; records the row the node will collect. 404 `unknown_repo` if the repo was never registered, `unknown_node` if the node is not the account's |
+| `GET /v1/handoffs?repo=` | session | the account's handoffs for one repo — this is what `relay status` reads |
+| `GET /v1/node/handoffs` | ed25519 request signature | node long-poll; leases pending rows to the caller |
+| `POST /v1/node/handoffs/ack` | ed25519 request signature | confirms a leased batch → `delivered` |
+| `POST /v1/node/handoffs/:id/ready` | ed25519 request signature | terminal success, set after the import completes |
+| `POST /v1/node/handoffs/:id/fail` | ed25519 request signature | terminal failure; `reason` must be one of a closed vocabulary |
 | `POST /v1/node-events` | ed25519 body signature | see below |
 | `GET /v1/tunnel/nodes/:nodeId` | `Bearer $BROKER_TOKEN` | broker authorization hook, see contract |
 | `GET /v1/admin/nodes` | `Bearer $ADMIN_TOKEN` | ops-only; response omits pubkeys |
@@ -90,6 +97,51 @@ Push mapping (asserted in tests):
   (`apns-push-type: background`, `content-available: 1`).
 
 Events are retained 7 days (`EVENT_RETENTION_DAYS`), swept every minute.
+
+`apns.send()` never throws and never reports a rejected push as success: it
+returns a classified outcome (`delivered`, `unregistered`, `auth_failed`,
+`rejected`, `unavailable`, `timeout`, `error`, `skipped`). A fanout that read
+"the promise resolved" as "Apple accepted it" is how a rotated-out signing key
+becomes invisible while every push 403s. With APNs unconfigured, sends
+short-circuit to `skipped` **before** any provider JWT is minted — the token is
+built while assembling the request headers, so without that guard an unset
+signing key throws out of `send()` entirely and the noop transport never gets a
+say.
+
+### Handoffs
+
+A handoff moves a stopped local coding session onto the account's sandbox. The
+sealed session blob travels through **GitHub**, on a `relay/handoff-*` branch —
+never through this service. The cloud only ever learns names: a repo full name,
+a branch name, a handoff id, and a state.
+
+```text
+pending ──lease──> leased ──ack──> delivered ──┬──> ready    (import succeeded)
+                                               └──> failed   (import did not)
+```
+
+- **`pending`** — the row exists and nothing has collected it. From the desk a
+  `pending` row and a powered-off machine are indistinguishable, so `pending`
+  must never be reported as success.
+- **`leased`** — a node's long-poll took the row. Leases expire, so a node that
+  dies mid-collection does not strand the handoff.
+- **`delivered`** — the node acked the lease. This means only *"the node took
+  it"*: the ack fires **before** the import runs, so `delivered` says nothing
+  about whether the handoff actually worked.
+- **`ready`** — the node cloned, decrypted, staged and imported successfully.
+  This is the only state that means success.
+- **`failed`** — terminal, and it wins: a node that already reported a failure
+  cannot walk the row back to `ready`, so a crash-loop cannot flap the state
+  the user is reading.
+
+`failed` reasons are validated against a closed vocabulary — `clone_failed`,
+`decrypt_failed`, `manifest_invalid`, `workspace_failed`, `internal_error` —
+rather than stored verbatim. A free-text reason from a node is exactly the
+shape a content leak takes, and this service is content-free by design.
+
+Both node routes answer an unknown id and another node's id with an identical
+404 `unknown_handoff`, so a node cannot probe for the existence of rows it does
+not own.
 
 ### Pairing rendezvous
 
@@ -290,10 +342,19 @@ APPLE_CLIENT_SECRET=<Apple ES256 client-secret JWT>
 MAGIC_LINK_BASE_URL=https://<domain>/auth/confirm
 ADMIN_TOKEN=<random>
 BROKER_TOKEN=<random>
+# APNs — all FOUR are required together. If any one is missing the service
+# starts normally, logs "APNs credentials unset — pushes will be skipped,
+# ingest still works", and every send returns the SKIPPED outcome. Events are
+# still ingested and stored; only the push is dropped. Partial configuration
+# is treated as unconfigured, not as an error.
 APNS_KEY_ID=<key-id>
 APNS_TEAM_ID=<team-id>
 APNS_BUNDLE_ID=<app-bundle-id>
 APNS_SIGNING_KEY_P8=<contents of the .p8, PEM>
+# Defaults to api.push.apple.com. A sandbox (development-build) device token
+# sent to the production host is rejected with BadDeviceToken, and vice versa —
+# this host must match the build the token came from.
+APNS_HOST=api.sandbox.push.apple.com
 
 # Trial sandboxes — optional; unset E2B_API_URL disables CREATING trials (the
 # fork screen hides "Try instantly" and POST /v1/trial-nodes 404s). The reaper

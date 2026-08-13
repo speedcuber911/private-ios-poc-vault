@@ -25,8 +25,18 @@ account selected by the `default` CLI profile.
 | CI/CD source | CodeCommit repository `relay-cloud`, branch `main` |
 | CI/CD pipeline | CodePipeline `relay-cloud-deploy` |
 | Pipeline stack | CloudFormation `relay-cloud-cicd` |
-| Current release | `97ac329a20377af3212444973d9946c171cb7f0a` |
-| Pre-deploy recovery point | EBS snapshot `snap-0027cd41761bc9dd7` |
+| Current release | `263265d67b41dbaec95cda73022314f3755f2deb` (deployed 2026-08-13) |
+| Pre-deploy recovery point | EBS snapshot `snap-0027cd41761bc9dd7`; per-deploy SQLite backups under `/var/lib/relay-cloud/relay-cloud.sqlite.bak-*` |
+
+The `263265d…` release was deployed by invoking `product/cloud/deploy/cicd-deploy.sh`
+directly (tar → private S3 → SSM → `install.sh`), **not** through
+CodeCommit/CodePipeline. The SHA is therefore a GitHub `main` commit and may not
+exist in the CodeCommit mirror; the next pipeline run supersedes it cleanly
+because the same code is on `main`. Verified after the flip: `current` →
+`releases/263265d…`, live `src/apns.js` sha256 `a8b936dc…` (byte-identical to
+`git show 263265d:product/cloud/src/apns.js`), service restarted, and both the
+loopback and public `/healthz` returning `{"ok":true}`. The prior release
+directory is retained for rollback.
 
 The public IP is intentionally not persisted in this document. Route 53 and
 the EC2 inventory are the current sources of truth.

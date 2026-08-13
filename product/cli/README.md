@@ -30,6 +30,57 @@ relay init
 relay handoff
 ```
 
+## Commands
+
+`relay login` signs in and pins the sandbox this machine hands off to. Approve
+the device code by scanning the QR in the iOS app. The production control plane
+is compiled in, so no environment variable is needed; `RELAY_CLOUD_URL`
+overrides it for development.
+
+`relay init` registers the current repository for handoffs. A repository that
+was never registered is rejected by `relay handoff` up front, before anything
+is pushed.
+
+`relay sync-auth` copies this machine's GitHub and harness logins to the
+sandbox, sealed to the node's key. Credentials ride the pairing rendezvous as
+opaque bytes; the control plane relays them without being able to read them,
+and they never touch GitHub. What it looks for:
+
+| harness | source |
+| --- | --- |
+| GitHub | `gh auth token` |
+| Claude Code | `~/.claude/.credentials.json`, or — on macOS — the login Keychain item `Claude Code-credentials` |
+| Codex | `~/.codex/auth.json` |
+| Cursor | no portable login exists; sign in on the sandbox itself |
+
+The Keychain lookup matters on macOS: Claude Code stores its login there and
+**not** in `~/.claude/.credentials.json`, which is the Linux location. Reading
+only the file meant a signed-in Mac reported "No Claude Code login found" and
+the sandbox came up with no Anthropic credential. Anything not found is named
+in the output rather than silently omitted — this command never reports a
+credential it did not actually send.
+
+`relay handoff` seals the current session, pushes it to a `relay/handoff-*`
+branch, tells the cloud, then **waits for the sandbox to finish importing it**
+before exiting. It reports the terminal state rather than assuming success:
+
+| result | exit code | meaning |
+| --- | --- | --- |
+| `ready` | 0 | the sandbox cloned, decrypted and imported the session |
+| `failed` | 1 | the sandbox could not open it; the reason is printed |
+| still pending after 120s | 0 | recorded but not yet collected — check `relay status` |
+
+`delivered` is deliberately not treated as success: the sandbox acks the row
+before the import runs, so it means only "it was collected". Use `--no-push` to
+prepare the branch locally without contacting the cloud, and `--session <id>`
+to hand off a session other than the most recent.
+
+`relay status` lists this repository's handoffs and their states.
+
+Progress is written to **stderr**, so piping `relay status` stays clean. Without
+a TTY it degrades to one line per step instead of a spinner, so CI logs still
+show which step ran — and which one it died on.
+
 ## Distribution model
 
 ```text
