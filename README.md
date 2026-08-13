@@ -24,6 +24,7 @@ The project has four core ideas:
 | Private POC hosting | Static HTML/CSS/JS demos live under `pocs/<slug>/public/` and are served through nginx. |
 | Signed discovery | `build/manifest.json` is generated from source metadata and signed with an Ed25519 sidecar. |
 | Relay iOS app | SwiftUI app presents the agent console, private POC library, diagnostics, and authenticated WebViews. |
+| Relay CLI | Per-user laptop CLI for authenticated session handoff, distributed through signed AWS-hosted releases. |
 | One-command deploys | `ops/deploy-poc` validates, stages, signs, logs, rsyncs, and promotes POCs to the VM. |
 | Local simulator mode | Simulator builds use a local signed vault on `127.0.0.1:8787` instead of production mTLS. |
 | Remote agent control | The agent console talks to an EC2-side async Codex/Claude job API for registered workspaces. |
@@ -188,6 +189,21 @@ POC_VAULT_MANIFEST_PUBLIC_KEY=
 ```
 
 Do not copy real values from local config into this repository.
+
+## Install The Relay CLI
+
+On macOS or Linux with Node.js 20 or newer:
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://get.relay.ai-rocket-experiments.com/install.sh | sh
+```
+
+The URL becomes active after the distribution stack is deployed in the intended
+AWS account; it is not hosted by the authenticated Relay API process. The
+installer is public, but Relay account login and all subsequent handoff
+operations still use the authenticated product boundaries. Distribution details
+and release instructions live in [`product/cli/README.md`](product/cli/README.md).
 
 For a new owner or teammate installing against their own EC2/domain, start with:
 

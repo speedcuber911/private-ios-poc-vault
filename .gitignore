@@ -2,6 +2,7 @@
 .env
 *.env
 *.pem
+!product/cli/dist/release-public-key.pem
 *.key
 *.crt
 *.csr
