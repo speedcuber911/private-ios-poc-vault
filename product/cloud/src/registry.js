@@ -230,6 +230,9 @@ function ensureDeviceCodeMachineColumns(db) {
   const names = new Set(columns.map((column) => column.name));
   if (!names.has("machine_name")) db.exec("ALTER TABLE device_codes ADD COLUMN machine_name TEXT");
   if (!names.has("platform")) db.exec("ALTER TABLE device_codes ADD COLUMN platform TEXT");
+  if (!names.has("client")) {
+    db.exec("ALTER TABLE device_codes ADD COLUMN client TEXT NOT NULL DEFAULT 'cli'");
+  }
 }
 
 // Which APNs environment a device's token was minted for.
@@ -874,13 +877,24 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     clientIp = null,
     machineName = null,
     platform = null,
+    client,
   }) {
     const id = randomUUID();
     db.prepare(
       `INSERT INTO device_codes
-         (id, device_code_hash, user_code, expires_at, created_at, client_ip, machine_name, platform)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(id, deviceCodeHash, userCode, expiresAt, now(), clientIp, machineName, platform);
+         (id, device_code_hash, user_code, expires_at, created_at, client_ip, machine_name, platform, client)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id,
+      deviceCodeHash,
+      userCode,
+      expiresAt,
+      now(),
+      clientIp,
+      machineName,
+      platform,
+      client === "web" ? "web" : "cli",
+    );
     return mapDeviceCode(db.prepare("SELECT * FROM device_codes WHERE id = ?").get(id));
   }
 
@@ -1663,6 +1677,7 @@ function mapDeviceCode(row) {
     cliLinkId: row.cli_link_id ?? null,
     machineName: row.machine_name ?? null,
     platform: row.platform ?? null,
+    client: row.client === "web" ? "web" : "cli",
   };
 }
 
