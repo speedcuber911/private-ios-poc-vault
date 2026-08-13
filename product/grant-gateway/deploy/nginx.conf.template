@@ -35,8 +35,35 @@ server {
     ssl_session_cache shared:RelayGrantGatewaySSL:10m;
     ssl_session_timeout 1d;
 
-    # Activity reads are GET-only; reject any request body.
-    client_max_body_size 0;
+    # Activity reads are GET-only; cap request bodies and reject GET that advertises one.
+    client_max_body_size 1k;
+
+    # GET must not carry Content-Length (non-empty, non-zero) or chunked Transfer-Encoding.
+    set $get_body 0;
+    if ($request_method = GET) {
+        set $get_body 1;
+    }
+    if ($http_content_length = "") {
+        set $get_body 0;
+    }
+    if ($http_content_length = "0") {
+        set $get_body 0;
+    }
+    if ($get_body = 1) {
+        return 400;
+    }
+
+    set $get_chunked 0;
+    if ($request_method = GET) {
+        set $get_chunked 1;
+    }
+    if ($http_transfer_encoding !~* chunked) {
+        set $get_chunked 0;
+    }
+    if ($get_chunked = 1) {
+        return 400;
+    }
+
     limit_req zone=relay_grant_gateway_per_ip burst=60 nodelay;
     limit_req_status 429;
 
