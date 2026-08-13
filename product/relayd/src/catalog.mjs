@@ -23,16 +23,15 @@ function loadModelCatalog() {
 
 
 function defaultModelCatalog() {
-  const bedrockChatModel = process.env.BEDROCK_CHAT_MODEL || "anthropic.claude-3-5-sonnet-20241022-v2:0";
+  // The harnesses. These are what a node actually runs, and they are the only
+  // entries every install should advertise.
+  //
+  // The label here used to read "Claude Code (Bedrock/SigiQ)" — internal naming
+  // carried over verbatim from the codex-api-deploy server this module was
+  // extracted from. It leaked to every user of every node, describing a routing
+  // detail that is not true of this product and means nothing to them. The
+  // provider is the `claude` harness adapter; Bedrock was never involved.
   const catalog = [
-    {
-      id: bedrockChatModel,
-      label: "Claude Sonnet (Bedrock)",
-      provider: "bedrock",
-      modes: ["chat"],
-      defaultOptions: { temperature: 0.7, maxTokens: 4096 },
-      effortLevels: ["low", "medium", "high"],
-    },
     {
       id: "codex-cli",
       label: "Codex CLI",
@@ -41,12 +40,29 @@ function defaultModelCatalog() {
     },
     {
       id: "claude-code",
-      label: "Claude Code (Bedrock/SigiQ)",
+      label: "Claude Code",
       provider: "claude",
       modes: ["task"],
       effortLevels: ["low", "medium", "high"],
     },
   ];
+  // Bedrock is opt-in, exactly like Azure below it. It was unconditional, so
+  // every node — including every trial sandbox — advertised a "Claude Sonnet
+  // (Bedrock)" chat model that could not work: Bedrock needs AWS credentials
+  // and a region that a trial sandbox has never had. The old default id was a
+  // hard-coded model arn, and `bedrockRegion` cannot serve as the gate because
+  // it falls back to "us-east-1" whether or not anyone configured Bedrock.
+  // Setting BEDROCK_CHAT_MODEL is the deliberate act that turns it on.
+  if (process.env.BEDROCK_CHAT_MODEL) {
+    catalog.unshift({
+      id: process.env.BEDROCK_CHAT_MODEL,
+      label: "Claude Sonnet (Bedrock)",
+      provider: "bedrock",
+      modes: ["chat"],
+      defaultOptions: { temperature: 0.7, maxTokens: 4096 },
+      effortLevels: ["low", "medium", "high"],
+    });
+  }
   if (process.env.AZURE_OPENAI_DEPLOYMENT) {
     catalog.push({
       id: process.env.AZURE_OPENAI_DEPLOYMENT,
