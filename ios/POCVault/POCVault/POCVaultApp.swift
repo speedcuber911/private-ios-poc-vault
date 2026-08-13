@@ -10,6 +10,7 @@ struct POCVaultApp: App {
     @StateObject private var statusFeedViewModel: StatusFeedViewModel
     @StateObject private var accountStore: RelayAccountStore
     @StateObject private var nodeStore: RelayNodeStore
+    @StateObject private var computerLinkStore: RelayComputerLinkStore
     @StateObject private var pushService: RelayPushService
     private let manifestClient: ManifestClient
     private let codexClient: CodexClient
@@ -48,6 +49,9 @@ struct POCVaultApp: App {
         ))
         _statusFeedViewModel = StateObject(wrappedValue: StatusFeedViewModel(client: codexClient))
         _accountStore = StateObject(wrappedValue: accountStore)
+        _computerLinkStore = StateObject(wrappedValue: RelayComputerLinkStore(
+            client: RelayAuthClient(baseURL: AppConfiguration.authBaseURL)
+        ))
         _pushService = StateObject(wrappedValue: RelayPushService(accountStore: accountStore))
         self.manifestClient = manifestClient
         self.codexClient = codexClient
@@ -90,6 +94,7 @@ struct POCVaultApp: App {
                         accountStore: accountStore,
                         identityStore: identityStore,
                         nodeStore: nodeStore,
+                        computerLinkStore: computerLinkStore,
                         manifestClient: manifestClient,
                         codexClient: codexClient,
                         trialClient: trialClient,
@@ -162,6 +167,7 @@ struct POCVaultRootView: View {
     @ObservedObject var accountStore: RelayAccountStore
     @ObservedObject var identityStore: ClientIdentityStore
     @ObservedObject var nodeStore: RelayNodeStore
+    @ObservedObject var computerLinkStore: RelayComputerLinkStore
     let manifestClient: ManifestClient
     let codexClient: CodexClient
     let trialClient: RelayTrialClient
@@ -179,20 +185,12 @@ struct POCVaultRootView: View {
     @State private var showingAccount = false
 
     var body: some View {
-        NavigationStack(path: $browserPath) {
-            browserScreen(folderPath: nil, isRoot: true)
-                .navigationDestination(for: BrowserRoute.self) { route in
-                    switch route {
-                    case .folder(let path):
-                        browserScreen(folderPath: path, isRoot: false)
-                    case .file(let entry):
-                        FileViewerView(
-                            client: codexClient,
-                            identityStore: identityStore,
-                            entry: entry
-                        )
-                    }
-                }
+        Group {
+            if foldersAreHiddenAfterComputerDisconnect {
+                disconnectedComputerScreen
+            } else {
+                browserNavigation
+            }
         }
         .tint(AppTheme.accent)
         .preferredColorScheme(.dark)
@@ -226,6 +224,7 @@ struct POCVaultRootView: View {
                 accountStore: accountStore,
                 nodeStore: nodeStore,
                 identityStore: identityStore,
+                computerLinkStore: computerLinkStore,
                 trialClient: trialClient
             )
         }
@@ -248,18 +247,31 @@ struct POCVaultRootView: View {
         // A handoff push carries no content — only a node id and an event type —
         // so the tap opens the threads list and the card loads from the node.
         .onChange(of: pushService.pendingRoute) { _, route in
-            guard case .handoff = route else { return }
+            guard case .handoff = route, !foldersAreHiddenAfterComputerDisconnect else { return }
             pushService.clearPendingRoute()
             if chatLaunch == nil {
                 openChat(folderPath: nil, workspaceID: nil)
             }
             opensThreadsForHandoff = true
         }
+        .onChange(of: foldersAreHiddenAfterComputerDisconnect) { _, isHidden in
+            guard isHidden else { return }
+            browserPath.removeAll()
+            chatLaunch = nil
+            showingStatus = false
+        }
         // A trial machine expires on the server's clock, so the countdown and
         // the expiry banner are only honest if we re-read state on foreground.
         .task(id: scenePhase) {
-            guard scenePhase == .active, nodeStore.trial != nil,
-                  let bearer = accountStore.currentSessionToken else { return }
+            guard scenePhase == .active,
+                  let bearer = accountStore.currentSessionToken,
+                  let accountID = accountStore.user?.id else { return }
+            await computerLinkStore.refresh(
+                bearerToken: bearer,
+                accountID: accountID,
+                showProgress: !computerLinkStore.hasLoaded
+            )
+            guard nodeStore.trial != nil else { return }
             // Only an authoritative "no trial" may forget the machine — see
             // RelayNodeStore.applyRefresh. A `try?` here once turned every
             // offline foreground into permanent, unrecoverable loss.
@@ -269,9 +281,9 @@ struct POCVaultRootView: View {
                 nodeStore.applyRefresh(.failure(error))
             }
         }
-        .task {
+        .task(id: foldersAreHiddenAfterComputerDisconnect) {
             // App-wide job monitor + completion notifications, owned by the session store.
-            guard shouldStartAgentMonitor else { return }
+            guard !foldersAreHiddenAfterComputerDisconnect, shouldStartAgentMonitor else { return }
             await chatSessionStore.monitorActiveWorkWhileAppIsOpen()
         }
         #if DEBUG
@@ -279,6 +291,67 @@ struct POCVaultRootView: View {
             applyUITestHooks()
         }
         #endif
+    }
+
+    private var browserNavigation: some View {
+        NavigationStack(path: $browserPath) {
+            browserScreen(folderPath: nil, isRoot: true)
+                .navigationDestination(for: BrowserRoute.self) { route in
+                    switch route {
+                    case .folder(let path):
+                        browserScreen(folderPath: path, isRoot: false)
+                    case .file(let entry):
+                        FileViewerView(
+                            client: codexClient,
+                            identityStore: identityStore,
+                            entry: entry
+                        )
+                    }
+                }
+        }
+    }
+
+    private var disconnectedComputerScreen: some View {
+        NavigationStack {
+            ZStack {
+                AppTheme.canvasGradient.ignoresSafeArea()
+                VStack(spacing: 14) {
+                    Image(systemName: "desktopcomputer.trianglebadge.exclamationmark")
+                        .font(.system(size: 34, weight: .medium))
+                        .foregroundStyle(AppTheme.textTertiary)
+                    Text("Computer disconnected")
+                        .font(AppTheme.serifFont(size: 26))
+                        .foregroundStyle(AppTheme.textPrimary)
+                    Text("Its folders are hidden on this phone. Link a computer to show folders again; files on the Relay machine were not deleted.")
+                        .font(AppTheme.uiFont(size: 14))
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .multilineTextAlignment(.center)
+                        .lineSpacing(3)
+                        .padding(.horizontal, 28)
+                    Button("Link a computer") {
+                        showingAccount = true
+                    }
+                    .buttonStyle(RelayPrimaryButtonStyle())
+                    .padding(.horizontal, 32)
+                    .padding(.top, 8)
+                }
+            }
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showingAccount = true
+                    } label: {
+                        Image(systemName: "person.crop.circle")
+                            .foregroundStyle(AppTheme.textSecondary)
+                    }
+                    .accessibilityLabel("Account & Settings")
+                }
+            }
+        }
+    }
+
+    private var foldersAreHiddenAfterComputerDisconnect: Bool {
+        computerLinkStore.suppressesFolderAccess(for: accountStore.user?.id)
     }
 
     private func browserScreen(folderPath: String?, isRoot: Bool) -> some View {

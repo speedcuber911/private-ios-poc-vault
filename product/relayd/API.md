@@ -41,7 +41,7 @@
   `/^artifact-[0-9]{3}$/` (`isSafeArtifactId`, 1602–1604). Non-matching ids
   return 404 before any lookup.
 
-### 1.2 Auth model (mTLS with forwarded-subject re-check)
+### 1.2 Auth model (mTLS or trial device token, with local re-check)
 
 `authorize` (1370–1387), applied to every route except `GET /healthz`
 (gate at 1401–1404):
@@ -60,8 +60,13 @@
   entirely; the subject header, if present, is still propagated.
 - The authorized subject is threaded through as `certSubject` into job
   records, chat threads, audit log lines, and echoed in job responses.
-- There are **no bearer tokens, API keys, cookies, or sessions** anywhere on
-  the node API. mTLS (via the gateway re-check) is the only data-path auth.
+- Personal/BYO nodes use mTLS. Trial nodes whose
+  `RELAYD_DEVICE_TOKEN_HASH_FILE` is configured use a host-scoped bearer token
+  derived during pairing; only its SHA-256 is stored by the node.
+- A token-authenticated node enrolled with relay-cloud also requires a current
+  account-access lease received on its signed handoff long-poll. Missing or
+  expired lease → **503**; an owner-disconnected computer → **403**. The cloud
+  never receives the file/job request itself.
 - `POST /v1/pair` is **never routable on this listener** — it is refused with
   a 404 before `authorize` runs, so the data port does not even reveal that it
   exists. Pairing has its own listener (§2.3).
@@ -726,8 +731,8 @@ development convenience, not part of the product surface.
 Everything below is new surface designed for relayd v1. Conventions carried
 over: camelCase JSON, `{"error": "…"}` failures, `sendSse` event grammar,
 bounded lists with `limit` + `truncated`, ISO-8601 UTC timestamps,
-UUID ids, mTLS-only data-path auth (client cert required in both listen
-modes; no tokens). New route namespaces drop the legacy `/codex` segment;
+UUID ids, the same node data-path auth described in §1.2. New route namespaces
+drop the legacy `/codex` segment;
 existing `/v1/codex/*` routes remain frozen as-is.
 
 ### 2.1 Resumable SSE via `Last-Event-ID`

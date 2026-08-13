@@ -55,6 +55,10 @@ function ensureCliComputerSchema(db) {
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_cli_computer_links_account
       ON cli_computer_links (account_id);
+    CREATE TABLE IF NOT EXISTS cli_computer_access_revocations (
+      account_id  TEXT PRIMARY KEY,
+      revoked_at  INTEGER NOT NULL
+    );
   `);
 }
 
@@ -323,6 +327,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       }
       db.prepare("DELETE FROM device_codes WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM cli_computer_links WHERE account_id = ?").run(accountId);
+      db.prepare("DELETE FROM cli_computer_access_revocations WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM repos WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM handoffs WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM sync_notices WHERE account_id = ?").run(accountId);
@@ -930,6 +935,11 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
          WHERE id = ? AND account_id IS NULL AND consumed_at IS NULL AND expires_at > ?`,
       ).run(accountId, linkId, timestamp, id, timestamp);
       if (Number(updated.changes) !== 1) throw new Error("device_code_transition_lost");
+      // Approval is the only transition that restores node access after the
+      // owner has disconnected a computer. Keep it in this transaction so a
+      // link can never become visible while the old revocation remains.
+      db.prepare("DELETE FROM cli_computer_access_revocations WHERE account_id = ?")
+        .run(accountId);
       db.exec("COMMIT");
       return {
         status: "approved",
@@ -1004,6 +1014,14 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     );
   }
 
+  function isCliComputerAccessRevoked(accountId) {
+    return Boolean(
+      db.prepare(
+        "SELECT 1 FROM cli_computer_access_revocations WHERE account_id = ?",
+      ).get(accountId),
+    );
+  }
+
   function disconnectCliComputer(accountId, expectedLinkId = null) {
     db.exec("BEGIN IMMEDIATE");
     try {
@@ -1013,6 +1031,16 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       // disconnect whichever computer is current; credential-reuse handling
       // supplies the exact link the compromised token belonged to.
       if (!link || (expectedLinkId && link.id !== expectedLinkId)) {
+        // The phone's DELETE is idempotent and remains authoritative even if
+        // its UI was stale and the link row has already gone. An old CLI token
+        // naming a DIFFERENT replacement link must not revoke that replacement.
+        if (!expectedLinkId) {
+          db.prepare(
+            `INSERT INTO cli_computer_access_revocations (account_id, revoked_at)
+             VALUES (?, ?)
+             ON CONFLICT (account_id) DO UPDATE SET revoked_at = excluded.revoked_at`,
+          ).run(accountId, now());
+        }
         db.exec("COMMIT");
         return null;
       }
@@ -1020,6 +1048,11 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       revokeCliLinkRefreshTokens(link.id);
       db.prepare("DELETE FROM cli_computer_links WHERE id = ? AND account_id = ?")
         .run(link.id, accountId);
+      db.prepare(
+        `INSERT INTO cli_computer_access_revocations (account_id, revoked_at)
+         VALUES (?, ?)
+         ON CONFLICT (account_id) DO UPDATE SET revoked_at = excluded.revoked_at`,
+      ).run(accountId, now());
       db.exec("COMMIT");
       return link;
     } catch (err) {
@@ -1557,6 +1590,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     connectCliComputer,
     getCliComputerLink,
     getCliComputerLinkById,
+    isCliComputerAccessRevoked,
     disconnectCliComputer,
     sweepDeviceCodes,
     countLiveDeviceCodes,
