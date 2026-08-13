@@ -28,7 +28,13 @@ final class CLILinkTests: XCTestCase {
         XCTAssertNil(CLILinkFlowModel.parseUserCode(from: ""))
         XCTAssertNil(CLILinkFlowModel.parseUserCode(from: "ABC"))
         XCTAssertNil(CLILinkFlowModel.parseUserCode(from: "https://relay.example/cli-login"))
-        XCTAssertNil(CLILinkFlowModel.parseUserCode(from: "https://relay.example/cli-login#code=TOO-SHORT"))
+        // "TOO-SHORT" was the fixture here and it never tested what it claimed:
+        // the dash is stripped before the length check, leaving TOOSHORT — eight
+        // alphanumerics, i.e. a perfectly well-formed code, which parseUserCode
+        // correctly returned as TOOS-HORT. Use a fragment that is genuinely the
+        // wrong length so the rule under test is the one being exercised.
+        XCTAssertNil(CLILinkFlowModel.parseUserCode(from: "https://relay.example/cli-login#code=TOOSHRT"))
+        XCTAssertNil(CLILinkFlowModel.parseUserCode(from: "https://relay.example/cli-login#code=TOOLONGCODE"))
     }
 
     func testNormalizeUserCode() {
