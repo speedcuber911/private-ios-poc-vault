@@ -833,10 +833,24 @@ enum AppConfiguration {
         infoKey: "POCVaultSignatureURL",
         fallback: "https://vault.pocs.conformal.live/manifest.sig.json"
     )
+    /// A node URL is per-user — the owner's own machine or an adopted trial —
+    /// so there is no correct global default and this fallback deliberately
+    /// resolves to nothing. `.invalid` is reserved by RFC 2606 and is
+    /// guaranteed never to resolve, so an unconfigured build fails at DNS,
+    /// immediately and legibly.
+    ///
+    /// It used to fall back to `https://codex.pocs.conformal.live`, which is a
+    /// *different, older* deployment — still live, still serving 200 on
+    /// /healthz with a valid certificate as of 2026-08-13. That is worse than a
+    /// dead host: an unconfigured build did not fail, it quietly talked to
+    /// someone else's server. `hasConfiguredPersonalInstall` is the predicate
+    /// that decides whether there is a machine at all, and it reads only
+    /// `supportConfig` — never this fallback — so nothing downstream should
+    /// reach this URL in the first place.
     static let codexBaseURL = configuredURL(
         supportValue: supportConfig?.codexBaseURL,
         infoKey: "POCVaultCodexBaseURL",
-        fallback: "https://codex.pocs.conformal.live"
+        fallback: "https://unconfigured.invalid"
     )
     // The control plane that owns accounts AND trials. It must be the box the
     // trial routes are deployed to — pointing this at a relay-cloud without
@@ -888,11 +902,13 @@ enum AppConfiguration {
     /// `testTrialRefreshClearsTheNodeURLOnceTheTrialIsNoLongerUsable` asserted
     /// something that could not hold and failed the build on Apple's side.
     ///
-    /// Deliberately NOT derived from the Info.plist base URL: the project
-    /// defaults `POC_VAULT_CODEX_BASE_URL` to a checked-in host, so "the plist
-    /// has a URL" is true of every build and means nothing. That default host is
-    /// the decommissioned one whose TLS failures this whole predicate exists to
-    /// stop reporting as the user's own machine misbehaving.
+    /// Deliberately NOT derived from the Info.plist base URL. That value comes
+    /// from a build setting, and a build setting always has *some* value, so
+    /// "the plist has a URL" would be true of every build and mean nothing.
+    /// `POC_VAULT_CODEX_BASE_URL` is now checked in empty for exactly this
+    /// reason — it used to default to `https://codex.pocs.conformal.live`, an
+    /// older deployment that is still live and still serving, so an
+    /// unconfigured build reached a stranger's server rather than failing.
     static let isSimulatorFixtureRun: Bool = {
 #if targetEnvironment(simulator)
         ProcessInfo.processInfo.environment["RELAY_SIM_FIXTURE"] == "1"
