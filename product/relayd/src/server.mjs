@@ -20,6 +20,7 @@ import { transcribeAudio, cleanAudioContentType, cleanAudioFilename } from "./tr
 import { jobsState, jobs, activeChildren, responseShape, wantsFullLogs, enqueueJob, cleanJobProviderFilter, normalizeJobProvider, cancelJob, streamJobEvents, toJobResponse } from "./jobs.mjs";
 import { codexThreadUiHtml } from "./ui.mjs";
 import { handleAdditionRoutes } from "./additions.mjs";
+import { computerAccessGate } from "./computeraccess.mjs";
 
 // SHA-256 of the device's bearer token, or null when this node authenticates
 // with client certificates instead. Re-read when the file changes, because the
@@ -82,6 +83,8 @@ function authorize(req) {
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
       return { ok: false, status: 401, error: "device token is not valid" };
     }
+    const computerAccess = computerAccessGate.authorize();
+    if (!computerAccess.ok) return computerAccess;
     return { ok: true, subject: "trial-device" };
   }
 

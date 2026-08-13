@@ -4,6 +4,7 @@ struct AccountSettingsView: View {
     @ObservedObject var accountStore: RelayAccountStore
     @ObservedObject var nodeStore: RelayNodeStore
     @ObservedObject var identityStore: ClientIdentityStore
+    @ObservedObject var computerLinkStore: RelayComputerLinkStore
     let trialClient: RelayTrialClient
     @Environment(\.dismiss) private var dismiss
 
@@ -12,11 +13,6 @@ struct AccountSettingsView: View {
     @State private var isDeletingTrial = false
     @State private var trialDeleteError: String?
     @State private var showingCLILink = false
-    @State private var linkedComputer: CLIComputerLink?
-    @State private var didLoadLinkedComputer = false
-    @State private var isLoadingLinkedComputer = false
-    @State private var isDisconnectingComputer = false
-    @State private var linkedComputerError: String?
     @State private var showingDisconnectConfirmation = false
 
     var body: some View {
@@ -36,13 +32,13 @@ struct AccountSettingsView: View {
                     }
 
                     Section {
-                        if !didLoadLinkedComputer && isLoadingLinkedComputer {
+                        if !computerLinkStore.hasLoaded && computerLinkStore.isLoading {
                             HStack(spacing: 10) {
                                 ProgressView()
                                 Text("Checking computer link…")
                                     .foregroundStyle(AppTheme.textSecondary)
                             }
-                        } else if let linkedComputer {
+                        } else if let linkedComputer = computerLinkStore.computer {
                             LabeledContent("Computer", value: computerName(linkedComputer))
                             LabeledContent("Status", value: computerStatus(linkedComputer))
                             if let platform = linkedComputer.platform {
@@ -60,17 +56,17 @@ struct AccountSettingsView: View {
                             Button("Disconnect computer", role: .destructive) {
                                 showingDisconnectConfirmation = true
                             }
-                            .disabled(isDisconnectingComputer)
+                            .disabled(computerLinkStore.isDisconnecting)
                             .accessibilityIdentifier("relay-disconnect-computer")
-                        } else if linkedComputerError == nil {
+                        } else if computerLinkStore.errorMessage == nil {
                             Button("Link a computer") {
                                 showingCLILink = true
                             }
-                            .disabled(isLoadingLinkedComputer || isDisconnectingComputer)
+                            .disabled(computerLinkStore.isLoading || computerLinkStore.isDisconnecting)
                             .accessibilityIdentifier("relay-link-computer")
                         }
 
-                        if let linkedComputerError {
+                        if let linkedComputerError = computerLinkStore.errorMessage {
                             Label(linkedComputerError, systemImage: "exclamationmark.triangle.fill")
                                 .foregroundStyle(AppTheme.statusError)
 
@@ -173,7 +169,7 @@ struct AccountSettingsView: View {
                 Text("This action cannot be undone. Data on servers you own is not deleted.")
             }
             .confirmationDialog(
-                "Disconnect \(linkedComputer.map(computerName) ?? "computer")?",
+                "Disconnect \(computerLinkStore.computer.map(computerName) ?? "computer")?",
                 isPresented: $showingDisconnectConfirmation,
                 titleVisibility: .visible
             ) {
@@ -182,7 +178,7 @@ struct AccountSettingsView: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("Relay will revoke this computer’s CLI access. You can link a different computer afterward.")
+                Text("Relay will revoke this computer’s CLI access and hide its folders on this phone. Files on the Relay machine are not deleted.")
             }
             .interactiveDismissDisabled(accountStore.isWorking)
             .overlay {
@@ -206,13 +202,13 @@ struct AccountSettingsView: View {
             .task {
                 await loadLinkedComputer()
             }
-            .task(id: linkedComputer?.id) {
-                guard linkedComputer?.status == .connecting else { return }
+            .task(id: computerLinkStore.computer?.id) {
+                guard computerLinkStore.computer?.status == .connecting else { return }
                 for _ in 0..<30 {
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
                     guard !Task.isCancelled else { return }
                     await loadLinkedComputer(showProgress: false)
-                    if linkedComputer?.status != .connecting { return }
+                    if computerLinkStore.computer?.status != .connecting { return }
                 }
             }
         }
@@ -220,7 +216,7 @@ struct AccountSettingsView: View {
     }
 
     private var computerFooter: String {
-        guard let linkedComputer else {
+        guard let linkedComputer = computerLinkStore.computer else {
             return "Scan the QR code from `relay login` on your Mac or Linux machine. Only one computer can be linked at a time."
         }
         switch linkedComputer.status {
@@ -254,40 +250,19 @@ struct AccountSettingsView: View {
     }
 
     private func loadLinkedComputer(showProgress: Bool = true) async {
-        guard let bearer = accountStore.currentSessionToken else {
-            linkedComputer = nil
-            didLoadLinkedComputer = true
-            return
-        }
-        if showProgress { isLoadingLinkedComputer = true }
-        linkedComputerError = nil
-        defer {
-            didLoadLinkedComputer = true
-            if showProgress { isLoadingLinkedComputer = false }
-        }
-        do {
-            linkedComputer = try await RelayAuthClient(
-                baseURL: AppConfiguration.authBaseURL
-            ).linkedComputer(bearerToken: bearer)
-        } catch {
-            linkedComputerError = "Relay couldn't refresh the computer link."
-        }
+        guard let bearer = accountStore.currentSessionToken,
+              let accountID = accountStore.user?.id else { return }
+        await computerLinkStore.refresh(
+            bearerToken: bearer,
+            accountID: accountID,
+            showProgress: showProgress
+        )
     }
 
     private func disconnectLinkedComputer() async {
-        guard let bearer = accountStore.currentSessionToken else { return }
-        isDisconnectingComputer = true
-        linkedComputerError = nil
-        defer { isDisconnectingComputer = false }
-        do {
-            try await RelayAuthClient(
-                baseURL: AppConfiguration.authBaseURL
-            ).disconnectComputer(bearerToken: bearer)
-            linkedComputer = nil
-            didLoadLinkedComputer = true
-        } catch {
-            linkedComputerError = "Relay couldn't disconnect this computer. Try again."
-        }
+        guard let bearer = accountStore.currentSessionToken,
+              let accountID = accountStore.user?.id else { return }
+        await computerLinkStore.disconnect(bearerToken: bearer, accountID: accountID)
     }
 
     private func computerName(_ computer: CLIComputerLink) -> String {

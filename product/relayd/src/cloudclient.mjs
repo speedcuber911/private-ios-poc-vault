@@ -100,6 +100,9 @@ function createCloudClient({
   // acknowledges notices and does nothing with them, which is what an older
   // daemon build would do anyway.
   onNotice = null,
+  // Managed nodes renew their account-level data-path authorization on this
+  // same signed long-poll. Optional for direct/BYO nodes.
+  onComputerAccess = null,
 } = {}) {
   const paths = baseDir ? identityPaths(baseDir) : identityPaths();
   const nodeId = readNodeId(paths);
@@ -357,6 +360,11 @@ function createCloudClient({
     const json = await res.json();
     const handoffs = Array.isArray(json?.handoffs) ? json.handoffs : [];
     const notices = actionableNotices(json?.notices);
+    if (onComputerAccess) {
+      // The callback owns strict shape/range validation. If it refuses the
+      // lease, this poll is not accepted and the prior lease naturally expires.
+      await onComputerAccess(json?.computerAccess);
+    }
     // res.json() resolving is itself the evidence that matters — proof the
     // bytes crossed a live connection — so ack right here, before returning
     // descriptors to the caller, and before anything is done with them.

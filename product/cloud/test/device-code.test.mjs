@@ -7,7 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { createDb } from "../src/db.js";
 import { createRegistry } from "../src/registry.js";
-import { startTestApp, api, signIn, authed } from "./helpers.mjs";
+import { startTestApp, api, signIn, authed, makeNodeIdentity } from "./helpers.mjs";
 import { mintUserCode, USER_CODE_ALPHABET } from "../src/server.js";
 
 const start = (t) => api(t.baseUrl, "POST", "/v1/auth/device/start", { body: {} });
@@ -18,6 +18,20 @@ const linkedComputer = (t, sessionToken) =>
   api(t.baseUrl, "GET", "/v1/auth/device/link", authed(sessionToken));
 const disconnectComputer = (t, sessionToken) =>
   api(t.baseUrl, "DELETE", "/v1/auth/device/link", authed(sessionToken));
+
+function nodeHeaders(identity, { nodeId, pathWithQuery, ts }) {
+  const input = Buffer.from(
+    `relay-node-req-v1\nGET\n${pathWithQuery}\n${nodeId}\n${ts}`,
+    "utf8",
+  );
+  return {
+    headers: {
+      "x-relay-node": nodeId,
+      "x-relay-ts": String(ts),
+      "x-relay-signature": identity.signBody(input),
+    },
+  };
+}
 
 test("full device-code flow: start, poll pending, approve, poll returns a session", async () => {
   const t = await startTestApp();
@@ -63,6 +77,7 @@ test("full device-code flow: start, poll pending, approve, poll returns a sessio
     const connecting = await linkedComputer(t, session.sessionToken);
     assert.equal(connecting.status, 200);
     assert.equal(connecting.json.computer.status, "connecting");
+    assert.equal(connecting.json.foldersAvailable, true);
 
     const granted = await poll(t, started.json.deviceCode);
     assert.equal(granted.status, 200);
@@ -331,7 +346,9 @@ test("disconnect revokes the linked computer and frees the one-computer slot", a
     const removed = await disconnectComputer(t, phone.sessionToken);
     assert.equal(removed.status, 200);
     assert.equal(removed.json.disconnected.status, "connected");
-    assert.equal((await linkedComputer(t, phone.sessionToken)).json.computer, null);
+    const disconnectedState = await linkedComputer(t, phone.sessionToken);
+    assert.equal(disconnectedState.json.computer, null);
+    assert.equal(disconnectedState.json.foldersAvailable, false);
 
     assert.equal(
       (await api(t.baseUrl, "GET", "/v1/account", authed(cli.json.sessionToken))).status,
@@ -346,6 +363,62 @@ test("disconnect revokes the linked computer and frees the one-computer slot", a
     const replacement = await start(t);
     assert.equal((await approve(t, phone.sessionToken, replacement.json.userCode)).status, 200);
     assert.equal((await poll(t, replacement.json.deviceCode)).status, 200);
+    assert.equal((await linkedComputer(t, phone.sessionToken)).json.foldersAvailable, true);
+  } finally { await t.close(); }
+});
+
+test("disconnect wakes the account node and its next signed poll revokes data access", async () => {
+  const t = await startTestApp();
+  try {
+    const phone = await signIn(t);
+    const started = await start(t);
+    await approve(t, phone.sessionToken, started.json.userCode);
+    await poll(t, started.json.deviceCode);
+
+    const identity = makeNodeIdentity();
+    const nodeId = "11111111-2222-4333-8444-555555555555";
+    t.app.registry.createNode(phone.accountId, {
+      id: nodeId,
+      kind: "trial",
+      name: "Trial",
+      pubkey: identity.pubkeyPem,
+    });
+
+    const firstPath = "/v1/node/handoffs?wait=0";
+    const first = await api(
+      t.baseUrl,
+      "GET",
+      firstPath,
+      nodeHeaders(identity, { nodeId, pathWithQuery: firstPath, ts: t.clock.t }),
+    );
+    assert.equal(first.status, 200);
+    assert.deepEqual(first.json.computerAccess, {
+      allowed: true,
+      leaseSec: t.config.computerAccessLeaseSec,
+    });
+
+    t.clock.t += 1;
+    const parkedPath = "/v1/node/handoffs?wait=25";
+    const polling = api(
+      t.baseUrl,
+      "GET",
+      parkedPath,
+      nodeHeaders(identity, { nodeId, pathWithQuery: parkedPath, ts: t.clock.t }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(t.app.handoffWaiters.get(nodeId)?.size, 1, "the node poll must be parked");
+
+    await disconnectComputer(t, phone.sessionToken);
+    const revoked = await Promise.race([
+      polling,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("disconnect did not wake node")), 2000)),
+    ]);
+    assert.equal(revoked.status, 200);
+    assert.deepEqual(revoked.json.computerAccess, {
+      allowed: false,
+      leaseSec: t.config.computerAccessLeaseSec,
+    });
+    assert.equal(t.app.handoffWaiters.has(nodeId), false);
   } finally { await t.close(); }
 });
 
