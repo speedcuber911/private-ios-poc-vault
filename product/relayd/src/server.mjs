@@ -21,9 +21,69 @@ import { jobsState, jobs, activeChildren, responseShape, wantsFullLogs, enqueueJ
 import { codexThreadUiHtml } from "./ui.mjs";
 import { handleAdditionRoutes } from "./additions.mjs";
 
+// SHA-256 of the device's bearer token, or null when this node authenticates
+// with client certificates instead. Re-read when the file changes, because the
+// daemon starts before pairing has written it.
+let deviceTokenHashCache = { mtimeMs: -1, value: null };
+function deviceTokenHash() {
+  const file = process.env.RELAYD_DEVICE_TOKEN_HASH_FILE;
+  if (!file) return null;
+  let stat;
+  try {
+    stat = fs.statSync(file);
+  } catch {
+    return null;
+  }
+  if (stat.mtimeMs !== deviceTokenHashCache.mtimeMs) {
+    try {
+      const value = fs.readFileSync(file, "utf8").trim().toLowerCase();
+      deviceTokenHashCache = { mtimeMs: stat.mtimeMs, value: /^[0-9a-f]{64}$/.test(value) ? value : null };
+    } catch {
+      deviceTokenHashCache = { mtimeMs: stat.mtimeMs, value: null };
+    }
+  }
+  return deviceTokenHashCache.value;
+}
+
+function bearerToken(header) {
+  const value = headerValue(header);
+  if (typeof value !== "string") return null;
+  const match = /^Bearer\s+(.+)$/i.exec(value.trim());
+  return match ? match[1].trim() : null;
+}
+
 function authorize(req) {
   const verify = headerValue(req.headers["x-ssl-client-verify"]);
   const subject = headerValue(req.headers["x-ssl-client-s-dn"]);
+
+  // Token authentication, when this node was paired with a device token.
+  //
+  // A trial machine cannot use client certificates: iOS will not send one on
+  // a connection it did not itself anchor, and on a machine whose certificate
+  // is publicly trusted it declines silently — the handshake dies with the
+  // client having sent nothing, and the machine sees no failed handshake to
+  // report. Proven against a live machine: a certificate minted from the
+  // node's own CA authenticated and returned 200, while the phone's — the
+  // same CA, byte-identical, with a usable key — was never sent at all.
+  //
+  // The token is derived from the same single-use pairing secret that already
+  // authenticates pairing, so no new secret crosses the wire and the pairing
+  // protocol is unchanged. Only its SHA-256 is stored here, and it is compared
+  // in constant time.
+  const expected = deviceTokenHash();
+  if (expected) {
+    const provided = bearerToken(req.headers.authorization);
+    if (!provided) {
+      return { ok: false, status: 401, error: "device token is required" };
+    }
+    const actual = crypto.createHash("sha256").update(provided, "utf8").digest("hex");
+    const a = Buffer.from(actual, "utf8");
+    const b = Buffer.from(expected, "utf8");
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return { ok: false, status: 401, error: "device token is not valid" };
+    }
+    return { ok: true, subject: "trial-device" };
+  }
 
   if (!requireMtls) {
     return { ok: true, subject: subject || null };
