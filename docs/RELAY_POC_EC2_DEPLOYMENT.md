@@ -25,18 +25,26 @@ account selected by the `default` CLI profile.
 | CI/CD source | CodeCommit repository `relay-cloud`, branch `main` |
 | CI/CD pipeline | CodePipeline `relay-cloud-deploy` |
 | Pipeline stack | CloudFormation `relay-cloud-cicd` |
-| Current release | `263265d67b41dbaec95cda73022314f3755f2deb` (deployed 2026-08-13) |
+| Current release | `8728c7f3b119944044b1bf1d53c9a52b481f0efd` (deployed 2026-08-13, 13:50 UTC) |
+| Previous release | `263265d67b41dbaec95cda73022314f3755f2deb` — retained on disk for rollback |
 | Pre-deploy recovery point | EBS snapshot `snap-0027cd41761bc9dd7`; per-deploy SQLite backups under `/var/lib/relay-cloud/relay-cloud.sqlite.bak-*` |
 
-The `263265d…` release was deployed by invoking `product/cloud/deploy/cicd-deploy.sh`
+Both releases were deployed by invoking `product/cloud/deploy/cicd-deploy.sh`
 directly (tar → private S3 → SSM → `install.sh`), **not** through
-CodeCommit/CodePipeline. The SHA is therefore a GitHub `main` commit and may not
-exist in the CodeCommit mirror; the next pipeline run supersedes it cleanly
-because the same code is on `main`. Verified after the flip: `current` →
-`releases/263265d…`, live `src/apns.js` sha256 `a8b936dc…` (byte-identical to
-`git show 263265d:product/cloud/src/apns.js`), service restarted, and both the
-loopback and public `/healthz` returning `{"ok":true}`. The prior release
-directory is retained for rollback.
+CodeCommit/CodePipeline. The SHAs are therefore GitHub `main` commits and may
+not exist in the CodeCommit mirror; the next pipeline run supersedes them
+cleanly because the same code is on `main`.
+
+`8728c7f…` carries the push-notification banner change (`notify.js`
+`bannerFor`). Verified on the host after the flip, not inferred from the
+deploy script's own exit status: `current` → `releases/8728c7f…`, service
+`active`, loopback `/healthz` `{"ok":true}`, `bannerFor` present in the running
+`src/notify.js`, `latestHandoffForNode` present in both `registry.js` and
+`notify.js`, no `loc-key` left on the alert path (the three remaining matches
+in `apns.js` are the comment explaining why it went), and no `credentials
+unset` line in the journal after the restart — the APNs `.p8` survived the
+release. Release directories are content-addressed by SHA, so rollback is a
+symlink flip plus `systemctl restart relay-cloud`.
 
 The public IP is intentionally not persisted in this document. Route 53 and
 the EC2 inventory are the current sources of truth.
