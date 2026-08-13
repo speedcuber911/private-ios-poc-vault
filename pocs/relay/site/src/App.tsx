@@ -14,6 +14,7 @@ import TextPressure from './components/reactbits/TextPressure';
 
 const ease = [0.16, 1, 0.3, 1] as const;
 const installCommand = "curl --proto '=https' --tlsv1.2 -fsSL https://get.openrelay.sh/install.sh | sh";
+const relayAppOrigin = import.meta.env.VITE_RELAY_APP_ORIGIN || '#';
 
 const capabilities = [
   {
@@ -339,7 +340,7 @@ export default function App() {
           <a href="#product">Product</a>
           <a href="#privacy">Privacy</a>
         </nav>
-        <a className="beta-link" href="#product">Private beta <ArrowUpRight size={13} /></a>
+        <a className="beta-link" href={`${relayAppOrigin}/login`}>Sign in <ArrowUpRight size={13} /></a>
       </header>
 
       <main>
