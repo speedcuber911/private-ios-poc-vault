@@ -1225,6 +1225,68 @@ still-running `tar` child is killed.
 
 ---
 
+### 2.10 `POST /v1/exec` — run a command on the node
+
+Implemented (`relayd/src/exec.mjs`, `serveExec`; routed in
+`src/additions.mjs`). Runs a shell command on the node and returns its
+output. Behind the same mTLS `authorize()` gate as the rest of the data
+path.
+
+Request: `{"command": "git status", "cwd": "/srv/relay-workspaces/x",
+"timeoutMs": 30000}` — `cwd` and `timeoutMs` optional.
+
+Response `200`:
+
+```json
+{ "exitCode": 0, "signal": null, "stdout": "...", "stderr": "",
+  "truncated": false, "timedOut": false, "durationMs": 84 }
+```
+
+A non-zero exit is **not** an HTTP error — the command ran and its result is
+the payload. Errors: `400 command is required`, `400 cwd is outside the
+workspace root`, `429 too many concurrent commands`.
+
+**Security note — this route is not jailed, and must not be described as if
+it were.** The workspace jail (`fsapi`, `workspaces.mjs`) is a *path
+containment check*: it resolves a requested path and refuses one that
+escapes `workspaceBrowseRoot`. That works because every `fsapi` caller
+reaches the filesystem through those helpers. A shell does not. Once the
+process exists it can `cd /` and read anything the runtime user can read,
+and validating the **starting** directory changes nothing about that. Real
+confinement is OS-level — mount namespaces, bubblewrap, a container per
+command — and the trial image ships none of them.
+
+So the boundary here is **authentication**, not the jail:
+
+- A caller reaching this route holds a device certificate issued by this
+  node's CA. There is no weaker path in, and there must never be one.
+- The blast radius is the runtime user. relayd runs as the non-root `relay`
+  user, so a command reaches that user's workspaces and harness
+  credentials — not root, not another tenant.
+- The `cwd` check is a usability guard that stops a caller *accidentally*
+  operating on the wrong tree. It does not stop a determined one leaving it.
+
+Bounds, which are about keeping one command from taking the node down:
+`EXEC_MAX_TIMEOUT_MS` 300 s (default 30 s), `EXEC_MAX_OUTPUT_BYTES` 1 MiB
+(truncation is reported in `truncated`, never silent), `EXEC_MAX_CONCURRENT`
+4 (429 past it — a phone with a stuck retry loop is otherwise a fork bomb).
+
+Two implementation details that are load-bearing:
+
+- **`detached: true`** puts the child in its own process group so the
+  timeout kill can target `-pid` and take the whole tree. Without it,
+  `bash -c 'sleep 60 & wait'` survives the kill as an orphan holding node
+  resources indefinitely.
+- **Output past the cap is read and discarded, not unpiped.** A child whose
+  stdout blocks on a full pipe never exits, so unpiping would make every
+  large-output command report a timeout that did not happen.
+
+Audit (`exec`) records the cwd, the command truncated to 200 characters, its
+length, exit code, timeout flag and duration. Output is never audited — it
+is the one field guaranteed to contain repository content.
+
+---
+
 ## Part 3 — Ambiguities & inconsistencies found during the freeze
 
 - **A1 — `workspaceCount` undercounts.** `healthPayload` reports

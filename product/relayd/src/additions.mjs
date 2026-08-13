@@ -10,6 +10,7 @@ import { streamNodeEvents, emitEvent } from "./events.mjs";
 import { listDevices, revokeDevice, publicDevice } from "./identity.mjs";
 import { listHarnesses, getOp, listOps, publicOp, startLoginOp, startSmokeOp } from "./harness.mjs";
 import { serveExportTar } from "./fsapi.mjs";
+import { serveExec } from "./exec.mjs";
 import { continueHandoff } from "./handoff.mjs";
 import { store, isInvalidRecordIdError } from "./store.mjs";
 import { toJobResponse, responseShape } from "./jobs.mjs";
@@ -25,6 +26,15 @@ async function handleAdditionRoutes(req, res, url, auth) {
 
   if (req.method === "GET" && url.pathname === "/v1/export.tar") {
     serveExportTar(req, res);
+    return true;
+  }
+
+  // Arbitrary command execution on this node. Behind the same mTLS gate as
+  // everything else here — which is the ENTIRE boundary, because a shell is
+  // not confined by the workspace jail. See the header of exec.mjs before
+  // touching this; the security model is stated there rather than implied.
+  if (req.method === "POST" && url.pathname === "/v1/exec") {
+    await serveExec(req, res);
     return true;
   }
 
