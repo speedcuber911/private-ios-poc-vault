@@ -1,4 +1,4 @@
-import { lazy, Suspense, useRef, useState } from 'react';
+import { Component, lazy, Suspense, useRef, useState, type ReactNode } from 'react';
 import {
   AnimatePresence,
   motion,
@@ -43,6 +43,28 @@ const capabilities = [
 
 function SceneFallback() {
   return <div className="scene-fallback" aria-hidden="true"><span /><span /><span /></div>;
+}
+
+class SceneErrorBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  render() {
+    return this.state.failed ? <SceneFallback /> : this.props.children;
+  }
+}
+
+function SafeRelayLoom({ progress, variant }: { progress?: MotionValue<number>; variant: 'hero' | 'story' }) {
+  return (
+    <SceneErrorBoundary>
+      <Suspense fallback={<SceneFallback />}>
+        <RelayLoom progress={progress} variant={variant} />
+      </Suspense>
+    </SceneErrorBoundary>
+  );
 }
 
 function Reveal({ children, className = '', delay = 0 }: { children: React.ReactNode; className?: string; delay?: number }) {
@@ -132,11 +154,7 @@ function HandoffStory({ reducedMotion }: { reducedMotion: boolean }) {
         <div className="stage-label stage-label-left">PHONE / INTENT</div>
         <div className="stage-label stage-label-right">RUNNER / EXECUTION</div>
         <div className="story-scene">
-          {reducedMotion ? <SceneFallback /> : (
-            <Suspense fallback={<SceneFallback />}>
-              <RelayLoom progress={scrollYProgress} variant="story" />
-            </Suspense>
-          )}
+          {reducedMotion ? <SceneFallback /> : <SafeRelayLoom progress={scrollYProgress} variant="story" />}
         </div>
         <StoryBeat
           index="01 / POINT"
@@ -279,11 +297,7 @@ export default function App() {
         <section className="hero" ref={heroRef}>
           <motion.div className="hero-inner" style={{ scale: heroScale, opacity: heroOpacity, y: heroY }}>
             <div className="hero-scene">
-              {reducedMotion ? <SceneFallback /> : (
-                <Suspense fallback={<SceneFallback />}>
-                  <RelayLoom variant="hero" />
-                </Suspense>
-              )}
+              {reducedMotion ? <SceneFallback /> : <SafeRelayLoom variant="hero" />}
             </div>
             <div className="hero-label hero-label-left">REMOTE INTENT</div>
             <div className="hero-label hero-label-right">LOCAL EXECUTION</div>
