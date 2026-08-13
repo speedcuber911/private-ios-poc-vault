@@ -775,6 +775,30 @@ export function createApp({
       return sendJson(res, 200, { handoff: publicHandoff(registry.getHandoff(id)) });
     }
 
+    // The success twin of the fail route above. Same auth, same replay guard,
+    // same 404-either-way rule; no body, because success has nothing to
+    // report but itself — which is also why there is no vocabulary to police
+    // here. Without it `delivered` was the end of the line for a successful
+    // handoff, and it means only "the node took it", so `relay status` could
+    // not distinguish a finished import from a hung one.
+    if (
+      method === "POST" && seg.length === 5 &&
+      seg[0] === "v1" && seg[1] === "node" && seg[2] === "handoffs" && seg[4] === "ready"
+    ) {
+      const id = seg[3];
+      const pathWithQuery = `${path}${url.search}`;
+      const verified = verifyNodeRequest(req, pathWithQuery, { registry, now, replayGuard: handoffReplayGuard });
+      if (verified.error) return sendJson(res, 401, { error: "unauthorized" });
+      if (!HANDOFF_ID_RE.test(id)) return sendJson(res, 400, { error: "invalid_handoff" });
+
+      const handoff = registry.getHandoff(id);
+      if (!handoff || handoff.nodeId !== verified.node.id) {
+        return sendJson(res, 404, { error: "unknown_handoff" });
+      }
+      registry.readyHandoff(verified.node.id, id);
+      return sendJson(res, 200, { handoff: publicHandoff(registry.getHandoff(id)) });
+    }
+
     // ── session-authed registry endpoints ───────────────────────────────
     const account = await auth.authenticate(req);
     if (!account) return sendJson(res, 401, { error: "unauthorized" });

@@ -849,6 +849,18 @@ async function safeReportFailure(cloud, id, reason) {
   }
 }
 
+// Success twin of safeReportFailure, wrapped for the same reason: the call
+// signs and writes before it returns a promise, so a synchronous throw would
+// escape a trailing `.catch()`. Best-effort — the session is already staged
+// and the local feed already knows; this is the copy `relay status` reads.
+async function safeReportReady(cloud, id) {
+  try {
+    await cloud?.reportHandoffReady?.(id);
+  } catch {
+    /* best-effort; the staged session and local event already landed */
+  }
+}
+
 function persist(record) {
   try {
     store.saveHandoff(record);
@@ -907,6 +919,12 @@ async function announceReady(record, cloud) {
     title: record.title,
     provider: record.provider,
   });
+  // Reported to the cloud BEFORE the event post, for the same reason the
+  // failure path is: the post is what triggers the phone's push, and the phone
+  // refetches GET /v1/handoffs the moment it arrives. Told second, a fast
+  // phone would refetch while the cloud still said `delivered` and render a
+  // handoff that looks unfinished.
+  await safeReportReady(cloud, record.id);
   await safePostEvent(cloud, "handoff.ready");
   return record;
 }
