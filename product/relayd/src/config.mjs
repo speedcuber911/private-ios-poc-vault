@@ -27,9 +27,54 @@ const artifactsDir = path.join(dataDir, "artifacts");
 
 const auditPath = path.join(dataDir, "audit.jsonl");
 
-const codexBin = process.env.CODEX_BIN || "/usr/bin/codex";
+// Where a harness CLI actually lives.
+//
+// `/usr/bin/<name>` was hardcoded as the default, and that is only true when
+// npm's global prefix is /usr. On the trial image it is not: node is unpacked
+// under /opt/node, so `npm install -g @openai/codex @anthropic-ai/claude-code`
+// puts them at /opt/node/bin/codex and /opt/node/bin/claude. Every trial
+// sandbox therefore answered every prompt with
+// `spawn /usr/bin/codex ENOENT` — both harnesses unrunnable, on every trial
+// machine, from the first one ever provisioned. Cursor was unaffected only
+// because its default is derived from CODEX_RUN_HOME rather than guessed.
+//
+// Resolution order:
+//   1. the explicit env var, honoured even if it points at nothing — an
+//      operator who names a path deserves an error about THAT path, not a
+//      silent substitution of something else;
+//   2. the conventional location, when it really is there;
+//   3. the first match on PATH;
+//   4. the conventional location again, so the ENOENT names the expected
+//      place rather than something empty.
+//
+// Resolved once at import: this is a handful of existsSync calls on a fixed
+// PATH, and the answer cannot change under a running daemon.
+function resolveOnPath(name) {
+  const entries = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  for (const dir of entries) {
+    const candidate = path.join(dir, name);
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch {
+      // An unreadable PATH entry is not this function's problem — keep looking.
+    }
+  }
+  return null;
+}
 
-const claudeBin = process.env.CLAUDE_BIN || "/usr/bin/claude";
+function resolveHarnessBin(explicit, name, conventional) {
+  if (explicit) return explicit;
+  try {
+    if (fs.existsSync(conventional)) return conventional;
+  } catch {
+    // fall through to the PATH scan
+  }
+  return resolveOnPath(name) || conventional;
+}
+
+const codexBin = resolveHarnessBin(process.env.CODEX_BIN, "codex", "/usr/bin/codex");
+
+const claudeBin = resolveHarnessBin(process.env.CLAUDE_BIN, "claude", "/usr/bin/claude");
 
 const cursorBin = process.env.CURSOR_BIN || path.join(process.env.CODEX_RUN_HOME || process.env.HOME || "/home/ec2-user", ".local", "bin", "cursor-agent");
 
