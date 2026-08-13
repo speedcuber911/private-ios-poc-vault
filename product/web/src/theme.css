@@ -260,6 +260,41 @@ a {
   height: 180px;
   margin: 28px 0 0;
   border: 1px solid var(--hairline-strong);
+  background: #ffffff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.qr-canvas {
+  width: 168px;
+  height: 168px;
+  display: block;
+}
+
+.cli-panel {
+  margin-top: 44px;
+}
+
+.cli-panel h2 {
+  margin: 0 0 12px;
+  font-family: var(--font-serif);
+  font-size: 22px;
+  font-weight: 500;
+}
+
+.cli-panel p {
+  margin: 0;
+  color: var(--ink-secondary);
+  font-size: 14px;
+}
+
+.machine-name {
+  margin: 18px 0 12px;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 18px;
+  letter-spacing: 0.04em;
 }
 
 .stub {
