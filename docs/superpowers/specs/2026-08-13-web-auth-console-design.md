@@ -11,6 +11,9 @@
 > `docs/superpowers/specs/2026-08-11-editorial-ember-design.md`.
 > Hosting and trust constraints from `docs/RELAY_ARCHITECTURE.md` and
 > `docs/RELAY_POC_EC2_AGENT_HANDOFF.md`. Hostnames genericized.
+> Review 2026-08-13: trial nodes are bearer-authed (not mTLS); grants are
+> Ed25519-asymmetric; gateway ingress is specified; 15-minute
+> unrevocable grants are an accepted risk.
 
 ## 1. What this is
 
@@ -67,7 +70,8 @@ the relay-cloud process.
         │                    (sees bytes,                        (trial / BYO)
         │                     never stores)
         │
-        └── mTLS via broker ──────────────────────────────────────▶  relayd
+        └── trial: bearer device token via broker ─────────────────▶  relayd
+            BYO: mTLS via broker ─────────────────────────────────▶  relayd
 ```
 
 | Party | Learns | Never learns |
@@ -103,23 +107,94 @@ Device codes gain a `client` column: `cli` (default) or `web`.
   calls `connectCliComputer`. Reusing that for phone→web QR would steal
   or 409 the laptop link.
 
-### 3.3 Grant gateway
+### 3.3 Node auth on trial machines (do not get this wrong)
+
+`authorize()` in `product/relayd/src/server.mjs` checks
+`deviceTokenHash()` first. When that file is set — every trial machine
+— it requires `Authorization: Bearer <device-token>` and returns
+terminally. The mTLS path below is never reached. The comment in that
+function is the reason: iOS will not send a client cert on a connection
+it did not itself anchor, proven against a live machine.
+
+So the console's first machines are **bearer-authed**, not mTLS. A
+browser grant is also `Authorization: Bearer …`. Today that first
+branch hashes whatever bearer arrives and compares it to one device
+token hash; a grant JWT would 401.
+
+Grant acceptance lives **inside that first branch**, with explicit
+precedence:
+
+1. Read the bearer.
+2. If it is JWT-shaped (exactly three base64url segments) **and** this
+   node has a grant public key: verify as a grant (Ed25519, `node`
+   claim equals this node id, `exp` valid, `scope` covers this route).
+   Success → `{ ok: true, subject: "browser-grant" }`. Failure → 401
+   `device token is not valid` (same public error as a bad device
+   token; do not advertise that grants exist).
+3. Else if `deviceTokenHash()` is set: existing constant-time hash
+   compare. Opaque device tokens are not JWT-shaped, so they fall here.
+4. Else: existing mTLS / `requireMtls` path (BYO nodes).
+
+Phone mTLS is therefore unchanged **only on BYO nodes**. On trial
+nodes there is no mTLS path to leave unchanged.
+
+### 3.4 Grant signing is asymmetric
+
+Cloud signs the grant JWT with an **Ed25519 private key** held only on
+the control-plane host (`BROWSER_GRANT_PRIVATE_KEY` in host env, never
+in the repo or CI variables). Nodes hold **only the public key**.
+
+An HMAC secret (`BROWSER_GRANT_SECRET`) is forbidden: the verify key
+would be the signing key, so one compromised trial sandbox could mint
+grants for every other node. That contradicts the rest of this spec.
+
+relayd holds no cloud verify key today. The public key is a new enroll
+field: written into `/var/lib/relayd/enroll.json` as `grantPublicKey`
+(raw 32-byte Ed25519 public key, base64url) alongside the existing
+enroll token and tunnel fields. `start.sh` installs it for relayd
+(`RELAYD_GRANT_PUBLIC_KEY` or a 0600 file). Existing nodes without the
+key cannot accept grants; they keep working for the phone.
+
+Algorithm: `EdDSA` / Ed25519. Claims: `sub` (account id), `node`,
+`scope` (array: `jobs.read`, `threads.read`, `events.read`), `iat`,
+`exp` (~15 minutes), `jti`. Totality: verify returns null on any
+malformed input and never throws (same contract as `jwt.js`).
+
+### 3.5 Grant gateway
 
 Separate process from relay-cloud. Lives on the data-path machine (the
 broker host), not on the control-plane process and not in the
 CodeCommit `relay-cloud` overlay. After login, cloud mints a short-lived
 grant bound to `account + node + read-activity`. The gateway verifies
-the grant and reverse-proxies only jobs, threads, and events from that
-node. Out-of-scope paths return 403.
+the grant (same public key) and reverse-proxies only jobs, threads, and
+events from that node. Out-of-scope paths return 403. It forwards the
+grant bearer to the node; the node verifies again so a buggy gateway
+cannot aim a grant at the wrong node.
 
-The node remains mTLS-only for the phone. The gateway is the only new
-caller: it presents the grant; the node accepts a verified grant for
-the listed read routes (implementation: cloud-signed JWT, dedicated
-`BROWSER_GRANT_SECRET` in host env, node learns the verify key at
-enroll or via the existing enroll/config channel). Gateway TLS to the
-node does not replace phone mTLS.
+#### Ingress
 
-### 3.4 Trial from the website
+The gateway is a new content-seeing public HTTPS surface. It does **not**
+share the broker's raw TCP port and is **not** terminated on the
+control-plane host (that would put activity bytes on the rendezvous
+box, which §8 forbids in spirit and the broker-on-80/443 rule forbids
+in letter).
+
+- Process: `relay-grant-gateway` systemd unit on the broker host,
+  loopback-only (e.g. `127.0.0.1:8791`).
+- Public name: sibling hostname on the existing API DNS zone
+  (`gateway.<api-zone>`). Product-domain `app.` cutover is still out of
+  scope; this hostname is allowed because it is the same zone already
+  pointing at Relay compute.
+- TLS: nginx + Let's Encrypt on the broker host, dedicated vhost,
+  proxy to the loopback unit. ACME on that host, not on poc-ec2.
+- Limits: nginx request-rate zone (same order as
+  `relay-cloud-rate-limit.conf`) and a request-body cap. Activity
+  reads are GET; reject unexpected bodies.
+- Security group: 80/443 on the broker host for this vhost only. Do
+  not open the gateway's loopback port. Do not put the raw broker
+  protocol on 80/443.
+
+### 3.6 Trial from the website
 
 After signup the site creates a pairing session (current
 `POST /v1/trial-nodes` requires `pairingId` + `pairingSecret`) and
@@ -227,10 +302,10 @@ origins; `credentials: include`).
 | Path | Change |
 |---|---|
 | `POST /v1/auth/device/start` | Optional `client`: `cli` \| `web`, default `cli`. Persist on `device_codes`. `web` does not reserve the computer slot. |
-| `POST /v1/auth/device/inspect` | Response also includes `client`. Unknown/expired/consumed stay identical 404 `unknown_user_code`. |
-| `POST /v1/auth/device/approve` | `cli` → existing `approveDeviceCodeForCliLink` (409 `computer_already_linked` if the slot is taken). `web` → bind `account_id` only; never insert `cli_computer_links`. |
-| `POST /v1/auth/device/token` | `cli` → today's JWT + `cliLinkId`. `web` → create Better Auth session and `Set-Cookie`. A `web` code must not call `connectCliComputer`. |
-| `POST /v1/nodes/:id/browser-grants` | Session required. 404 if the node is not this account's. Returns `{ grant, expiresIn, gatewayUrl }`. JWT claims: `sub` (account), `node`, `scope` (`jobs.read`, `threads.read`, `events.read`), `exp` (~15 minutes). Signed with dedicated `BROWSER_GRANT_SECRET` (host env, never in repo or CI variables). |
+| `POST /v1/auth/device/inspect` | Response also includes `client`. Unknown/expired/consumed stay identical 404 `unknown_user_code`. **Do not 409 `computer_already_linked` before classifying the code.** Today's handler 409s if the account already has a CLI link, which would block phone→web login for anyone who already ran `relay login`. Lookup first; 409 only when `client` is `cli` (or omitted) and the slot is taken. |
+| `POST /v1/auth/device/approve` | Same lookup-first rule. `cli` → existing `approveDeviceCodeForCliLink` (409 if the slot is taken). `web` → bind `account_id` only; never insert `cli_computer_links`. A signed-in phone with a linked laptop must still approve a `web` code. |
+| `POST /v1/auth/device/token` | `cli` → today's JWT + `cliLinkId`. `web` → create a Better Auth session and `Set-Cookie` (this route is custom — call `auth.api` and write cookies onto the Node response). A `web` code must not call `connectCliComputer`. |
+| `POST /v1/nodes/:id/browser-grants` | Session required. 404 if the node is not this account's. Returns `{ grant, expiresIn, gatewayUrl }`. Ed25519 JWT: `sub`, `node`, `scope`, `iat`, `exp` (~15 min), `jti`. Signed with `BROWSER_GRANT_PRIVATE_KEY`. The public half is what `enroll.json` carries. |
 | `GET /v1/account`, `GET /v1/nodes`, `GET/POST/DELETE /v1/trial-nodes/*`, `POST /v1/pairing/sessions`, `POST /v1/waitlist` | Unchanged contracts. Web is a new caller. |
 
 `DEVICE_LOGIN_URL` on the control-plane host is set to
@@ -260,6 +335,11 @@ to logs.
 - **QRLjacking** — confirm names the machine before approve; one-shot
   codes; 15-minute TTL; approval requires a signed-in session (phone or
   web). Residual risk equals the existing CLI device flow — accepted.
+- **Unrevocable grants** — a grant JWT has no denylist. Deleting a node,
+  signing out of the browser, or `revokeAll()` leaves any already-minted
+  grant valid until `exp` (~15 minutes). Accepted at this TTL, the same
+  way QRLjacking is accepted above. A `jti` denylist is out of scope.
+  Do not lengthen `exp` without revisiting this.
 - **Auto-approve after login fails** — show the CLI confirm again. Do
   not loop approve.
 - **Trial** — `trial_unavailable`, `trial_capacity`, `trial_already_used`,
@@ -294,22 +374,35 @@ Hard rules:
   account). This pass may use a sibling vhost on the existing API zone.
   Do not treat a product-domain cutover as in scope.
 - Grant gateway deploys to the data-path / broker host, not into the
-  relay-cloud systemd unit.
+  relay-cloud systemd unit. Ingress is §3.5: loopback unit + nginx/LE
+  vhost on that host, sibling `gateway.<api-zone>` name, rate-limited.
+  Do not terminate gateway TLS on the control-plane host.
 
-`BROWSER_GRANT_SECRET` and any gateway credentials are generated on the
-host, same pattern as existing control-plane secrets.
+`BROWSER_GRANT_PRIVATE_KEY` is generated on the control-plane host
+(Ed25519, 0600). The public half is not secret and is what enroll
+delivers. Gateway TLS private keys stay on the broker host. Same
+pattern as existing on-host secrets: never in the repo or CI variables.
 
 ## 9. Testing
 
 - **Cloud.** `client: "web"` vs `"cli"` isolation: web approve does not
   create `cli_computer_links`; web token does not call
   `connectCliComputer`; CLI approve still 409s when the slot is taken;
-  inspect returns `client`; anti-enumeration 404s remain byte-identical
-  across client kinds; grant mint for own node, 404 for foreign node,
-  expiry, scope claims; SQLite after a mocked activity session still
-  has no prompt or file rows.
+  inspect/approve of a `web` code **succeeds while a CLI link already
+  exists**; inspect returns `client`; anti-enumeration 404s remain
+  byte-identical across client kinds; grant is Ed25519 (HMAC secret
+  rejected); grant mint for own node, 404 for foreign node, expiry,
+  scope claims; SQLite after a mocked activity session still has no
+  prompt or file rows.
+- **relayd.** With `RELAYD_DEVICE_TOKEN_HASH_FILE` set (trial shape): a
+  valid grant JWT on an activity route is 200; a device token still
+  works; a grant JWT hashed as if it were a device token must not be
+  the success path; a grant for another `node` is 401 with the same
+  public error as a bad device token; files/jobs-write routes reject
+  grants. With no device-token file (BYO): mTLS path unchanged.
 - **Gateway.** Allowed routes proxy; other paths 403; expired/wrong-node
-  grants fail; test logger receives no response bodies.
+  grants fail; test logger receives no response bodies. Ingress
+  templates exist and bind loopback only.
 - **Web.** Password signup → provisioning → machines → activity;
   Sign in with iPhone poll → cookie → machines; `/cli-login#code=` with
   no session → login → CLI approved; waitlist join and joined state;
@@ -333,8 +426,10 @@ host, same pattern as existing control-plane secrets.
 - Better Auth `trustedOrigins` + cookie config for the app origin.
 - `POST /v1/nodes/:id/browser-grants`.
 - `normalizeDevicePlatform` accepts `web`.
-- Host env: `DEVICE_LOGIN_URL`, `BROWSER_GRANT_SECRET`, gateway URL
-  used in grant responses.
+- Host env: `DEVICE_LOGIN_URL`, `BROWSER_GRANT_PRIVATE_KEY` (Ed25519
+  PKCS8 or raw 32-byte, host-only), `BROWSER_GRANT_PUBLIC_KEY` (the
+  32-byte public half, also written into `enroll.json`), gateway URL
+  used in grant responses. There is no `BROWSER_GRANT_SECRET`.
 
 ### 10.2 `product/web` (new)
 
@@ -364,12 +459,17 @@ host, same pattern as existing control-plane secrets.
 
 ### 10.7 `product/relayd`
 
-- Accept a cloud-signed browser grant on the activity read routes the
-  gateway proxies (`jobs`, `threads`, `events`). Phone mTLS is unchanged.
-- Learn the grant verify key through the existing enroll/config channel.
-  Do not accept Better Auth cookies on the node.
+- Extend `authorize()`'s **first** branch (the `deviceTokenHash()`
+  bearer path) with the JWT-vs-device-token precedence in §3.3. Do not
+  add a third top-level branch that trial traffic never reaches.
+- Verify grants with the enroll-delivered Ed25519 **public** key only.
+  Never ship or store the cloud private key on a node.
+- Scope-check activity routes (`jobs`, `threads`, `events`). Other
+  routes stay device-token or mTLS.
+- Do not accept Better Auth cookies on the node.
 - Job engine, workspaces, handoff import, and harness adapters are
-  otherwise untouched.
+  otherwise untouched. BYO mTLS is unchanged. Trial phone auth stays
+  the existing opaque device token.
 
 ### 10.8 Untouched
 
@@ -388,10 +488,13 @@ destroy recovery.
   code in the URL hash fragment only.
 - Cookies: `Secure`; `SameSite=None` only because the SPA and API are
   different origins; `trustedOrigins` is an allowlist, not `*`.
-- `BROWSER_GRANT_SECRET` is host-only, ≥32 bytes, distinct from
-  `BETTER_AUTH_SECRET` / `SESSION_SECRET`.
-- No new node route accepts a browser cookie. The node verifies a grant
-  or continues to require mTLS for the phone.
+- `BROWSER_GRANT_PRIVATE_KEY` is host-only, Ed25519, distinct from
+  `BETTER_AUTH_SECRET` / `SESSION_SECRET`. Nodes receive only
+  `grantPublicKey`. An HMAC grant secret is a spec violation.
+- No new node route accepts a browser cookie. Trial phones keep the
+  opaque device token. BYO phones keep mTLS. The gateway and the node
+  both verify the grant JWT.
+- Grants are unrevocable until `exp` (§7). Accepted.
 
 ## 12. Non-goals
 
@@ -407,3 +510,5 @@ destroy recovery.
 - Deploying the SPA via `ops/deploy-poc` or into CodeCommit `relay-cloud`.
 - PostgreSQL cutover.
 - iOS UI rewrite for `client: "web"` confirm copy.
+- HMAC / shared `BROWSER_GRANT_SECRET`.
+- Grant `jti` denylist or session-tied revocation.
