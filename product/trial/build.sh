@@ -105,16 +105,42 @@ echo "==> templateID=${template_id} jobID=${job_id}"
 # fail every sandbox create, so wait rather than reporting a premature success.
 echo "==> waiting for template to become READY"
 deadline=$(( $(date +%s) + 1800 ))
+last_body=""
+waited=0
 while :; do
-  # The response is a single line carrying MANY "status" keys — per-replica
-  # status, compat_status, artifact_status, template_status. A greedy
-  # `sed 's/.*"status"...'` matches the LAST of them and misreports the
-  # template as FAILED while it is in fact READY (observed). The top-level
-  # status is the first occurrence, so match non-greedily and take head -1.
-  status=$(curl -sS "${CUBE_API_URL}/templates/${template_id}" "${auth_args[@]}" \
+  # Every stage here tolerates failure on purpose, because this script runs
+  # under `set -euo pipefail` and this loop used to abort the whole build
+  # SILENTLY on its very first pass.
+  #
+  # Right after POST /templates returns 202, GET /templates/<id> does not yet
+  # carry a top-level "status". grep found no match, exited 1, pipefail
+  # promoted that to the pipeline's status, and `set -e` killed the script —
+  # printing neither the FAILED message below nor the timeout message, so the
+  # output ended at the echo above and looked exactly like a real failure.
+  # Three good builds in a row were reported as failures that way (templates
+  # tpl-97cdddf6…, tpl-b5b8e74c… and one before them), each of which reached
+  # READY a minute or two later. A false negative that is indistinguishable
+  # from a true one is worse than no check at all: it trains you to ignore it,
+  # and then a genuinely broken build sails through.
+  #
+  # "not yet readable" and "the build failed" are different answers. Only an
+  # explicit top-level FAILED/ERROR is fatal now; everything else retries
+  # until the deadline.
+  last_body=$(curl -sS "${CUBE_API_URL}/templates/${template_id}" "${auth_args[@]}" 2>/dev/null || true)
+
+  # The body is one line carrying MANY "status" keys — per-replica status,
+  # compat_status, artifact_status. The top-level one is the first occurrence.
+  # `sed -n '1s//p'` takes it while still consuming the whole stream, so the
+  # producer is never signalled; `|| true` keeps a no-match non-fatal.
+  #
+  # Reading ONLY the top level matters: a replica can sit at FAILED while the
+  # template is still converging and then go READY. That has been observed on
+  # every build here, so treating any "status":"FAILED" as fatal would fail
+  # every build.
+  status=$(printf '%s' "${last_body}" \
     | grep -o '"status"[[:space:]]*:[[:space:]]*"[^"]*"' \
-    | head -1 \
-    | sed 's/.*"\([^"]*\)"$/\1/')
+    | sed -n '1s/.*"\([^"]*\)"$/\1/p' || true)
+
   case "${status}" in
     READY)
       echo "template ${template_id} is READY"
@@ -123,12 +149,23 @@ while :; do
       ;;
     FAILED|ERROR)
       echo "template ${template_id} build FAILED (status=${status})" >&2
+      echo "last response: ${last_body}" >&2
       exit 1
       ;;
   esac
+
   if [ "$(date +%s)" -ge "${deadline}" ]; then
-    echo "timed out after 30m waiting for template ${template_id} (last status: ${status:-unknown})" >&2
+    echo "timed out after 30m waiting for template ${template_id} (last status: ${status:-unreadable})" >&2
+    echo "last response: ${last_body}" >&2
     exit 1
+  fi
+
+  # A silent wait is indistinguishable from a hang. One line a minute, naming
+  # what was actually read, so an unreadable status is visible rather than
+  # looking like PENDING.
+  waited=$(( waited + 10 ))
+  if [ $(( waited % 60 )) -eq 0 ]; then
+    echo "    ... ${waited}s, status=${status:-unreadable}"
   fi
   sleep 10
 done
