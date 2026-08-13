@@ -14,6 +14,9 @@ Group=relaygateway
 UMask=0077
 WorkingDirectory=/opt/relay-grant-gateway/current
 EnvironmentFile=/etc/relay-grant-gateway/env
+# RELAY_WEB_ORIGINS is a comma-separated exact-origin CORS allowlist
+# (same name as relay-cloud). Required for browser Authorization: Bearer
+# GETs from the SPA origin. Never "*".
 Environment=NODE_ENV=production
 Environment=HOST=127.0.0.1
 Environment=PORT=8791

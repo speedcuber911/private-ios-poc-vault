@@ -1,6 +1,11 @@
 // Grant gateway: verify an Ed25519 browser-grant JWT and reverse-proxy only
 // GET /activity/{jobs,threads,events} to the node's real list paths.
 //
+// Browser CORS: RELAY_WEB_ORIGINS is a comma-separated exact-origin allowlist
+// (same name as relay-cloud). OPTIONS on those activity paths returns 204 so
+// Authorization: Bearer GETs from the app origin can preflight. A
+// non-allowlisted Origin gets no Access-Control-Allow-Origin. Never "*".
+//
 // JWT verify helpers below are a local copy of the cloud jwt.js shape
 // (decode + totality: never throw). Canonical copy: product/cloud/src/jwt.js.
 // jwt.js does not yet export verifyEd25519 on this branch; this file implements
@@ -114,8 +119,33 @@ function resolveNodeOrigin(nodeId, { nodeProxyTarget, nodeBaseUrl, tunnelSuffix 
   return null;
 }
 
-function send(res, status) {
-  res.writeHead(status, { "content-type": "application/json" });
+function parseWebOrigins(value) {
+  if (Array.isArray(value)) {
+    return value.filter((origin) => typeof origin === "string" && origin.length > 0);
+  }
+  return String(value || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function originOf(req) {
+  const value = req.headers.origin;
+  return typeof value === "string" ? value : "";
+}
+
+function corsHeaders(req, origins) {
+  const origin = originOf(req);
+  if (!origin || !origins.includes(origin)) return {};
+  return {
+    "access-control-allow-origin": origin,
+    "access-control-allow-credentials": "true",
+    vary: "Origin",
+  };
+}
+
+function send(res, status, cors = {}) {
+  res.writeHead(status, { "content-type": "application/json", ...cors });
   res.end(status === 401 ? '{"error":"unauthorized"}' : '{"error":"forbidden"}');
 }
 
@@ -127,7 +157,7 @@ function logSafe(log, event) {
   }
 }
 
-function proxyGet(target, authorization, res, logEvent) {
+function proxyGet(target, authorization, res, logEvent, cors = {}) {
   const url = new URL(target);
   const request = url.protocol === "https:" ? httpsRequest : httpRequest;
   const upstream = request(
@@ -144,7 +174,7 @@ function proxyGet(target, authorization, res, logEvent) {
     },
     (upRes) => {
       logEvent(upRes.statusCode);
-      const headers = {};
+      const headers = { ...cors };
       if (upRes.headers["content-type"]) headers["content-type"] = upRes.headers["content-type"];
       if (upRes.headers["cache-control"]) headers["cache-control"] = upRes.headers["cache-control"];
       res.writeHead(upRes.statusCode, headers);
@@ -154,7 +184,7 @@ function proxyGet(target, authorization, res, logEvent) {
   upstream.on("error", () => {
     logEvent(502);
     if (!res.headersSent) {
-      res.writeHead(502, { "content-type": "application/json" });
+      res.writeHead(502, { "content-type": "application/json", ...cors });
       res.end('{"error":"bad_gateway"}');
     } else {
       res.destroy();
@@ -171,15 +201,36 @@ export function createGateway(options = {}) {
   const nodeProxyTarget = options.nodeProxyTarget ?? process.env.NODE_PROXY_TARGET;
   const nodeBaseUrl = options.nodeBaseUrl ?? process.env.NODE_BASE_URL;
   const tunnelSuffix = options.tunnelSuffix ?? process.env.TUNNEL_SUFFIX;
+  // Exact-origin allowlist for browser preflight. Same env name as cloud.
+  const webOrigins = parseWebOrigins(options.webOrigins ?? process.env.RELAY_WEB_ORIGINS);
   const log = options.log ?? createLogger();
   const now = options.now ?? Date.now;
 
   return createServer((req, res) => {
     const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
-    const mapped = req.method === "GET" ? ALLOW[url.pathname] : undefined;
-    if (!mapped) {
+    const mapped = ALLOW[url.pathname];
+    const cors = corsHeaders(req, webOrigins);
+
+    if (req.method === "OPTIONS") {
+      if (!mapped) {
+        logSafe(log, { method: req.method, path: url.pathname, status: 403 });
+        send(res, 403, cors);
+        return;
+      }
+      logSafe(log, { method: req.method, path: url.pathname, status: 204 });
+      res.writeHead(204, {
+        ...cors,
+        "access-control-allow-methods": "GET, OPTIONS",
+        "access-control-allow-headers": "authorization, content-type, accept",
+        "access-control-max-age": "600",
+      });
+      res.end();
+      return;
+    }
+
+    if (req.method !== "GET" || !mapped) {
       logSafe(log, { method: req.method, path: url.pathname, status: 403 });
-      send(res, 403);
+      send(res, 403, cors);
       return;
     }
 
@@ -187,26 +238,26 @@ export function createGateway(options = {}) {
     const payload = verifyEd25519(token, grantPublicKey, now());
     if (!payload) {
       logSafe(log, { method: req.method, path: url.pathname, status: 401 });
-      send(res, 401);
+      send(res, 401, cors);
       return;
     }
     if (typeof payload.node !== "string" || payload.node.length === 0) {
       logSafe(log, { method: req.method, path: url.pathname, status: 403 });
-      send(res, 403);
+      send(res, 403, cors);
       return;
     }
 
     const origin = resolveNodeOrigin(payload.node, { nodeProxyTarget, nodeBaseUrl, tunnelSuffix });
     if (!origin) {
       logSafe(log, { method: req.method, path: url.pathname, status: 403, node: payload.node });
-      send(res, 403);
+      send(res, 403, cors);
       return;
     }
 
     const target = `${origin}${mapped}${url.search}`;
     proxyGet(target, `Bearer ${token}`, res, (status) => {
       logSafe(log, { method: "GET", path: url.pathname, status, node: payload.node });
-    });
+    }, cors);
   });
 }
 
