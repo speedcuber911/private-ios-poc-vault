@@ -9,10 +9,11 @@ import {
   useTransform,
   type MotionValue,
 } from 'framer-motion';
-import { ArrowDown, ArrowUpRight, Check, RotateCcw } from 'lucide-react';
+import { ArrowDown, ArrowUpRight, Check, Copy, RotateCcw } from 'lucide-react';
 import TextPressure from './components/reactbits/TextPressure';
 
 const ease = [0.16, 1, 0.3, 1] as const;
+const installCommand = "curl --proto '=https' --tlsv1.2 -fsSL https://get.openrelay.sh/install.sh | sh";
 
 const capabilities = [
   {
@@ -300,6 +301,7 @@ function CapabilityIndex() {
 }
 
 export default function App() {
+  const [installCopied, setInstallCopied] = useState(false);
   const reducedMotion = Boolean(useReducedMotion());
   const { scrollYProgress } = useScroll();
   const pageProgress = useSpring(scrollYProgress, { stiffness: 130, damping: 30, mass: 0.25 });
@@ -308,6 +310,24 @@ export default function App() {
   const heroScale = useTransform(heroProgress, [0, 1], [1, reducedMotion ? 1 : 0.96]);
   const heroOpacity = useTransform(heroProgress, [0, 0.86], [1, 0]);
   const heroY = useTransform(heroProgress, [0, 1], ['0%', reducedMotion ? '0%' : '8%']);
+
+  const copyInstallCommand = async () => {
+    try {
+      await navigator.clipboard.writeText(installCommand);
+    } catch {
+      const textArea = document.createElement('textarea');
+      textArea.value = installCommand;
+      textArea.style.position = 'fixed';
+      textArea.style.opacity = '0';
+      document.body.appendChild(textArea);
+      textArea.select();
+      document.execCommand('copy');
+      textArea.remove();
+    }
+
+    setInstallCopied(true);
+    window.setTimeout(() => setInstallCopied(false), 1800);
+  };
 
   return (
     <div className="site" id="top">
@@ -330,6 +350,14 @@ export default function App() {
             <div className="hero-label hero-label-left">YOUR MACHINE</div>
             <div className="hero-label hero-label-right">YOUR IPHONE</div>
             <TextPressure text="RELAY" className="hero-pressure" minFontSize={64} maxFontSize={220} />
+            <div className="hero-install" role="group" aria-label="Install the Relay CLI">
+              <span className="hero-install-label">Install CLI</span>
+              <code><i aria-hidden="true">$</i><span>{installCommand}</span></code>
+              <button type="button" onClick={copyInstallCommand} aria-label={installCopied ? 'Install command copied' : 'Copy install command'}>
+                {installCopied ? <Check size={16} /> : <Copy size={16} />}
+                <span aria-live="polite">{installCopied ? 'Copied' : 'Copy'}</span>
+              </button>
+            </div>
             <div className="hero-copy">
               <h2>Start it at your desk.<br /><em>Carry it anywhere.</em></h2>
               <p>Launch, watch, and continue agent work from your iPhone while the machine with your files does the execution.</p>
