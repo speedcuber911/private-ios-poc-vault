@@ -362,6 +362,10 @@ export function createNotify({
             payload,
             collapseId,
             banner,
+            // Per device, not per fanout: one account can hold a TestFlight
+            // token and a development-build token at once, and each is only
+            // valid against its own APNs host.
+            apnsEnvironment: device.apnsEnvironment,
           });
           record(device, result, bump);
         } catch (err) {

@@ -152,6 +152,24 @@ export function createApnsClient({ config, transport, now = () => Date.now() }) 
     return cachedToken;
   }
 
+  // The APNs host a given device's token is valid against.
+  //
+  // A token only works against the environment of the build that minted it: a
+  // TestFlight/App Store token against api.push.apple.com, a development
+  // build's against api.sandbox.push.apple.com. Sent to the wrong one Apple
+  // answers `400 BadDeviceToken`, which looks exactly like a dead token.
+  //
+  // With one global host, an account could not hold both kinds — and on
+  // 2026-08-13 that cost the owner every token they had, because BadDeviceToken
+  // was being treated as "the app is gone". `host` remains the configured
+  // default and is what an unknown environment still uses, so a device that
+  // never reported one behaves exactly as before.
+  function hostFor(apnsEnvironment) {
+    if (apnsEnvironment === "production") return "api.push.apple.com";
+    if (apnsEnvironment === "development") return "api.sandbox.push.apple.com";
+    return host;
+  }
+
   // Read per call, not at construction: the deadline is operational tuning,
   // not identity, and tests need to shorten it without rebuilding the app.
   function timeoutMs() {
@@ -166,7 +184,7 @@ export function createApnsClient({ config, transport, now = () => Date.now() }) 
   //   is the single place that decides what a user reads and what therefore
   //   becomes visible to Apple. Ignored for silent pushes.
   // Resolves to {outcome, status, reason} — see APNS_OUTCOME. Never rejects.
-  async function send({ deviceToken, kind, category, payload, collapseId, banner }) {
+  async function send({ deviceToken, kind, category, payload, collapseId, banner, apnsEnvironment }) {
     // BEFORE any JWT work, and the reason is the header block below: it
     // interpolates providerToken() while building `headers`, which happens
     // outside the try/catch that guards the transport. With no signing key,
@@ -223,7 +241,7 @@ export function createApnsClient({ config, transport, now = () => Date.now() }) 
     let response;
     try {
       const attempt = transport({
-        host,
+        host: hostFor(apnsEnvironment),
         path: `/3/device/${deviceToken}`,
         headers,
         body,

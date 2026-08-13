@@ -232,6 +232,27 @@ function ensureDeviceCodeMachineColumns(db) {
   if (!names.has("platform")) db.exec("ALTER TABLE device_codes ADD COLUMN platform TEXT");
 }
 
+// Which APNs environment a device's token was minted for.
+//
+// A token is only valid against the environment of the build that produced it:
+// a TestFlight/App Store token works against api.push.apple.com and a
+// development build's token against api.sandbox.push.apple.com. Sent to the
+// wrong one, Apple answers `400 BadDeviceToken`, indistinguishable from a dead
+// token. With a single global APNS_HOST, one account cannot hold both kinds —
+// and on 2026-08-13 that silently deleted every token on the owner's account,
+// because BadDeviceToken was being treated as "the app is gone".
+//
+// Recorded per device so each push goes to the host that token belongs to.
+// NULL means "the app did not say", which is every row written before this
+// column existed; those fall back to the configured default host.
+function ensureDeviceApnsEnvironmentColumn(db) {
+  const columns = db.prepare("PRAGMA table_info(devices)").all();
+  if (columns.length === 0) return;
+  if (!columns.some((column) => column.name === "apns_environment")) {
+    db.exec("ALTER TABLE devices ADD COLUMN apns_environment TEXT");
+  }
+}
+
 export function createRegistry(db, { now = () => Date.now() } = {}) {
   ensureCliComputerSchema(db);
   ensureAuthSchema(db, now);
@@ -240,6 +261,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
   ensureHandoffLeaseColumns(db);
   ensureDeviceCodeClientIpColumn(db);
   ensureDeviceCodeMachineColumns(db);
+  ensureDeviceApnsEnvironmentColumn(db);
 
   // ── accounts ────────────────────────────────────────────────────────────
   function createAccount({ id = randomUUID(), appleSub = null, email = null }) {
@@ -402,12 +424,12 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
   }
 
   // ── devices ─────────────────────────────────────────────────────────────
-  function createDevice(accountId, { apnsToken, platform, name, certSerials }) {
+  function createDevice(accountId, { apnsToken, platform, name, certSerials, apnsEnvironment }) {
     const id = randomUUID();
     const t = now();
     db.prepare(
-      `INSERT INTO devices (id, account_id, apns_token, platform, name, cert_serials, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO devices (id, account_id, apns_token, platform, name, cert_serials, apns_environment, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       id,
       accountId,
@@ -415,6 +437,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       platform ?? null,
       name ?? null,
       JSON.stringify(certSerials ?? []),
+      apnsEnvironment ?? null,
       t,
       t,
     );
@@ -430,15 +453,18 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       name: patch.name !== undefined ? patch.name : current.name,
       certSerials:
         patch.certSerials !== undefined ? patch.certSerials : current.certSerials,
+      apnsEnvironment:
+        patch.apnsEnvironment !== undefined ? patch.apnsEnvironment : current.apnsEnvironment,
     };
     db.prepare(
-      `UPDATE devices SET apns_token = ?, platform = ?, name = ?, cert_serials = ?, updated_at = ?
+      `UPDATE devices SET apns_token = ?, platform = ?, name = ?, cert_serials = ?, apns_environment = ?, updated_at = ?
        WHERE id = ? AND account_id = ?`,
     ).run(
       next.apnsToken ?? null,
       next.platform ?? null,
       next.name ?? null,
       JSON.stringify(next.certSerials ?? []),
+      next.apnsEnvironment ?? null,
       now(),
       id,
       accountId,
@@ -1589,6 +1615,7 @@ function mapDevice(row) {
     apnsToken: row.apns_token,
     platform: row.platform,
     name: row.name,
+    apnsEnvironment: row.apns_environment ?? null,
     certSerials,
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
