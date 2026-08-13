@@ -345,7 +345,28 @@ export function createNotify({
       { length: Math.min(FANOUT_CONCURRENCY, devices.length) },
       worker,
     );
+    const before = { ...stats };
     await Promise.all(workers);
+
+    // One summary line per fanout, and NOT through alert(): alert() is
+    // rate-limited per key, so a fanout where every device failed logs the same
+    // single line as one where a single stale token failed. That is exactly how
+    // this went undiagnosable in production — the log showed one "apns
+    // transport error" for a 27-device fanout and nothing said whether the
+    // other 26 arrived, because the stats counters were never printed anywhere.
+    //
+    // Counts are deltas for THIS fanout (stats is cumulative), and carry no
+    // device ids or tokens — the outcome mix is the diagnostic.
+    const delta = {};
+    for (const key of Object.keys(stats)) {
+      const moved = stats[key] - (before[key] ?? 0);
+      if (moved > 0) delta[key] = moved;
+    }
+    const summary = Object.entries(delta)
+      .filter(([key]) => key !== "queued")
+      .map(([key, count]) => `${key}=${count}`)
+      .join(" ");
+    log(`apns fanout: devices=${devices.length} ${summary || "no outcomes recorded"}`);
   }
 
   function record(device, result) {

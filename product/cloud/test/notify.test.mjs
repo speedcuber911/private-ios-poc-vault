@@ -734,3 +734,61 @@ test("pushes carry ids and event types only — never prompts, paths or names", 
     await t.close();
   }
 });
+
+// A fanout must say what it did, per fanout, in one line.
+//
+// Diagnosing a real "no notification arrived" report, the entire server-side
+// record of a 27-device fanout was ONE line:
+//
+//   apns transport error: The pending stream has been canceled
+//
+// and that was consistent with 1 failure or with 27. alert() is rate-limited
+// per key, so repeated failures collapse to a single line, and the stats
+// counters — delivered, unregistered, error — were never printed anywhere at
+// all. There was no way to tell a working fanout from a totally broken one.
+test("every fanout logs a per-fanout outcome summary", async () => {
+  const t = await startTestApp();
+  const warn = captureWarnings();
+  try {
+    const { identity, nodeId } = await setupNodeWithDevices(t, ["tok-a", "tok-b"]);
+    const res = await post(t, identity, eventBody(t, nodeId, { type: "handoff.ready", seq: 1 }));
+    assert.equal(res.status, 202);
+    await t.app.notify.drain();
+
+    const summary = warn.lines.find((line) => line.startsWith("apns fanout:"));
+    assert.ok(summary, `no fanout summary was logged; saw: ${JSON.stringify(warn.lines)}`);
+    assert.match(summary, /devices=2/);
+    assert.match(summary, /delivered=2/, "a successful fanout must state how many arrived");
+  } finally {
+    warn.restore();
+    await t.close();
+  }
+});
+
+// The case that was invisible: the summary must distinguish partial failure
+// from success, even though alert() has already collapsed the error lines.
+test("the summary separates delivered from failed when both happen", async () => {
+  // First device 200, every later one a transport error.
+  let n = 0;
+  const transport = async () => {
+    n += 1;
+    if (n === 1) return { status: 200, headers: {}, body: "" };
+    throw new Error("The pending stream has been canceled");
+  };
+  const t = await startTestApp({ apnsTransport: transport });
+  const warn = captureWarnings();
+  try {
+    const { identity, nodeId } = await setupNodeWithDevices(t, ["tok-a", "tok-b", "tok-c"]);
+    await post(t, identity, eventBody(t, nodeId, { type: "handoff.ready", seq: 1 }));
+    await t.app.notify.drain();
+
+    const summary = warn.lines.find((line) => line.startsWith("apns fanout:"));
+    assert.ok(summary, "a summary must be logged even when sends fail");
+    assert.match(summary, /devices=3/);
+    assert.match(summary, /delivered=1/);
+    assert.match(summary, /error=2/, "the failures must be counted, not just alerted once");
+  } finally {
+    warn.restore();
+    await t.close();
+  }
+});
