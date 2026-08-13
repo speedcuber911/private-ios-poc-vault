@@ -77,6 +77,26 @@ test("OPTIONS preflight for a non-allowlisted origin has no ACAO", async () => {
   }
 });
 
+test("POST /api/auth/sign-up/email from the app origin echoes ACAO", async () => {
+  const t = await startTestApp({ env: corsEnv() });
+  try {
+    const res = await api(t.baseUrl, "POST", "/api/auth/sign-up/email", {
+      headers: { origin: APP },
+      body: {
+        email: "cors-signup@example.com",
+        name: "Cors Signup",
+        username: "cors_signup",
+        password: "correct-horse-battery",
+      },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("access-control-allow-origin"), APP);
+    assert.equal(res.headers.get("access-control-allow-credentials"), "true");
+  } finally {
+    await t.close();
+  }
+});
+
 test("credentialed JSON POST from the app origin includes CORS on the response", async () => {
   const t = await startTestApp({ env: corsEnv() });
   try {
