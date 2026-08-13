@@ -6,7 +6,7 @@ import crypto from "node:crypto";
 import os from "node:os";
 
 import { createCloudApi, DEFAULT_BASE_URL } from "../cloud.mjs";
-import { writeCredentials } from "../creds.mjs";
+import { readCredentials, writeCredentials } from "../creds.mjs";
 import { noopProgress } from "../progress.mjs";
 import { renderQrAnsi, qrAnsiWidth } from "../qr.mjs";
 
@@ -125,12 +125,51 @@ async function cmdLogin(args = [], deps = {}) {
     progress.stop();
   }
 
+  // A login REPLACES the identity on this machine; it must never merge into
+  // the previous one. writeCredentials merges by design, so the pinned machine
+  // has to be cleared explicitly right here — passing null drops the field.
+  //
+  // Without this, approving a code with a DIFFERENT account left that account's
+  // session sitting next to the previous account's `nodeId`/`nodeEncPubkey`,
+  // because the only thing that overwrote the pin was the trial lookup below —
+  // and that returns early when the new account has no machine. Two accounts,
+  // one credentials file. Concretely, that mismatch meant:
+  //
+  //   - `relay handoff` sealed the session blob to the OTHER account's node
+  //     public key and pushed it to GitHub before the cloud rejected the row
+  //     as `unknown_node`. Content encrypted to someone else's key, published.
+  //   - `relay sync-auth` sent THIS machine's GitHub and harness logins to
+  //     whatever sandbox was pinned — the wrong account's sandbox.
+  //
+  // Clearing unconditionally (not just when the account changes) is deliberate:
+  // the pin is derived from the account's current trial, so a stale pin is
+  // wrong even on a repeat login to the same account whose machine has since
+  // been destroyed.
+  const previous = readCredentials({ home });
+  const switchedAccount = Boolean(previous?.accountId)
+    && previous.accountId !== session.accountId;
+
   writeCredentials({
     sessionToken: session.sessionToken,
     refreshToken: session.refreshToken,
     accountId: session.accountId,
+    nodeId: null,
+    nodeEncPubkey: null,
   }, { home });
-  log("  Signed in.");
+
+  if (switchedAccount) {
+    // Loud, because this is the shape of an accidental account takeover: the
+    // QR is on screen, someone else scans it, and this machine is now theirs.
+    // The unpin above already stops a handoff or a credential sync going to
+    // the wrong sandbox, but the operator still needs to know it happened.
+    log("  Signed in — but as a DIFFERENT account than this machine used before.");
+    log("  The previously pinned machine has been unpinned.");
+    log("  If you did not intend this, run relay login again and approve it yourself:");
+    log("  `relay sync-auth` would send this machine's GitHub and harness logins");
+    log("  to the newly signed-in account's sandbox.");
+  } else {
+    log("  Signed in.");
+  }
 
   const authed = createCloudApi({
     baseUrl,
