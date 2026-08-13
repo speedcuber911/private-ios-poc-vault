@@ -1,5 +1,7 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { cloud } from "../api/cloud.js";
+import { device as defaultDevice, qrPayloadFromStart } from "../api/device.js";
+import { drawQrToCanvas } from "../api/qr.js";
 
 type Mode = "signIn" | "createAccount";
 type Panel = "credentials" | "iphone";
@@ -27,7 +29,7 @@ function credentialsAreValid(mode: Mode, username: string, email: string, passwo
   return validUsername && validPassword;
 }
 
-function RelayMark() {
+export function RelayMark() {
   return (
     <svg className="brand-mark" viewBox="0 0 34 34" aria-hidden="true">
       <defs>
@@ -86,6 +88,97 @@ function UnderlineField({
   );
 }
 
+function QrMark({ payload }: { payload: string }) {
+  const ref = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    if (!ref.current || !payload) return;
+    drawQrToCanvas(ref.current, payload, { modulePx: 5 });
+  }, [payload]);
+  return <canvas ref={ref} className="qr-canvas" role="img" aria-label="Sign-in QR code" />;
+}
+
+function IphonePanel({
+  onBack,
+  onSignedIn,
+}: {
+  onBack: () => void;
+  onSignedIn: () => void;
+}) {
+  const deviceApi = defaultDevice;
+  const [userCode, setUserCode] = useState<string | null>(null);
+  const [payload, setPayload] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const onSignedInRef = useRef(onSignedIn);
+  onSignedInRef.current = onSignedIn;
+
+  useEffect(() => {
+    const ac = new AbortController();
+    (async () => {
+      try {
+        const started = await deviceApi.startWebLogin();
+        if (ac.signal.aborted) return;
+        if (!started.ok) {
+          setError("Relay could not start phone sign-in.");
+          return;
+        }
+        setUserCode(started.json?.userCode ?? null);
+        setPayload(qrPayloadFromStart(started.json));
+        const granted = await deviceApi.pollWebLogin(started.json.deviceCode, {
+          interval: started.json.interval,
+          expiresIn: started.json.expiresIn,
+          signal: ac.signal,
+        });
+        if (ac.signal.aborted) return;
+        if (granted.status === 200) {
+          onSignedInRef.current();
+          return;
+        }
+        if (granted.json?.error === "aborted") return;
+        if (granted.json?.error === "expired_token") {
+          setError("That code isn't valid anymore.");
+          return;
+        }
+        setError("Relay could not complete that request.");
+      } catch {
+        if (!ac.signal.aborted) setError("Can't reach the Relay control plane.");
+      }
+    })();
+    return () => ac.abort();
+  }, [deviceApi]);
+
+  return (
+    <div className="auth">
+      <div className="brand">
+        <RelayMark />
+        <div>
+          <h1 className="wordmark">Relay</h1>
+          <p className="tagline">Your agents, within reach.</p>
+        </div>
+      </div>
+      <section className="iphone-panel" aria-label="Sign in with iPhone">
+        <h2>Sign in with iPhone</h2>
+        <p>Scan this code on the signed-in Relay app.</p>
+        <div className="qr-slot" aria-hidden={!payload}>
+          {payload ? <QrMark payload={payload} /> : null}
+        </div>
+        <p className="user-code" data-testid="relay-user-code">
+          {userCode || "———— ————"}
+        </p>
+        {error ? (
+          <p className="error" role="alert">
+            {error}
+          </p>
+        ) : null}
+      </section>
+      <div className="actions">
+        <button type="button" className="btn-text" onClick={onBack}>
+          Use username instead
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function Login({
   onSignedIn,
   onSignedUp,
@@ -135,26 +228,7 @@ export function Login({
 
   if (panel === "iphone") {
     return (
-      <div className="auth">
-        <div className="brand">
-          <RelayMark />
-          <div>
-            <h1 className="wordmark">Relay</h1>
-            <p className="tagline">Your agents, within reach.</p>
-          </div>
-        </div>
-        <section className="iphone-panel" aria-label="Sign in with iPhone">
-          <h2>Sign in with iPhone</h2>
-          <p>Scan this code on the signed-in Relay app.</p>
-          <div className="qr-slot" aria-hidden="true" />
-          <p className="user-code">———— ————</p>
-        </section>
-        <div className="actions">
-          <button type="button" className="btn-text" onClick={() => setPanel("credentials")}>
-            Use username instead
-          </button>
-        </div>
-      </div>
+      <IphonePanel onBack={() => setPanel("credentials")} onSignedIn={onSignedIn} />
     );
   }
 

@@ -1,4 +1,6 @@
 import { useEffect, useState } from "react";
+import { parseUserCodeFromHash } from "./api/device.js";
+import { CliLogin } from "./pages/CliLogin";
 import { Login } from "./pages/Login";
 
 function currentPath() {
@@ -38,11 +40,21 @@ export default function App() {
 
   let screen = (
     <Login
-      onSignedIn={() => navigate("/machines")}
+      onSignedIn={() => {
+        if (parseUserCodeFromHash(window.location.hash)) navigate("/cli-login");
+        else navigate("/machines");
+      }}
       onSignedUp={() => navigate("/provisioning")}
     />
   );
-  if (route === "/provisioning") {
+  if (route === "/cli-login") {
+    screen = (
+      <CliLogin
+        onApproved={() => navigate("/machines")}
+        onSignedUp={() => navigate("/provisioning")}
+      />
+    );
+  } else if (route === "/provisioning") {
     screen = <Stub title="Your machine" status="Creating" />;
   } else if (route === "/machines") {
     screen = <Stub title="Machines" status="No machines yet" />;
