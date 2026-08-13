@@ -211,9 +211,17 @@ The user code rides in the URL hash so it never hits access logs.
 
 Web token redemption (`POST /v1/auth/device/token` with `client: "web"`)
 sets a Better Auth cookie (`SameSite=None`; `Secure` only when
-`BETTER_AUTH_URL` is https). `RELAY_WEB_ORIGINS` (comma-separated) is
-appended to Better Auth `trustedOrigins` so the browser origin can send
-that cookie.
+`BETTER_AUTH_URL` is https). `RELAY_WEB_ORIGINS` (comma-separated exact
+origins) is appended to Better Auth `trustedOrigins` and is the CORS
+allowlist for credentialed JSON (`Access-Control-Allow-Credentials: true`,
+echoed `Origin`, `Vary: Origin`; never `*`). A non-allowlisted origin gets
+no `Access-Control-Allow-Origin`. Apple-only accounts (no Better Auth user)
+return `400 { "error": "web_session_unavailable" }` and do not consume the
+code.
+
+If `RELAY_WEB_ORIGINS` is set, `main.js` refuses to start unless
+`BETTER_AUTH_URL` is https — SameSite=None cookies are otherwise unusable
+from the app origin.
 
 ### Browser activity grants
 
@@ -239,7 +247,9 @@ or an identical 404 for unknown and cross-account ids. Claims: `sub`,
 The grant gateway (`product/grant-gateway`) listens on `127.0.0.1:8791`.
 TLS and nginx live on the **broker host**, as a sibling
 `gateway.<api-zone>`. Do not terminate on poc-ec2. Do not put the raw
-broker on 80/443.
+broker on 80/443. Set `RELAY_WEB_ORIGINS` on the gateway the same way as
+cloud (comma-separated exact origins) so `OPTIONS /activity/{jobs,threads,events}`
+is 204 with `authorization` allowed; a foreign origin gets no ACAO.
 
 ### Trial sandboxes
 
@@ -428,6 +438,7 @@ CLOUD_DB_PATH=/var/lib/relay-cloud/relay-cloud.sqlite
 SESSION_SECRET=<32+ random bytes>
 BETTER_AUTH_SECRET=<32+ random bytes; may initially match SESSION_SECRET>
 BETTER_AUTH_URL=https://api.<domain>
+RELAY_WEB_ORIGINS=https://<app-origin>
 APPLE_CLIENT_IDS=<app-bundle-id>,<services-id>
 APPLE_CLIENT_SECRET=<Apple ES256 client-secret JWT>
 MAGIC_LINK_BASE_URL=https://<domain>/auth/confirm
@@ -490,10 +501,17 @@ host and never commit them):
 1. Generate an Ed25519 grant keypair on the control-plane host; set
    `BROWSER_GRANT_PRIVATE_KEY` / `BROWSER_GRANT_PUBLIC_KEY`.
 2. Set `DEVICE_LOGIN_URL=https://<app-origin>/cli-login`.
-3. Set `RELAY_WEB_ORIGINS=https://<app-origin>`.
-4. Set `GRANT_GATEWAY_URL=https://gateway.<api-zone>`.
-5. Deploy the gateway unit + nginx on the broker host.
-6. Do not deploy web via CodeCommit `relay-cloud` or `ops/deploy-poc`.
+3. Set `BETTER_AUTH_URL=https://api.<domain>` (https required whenever
+   `RELAY_WEB_ORIGINS` is set; otherwise `main.js` refuses to start).
+4. Set `RELAY_WEB_ORIGINS=https://<app-origin>` on relay-cloud **and** on
+   the grant gateway (`/etc/relay-grant-gateway/env`). Exact-origin CORS
+   allowlist; never `*`.
+5. Set `GRANT_GATEWAY_URL=https://gateway.<api-zone>`.
+6. Deploy the gateway unit + nginx on the broker host.
+7. Host the SPA so unknown paths rewrite to `index.html` (nginx
+   `try_files $uri /index.html;`, or the equivalent on the static host).
+   Without that rewrite, `/cli-login` 404s and `DEVICE_LOGIN_URL` is dead.
+8. Do not deploy web via CodeCommit `relay-cloud` or `ops/deploy-poc`.
 
 ### AWS-native CI/CD
 
