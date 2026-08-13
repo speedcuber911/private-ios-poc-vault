@@ -1,0 +1,290 @@
+/* Editorial Ember — tokens from docs/superpowers/specs/2026-08-11-editorial-ember-design.md */
+
+:root {
+  --canvas-top: #1e1b17;
+  --canvas-bottom: #151310;
+  --ink: #ede8df;
+  --ink-secondary: color-mix(in srgb, var(--ink) 55%, transparent);
+  --ink-tertiary: color-mix(in srgb, var(--ink) 38%, transparent);
+  --ink-faint: color-mix(in srgb, var(--ink) 25%, transparent);
+  --hairline: color-mix(in srgb, var(--ink) 10%, transparent);
+  --hairline-strong: color-mix(in srgb, var(--ink) 16%, transparent);
+  --ember-bright: #e8965c;
+  --ember: #d4804a;
+  --ember-deep: #c96f35;
+  --on-ember: #1c1207;
+  --status-error: #d9776b;
+  --status-warn: #e0b25c;
+  --accent-gradient: linear-gradient(135deg, var(--ember-bright), var(--ember-deep));
+  --ember-shadow: 0 6px 20px color-mix(in srgb, var(--ember-deep) 25%, transparent);
+  --shadow: 0 6px 20px color-mix(in srgb, #000 35%, transparent);
+  --font-serif: "New York", "Iowan Old Style", "Apple Garamond", Palatino, "Palatino Linotype", ui-serif, Georgia, serif;
+  --font-sans: "DM Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "DM Mono", ui-monospace, Menlo, monospace;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+html {
+  color-scheme: dark;
+  background: var(--canvas-bottom);
+}
+
+body {
+  margin: 0;
+  min-height: 100dvh;
+  background: linear-gradient(180deg, var(--canvas-top), var(--canvas-bottom));
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  font-weight: 400;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+a {
+  color: var(--ember);
+}
+
+.canvas {
+  min-height: 100dvh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 26px 108px;
+}
+
+.auth {
+  width: min(100%, 520px);
+}
+
+.brand {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 18px;
+}
+
+.brand-mark {
+  width: 34px;
+  height: 34px;
+  display: block;
+}
+
+.wordmark {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-size: 40px;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  line-height: 1.05;
+  text-wrap: balance;
+}
+
+.tagline {
+  margin: 8px 0 0;
+  font-family: var(--font-serif);
+  font-size: 15px;
+  font-style: italic;
+  font-weight: 400;
+  color: var(--ink-secondary);
+}
+
+.fields {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  margin-top: 44px;
+}
+
+.underline-field {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.underline-field input {
+  width: 100%;
+  padding: 0 0 10px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink);
+  font-size: 16px;
+  caret-color: var(--ember);
+  box-shadow: none;
+  outline: none;
+  appearance: none;
+}
+
+.underline-field input::placeholder {
+  color: var(--ink-tertiary);
+}
+
+.underline {
+  display: block;
+  height: 1px;
+  background: var(--hairline-strong);
+  transition: background-color 180ms cubic-bezier(0.16, 1, 0.3, 1), height 180ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.underline-field:focus-within .underline {
+  height: 2px;
+  background: var(--ember);
+}
+
+.error {
+  margin: 18px 0 0;
+  color: var(--status-error);
+  font-size: 13px;
+}
+
+.actions {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 30px;
+}
+
+.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 50px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--accent-gradient);
+  color: var(--on-ember);
+  font-size: 16px;
+  font-weight: 600;
+  box-shadow: var(--ember-shadow);
+  transition: opacity 150ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.btn-primary:hover:not(:disabled) {
+  opacity: 0.92;
+}
+
+.btn-primary:active:not(:disabled) {
+  opacity: 0.85;
+}
+
+.btn-primary:disabled {
+  background: color-mix(in srgb, var(--ink) 8%, transparent);
+  color: var(--ink-tertiary);
+  box-shadow: none;
+  cursor: default;
+}
+
+.btn-text {
+  align-self: center;
+  margin: 0;
+  padding: 8px 4px;
+  border: 0;
+  background: none;
+  color: var(--ember);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.btn-text:hover {
+  color: var(--ember-bright);
+}
+
+.mode-switch {
+  display: flex;
+  justify-content: center;
+  gap: 6px;
+  margin-top: 22px;
+  font-size: 13px;
+  color: var(--ink-tertiary);
+}
+
+.mode-switch button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ember);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.iphone-panel {
+  margin-top: 44px;
+}
+
+.iphone-panel h2 {
+  margin: 0 0 12px;
+  font-family: var(--font-serif);
+  font-size: 22px;
+  font-weight: 500;
+}
+
+.iphone-panel p {
+  margin: 0;
+  color: var(--ink-secondary);
+  font-size: 14px;
+}
+
+.user-code {
+  margin: 28px 0 0;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 22px;
+  letter-spacing: 0.14em;
+}
+
+.qr-slot {
+  width: 180px;
+  height: 180px;
+  margin: 28px 0 0;
+  border: 1px solid var(--hairline-strong);
+}
+
+.stub {
+  width: min(100%, 520px);
+}
+
+.stub h1 {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-size: 32px;
+  font-weight: 500;
+}
+
+.stub-status {
+  margin: 14px 0 0;
+  color: var(--ink-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .underline,
+  .btn-primary {
+    transition: none;
+  }
+}

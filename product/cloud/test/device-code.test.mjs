@@ -663,6 +663,26 @@ test("mapDeviceCode returns numbers for the integer columns", () => {
   assert.equal(record.consumedAt, null);
 });
 
+test("createDeviceCode persists client=web and defaults omitted client to cli", () => {
+  const dir = mkdtempSync(join(tmpdir(), "relay-dc-"));
+  const db = createDb(join(dir, "t.sqlite"));
+  const registry = createRegistry(db);
+  const web = registry.createDeviceCode({
+    deviceCodeHash: "a".repeat(64),
+    userCode: "ABCD-EFGH",
+    expiresAt: Date.now() + 60_000,
+    client: "web",
+  });
+  assert.equal(web.client, "web");
+  const cli = registry.createDeviceCode({
+    deviceCodeHash: "b".repeat(64),
+    userCode: "IJKL-MNOP",
+    expiresAt: Date.now() + 60_000,
+  });
+  assert.equal(cli.client, "cli");
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("createDb adds CLI link columns to a pre-existing database idempotently", () => {
   const dir = mkdtempSync(join(tmpdir(), "relay-cli-link-migration-"));
   const file = join(dir, "relay.db");

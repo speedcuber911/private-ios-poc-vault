@@ -170,7 +170,8 @@ CREATE TABLE IF NOT EXISTS device_codes (
   -- confirm copy carries the weight. Nullable so older rows and starts that
   -- omit the fields still work.
   machine_name TEXT,
-  platform TEXT
+  platform TEXT,
+  client TEXT NOT NULL DEFAULT 'cli'
 );
 CREATE INDEX IF NOT EXISTS idx_device_codes_expires ON device_codes (expires_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_device_codes_user_code ON device_codes (user_code);
@@ -329,4 +330,5 @@ function migrateCliComputerLinks(db) {
   };
   addColumnIfMissing("refresh_tokens", "cli_link_id", "cli_link_id TEXT");
   addColumnIfMissing("device_codes", "cli_link_id", "cli_link_id TEXT");
+  addColumnIfMissing("device_codes", "client", "client TEXT NOT NULL DEFAULT 'cli'");
 }
