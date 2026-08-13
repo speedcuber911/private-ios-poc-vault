@@ -384,3 +384,103 @@ final class TrialPairingTests: XCTestCase {
         "veVKJWDQFXp5y3QZeXw="
     )!
 }
+
+// MARK: - trial_already_used is three situations, not one
+
+/// Canned-response transport, so the flow can be driven through the exact
+/// server answers a returning user gets without a live control plane.
+final class StubTrialURLProtocol: URLProtocol {
+    /// path -> (status, json). Set per test; read on the URLSession's queue.
+    nonisolated(unsafe) static var routes: [String: (Int, String)] = [:]
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let path = request.url?.path ?? ""
+        let (status, body) = Self.routes[path] ?? (404, "{\"error\":\"not_found\"}")
+        let response = HTTPURLResponse(
+            url: request.url!, statusCode: status, httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private func stubbedTrialClient() -> RelayTrialClient {
+    let config = URLSessionConfiguration.ephemeral
+    config.protocolClasses = [StubTrialURLProtocol.self]
+    return RelayTrialClient(baseURL: URL(string: "https://cloud.test")!, session: URLSession(configuration: config))
+}
+
+private func trialJSON(state: String, sni: String?) -> String {
+    let sniField = sni.map { "\"\($0)\"" } ?? "null"
+    return """
+    {"trial":{"id":"t1","state":"\(state)","nodeId":"node-1","sni":\(sniField),\
+    "createdAt":1000,"expiresAt":9999999999999}}
+    """
+}
+
+/// The bug this covers: `start()` ran straight into `createTrial` on every
+/// entry, so a returning user — reinstall, second device, cleared node store —
+/// dead-ended on "This account's trial was already used". True, and useless:
+/// it says nothing about whether their machine is alive, which is the only
+/// thing they wanted to know.
+@MainActor
+func makeFlow(_ suite: String) -> (RelayTrialFlowModel, RelayNodeStore) {
+    let defaults = UserDefaults(suiteName: suite)!
+    defaults.removePersistentDomain(forName: suite)
+    let nodeStore = RelayNodeStore(defaults: defaults)
+    let flow = RelayTrialFlowModel(
+        client: stubbedTrialClient(),
+        identityStore: ClientIdentityStore(),
+        nodeStore: nodeStore,
+        pollIntervalNs: 1
+    )
+    return (flow, nodeStore)
+}
+
+extension TrialPairingTests {
+    @MainActor
+    func testAlreadyUsedWithALiveMachineExplainsTheMissingCredential() async {
+        StubTrialURLProtocol.routes = [
+            "/v1/pairing/sessions": (201, "{\"pairingId\":\"p1\",\"expiresAt\":9999999999999}"),
+            "/v1/trial-nodes": (409, "{\"error\":\"trial_already_used\"}"),
+            "/v1/trial-nodes/current": (200, trialJSON(state: "ready", sni: "node-1.tun.test")),
+        ]
+        let (flow, nodeStore) = makeFlow("trial-adopt-live")
+
+        await flow.start(bearer: "b", deviceName: "Test")
+
+        guard case .failed(let message) = flow.step else {
+            return XCTFail("expected .failed, got \(flow.step)")
+        }
+        // The machine is up, so the message must be about THIS DEVICE's
+        // credential, not about the trial being spent.
+        XCTAssertTrue(message.contains("still running"), "got: \(message)")
+        XCTAssertTrue(message.contains("credential"), "got: \(message)")
+        XCTAssertNil(nodeStore.trial, "a machine this device cannot authenticate to must not be adopted")
+    }
+
+    @MainActor
+    func testAlreadyUsedWithADestroyedMachineNamesTheState() async {
+        StubTrialURLProtocol.routes = [
+            "/v1/pairing/sessions": (201, "{\"pairingId\":\"p1\",\"expiresAt\":9999999999999}"),
+            "/v1/trial-nodes": (409, "{\"error\":\"trial_already_used\"}"),
+            "/v1/trial-nodes/current": (200, trialJSON(state: "destroyed", sni: nil)),
+        ]
+        let (flow, nodeStore) = makeFlow("trial-adopt-destroyed")
+
+        await flow.start(bearer: "b", deviceName: "Test")
+
+        guard case .failed(let message) = flow.step else {
+            return XCTFail("expected .failed, got \(flow.step)")
+        }
+        XCTAssertTrue(message.contains("destroyed"), "the state the user is actually in must be named: \(message)")
+        XCTAssertNil(nodeStore.trial)
+    }
+}

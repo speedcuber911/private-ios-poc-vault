@@ -67,7 +67,19 @@ final class RelayTrialFlowModel: ObservableObject {
             let pairingId = try await client.createPairingSession(authToken: authToken, bearer: bearer)
 
             step = .creating
-            let created = try await client.createTrial(pairingId: pairingId, pairingSecret: secret, bearer: bearer)
+            let created: RelayTrialNode
+            do {
+                created = try await client.createTrial(pairingId: pairingId, pairingSecret: secret, bearer: bearer)
+            } catch RelayTrialClientError.alreadyUsed {
+                // A returning user, not a rule-breaker. This flow used to run
+                // straight into `createTrial` on every entry and dead-end here
+                // with "This account's trial was already used" — true, useless,
+                // and wrong whenever the machine is still running and this
+                // device can still reach it. Ask what the account actually has
+                // before deciding there is nothing to do.
+                await adoptExistingTrial(bearer: bearer)
+                return
+            }
 
             let deviceBlob = try Self.encodeDeviceBlob(deviceName: deviceName)
             let deviceTag = RelayTrialPairing.blobTag(macKey: macKey, slot: RelayTrialPairing.deviceSlot, blob: deviceBlob)
@@ -109,6 +121,50 @@ final class RelayTrialFlowModel: ObservableObject {
         } catch {
             step = .failed(Self.message(for: error))
         }
+    }
+
+    /// Recovers from `trial_already_used`, which is not one situation but three.
+    ///
+    /// A trial is one per account for the life of the account, so this error is
+    /// permanent — but it says nothing about whether the user has a working
+    /// machine. Re-entering this flow only means THIS DEVICE has no pointer to
+    /// one, which happens on a reinstall, a second device, or after the node
+    /// store is cleared. The machine itself may be alive and reachable.
+    ///
+    /// The one case that cannot be recovered here is a live machine this device
+    /// has no credential for: the pairing rendezvous is put-once and the node
+    /// only ever runs `runTrialPairing` at boot, so there is no way to reissue
+    /// one. Say that plainly instead of implying the user did something wrong.
+    private func adoptExistingTrial(bearer: String) async {
+        let current: RelayTrialNode
+        do {
+            current = try await client.currentTrial(bearer: bearer)
+        } catch {
+            step = .failed(Self.message(for: error))
+            return
+        }
+
+        guard current.state == .ready, let host = current.sni else {
+            step = .failed(
+                "This account's trial machine is \(current.state.rawValue) and a trial can only be created once, "
+                + "so a replacement can't be started here."
+            )
+            return
+        }
+
+        // The common recoverable case: the machine is up and this device still
+        // holds the identity and bearer it was issued during pairing.
+        guard identityStore.hasTrialIssuedIdentity, identityStore.deviceToken(for: host) != nil else {
+            step = .failed(
+                "Your trial machine is still running, but this device no longer has the credential for it. "
+                + "That credential is issued once, during setup, and can't be reissued — so it can only be "
+                + "reached from a device that still has it."
+            )
+            return
+        }
+
+        nodeStore.adoptTrial(current)
+        step = .done
     }
 
     /// Polls `currentTrial` until it reaches `.ready`. Any other terminal state
