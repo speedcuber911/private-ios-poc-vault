@@ -46,13 +46,14 @@ enum RelayTrialPairing {
         message.append(blob)
         let expected = Data(HMAC<SHA256>.authenticationCode(for: message, using: macKey))
         guard expected.count == tagData.count else { return false }
-        return expected.withUnsafeBytes { a in
-            tagData.withUnsafeBytes { b in
-                var diff: UInt8 = 0
-                for i in 0..<expected.count { diff |= a[i] ^ b[i] }
-                return diff == 0
-            }
+        // Constant-time compare without Data.withUnsafeBytes — nested closures
+        // hit "Ambiguous use of 'withUnsafeBytes'" under Swift 6 / SourceKit
+        // (ContiguousBytes vs the deprecated typed-pointer overload).
+        var diff: UInt8 = 0
+        for i in 0..<expected.count {
+            diff |= expected[i] ^ tagData[i]
         }
+        return diff == 0
     }
 
     static func p12Passphrase(secret: String) -> String {
