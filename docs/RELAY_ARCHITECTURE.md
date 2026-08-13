@@ -45,10 +45,47 @@ Two consequences that are easy to get wrong and are enforced in code:
 | trial image | built on the Cube host | Debian + node + Codex/Claude/Cursor CLIs + relayd. `product/trial/` |
 | iOS app (Relay) | phone | mTLS client to the node; control plane only for auth, pairing and push. `ios/POCVault/` |
 
-## AWS — one account, not two
+## AWS — two accounts: compute in one, DNS split across both
 
-Everything Relay is lives in **`507121383669`**, region **`ap-south-1`**
-(the `default` CLI profile).
+The split is **not** prod/staging. It is *machines here, several domains there*,
+and the two cross over — which is easy to get backwards.
+
+| | Account `507121383669` (`default`) | Account `992203938018` (`cut-personal`) |
+|---|---|---|
+| Holds | every Relay EC2 instance, both S3 buckets | the product domain and `conformal.live` |
+| Route 53 | `ai-rocket-experiments.com` (Z080645839I5BO3TEQ366), `rocketizer.ai`, plus private zones | `openrelay.sh`, `conformal.live` (Z01646542WQQGABIKJZV5), `cutcompanion.xyz` |
+| Serves | `relay.ai-rocket-experiments.com` → `poc-ec2` | `www`/`get.openrelay.sh` → CloudFront, with ACM validation records |
+
+The crossover that makes this confusing: **`conformal.live`'s zone lives in the
+cut account, but three of its records point at a machine in the Relay account.**
+
+```
+conformal.live zone            (cut, 992203938018)
+├── conformal.live         ──► 13.206.15.163  cutcompanion-backend   (cut account)
+├── dcmshriram, pnb        ──► 13.206.15.163  cutcompanion-backend   (cut account)
+└── api|codex|vault.pocs   ──► 3.111.143.88   pariksj-dev            (RELAY account)
+
+ai-rocket-experiments.com zone (Relay, 507121383669)
+└── relay                  ──► 43.204.94.3    poc-ec2                (RELAY account)
+```
+
+So "who owns conformal.live" and "what is it pointing at" have different
+answers, and an earlier revision of the EC2 handoff doc asserted the first
+while I checked only the second. The zone is not in the Relay account; the
+`pocs.*` target is.
+
+**`openrelay.sh` is the product domain**, and it is in the cut account. It
+already carries ACM validation records and a CloudFront distribution for
+`www`, plus a `get` subdomain — which is what `STATUS.md`'s "product domain,
+`api.`, `get.`, `*.tun.`, `www.`" item is about. Nothing in `product/` deploys
+to it yet; the live control plane is still on
+`relay.ai-rocket-experiments.com`. Any cutover has to account for the cert and
+DNS living in a different account from the instance.
+
+`cutcompanion-backend` (`i-06e721ea98a675006`, in the cut account) is a
+different product. No Relay component depends on it.
+
+### Relay compute — all in `507121383669`, region `ap-south-1`
 
 | Instance | Role |
 |---|---|
@@ -62,10 +99,11 @@ Supporting resources, same account: Route 53 zone `ai-rocket-experiments.com`;
 `relay-poc-backups-507121383669-ap-south-1` (SQLite backups, versioned,
 block-public-access, SSE-S3).
 
-**The second account is not Relay.** `992203938018` (profile `cut-personal`)
-runs `cutcompanion-backend` — a different product. No Relay component depends on
-it, and nothing in this repo deploys there. If you were expecting Relay to span
-two accounts, it does not; the split is by product, not by environment.
+No Relay *compute* runs in the cut account, and nothing in `product/` deploys
+there — but it is not irrelevant to Relay either: it holds `openrelay.sh`, the
+product domain, and the `conformal.live` zone whose `pocs.*` records point back
+at a Relay-account machine. Credentials for both are needed to reason about
+DNS; only the default profile is needed to deploy.
 
 Access to both hosts is **AWS SSM only** — no inbound SSH, and the control
 plane's listener is loopback-bound.
