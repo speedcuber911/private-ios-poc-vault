@@ -1,0 +1,60 @@
+# Grant gateway public HTTPS vhost — broker/data-path host only.
+#
+# - ACME / Let's Encrypt runs on this broker host, NOT on poc-ec2.
+# - Do NOT enable this vhost on the control-plane box (relay-cloud / poc-ec2).
+# - server_name is gateway.<api-zone> (placeholder __GATEWAY_DOMAIN__ below).
+# - Terminates TLS and proxies HTTP to the loopback grant-gateway unit.
+# - Does NOT proxy the broker's raw tunnel or SNI passthrough listeners.
+#
+# Render __GATEWAY_DOMAIN__, install to /etc/nginx/conf.d/relay-grant-gateway.conf,
+# and include deploy/rate-limit.conf from the http{} block if not already present.
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name __GATEWAY_DOMAIN__;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name __GATEWAY_DOMAIN__;
+
+    ssl_certificate /etc/letsencrypt/live/__GATEWAY_DOMAIN__/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/__GATEWAY_DOMAIN__/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:RelayGrantGatewaySSL:10m;
+    ssl_session_timeout 1d;
+
+    # Activity reads are GET-only; reject any request body.
+    client_max_body_size 0;
+    limit_req zone=relay_grant_gateway_per_ip burst=60 nodelay;
+    limit_req_status 429;
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options DENY always;
+    add_header Referrer-Policy no-referrer always;
+    add_header X-Robots-Tag "noindex, nofollow" always;
+    add_header Cache-Control no-store always;
+
+    location / {
+        proxy_pass http://127.0.0.1:8791;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_buffering off;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}

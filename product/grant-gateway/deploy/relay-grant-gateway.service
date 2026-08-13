@@ -1,0 +1,38 @@
+[Unit]
+Description=Relay grant gateway (browser activity proxy)
+After=network-online.target
+Wants=network-online.target
+
+# Broker/data-path host only — not the poc-ec2 control-plane box.
+# Create the dedicated user once if missing:
+#   useradd --system --home-dir /var/lib/relay-grant-gateway --shell /usr/sbin/nologin relaygateway
+
+[Service]
+Type=simple
+User=relaygateway
+Group=relaygateway
+UMask=0077
+WorkingDirectory=/opt/relay-grant-gateway/current
+EnvironmentFile=/etc/relay-grant-gateway/env
+Environment=NODE_ENV=production
+Environment=HOST=127.0.0.1
+Environment=PORT=8791
+Environment=PATH=/opt/relay-grant-gateway/node/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/relay-grant-gateway/node/bin/node src/server.js
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/relay-grant-gateway
+
+[Install]
+WantedBy=multi-user.target
