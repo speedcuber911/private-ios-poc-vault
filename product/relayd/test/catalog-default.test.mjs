@@ -45,18 +45,72 @@ function withEnv(vars, fn) {
 
 const CLEAN = { BEDROCK_CHAT_MODEL: undefined, AZURE_OPENAI_DEPLOYMENT: undefined };
 
-test("an unconfigured node advertises only the harnesses it can actually run", () => {
+test("an unconfigured node advertises only harnesses it can actually run", () => {
   const catalog = withEnv(CLEAN, () => defaultModelCatalog());
 
   assert.deepEqual(
-    catalog.map((entry) => entry.id),
-    ["codex-cli", "claude-code"],
-    "nothing but the two harnesses",
+    [...new Set(catalog.map((entry) => entry.provider))].sort(),
+    ["claude", "codex"],
+    "only the two harnesses the image ships",
   );
   assert.ok(
     !catalog.some((entry) => entry.provider === "bedrock"),
     "Bedrock must not appear on a node that has no Bedrock credentials",
   );
+});
+
+// Each provider keeps one entry with NO taskModel. It runs whatever the CLI
+// defaults to, so it cannot break because of a model name this account is not
+// entitled to — the fallback that stays working when a named row does not.
+test("each provider keeps a no-model default entry", () => {
+  const catalog = withEnv(CLEAN, () => defaultModelCatalog());
+
+  for (const provider of ["codex", "claude"]) {
+    const bare = catalog.filter((e) => e.provider === provider && e.taskModel === undefined);
+    assert.equal(bare.length, 1, `${provider} must have exactly one harness-default entry`);
+  }
+});
+
+// The point of the change: picking a provider must then offer models. A
+// default install used to advertise one row per harness and nothing else, so
+// there was no model choice at all.
+test("each provider offers named models to choose from", () => {
+  const catalog = withEnv(CLEAN, () => defaultModelCatalog());
+
+  for (const provider of ["codex", "claude"]) {
+    const named = catalog.filter((e) => e.provider === provider && e.taskModel);
+    assert.ok(named.length >= 2, `${provider} offers no model choice: ${named.length} named entries`);
+    for (const entry of named) {
+      assert.ok(entry.taskModel.length > 0, `${entry.id} has an empty taskModel`);
+    }
+  }
+});
+
+// effortLevels is exactly what the app renders as the effort picker
+// (RelayChatViewModel.availableEfforts). Codex had none, so selecting Codex
+// produced an empty effort picker on every node.
+test("every entry exposes effort levels, so the picker is never empty", () => {
+  const catalog = withEnv(CLEAN, () => defaultModelCatalog());
+
+  for (const entry of catalog) {
+    assert.ok(
+      Array.isArray(entry.effortLevels) && entry.effortLevels.length > 0,
+      `${entry.id} exposes no effort levels`,
+    );
+    for (const level of entry.effortLevels) {
+      assert.ok(
+        ["low", "medium", "high", "xhigh"].includes(level),
+        `${entry.id} declares an effort level the server will drop: ${level}`,
+      );
+    }
+  }
+});
+
+// Ids reach the app as selection keys and the app assumes they are unique.
+test("catalog ids are unique", () => {
+  const catalog = withEnv(CLEAN, () => defaultModelCatalog());
+  const ids = catalog.map((e) => e.id);
+  assert.equal(new Set(ids).size, ids.length, `duplicate id in ${ids.join(", ")}`);
 });
 
 // The specific string the user saw. Worth pinning by exact value: a label is

@@ -27,6 +27,24 @@ export CODEX_BIN="${CODEX_BIN:-$(command -v codex || echo /usr/bin/codex)}"
 export CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude || echo /usr/bin/claude)}"
 echo "harness binaries: codex=${CODEX_BIN} claude=${CLAUDE_BIN}" >&2
 
+# Claude Code refuses `--dangerously-skip-permissions` under root:
+#   "--dangerously-skip-permissions cannot be used with root/sudo privileges
+#    for security reasons"
+# and this container is deliberately root (see the Dockerfile — the base
+# entrypoint has to start envd, which mounts and therefore needs root). relayd
+# passes that flag whenever CODEX_DANGEROUS_MODE is on, which it is by default,
+# so EVERY Claude job on EVERY trial sandbox failed before running a single
+# token. Note `--permission-mode bypassPermissions` is refused by the same
+# guard, so dropping the flag is not a workaround; tested against Claude Code
+# 2.1.227 in this image.
+#
+# IS_SANDBOX is Claude Code's own escape for exactly this case, and the claim
+# is true here: a Cube microVM, one per trial user, no persistent state, torn
+# down at expiry. Set ONLY in this image for that reason — it must never be
+# relayd's default, because on a BYO install running as root the guard is
+# protecting somebody's actual machine.
+export IS_SANDBOX=1
+
 RELAYD_BIN=/opt/relayd/app/bin/relayd
 # Device-token authentication for this machine. Pairing derives the token from
 # the pairing secret and writes only its SHA-256 here; relayd then requires a
