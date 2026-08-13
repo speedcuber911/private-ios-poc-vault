@@ -80,6 +80,12 @@ const TIMEOUT_SENTINEL = Symbol("apns_timeout");
 
 export function createApnsClient({ config, transport, now = () => Date.now() }) {
   const { keyId, teamId, bundleId, signingKeyPem, host } = config.apns;
+  // Deliberately the SAME predicate main.js uses to choose the noop transport,
+  // called rather than re-derived. When these two drift, an unconfigured
+  // deployment picks the noop transport (so it believes it is safe) while the
+  // client still tries to mint a provider JWT — which is exactly the bug this
+  // guard exists to close.
+  const credentialsPresent = apnsConfigured(config);
   let cachedToken = null;
   let cachedAt = 0;
 
@@ -112,6 +118,23 @@ export function createApnsClient({ config, transport, now = () => Date.now() }) 
   // rewrites the banner after fetching content from the node).
   // Resolves to {outcome, status, reason} — see APNS_OUTCOME. Never rejects.
   async function send({ deviceToken, kind, category, payload, collapseId }) {
+    // BEFORE any JWT work, and the reason is the header block below: it
+    // interpolates providerToken() while building `headers`, which happens
+    // outside the try/catch that guards the transport. With no signing key,
+    // createPrivateKey("") throws OpenSSL's "DECODER routines::unsupported"
+    // straight out of send() — breaking the contract stated at the top of this
+    // file that send() NEVER throws, and defeating the noop transport entirely,
+    // because the token is minted before the transport is ever consulted.
+    //
+    // Observed in production: the process logged "APNs credentials unset —
+    // pushes will be skipped" at boot and then threw "apns send threw:
+    // error:1E08010C:DECODER routines::unsupported" on the first real push.
+    // The skip was never real. Returning the same shape classify() produces
+    // for status 0 keeps callers on the one code path they already handle.
+    if (!credentialsPresent) {
+      return { outcome: APNS_OUTCOME.SKIPPED, status: 0, reason: null };
+    }
+
     const aps =
       kind === "silent"
         ? { "content-available": 1 }

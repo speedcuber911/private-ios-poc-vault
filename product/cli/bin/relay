@@ -44,7 +44,11 @@ try {
     }
     case "handoff": {
       const { cmdHandoff } = await import("../src/commands/handoff.mjs");
-      await cmdHandoff(rest, { progress: await withProgress() });
+      // Watch the handoff through to a terminal state instead of exiting the
+      // moment the cloud accepts the row. Two minutes is far longer than the
+      // ~10s a healthy pickup takes, and the wait is bounded so an offline
+      // machine ends in an honest "still pending", not a hang.
+      await cmdHandoff(rest, { progress: await withProgress(), waitForReadyMs: 120_000 });
       break;
     }
     case "sync-auth": {
