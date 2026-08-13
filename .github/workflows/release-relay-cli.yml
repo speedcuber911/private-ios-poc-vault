@@ -1,0 +1,41 @@
+name: Release Relay CLI
+
+on:
+  push:
+    tags:
+      - relay-cli-v*
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Verify tag and package version
+        working-directory: product/cli
+        run: |
+          version="$(node -p 'require("./package.json").version')"
+          test "$GITHUB_REF_NAME" = "relay-cli-v$version"
+
+      - name: Test CLI
+        working-directory: product/cli
+        run: npm test
+
+      - name: Assume the AWS publisher role
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.RELAY_CLI_PUBLISH_ROLE_ARN }}
+          aws-region: ${{ vars.RELAY_CLI_AWS_REGION }}
+
+      - name: Sign and publish immutable release
+        env:
+          RELAY_CLI_SIGNING_KEY_B64: ${{ secrets.RELAY_CLI_SIGNING_KEY_B64 }}
+          RELAY_SKIP_TESTS: '1'
+        run: product/cli/deploy/publish.sh
