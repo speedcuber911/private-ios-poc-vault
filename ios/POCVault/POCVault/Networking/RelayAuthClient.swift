@@ -185,14 +185,20 @@ final class RelayAuthClient {
         guard response.ok == true else { throw RelayAuthClientError.invalidResponse }
     }
 
-    func linkedComputer(bearerToken: String) async throws -> CLIComputerLink? {
-        struct Payload: Decodable { let computer: CLIComputerLink? }
+    func computerLinkState(bearerToken: String) async throws -> CLIComputerLinkState {
+        struct Payload: Decodable {
+            let computer: CLIComputerLink?
+            let foldersAvailable: Bool
+        }
         guard let response: Payload = try await request(
             method: "GET",
             path: "/v1/auth/device/link",
             bearerToken: bearerToken
         ) else { throw RelayAuthClientError.invalidResponse }
-        return response.computer
+        return CLIComputerLinkState(
+            computer: response.computer,
+            foldersAvailable: response.foldersAvailable
+        )
     }
 
     func disconnectComputer(bearerToken: String) async throws {

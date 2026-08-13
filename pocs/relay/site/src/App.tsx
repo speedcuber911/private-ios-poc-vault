@@ -463,79 +463,95 @@ export default function App() {
         <HandoffStory reducedMotion={reducedMotion} />
         <SurfaceSection />
 
-        <section className="boundary-v2" id="privacy">
-          <div className="boundary-v2-topline">
-            <span>03 — PRIVATE BY DESIGN</span>
-            <small>AUTHENTICATED CONTROL / BOUNDED EXECUTION</small>
+        <section className="architecture-v4" id="privacy">
+          <div className="architecture-v4-topline">
+            <span>03 — WHAT LEAVES THE MACHINE</span>
+            <small>PRIVATE BY DESIGN</small>
           </div>
-          <Reveal className="boundary-v2-heading">
-            <h2>Only the signal<br /><em>moves.</em></h2>
-          </Reveal>
 
-          <Reveal className="boundary-v2-field">
-            <div className="boundary-v2-local">
-              <div className="boundary-v2-rings" aria-hidden="true"><i /><i /><i /></div>
-              <span className="boundary-v2-label label-files">FILES</span>
-              <span className="boundary-v2-label label-tools">TOOLS</span>
-              <span className="boundary-v2-label label-auth">AUTH</span>
-              <div className="boundary-v2-core">
-                <small>EXECUTION</small>
-                <strong>RUNNER</strong>
-                <span><i /> LOCAL / ACTIVE</span>
+          <div className="architecture-v4-heading">
+            <Reveal><h2>Only the thread<br /><em>travels.</em></h2></Reveal>
+            <p>Relay sends your direction to the runner and streams progress back. The workspace itself never moves.</p>
+          </div>
+
+          <Reveal className="architecture-v4-stage">
+            <div className="architecture-v4-runner">
+              <div className="architecture-v4-runner-bar">
+                <div aria-hidden="true"><i /><i /><i /></div>
+                <span>YOUR MACHINE / RELAY RUNNER</span>
+                <small><i /> EXECUTING LOCALLY</small>
+              </div>
+              <div className="architecture-v4-runner-body">
+                <aside>
+                  <small>WORKSPACE</small>
+                  <strong>checkout</strong>
+                  <div className="architecture-v4-tree">
+                    <span><i /> src</span>
+                    <span className="active"><i /> checkout.ts</span>
+                    <span><i /> tests</span>
+                    <span><i /> .env.local</span>
+                  </div>
+                  <div className="architecture-v4-local-key"><Check size={10} /><span>SIGN-IN LOCAL</span></div>
+                </aside>
+                <div className="architecture-v4-run">
+                  <div className="architecture-v4-run-meta"><span>CODEX / CHECKOUT</span><small>00:42</small></div>
+                  <div className="architecture-v4-run-title"><h3>Checkout repair</h3><span><i /> RUNNING</span></div>
+                  <div className="architecture-v4-prompt">Audit checkout failures and ship the fix.</div>
+                  <div className="architecture-v4-steps">
+                    <div><Check size={12} /><span><strong>Failure isolated</strong><small>Payment callback</small></span><b>DONE</b></div>
+                    <div><Check size={12} /><span><strong>Fix applied</strong><small>2 files changed</small></span><b>DONE</b></div>
+                    <div className="live"><i /><span><strong>Verification</strong><small>Focused suite</small></span><b>LIVE</b></div>
+                  </div>
+                </div>
+              </div>
+              <div className="architecture-v4-runner-foot">
+                <span><small>FILES</small><strong>LOCAL</strong></span>
+                <span><small>TOOLS</small><strong>LOCAL</strong></span>
+                <span><small>CREDENTIALS</small><strong>LOCAL</strong></span>
+                <span><small>EXECUTION</small><strong>LOCAL</strong></span>
               </div>
             </div>
 
-            <div className="boundary-v2-lanes" aria-label="Prompts, live state, and results cross the authenticated boundary">
-              <div><span>PROMPTS</span><i><b /></i></div>
-              <div><span>LIVE STATE</span><i><b /></i></div>
-              <div><span>RESULTS</span><i><b /></i></div>
+            <div className="architecture-v4-link" aria-label="Authenticated two-way Relay connection">
+              <div className="architecture-v4-link-out"><span>YOUR DIRECTION</span><i /></div>
+              <div className="architecture-v4-gate"><Check size={13} /><small>AUTHENTICATED</small></div>
+              <div className="architecture-v4-link-back"><i /><span>LIVE UPDATE</span></div>
             </div>
 
-            <div className="boundary-v2-gate">
-              <span>AUTHENTICATED</span>
-              <i><b /></i>
-              <small>CONTROL ONLY</small>
-            </div>
-
-            <div className="boundary-v2-portable">
-              <div className="boundary-v2-portable-rings" aria-hidden="true"><i /><i /></div>
-              <div className="boundary-v2-relay-core">
-                <small>CONTROL</small>
-                <strong>RELAY</strong>
-                <span><i /> CONNECTED</span>
-              </div>
-              <div className="boundary-v2-device">IPHONE</div>
+            <div className="architecture-v4-phone">
+              <PhoneVisual mode="watch" />
+              <div><span>RELAY ON IPHONE</span><strong>Prompts · progress · results</strong></div>
             </div>
           </Reveal>
-
-          <div className="boundary-v2-legend">
-            <Reveal delay={0.04}><small>STAYS ON THE RUNNER</small><strong>FILES · TOOLS · AUTH</strong></Reveal>
-            <Reveal delay={0.1}><small>MOVES WITH YOU</small><strong>PROMPTS · STATE · RESULTS</strong></Reveal>
-          </div>
         </section>
 
-        <section className="closing closing-v2">
-          <div className="closing-v2-grid" aria-hidden="true" />
-          <div className="closing-v2-orbit" aria-hidden="true"><i /></div>
-          <div className="closing-v2-top">
-            <span>04 — KEEP MOVING</span>
+        <section className="closing-v4" id="start-relay">
+          <div className="closing-v4-topline">
+            <span>04 — TAKE THE THREAD WITH YOU</span>
             <small>RELAY / PRIVATE BETA</small>
           </div>
-          <Reveal className="closing-v2-copy">
-            <h2>Leave the desk.<br /><em>Not the work.</em></h2>
-            <p>Install Relay on the machine that holds your work. Carry the live thread from iPhone.</p>
-          </Reveal>
-          <Reveal className="closing-v2-action" delay={0.08}>
-            <div>
-              <small>INSTALL RELAY CLI</small>
-              <code><i>$</i> curl -fsSL get.openrelay.sh/install.sh | sh</code>
+          <div className="closing-v4-layout">
+            <div className="closing-v4-copy">
+              <Reveal><h2>One command.<br /><em>Then walk away.</em></h2></Reveal>
+              <p>Install Relay on the machine that holds your work. Start the agent there. Keep the live thread on iPhone.</p>
+              <Reveal className="closing-v4-action" delay={0.08}>
+                <div>
+                  <small>INSTALL RELAY CLI</small>
+                  <code><i>$</i> curl -fsSL get.openrelay.sh/install.sh | sh</code>
+                </div>
+                <button type="button" onClick={copyInstallCommand} aria-label={installCopied ? 'Install command copied' : 'Copy install command'}>
+                  {installCopied ? <Check size={16} /> : <Copy size={16} />}
+                  <span>{installCopied ? 'COPIED' : 'COPY'}</span>
+                </button>
+              </Reveal>
+              <div className="closing-v4-note"><i /><span>Files and execution stay on your machine.</span></div>
             </div>
-            <button type="button" onClick={copyInstallCommand}>
-              {installCopied ? <Check size={16} /> : <Copy size={16} />}
-              <span>{installCopied ? 'COPIED' : 'COPY'}</span>
-            </button>
-          </Reveal>
-          <div className="closing-v2-bottom">
+            <Reveal className="closing-v4-device" delay={0.1}>
+              <div className="closing-v4-halo" aria-hidden="true"><i /><i /></div>
+              <PhoneVisual mode="open" />
+            </Reveal>
+          </div>
+          <div className="closing-v4-bottom">
             <strong>RELAY</strong>
             <a href="#top" className="return-link">Back to top <RotateCcw size={14} /></a>
           </div>

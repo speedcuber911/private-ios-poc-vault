@@ -39,6 +39,7 @@ import { appendAudit } from "./audit.mjs";
 import { identityPaths, readNodeId, getCaPem, ensureServerCert, isRevokedSerial } from "./identity.mjs";
 import { startTunnelService } from "./tunnel.mjs";
 import { startPairingListener, prunePairingSessions } from "./pairing.mjs";
+import { computerAccessGate } from "./computeraccess.mjs";
 
 loadPersistedJobs();
 processQueue();
@@ -166,6 +167,7 @@ async function startHandoffPickup() {
     // createCloudClient has returned and this binding is initialized.
     const cloud = createCloudClient({
       cloudUrl,
+      onComputerAccess: (lease) => computerAccessGate.applyLease(lease),
       onNotice: (notice) =>
         installFromNotice(notice, {
           cloudUrl,
