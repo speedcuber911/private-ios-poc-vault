@@ -11,7 +11,9 @@
 
 import {
   createHmac,
+  createPrivateKey,
   createPublicKey,
+  sign as cryptoSign,
   timingSafeEqual,
   verify as cryptoVerify,
 } from "node:crypto";
@@ -124,4 +126,49 @@ export function verifyRS256(token, jwk) {
     return null;
   }
   return ok ? { header, payload } : null;
+}
+
+function normalizePrivateKey(privateKey) {
+  if (typeof privateKey === "string") {
+    return createPrivateKey(privateKey);
+  }
+  return privateKey;
+}
+
+export function signEd25519(payload, privateKey) {
+  const header = b64urlJson({ alg: "EdDSA", typ: "JWT" });
+  const body = b64urlJson(payload);
+  const data = `${header}.${body}`;
+  const sig = cryptoSign(null, Buffer.from(data), normalizePrivateKey(privateKey)).toString(
+    "base64url",
+  );
+  return `${data}.${sig}`;
+}
+
+// Returns the payload on success, null on any failure. Never throws.
+export function verifyEd25519(token, publicKey, nowMs = Date.now()) {
+  const decoded = decodeJwtUnsafe(token);
+  if (!decoded) return null;
+  const { header, payload, parts } = decoded;
+  if (header.alg !== "EdDSA") return null;
+  if (
+    typeof payload.exp !== "number" ||
+    !Number.isFinite(payload.exp) ||
+    payload.exp * 1000 <= nowMs
+  ) {
+    return null;
+  }
+  const sig = Buffer.from(parts[2], "base64url");
+  let ok = false;
+  try {
+    ok = cryptoVerify(
+      null,
+      Buffer.from(`${parts[0]}.${parts[1]}`),
+      publicKey,
+      sig,
+    );
+  } catch {
+    return null;
+  }
+  return ok ? payload : null;
 }

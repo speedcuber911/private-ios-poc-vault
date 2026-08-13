@@ -32,6 +32,7 @@ import {
 
 const ease = [0.16, 1, 0.3, 1] as const;
 const installCommand = "curl --proto '=https' --tlsv1.2 -fsSL https://get.openrelay.sh/install.sh | sh";
+const relayAppOrigin = import.meta.env.VITE_RELAY_APP_ORIGIN || '#';
 
 const chapters = [
   { time: '10:18', title: 'Start on your Mac.', copy: 'Relay begins inside the folder that already has the work.' },
@@ -296,7 +297,7 @@ function App() {
 
   return (
     <div className="site" id="top">
-      <header className="topbar"><a href="#top" className="wordmark" aria-label="Relay home">Relay</a><nav><a href="#handoff">Handoff</a><a href="#product">The app</a><a href="#privacy">Privacy</a></nav><a className="nav-cta" href="#start">Private beta <ArrowUpRight /></a></header>
+      <header className="topbar"><a href="#top" className="wordmark" aria-label="Relay home">Relay</a><nav><a href="#handoff">Handoff</a><a href="#product">The app</a><a href="#privacy">Privacy</a></nav><a className="nav-cta" href={`${relayAppOrigin}/login`}>Sign in <ArrowUpRight /></a></header>
       <main>
         <OpeningFilm />
 

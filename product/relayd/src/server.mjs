@@ -7,7 +7,8 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 
-import { host, port, requireMtls, allowedCertSubjects, maxConcurrent, maxBodyBytes, maxTranscriptionAudioBytes, proxyBaseUrl, proxyClientCertPath, proxyClientKeyPath } from "./config.mjs";
+import { host, port, requireMtls, allowedCertSubjects, maxConcurrent, maxBodyBytes, maxTranscriptionAudioBytes, proxyBaseUrl, proxyClientCertPath, proxyClientKeyPath, grantPublicKey, nodeId } from "./config.mjs";
+import { isJwtShaped, verifyBrowserGrant, activityScope, scopeCovers } from "./grant.mjs";
 import { sendJson, sendHtml, sendError, readBody, readBinaryBody, headerValue, clampLimit, isSafeJobId } from "./util.mjs";
 import { workspaces, workspaceList, publicWorkspace, workspaceDirectoryResponse, selectWorkspaceDirectory, createWorkspaceDirectory } from "./workspaces.mjs";
 import { publicModelCatalog } from "./catalog.mjs";
@@ -52,7 +53,7 @@ function bearerToken(header) {
   return match ? match[1].trim() : null;
 }
 
-function authorize(req) {
+function authorize(req, { pathname } = {}) {
   const verify = headerValue(req.headers["x-ssl-client-verify"]);
   const subject = headerValue(req.headers["x-ssl-client-s-dn"]);
 
@@ -70,11 +71,33 @@ function authorize(req) {
   // authenticates pairing, so no new secret crosses the wire and the pairing
   // protocol is unchanged. Only its SHA-256 is stored here, and it is compared
   // in constant time.
+  //
+  // Browser grants are also Authorization: Bearer. Precedence lives inside
+  // this first branch so trial traffic actually reaches it (spec §3.3):
+  // 1. Read bearer.
+  // 2. If JWT-shaped (exactly 3 base64url segments) AND grant public key
+  //    configured: verify grant; payload.node === thisNodeId; exp valid; if
+  //    pathname is an activity read, require matching scope. Fail → 401
+  //    { error: "device token is not valid" } (identical public error).
+  // 3. Else if deviceTokenHash() set: existing hash compare.
+  // 4. Else: existing mTLS path.
+  // Never hash a JWT and compare it to deviceTokenHash.
   const expected = deviceTokenHash();
   if (expected) {
     const provided = bearerToken(req.headers.authorization);
     if (!provided) {
       return { ok: false, status: 401, error: "device token is required" };
+    }
+    if (isJwtShaped(provided) && grantPublicKey) {
+      const grant = verifyBrowserGrant(provided, {
+        publicKey: grantPublicKey,
+        nodeId,
+      });
+      const needed = activityScope(req.method, pathname);
+      if (grant.ok && scopeCovers(grant.payload.scope, needed)) {
+        return { ok: true, subject: "browser-grant" };
+      }
+      return { ok: false, status: 401, error: "device token is not valid" };
     }
     const actual = crypto.createHash("sha256").update(provided, "utf8").digest("hex");
     const a = Buffer.from(actual, "utf8");
@@ -116,7 +139,7 @@ async function routeRequest(req, res) {
     return sendError(res, 404, "not found");
   }
 
-  const auth = authorize(req);
+  const auth = authorize(req, { pathname: url.pathname });
   if (!auth.ok) {
     return sendError(res, auth.status, auth.error);
   }

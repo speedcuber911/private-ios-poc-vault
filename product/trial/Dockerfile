@@ -61,6 +61,7 @@ COPY relayd/src /opt/relayd/app/src
 COPY relayd/bin /opt/relayd/app/bin
 COPY relayd/package.json /opt/relayd/app/package.json
 COPY start.sh /opt/relayd/start.sh
+COPY src /opt/relayd/src
 RUN chmod 0755 /opt/relayd/start.sh /opt/relayd/app/bin/relayd
 
 # Deliberately NO `USER relay`. The base image's entrypoint has to start envd,
