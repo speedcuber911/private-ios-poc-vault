@@ -99,10 +99,10 @@ if [ ! -f "${ENROLL_MARKER}" ]; then
 fi
 
 # Tunnel settings AND the control-plane URL are frozen in the snapshot for the
-# same reason, so they come from the same file. These are not secrets (broker
-# address, SNI suffix, cloud base URL), but they still must not be word-split
-# or re-interpreted by the shell — node emits them single-quoted so a value can
-# never break out into a command.
+# same reason, so they come from the same file. The enroll-delivered grant
+# public key (verify-only) and the post-enroll node id go in the same 0600
+# env file so `relayd run` can verify browser grants. Values are single-quoted
+# so they cannot break out into a command. Do not echo the key or node id.
 #
 # RELAYD_CLOUD_URL is load-bearing and was missing: relayd reads the control
 # plane out of the ENVIRONMENT (config.mjs), and this script exported it
@@ -114,17 +114,11 @@ fi
 # as a file. Symptom was a handoff stuck at `pending` forever with the node's
 # `lastSeen` still null, because the node never polled even once.
 if [ -f "${ENROLL_CONFIG}" ]; then
-  node -e '
-    const fs = require("node:fs");
-    const cfg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-    const q = (v) => "'"'"'" + String(v).replace(/'"'"'/g, "'"'"'\\'"'"''"'"'") + "'"'"'";
-    const out = [];
-    if (cfg.cloudUrl) out.push("RELAYD_CLOUD_URL=" + q(cfg.cloudUrl));
-    if (cfg.tunnelHost) out.push("RELAYD_TUNNEL_HOST=" + q(cfg.tunnelHost));
-    if (cfg.tunnelPort) out.push("RELAYD_TUNNEL_PORT=" + q(cfg.tunnelPort));
-    if (cfg.tunnelSuffix) out.push("RELAYD_TUNNEL_SUFFIX=" + q(cfg.tunnelSuffix));
-    fs.writeFileSync(process.argv[2], out.join("\n") + "\n", { mode: 0o600 });
-  ' "${ENROLL_CONFIG}" "${CODEX_DATA_DIR}/runtime.env"
+  BOOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+  node "${BOOT_DIR}/src/write-runtime-env.mjs" \
+    "${ENROLL_CONFIG}" \
+    "${CODEX_DATA_DIR}/runtime.env" \
+    "${RELAYD_IDENTITY_DIR}/node-id"
   set -a
   # shellcheck disable=SC1090
   . "${CODEX_DATA_DIR}/runtime.env"
