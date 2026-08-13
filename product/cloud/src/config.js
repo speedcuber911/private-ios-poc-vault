@@ -29,6 +29,10 @@ export function loadConfig(env = process.env) {
     betterAuthBaseURL:
       env.BETTER_AUTH_URL ||
       `http://${env.HOST || "127.0.0.1"}:${intFrom(env.PORT, 8790)}`,
+    trustedWebOrigins: (env.RELAY_WEB_ORIGINS || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
 
     // Sign in with Apple. Comma-separated audience allowlist (bundle ids /
     // services ids registered with Apple).
