@@ -24,8 +24,8 @@ final class HandoffTests: XCTestCase {
         XCTAssertEqual(card.workspaceID, "dir-handoff-abc123")
         XCTAssertTrue(card.canResumeNatively)
         XCTAssertTrue(card.isActionable)
-        XCTAssertEqual(card.statusLabel, "READY")
-        XCTAssertEqual(card.subtitle, "me/relay · relay/handoff-a1b2c3d4e5f6")
+        XCTAssertEqual(card.statusLabel, "Ready to continue")
+        XCTAssertEqual(card.subtitle, "me/relay")
         XCTAssertNotNil(card.createdAt)
         XCTAssertNil(card.failureSummary, "a healthy handoff has nothing to apologise for")
     }
@@ -55,7 +55,7 @@ final class HandoffTests: XCTestCase {
         """)
 
         XCTAssertEqual(card.state, .failed)
-        XCTAssertEqual(card.statusLabel, "FAILED")
+        XCTAssertEqual(card.statusLabel, "Needs attention")
         XCTAssertEqual(card.error, "clone_failed")
         XCTAssertFalse(card.isActionable)
         XCTAssertNil(card.provider)
@@ -84,7 +84,7 @@ final class HandoffTests: XCTestCase {
         """)
 
         XCTAssertEqual(card.state, .unknown("quarantined"))
-        XCTAssertEqual(card.statusLabel, "QUARANTINED")
+        XCTAssertEqual(card.statusLabel, "Status unavailable")
         XCTAssertFalse(card.isActionable)
     }
 

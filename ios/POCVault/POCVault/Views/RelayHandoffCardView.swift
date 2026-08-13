@@ -20,11 +20,10 @@ struct RelayHandoffCardView: View {
                 .foregroundStyle(AppTheme.textPrimary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            Text(card.subtitle)
-                .font(AppTheme.monoFont(size: 11))
+            Text(sourceSummary)
+                .font(AppTheme.uiFont(size: 12))
                 .foregroundStyle(AppTheme.textTertiary)
                 .lineLimit(2)
-                .truncationMode(.middle)
 
             if let diffstat = manifest?.diffstat {
                 Text(diffstat)
@@ -63,18 +62,11 @@ struct RelayHandoffCardView: View {
 
     private var header: some View {
         HStack(spacing: 8) {
-            RelayCapsLabel(text: card.statusLabel, color: statusColor, size: 9)
             RelayCapsLabel(text: harnessLabel, color: AppTheme.textTertiary, size: 9)
-            if card.canResumeNatively {
-                RelayCapsLabel(text: "Resumable", color: AppTheme.textTertiary, size: 9)
-            }
             Spacer(minLength: 6)
-            if let machine = manifest?.machine {
-                Text(machine)
-                    .font(AppTheme.monoFont(size: 10))
-                    .foregroundStyle(AppTheme.textFaint)
-                    .lineLimit(1)
-            }
+            Text(card.statusLabel)
+                .font(AppTheme.uiFont(size: 11, weight: .semibold))
+                .foregroundStyle(statusColor)
         }
     }
 
@@ -108,7 +100,20 @@ struct RelayHandoffCardView: View {
     /// than pretending this is the first pickup.
     private var continueTitle: String {
         if isContinuing { return "Starting" }
-        return card.lastJobID == nil ? "Continue" : "Continue again"
+        return card.lastJobID == nil ? "Continue this work" : "Continue again"
+    }
+
+    /// Repository, source computer, and freshness are the useful parts of a
+    /// handoff. The opaque transport branch deliberately never reaches the UI.
+    private var sourceSummary: String {
+        var parts = [card.subtitle]
+        if let machine = manifest?.machine {
+            parts.append("from \(machine)")
+        }
+        if let date = card.updatedAt ?? card.createdAt {
+            parts.append(RelayRelativeTime.string(for: date))
+        }
+        return parts.joined(separator: " · ")
     }
 
     /// The harness the laptop session belonged to, from the manifest; the

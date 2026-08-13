@@ -227,7 +227,7 @@ struct AccountSettingsView: View {
         case .connecting:
             return "Link approved. Finish `relay login` on the computer; Relay will mark it Connected when sign-in completes."
         case .connected:
-            return "Only this computer can use `relay handoff`. Disconnect it before linking a different computer."
+            return "This computer can use the Relay CLI and hand off sessions. Codex and Claude authentication stays outside the iPhone app."
         }
     }
 

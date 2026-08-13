@@ -72,9 +72,14 @@ struct AuthenticationView: View {
                 Text("Relay")
                     .font(AppTheme.serifFont(size: 40))
                     .foregroundStyle(AppTheme.textPrimary)
-                Text("Your agents, within reach.")
-                    .font(AppTheme.serifFont(size: 15, weight: .regular).italic())
+                Text("Continue Codex and Claude Code work from your phone.")
+                    .font(AppTheme.uiFont(size: 16, weight: .medium))
                     .foregroundStyle(AppTheme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("Your subscriptions stay on your computer and Relay machine — never on the phone.")
+                    .font(AppTheme.uiFont(size: 13))
+                    .foregroundStyle(AppTheme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }

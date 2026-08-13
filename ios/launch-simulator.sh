@@ -13,6 +13,12 @@
 #   SIMCTL_CHILD_RELAY_UITEST_CHAT=1             open the chat cover (for RELAY_UITEST_PATH's
 #                                                folder when set, else the root)
 #   SIMCTL_CHILD_RELAY_UITEST_OPEN=library|status  present the Library cover / Status sheet
+#   SIMCTL_CHILD_RELAY_UITEST_CREATE_USERNAME=...  create a local simulator account
+#   SIMCTL_CHILD_RELAY_UITEST_CREATE_EMAIL=...     email for that local account
+#   SIMCTL_CHILD_RELAY_UITEST_CREATE_PASSWORD=...  password for that local account
+#   SIMCTL_CHILD_RELAY_UITEST_SKIP_ONBOARDING=1    enter the signed-in app directly
+#   RELAY_SIM_SIGNED_OUT=1                         show the sign-in flow instead of the
+#                                                  default local preview account
 #
 #   Chat auto-drive (combine with RELAY_UITEST_CHAT=1):
 #   SIMCTL_CHILD_RELAY_UITEST_MODEL=<substr>     pick the model whose id/label contains this
@@ -130,13 +136,25 @@ xcodebuild build \
   -arch arm64 \
   PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
   POC_VAULT_CODEX_BASE_URL="${POC_VAULT_SIM_CODEX_BASE_URL:-http://127.0.0.1:${PORT}}" \
+  RELAY_AUTH_BASE_URL="${POC_VAULT_SIM_AUTH_BASE_URL:-http://127.0.0.1:${PORT}}" \
   POC_VAULT_MANIFEST_PUBLIC_KEY="$POC_VAULT_MANIFEST_PUBLIC_KEY" \
-  CODE_SIGNING_ALLOWED=NO >/tmp/poc-vault-simulator-build.log
+  CODE_SIGNING_ALLOWED=YES >/tmp/poc-vault-simulator-build.log
 
 APP_PATH="$ROOT/ios/POCVault/build/Debug-iphonesimulator/Relay.app"
 xcrun simctl terminate "$SIM_ID" "$BUNDLE_ID" >/dev/null 2>&1 || true
 xcrun simctl uninstall "$SIM_ID" "$BUNDLE_ID" >/dev/null 2>&1 || true
 xcrun simctl install "$SIM_ID" "$APP_PATH"
+
+# The local fixture server owns this preview-only account. Keep the normal one-command
+# simulator workflow inside the product instead of dropping back to the sign-in screen
+# after every uninstall/install cycle.
+if [[ "${RELAY_SIM_SIGNED_OUT:-0}" != "1" ]]; then
+  export SIMCTL_CHILD_RELAY_UITEST_CREATE_USERNAME="${SIMCTL_CHILD_RELAY_UITEST_CREATE_USERNAME:-Relay Preview}"
+  export SIMCTL_CHILD_RELAY_UITEST_CREATE_EMAIL="${SIMCTL_CHILD_RELAY_UITEST_CREATE_EMAIL:-preview@relay.local}"
+  export SIMCTL_CHILD_RELAY_UITEST_CREATE_PASSWORD="${SIMCTL_CHILD_RELAY_UITEST_CREATE_PASSWORD:-relay-local-preview}"
+  export SIMCTL_CHILD_RELAY_UITEST_SKIP_ONBOARDING="${SIMCTL_CHILD_RELAY_UITEST_SKIP_ONBOARDING:-1}"
+fi
+
 xcrun simctl launch "$SIM_ID" "$BUNDLE_ID"
 
 echo "Launched Relay on simulator ${SIM_ID}"
