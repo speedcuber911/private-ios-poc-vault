@@ -91,6 +91,11 @@ export function createApp({
   apnsTransport = createNoopTransport(),
   now = () => Date.now(),
   provisioner = createProvisioner(config),
+  // Operator warnings from the push pipeline. Injectable so a test can assert
+  // that a whole-account APNs refusal actually SAYS so — the fanout summary and
+  // the bad-token alert are the only signal an operator gets, and both were
+  // silently wrong or absent during the 2026-08-13 token-deletion incident.
+  log = (msg) => console.warn(msg),
 } = {}) {
   const registry = createRegistry(db, { now });
   const legacyAuth = createAuth({ registry, config, jwksFetcher, mailTransport, now });
@@ -119,7 +124,7 @@ export function createApp({
   };
   const pairing = createPairing({ registry, config, now });
   const apns = createApnsClient({ config, transport: apnsTransport, now });
-  const notify = createNotify({ registry, apns, config, now });
+  const notify = createNotify({ registry, apns, config, now, log });
 
   // Destroys a trial's sandbox, or records it for reconciliation when it
   // cannot be destroyed right now (no provisioner configured, or the Cube host

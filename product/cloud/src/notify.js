@@ -194,6 +194,7 @@ export function createNotify({
     queued: 0,
     delivered: 0,
     unregistered: 0,
+    badToken: 0,
     authFailed: 0,
     rejected: 0,
     unavailable: 0,
@@ -333,6 +334,22 @@ export function createNotify({
   // for the whole function — including the two call sites below, which are the
   // only warning an operator gets that the pipeline is broken.
   async function fanout({ devices, kind, category, payload, collapseId, banner }) {
+    // Per-fanout tally, counted as outcomes happen.
+    //
+    // This used to be a diff of `stats` taken before and after the await, and
+    // that is wrong: ingest calls track() and returns without awaiting, so
+    // fanouts overlap. Each one then observed the OTHER's counters moving
+    // inside its own window and reported them as its own — which is how a
+    // 27-device fanout logged "delivered=43 error=10" in production, numbers
+    // that cannot describe 27 sends and made the log actively misleading at the
+    // exact moment it was needed. `stats` stays cumulative for the process;
+    // this is what THIS fanout did.
+    const local = {};
+    const bump = (key) => {
+      stats[key] += 1;
+      local[key] = (local[key] ?? 0) + 1;
+    };
+
     let next = 0;
     const worker = async () => {
       while (next < devices.length) {
@@ -346,11 +363,11 @@ export function createNotify({
             collapseId,
             banner,
           });
-          record(device, result);
+          record(device, result, bump);
         } catch (err) {
           // apns.send is documented not to throw; if it ever does, the fanout
           // still must not take the process down.
-          stats.error += 1;
+          bump("error");
           alert("send_threw", `apns send threw: ${String(err?.message ?? err)}`);
         }
       }
@@ -359,7 +376,6 @@ export function createNotify({
       { length: Math.min(FANOUT_CONCURRENCY, devices.length) },
       worker,
     );
-    const before = { ...stats };
     await Promise.all(workers);
 
     // One summary line per fanout, and NOT through alert(): alert() is
@@ -369,39 +385,51 @@ export function createNotify({
     // transport error" for a 27-device fanout and nothing said whether the
     // other 26 arrived, because the stats counters were never printed anywhere.
     //
-    // Counts are deltas for THIS fanout (stats is cumulative), and carry no
-    // device ids or tokens — the outcome mix is the diagnostic.
-    const delta = {};
-    for (const key of Object.keys(stats)) {
-      const moved = stats[key] - (before[key] ?? 0);
-      if (moved > 0) delta[key] = moved;
-    }
-    const summary = Object.entries(delta)
+    // Carries no device ids or tokens — the outcome mix is the diagnostic.
+    const summary = Object.entries(local)
       .filter(([key]) => key !== "queued")
       .map(([key, count]) => `${key}=${count}`)
       .join(" ");
     log(`apns fanout: devices=${devices.length} ${summary || "no outcomes recorded"}`);
   }
 
-  function record(device, result) {
+  function record(device, result, bump) {
     switch (result.outcome) {
       case APNS_OUTCOME.DELIVERED:
-        stats.delivered += 1;
+        bump("delivered");
         return;
 
       case APNS_OUTCOME.UNREGISTERED:
-        // The only signal Apple gives that an app was uninstalled. Ignoring
-        // it means retrying a dead token on every event, forever.
-        stats.unregistered += 1;
+        // 410. The only signal Apple gives that an app was uninstalled.
+        // Ignoring it means retrying a dead token on every event, forever.
+        // This is the ONLY branch permitted to delete a token — see
+        // AMBIGUOUS_TOKEN_400_REASONS in apns.js for why BadDeviceToken is not
+        // here any more.
+        bump("unregistered");
         if (registry.clearApnsToken(device.id, device.apnsToken)) {
-          stats.tokensDropped += 1;
+          bump("tokensDropped");
         }
+        return;
+
+      case APNS_OUTCOME.BAD_TOKEN:
+        // Apple refused the token, but the cause may be ours: a production
+        // token sent to the sandbox host (or the reverse) fails exactly like a
+        // dead one. Counted and alerted, never deleted. The alert names the
+        // host on purpose — a burst of these is the signature of APNS_HOST
+        // pointing at the wrong environment, and the host is the fix.
+        bump("badToken");
+        alert(
+          `bad_token:${result.reason ?? "unknown"}`,
+          `apns refused a device token: reason=${result.reason ?? "unknown"} host=${config.apns.host} — ` +
+          "if this is happening to many devices, APNS_HOST is probably pointed at the wrong APNs environment " +
+          "for the build those tokens came from. Tokens are NOT being deleted.",
+        );
         return;
 
       case APNS_OUTCOME.AUTH_FAILED:
         // Wrong team id, rotated-out .p8, expired provider token: every push
         // for every user fails identically and nothing else will notice.
-        stats.authFailed += 1;
+        bump("authFailed");
         alert(
           "auth_failed",
           `apns AUTH FAILURE — every push is failing: status=${result.status} reason=${result.reason ?? "unknown"}`,
@@ -411,7 +439,7 @@ export function createNotify({
       case APNS_OUTCOME.REJECTED:
         // 4xx that is not a token problem: bad topic, oversize payload, bad
         // collapse id. Always our bug, always total.
-        stats.rejected += 1;
+        bump("rejected");
         alert(
           `rejected:${result.status}:${result.reason ?? "unknown"}`,
           `apns rejected push: status=${result.status} reason=${result.reason ?? "unknown"} device=${device.id}`,
@@ -419,7 +447,7 @@ export function createNotify({
         return;
 
       case APNS_OUTCOME.UNAVAILABLE:
-        stats.unavailable += 1;
+        bump("unavailable");
         alert(
           "unavailable",
           `apns unavailable: status=${result.status} reason=${result.reason ?? "unknown"}`,
@@ -427,16 +455,16 @@ export function createNotify({
         return;
 
       case APNS_OUTCOME.TIMEOUT:
-        stats.timeout += 1;
+        bump("timeout");
         alert("timeout", `apns request timed out: device=${device.id}`);
         return;
 
       case APNS_OUTCOME.SKIPPED:
-        stats.skipped += 1;
+        bump("skipped");
         return;
 
       default:
-        stats.error += 1;
+        bump("error");
         alert(
           "error",
           `apns transport error: ${result.error ?? result.outcome}`,

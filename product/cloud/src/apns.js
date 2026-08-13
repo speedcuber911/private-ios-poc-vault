@@ -59,7 +59,8 @@ export function apnsCollapseId(...parts) {
 // Classified send outcomes. Only DELIVERED means Apple accepted the push.
 export const APNS_OUTCOME = {
   DELIVERED: "delivered", // 200
-  UNREGISTERED: "unregistered", // token is permanently dead — stop using it
+  UNREGISTERED: "unregistered", // 410 — token is permanently dead, delete it
+  BAD_TOKEN: "bad_token", // 400 BadDeviceToken/NotForTopic — token OR our env is wrong; never delete
   AUTH_FAILED: "auth_failed", // 401/403 — provider credential problem
   REJECTED: "rejected", // other 4xx — a bug in what we sent
   UNAVAILABLE: "unavailable", // 429/5xx — transient, safe to retry later
@@ -69,14 +70,40 @@ export const APNS_OUTCOME = {
 };
 
 // 410 always means "this token is gone" (app uninstalled / restored onto a
-// new device). These two 400 reasons mean the same thing. No other 400 does —
-// notably BadCollapseId / PayloadTooLarge are OUR bugs, and deleting the
-// user's push token because of one would be a silent, permanent outage.
-const TOKEN_FATAL_400_REASONS = new Set([
+// new device). It is the ONLY status that may delete a token.
+//
+// `400 BadDeviceToken` used to be treated the same way, and that was a
+// destructive mistake. Apple returns it for two very different things:
+//
+//   (a) the token is genuinely not a valid device token, and
+//   (b) the token is perfectly valid but belongs to the OTHER APNs
+//       environment — a production (TestFlight/App Store) token sent to
+//       api.sandbox.push.apple.com, or the reverse.
+//
+// (b) is a server misconfiguration, and treating it as (a) means one wrong
+// APNS_HOST silently deletes every push token of every account, permanently,
+// with each device only recoverable by reinstalling or relaunching the app.
+// That is exactly what happened on 2026-08-13: APNS_HOST was left at
+// api.sandbox.push.apple.com, the owner installed a TestFlight (production)
+// build, and its token was deleted on the first push after each registration —
+// twice, within four minutes, so no notification could ever arrive.
+//
+// `DeviceTokenNotForTopic` is the same shape of ambiguity: it means the token
+// does not match `apns-topic`, which is at least as likely to be our bundle id
+// being wrong as the device being stale.
+//
+// Both are now classified BAD_TOKEN: counted, alerted on — because at scale
+// they are the signature of a misconfigured environment — but never deleted.
+// A device whose app is really gone still gets cleaned up, by the 410 that
+// Apple sends for precisely that case.
+const AMBIGUOUS_TOKEN_400_REASONS = new Set([
   "BadDeviceToken",
   "DeviceTokenNotForTopic",
-  "Unregistered",
 ]);
+
+// A 400 whose reason literally says the token is no longer registered. Unlike
+// the two above this is not environment-dependent, so it keeps 410's meaning.
+const UNREGISTERED_400_REASONS = new Set(["Unregistered"]);
 
 const TIMEOUT_SENTINEL = Symbol("apns_timeout");
 
@@ -233,8 +260,11 @@ export function createApnsClient({ config, transport, now = () => Date.now() }) 
     if (status === 0) {
       return { outcome: APNS_OUTCOME.SKIPPED, status, reason };
     }
-    if (status === 410 || (status === 400 && TOKEN_FATAL_400_REASONS.has(reason))) {
+    if (status === 410 || (status === 400 && UNREGISTERED_400_REASONS.has(reason))) {
       return { outcome: APNS_OUTCOME.UNREGISTERED, status, reason };
+    }
+    if (status === 400 && AMBIGUOUS_TOKEN_400_REASONS.has(reason)) {
+      return { outcome: APNS_OUTCOME.BAD_TOKEN, status, reason };
     }
     if (status === 401 || status === 403) {
       // The provider JWT is cached for 45 minutes. If Apple is refusing it,
