@@ -55,7 +55,9 @@
 //
 // Unknown top-level fields are ignored: never stored, never forwarded. The
 // push payload is constructed field by field from the validated values above,
-// so the content-free guarantee does not depend on the node behaving.
+// so the content-free guarantee does not depend on the node behaving. Nothing
+// a node sends in an event reaches the banner either — see bannerFor, which
+// builds its text from this server's own handoffs table, not from the event.
 //
 // Responses: 202 {ok,kind,queued} accepted · 202 {ok,duplicate,queued:0}
 // already seen · 400 invalid_json | unsupported_version | invalid_event |
@@ -303,6 +305,12 @@ export function createNotify({
       ? apnsCollapseId(nodeId, jobId, kind)
       : undefined;
 
+    // Built once per event, not once per device: it is the same text on every
+    // one of the account's phones, and handoffNames reads the database.
+    const banner = kind === "mutable"
+      ? bannerFor(type, { registry, nodeId, nowMs })
+      : undefined;
+
     stats.queued += devices.length;
     track(
       fanout({
@@ -311,6 +319,7 @@ export function createNotify({
         category: kind === "mutable" ? categoryFor(type) : undefined,
         payload,
         collapseId,
+        banner,
       }),
     );
 
@@ -319,7 +328,11 @@ export function createNotify({
 
   // Bounded-concurrency fanout. Never rejects: every per-device failure is
   // classified and counted, so one dead device cannot abort the rest.
-  async function fanout({ devices, kind, category, payload, collapseId }) {
+  // `banner` is deliberately NOT named `alert` here: alert() is this closure's
+  // rate-limited operator logger, and a parameter of that name would shadow it
+  // for the whole function — including the two call sites below, which are the
+  // only warning an operator gets that the pipeline is broken.
+  async function fanout({ devices, kind, category, payload, collapseId, banner }) {
     let next = 0;
     const worker = async () => {
       while (next < devices.length) {
@@ -331,6 +344,7 @@ export function createNotify({
             category,
             payload,
             collapseId,
+            banner,
           });
           record(device, result);
         } catch (err) {
@@ -453,6 +467,131 @@ export function createNotify({
   }
 
   return { ingest, sweep, drain, stats: () => ({ ...stats }) };
+}
+
+// ── Banner text ────────────────────────────────────────────────────────────
+//
+// Until this existed, every mutable push carried `alert: {"loc-key":
+// "RELAY_EVENT"}` — a placeholder for a Notification Service Extension to
+// rewrite after fetching the real content from the node over mTLS. No such
+// extension is in the app, and iOS renders an unresolvable loc-key verbatim,
+// so the banner a user actually saw on their lock screen read "RELAY_EVENT".
+//
+// WHAT THIS SENDS TO APPLE, stated plainly because it is a deliberate change
+// to what leaves this server: a handoff banner names the repository and the
+// branch — "acme/widgets · relay/handoff-da52e722". Both are already stored
+// here (POST /v1/handoffs accepts exactly those two names and nothing else),
+// but a push payload is readable by Apple in a way this database is not, so
+// it is a real widening. It is made because a banner that cannot say WHICH
+// session is ready is not worth the interruption. Nothing follows it: no
+// transcript, no prompt, no manifest, no job or session title, and no failure
+// text outside the closed vocabulary below. Job and credential banners are
+// fixed strings and disclose nothing that the push's existence did not.
+//
+// If a Notification Service Extension is added later it can still replace all
+// of this — `mutable-content` stays set — and at that point the names can come
+// out of the payload again and be fetched from the node instead.
+
+// How far back the lookup will reach for the handoff an event is about. The
+// node reports ready/fail and awaits that call before posting the event, so
+// in practice the row was written milliseconds ago. The window is what makes
+// a report that did NOT land (both node calls are best-effort) degrade to a
+// generic banner, instead of confidently naming whichever older handoff
+// happens to be the newest one still sitting in that state.
+const BANNER_LOOKUP_WINDOW_MS = 5 * 60 * 1000;
+
+// Bounds on what reaches the banner. Well above a real "owner/name" and the
+// 16-hex `relay/handoff-…` branch the CLI mints; low enough that no stored
+// value can turn a 4KB APNs payload into a rejected one.
+const BANNER_REPO_MAX = 64;
+const BANNER_BRANCH_MAX = 80;
+
+// The five codes POST /v1/node/handoffs/{id}/fail accepts (server.js
+// HANDOFF_FAILURE_REASONS), in words. A code outside the map yields no
+// explanation rather than a raw identifier on the lock screen — the phrasing
+// here is the whole point, and an unmapped code means the vocabulary grew
+// without this table being updated.
+const HANDOFF_FAILURE_TEXT = new Map([
+  ["clone_failed", "couldn't clone the branch"],
+  ["decrypt_failed", "couldn't open the sealed session"],
+  ["manifest_invalid", "the session manifest was unusable"],
+  ["workspace_failed", "the workspace couldn't be prepared"],
+  ["internal_error", "the machine hit an internal error"],
+]);
+
+// Defence in depth, not the primary check. repo and branch are charset-
+// validated on the way in (REPO_FULL_NAME_RE and isValidHandoffBranch in
+// server.js), so neither can carry a control character or a newline — but the
+// banner is the one place a stored string is handed to a third party and
+// rendered as text, and rows predate today's validators. Returns null for
+// anything that would render as nothing.
+function bannerSafe(value, max) {
+  if (typeof value !== "string") return null;
+  const clean = value.replace(/\p{C}/gu, "").trim();
+  if (!clean) return null;
+  return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
+}
+
+// The names for a handoff event, or null when the row cannot be identified
+// with confidence — in which case the caller falls back to a generic banner.
+function handoffNames(registry, nodeId, state, nowMs) {
+  let row = null;
+  try {
+    row = registry.latestHandoffForNode(nodeId, state);
+  } catch {
+    return null; // a banner is never worth failing a push over
+  }
+  if (!row) return null;
+  if (!Number.isFinite(row.updatedAt) || nowMs - row.updatedAt > BANNER_LOOKUP_WINDOW_MS) {
+    return null;
+  }
+  const repo = bannerSafe(row.repo, BANNER_REPO_MAX);
+  const branch = bannerSafe(row.branch, BANNER_BRANCH_MAX);
+  if (!repo && !branch) return null;
+  return { repo, branch, reason: row.reason ?? null };
+}
+
+// {title, body} for a user-visible push. Called only for MUTABLE_TYPES.
+function bannerFor(type, { registry, nodeId, nowMs }) {
+  switch (type) {
+    case "handoff.ready": {
+      const names = handoffNames(registry, nodeId, "ready", nowMs);
+      return {
+        title: "Session ready",
+        body: names
+          ? [names.repo, names.branch].filter(Boolean).join(" · ")
+          : "A handed-off session is ready to pick up.",
+      };
+    }
+
+    case "handoff.failed": {
+      const names = handoffNames(registry, nodeId, "failed", nowMs);
+      const why = names?.reason ? HANDOFF_FAILURE_TEXT.get(names.reason) : null;
+      const where = names ? [names.repo, names.branch].filter(Boolean).join(" · ") : null;
+      return {
+        title: "Handoff failed",
+        body: [where, why].filter(Boolean).join(" — ") || "A handed-off session couldn't be set up.",
+      };
+    }
+
+    case "job.needs_input":
+      return { title: "Waiting on you", body: "A run needs your approval to continue." };
+
+    case "job.completed":
+      return { title: "Run finished", body: "Open Relay to see what it did." };
+
+    case "job.failed":
+      return { title: "Run failed", body: "Open Relay to see what went wrong." };
+
+    case "credentials.failed":
+      return {
+        title: "Credential sync failed",
+        body: "Your machine is still unauthenticated — run relay sync-auth again.",
+      };
+
+    default:
+      return { title: "Relay", body: "Open Relay to see what changed." };
+  }
 }
 
 function categoryFor(type) {

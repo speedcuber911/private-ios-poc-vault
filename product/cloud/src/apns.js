@@ -8,9 +8,11 @@
 // a transport that ignores it still cannot hang the caller, because send()
 // races the transport against that deadline itself.
 //
-// Payloads carry ids and event types only — never job titles, prompts, or
-// content. The Notification Service Extension on the device fetches real
-// content from the node over the tunnel (mTLS) and rewrites the banner.
+// The `relay` payload block carries ids and event types only — never job
+// titles, prompts, transcripts, or manifests. The banner (`aps.alert`) is the
+// one part a user reads and the one part Apple can read as text; notify.js's
+// bannerFor is the single place that decides what goes in it, and the comment
+// there states exactly what that discloses.
 //
 // send() NEVER throws and never resolves "successfully" for a rejected push:
 // it returns a classified {outcome, status, reason}. Callers fan out over many
@@ -78,6 +80,24 @@ const TOKEN_FATAL_400_REASONS = new Set([
 
 const TIMEOUT_SENTINEL = Symbol("apns_timeout");
 
+// The alert dictionary for a mutable push.
+//
+// The fallback is real words, not a loc-key. This used to send
+// {"loc-key":"RELAY_EVENT"} on the assumption that a Notification Service
+// Extension would rewrite it; there is no such extension, and iOS renders an
+// unresolvable loc-key verbatim — so users' lock screens read "RELAY_EVENT".
+// A fallback that only fires on a caller bug is exactly the one nobody sees
+// until it is in front of a user, so it says something a human can act on.
+function apsAlert(banner) {
+  const title = typeof banner?.title === "string" && banner.title.trim()
+    ? banner.title.trim()
+    : "Relay";
+  const body = typeof banner?.body === "string" && banner.body.trim()
+    ? banner.body.trim()
+    : null;
+  return body ? { title, body } : { title };
+}
+
 export function createApnsClient({ config, transport, now = () => Date.now() }) {
   const { keyId, teamId, bundleId, signingKeyPem, host } = config.apns;
   // Deliberately the SAME predicate main.js uses to choose the noop transport,
@@ -114,10 +134,12 @@ export function createApnsClient({ config, transport, now = () => Date.now() }) 
       : DEFAULT_APNS_TIMEOUT_MS;
   }
 
-  // kind: "silent" (background state sync) or "mutable" (user-visible, NSE
-  // rewrites the banner after fetching content from the node).
+  // kind: "silent" (background state sync) or "mutable" (user-visible).
+  // banner: {title, body} for a mutable push — see notify.js's bannerFor, which
+  //   is the single place that decides what a user reads and what therefore
+  //   becomes visible to Apple. Ignored for silent pushes.
   // Resolves to {outcome, status, reason} — see APNS_OUTCOME. Never rejects.
-  async function send({ deviceToken, kind, category, payload, collapseId }) {
+  async function send({ deviceToken, kind, category, payload, collapseId, banner }) {
     // BEFORE any JWT work, and the reason is the header block below: it
     // interpolates providerToken() while building `headers`, which happens
     // outside the try/catch that guards the transport. With no signing key,
@@ -139,7 +161,11 @@ export function createApnsClient({ config, transport, now = () => Date.now() }) 
       kind === "silent"
         ? { "content-available": 1 }
         : {
-            alert: { "loc-key": "RELAY_EVENT" }, // placeholder; NSE rewrites
+            alert: apsAlert(banner),
+            // Kept set even though nothing rewrites the banner today: a
+            // Notification Service Extension added later can replace this text
+            // with something fetched from the node over mTLS, at which point
+            // the names can come back out of the payload.
             "mutable-content": 1,
             category: category || "RELAY_EVENT",
           };

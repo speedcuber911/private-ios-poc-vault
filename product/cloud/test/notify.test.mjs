@@ -710,9 +710,15 @@ test("pushes carry ids and event types only — never prompts, paths or names", 
         "ts",
         "type",
       ]);
-      // The visible banner is a placeholder; the NSE rewrites it from the
-      // node over mTLS.
-      assert.deepEqual(push.body.aps.alert, { "loc-key": "RELAY_EVENT" });
+      // A job banner is a FIXED string — the cloud holds no job titles, and
+      // nothing the node attached to the event may reach it. The SECRETS loop
+      // above already proves the negative; this pins the positive, so a future
+      // change that starts interpolating event fields into the banner fails
+      // here rather than only on a payload that happens to name a secret.
+      assert.deepEqual(push.body.aps.alert, {
+        title: "Waiting on you",
+        body: "A run needs your approval to continue.",
+      });
       assert.deepEqual(Object.keys(push.body).sort(), ["aps", "relay"]);
     }
 
