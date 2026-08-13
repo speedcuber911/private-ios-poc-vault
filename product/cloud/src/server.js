@@ -17,6 +17,7 @@
 import { createServer } from "node:http";
 import { readFileSync } from "node:fs";
 import { timingSafeEqual, randomBytes, createHash } from "node:crypto";
+import { serializeSignedCookie } from "better-call";
 import { createDb } from "./db.js";
 import { createRegistry } from "./registry.js";
 import { createAuth, createAppleJwksFetcher } from "./auth.js";
@@ -149,6 +150,24 @@ export function createApp({
       accountId: trial.accountId,
       reason,
     });
+  }
+
+  // Web device-code redemption: Better Auth 1.6.26 has no auth.api.createSession.
+  // The same user id as registry.getAccount is the Better Auth user id for
+  // password sign-ups (ensureRelayAccount). Cookie name is better-auth.session_token.
+  async function mintBetterAuthSessionCookie(userId) {
+    const ctx = await auth.betterAuth.$context;
+    const session = await ctx.internalAdapter.createSession(userId);
+    if (!session?.token) return null;
+    return serializeSignedCookie(
+      ctx.authCookies.sessionToken.name,
+      session.token,
+      ctx.secret,
+      {
+        ...ctx.authCookies.sessionToken.attributes,
+        maxAge: ctx.sessionConfig.expiresIn,
+      },
+    );
   }
 
   // Second chance at sandboxes an earlier pass could not destroy. Cheap and
@@ -418,6 +437,7 @@ export function createApp({
             clientIp,
             machineName,
             platform,
+            client: body?.client === "web" ? "web" : "cli",
           });
           break;
         } catch (err) {
@@ -444,6 +464,15 @@ export function createApp({
       if (!record || record.consumedAt !== null) return sendJson(res, 400, { error: "invalid_grant" });
       if (record.expiresAt <= now()) return sendJson(res, 400, { error: "expired_token" });
       if (record.accountId === null) return sendJson(res, 400, { error: "authorization_pending" });
+      if (record.client === "web") {
+        const consumed = registry.consumeDeviceCode(record.id);
+        if (!consumed) return sendJson(res, 400, { error: "invalid_grant" });
+        const account = registry.getAccount(consumed.accountId);
+        if (!account) return sendJson(res, 400, { error: "invalid_grant" });
+        const cookie = await mintBetterAuthSessionCookie(account.id);
+        if (!cookie) return sendJson(res, 400, { error: "invalid_grant" });
+        return sendJson(res, 200, { accountId: account.id }, { "set-cookie": cookie });
+      }
       const connected = registry.connectCliComputer(record.id);
       if (!connected) return sendJson(res, 400, { error: "invalid_grant" });
       const account = registry.getAccount(connected.record.accountId);
@@ -830,11 +859,10 @@ export function createApp({
       // approved all return the identical 404. Always performs the user-code
       // lookup (no short-circuit that would skip the hash/index read on a
       // malformed code) so timing does not separate failure classes.
+      // Occupied-slot 409 is after classification: web codes must succeed
+      // while a CLI computer is already linked.
       if (!allowDeviceInspect(account.id, now())) {
         return sendJson(res, 429, { error: "rate_limited" });
-      }
-      if (registry.getCliComputerLink(account.id)) {
-        return sendJson(res, 409, { error: "computer_already_linked" });
       }
       const body = await readJson(req, config.jsonBodyMaxBytes);
       const userCode = normalizeUserCode(body?.userCode);
@@ -847,23 +875,34 @@ export function createApp({
       ) {
         return sendJson(res, 404, { error: "unknown_user_code" });
       }
+      if (record.client !== "web" && registry.getCliComputerLink(account.id)) {
+        return sendJson(res, 409, { error: "computer_already_linked" });
+      }
       return sendJson(res, 200, {
         machineName: record.machineName,
         platform: record.platform,
         createdAt: record.createdAt,
         expiresAt: record.expiresAt,
+        client: record.client,
       });
     }
 
     if (method === "POST" && path === "/v1/auth/device/approve") {
-      if (registry.getCliComputerLink(account.id)) {
-        return sendJson(res, 409, { error: "computer_already_linked" });
-      }
       const body = await readJson(req, config.jsonBodyMaxBytes);
       const userCode = normalizeUserCode(body?.userCode);
       const record = userCode ? registry.getDeviceCodeByUserCode(userCode) : null;
       if (!record || record.consumedAt !== null || record.expiresAt <= now()) {
         return sendJson(res, 404, { error: "unknown_user_code" });
+      }
+      if (record.client === "web") {
+        const approved = registry.approveDeviceCodeForWebSession(record.id, account.id);
+        if (approved.status !== "approved") {
+          return sendJson(res, 404, { error: "unknown_user_code" });
+        }
+        return sendJson(res, 200, { ok: true });
+      }
+      if (registry.getCliComputerLink(account.id)) {
+        return sendJson(res, 409, { error: "computer_already_linked" });
       }
       // The registry reserves the account's unique computer row and approves
       // the code in one transaction. A stale UI or two simultaneous approval
@@ -1224,9 +1263,9 @@ export function createApp({
 
 // ── helpers ───────────────────────────────────────────────────────────────
 
-function sendJson(res, status, payload) {
+function sendJson(res, status, payload, extraHeaders = {}) {
   if (status === 204 || payload === null) {
-    res.writeHead(status === 204 ? 204 : status, baseHeaders());
+    res.writeHead(status === 204 ? 204 : status, { ...baseHeaders(), ...extraHeaders });
     return res.end();
   }
   const body = JSON.stringify(payload);
@@ -1234,6 +1273,7 @@ function sendJson(res, status, payload) {
     ...baseHeaders(),
     "content-type": "application/json; charset=utf-8",
     "content-length": Buffer.byteLength(body),
+    ...extraHeaders,
   });
   res.end(body);
 }
@@ -1530,6 +1570,6 @@ function normalizeDevicePlatform(value) {
   if (typeof value !== "string") return null;
   const raw = value.trim().toLowerCase();
   if (!raw) return null;
-  if (raw === "macos" || raw === "linux" || raw === "windows" || raw === "other") return raw;
+  if (raw === "macos" || raw === "linux" || raw === "windows" || raw === "other" || raw === "web") return raw;
   return "other";
 }
