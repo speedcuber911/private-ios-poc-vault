@@ -1,0 +1,14 @@
+{
+  "name": "relay-grant-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Loopback grant gateway: verify Ed25519 browser grants and proxy allowlisted activity reads to a node.",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/*.test.mjs"
+  }
+}
