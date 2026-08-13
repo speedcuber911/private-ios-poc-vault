@@ -832,21 +832,6 @@ enum AppConfiguration {
         infoKey: "POCVaultCodexBaseURL",
         fallback: "https://codex.pocs.conformal.live"
     )
-    /// True only when someone deliberately pointed this install at a personal
-    /// machine, via `support/vault-config.json`.
-    ///
-    /// `codexBaseURL` always resolves to something, because the build setting
-    /// is its last resort — so "we have a base URL" has never meant "we have a
-    /// machine". A trial user who signs out reverts to that build default and
-    /// the app then talks to whatever host happens to be baked in, reporting
-    /// its failures as if the user's own machine were broken. It surfaced as
-    /// `The server "codex.pocs.conformal.live" did not accept the certificate`
-    /// on an account whose only machine was a trial, against a host that had
-    /// been decommissioned.
-    static let hasConfiguredPersonalInstall: Bool = {
-        (supportConfig?.codexBaseURL?.trimmedNonEmpty) != nil
-    }()
-
     // The control plane that owns accounts AND trials. It must be the box the
     // trial routes are deployed to — pointing this at a relay-cloud without
     // trial config does not degrade to "no trial", it 403s from the mTLS-gated
@@ -858,6 +843,27 @@ enum AppConfiguration {
     )
     static let runtimeMode = "Relay Cloud"
 #endif
+
+    /// True only when someone deliberately pointed this install at a personal
+    /// machine, via `support/vault-config.json`.
+    ///
+    /// `codexBaseURL` always resolves to something, because the build setting
+    /// is its last resort — so "we have a base URL" has never meant "we have a
+    /// machine". A trial user who signs out reverts to that build default and
+    /// the app then talks to whatever host happens to be baked in, reporting
+    /// its failures as if the user's own machine were broken. It surfaced as
+    /// `The server "codex.pocs.conformal.live" did not accept the certificate`
+    /// on an account whose only machine was a trial, against a host that had
+    /// been decommissioned.
+    ///
+    /// Declared OUTSIDE the build branches, not inside `#else`: it reads only
+    /// `supportConfig`, which both branches share, and `RelayNodeStore.hasMachine`
+    /// references it unconditionally. Defined in one branch only, it compiled
+    /// for the device and broke every simulator build — which is also the
+    /// build the handoff states get exercised from.
+    static let hasConfiguredPersonalInstall: Bool = {
+        (supportConfig?.codexBaseURL?.trimmedNonEmpty) != nil
+    }()
 
     static let trustedManifestPublicKey = configuredPublicKey(
         supportValue: supportConfig?.manifestPublicKey,
