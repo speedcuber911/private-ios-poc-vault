@@ -54,10 +54,15 @@ ExperimentalWarning on Node 22 is expected.
 | `POST /v1/auth/refresh` | none | rotating single-use refresh tokens |
 | `POST /v1/auth/magic-link/request` | none | always 202/400 — no enumeration |
 | `POST /v1/auth/magic-link/confirm` | none | `{token}` → session |
+| `POST /v1/auth/device/start` | none | `{client: "cli"\|"web"}` (default `cli`) → device code; `verificationUri` from `DEVICE_LOGIN_URL` |
+| `POST /v1/auth/device/token` | none | `cli`: session JWT + computer slot. `web`: Better Auth cookie, no CLI slot |
+| `POST /v1/auth/device/inspect` | session | lookup-first; returns `client`; `computer_already_linked` only for `cli` |
+| `POST /v1/auth/device/approve` | session | lookup-first; web may approve while a CLI computer is already linked |
 | `POST /v1/waitlist` | none | `{email}`; idempotent |
 | `GET /v1/account` | session | account + entitlements |
 | `POST/GET /v1/devices`, `PATCH/DELETE /v1/devices/:id` | session | `apnsToken`, `platform`, `name`, `certSerials` |
 | `POST/GET /v1/nodes`, `GET/DELETE /v1/nodes/:id` | session | create is entitlement-gated (`nodes.max`) and validates the ed25519 pubkey |
+| `POST /v1/nodes/:id/browser-grants` | session | `{ grant, expiresIn: 900, gatewayUrl }`; Ed25519 (`alg: EdDSA`); 503 if grant keys or `GRANT_GATEWAY_URL` unset |
 | `POST /v1/trial-nodes` | session | body `{pairingId, pairingSecret}`; provisions a trial sandbox for the account; 404 `trial_unavailable` when no provisioner is configured, 409 `trial_already_used` (unless the account's existing trial is `failed`, in which case it's retried in place), 503 `trial_capacity`, 502 `provision_failed` |
 | `GET/DELETE /v1/trial-nodes/current` | session | poll trial state, or tear it down early (kills the sandbox, deletes the node) |
 | `POST /v1/trial-nodes/enroll` | single-use enroll token (`{token}` in body) | the sandbox's own bootstrap call — registers its node identity, burns the token, returns `{ok, sni}` |
@@ -184,6 +189,57 @@ The cloud never parses blob contents; they are stored as bytes and returned
 verbatim. The CSR⇄cert exchange runs end-to-end between device and node —
 compromise of this box cannot mint access to any node. Sessions expire after
 15 minutes (`PAIRING_TTL_SEC`) and are physically deleted by the sweep.
+
+### Device-code login (`cli` | `web`)
+
+One mechanism, two clients. `POST /v1/auth/device/start` accepts
+`client: "cli"` (default) or `"web"`. The CLI occupies the account's single
+computer slot. The web client mints a Better Auth session cookie and does
+not take that slot.
+
+`POST /v1/auth/device/inspect` and `/approve` look up the code first.
+Unknown, expired, consumed, and already-approved codes all return the same
+404. `computer_already_linked` (409) is only for `cli` — a web code can be
+inspected and approved while a CLI computer is already linked.
+
+`verificationUri` / `verificationUriComplete` are built from
+`DEVICE_LOGIN_URL`. If that env is unset, `config.js` falls back to
+`https://relay.example/cli-login` and `relay login` QR-encodes the same
+dead domain. The `/cli-login` page now exists in `product/web`; pointing
+the host at `https://<app-origin>/cli-login` is still an operator step.
+The user code rides in the URL hash so it never hits access logs.
+
+Web token redemption (`POST /v1/auth/device/token` with `client: "web"`)
+sets a Better Auth cookie (`SameSite=None`; `Secure` only when
+`BETTER_AUTH_URL` is https). `RELAY_WEB_ORIGINS` (comma-separated) is
+appended to Better Auth `trustedOrigins` so the browser origin can send
+that cookie.
+
+### Browser activity grants
+
+The cloud signs short-lived Ed25519 JWTs (`alg: EdDSA`) that authorize
+read-only activity through the grant gateway. Signing is public-key only:
+`BROWSER_GRANT_PRIVATE_KEY` (PKCS8 PEM) stays on the control-plane host;
+`BROWSER_GRANT_PUBLIC_KEY` (raw 32-byte base64url) is what nodes verify
+against.
+
+`POST /v1/nodes/:id/browser-grants` (session) returns
+`{ grant, expiresIn: 900, gatewayUrl }` for a node owned by the account,
+or an identical 404 for unknown and cross-account ids. Claims: `sub`,
+`node`, `scope` (`jobs.read`, `threads.read`, `events.read`), `iat`,
+`exp`, `jti`. Grants are unrevocable until `exp`.
+
+`BROWSER_GRANT_PRIVATE_KEY`, `BROWSER_GRANT_PUBLIC_KEY`, and
+`GRANT_GATEWAY_URL` must be set together or the route 503s
+`grants_unavailable` and trial `enroll.json` omits `grantPublicKey`
+(existing phones keep working). When present, enroll.json includes
+`grantPublicKey`; trial `start.sh` writes `RELAYD_GRANT_PUBLIC_KEY` and
+`RELAYD_NODE_ID` into mode-0600 `runtime.env`.
+
+The grant gateway (`product/grant-gateway`) listens on `127.0.0.1:8791`.
+TLS and nginx live on the **broker host**, as a sibling
+`gateway.<api-zone>`. Do not terminate on poc-ec2. Do not put the raw
+broker on 80/443.
 
 ### Trial sandboxes
 
@@ -422,6 +478,23 @@ zone is in `deploy/relay-cloud-rate-limit.conf`. The broker's
 `*.tun.<domain>` listener is TLS **passthrough** and entirely separate — never
 terminate tunnel TLS here.
 
+### Web console (operator env)
+
+`product/web` is a Vite+React app (login, phone QR, `/cli-login`,
+provisioning, machines, activity). Do **not** deploy it via CodeCommit
+`relay-cloud` or `ops/deploy-poc`.
+
+Operator checklist (names and URL shapes only; generate values on the
+host and never commit them):
+
+1. Generate an Ed25519 grant keypair on the control-plane host; set
+   `BROWSER_GRANT_PRIVATE_KEY` / `BROWSER_GRANT_PUBLIC_KEY`.
+2. Set `DEVICE_LOGIN_URL=https://<app-origin>/cli-login`.
+3. Set `RELAY_WEB_ORIGINS=https://<app-origin>`.
+4. Set `GRANT_GATEWAY_URL=https://gateway.<api-zone>`.
+5. Deploy the gateway unit + nginx on the broker host.
+6. Do not deploy web via CodeCommit `relay-cloud` or `ops/deploy-poc`.
+
 ### AWS-native CI/CD
 
 `deploy/relay-cloud-cicd.yml` provisions a dedicated CodeCommit repository,
@@ -511,9 +584,11 @@ Stubbed / deferred (production work items):
   headless-installer flow (node creates the session via a short enroll code
   printed by `install.sh`) is not built; W2's enrollment work defines it.
 - **Postgres DAL**: SQLite only; the registry API is the seam.
-- **Billing / web dashboard**: out of W3 scope, not present. (The trial
-  sandbox provisioner itself is now real — see "Real, tested" above; that is
-  provisioning, not billing.)
+- **Billing**: out of W3 scope. The authenticated web console lives in
+  `product/web` (login, machines, waitlist, activity) and is **not**
+  shipped through this service's CodeCommit `relay-cloud` path or
+  `ops/deploy-poc`. (The trial sandbox provisioner itself is now real —
+  see "Real, tested" above; that is provisioning, not billing.)
 - **Admin surface**: read-only node list only.
 - **IaC**: the CodeCommit/CodeBuild/CodePipeline/SSM release path and its
   buckets/roles are CloudFormation-managed. The pre-existing VPC, EC2,
