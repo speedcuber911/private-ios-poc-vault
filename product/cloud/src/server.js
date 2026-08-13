@@ -892,6 +892,11 @@ export function createApp({
         apnsToken: strOrNull(body.apnsToken),
         platform: strOrNull(body.platform),
         name: strOrNull(body.name),
+        // Which APNs environment this build's token belongs to. Anything
+        // outside the two Apple values is stored as NULL rather than rejected:
+        // an app that cannot determine its own environment must still be able
+        // to register, and NULL falls back to the configured host.
+        apnsEnvironment: cleanApnsEnvironment(body.apnsEnvironment),
         certSerials: Array.isArray(body.certSerials)
           ? body.certSerials.map(String)
           : [],
@@ -912,6 +917,7 @@ export function createApp({
         if ("apnsToken" in body) patch.apnsToken = strOrNull(body.apnsToken);
         if ("platform" in body) patch.platform = strOrNull(body.platform);
         if ("name" in body) patch.name = strOrNull(body.name);
+        if ("apnsEnvironment" in body) patch.apnsEnvironment = cleanApnsEnvironment(body.apnsEnvironment);
         if ("certSerials" in body) {
           patch.certSerials = Array.isArray(body.certSerials)
             ? body.certSerials.map(String)
@@ -1356,6 +1362,17 @@ function isValidHandoffBranch(branch) {
 // the CLI as 16 hex characters, accepted here up to 64 so a future longer id
 // is not a breaking change. One constant, three call sites (create, ack,
 // fail-report) — previously two copies of the same literal.
+// Apple names exactly two APNs environments. A device reports its own so each
+// push goes to the host that token is valid for; anything else becomes NULL,
+// which means "unknown" and falls back to the configured APNS_HOST.
+const APNS_ENVIRONMENTS = new Set(["development", "production"]);
+
+function cleanApnsEnvironment(value) {
+  if (typeof value !== "string") return null;
+  const cleaned = value.trim().toLowerCase();
+  return APNS_ENVIRONMENTS.has(cleaned) ? cleaned : null;
+}
+
 const HANDOFF_ID_RE = /^[a-f0-9]{16,64}$/;
 
 // The CLOSED vocabulary `reason` may hold once a handoff reaches `failed`.

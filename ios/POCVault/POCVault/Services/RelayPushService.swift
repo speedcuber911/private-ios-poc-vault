@@ -80,7 +80,8 @@ final class RelayPushService: NSObject, ObservableObject, UNUserNotificationCent
         request.httpBody = try? JSONSerialization.data(withJSONObject: [
             "apnsToken": Self.hexToken(from: token),
             "platform": "ios",
-            "name": UIDevice.current.name
+            "name": UIDevice.current.name,
+            "apnsEnvironment": Self.apnsEnvironment
         ])
 
         do {
@@ -107,6 +108,37 @@ final class RelayPushService: NSObject, ObservableObject, UNUserNotificationCent
     nonisolated static func hexToken(from token: Data) -> String {
         token.map { String(format: "%02x", $0) }.joined()
     }
+
+    /// Which APNs environment this build's device token is valid against.
+    ///
+    /// A token only works against the environment that minted it. Send a
+    /// TestFlight token to the sandbox host (or the reverse) and Apple answers
+    /// `400 BadDeviceToken`, which looks exactly like a dead token — the cloud
+    /// used to delete it on that basis, and one wrong `APNS_HOST` wiped every
+    /// token on the account. The server now routes per device, but only if the
+    /// device says which one it is.
+    ///
+    /// Read from the embedded provisioning profile's `aps-environment`
+    /// entitlement, which is the authority: it is what Apple actually issued
+    /// the token under. `#if DEBUG` is NOT that authority — a Release build
+    /// installed from Xcode still gets a development token, and would lie.
+    ///
+    /// App Store builds ship no `embedded.mobileprovision`; that absence only
+    /// happens for App Store distribution, which is always production.
+    static let apnsEnvironment: String = {
+        guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
+              let raw = try? Data(contentsOf: url) else {
+            return "production" // no profile ⇒ App Store build
+        }
+        // The file is CMS-wrapped; the embedded plist is plain XML inside it,
+        // so scan for the entitlement rather than decoding the signature.
+        guard let text = String(data: raw, encoding: .ascii),
+              let range = text.range(of: "<key>aps-environment</key>") else {
+            return "production"
+        }
+        let tail = text[range.upperBound...].prefix(200)
+        return tail.contains("<string>development</string>") ? "development" : "production"
+    }()
 
     /// Pure routing, so the contract is testable without a device.
     nonisolated static func route(from userInfo: [AnyHashable: Any]) -> RelayPushRoute {
