@@ -46,6 +46,7 @@
 		200000000000000000000040 /* RelayTrialNode.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000044 /* RelayTrialNode.swift */; };
 		200000000000000000000041 /* RelayTrialPairing.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000045 /* RelayTrialPairing.swift */; };
 		200000000000000000000042 /* TrialPairingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000046 /* TrialPairingTests.swift */; };
+		2000000000000000000000A1 /* TrialMaterialPersistenceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1000000000000000000000A1 /* TrialMaterialPersistenceTests.swift */; };
 		200000000000000000000043 /* RelayTrialClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000047 /* RelayTrialClient.swift */; };
 		200000000000000000000044 /* RelayNodeStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000048 /* RelayNodeStore.swift */; };
 		200000000000000000000045 /* RelayTrialFlowModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000049 /* RelayTrialFlowModel.swift */; };
@@ -116,6 +117,7 @@
 		100000000000000000000044 /* RelayTrialNode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayTrialNode.swift; sourceTree = "<group>"; };
 		100000000000000000000045 /* RelayTrialPairing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayTrialPairing.swift; sourceTree = "<group>"; };
 		100000000000000000000046 /* TrialPairingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrialPairingTests.swift; sourceTree = "<group>"; };
+		1000000000000000000000A1 /* TrialMaterialPersistenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrialMaterialPersistenceTests.swift; sourceTree = "<group>"; };
 		100000000000000000000047 /* RelayTrialClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayTrialClient.swift; sourceTree = "<group>"; };
 		100000000000000000000048 /* RelayNodeStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayNodeStore.swift; sourceTree = "<group>"; };
 		100000000000000000000049 /* RelayTrialFlowModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayTrialFlowModel.swift; sourceTree = "<group>"; };
@@ -192,6 +194,7 @@
 				100000000000000000000003 /* ManifestTests.swift */,
 				100000000000000000000043 /* AccountTests.swift */,
 				100000000000000000000046 /* TrialPairingTests.swift */,
+				1000000000000000000000A1 /* TrialMaterialPersistenceTests.swift */,
 				100000000000000000000063 /* HandoffTests.swift */,
 				100000000000000000000067 /* CLILinkTests.swift */,
 			);
@@ -470,6 +473,7 @@
 				200000000000000000000002 /* ManifestTests.swift in Sources */,
 				200000000000000000000039 /* AccountTests.swift in Sources */,
 				200000000000000000000042 /* TrialPairingTests.swift in Sources */,
+				2000000000000000000000A1 /* TrialMaterialPersistenceTests.swift in Sources */,
 				200000000000000000000063 /* HandoffTests.swift in Sources */,
 				200000000000000000000067 /* CLILinkTests.swift in Sources */,
 			);
