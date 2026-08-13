@@ -31,18 +31,86 @@ function defaultModelCatalog() {
   // extracted from. It leaked to every user of every node, describing a routing
   // detail that is not true of this product and means nothing to them. The
   // provider is the `claude` harness adapter; Bedrock was never involved.
+  // Two kinds of entry, on purpose.
+  //
+  // The first of each provider carries NO taskModel: it runs the harness on
+  // whatever model the CLI itself defaults to. That entry is the safety net —
+  // it cannot break because of a model name this account is not entitled to,
+  // and it is what a node advertised before named models existed here.
+  //
+  // The rest name a model via `taskModel`, which is what gives the app a model
+  // list to choose from after picking a provider. A default install used to
+  // advertise one row per harness and nothing else, so there was no model
+  // choice at all and — for Codex, which had no effortLevels either — no
+  // effort choice. The names mirror the personal install's CODEX_MODEL_CATALOG
+  // (ops/init-install-config), because it is the same harness authenticated
+  // with the same user's credentials; an install that needs a different set
+  // still overrides the whole catalog through CODEX_MODEL_CATALOG.
+  //
+  // effortLevels is what the app renders as the effort picker
+  // (RelayChatViewModel.availableEfforts). Codex had none, so its picker was
+  // always empty.
   const catalog = [
     {
       id: "codex-cli",
       label: "Codex CLI",
       provider: "codex",
       modes: ["task"],
+      effortLevels: ["low", "medium", "high", "xhigh"],
+    },
+    {
+      id: "codex-gpt-5.6-sol",
+      label: "Codex · GPT-5.6 Sol",
+      provider: "codex",
+      modes: ["task"],
+      taskModel: "gpt-5.6-sol",
+      effortLevels: ["low", "medium", "high", "xhigh"],
+    },
+    {
+      id: "codex-gpt-5.6-terra",
+      label: "Codex · GPT-5.6 Terra",
+      provider: "codex",
+      modes: ["task"],
+      taskModel: "gpt-5.6-terra",
+      effortLevels: ["low", "medium", "high", "xhigh"],
+    },
+    {
+      id: "codex-gpt-5.6-luna",
+      label: "Codex · GPT-5.6 Luna",
+      provider: "codex",
+      modes: ["task"],
+      taskModel: "gpt-5.6-luna",
+      effortLevels: ["low", "medium", "high", "xhigh"],
     },
     {
       id: "claude-code",
       label: "Claude Code",
       provider: "claude",
       modes: ["task"],
+      effortLevels: ["low", "medium", "high"],
+    },
+    {
+      id: "claude-code-sonnet",
+      label: "Claude Code · Sonnet",
+      provider: "claude",
+      modes: ["task"],
+      taskModel: "sonnet",
+      effortLevels: ["low", "medium", "high"],
+    },
+    {
+      id: "claude-code-opus",
+      label: "Claude Code · Opus",
+      provider: "claude",
+      modes: ["task"],
+      taskModel: "opus",
+      effortLevels: ["low", "medium", "high"],
+    },
+    {
+      id: "claude-code-haiku",
+      label: "Claude Code · Haiku",
+      provider: "claude",
+      modes: ["task"],
+      taskModel: "haiku",
       effortLevels: ["low", "medium", "high"],
     },
   ];
