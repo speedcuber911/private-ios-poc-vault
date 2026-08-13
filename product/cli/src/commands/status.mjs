@@ -1,6 +1,7 @@
 // relay status — what happened to this repository's handoffs.
 import { createCloudApi, DEFAULT_BASE_URL } from "../cloud.mjs";
 import { readCredentials } from "../creds.mjs";
+import { noopProgress } from "../progress.mjs";
 import { requireGitHubRepo } from "../repo.mjs";
 
 function age(createdAt) {
@@ -12,14 +13,23 @@ function age(createdAt) {
 }
 
 async function cmdStatus(args = [], deps = {}) {
-  const { home = undefined, cwd = process.cwd(), baseUrl = DEFAULT_BASE_URL, fetchImpl = fetch, log = console.log } = deps;
+  const {
+    home = undefined, cwd = process.cwd(), baseUrl = DEFAULT_BASE_URL, fetchImpl = fetch,
+    log = console.log, progress = noopProgress,
+  } = deps;
 
   const credentials = readCredentials({ home });
   if (!credentials?.sessionToken) throw new Error("not_logged_in: run relay login first");
 
   const repo = await requireGitHubRepo({ cwd });
-  const api = createCloudApi({ baseUrl, sessionToken: credentials.sessionToken, fetchImpl });
-  const result = await api.listHandoffs(repo.fullName);
+  const api = createCloudApi({
+    baseUrl,
+    sessionToken: credentials.sessionToken,
+    refreshToken: credentials.refreshToken,
+    home,
+    fetchImpl,
+  });
+  const result = await progress.run("Fetching handoffs", () => api.listHandoffs(repo.fullName));
   if (result.status !== 200) throw new Error(`status_failed_${result.status}`);
 
   const handoffs = [...(result.json?.handoffs || [])].sort((left, right) => right.createdAt - left.createdAt);

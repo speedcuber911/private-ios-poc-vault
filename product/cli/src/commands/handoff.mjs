@@ -18,6 +18,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 import { createCloudApi, DEFAULT_BASE_URL } from "../cloud.mjs";
+import { noopProgress } from "../progress.mjs";
 import { readCredentials } from "../creds.mjs";
 import { requireGitHubRepo, workingTreeSummary, git } from "../repo.mjs";
 import { discoverSessions, readSessionBytes, sessionExcerpt } from "../sessions.mjs";
@@ -260,6 +261,9 @@ async function cmdHandoff(args = [], deps = {}) {
     home = undefined, cwd = process.cwd(), baseUrl = DEFAULT_BASE_URL, fetchImpl = fetch,
     log = console.log, machine = os.hostname(), now = () => Date.now(),
     execFileImpl = execFileAsync, env: envOverride = undefined,
+    // Silent by default so every existing test stays quiet; bin/relay passes a
+    // real one. Progress writes to stderr and never through `log`.
+    progress = noopProgress,
     // Test-only: force a specific handoff id so a collision (local or
     // remote) can be constructed deterministically instead of waiting on a
     // crypto.randomBytes clash that is never expected to happen for real.
@@ -274,7 +278,39 @@ async function cmdHandoff(args = [], deps = {}) {
 
   const repo = await requireGitHubRepo({ cwd, execFileImpl });
   const realRoot = fs.realpathSync(repo.root);
-  const wip = await workingTreeSummary({ root: repo.root, execFileImpl });
+  const willPush = !args.includes("--no-push");
+
+  const api = createCloudApi({
+    baseUrl,
+    sessionToken: credentials.sessionToken,
+    refreshToken: credentials.refreshToken,
+    home,
+    fetchImpl,
+  });
+
+  // Pre-flight, before ANY work: an unregistered repo makes the cloud reject
+  // the handoff at the very last step, after a branch has already been pushed
+  // to GitHub — and a rejected handoff is never recorded, so nothing will ever
+  // collect it. That is not a recoverable state, it is litter on the remote
+  // plus a user told to wait for something that cannot arrive. Skipped for
+  // --no-push, which never contacts the cloud at all.
+  if (willPush) {
+    const repos = await progress.run("Checking this repository is registered",
+      () => api.listRepos());
+    if (repos.status === 200) {
+      const known = (repos.json?.repos || []).some((entry) => entry?.fullName === repo.fullName);
+      if (!known) {
+        throw new Error(`repo_not_registered: run \`relay init\` in this repository first (${repo.fullName})`);
+      }
+    }
+    // A non-200 is deliberately NOT fatal: the probe is here to catch the
+    // predictable misconfiguration, not to add a new way for handoff to fail.
+    // If the cloud is unhappy for some other reason, the create call below
+    // reports it with the real error rather than this one guessing.
+  }
+
+  const wip = await progress.run("Inspecting your working tree",
+    () => workingTreeSummary({ root: repo.root, execFileImpl }));
 
   const requestedId = flagValue(args, "--session");
   const sessions = discoverSessions({ cwd: realRoot, home });
@@ -313,8 +349,10 @@ async function cmdHandoff(args = [], deps = {}) {
   if (await refExistsLocally(repo.root, ref, execFileImpl)) {
     throw new Error(`branch_collision: ${branch} already exists locally`);
   }
-  const willPush = !args.includes("--no-push");
-  if (willPush && await refExistsOnRemote(repo.root, branch, execFileImpl)) {
+  // A network round trip to origin, and the first place a handoff can stall
+  // for a noticeable time (a slow remote, an ssh key prompt, a VPN).
+  if (willPush && await progress.run("Checking origin for a name collision",
+    () => refExistsOnRemote(repo.root, branch, execFileImpl))) {
     throw new Error(`branch_collision: ${branch} already exists on origin`);
   }
 
@@ -365,22 +403,32 @@ async function cmdHandoff(args = [], deps = {}) {
     // control, because it cannot be: it does not know about a key the user
     // never thought to ignore, and it does not apply at all to a tracked file
     // that was filled in locally.
-    const candidates = parsePorcelainZ(
+    const candidates = await progress.run("Scanning changed files", async () => parsePorcelainZ(
       (await gitPlumbing(repo.root,
         ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { env })).toString("utf8"),
-    );
+    ));
     const allowed = candidates.filter((entry) => !isSecretPath(entry));
     const withheld = candidates.filter((entry) => isSecretPath(entry));
+    // Deliberately outside any progress step: reportWithheld writes to stdout
+    // while the spinner is on stderr, and on a terminal that is one screen —
+    // printing into a live animation interleaves the two.
     // Said before anything is committed, and said on every path out of here —
     // a handoff that quietly leaves a file behind is its own kind of failure.
     reportWithheld(withheld, log);
 
+    // Phase markers from here down use start() rather than run(): each phase's
+    // results are consts the following phases read, and wrapping them in
+    // closures would mean re-scoping half this function to add a spinner. A
+    // later start() supersedes the previous one, and the finally below stops
+    // whichever was last.
+    progress.start("Staging your working tree");
     // Batched so a repo with tens of thousands of changed paths cannot blow
     // the argv limit; 200 matches relayd's own batch size.
     for (let index = 0; index < allowed.length; index += 200) {
       await gitPlumbing(repo.root, ["add", "--", ...allowed.slice(index, index + 200)], { env });
     }
 
+    progress.start("Sealing your session");
     const manifestSha = await gitPlumbingText(repo.root, ["hash-object", "-w", "--stdin"], {
       env, input: sealTo(credentials.nodeEncPubkey, Buffer.from(JSON.stringify(manifest), "utf8")),
     });
@@ -430,6 +478,7 @@ async function cmdHandoff(args = [], deps = {}) {
       );
     }
 
+    progress.start("Preparing the handoff branch");
     const treeSha = await gitPlumbingText(repo.root, ["write-tree"], { env });
 
     let commitSha;
@@ -453,25 +502,42 @@ async function cmdHandoff(args = [], deps = {}) {
     }
 
     if (!willPush) {
+      // stop() before any log: the spinner is on stderr and this is stdout,
+      // but on a terminal they share one screen.
+      progress.stop();
       log(`  Prepared ${branch} locally. Nothing was pushed and no notification was sent.`);
     } else {
+      // The slowest step by far, and the one that made the command look hung.
+      progress.start(`Pushing ${branch} to GitHub`);
       // No --force, ever: a rejected (non-fast-forward) push must fail
       // loudly rather than overwrite whatever is already on the remote ref.
       await git(repo.root, ["push", "-q", "origin", `${ref}:${ref}`], execFileImpl);
       pushed = true;
     }
   } finally {
+    // Whichever phase was last, running or failed, ends here.
+    progress.stop();
     fs.rmSync(tmpIndexDir, { recursive: true, force: true });
   }
 
   if (!pushed) return { handoffId, branch, pushed: false };
 
-  const api = createCloudApi({ baseUrl, sessionToken: credentials.sessionToken, fetchImpl });
-  const ping = await api.createHandoff({ handoffId, repo: repo.fullName, branch, nodeId: credentials.nodeId });
+  const ping = await progress.run("Notifying your machine",
+    () => api.createHandoff({ handoffId, repo: repo.fullName, branch, nodeId: credentials.nodeId }));
   if (ping.status !== 201) {
-    log(`  Pushed ${branch}, but the notification failed (${ping.json?.error || ping.status}).`);
-    log("  Your machine will still pick it up on its next poll.");
-    return { handoffId, branch, pushed: true };
+    // This used to say "Your machine will still pick it up on its next poll."
+    // It cannot. The node's poll leases handoff ROWS from the cloud, and a
+    // rejected create wrote no row — so there is nothing to lease, now or
+    // ever. Saying otherwise left a user waiting on a phone that was never
+    // going to light up, with a branch on GitHub that nothing would consume.
+    const reason = ping.json?.error || ping.status;
+    log(`  Pushed ${branch}, but the cloud rejected the handoff (${reason}).`);
+    log("  Your machine will NOT pick this up — it only ever collects handoffs");
+    log("  the cloud recorded, and this one was not recorded.");
+    if (reason === "unknown_repo") log("  Run `relay init` in this repository, then hand off again.");
+    if (reason === "unknown_node") log("  Run `relay login` to re-pin this machine, then hand off again.");
+    log(`  The pushed branch is unused; delete it with: git push origin --delete ${branch}`);
+    return { handoffId, branch, pushed: true, notified: false, reason: String(reason) };
   }
 
   // Keep the phone's "On your Mac" list current. Best-effort by design: the
@@ -491,10 +557,12 @@ async function cmdHandoff(args = [], deps = {}) {
   // something fixable from here.
   try {
     const { publishSessionIndex } = await import("./syncauth.mjs");
-    await publishSessionIndex({
+    // run(), so the spinner is already stopped by the time the catch below
+    // logs.
+    await progress.run("Updating the session list", () => publishSessionIndex({
       repoFullName: repo.fullName, root: realRoot, home: home || os.homedir(),
       api, nodeId: credentials.nodeId, nodeEncPubkey: credentials.nodeEncPubkey, machine,
-    });
+    }));
   } catch (err) {
     log(`  Note: could not update the "On your Mac" session list (${err?.message || "unknown error"}).`);
     log("  Your handoff still succeeded; run `relay sync-auth` to refresh the index.");

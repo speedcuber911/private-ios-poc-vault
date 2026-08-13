@@ -21,31 +21,39 @@ function fail(message, code = 1) {
   process.exit(code);
 }
 
+// One progress instance for the process, created lazily so `relay help` still
+// touches nothing. Commands take it as a dependency and default to a no-op, so
+// tests stay silent without opting out of anything.
+async function withProgress() {
+  const { createProgress } = await import("../src/progress.mjs");
+  return createProgress();
+}
+
 try {
   switch (command) {
     case "login": {
       const { cmdLogin } = await import("../src/commands/login.mjs");
-      await cmdLogin(rest);
+      await cmdLogin(rest, { progress: await withProgress() });
       break;
     }
     case "init": {
       const { cmdInit } = await import("../src/commands/init.mjs");
-      await cmdInit(rest);
+      await cmdInit(rest, { progress: await withProgress() });
       break;
     }
     case "handoff": {
       const { cmdHandoff } = await import("../src/commands/handoff.mjs");
-      await cmdHandoff(rest);
+      await cmdHandoff(rest, { progress: await withProgress() });
       break;
     }
     case "sync-auth": {
       const { cmdSyncAuth } = await import("../src/commands/syncauth.mjs");
-      await cmdSyncAuth(rest);
+      await cmdSyncAuth(rest, { progress: await withProgress() });
       break;
     }
     case "status": {
       const { cmdStatus } = await import("../src/commands/status.mjs");
-      await cmdStatus(rest);
+      await cmdStatus(rest, { progress: await withProgress() });
       break;
     }
     case undefined:

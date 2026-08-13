@@ -155,12 +155,23 @@ function ensureDeviceCodeClientIpColumn(db) {
   db.exec("CREATE INDEX IF NOT EXISTS idx_device_codes_client_ip ON device_codes (client_ip, expires_at)");
 }
 
+// Non-destructive guard for existing databases that predate the QR CLI auth
+// handoff machine metadata columns on device_codes.
+function ensureDeviceCodeMachineColumns(db) {
+  const columns = db.prepare("PRAGMA table_info(device_codes)").all();
+  if (columns.length === 0) return;
+  const names = new Set(columns.map((column) => column.name));
+  if (!names.has("machine_name")) db.exec("ALTER TABLE device_codes ADD COLUMN machine_name TEXT");
+  if (!names.has("platform")) db.exec("ALTER TABLE device_codes ADD COLUMN platform TEXT");
+}
+
 export function createRegistry(db, { now = () => Date.now() } = {}) {
   ensureAuthSchema(db);
   ensureNodeEventSchema(db);
   ensureNodeEncColumn(db);
   ensureHandoffLeaseColumns(db);
   ensureDeviceCodeClientIpColumn(db);
+  ensureDeviceCodeMachineColumns(db);
 
   // ── accounts ────────────────────────────────────────────────────────────
   function createAccount({ id = randomUUID(), appleSub = null, email = null }) {
@@ -749,11 +760,20 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
   }
 
   // ── device codes (CLI login) ────────────────────────────────────────────
-  function createDeviceCode({ deviceCodeHash, userCode, expiresAt, clientIp = null }) {
+  function createDeviceCode({
+    deviceCodeHash,
+    userCode,
+    expiresAt,
+    clientIp = null,
+    machineName = null,
+    platform = null,
+  }) {
     const id = randomUUID();
     db.prepare(
-      "INSERT INTO device_codes (id, device_code_hash, user_code, expires_at, created_at, client_ip) VALUES (?, ?, ?, ?, ?, ?)",
-    ).run(id, deviceCodeHash, userCode, expiresAt, now(), clientIp);
+      `INSERT INTO device_codes
+         (id, device_code_hash, user_code, expires_at, created_at, client_ip, machine_name, platform)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(id, deviceCodeHash, userCode, expiresAt, now(), clientIp, machineName, platform);
     return mapDeviceCode(db.prepare("SELECT * FROM device_codes WHERE id = ?").get(id));
   }
 
@@ -1364,6 +1384,8 @@ function mapDeviceCode(row) {
     expiresAt: Number(row.expires_at),
     createdAt: Number(row.created_at),
     clientIp: row.client_ip ?? null,
+    machineName: row.machine_name ?? null,
+    platform: row.platform ?? null,
   };
 }
 

@@ -162,7 +162,13 @@ CREATE TABLE IF NOT EXISTS device_codes (
   -- per-IP live-code ceiling — see countLiveDeviceCodesForIp in registry.js
   -- and config.deviceCodeMaxLivePerIp. The global ceiling alone let one
   -- attacker holding DEVICE_CODE_MAX_LIVE codes deny every other login.
-  client_ip TEXT
+  client_ip TEXT,
+  -- Advisory machine identity the CLI self-reports on /device/start. Shown
+  -- on the phone confirm sheet before approve; never authenticated — the
+  -- confirm copy carries the weight. Nullable so older rows and starts that
+  -- omit the fields still work.
+  machine_name TEXT,
+  platform TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_device_codes_expires ON device_codes (expires_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_device_codes_user_code ON device_codes (user_code);
