@@ -232,6 +232,40 @@ function ensureDeviceCodeMachineColumns(db) {
   if (!names.has("platform")) db.exec("ALTER TABLE device_codes ADD COLUMN platform TEXT");
 }
 
+// One row per (account, push token).
+//
+// POST /v1/devices used to insert unconditionally, so a phone that registered
+// on every app launch produced a row per launch and the fanout delivered one
+// push per row — four identical "Session ready" banners for one handoff.
+//
+// The DELETE removes only exact duplicates: same account, same token, keeping
+// the most recently created row. Nothing unique is lost, because every deleted
+// row addressed the same device as the row that survives. It runs before the
+// index because the index cannot be created while duplicates exist.
+function ensureDeviceTokenUniqueness(db) {
+  const columns = db.prepare("PRAGMA table_info(devices)").all();
+  if (columns.length === 0) return;
+  db.exec(`
+    DELETE FROM devices
+     WHERE apns_token IS NOT NULL
+       AND id NOT IN (
+         SELECT id FROM (
+           SELECT id,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY account_id, apns_token
+                    ORDER BY created_at DESC, rowid DESC
+                  ) AS rn
+             FROM devices
+            WHERE apns_token IS NOT NULL
+         ) WHERE rn = 1
+       )
+  `);
+  db.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_account_token " +
+    "ON devices (account_id, apns_token) WHERE apns_token IS NOT NULL",
+  );
+}
+
 // Which APNs environment a device's token was minted for.
 //
 // A token is only valid against the environment of the build that produced it:
@@ -262,6 +296,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
   ensureDeviceCodeClientIpColumn(db);
   ensureDeviceCodeMachineColumns(db);
   ensureDeviceApnsEnvironmentColumn(db);
+  ensureDeviceTokenUniqueness(db);
 
   // ── accounts ────────────────────────────────────────────────────────────
   function createAccount({ id = randomUUID(), appleSub = null, email = null }) {
@@ -424,7 +459,31 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
   }
 
   // ── devices ─────────────────────────────────────────────────────────────
+  // Registering the same token twice is an UPDATE, not a second row.
+  //
+  // The app calls POST /v1/devices on every launch (registerForPushNotifications
+  // → handleDeviceToken), and this inserted unconditionally. One phone therefore
+  // accumulated one row per launch, and the fanout sends one push PER ROW — so a
+  // single handoff arrived as four identical banners, and one account had
+  // reached 34 rows holding 2 distinct tokens. Observed 2026-08-13.
+  //
+  // Keyed on (account_id, apns_token): the same physical device on two accounts
+  // is genuinely two rows, and the unique index in ensureDeviceTokenUniqueness
+  // makes the duplicate case unrepresentable rather than merely unlikely.
   function createDevice(accountId, { apnsToken, platform, name, certSerials, apnsEnvironment }) {
+    if (apnsToken) {
+      const existing = db
+        .prepare("SELECT * FROM devices WHERE account_id = ? AND apns_token = ?")
+        .get(accountId, apnsToken);
+      if (existing) {
+        return updateDevice(accountId, existing.id, {
+          platform: platform ?? null,
+          name: name ?? null,
+          apnsEnvironment: apnsEnvironment ?? null,
+          ...(certSerials !== undefined ? { certSerials: certSerials ?? [] } : {}),
+        });
+      }
+    }
     const id = randomUUID();
     const t = now();
     db.prepare(
