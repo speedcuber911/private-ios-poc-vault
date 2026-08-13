@@ -296,6 +296,33 @@ fs.mkdirSync(artifactsDir, { recursive: true });
 
 fs.mkdirSync(chatsDir, { recursive: true });
 
+// The harness home directories relayd NAMES in every child's environment
+// (buildJobEnv sets HOME=runHome and CODEX_HOME=codexHome).
+//
+// Codex refuses to start when CODEX_HOME does not exist:
+//
+//   Error finding codex home: CODEX_HOME points to "/home/relay/.codex",
+//   but that path does not exist
+//
+// and relayd was pointing at a directory it never created. It only ever
+// appeared to work because `relay sync-auth` creates the directory as a side
+// effect of writing auth.json — so a machine that had been synced was fine and
+// a fresh one failed every prompt. Same shape as the /usr/bin/codex default:
+// naming a path is not the same as ensuring it.
+//
+// Guarded, unlike the directories above: those are relayd's own data dir and a
+// failure there is fatal by design, but CODEX_HOME is operator-supplied on a
+// BYO install and may legitimately point somewhere this process cannot create.
+// Refusing to boot over that would be worse than letting the harness report it
+// — which it does, clearly, in the message above.
+for (const dir of [runHome, codexHome]) {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch {
+    // Left to the harness to report; see the comment above.
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Client-certificate subject allowlist (API.md §1.2).
 //
