@@ -439,10 +439,11 @@ export function createApp({
       if (!record || record.consumedAt !== null) return sendJson(res, 400, { error: "invalid_grant" });
       if (record.expiresAt <= now()) return sendJson(res, 400, { error: "expired_token" });
       if (record.accountId === null) return sendJson(res, 400, { error: "authorization_pending" });
-      if (!registry.consumeDeviceCode(record.id)) return sendJson(res, 400, { error: "invalid_grant" });
-      const account = registry.getAccount(record.accountId);
+      const connected = registry.connectCliComputer(record.id);
+      if (!connected) return sendJson(res, 400, { error: "invalid_grant" });
+      const account = registry.getAccount(connected.record.accountId);
       if (!account) return sendJson(res, 400, { error: "invalid_grant" });
-      return sendJson(res, 200, auth.issueSession(account));
+      return sendJson(res, 200, auth.issueSession(account, { cliLinkId: connected.link.id }));
     }
 
     // ── waitlist (public) ───────────────────────────────────────────────
@@ -803,6 +804,20 @@ export function createApp({
     const account = await auth.authenticate(req);
     if (!account) return sendJson(res, 401, { error: "unauthorized" });
 
+    if (path === "/v1/auth/device/link" && method === "GET") {
+      return sendJson(res, 200, {
+        computer: publicCliComputer(registry.getCliComputerLink(account.id)),
+      });
+    }
+
+    if (path === "/v1/auth/device/link" && method === "DELETE") {
+      const disconnected = registry.disconnectCliComputer(account.id);
+      return sendJson(res, 200, {
+        ok: true,
+        disconnected: publicCliComputer(disconnected),
+      });
+    }
+
     if (method === "POST" && path === "/v1/auth/device/inspect") {
       // Read-only twin of /device/approve: returns the CLI-reported machine
       // name so the phone can show a confirm sheet before approving. Same
@@ -812,6 +827,9 @@ export function createApp({
       // malformed code) so timing does not separate failure classes.
       if (!allowDeviceInspect(account.id, now())) {
         return sendJson(res, 429, { error: "rate_limited" });
+      }
+      if (registry.getCliComputerLink(account.id)) {
+        return sendJson(res, 409, { error: "computer_already_linked" });
       }
       const body = await readJson(req, config.jsonBodyMaxBytes);
       const userCode = normalizeUserCode(body?.userCode);
@@ -833,21 +851,26 @@ export function createApp({
     }
 
     if (method === "POST" && path === "/v1/auth/device/approve") {
+      if (registry.getCliComputerLink(account.id)) {
+        return sendJson(res, 409, { error: "computer_already_linked" });
+      }
       const body = await readJson(req, config.jsonBodyMaxBytes);
       const userCode = normalizeUserCode(body?.userCode);
       const record = userCode ? registry.getDeviceCodeByUserCode(userCode) : null;
       if (!record || record.consumedAt !== null || record.expiresAt <= now()) {
         return sendJson(res, 404, { error: "unknown_user_code" });
       }
-      // Approval is one-shot, and the decision is the registry's atomic
-      // UPDATE, not the read above: a code already bound to an account — this
-      // one or anyone else's — must fail rather than be silently rebound.
-      // Same 404 as every other refusal, so nothing here tells a caller
-      // whether the code exists, is already approved, or was never real.
-      if (!registry.approveDeviceCode(record.id, account.id)) {
+      // The registry reserves the account's unique computer row and approves
+      // the code in one transaction. A stale UI or two simultaneous approval
+      // requests therefore cannot create a second linked computer.
+      const approved = registry.approveDeviceCodeForCliLink(record.id, account.id);
+      if (approved.status === "link_exists") {
+        return sendJson(res, 409, { error: "computer_already_linked" });
+      }
+      if (approved.status !== "approved") {
         return sendJson(res, 404, { error: "unknown_user_code" });
       }
-      return sendJson(res, 200, { ok: true });
+      return sendJson(res, 200, { ok: true, computer: publicCliComputer(approved.link) });
     }
 
     if (method === "GET" && path === "/v1/account") {
@@ -1375,6 +1398,18 @@ function publicTrial(trial, config, registry) {
     sni: trial.nodeId && config.tunnel.suffix ? `${trial.nodeId}${config.tunnel.suffix}` : null,
     createdAt: trial.createdAt,
     expiresAt: trial.expiresAt,
+  };
+}
+
+function publicCliComputer(link) {
+  if (!link) return null;
+  return {
+    id: link.id,
+    machineName: link.machineName,
+    platform: link.platform,
+    status: link.connectedAt === null ? "connecting" : "connected",
+    connectedAt: link.connectedAt,
+    createdAt: link.createdAt,
   };
 }
 

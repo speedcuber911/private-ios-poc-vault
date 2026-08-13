@@ -39,8 +39,8 @@ struct CLILinkScannerView: View {
             confirmBody(machineName: machineName, platform: platform)
         case .approving:
             statusBody(title: "Linking", detail: "Approving this computer…")
-        case .linked:
-            linkedBody
+        case .approved(let machineName):
+            approvedBody(machineName: machineName)
         case .failed(let reason):
             failedBody(reason: reason)
         }
@@ -152,13 +152,13 @@ struct CLILinkScannerView: View {
         .frame(maxWidth: .infinity)
     }
 
-    private var linkedBody: some View {
+    private func approvedBody(machineName: String?) -> some View {
         VStack(spacing: 16) {
             Spacer()
-            Text("Computer linked")
+            Text("Link approved")
                 .font(AppTheme.serifFont(size: 28))
                 .foregroundStyle(AppTheme.textPrimary)
-            Text("This computer can use `relay handoff` with your Relay account.")
+            Text(approvalDetail(machineName))
                 .font(AppTheme.uiFont(size: 15))
                 .foregroundStyle(AppTheme.textSecondary)
                 .multilineTextAlignment(.center)
@@ -167,6 +167,11 @@ struct CLILinkScannerView: View {
                 .buttonStyle(RelayPrimaryButtonStyle(isEnabled: true))
         }
         .padding(24)
+    }
+
+    private func approvalDetail(_ machineName: String?) -> String {
+        let computer = machineName?.isEmpty == false ? machineName! : "the computer"
+        return "Finish `relay login` on \(computer). Account & Settings will show Connected after it receives access."
     }
 
     private func failedBody(reason: String) -> some View {

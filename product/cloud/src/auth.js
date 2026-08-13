@@ -62,7 +62,7 @@ export function createAuth({
     registry.setEntitlement(account.id, "nodes.max", String(config.defaultMaxNodes));
   }
 
-  function issueSession(account) {
+  function issueSession(account, { cliLinkId = null } = {}) {
     const iat = Math.floor(now() / 1000);
     const sessionToken = signHS256(
       {
@@ -75,6 +75,10 @@ export function createAuth({
         // rejects the token once the account's epoch moves past it, which is
         // what lets revokeAll() reach sessions that are already in the wild.
         sep: registry.getSessionEpoch(account.id),
+        // CLI sessions are capabilities for one explicitly linked computer.
+        // authenticate() checks that this exact link still exists, so the
+        // phone can disconnect it immediately without revoking phone sessions.
+        ...(cliLinkId ? { cli: cliLinkId } : {}),
       },
       config.sessionSecret,
     );
@@ -82,6 +86,7 @@ export function createAuth({
     registry.insertRefreshToken({
       accountId: account.id,
       tokenHash: sha256hex(refreshToken), // hashed at rest; the plaintext only ever leaves in this response
+      cliLinkId,
       expiresAt: now() + config.refreshTtlSec * 1000,
     });
     return {
@@ -255,14 +260,28 @@ export function createAuth({
       // thief's copy dies with it. Session JWTs are deliberately left alone —
       // they expire on their own within minutes and this signal can also fire
       // on a benign client retry. Owner-triggered revokeAll() drops those too.
-      registry.revokeAllRefreshTokens(record.accountId);
+      if (record.cliLinkId) {
+        // A replay inside the computer's refresh chain disconnects that one
+        // computer. It must not sign the phone (Better Auth) or unrelated
+        // legacy clients out, and deleting the link also kills live CLI JWTs.
+        registry.disconnectCliComputer(record.accountId, record.cliLinkId);
+      } else {
+        registry.revokeAllRefreshTokens(record.accountId);
+      }
       return null;
     }
     if (record.expiresAt <= now()) return null;
     const account = registry.getAccount(record.accountId);
     if (!account) return null;
+    if (record.cliLinkId) {
+      const link = registry.getCliComputerLinkById(record.cliLinkId);
+      if (!link || link.accountId !== account.id || link.connectedAt === null) {
+        registry.revokeRefreshToken(record.id);
+        return null;
+      }
+    }
     registry.revokeRefreshToken(record.id); // rotation: single use
-    return issueSession(account);
+    return issueSession(account, { cliLinkId: record.cliLinkId });
   }
 
   // Owner-triggered sign-out-everywhere: drops every refresh token AND
@@ -331,6 +350,11 @@ export function createAuth({
     if (!account) return null;
     const sep = typeof payload.sep === "number" ? payload.sep : 0;
     if (sep < registry.getSessionEpoch(account.id)) return null; // revoked
+    if (payload.cli !== undefined) {
+      if (typeof payload.cli !== "string" || !payload.cli) return null;
+      const link = registry.getCliComputerLinkById(payload.cli);
+      if (!link || link.accountId !== account.id || link.connectedAt === null) return null;
+    }
     return account;
   }
 

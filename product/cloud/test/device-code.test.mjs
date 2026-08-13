@@ -1,5 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import { createDb } from "../src/db.js";
 import { createRegistry } from "../src/registry.js";
@@ -10,6 +14,10 @@ const start = (t) => api(t.baseUrl, "POST", "/v1/auth/device/start", { body: {} 
 const poll = (t, deviceCode) => api(t.baseUrl, "POST", "/v1/auth/device/token", { body: { deviceCode } });
 const approve = (t, sessionToken, userCode) =>
   api(t.baseUrl, "POST", "/v1/auth/device/approve", { body: { userCode }, ...authed(sessionToken) });
+const linkedComputer = (t, sessionToken) =>
+  api(t.baseUrl, "GET", "/v1/auth/device/link", authed(sessionToken));
+const disconnectComputer = (t, sessionToken) =>
+  api(t.baseUrl, "DELETE", "/v1/auth/device/link", authed(sessionToken));
 
 test("full device-code flow: start, poll pending, approve, poll returns a session", async () => {
   const t = await startTestApp();
@@ -52,10 +60,18 @@ test("full device-code flow: start, poll pending, approve, poll returns a sessio
       "sanity: this fixture must actually contain a letter to exercise the case fold");
     assert.equal((await approve(t, session.sessionToken, started.json.userCode.toLowerCase())).status, 200);
 
+    const connecting = await linkedComputer(t, session.sessionToken);
+    assert.equal(connecting.status, 200);
+    assert.equal(connecting.json.computer.status, "connecting");
+
     const granted = await poll(t, started.json.deviceCode);
     assert.equal(granted.status, 200);
     assert.equal(granted.json.accountId, session.accountId);
     assert.ok(granted.json.sessionToken.length > 0);
+
+    const connected = await linkedComputer(t, session.sessionToken);
+    assert.equal(connected.json.computer.status, "connected");
+    assert.equal(typeof connected.json.computer.connectedAt, "number");
   } finally { await t.close(); }
 });
 
@@ -288,13 +304,134 @@ test("an approved code cannot be rebound to a second account", async () => {
 // Re-approval by the SAME account must fail too: an approval is a transition,
 // not an idempotent write, and "who approved it" must not decide whether the
 // second write lands.
-test("even the approving account cannot approve the same code twice", async () => {
+test("an account with a reserved computer slot cannot approve another code", async () => {
   const t = await startTestApp();
   try {
     const started = await start(t);
     const session = await signIn(t);
     assert.equal((await approve(t, session.sessionToken, started.json.userCode)).status, 200);
-    assert.equal((await approve(t, session.sessionToken, started.json.userCode)).status, 404);
+    const second = await start(t);
+    const refused = await approve(t, session.sessionToken, second.json.userCode);
+    assert.equal(refused.status, 409);
+    assert.equal(refused.json.error, "computer_already_linked");
+    assert.equal((await poll(t, second.json.deviceCode)).json.error, "authorization_pending");
+  } finally { await t.close(); }
+});
+
+test("disconnect revokes the linked computer and frees the one-computer slot", async () => {
+  const t = await startTestApp();
+  try {
+    const phone = await signIn(t);
+    const first = await start(t);
+    assert.equal((await approve(t, phone.sessionToken, first.json.userCode)).status, 200);
+    const cli = await poll(t, first.json.deviceCode);
+    assert.equal(cli.status, 200);
+
+    assert.equal((await api(t.baseUrl, "GET", "/v1/account", authed(cli.json.sessionToken))).status, 200);
+    const removed = await disconnectComputer(t, phone.sessionToken);
+    assert.equal(removed.status, 200);
+    assert.equal(removed.json.disconnected.status, "connected");
+    assert.equal((await linkedComputer(t, phone.sessionToken)).json.computer, null);
+
+    assert.equal(
+      (await api(t.baseUrl, "GET", "/v1/account", authed(cli.json.sessionToken))).status,
+      401,
+      "disconnect left the computer's live session usable",
+    );
+    const refreshed = await api(t.baseUrl, "POST", "/v1/auth/refresh", {
+      body: { refreshToken: cli.json.refreshToken },
+    });
+    assert.equal(refreshed.status, 401, "disconnect left the computer's refresh token usable");
+
+    const replacement = await start(t);
+    assert.equal((await approve(t, phone.sessionToken, replacement.json.userCode)).status, 200);
+    assert.equal((await poll(t, replacement.json.deviceCode)).status, 200);
+  } finally { await t.close(); }
+});
+
+test("disconnecting a pending approval prevents its computer from redeeming", async () => {
+  const t = await startTestApp();
+  try {
+    const phone = await signIn(t);
+    const started = await start(t);
+    assert.equal((await approve(t, phone.sessionToken, started.json.userCode)).status, 200);
+    assert.equal((await linkedComputer(t, phone.sessionToken)).json.computer.status, "connecting");
+
+    assert.equal((await disconnectComputer(t, phone.sessionToken)).status, 200);
+    const denied = await poll(t, started.json.deviceCode);
+    assert.equal(denied.status, 400);
+    assert.equal(denied.json.error, "invalid_grant");
+  } finally { await t.close(); }
+});
+
+test("an expired pending approval frees the computer slot", async () => {
+  const t = await startTestApp({ env: { DEVICE_CODE_TTL_SEC: "1" } });
+  try {
+    const phone = await signIn(t);
+    const started = await start(t);
+    assert.equal((await approve(t, phone.sessionToken, started.json.userCode)).status, 200);
+    assert.equal((await linkedComputer(t, phone.sessionToken)).json.computer.status, "connecting");
+
+    t.clock.t += 2_000;
+    t.app.runSweeps();
+    assert.equal((await linkedComputer(t, phone.sessionToken)).json.computer, null);
+
+    const replacement = await start(t);
+    assert.equal((await approve(t, phone.sessionToken, replacement.json.userCode)).status, 200);
+  } finally { await t.close(); }
+});
+
+test("replaying a CLI refresh token disconnects only that computer", async () => {
+  const t = await startTestApp();
+  try {
+    const phone = await signIn(t);
+    const started = await start(t);
+    await approve(t, phone.sessionToken, started.json.userCode);
+    const cli = await poll(t, started.json.deviceCode);
+    const rotated = await api(t.baseUrl, "POST", "/v1/auth/refresh", {
+      body: { refreshToken: cli.json.refreshToken },
+    });
+    assert.equal(rotated.status, 200);
+
+    const replayed = await api(t.baseUrl, "POST", "/v1/auth/refresh", {
+      body: { refreshToken: cli.json.refreshToken },
+    });
+    assert.equal(replayed.status, 401);
+    assert.equal((await linkedComputer(t, phone.sessionToken)).json.computer, null);
+    assert.equal((await api(t.baseUrl, "GET", "/v1/account", authed(phone.sessionToken))).status, 200);
+    assert.equal((await api(t.baseUrl, "GET", "/v1/account", authed(rotated.json.sessionToken))).status, 401);
+    assert.equal(
+      (await api(t.baseUrl, "POST", "/v1/auth/refresh", {
+        body: { refreshToken: rotated.json.refreshToken },
+      })).status,
+      401,
+    );
+  } finally { await t.close(); }
+});
+
+test("replaying an old computer token cannot disconnect its replacement", async () => {
+  const t = await startTestApp();
+  try {
+    const phone = await signIn(t);
+    const first = await start(t);
+    await approve(t, phone.sessionToken, first.json.userCode);
+    const oldCli = await poll(t, first.json.deviceCode);
+    await disconnectComputer(t, phone.sessionToken);
+
+    const second = await start(t);
+    await approve(t, phone.sessionToken, second.json.userCode);
+    const replacement = await poll(t, second.json.deviceCode);
+    const current = await linkedComputer(t, phone.sessionToken);
+    assert.equal(current.json.computer.status, "connected");
+
+    assert.equal(
+      (await api(t.baseUrl, "POST", "/v1/auth/refresh", {
+        body: { refreshToken: oldCli.json.refreshToken },
+      })).status,
+      401,
+    );
+    assert.equal((await linkedComputer(t, phone.sessionToken)).json.computer.id, current.json.computer.id);
+    assert.equal((await api(t.baseUrl, "GET", "/v1/account", authed(replacement.json.sessionToken))).status, 200);
   } finally { await t.close(); }
 });
 
@@ -441,14 +578,16 @@ test("deleting an account destroys its device codes", () => {
   const record = registry.createDeviceCode({
     deviceCodeHash: "a".repeat(64), userCode: "BCDF-GHJK", expiresAt: clock.t + 900_000,
   });
-  assert.notEqual(registry.approveDeviceCode(record.id, account.id), null);
+  assert.equal(registry.approveDeviceCodeForCliLink(record.id, account.id).status, "approved");
   assert.equal(registry.getDeviceCodeByHash("a".repeat(64)).accountId, account.id);
+  assert.notEqual(registry.getCliComputerLink(account.id), null);
 
   registry.deleteAccount(account.id);
   assert.equal(registry.getDeviceCodeByHash("a".repeat(64)), null);
+  assert.equal(registry.getCliComputerLink(account.id), null);
 });
 
-test("approveDeviceCode reports whether the transition happened", () => {
+test("approveDeviceCodeForCliLink binds one code to one account", () => {
   const clock = { t: 1_800_000_000_000 };
   const registry = createRegistry(createDb(":memory:"), { now: () => clock.t });
   const first = registry.createAccount({ appleSub: "apple-1", email: "a@example.com" });
@@ -457,8 +596,12 @@ test("approveDeviceCode reports whether the transition happened", () => {
     deviceCodeHash: "b".repeat(64), userCode: "BCDF-GHJK", expiresAt: clock.t + 900_000,
   });
 
-  assert.equal(registry.approveDeviceCode(record.id, first.id).accountId, first.id);
-  assert.equal(registry.approveDeviceCode(record.id, second.id), null, "a second approval overwrote the first");
+  assert.equal(registry.approveDeviceCodeForCliLink(record.id, first.id).status, "approved");
+  assert.equal(
+    registry.approveDeviceCodeForCliLink(record.id, second.id).status,
+    "invalid_code",
+    "a second approval overwrote the first",
+  );
   assert.equal(registry.getDeviceCodeByHash("b".repeat(64)).accountId, first.id);
 });
 
@@ -466,30 +609,31 @@ test("approveDeviceCode reports whether the transition happened", () => {
 // The route's re-use check makes this invisible over HTTP — the server is
 // single-threaded and nothing awaits between the read and the consume — so
 // the property has to be pinned where it actually lives.
-test("consumeDeviceCode is a one-time transition", () => {
+test("connectCliComputer is a one-time transition", () => {
   const clock = { t: 1_800_000_000_000 };
   const registry = createRegistry(createDb(":memory:"), { now: () => clock.t });
   const account = registry.createAccount({ appleSub: "apple-1", email: "a@example.com" });
   const record = registry.createDeviceCode({
     deviceCodeHash: "e".repeat(64), userCode: "BCDF-GHJK", expiresAt: clock.t + 900_000,
   });
-  registry.approveDeviceCode(record.id, account.id);
+  registry.approveDeviceCodeForCliLink(record.id, account.id);
 
-  assert.equal(registry.consumeDeviceCode(record.id), true);
-  assert.equal(registry.consumeDeviceCode(record.id), false, "a device code was redeemed twice");
-  assert.equal(registry.consumeDeviceCode(record.id), false);
+  assert.notEqual(registry.connectCliComputer(record.id), null);
+  assert.equal(registry.connectCliComputer(record.id), null, "a device code was redeemed twice");
+  assert.equal(registry.connectCliComputer(record.id), null);
 });
 
-test("a redeemed code cannot be approved, whoever asks", () => {
+test("a disconnected pending code cannot be redeemed or approved", () => {
   const clock = { t: 1_800_000_000_000 };
   const registry = createRegistry(createDb(":memory:"), { now: () => clock.t });
   const account = registry.createAccount({ appleSub: "apple-1", email: "a@example.com" });
   const record = registry.createDeviceCode({
     deviceCodeHash: "f".repeat(64), userCode: "BCDF-GHJK", expiresAt: clock.t + 900_000,
   });
-  assert.equal(registry.consumeDeviceCode(record.id), true);
-  assert.equal(registry.approveDeviceCode(record.id, account.id), null, "a redeemed code was approved");
-  assert.equal(registry.getDeviceCodeByHash("f".repeat(64)).accountId, null);
+  assert.equal(registry.approveDeviceCodeForCliLink(record.id, account.id).status, "approved");
+  registry.disconnectCliComputer(account.id);
+  assert.equal(registry.connectCliComputer(record.id), null);
+  assert.equal(registry.getDeviceCodeByHash("f".repeat(64)), null);
 });
 
 test("a consumed device code does not linger past the next sweep", () => {
@@ -499,8 +643,8 @@ test("a consumed device code does not linger past the next sweep", () => {
   const record = registry.createDeviceCode({
     deviceCodeHash: "c".repeat(64), userCode: "BCDF-GHJK", expiresAt: clock.t + 900_000,
   });
-  registry.approveDeviceCode(record.id, account.id);
-  assert.equal(registry.consumeDeviceCode(record.id), true);
+  registry.approveDeviceCodeForCliLink(record.id, account.id);
+  assert.notEqual(registry.connectCliComputer(record.id), null);
 
   registry.sweepDeviceCodes(clock.t);
   assert.equal(registry.getDeviceCodeByUserCode("BCDF-GHJK"), null, "a redeemed row pinned its user_code");
@@ -517,6 +661,74 @@ test("mapDeviceCode returns numbers for the integer columns", () => {
   assert.equal(record.accountId, null);
   assert.equal(record.approvedAt, null);
   assert.equal(record.consumedAt, null);
+});
+
+test("createDb adds CLI link columns to a pre-existing database idempotently", () => {
+  const dir = mkdtempSync(join(tmpdir(), "relay-cli-link-migration-"));
+  const file = join(dir, "relay.db");
+  try {
+    const legacy = new DatabaseSync(file);
+    legacy.exec(`
+      CREATE TABLE refresh_tokens (
+        id TEXT PRIMARY KEY, account_id TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
+        expires_at INTEGER NOT NULL, revoked_at INTEGER, created_at INTEGER NOT NULL
+      );
+      CREATE TABLE device_codes (
+        id TEXT PRIMARY KEY, device_code_hash TEXT NOT NULL, user_code TEXT NOT NULL,
+        account_id TEXT, approved_at INTEGER, consumed_at INTEGER, expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL, client_ip TEXT, machine_name TEXT, platform TEXT
+      );
+    `);
+    legacy.close();
+
+    for (let open = 0; open < 2; open++) {
+      const migrated = createDb(file);
+      const refreshColumns = migrated.prepare("PRAGMA table_info(refresh_tokens)").all().map((c) => c.name);
+      const deviceCodeColumns = migrated.prepare("PRAGMA table_info(device_codes)").all().map((c) => c.name);
+      assert.equal(refreshColumns.filter((name) => name === "cli_link_id").length, 1);
+      assert.equal(deviceCodeColumns.filter((name) => name === "cli_link_id").length, 1);
+      assert.equal(
+        migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cli_computer_links'").get().name,
+        "cli_computer_links",
+      );
+      migrated.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("single-computer upgrade revokes untracked legacy CLI credentials exactly once", () => {
+  const clock = { t: 1_800_000_000_000 };
+  const db = createDb(":memory:");
+  db.prepare(
+    "INSERT INTO accounts (id, apple_sub, email, created_at) VALUES (?, ?, ?, ?)",
+  ).run("account-1", "apple-1", "a@example.com", clock.t - 10_000);
+  db.prepare(
+    `INSERT INTO refresh_tokens
+       (id, account_id, token_hash, cli_link_id, expires_at, revoked_at, created_at)
+     VALUES (?, ?, ?, NULL, ?, NULL, ?)`,
+  ).run("refresh-1", "account-1", "a".repeat(64), clock.t + 900_000, clock.t - 5_000);
+  db.prepare(
+    `INSERT INTO device_codes
+       (id, device_code_hash, user_code, account_id, cli_link_id, approved_at,
+        consumed_at, expires_at, created_at, client_ip, machine_name, platform)
+     VALUES (?, ?, ?, ?, NULL, ?, NULL, ?, ?, NULL, ?, ?)`,
+  ).run(
+    "code-1", "b".repeat(64), "BCDF-GHJK", "account-1", clock.t - 4_000,
+    clock.t + 900_000, clock.t - 5_000, "old-mac", "macos",
+  );
+
+  createRegistry(db, { now: () => clock.t });
+  assert.equal(db.prepare("SELECT revoked_at FROM refresh_tokens WHERE id = 'refresh-1'").get().revoked_at, clock.t);
+  assert.equal(db.prepare("SELECT session_epoch FROM account_security WHERE account_id = 'account-1'").get().session_epoch, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM device_codes WHERE id = 'code-1'").get().n, 0);
+
+  clock.t += 10_000;
+  createRegistry(db, { now: () => clock.t });
+  assert.equal(db.prepare("SELECT revoked_at FROM refresh_tokens WHERE id = 'refresh-1'").get().revoked_at, 1_800_000_000_000);
+  assert.equal(db.prepare("SELECT session_epoch FROM account_security WHERE account_id = 'account-1'").get().session_epoch, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM relay_migrations WHERE name = 'single_cli_computer_v1'").get().n, 1);
 });
 
 // ── QR CLI auth handoff: machine metadata + inspect ───────────────────────
@@ -596,7 +808,7 @@ test("device/inspect returns machine metadata for a pending code", async () => {
   } finally { await t.close(); }
 });
 
-test("device/inspect unknown, expired, and approved codes are byte-identical 404s", async () => {
+test("device/inspect hides invalid codes and reports an occupied computer slot", async () => {
   // Short code TTL so expiry does not also kill the approver's session.
   const t = await startTestApp({ env: { DEVICE_CODE_TTL_SEC: "1" } });
   try {
@@ -615,14 +827,20 @@ test("device/inspect unknown, expired, and approved codes are byte-identical 404
     const live = await start(t);
     assert.equal((await approve(t, session.sessionToken, live.json.userCode)).status, 200);
     const approved = await inspect(t, session.sessionToken, live.json.userCode);
-    assert.equal(approved.status, 404);
-    assert.equal(JSON.stringify(approved.json), JSON.stringify(unknown.json));
-    assert.equal(approved.buf.toString("utf8"), unknown.buf.toString("utf8"));
+    assert.equal(approved.status, 409);
+    assert.equal(approved.json.error, "computer_already_linked");
 
-    // Regression: approve remains one-shot after an inspect miss on an approved code.
+    // Once the owner disconnects, the pending approved code is destroyed and
+    // becomes indistinguishable from a code that never existed.
+    assert.equal((await disconnectComputer(t, session.sessionToken)).status, 200);
+    const afterDisconnect = await inspect(t, session.sessionToken, live.json.userCode);
+    assert.equal(afterDisconnect.status, 404);
+    assert.equal(afterDisconnect.buf.toString("utf8"), unknown.buf.toString("utf8"));
+
+    // The unique slot is now free for a replacement.
     const again = await start(t);
     assert.equal((await approve(t, session.sessionToken, again.json.userCode)).status, 200);
-    assert.equal((await approve(t, session.sessionToken, again.json.userCode)).status, 404);
+    assert.equal((await approve(t, session.sessionToken, again.json.userCode)).status, 409);
   } finally { await t.close(); }
 });
 

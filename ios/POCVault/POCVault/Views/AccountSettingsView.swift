@@ -12,6 +12,12 @@ struct AccountSettingsView: View {
     @State private var isDeletingTrial = false
     @State private var trialDeleteError: String?
     @State private var showingCLILink = false
+    @State private var linkedComputer: CLIComputerLink?
+    @State private var didLoadLinkedComputer = false
+    @State private var isLoadingLinkedComputer = false
+    @State private var isDisconnectingComputer = false
+    @State private var linkedComputerError: String?
+    @State private var showingDisconnectConfirmation = false
 
     var body: some View {
         NavigationStack {
@@ -30,14 +36,52 @@ struct AccountSettingsView: View {
                     }
 
                     Section {
-                        Button("Link a computer") {
-                            showingCLILink = true
+                        if !didLoadLinkedComputer && isLoadingLinkedComputer {
+                            HStack(spacing: 10) {
+                                ProgressView()
+                                Text("Checking computer link…")
+                                    .foregroundStyle(AppTheme.textSecondary)
+                            }
+                        } else if let linkedComputer {
+                            LabeledContent("Computer", value: computerName(linkedComputer))
+                            LabeledContent("Status", value: computerStatus(linkedComputer))
+                            if let platform = linkedComputer.platform {
+                                LabeledContent("Platform", value: platformLabel(platform))
+                            }
+                            if let connectedAt = linkedComputer.connectedAt {
+                                LabeledContent(
+                                    "Connected",
+                                    value: Self.computerDateFormatter.string(
+                                        from: Date(timeIntervalSince1970: Double(connectedAt) / 1_000)
+                                    )
+                                )
+                            }
+
+                            Button("Disconnect computer", role: .destructive) {
+                                showingDisconnectConfirmation = true
+                            }
+                            .disabled(isDisconnectingComputer)
+                            .accessibilityIdentifier("relay-disconnect-computer")
+                        } else if linkedComputerError == nil {
+                            Button("Link a computer") {
+                                showingCLILink = true
+                            }
+                            .disabled(isLoadingLinkedComputer || isDisconnectingComputer)
+                            .accessibilityIdentifier("relay-link-computer")
                         }
-                        .accessibilityIdentifier("relay-link-computer")
+
+                        if let linkedComputerError {
+                            Label(linkedComputerError, systemImage: "exclamationmark.triangle.fill")
+                                .foregroundStyle(AppTheme.statusError)
+
+                            Button("Try again") {
+                                Task { await loadLinkedComputer() }
+                            }
+                        }
                     } header: {
                         Text("Computers")
                     } footer: {
-                        Text("Scan the QR code from `relay login` on your Mac or Linux machine to approve CLI access.")
+                        Text(computerFooter)
                     }
 
                     Section {
@@ -98,6 +142,9 @@ struct AccountSettingsView: View {
                 }
             }
             .scrollContentBackground(.hidden)
+            .refreshable {
+                await loadLinkedComputer()
+            }
             .background(AppTheme.bgCanvas)
             .tint(AppTheme.accent)
             .navigationTitle("Account & Settings")
@@ -125,6 +172,18 @@ struct AccountSettingsView: View {
             } message: {
                 Text("This action cannot be undone. Data on servers you own is not deleted.")
             }
+            .confirmationDialog(
+                "Disconnect \(linkedComputer.map(computerName) ?? "computer")?",
+                isPresented: $showingDisconnectConfirmation,
+                titleVisibility: .visible
+            ) {
+                Button("Disconnect computer", role: .destructive) {
+                    Task { await disconnectLinkedComputer() }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Relay will revoke this computer’s CLI access. You can link a different computer afterward.")
+            }
             .interactiveDismissDisabled(accountStore.isWorking)
             .overlay {
                 if accountStore.isWorking {
@@ -134,7 +193,9 @@ struct AccountSettingsView: View {
                     }
                 }
             }
-            .sheet(isPresented: $showingCLILink) {
+            .sheet(isPresented: $showingCLILink, onDismiss: {
+                Task { await loadLinkedComputer() }
+            }) {
                 if let bearer = accountStore.currentSessionToken {
                     CLILinkScannerView(
                         authClient: RelayAuthClient(baseURL: AppConfiguration.authBaseURL),
@@ -142,8 +203,32 @@ struct AccountSettingsView: View {
                     )
                 }
             }
+            .task {
+                await loadLinkedComputer()
+            }
+            .task(id: linkedComputer?.id) {
+                guard linkedComputer?.status == .connecting else { return }
+                for _ in 0..<30 {
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    guard !Task.isCancelled else { return }
+                    await loadLinkedComputer(showProgress: false)
+                    if linkedComputer?.status != .connecting { return }
+                }
+            }
         }
         .preferredColorScheme(.dark)
+    }
+
+    private var computerFooter: String {
+        guard let linkedComputer else {
+            return "Scan the QR code from `relay login` on your Mac or Linux machine. Only one computer can be linked at a time."
+        }
+        switch linkedComputer.status {
+        case .connecting:
+            return "Link approved. Finish `relay login` on the computer; Relay will mark it Connected when sign-in completes."
+        case .connected:
+            return "Only this computer can use `relay handoff`. Disconnect it before linking a different computer."
+        }
     }
 
     private var versionText: String {
@@ -168,6 +253,65 @@ struct AccountSettingsView: View {
         }
     }
 
+    private func loadLinkedComputer(showProgress: Bool = true) async {
+        guard let bearer = accountStore.currentSessionToken else {
+            linkedComputer = nil
+            didLoadLinkedComputer = true
+            return
+        }
+        if showProgress { isLoadingLinkedComputer = true }
+        linkedComputerError = nil
+        defer {
+            didLoadLinkedComputer = true
+            if showProgress { isLoadingLinkedComputer = false }
+        }
+        do {
+            linkedComputer = try await RelayAuthClient(
+                baseURL: AppConfiguration.authBaseURL
+            ).linkedComputer(bearerToken: bearer)
+        } catch {
+            linkedComputerError = "Relay couldn't refresh the computer link."
+        }
+    }
+
+    private func disconnectLinkedComputer() async {
+        guard let bearer = accountStore.currentSessionToken else { return }
+        isDisconnectingComputer = true
+        linkedComputerError = nil
+        defer { isDisconnectingComputer = false }
+        do {
+            try await RelayAuthClient(
+                baseURL: AppConfiguration.authBaseURL
+            ).disconnectComputer(bearerToken: bearer)
+            linkedComputer = nil
+            didLoadLinkedComputer = true
+        } catch {
+            linkedComputerError = "Relay couldn't disconnect this computer. Try again."
+        }
+    }
+
+    private func computerName(_ computer: CLIComputerLink) -> String {
+        guard let name = computer.machineName, !name.isEmpty else { return "Linked computer" }
+        return name
+    }
+
+    private func computerStatus(_ computer: CLIComputerLink) -> String {
+        switch computer.status {
+        case .connecting: return "Waiting for computer"
+        case .connected: return "Connected"
+        }
+    }
+
+    private func platformLabel(_ platform: String) -> String {
+        switch platform {
+        case "macos": return "macOS"
+        case "linux": return "Linux"
+        case "windows": return "Windows"
+        case "other": return "Other"
+        default: return platform
+        }
+    }
+
     private static func stateLabel(for state: RelayTrialNode.State) -> String {
         switch state {
         case .creating: return "Creating"
@@ -179,6 +323,13 @@ struct AccountSettingsView: View {
     }
 
     private static let expiryFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
+    private static let computerDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
         formatter.timeStyle = .short

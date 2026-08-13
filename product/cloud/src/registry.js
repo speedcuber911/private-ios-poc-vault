@@ -30,11 +30,39 @@ function isUniqueViolation(err) {
   );
 }
 
+// Registry tests and operational callers may open an older database directly
+// and then construct the registry without passing through createDb(). Keep the
+// single-computer migration safe on that path too; the declarations mirror
+// db.js and are intentionally idempotent.
+function ensureCliComputerSchema(db) {
+  const addColumnIfMissing = (table, column, declaration) => {
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+    if (columns.length > 0 && !columns.some((entry) => entry.name === column)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${declaration}`);
+    }
+  };
+  addColumnIfMissing("refresh_tokens", "cli_link_id", "cli_link_id TEXT");
+  addColumnIfMissing("device_codes", "cli_link_id", "cli_link_id TEXT");
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS cli_computer_links (
+      id           TEXT PRIMARY KEY,
+      account_id   TEXT NOT NULL UNIQUE,
+      machine_name TEXT,
+      platform     TEXT,
+      connected_at INTEGER,
+      created_at   INTEGER NOT NULL,
+      updated_at   INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_cli_computer_links_account
+      ON cli_computer_links (account_id);
+  `);
+}
+
 // Stores that hang off auth rather than off the core object model. Created
 // here, idempotently, so that opening a database provisioned from an earlier
 // schema turns these protections on rather than failing closed on first use;
 // db.js stays the canonical home for the core tables.
-function ensureAuthSchema(db) {
+function ensureAuthSchema(db, now) {
   db.exec(`
     -- Bumped by an owner-triggered "sign out everywhere". Session JWTs carry
     -- the epoch they were minted under and are rejected once it falls behind,
@@ -57,7 +85,46 @@ function ensureAuthSchema(db) {
       ON apple_token_uses (expires_at);
     CREATE INDEX IF NOT EXISTS idx_refresh_tokens_account
       ON refresh_tokens (account_id);
+
+    CREATE TABLE IF NOT EXISTS relay_migrations (
+      name        TEXT PRIMARY KEY,
+      applied_at  INTEGER NOT NULL
+    );
   `);
+  const hasDeviceCodes = Boolean(
+    db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'device_codes'",
+    ).get(),
+  );
+
+  // Device-code sessions issued before the single-computer model carry no
+  // link id, cannot be attributed to one computer, and may already exist on
+  // several computers. Revoke them exactly once at upgrade. Better Auth phone
+  // sessions live in Better Auth's own session table and are unaffected.
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const claimed = db.prepare(
+      "INSERT OR IGNORE INTO relay_migrations (name, applied_at) VALUES ('single_cli_computer_v1', ?)",
+    ).run(now());
+    if (Number(claimed.changes) > 0) {
+      db.prepare(
+        "UPDATE refresh_tokens SET revoked_at = ? WHERE cli_link_id IS NULL AND revoked_at IS NULL",
+      ).run(now());
+      db.exec(`
+        INSERT INTO account_security (account_id, session_epoch)
+          SELECT id, 1 FROM accounts WHERE true
+        ON CONFLICT (account_id) DO UPDATE
+          SET session_epoch = account_security.session_epoch + 1;
+      `);
+      if (hasDeviceCodes) {
+        db.exec("DELETE FROM device_codes WHERE account_id IS NOT NULL");
+      }
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
 }
 
 // Replay protection for node event ingest. Created here, idempotently, for the
@@ -166,7 +233,8 @@ function ensureDeviceCodeMachineColumns(db) {
 }
 
 export function createRegistry(db, { now = () => Date.now() } = {}) {
-  ensureAuthSchema(db);
+  ensureCliComputerSchema(db);
+  ensureAuthSchema(db, now);
   ensureNodeEventSchema(db);
   ensureNodeEncColumn(db);
   ensureHandoffLeaseColumns(db);
@@ -232,6 +300,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
         db.prepare("DELETE FROM magic_links WHERE email = ?").run(account.email);
       }
       db.prepare("DELETE FROM device_codes WHERE account_id = ?").run(accountId);
+      db.prepare("DELETE FROM cli_computer_links WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM repos WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM handoffs WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM sync_notices WHERE account_id = ?").run(accountId);
@@ -641,12 +710,13 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
   }
 
   // ── refresh tokens ──────────────────────────────────────────────────────
-  function insertRefreshToken({ accountId, tokenHash, expiresAt }) {
+  function insertRefreshToken({ accountId, tokenHash, expiresAt, cliLinkId = null }) {
     const id = randomUUID();
     db.prepare(
-      `INSERT INTO refresh_tokens (id, account_id, token_hash, expires_at, revoked_at, created_at)
-       VALUES (?, ?, ?, ?, NULL, ?)`,
-    ).run(id, accountId, tokenHash, expiresAt, now());
+      `INSERT INTO refresh_tokens
+         (id, account_id, token_hash, cli_link_id, expires_at, revoked_at, created_at)
+       VALUES (?, ?, ?, ?, ?, NULL, ?)`,
+    ).run(id, accountId, tokenHash, cliLinkId, expiresAt, now());
     return id;
   }
 
@@ -658,6 +728,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     return {
       id: row.id,
       accountId: row.account_id,
+      cliLinkId: row.cli_link_id ?? null,
       expiresAt: Number(row.expires_at),
       revokedAt: row.revoked_at == null ? null : Number(row.revoked_at),
     };
@@ -678,6 +749,16 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
         "UPDATE refresh_tokens SET revoked_at = ? WHERE account_id = ? AND revoked_at IS NULL",
       )
       .run(now(), accountId);
+    return Number(result.changes);
+  }
+
+  function revokeCliLinkRefreshTokens(cliLinkId) {
+    if (!cliLinkId) return 0;
+    const result = db
+      .prepare(
+        "UPDATE refresh_tokens SET revoked_at = ? WHERE cli_link_id = ? AND revoked_at IS NULL",
+      )
+      .run(now(), cliLinkId);
     return Number(result.changes);
   }
 
@@ -787,31 +868,138 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     return mapDeviceCode(db.prepare("SELECT * FROM device_codes WHERE user_code = ?").get(userCode));
   }
 
-  // Approval is a ONE-TIME transition, enforced atomically here rather than by
-  // a read-then-write in the route. Without `AND account_id IS NULL` a second
-  // account could silently rebind an already-approved code, and the victim's
-  // CLI — which sees nothing but a successful login — would receive a session
-  // for the ATTACKER's account: every later `relay handoff` targets the
-  // attacker's node, and `relay sync-auth` seals the victim's GitHub token and
-  // harness credentials to the attacker's node key. Returns null when the
-  // transition did not happen, so the caller must decide what to do about it
-  // instead of reading back a row that someone else's write may have won.
-  function approveDeviceCode(id, accountId) {
-    const result = db.prepare(
-      `UPDATE device_codes SET account_id = ?, approved_at = ?
-         WHERE id = ? AND account_id IS NULL AND consumed_at IS NULL`,
-    ).run(accountId, now(), id);
-    if (result.changes === 0) return null;
-    return mapDeviceCode(db.prepare("SELECT * FROM device_codes WHERE id = ?").get(id));
+  // Reserves the account's single computer slot and approves its device code
+  // in one transaction. The UNIQUE(account_id) constraint is the final guard
+  // against two simultaneous approvals; no read-then-write race can create a
+  // second link. `status` distinguishes a stale code from an occupied slot so
+  // the signed-in owner gets useful UI without exposing either condition to an
+  // unauthenticated caller.
+  function approveDeviceCodeForCliLink(id, accountId) {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = getCliComputerLink(accountId);
+      if (existing) {
+        db.exec("ROLLBACK");
+        return { status: "link_exists", link: existing };
+      }
+      const row = db.prepare(
+        `SELECT * FROM device_codes
+         WHERE id = ? AND account_id IS NULL AND consumed_at IS NULL AND expires_at > ?`,
+      ).get(id, now());
+      if (!row) {
+        db.exec("ROLLBACK");
+        return { status: "invalid_code" };
+      }
+
+      const linkId = randomUUID();
+      const timestamp = now();
+      db.prepare(
+        `INSERT INTO cli_computer_links
+           (id, account_id, machine_name, platform, connected_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, NULL, ?, ?)`,
+      ).run(linkId, accountId, row.machine_name, row.platform, timestamp, timestamp);
+      const updated = db.prepare(
+        `UPDATE device_codes
+         SET account_id = ?, cli_link_id = ?, approved_at = ?
+         WHERE id = ? AND account_id IS NULL AND consumed_at IS NULL AND expires_at > ?`,
+      ).run(accountId, linkId, timestamp, id, timestamp);
+      if (Number(updated.changes) !== 1) throw new Error("device_code_transition_lost");
+      db.exec("COMMIT");
+      return {
+        status: "approved",
+        record: mapDeviceCode(db.prepare("SELECT * FROM device_codes WHERE id = ?").get(id)),
+        link: getCliComputerLink(accountId),
+      };
+    } catch (err) {
+      db.exec("ROLLBACK");
+      if (isUniqueViolation(err)) {
+        return { status: "link_exists", link: getCliComputerLink(accountId) };
+      }
+      throw err;
+    }
   }
 
-  // The atomic `AND consumed_at IS NULL` is what makes redemption single-use
-  // under concurrency: two simultaneous polls on one approved code race here,
-  // and exactly one of them sees changes > 0.
-  function consumeDeviceCode(id) {
-    const result = db.prepare("UPDATE device_codes SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL")
-      .run(now(), id);
-    return result.changes > 0;
+  // Redemption and the pending→connected transition are one transaction.
+  // A code belonging to a disconnected/replaced link can never mint a session
+  // for the newer computer, even if its final poll races the disconnect.
+  function connectCliComputer(id) {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = db.prepare(
+        `SELECT * FROM device_codes
+         WHERE id = ? AND account_id IS NOT NULL AND cli_link_id IS NOT NULL
+           AND consumed_at IS NULL AND expires_at > ?`,
+      ).get(id, now());
+      if (!row) {
+        db.exec("ROLLBACK");
+        return null;
+      }
+      const link = db.prepare(
+        "SELECT * FROM cli_computer_links WHERE id = ? AND account_id = ?",
+      ).get(row.cli_link_id, row.account_id);
+      if (!link) {
+        db.exec("ROLLBACK");
+        return null;
+      }
+      const timestamp = now();
+      const consumed = db.prepare(
+        "UPDATE device_codes SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL",
+      ).run(timestamp, id);
+      if (Number(consumed.changes) !== 1) {
+        db.exec("ROLLBACK");
+        return null;
+      }
+      db.prepare(
+        `UPDATE cli_computer_links
+         SET connected_at = COALESCE(connected_at, ?), updated_at = ?
+         WHERE id = ? AND account_id = ?`,
+      ).run(timestamp, timestamp, row.cli_link_id, row.account_id);
+      db.exec("COMMIT");
+      return {
+        record: mapDeviceCode(db.prepare("SELECT * FROM device_codes WHERE id = ?").get(id)),
+        link: getCliComputerLink(row.account_id),
+      };
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  function getCliComputerLink(accountId) {
+    return mapCliComputerLink(
+      db.prepare("SELECT * FROM cli_computer_links WHERE account_id = ?").get(accountId),
+    );
+  }
+
+  function getCliComputerLinkById(id) {
+    if (!id) return null;
+    return mapCliComputerLink(
+      db.prepare("SELECT * FROM cli_computer_links WHERE id = ?").get(id),
+    );
+  }
+
+  function disconnectCliComputer(accountId, expectedLinkId = null) {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const link = getCliComputerLink(accountId);
+      // A replayed refresh token from a PREVIOUS computer must never remove a
+      // replacement linked later. The phone omits expectedLinkId and may
+      // disconnect whichever computer is current; credential-reuse handling
+      // supplies the exact link the compromised token belonged to.
+      if (!link || (expectedLinkId && link.id !== expectedLinkId)) {
+        db.exec("COMMIT");
+        return null;
+      }
+      db.prepare("DELETE FROM device_codes WHERE cli_link_id = ?").run(link.id);
+      revokeCliLinkRefreshTokens(link.id);
+      db.prepare("DELETE FROM cli_computer_links WHERE id = ? AND account_id = ?")
+        .run(link.id, accountId);
+      db.exec("COMMIT");
+      return link;
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
   }
 
   // Redeemed rows go too, not just expired ones: a consumed row holds no live
@@ -820,6 +1008,21 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
   // account_id link for the remainder of its TTL.
   function sweepDeviceCodes(nowMs) {
     db.prepare("DELETE FROM device_codes WHERE expires_at <= ? OR consumed_at IS NOT NULL").run(nowMs);
+    // An approval that was never redeemed is only a reservation for its live
+    // device code. Once that code expires, remove the pending link too so the
+    // phone cannot be stuck forever on "Waiting for computer" after a CLI was
+    // closed before completing login. Connected links intentionally survive
+    // after their one-time code is swept.
+    db.prepare(
+      `DELETE FROM cli_computer_links
+       WHERE connected_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM device_codes
+           WHERE device_codes.cli_link_id = cli_computer_links.id
+             AND device_codes.consumed_at IS NULL
+             AND device_codes.expires_at > ?
+         )`,
+    ).run(nowMs);
   }
 
   // Live = still redeemable: unconsumed and unexpired. The ceiling on
@@ -1292,6 +1495,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     findRefreshToken,
     revokeRefreshToken,
     revokeAllRefreshTokens,
+    revokeCliLinkRefreshTokens,
     countLiveRefreshTokens,
     getSessionEpoch,
     bumpSessionEpoch,
@@ -1303,8 +1507,11 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     createDeviceCode,
     getDeviceCodeByHash,
     getDeviceCodeByUserCode,
-    approveDeviceCode,
-    consumeDeviceCode,
+    approveDeviceCodeForCliLink,
+    connectCliComputer,
+    getCliComputerLink,
+    getCliComputerLinkById,
+    disconnectCliComputer,
     sweepDeviceCodes,
     countLiveDeviceCodes,
     countLiveDeviceCodesForIp,
@@ -1405,8 +1612,22 @@ function mapDeviceCode(row) {
     expiresAt: Number(row.expires_at),
     createdAt: Number(row.created_at),
     clientIp: row.client_ip ?? null,
+    cliLinkId: row.cli_link_id ?? null,
     machineName: row.machine_name ?? null,
     platform: row.platform ?? null,
+  };
+}
+
+function mapCliComputerLink(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    accountId: row.account_id,
+    machineName: row.machine_name ?? null,
+    platform: row.platform ?? null,
+    connectedAt: row.connected_at == null ? null : Number(row.connected_at),
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
   };
 }
 
