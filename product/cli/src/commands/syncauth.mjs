@@ -56,11 +56,56 @@ function readIfPresent(filePath) {
   }
 }
 
+// Claude Code stores its login in the macOS login Keychain — generic-password
+// service "Claude Code-credentials" — and NOT in ~/.claude/.credentials.json,
+// which is where it keeps it on Linux. Reading only the file meant sync-auth
+// never found a Claude login on a Mac: it reported "No Claude Code login found
+// on this machine" on a machine that was signed in and actively running Claude
+// Code, and the sandbox came up with no Anthropic credential at all. The
+// flagship harness on the flagship platform was the one that never synced.
+//
+// The blob is opaque here on purpose. Whatever the Keychain holds is exactly
+// the document relayd writes back out to .claude/.credentials.json
+// (product/relayd/src/syncauth.mjs:276-278), so this must copy it through
+// byte-for-byte rather than parse and re-serialise it — a re-serialised
+// document is a different document, and any field this CLI does not know about
+// would be silently dropped on the way.
+async function readClaudeKeychain({ execFileImpl, platform }) {
+  if (platform !== "darwin") return null;
+  let stdout;
+  try {
+    // -w prints ONLY the secret. Deliberately not -g, which writes the secret
+    // to stderr as well and would put a live credential into any terminal
+    // transcript or CI log that captured this command.
+    const result = await execFileImpl("security", [
+      "find-generic-password", "-s", "Claude Code-credentials", "-w",
+    ]);
+    stdout = typeof result?.stdout === "string" ? result.stdout : "";
+  } catch {
+    // Not signed in, no such item, or the user declined the Keychain prompt.
+    return null;
+  }
+  const blob = stdout.trim();
+  if (!blob) return null;
+  // Shipping a non-JSON blob would install a corrupt .credentials.json on the
+  // sandbox, and Claude Code would fail there for reasons no one would trace
+  // back to this function. Validate the shape, then discard the parse and send
+  // the original text.
+  try {
+    JSON.parse(blob);
+  } catch {
+    return null;
+  }
+  return blob;
+}
+
 // Never fakes a success: a harness with no portable credential on this
 // machine is reported by name in `skipped`, not silently omitted. Cursor has
 // no portable credential at all (v0), so it is never even attempted here —
 // cmdSyncAuth states its on-box login requirement unconditionally instead.
-async function collectCredentialBundle({ home = os.homedir(), execFileImpl = execFileAsync } = {}) {
+async function collectCredentialBundle({
+  home = os.homedir(), execFileImpl = execFileAsync, platform = process.platform,
+} = {}) {
   const bundle = { v: 1, kind: "sync-auth" };
   const skipped = [];
 
@@ -81,7 +126,12 @@ async function collectCredentialBundle({ home = os.homedir(), execFileImpl = exe
   if (githubToken) bundle.github = { token: githubToken };
   else skipped.push("github");
 
-  const claude = readIfPresent(path.join(home, ".claude", ".credentials.json"));
+  // File first, Keychain second. The file is the explicit choice — someone who
+  // put one there (a Linux box, or a Mac user who exported it deliberately)
+  // means it — and on macOS it simply does not exist, so the Keychain is the
+  // only path that ever finds anything.
+  const claude = readIfPresent(path.join(home, ".claude", ".credentials.json"))
+    || await readClaudeKeychain({ execFileImpl, platform });
   if (claude) bundle.claude = { credentials: claude };
   else skipped.push("claude");
 
@@ -202,7 +252,7 @@ async function cmdSyncAuth(args = [], deps = {}) {
   for (const name of installed) log(`  Sent ${name} login to your machine.`);
   for (const name of skipped) {
     if (name === "github") log("  No GitHub token found — run `gh auth login`, or create a fine-grained PAT scoped to your repo.");
-    if (name === "claude") log("  No Claude Code login found on this machine.");
+    if (name === "claude") log("  No Claude Code login found — run `claude` and sign in, then re-run this.");
     if (name === "codex") log("  No Codex login found on this machine.");
   }
   log("  Cursor has no portable login — sign in to Cursor on the machine itself.");

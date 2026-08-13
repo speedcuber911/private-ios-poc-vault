@@ -256,6 +256,47 @@ async function refExistsOnRemote(root, branch, execFileImpl) {
   }
 }
 
+// Watches a recorded handoff until the machine reaches a terminal state.
+//
+// Until this existed, `relay handoff` printed "Check your phone — it should be
+// there in a moment" and exited, having proven only that the CLOUD accepted a
+// row. Everything that decides whether the handoff actually works happens
+// after that and elsewhere: the node leases the row, clones the branch,
+// decrypts the sealed blobs, and imports the session. That takes seconds, and
+// the user was given no signal for any of it — a failed import and a perfect
+// success printed exactly the same line.
+//
+// `pending` is not success. It is the state a handoff sits in when nothing has
+// collected it, which is indistinguishable — from the desk — from a machine
+// that is switched off.
+//
+// Returns the terminal row, or {state, timedOut: true} if the budget expired.
+// Never throws: a watch that fails must not turn a completed handoff into an
+// error, so a broken listing simply keeps polling until the budget runs out.
+async function awaitTerminalState({
+  api, repo, handoffId, budgetMs, pollIntervalMs, sleepImpl, now,
+}) {
+  const deadline = now() + budgetMs;
+  let lastState = "pending";
+  for (;;) {
+    try {
+      const res = await api.listHandoffs(repo);
+      if (res.status === 200) {
+        const row = (res.json?.handoffs || []).find((entry) => entry?.id === handoffId);
+        if (row?.state) {
+          lastState = row.state;
+          if (row.state === "ready" || row.state === "failed") return row;
+        }
+      }
+    } catch {
+      // Transport hiccup mid-watch. The handoff is already recorded; keep
+      // watching rather than reporting a failure that has not happened.
+    }
+    if (now() >= deadline) return { id: handoffId, state: lastState, timedOut: true };
+    await sleepImpl(pollIntervalMs);
+  }
+}
+
 async function cmdHandoff(args = [], deps = {}) {
   const {
     home = undefined, cwd = process.cwd(), baseUrl = DEFAULT_BASE_URL, fetchImpl = fetch,
@@ -264,6 +305,17 @@ async function cmdHandoff(args = [], deps = {}) {
     // Silent by default so every existing test stays quiet; bin/relay passes a
     // real one. Progress writes to stderr and never through `log`.
     progress = noopProgress,
+    // How long to keep watching for the machine to finish, after the branch is
+    // pushed and the cloud has recorded the handoff. 0 disables the wait.
+    //
+    // Off by default for the same reason `progress` is a no-op by default:
+    // bin/relay opts in, and the existing tests — whose fetch stub answers
+    // every /v1/handoffs call, GET and POST alike, with a create response —
+    // would otherwise poll until the budget expired. Tests for this behaviour
+    // pass a budget and a fake clock explicitly.
+    waitForReadyMs = 0,
+    pollIntervalMs = 1500,
+    sleepImpl = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     // Test-only: force a specific handoff id so a collision (local or
     // remote) can be constructed deterministically instead of waiting on a
     // crypto.randomBytes clash that is never expected to happen for real.
@@ -572,9 +624,41 @@ async function cmdHandoff(args = [], deps = {}) {
   log(`  Handed off: ${title}`);
   log(`  Branch:     ${branch}`);
   log(`  Machine:    ${credentials.nodeId}`);
+
+  if (waitForReadyMs <= 0) {
+    log("");
+    log("  Check your phone — it should be there in a moment.");
+    return { handoffId, branch, pushed: true };
+  }
+
+  const outcome = await progress.run("Waiting for your machine to pick it up",
+    () => awaitTerminalState({
+      api, repo: repo.fullName, handoffId,
+      budgetMs: waitForReadyMs, pollIntervalMs, sleepImpl, now,
+    }));
+
   log("");
-  log("  Check your phone — it should be there in a moment.");
-  return { handoffId, branch, pushed: true };
+  if (outcome.state === "ready") {
+    log("  Ready on your machine — open the app to pick it up.");
+    return { handoffId, branch, pushed: true, state: "ready" };
+  }
+
+  if (outcome.state === "failed") {
+    // The machine reached the handoff and could not use it. That is a failure
+    // of the thing the user asked for, so it exits non-zero rather than
+    // printing a cheerful line about checking their phone.
+    const reason = outcome.reason || "unknown";
+    throw new Error(
+      `handoff_failed: your machine could not open this handoff (${reason}); the branch ${branch} is still on GitHub`,
+    );
+  }
+
+  // Budget expired with the row still un-collected. Deliberately not an error:
+  // a slow machine and a dead one look identical from here, and the handoff is
+  // recorded either way, so the honest report is "not yet" plus where to look.
+  log(`  Still ${outcome.state} after ${Math.round(waitForReadyMs / 1000)}s — your machine has not picked it up yet.`);
+  log("  It will be collected whenever the machine next polls; check with `relay status`.");
+  return { handoffId, branch, pushed: true, state: outcome.state, timedOut: true };
 }
 
-export { cmdHandoff, buildManifest, handoffBranchName, isSecretPath };
+export { cmdHandoff, buildManifest, handoffBranchName, isSecretPath, awaitTerminalState };
