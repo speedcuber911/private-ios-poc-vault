@@ -54,11 +54,18 @@ export function makeMailTransport() {
 
 export function makeApnsTransport() {
   const requests = [];
+  // Default is Apple accepting the push. `respondWith` makes it answer
+  // something else for every subsequent send — needed to exercise the outcome
+  // classifier (BadDeviceToken, 410, auth failures) without a live APNs.
+  let reply = { status: 200, headers: {}, body: "" };
   const transport = async ({ host, path, headers, body }) => {
     requests.push({ host, path, headers, body: JSON.parse(body) });
-    return { status: 200, headers: {}, body: "" };
+    return reply;
   };
   transport.requests = requests;
+  transport.respondWith = ({ status, body = "", headers = {} }) => {
+    reply = { status, headers, body };
+  };
   return transport;
 }
 
@@ -110,6 +117,7 @@ export async function startTestApp(overrides = {}) {
     apnsTransport,
     now,
     provisioner: overrides.provisioner,
+    ...(overrides.log ? { log: overrides.log } : {}),
   });
 
   await app.auth.ready;
