@@ -88,12 +88,23 @@ do not belong on it.
 The final API host is `relay.ai-rocket-experiments.com`, not a `conformal.live`
 name, because Route 53 holds the `ai-rocket-experiments.com` zone here.
 
-Correcting an earlier claim in this document, which said `conformal.live` is
-not hosted in this AWS account: as of 2026-08-13 it is. `codex.pocs.conformal.live`
-and `vault.pocs.conformal.live` resolve to `3.111.143.88`, an Elastic IP in
-account `507121383669` (tagged `Project: Relay`) attached to `pariksj-dev`
-(`i-0364bb0f31f506e7c`) — the owner's personal development box, still serving
-200 on `/healthz` behind a valid certificate.
+The original claim above — that `conformal.live` is not hosted in this AWS
+account — is **correct about the zone** and worth stating precisely, because
+the name and the machine live in different accounts:
+
+- The **`conformal.live` hosted zone** is in account `992203938018`
+  (`cut-personal`, zone `Z01646542WQQGABIKJZV5`), alongside `openrelay.sh` and
+  `cutcompanion.xyz`.
+- Its **`*.pocs` records point back into this account**:
+  `api|codex|vault.pocs.conformal.live` → `3.111.143.88`, an Elastic IP in
+  `507121383669` tagged `Project: Relay`, attached to `pariksj-dev`
+  (`i-0364bb0f31f506e7c`) — the owner's personal development box, still
+  serving 200 behind a valid certificate.
+- The apex and its other records (`dcmshriram`, `pnb`) point at
+  `13.206.15.163`, `cutcompanion-backend`, which is in the cut account.
+
+Checking only the EIP shows a Relay-account machine and suggests the domain is
+local; checking only the zone shows the cut account. Both are needed.
 
 That matters because it is not the product, and it was the checked-in default
 for `POC_VAULT_CODEX_BASE_URL`: an unconfigured build did not fail, it quietly
