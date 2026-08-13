@@ -49,12 +49,13 @@ async function startFakeNode({ body = JOBS_BODY, status = 200, contentType = "ap
   return { hits, ...bound };
 }
 
-async function startGateway({ publicKey, nodeProxyTarget, log = () => {}, now } = {}) {
+async function startGateway({ publicKey, nodeProxyTarget, log = () => {}, now, webOrigins } = {}) {
   const server = createGateway({
     grantPublicKey: publicKey,
     nodeProxyTarget,
     log,
     now,
+    webOrigins,
   });
   const bound = await listen(server);
   return { server, ...bound };
@@ -151,6 +152,88 @@ test("grant missing node is 403 and the node is not contacted", async () => {
     });
     assert.equal(res.status, 403);
     assert.equal(node.hits.length, 0);
+  } finally {
+    await gateway.close();
+    await node.close();
+  }
+});
+
+test("OPTIONS on an activity path is 204 with authorization allowed for an allowlisted origin", async () => {
+  const { publicKey } = generateKeyPairSync("ed25519");
+  const node = await startFakeNode();
+  const gateway = await startGateway({
+    publicKey,
+    nodeProxyTarget: node.baseUrl,
+    webOrigins: ["https://app.example.test"],
+  });
+  try {
+    const res = await fetch(`${gateway.baseUrl}/activity/jobs`, {
+      method: "OPTIONS",
+      headers: {
+        origin: "https://app.example.test",
+        "access-control-request-method": "GET",
+        "access-control-request-headers": "authorization",
+      },
+    });
+    assert.equal(res.status, 204);
+    assert.equal(res.headers.get("access-control-allow-origin"), "https://app.example.test");
+    assert.match((res.headers.get("access-control-allow-headers") || "").toLowerCase(), /authorization/);
+    assert.equal(node.hits.length, 0);
+  } finally {
+    await gateway.close();
+    await node.close();
+  }
+});
+
+test("OPTIONS on a non-activity path stays 403", async () => {
+  const { publicKey } = generateKeyPairSync("ed25519");
+  const node = await startFakeNode();
+  const gateway = await startGateway({
+    publicKey,
+    nodeProxyTarget: node.baseUrl,
+    webOrigins: ["https://app.example.test"],
+  });
+  try {
+    const res = await fetch(`${gateway.baseUrl}/activity/files`, {
+      method: "OPTIONS",
+      headers: { origin: "https://app.example.test" },
+    });
+    assert.equal(res.status, 403);
+    assert.equal(node.hits.length, 0);
+  } finally {
+    await gateway.close();
+    await node.close();
+  }
+});
+
+test("GET from an allowlisted origin echoes ACAO; a foreign origin gets none", async () => {
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  const node = await startFakeNode();
+  const gateway = await startGateway({
+    publicKey,
+    nodeProxyTarget: node.baseUrl,
+    webOrigins: ["https://app.example.test"],
+  });
+  try {
+    const grant = mintGrant(privateKey);
+    const allowed = await fetch(`${gateway.baseUrl}/activity/jobs`, {
+      headers: {
+        authorization: `Bearer ${grant}`,
+        origin: "https://app.example.test",
+      },
+    });
+    assert.equal(allowed.status, 200);
+    assert.equal(allowed.headers.get("access-control-allow-origin"), "https://app.example.test");
+
+    const foreign = await fetch(`${gateway.baseUrl}/activity/jobs`, {
+      headers: {
+        authorization: `Bearer ${grant}`,
+        origin: "https://evil.example.test",
+      },
+    });
+    assert.equal(foreign.status, 200);
+    assert.equal(foreign.headers.get("access-control-allow-origin"), null);
+    assert.notEqual(foreign.headers.get("access-control-allow-origin"), "*");
   } finally {
     await gateway.close();
     await node.close();
