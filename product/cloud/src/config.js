@@ -29,6 +29,10 @@ export function loadConfig(env = process.env) {
     betterAuthBaseURL:
       env.BETTER_AUTH_URL ||
       `http://${env.HOST || "127.0.0.1"}:${intFrom(env.PORT, 8790)}`,
+    trustedWebOrigins: (env.RELAY_WEB_ORIGINS || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
 
     // Sign in with Apple. Comma-separated audience allowlist (bundle ids /
     // services ids registered with Apple).
@@ -158,6 +162,15 @@ export function loadConfig(env = process.env) {
     // where the fallback (host:port) is used instead.
     enrollBaseUrl: env.ENROLL_BASE_URL || "",
 
+    // Browser activity grants. Ed25519 only — there is no HMAC
+    // BROWSER_GRANT_SECRET. Private key stays on the control-plane host;
+    // the 32-byte public half is what enroll.json delivers to the node.
+    // Unset means POST /v1/nodes/:id/browser-grants returns 503 and
+    // enroll.json omits grantPublicKey so existing phones keep working.
+    browserGrantPrivateKey: env.BROWSER_GRANT_PRIVATE_KEY || "",
+    browserGrantPublicKey: env.BROWSER_GRANT_PUBLIC_KEY || "",
+    grantGatewayUrl: env.GRANT_GATEWAY_URL || "",
+
     // General request body cap for JSON endpoints.
     jsonBodyMaxBytes: intFrom(env.JSON_BODY_MAX_BYTES, 32 * 1024),
 
@@ -184,6 +197,18 @@ export function loadConfig(env = process.env) {
     // it only bounds how long a genuinely partitioned handoff stays stuck.
     handoffLeaseSec: Math.max(1, intFrom(env.HANDOFF_LEASE_SEC, 30)),
   };
+}
+
+// Same shape as the grant half-config check in main.js: a live web console
+// with RELAY_WEB_ORIGINS needs an https BETTER_AUTH_URL so SameSite=None
+// cookies can be Secure. Checked at process start, not inside createApp, so
+// in-process tests may still use http://127.0.0.1.
+export function webOriginsRequireHttps(config) {
+  return (
+    Array.isArray(config.trustedWebOrigins) &&
+    config.trustedWebOrigins.length > 0 &&
+    !String(config.betterAuthBaseURL || "").startsWith("https://")
+  );
 }
 
 function intFrom(value, fallback) {

@@ -276,6 +276,13 @@ const tunnelBackoffMaxMs = Math.max(
 // every cloud-facing loop.
 const cloudUrl = cleanOptionalUrlBase(process.env.RELAYD_CLOUD_URL || process.env.RELAYD_ENROLL_URL || "", "RELAYD_CLOUD_URL");
 
+// Enroll-delivered Ed25519 public key (raw 32-byte base64url). Empty means
+// this node cannot accept browser grants; the phone device-token path is
+// unchanged. Never a signing key — HMAC grant secrets are a spec violation.
+const grantPublicKey = (process.env.RELAYD_GRANT_PUBLIC_KEY || "").trim() || null;
+
+const nodeId = (process.env.RELAYD_NODE_ID || "").trim() || null;
+
 const handoffEnabled = parseBooleanEnv("RELAYD_HANDOFF_ENABLED", true);
 
 const handoffPollWaitSec = parseIntegerEnv("RELAYD_HANDOFF_POLL_WAIT_SEC", 20, 0, 60);
@@ -947,6 +954,8 @@ export {
   tunnelBackoffBaseMs,
   tunnelBackoffMaxMs,
   cloudUrl,
+  grantPublicKey,
+  nodeId,
   handoffEnabled,
   handoffPollWaitSec,
   chatsDir,

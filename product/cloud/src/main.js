@@ -1,6 +1,6 @@
 // Entrypoint: env-configured server + periodic sweeps.
 
-import { loadConfig } from "./config.js";
+import { loadConfig, webOriginsRequireHttps } from "./config.js";
 import { createApp } from "./server.js";
 import { createHttp2Transport, createNoopTransport, apnsConfigured } from "./apns.js";
 
@@ -48,6 +48,33 @@ if (config.e2b.apiUrl) {
     );
     process.exit(1);
   }
+}
+
+// Browser grants are the same shape of trap: GRANT_GATEWAY_URL in a response
+// with no private key to sign, or a public key enrolled onto nodes with no
+// way to mint, both look configured and fail at request time. Names only.
+const grantMissing = [
+  ["BROWSER_GRANT_PRIVATE_KEY", config.browserGrantPrivateKey],
+  ["BROWSER_GRANT_PUBLIC_KEY", config.browserGrantPublicKey],
+  ["GRANT_GATEWAY_URL", config.grantGatewayUrl],
+]
+  .filter(([, value]) => !value)
+  .map(([name]) => name);
+if (grantMissing.length > 0 && grantMissing.length < 3) {
+  console.error(
+    `browser grants are half-configured; missing ${grantMissing.join(", ")}. ` +
+      "Set BROWSER_GRANT_PRIVATE_KEY, BROWSER_GRANT_PUBLIC_KEY, and GRANT_GATEWAY_URL together, " +
+      "or unset all three to disable grants.",
+  );
+  process.exit(1);
+}
+
+if (webOriginsRequireHttps(config)) {
+  console.error(
+    "RELAY_WEB_ORIGINS is set but BETTER_AUTH_URL is not https; refusing to start. " +
+      "Set BETTER_AUTH_URL to the public https API origin, or unset RELAY_WEB_ORIGINS.",
+  );
+  process.exit(1);
 }
 
 const apnsTransport = apnsConfigured(config)

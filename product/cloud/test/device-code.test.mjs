@@ -663,6 +663,26 @@ test("mapDeviceCode returns numbers for the integer columns", () => {
   assert.equal(record.consumedAt, null);
 });
 
+test("createDeviceCode persists client=web and defaults omitted client to cli", () => {
+  const dir = mkdtempSync(join(tmpdir(), "relay-dc-"));
+  const db = createDb(join(dir, "t.sqlite"));
+  const registry = createRegistry(db);
+  const web = registry.createDeviceCode({
+    deviceCodeHash: "a".repeat(64),
+    userCode: "ABCD-EFGH",
+    expiresAt: Date.now() + 60_000,
+    client: "web",
+  });
+  assert.equal(web.client, "web");
+  const cli = registry.createDeviceCode({
+    deviceCodeHash: "b".repeat(64),
+    userCode: "IJKL-MNOP",
+    expiresAt: Date.now() + 60_000,
+  });
+  assert.equal(cli.client, "cli");
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("createDb adds CLI link columns to a pre-existing database idempotently", () => {
   const dir = mkdtempSync(join(tmpdir(), "relay-cli-link-migration-"));
   const file = join(dir, "relay.db");
@@ -827,8 +847,8 @@ test("device/inspect hides invalid codes and reports an occupied computer slot",
     const live = await start(t);
     assert.equal((await approve(t, session.sessionToken, live.json.userCode)).status, 200);
     const approved = await inspect(t, session.sessionToken, live.json.userCode);
-    assert.equal(approved.status, 409);
-    assert.equal(approved.json.error, "computer_already_linked");
+    assert.equal(approved.status, 404);
+    assert.equal(JSON.stringify(approved.json), JSON.stringify({ error: "unknown_user_code" }));
 
     // Once the owner disconnects, the pending approved code is destroyed and
     // becomes indistinguishable from a code that never existed.
@@ -869,5 +889,107 @@ test("device/inspect requires a session", async () => {
     const started = await start(t);
     const res = await api(t.baseUrl, "POST", "/v1/auth/device/inspect", { body: { userCode: started.json.userCode } });
     assert.equal(res.status, 401);
+  } finally { await t.close(); }
+});
+
+// ── client=web: session cookie without occupying the CLI computer slot ────
+//
+// Apple signIn cannot create a Better Auth user row, so the web-token cookie
+// path signs up through /api/auth/sign-up/email (password/Better Auth).
+
+test("web device code does not create a cli computer link", async () => {
+  const t = await startTestApp();
+  try {
+    const started = await api(t.baseUrl, "POST", "/v1/auth/device/start", {
+      body: { client: "web", machineName: "This browser", platform: "web" },
+    });
+    assert.equal(started.status, 201);
+    const signup = await api(t.baseUrl, "POST", "/api/auth/sign-up/email", {
+      headers: { origin: t.config.betterAuthBaseURL },
+      body: {
+        email: "web-device@example.com",
+        name: "Web User",
+        username: "web_device",
+        password: "correct-horse-battery",
+      },
+    });
+    assert.equal(signup.status, 200);
+    const sessionToken = signup.headers.get("set-auth-token");
+    const inspected = await api(t.baseUrl, "POST", "/v1/auth/device/inspect", {
+      body: { userCode: started.json.userCode },
+      ...authed(sessionToken),
+    });
+    assert.equal(inspected.status, 200);
+    assert.equal(inspected.json.client, "web");
+    assert.equal((await approve(t, sessionToken, started.json.userCode)).status, 200);
+    const link = await api(t.baseUrl, "GET", "/v1/auth/device/link", authed(sessionToken));
+    assert.equal(link.status, 200);
+    assert.equal(link.json.computer, null);
+    const granted = await poll(t, started.json.deviceCode);
+    assert.equal(granted.status, 200);
+    assert.equal(granted.json.cliLinkId, undefined);
+    const setCookie = granted.headers.get("set-cookie") || "";
+    const cookie = setCookie.split(";")[0];
+    assert.match(cookie, /better-auth|session/i);
+    const me = await api(t.baseUrl, "GET", "/v1/account", {
+      headers: { cookie },
+    });
+    assert.equal(me.status, 200);
+    assert.equal(me.json.account.email, "web-device@example.com");
+    assert.equal(me.json.account.id, granted.json.accountId);
+  } finally { await t.close(); }
+});
+
+test("Apple-only web token is web_session_unavailable and does not consume the code", async () => {
+  const t = await startTestApp();
+  try {
+    const session = await signIn(t);
+    const started = await api(t.baseUrl, "POST", "/v1/auth/device/start", {
+      body: { client: "web", platform: "web" },
+    });
+    assert.equal((await approve(t, session.sessionToken, started.json.userCode)).status, 200);
+    const first = await poll(t, started.json.deviceCode);
+    assert.equal(first.status, 400);
+    assert.equal(first.json.error, "web_session_unavailable");
+    const retry = await poll(t, started.json.deviceCode);
+    assert.equal(retry.status, 400);
+    assert.equal(retry.json.error, "web_session_unavailable");
+  } finally { await t.close(); }
+});
+
+test("inspect and approve of a web code succeed when a CLI computer is already linked", async () => {
+  const t = await startTestApp();
+  try {
+    const session = await signIn(t);
+    const cli = await api(t.baseUrl, "POST", "/v1/auth/device/start", { body: { machineName: "mbp" } });
+    assert.equal((await approve(t, session.sessionToken, cli.json.userCode)).status, 200);
+    assert.equal((await poll(t, cli.json.deviceCode)).status, 200);
+
+    const web = await api(t.baseUrl, "POST", "/v1/auth/device/start", {
+      body: { client: "web", platform: "web" },
+    });
+    const inspected = await api(t.baseUrl, "POST", "/v1/auth/device/inspect", {
+      body: { userCode: web.json.userCode },
+      ...authed(session.sessionToken),
+    });
+    assert.equal(inspected.status, 200);
+    assert.equal(inspected.json.client, "web");
+    assert.equal((await approve(t, session.sessionToken, web.json.userCode)).status, 200);
+  } finally { await t.close(); }
+});
+
+test("cli inspect still 409s computer_already_linked when the slot is taken", async () => {
+  const t = await startTestApp();
+  try {
+    const session = await signIn(t);
+    const first = await api(t.baseUrl, "POST", "/v1/auth/device/start", { body: {} });
+    assert.equal((await approve(t, session.sessionToken, first.json.userCode)).status, 200);
+    const second = await api(t.baseUrl, "POST", "/v1/auth/device/start", { body: {} });
+    const inspected = await api(t.baseUrl, "POST", "/v1/auth/device/inspect", {
+      body: { userCode: second.json.userCode },
+      ...authed(session.sessionToken),
+    });
+    assert.equal(inspected.status, 409);
+    assert.equal(inspected.json.error, "computer_already_linked");
   } finally { await t.close(); }
 });

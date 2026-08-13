@@ -42,6 +42,8 @@ Two consequences that are easy to get wrong and are enforced in code:
 | relay-cloud | `poc-ec2` | Accounts, entitlements, devices, nodes, handoff state machine, rendezvous, APNs fanout, trial provisioning. SQLite. `product/cloud/` |
 | relayd | inside each sandbox | The node daemon: jobs, workspaces (jailed), handoff import, credential install, harness adapters. `product/relayd/` |
 | broker | `relay-router` | Tunnel between the phone and a node. `product/broker/` |
+| grant gateway | broker host loopback `:8791`; public `gateway.<api-zone>` | Ed25519 grant verify + GET activity proxy. Ingress on the broker host, not poc-ec2. `product/grant-gateway/` |
+| web console | not deployed via CodeCommit `relay-cloud` or `ops/deploy-poc` | Vite+React: login, phone QR, `/cli-login`, provisioning, machines, activity. `product/web/` |
 | trial image | built on the Cube host | Debian + node + Codex/Claude/Cursor CLIs + relayd. `product/trial/` |
 | iOS app (Relay) | phone | mTLS client to the node; control plane only for auth, pairing and push. `ios/POCVault/` |
 
@@ -177,9 +179,11 @@ meaningful.
 
 ## Known gaps
 
-- **`DEVICE_LOGIN_URL` is unset in production**, so `relay login` tells every
-  user to approve at `https://relay.example/cli-login` — the `config.js`
-  placeholder. The QR encodes the same dead domain.
+- **`DEVICE_LOGIN_URL` must still be set on the control-plane host.** The
+  `/cli-login` page now exists in `product/web`. Until the host env is
+  `https://<app-origin>/cli-login`, `relay login` keeps the `config.js`
+  placeholder `https://relay.example/cli-login` and the QR encodes the same
+  dead domain.
 - **No re-pair path for an existing trial node.** The rendezvous is put-once
   and `runTrialPairing` only runs at boot, so a device that loses its
   credential to a still-running machine cannot be re-issued one.

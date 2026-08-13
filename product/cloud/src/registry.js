@@ -230,6 +230,9 @@ function ensureDeviceCodeMachineColumns(db) {
   const names = new Set(columns.map((column) => column.name));
   if (!names.has("machine_name")) db.exec("ALTER TABLE device_codes ADD COLUMN machine_name TEXT");
   if (!names.has("platform")) db.exec("ALTER TABLE device_codes ADD COLUMN platform TEXT");
+  if (!names.has("client")) {
+    db.exec("ALTER TABLE device_codes ADD COLUMN client TEXT NOT NULL DEFAULT 'cli'");
+  }
 }
 
 // One row per (account, push token).
@@ -933,13 +936,24 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     clientIp = null,
     machineName = null,
     platform = null,
+    client,
   }) {
     const id = randomUUID();
     db.prepare(
       `INSERT INTO device_codes
-         (id, device_code_hash, user_code, expires_at, created_at, client_ip, machine_name, platform)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(id, deviceCodeHash, userCode, expiresAt, now(), clientIp, machineName, platform);
+         (id, device_code_hash, user_code, expires_at, created_at, client_ip, machine_name, platform, client)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id,
+      deviceCodeHash,
+      userCode,
+      expiresAt,
+      now(),
+      clientIp,
+      machineName,
+      platform,
+      client === "web" ? "web" : "cli",
+    );
     return mapDeviceCode(db.prepare("SELECT * FROM device_codes WHERE id = ?").get(id));
   }
 
@@ -1002,6 +1016,50 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       }
       throw err;
     }
+  }
+
+  // One-shot approval for browser login: bind the code to the account without
+  // occupying the unique CLI computer slot. No cli_link_id, no links row.
+  function approveDeviceCodeForWebSession(id, accountId) {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = db.prepare(
+        `SELECT * FROM device_codes
+         WHERE id = ? AND client = 'web' AND account_id IS NULL AND consumed_at IS NULL AND expires_at > ?`,
+      ).get(id, now());
+      if (!row) {
+        db.exec("ROLLBACK");
+        return { status: "invalid_code" };
+      }
+      const timestamp = now();
+      const updated = db.prepare(
+        `UPDATE device_codes
+         SET account_id = ?, approved_at = ?
+         WHERE id = ? AND client = 'web' AND account_id IS NULL AND consumed_at IS NULL AND expires_at > ?`,
+      ).run(accountId, timestamp, id, timestamp);
+      if (Number(updated.changes) !== 1) throw new Error("device_code_transition_lost");
+      db.exec("COMMIT");
+      return {
+        status: "approved",
+        record: mapDeviceCode(db.prepare("SELECT * FROM device_codes WHERE id = ?").get(id)),
+      };
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  // Atomic consume for web (and any other non-CLI) redemption. CLI still uses
+  // connectCliComputer, which also requires a live cli_link_id.
+  function consumeDeviceCode(id) {
+    const timestamp = now();
+    const consumed = db.prepare(
+      `UPDATE device_codes
+       SET consumed_at = ?
+       WHERE id = ? AND account_id IS NOT NULL AND consumed_at IS NULL AND expires_at > ?`,
+    ).run(timestamp, id, timestamp);
+    if (Number(consumed.changes) !== 1) return null;
+    return mapDeviceCode(db.prepare("SELECT * FROM device_codes WHERE id = ?").get(id));
   }
 
   // Redemption and the pending→connected transition are one transaction.
@@ -1613,6 +1671,8 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     getDeviceCodeByHash,
     getDeviceCodeByUserCode,
     approveDeviceCodeForCliLink,
+    approveDeviceCodeForWebSession,
+    consumeDeviceCode,
     connectCliComputer,
     getCliComputerLink,
     getCliComputerLinkById,
@@ -1722,6 +1782,7 @@ function mapDeviceCode(row) {
     cliLinkId: row.cli_link_id ?? null,
     machineName: row.machine_name ?? null,
     platform: row.platform ?? null,
+    client: row.client === "web" ? "web" : "cli",
   };
 }
 
