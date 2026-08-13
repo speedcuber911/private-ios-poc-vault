@@ -32,8 +32,8 @@ struct RelayOnboardingView: View {
     private let pages = [
         OnboardingPage(
             icon: "rectangle.connected.to.line.below",
-            title: "Your agents, one place",
-            detail: "Start, monitor, and continue Codex, Claude, and Cursor work from your iPhone."
+            title: "Your computer, from your phone",
+            detail: "Relay lets you start and continue Codex or Claude Code work without keeping your laptop open."
         ),
         OnboardingPage(
             icon: "lock.shield",
@@ -42,8 +42,8 @@ struct RelayOnboardingView: View {
         ),
         OnboardingPage(
             icon: "checkmark.seal",
-            title: "Ready to Relay",
-            detail: "Use Files to browse workspaces, open Chat for agent work, and find your account in Settings."
+            title: "Link your computer",
+            detail: "Run relay login on your computer and approve the one-time link here. Codex and Claude authentication stays on your computer and Relay machine."
         )
     ]
 

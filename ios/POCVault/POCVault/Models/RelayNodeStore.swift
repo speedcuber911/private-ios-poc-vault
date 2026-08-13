@@ -36,7 +36,14 @@ final class RelayNodeStore: ObservableObject {
     /// report the resulting TLS failure as the user's machine misbehaving,
     /// check this first.
     var hasMachine: Bool {
+#if targetEnvironment(simulator)
+        // The simulator launcher always supplies the local Codex fixture. Treat
+        // that fixture as its machine so UI previews can reach the signed-in app
+        // without provisioning a real trial or importing device credentials.
+        true
+#else
         activeNodeURL != nil || AppConfiguration.hasConfiguredPersonalInstall
+#endif
     }
 
     /// Adopts a newly created/paired trial node: persists it and points the app at it.

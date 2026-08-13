@@ -76,10 +76,20 @@ struct RelayHandoffCard: Decodable, Identifiable, Hashable {
         updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt)
     }
 
-    /// A word, never a glyph — the design language has no status dots.
-    var statusLabel: String { state.rawValue.uppercased() }
+    /// Human copy for the phone. Backend state names remain available through
+    /// `state.rawValue`, but users should not have to translate them.
+    var statusLabel: String {
+        switch state {
+        case .importing: return "Preparing"
+        case .ready: return "Ready to continue"
+        case .failed: return "Needs attention"
+        case .unknown: return "Status unavailable"
+        }
+    }
 
-    var subtitle: String { branch.isEmpty ? repo : "\(repo) · \(branch)" }
+    /// The handoff branch is an internal transport identifier
+    /// (`relay/handoff-<opaque id>`), not useful context for the user.
+    var subtitle: String { repo.trimmedNonEmpty ?? "Repository unavailable" }
 
     var isActionable: Bool { state == .ready }
 

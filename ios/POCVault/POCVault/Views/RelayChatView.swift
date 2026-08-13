@@ -868,7 +868,7 @@ private struct RelayThreadDrawer: View {
     /// handoff is the thing the user was just pushed about.
     @ViewBuilder private var handoffSection: some View {
         if !viewModel.handoffs.isEmpty {
-            Section("Handed off") {
+            Section {
                 ForEach(viewModel.handoffs) { card in
                     RelayHandoffCardView(
                         card: card,
@@ -884,6 +884,12 @@ private struct RelayThreadDrawer: View {
                     .listRowBackground(Color.clear)
                     .listRowInsets(EdgeInsets(top: 6, leading: 8, bottom: 6, trailing: 8))
                 }
+            } header: {
+                Text("Continue from your computer")
+            } footer: {
+                Text("These are Codex or Claude Code sessions sent from your linked computer. Continue resumes the same work on your Relay machine.")
+                    .font(AppTheme.uiFont(size: 12))
+                    .foregroundStyle(AppTheme.textFaint)
             }
         }
     }

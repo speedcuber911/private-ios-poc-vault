@@ -235,9 +235,15 @@ struct POCVaultRootView: View {
         // Push registration waits for a signed-in account: this view only exists
         // in the `.ready` phase, and the cloud device route is session-authed.
         .task {
+#if targetEnvironment(simulator)
+            // Simulator previews use local fixtures and should not interrupt UI
+            // review with a notification permission prompt.
+            return
+#else
             RelayAppDelegate.pushService = pushService
             pushService.registerForPushNotifications()
             await pushService.registerPendingDeviceTokenIfNeeded()
+#endif
         }
         // A handoff push carries no content — only a node id and an event type —
         // so the tap opens the threads list and the card loads from the node.
