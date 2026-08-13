@@ -16,6 +16,17 @@ fi
 export CODEX_RUN_HOME="${CODEX_RUN_HOME:-/home/relay}"
 export RELAYD_STORE="${RELAYD_STORE:-sqlite}"
 
+# npm's global prefix on this base image is /opt/node, not /usr, so
+# `npm install -g @openai/codex @anthropic-ai/claude-code` puts the CLIs at
+# /opt/node/bin. relayd's historic default was /usr/bin/<name>, which does not
+# exist here — so every prompt on every trial sandbox failed with
+# `spawn /usr/bin/codex ENOENT`, both harnesses, since the first machine ever
+# provisioned. relayd now falls back to a PATH scan on its own, but naming the
+# paths here keeps the image self-describing and works on an older relayd too.
+export CODEX_BIN="${CODEX_BIN:-$(command -v codex || echo /usr/bin/codex)}"
+export CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude || echo /usr/bin/claude)}"
+echo "harness binaries: codex=${CODEX_BIN} claude=${CLAUDE_BIN}" >&2
+
 RELAYD_BIN=/opt/relayd/app/bin/relayd
 # Device-token authentication for this machine. Pairing derives the token from
 # the pairing secret and writes only its SHA-256 here; relayd then requires a
