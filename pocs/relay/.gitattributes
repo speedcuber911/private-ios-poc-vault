@@ -1,0 +1,2 @@
+# Bundled Three.js shader strings intentionally preserve upstream GLSL whitespace.
+public/assets/*.js -whitespace

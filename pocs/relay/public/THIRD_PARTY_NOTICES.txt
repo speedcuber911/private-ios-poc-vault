@@ -1,0 +1,10 @@
+React Bits components
+Copyright (c) 2026 David Haz
+
+Used under the MIT + Commons Clause License Condition v1.0.
+https://github.com/DavidHDev/react-bits/blob/main/LICENSE.md
+
+Permission is granted to use, copy, modify, merge, publish, and distribute
+the software as part of an application, website, or product. The components
+may not be sold, sublicensed, or redistributed themselves, whether alone, in
+a bundle, or as a ported version. The software is provided without warranty.
