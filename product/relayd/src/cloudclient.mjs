@@ -280,6 +280,39 @@ function createCloudClient({
     return false;
   }
 
+  async function reportHandoffReadyOnce(handoffId) {
+    const pathWithQuery = `/v1/node/handoffs/${handoffId}/ready`;
+    const res = await fetchImpl(`${base}${pathWithQuery}`, {
+      method: "POST",
+      headers: { ...signedHeaders("POST", pathWithQuery), "content-type": "application/json" },
+      body: "{}",
+    });
+    await res.json().catch(() => null);
+    return res.status;
+  }
+
+  // The success twin of reportHandoffFailure, with the same retry rule and for
+  // the same reasons: a 4xx here is terminal for this exact handoff id, and
+  // retrying it only burns the replay guard. Never throws — the caller has
+  // already staged the session and told the local event feed, so an exception
+  // here would turn a completed handoff into a crash.
+  //
+  // Without this, `delivered` was the last thing the cloud ever heard about a
+  // successful handoff, and `delivered` is written on ack — before the import
+  // even starts.
+  async function reportHandoffReady(handoffId) {
+    for (let attempt = 1; attempt <= HANDOFF_ACK_MAX_ATTEMPTS; attempt++) {
+      try {
+        const status = await reportHandoffReadyOnce(handoffId);
+        if (status === 200) return true;
+        if (status >= 400 && status < 500) return false;
+      } catch {
+        // Transport failure: bounded by the loop, same as the failure twin.
+      }
+    }
+    return false;
+  }
+
   function ackableFrom(entries) {
     return (Array.isArray(entries) ? entries : [])
       .filter((entry) => entry && typeof entry.id === "string" && typeof entry.lease === "string")
@@ -395,7 +428,7 @@ function createCloudClient({
     return result;
   }
 
-  return { nodeId, pollHandoffs, postEvent, reportHandoffFailure };
+  return { nodeId, pollHandoffs, postEvent, reportHandoffFailure, reportHandoffReady };
 }
 
 export { createCloudClient, nodeRequestSigningInput, mapFailureReason };

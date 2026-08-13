@@ -1227,6 +1227,26 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     return info.changes > 0;
   }
 
+  // The success twin of failHandoff, and the reason it exists: `delivered`
+  // only ever meant "the node leased this row and acked it", never "the import
+  // worked". Failure had a terminal state and success did not, so `relay
+  // status` could not tell a finished handoff from one whose import hung — the
+  // same asymmetry that let a failed import sit at `delivered` forever before
+  // the fail route was wired up.
+  //
+  // `failed` stays terminal: a node that already reported a failure must not
+  // be able to resurrect the row, so this refuses that one transition and
+  // accepts every other, exactly as failHandoff does in the other direction.
+  // `reason` is cleared because a row that reached ready has nothing to
+  // explain, and leaving a stale one would surface on the phone's card.
+  function readyHandoff(nodeId, id) {
+    const info = db.prepare(
+      "UPDATE handoffs SET state = 'ready', reason = NULL, updated_at = ? " +
+      "WHERE id = ? AND node_id = ? AND state != 'failed'",
+    ).run(now(), id, nodeId);
+    return info.changes > 0;
+  }
+
   return {
     createAccount,
     ensureAccount,
@@ -1308,6 +1328,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     leaseHandoffs,
     confirmHandoffDelivery,
     failHandoff,
+    readyHandoff,
     createSyncNotice,
     getSyncNoticeByPairingId,
     listPendingSyncNotices,

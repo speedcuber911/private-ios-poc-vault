@@ -2315,3 +2315,104 @@ test("guard: a manifest that is a JSON array is refused as invalid, not read as 
   assert.equal(record.state, "failed");
   assert.equal(record.error, "manifest_invalid");
 });
+
+// ── the success report, the twin of F7B above ───────────────────────────────
+//
+// `delivered` on the cloud is written when the node ACKS the lease, which
+// happens before the import runs. So a successful handoff and one whose import
+// hung looked identical to `relay status`: failure had a terminal state and
+// success did not. announceReady now closes that.
+
+const readyManifest = (id) => ({ ...MANIFEST, id });
+
+test("READY-1: a successful import reports ready to the cloud, once, with its own id", async () => {
+  const manifest = readyManifest("aaaa1111bbbb0001");
+  const origin = await makeOriginRepo({ manifest });
+  const reported = [];
+  const options = deps(origin, {
+    cloud: {
+      async postEvent() { return { status: 202 }; },
+      async reportHandoffReady(id) { reported.push(id); return true; },
+    },
+  });
+
+  const record = await importHandoff({ id: manifest.id, repo: manifest.repo, branch: manifest.branch }, options);
+
+  assert.equal(record.state, "ready");
+  assert.deepEqual(reported, [manifest.id]);
+});
+
+test("READY-2: the ready report reaches the cloud strictly before the handoff.ready event post", async () => {
+  const manifest = readyManifest("aaaa1111bbbb0002");
+  const origin = await makeOriginRepo({ manifest });
+  const order = [];
+  const options = deps(origin, {
+    cloud: {
+      async postEvent(type) { order.push(["postEvent", type]); return { status: 202 }; },
+      async reportHandoffReady(id) { order.push(["reportHandoffReady", id]); return true; },
+    },
+  });
+
+  await importHandoff({ id: manifest.id, repo: manifest.repo, branch: manifest.branch }, options);
+
+  // One shared array in call order — two separate arrays each checked for
+  // presence would pass even with the post first, which is the bug.
+  assert.equal(order.length, 2, `expected one report and one post, got ${JSON.stringify(order)}`);
+  assert.equal(order[0][0], "reportHandoffReady",
+    "the cloud must already say ready before the post that wakes the phone's push, or a fast refetch still sees delivered");
+  assert.equal(order[1][0], "postEvent");
+});
+
+test("READY-3: a failed import never reports ready", async () => {
+  const reported = [];
+  const options = deps("/nonexistent/repo.git", {
+    cloud: {
+      async postEvent() { return { status: 202 }; },
+      async reportHandoffReady(id) { reported.push(id); return true; },
+      async reportHandoffFailure() { return true; },
+    },
+  });
+
+  const record = await importHandoff({ id: "ready3handoff", repo: "me/relay", branch: "relay/handoff-x" }, options);
+
+  assert.equal(record.state, "failed");
+  assert.deepEqual(reported, [], "a failed handoff must never be announced as ready");
+});
+
+// The session is already staged and the local feed already told the phone by
+// the time this runs; an exception here would turn a completed handoff into a
+// crash. Both throw shapes, because a synchronous one escapes a trailing catch.
+test("READY-4: a cloud.reportHandoffReady that throws still yields a ready record and still posts", async () => {
+  const throwers = [
+    ["aaaa1111bbbb0041", () => { throw new Error("sync boom"); }],
+    ["aaaa1111bbbb0042", async () => { throw new Error("async boom"); }],
+  ];
+  for (const [id, thrower] of throwers) {
+    const manifest = readyManifest(id);
+    const origin = await makeOriginRepo({ manifest });
+    const posted = [];
+    const options = deps(origin, {
+      cloud: {
+        async postEvent(type) { posted.push(type); return { status: 202 }; },
+        reportHandoffReady: thrower,
+      },
+    });
+
+    const record = await importHandoff({ id: manifest.id, repo: manifest.repo, branch: manifest.branch }, options);
+
+    assert.equal(record.state, "ready");
+    assert.deepEqual(posted, ["handoff.ready"], "the post must still happen");
+  }
+});
+
+// A cloud stub without the method at all — several tests here use one — must
+// not be a crash.
+test("READY-5: a cloud with no reportHandoffReady is not a crash", async () => {
+  const manifest = readyManifest("aaaa1111bbbb0005");
+  const origin = await makeOriginRepo({ manifest });
+  const options = deps(origin, { cloud: { async postEvent() { return { status: 202 }; } } });
+
+  const record = await importHandoff({ id: manifest.id, repo: manifest.repo, branch: manifest.branch }, options);
+
+  assert.equal(record.state, "ready");
+});

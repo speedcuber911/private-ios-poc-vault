@@ -1003,3 +1003,75 @@ test("reportHandoffFailure returns false (and does not throw) for a thrown trans
   assert.equal(ok, false);
   assert.ok(calls >= 1 && calls <= 5, `expected a small bounded retry count, saw ${calls} attempts`);
 });
+
+// ── reportHandoffReady ──────────────────────────────────────────────────────
+//
+// The success twin. `delivered` is written when the node ACKS the lease, which
+// happens before the import runs, so it never meant the handoff worked — a
+// finished one and a hung one looked identical to `relay status`. Failure had a
+// terminal state and success did not.
+
+test("reportHandoffReady posts exactly one signed request to the ready route", async () => {
+  const node = freshNode();
+  const cloud = await startFakeCloud((res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ handoff: { id: "deadbeefcafef00d", state: "ready" } }));
+  });
+  try {
+    const client = createCloudClient({ cloudUrl: cloud.url, baseDir: node.baseDir });
+    const ok = await client.reportHandoffReady("deadbeefcafef00d");
+
+    assert.equal(ok, true);
+    assert.equal(cloud.calls.length, 1, "exactly one POST for a successful report");
+    const call = cloud.calls[0];
+    assert.equal(call.method, "POST");
+    assert.equal(call.url, "/v1/node/handoffs/deadbeefcafef00d/ready");
+    assert.equal(call.headers["x-relay-node"], node.nodeId);
+    assert.ok(call.headers["x-relay-ts"], "x-relay-ts header must be present");
+    assert.ok(call.headers["x-relay-signature"], "x-relay-signature header must be present");
+    // Success has nothing to report but itself, so there is no vocabulary to
+    // police and no reason field to get wrong.
+    assert.deepEqual(JSON.parse(call.raw.toString("utf8")), {});
+  } finally { await cloud.close(); }
+});
+
+// Same rule as the failure twin, and invisible unless the requests are counted.
+test("reportHandoffReady does not retry a 4xx — it is permanent for this id", async () => {
+  for (const status of [400, 404]) {
+    const node = freshNode();
+    const cloud = await startFakeCloud((res) => {
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "nope" }));
+    });
+    try {
+      const client = createCloudClient({ cloudUrl: cloud.url, baseDir: node.baseDir });
+      assert.equal(await client.reportHandoffReady("deadbeefcafef00d"), false);
+      assert.equal(cloud.calls.length, 1,
+        `${status} must not be retried: it cannot succeed and each attempt burns the replay guard`);
+    } finally { await cloud.close(); }
+  }
+});
+
+test("reportHandoffReady retries a 5xx and reports success when one lands", async () => {
+  const node = freshNode();
+  let seen = 0;
+  const cloud = await startFakeCloud((res) => {
+    seen += 1;
+    if (seen === 1) { res.writeHead(503); res.end("{}"); return; }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ handoff: { id: "deadbeefcafef00d", state: "ready" } }));
+  });
+  try {
+    const client = createCloudClient({ cloudUrl: cloud.url, baseDir: node.baseDir });
+    assert.equal(await client.reportHandoffReady("deadbeefcafef00d"), true);
+    assert.equal(cloud.calls.length, 2);
+  } finally { await cloud.close(); }
+});
+
+// The caller has already staged the session; an exception here would turn a
+// completed handoff into a crash.
+test("reportHandoffReady never throws on a transport failure", async () => {
+  const node = freshNode();
+  const client = createCloudClient({ cloudUrl: "http://127.0.0.1:9", baseDir: node.baseDir });
+  assert.equal(await client.reportHandoffReady("deadbeefcafef00d"), false);
+});
