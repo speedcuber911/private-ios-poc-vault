@@ -225,7 +225,12 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         // TLS 1.2 with a pinned CA and a required client certificate is what
         // this app has always used against a personal install; the security
         // property is unchanged, and mTLS is still enforced by the machine.
-        configuration.tlsMaximumSupportedProtocolVersion = .TLSv12
+        // No TLS ceiling. One was set while chasing the missing
+        // client-certificate challenge, on the theory that TLS 1.3 delivers
+        // the certificate request too late for URLSession to ask the delegate.
+        // That was wrong — the challenge was suppressed by answering server
+        // trust with `.useCredential`, not by the protocol version — so the
+        // cap fixed nothing and left a constraint nobody had reason to want.
         // URLSession's 60-second default is far too long for a machine that is
         // simply not there. Losing a trial (sign-out, or the server answering
         // `no_trial`) reverts the app to the personal install's configured base
@@ -601,6 +606,7 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
                     }
 
                     var request = URLRequest(url: url)
+                    applyDeviceToken(to: &request, url: url)
                     request.httpMethod = "POST"
                     request.timeoutInterval = 300
                     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -675,6 +681,7 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
                     }
 
                     var request = URLRequest(url: url)
+                    applyDeviceToken(to: &request, url: url)
                     request.httpMethod = "GET"
                     request.timeoutInterval = 300
                     request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
@@ -776,6 +783,7 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         ])
 
         var request = URLRequest(url: url)
+        applyDeviceToken(to: &request, url: url)
         request.httpMethod = method
         request.timeoutInterval = 45
         request.setValue(accept, forHTTPHeaderField: "Accept")
@@ -846,6 +854,7 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
     func downloadExport() async throws -> URL {
         let url = endpoint(path: "/v1/export.tar", queryItems: [])
         var request = URLRequest(url: url)
+        applyDeviceToken(to: &request, url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = 600
         request.setValue("application/x-tar", forHTTPHeaderField: "Accept")
@@ -979,6 +988,20 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         handleAuthenticationChallenge(challenge, scope: "task", completionHandler: completionHandler)
     }
 
+
+    /// Adds the machine's bearer token, when this device has one for that host.
+    ///
+    /// Trial machines authenticate the device with a token instead of a client
+    /// certificate: iOS will not send a certificate to a server whose
+    /// certificate it did not itself anchor, and declines silently, so mTLS to
+    /// a trial machine cannot complete from the app. The token is scoped to one
+    /// host, so no other server ever receives it, and a personal install
+    /// continues to authenticate with its certificate untouched.
+    private func applyDeviceToken(to request: inout URLRequest, url: URL) {
+        guard let host = url.host, let token = identityStore.deviceToken(for: host) else { return }
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    }
+
     private func handleAuthenticationChallenge(
         _ challenge: URLAuthenticationChallenge,
         scope: String,
@@ -1003,7 +1026,13 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
                 CodexDiagnostics.log("codex_client_cert_challenge", fields: [
                     "host": challenge.protectionSpace.host,
                     "scope": scope,
-                    "hasCredential": "true"
+                    "hasCredential": "true",
+                    // What we are about to hand iOS, and how many CAs the
+                    // machine said it would accept. iOS silently declines to
+                    // send a certificate it cannot match to that list, and
+                    // says nothing about why.
+                    "identity": identityStore.storedIdentityDescription,
+                    "acceptableCAs": String(challenge.protectionSpace.distinguishedNames?.count ?? -1)
                 ])
                 completionHandler(.useCredential, credential)
             } else {

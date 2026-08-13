@@ -53,6 +53,8 @@ final class ClientIdentityStore: ObservableObject {
     private let pinnedCAKey = "com.parikshit.pocvault.identity.pinnedCA"
     private let pinnedHostKey = "com.parikshit.pocvault.identity.pinnedHost"
     private let trialIssuedKey = "com.parikshit.pocvault.identity.trialIssued"
+    private let deviceTokenKey = "com.parikshit.pocvault.identity.deviceToken"
+    private let deviceTokenHostKey = "com.parikshit.pocvault.identity.deviceTokenHost"
     private var cachedIdentity: SecIdentity?
     private var cachedPinnedCA: SecCertificate?
 
@@ -110,7 +112,33 @@ final class ClientIdentityStore: ObservableObject {
         case (_, nil): issuedByPinnedCA = "no-pinned-ca"
         case let (issuer?, pinned?): issuedByPinnedCA = issuer == pinned ? "yes" : "NO"
         }
-        return "\(subject)|issuedByPinnedCA=\(issuedByPinnedCA)"
+        // Whether the private key can actually SIGN, not merely whether the
+        // identity exists.
+        //
+        // A client certificate is only sent if the TLS stack can produce a
+        // CertificateVerify with its key. If the key is missing from the
+        // keychain or unusable, iOS abandons the handshake without sending
+        // anything — which is what the machine observes: it records no failed
+        // handshake at all, while the phone reports "requires a client
+        // certificate". An identity that looks complete can still fail here,
+        // so it is checked directly rather than assumed.
+        var signable = "no-key"
+        if let key = { () -> SecKey? in
+            var k: SecKey?
+            return SecIdentityCopyPrivateKey(identity, &k) == errSecSuccess ? k : nil
+        }() {
+            var signError: Unmanaged<CFError>?
+            let probe = Data("relay-key-usability-probe".utf8) as CFData
+            let algorithm: SecKeyAlgorithm = .ecdsaSignatureMessageX962SHA256
+            if SecKeyIsAlgorithmSupported(key, .sign, algorithm) {
+                signable = SecKeyCreateSignature(key, algorithm, probe, &signError) != nil
+                    ? "yes"
+                    : "FAILED(\((signError?.takeRetainedValue() as Error?).map { ($0 as NSError).code.description } ?? "?"))"
+            } else {
+                signable = "algorithm-unsupported"
+            }
+        }
+        return "\(subject)|issuedByPinnedCA=\(issuedByPinnedCA)|canSign=\(signable)"
     }
 
     var supportDirectory: URL {
@@ -215,6 +243,18 @@ final class ClientIdentityStore: ObservableObject {
         let data = try Data(contentsOf: url)
         let imported = try Self.importPKCS12(data, passphrase: passphrase)
         try save(identity: imported.identity, label: url.deletingPathExtension().lastPathComponent)
+        // The issuing CA goes into the keychain alongside the identity, not
+        // only into defaults for pinning.
+        //
+        // A machine names one acceptable client CA in its certificate request,
+        // and iOS sends a certificate only when it can build a chain from the
+        // leaf to one of those names. With the CA absent from the keychain
+        // there is no chain to build: iOS declined silently, sent nothing, and
+        // the connection failed as -1206 while the machine logged no handshake
+        // error at all — because none reached it. A certificate minted from
+        // the same CA, with that CA available locally, authenticated to the
+        // same machine and returned 200.
+        saveCACertificate(imported.caCertificate)
         cachedIdentity = imported.identity
         lastImportedCertificateName = certificateCommonName(for: imported.identity) ?? url.lastPathComponent
         pinTrialMaterial(caCertificate: imported.caCertificate, host: trialHost)
@@ -235,6 +275,34 @@ final class ClientIdentityStore: ObservableObject {
         }
         cachedPinnedCA = certificate
         return certificate
+    }
+
+    /// Stores the bearer token this device authenticates to `host` with, and
+    /// the host it belongs to.
+    ///
+    /// Scoped to one host for the same reason the pinned CA is: a token left
+    /// behind by an expired trial must never be offered to the next machine,
+    /// or to a personal install. Cleared with the rest of the trial material.
+    func storeDeviceToken(_ token: String, host: String?) {
+        guard let host = host?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !host.isEmpty, !token.isEmpty else {
+            return
+        }
+        defaults.set(token, forKey: deviceTokenKey)
+        defaults.set(host, forKey: deviceTokenHostKey)
+        CodexDiagnostics.log("identity_device_token_stored", fields: ["host": host])
+    }
+
+    /// The token for `host`, or nil when this device has none for it.
+    func deviceToken(for host: String) -> String? {
+        let wanted = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !wanted.isEmpty,
+              let stored = defaults.string(forKey: deviceTokenHostKey)?.lowercased(),
+              stored == wanted,
+              let token = defaults.string(forKey: deviceTokenKey)?.trimmedNonEmpty else {
+            return nil
+        }
+        return token
     }
 
     /// The single host `pinnedCACertificate` may be applied to.
@@ -287,6 +355,11 @@ final class ClientIdentityStore: ObservableObject {
         defaults.removeObject(forKey: trialIssuedKey)
         defaults.removeObject(forKey: pinnedHostKey)
         defaults.removeObject(forKey: pinnedCAKey)
+        // The device token is machine access just as much as the identity is,
+        // so it goes with the rest of the trial material — leaving it behind
+        // would hand the next account on this phone a working credential.
+        defaults.removeObject(forKey: deviceTokenKey)
+        defaults.removeObject(forKey: deviceTokenHostKey)
         cachedPinnedCA = nil
     }
 
@@ -386,6 +459,26 @@ final class ClientIdentityStore: ObservableObject {
         }
 
         return nil
+    }
+
+    /// Adds the issuing CA to the keychain so iOS can chain the client
+    /// certificate to it. Best effort: a duplicate is success, and any other
+    /// failure leaves the identity usable for servers that ask for no
+    /// particular issuer, so it must not abort the import.
+    private func saveCACertificate(_ certificate: SecCertificate?) {
+        guard let certificate else {
+            CodexDiagnostics.log("identity_ca_keychain", fields: ["stored": "false", "reason": "absent"])
+            return
+        }
+        let status = SecItemAdd([
+            kSecClass as String: kSecClassCertificate,
+            kSecValueRef as String: certificate,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        ] as CFDictionary, nil)
+        CodexDiagnostics.log("identity_ca_keychain", fields: [
+            "stored": String(status == errSecSuccess || status == errSecDuplicateItem),
+            "status": String(status)
+        ])
     }
 
     private func save(identity: SecIdentity, label: String) throws {
