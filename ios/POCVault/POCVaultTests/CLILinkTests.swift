@@ -57,7 +57,7 @@ final class CLILinkTests: XCTestCase {
         XCTAssertEqual(stub.lastInspectCode, "ABCD-EFGH")
 
         await model.confirmLink()
-        XCTAssertEqual(model.step, .linked)
+        XCTAssertEqual(model.step, .approved(machineName: "dev-box"))
         XCTAssertEqual(stub.lastApproveCode, "ABCD-EFGH")
     }
 
@@ -73,6 +73,21 @@ final class CLILinkTests: XCTestCase {
         model.manualCode = "ABCD-EFGH"
         await model.submitManualCode()
         XCTAssertEqual(model.step, .failed(CLILinkFlowModel.staleCodeMessage))
+    }
+
+    func testFlowExplainsSingleComputerConflict() async {
+        let stub = StubCLILinkAuth()
+        stub.inspectError = RelayAuthClientError.server(
+            status: 409,
+            code: "computer_already_linked",
+            message: "x"
+        )
+        let model = CLILinkFlowModel(authClient: stub, bearerToken: "tok")
+        model.manualCode = "ABCD-EFGH"
+
+        await model.submitManualCode()
+
+        XCTAssertEqual(model.step, .failed(CLILinkFlowModel.alreadyLinkedMessage))
     }
 }
 

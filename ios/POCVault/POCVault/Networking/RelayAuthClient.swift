@@ -27,6 +27,8 @@ enum RelayAuthClientError: Error, LocalizedError, Equatable {
                 return "The password is incorrect."
             case "PROVIDER_NOT_FOUND":
                 return "Sign in with Apple is not configured on the Relay server yet."
+            case "computer_already_linked":
+                return "A computer is already connected. Disconnect it before linking another one."
             default:
                 return message
             }
@@ -181,6 +183,26 @@ final class RelayAuthClient {
             bearerToken: bearerToken
         ) else { throw RelayAuthClientError.invalidResponse }
         guard response.ok == true else { throw RelayAuthClientError.invalidResponse }
+    }
+
+    func linkedComputer(bearerToken: String) async throws -> CLIComputerLink? {
+        struct Payload: Decodable { let computer: CLIComputerLink? }
+        guard let response: Payload = try await request(
+            method: "GET",
+            path: "/v1/auth/device/link",
+            bearerToken: bearerToken
+        ) else { throw RelayAuthClientError.invalidResponse }
+        return response.computer
+    }
+
+    func disconnectComputer(bearerToken: String) async throws {
+        struct Payload: Decodable { let ok: Bool }
+        guard let response: Payload = try await request(
+            method: "DELETE",
+            path: "/v1/auth/device/link",
+            bearerToken: bearerToken
+        ) else { throw RelayAuthClientError.invalidResponse }
+        guard response.ok else { throw RelayAuthClientError.invalidResponse }
     }
 
     private func sessionToken(_ bodyToken: String?) throws -> String {

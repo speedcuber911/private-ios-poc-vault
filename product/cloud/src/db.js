@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
   id          TEXT PRIMARY KEY,
   account_id  TEXT NOT NULL,
   token_hash  TEXT NOT NULL UNIQUE,
+  cli_link_id TEXT,
   expires_at  INTEGER NOT NULL,
   revoked_at  INTEGER,
   created_at  INTEGER NOT NULL
@@ -151,6 +152,7 @@ CREATE TABLE IF NOT EXISTS device_codes (
   device_code_hash TEXT NOT NULL,
   user_code TEXT NOT NULL,
   account_id TEXT,
+  cli_link_id TEXT,
   approved_at INTEGER,
   consumed_at INTEGER,
   expires_at INTEGER NOT NULL,
@@ -186,6 +188,23 @@ CREATE INDEX IF NOT EXISTS idx_device_codes_client_ip ON device_codes (client_ip
 -- is guaranteed by construction, and a UNIQUE index would turn any legacy
 -- duplicate into a failure to open the database at boot.
 CREATE INDEX IF NOT EXISTS idx_device_codes_hash ON device_codes (device_code_hash);
+
+-- A Relay account may authorize exactly one handoff computer at a time.
+-- The row is created when the phone approves a device code and becomes
+-- connected only when that computer redeems the code. CLI session/refresh
+-- credentials carry this row's id, so deleting it immediately invalidates
+-- that computer without signing the phone out of its Better Auth session.
+CREATE TABLE IF NOT EXISTS cli_computer_links (
+  id           TEXT PRIMARY KEY,
+  account_id   TEXT NOT NULL UNIQUE,
+  machine_name TEXT,
+  platform     TEXT,
+  connected_at INTEGER,
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cli_computer_links_account
+  ON cli_computer_links (account_id);
 
 CREATE TABLE IF NOT EXISTS repos (
   id TEXT PRIMARY KEY,
@@ -272,6 +291,7 @@ export function createDb(path = ":memory:") {
   db.exec("PRAGMA foreign_keys = ON;");
   migratePairingSessions(db);
   db.exec(SCHEMA);
+  migrateCliComputerLinks(db);
   return db;
 }
 
@@ -295,4 +315,18 @@ function migratePairingSessions(db) {
   if (!columns.some((column) => column.name === "kind")) {
     db.exec("DROP TABLE pairing_sessions");
   }
+}
+
+// CREATE TABLE IF NOT EXISTS does not add columns to an existing SQLite
+// table. These nullable link ids are backwards-compatible with credentials
+// and in-flight device codes issued before single-computer linking existed.
+function migrateCliComputerLinks(db) {
+  const addColumnIfMissing = (table, column, declaration) => {
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+    if (!columns.some((entry) => entry.name === column)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${declaration}`);
+    }
+  };
+  addColumnIfMissing("refresh_tokens", "cli_link_id", "cli_link_id TEXT");
+  addColumnIfMissing("device_codes", "cli_link_id", "cli_link_id TEXT");
 }
