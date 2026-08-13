@@ -16,7 +16,8 @@
 
 import { createServer } from "node:http";
 import { readFileSync } from "node:fs";
-import { timingSafeEqual, randomBytes, createHash } from "node:crypto";
+import { timingSafeEqual, randomBytes, createHash, randomUUID } from "node:crypto";
+import { signEd25519 } from "./jwt.js";
 import { serializeSignedCookie } from "better-call";
 import { createDb } from "./db.js";
 import { createRegistry } from "./registry.js";
@@ -29,6 +30,8 @@ import { createProvisioner } from "./provisioner.js";
 import { verifyNodeRequest, createReplayGuard } from "./nodeauth.js";
 
 const NODE_KINDS = new Set(["byo", "managed"]);
+const BROWSER_GRANT_TTL_SEC = 900;
+const BROWSER_GRANT_SCOPE = ["jobs.read", "threads.read", "events.read"];
 
 // Reads the wildcard certificate handed to every trial node, or {} when none
 // is configured. Read per provision rather than cached at boot so a certbot
@@ -1011,6 +1014,41 @@ export function createApp({
       return sendJson(res, 200, { nodes: registry.listNodes(account.id) });
     }
 
+    if (
+      method === "POST" &&
+      seg.length === 4 &&
+      seg[0] === "v1" &&
+      seg[1] === "nodes" &&
+      seg[3] === "browser-grants"
+    ) {
+      // Same 404 whether the id is unknown or belongs to another account —
+      // a browser session has no business learning which is true.
+      const node = registry.getNode(seg[2]);
+      if (!node || node.accountId !== account.id) {
+        return sendJson(res, 404, { error: "not_found" });
+      }
+      if (!config.browserGrantPrivateKey || !config.grantGatewayUrl) {
+        return sendJson(res, 503, { error: "grants_unavailable" });
+      }
+      const iat = Math.floor(now() / 1000);
+      const grant = signEd25519(
+        {
+          sub: account.id,
+          node: node.id,
+          scope: BROWSER_GRANT_SCOPE,
+          iat,
+          exp: iat + BROWSER_GRANT_TTL_SEC,
+          jti: randomUUID(),
+        },
+        config.browserGrantPrivateKey,
+      );
+      return sendJson(res, 201, {
+        grant,
+        expiresIn: BROWSER_GRANT_TTL_SEC,
+        gatewayUrl: config.grantGatewayUrl,
+      });
+    }
+
     if (seg.length === 3 && seg[0] === "v1" && seg[1] === "nodes") {
       const node = registry.getNode(seg[2]);
       if (!node || node.accountId !== account.id) {
@@ -1211,6 +1249,11 @@ export function createApp({
             // all — so mTLS cannot complete. Absent (no wildcard configured),
             // the node falls back to self-signing and nothing else changes.
             ...nodeTlsMaterial(config),
+            // Public half of the browser-grant key. Omitted when unset so
+            // existing phones and nodes that do not speak grants keep working.
+            ...(config.browserGrantPublicKey
+              ? { grantPublicKey: config.browserGrantPublicKey }
+              : {}),
           }),
         );
       } catch {

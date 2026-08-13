@@ -162,6 +162,15 @@ export function loadConfig(env = process.env) {
     // where the fallback (host:port) is used instead.
     enrollBaseUrl: env.ENROLL_BASE_URL || "",
 
+    // Browser activity grants. Ed25519 only — there is no HMAC
+    // BROWSER_GRANT_SECRET. Private key stays on the control-plane host;
+    // the 32-byte public half is what enroll.json delivers to the node.
+    // Unset means POST /v1/nodes/:id/browser-grants returns 503 and
+    // enroll.json omits grantPublicKey so existing phones keep working.
+    browserGrantPrivateKey: env.BROWSER_GRANT_PRIVATE_KEY || "",
+    browserGrantPublicKey: env.BROWSER_GRANT_PUBLIC_KEY || "",
+    grantGatewayUrl: env.GRANT_GATEWAY_URL || "",
+
     // General request body cap for JSON endpoints.
     jsonBodyMaxBytes: intFrom(env.JSON_BODY_MAX_BYTES, 32 * 1024),
 
