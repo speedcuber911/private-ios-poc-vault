@@ -868,7 +868,37 @@ enum AppConfiguration {
     /// for the device and broke every simulator build — which is also the
     /// build the handoff states get exercised from.
     static let hasConfiguredPersonalInstall: Bool = {
-        (supportConfig?.codexBaseURL?.trimmedNonEmpty) != nil
+        if (supportConfig?.codexBaseURL?.trimmedNonEmpty) != nil { return true }
+        return isSimulatorFixtureRun
+    }()
+
+    /// True only when `ios/launch-simulator.sh` is driving this run: it exports
+    /// `SIMCTL_CHILD_RELAY_SIM_FIXTURE=1`, which reaches the app as
+    /// `RELAY_SIM_FIXTURE`, and it builds against the local fixture server. That
+    /// run genuinely has a machine, so it belongs in
+    /// `hasConfiguredPersonalInstall` rather than as a short-circuit inside
+    /// `RelayNodeStore.hasMachine`.
+    ///
+    /// Both guards are load-bearing. The `#if` means no device build can be
+    /// talked into claiming a machine by an environment variable. The env check
+    /// means `xcodebuild test` — also a simulator build, and it sets none of
+    /// these — sees the truth. The previous blanket
+    /// `#if targetEnvironment(simulator) → true` made `hasMachine`
+    /// unconditionally true wherever the tests run, so
+    /// `testTrialRefreshClearsTheNodeURLOnceTheTrialIsNoLongerUsable` asserted
+    /// something that could not hold and failed the build on Apple's side.
+    ///
+    /// Deliberately NOT derived from the Info.plist base URL: the project
+    /// defaults `POC_VAULT_CODEX_BASE_URL` to a checked-in host, so "the plist
+    /// has a URL" is true of every build and means nothing. That default host is
+    /// the decommissioned one whose TLS failures this whole predicate exists to
+    /// stop reporting as the user's own machine misbehaving.
+    static let isSimulatorFixtureRun: Bool = {
+#if targetEnvironment(simulator)
+        ProcessInfo.processInfo.environment["RELAY_SIM_FIXTURE"] == "1"
+#else
+        false
+#endif
     }()
 
     static let trustedManifestPublicKey = configuredPublicKey(

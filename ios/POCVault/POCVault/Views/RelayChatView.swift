@@ -776,7 +776,7 @@ private struct RelayStatusPill: View {
         if status.isActive, let startedAt {
             TimelineView(.periodic(from: .now, by: 1)) { context in
                 RelayCapsLabel(
-                    text: "\(status.label) · \(elapsedLabel(to: context.date))",
+                    text: "\(status.label) · \(Self.elapsedLabel(from: startedAt, to: context.date))",
                     color: AppTheme.accentBright
                 )
             }
@@ -785,8 +785,11 @@ private struct RelayStatusPill: View {
         }
     }
 
-    private func elapsedLabel(to now: Date) -> String {
-        guard let startedAt else { return "" }
+    /// Takes the start explicitly rather than re-unwrapping the property: the
+    /// `if let` above had already proved it non-nil, so the second `guard let`
+    /// was dead, and the binding it discarded was the compiler's "immutable
+    /// value 'startedAt' was never used" warning.
+    private static func elapsedLabel(from startedAt: Date, to now: Date) -> String {
         let seconds = max(0, Int(now.timeIntervalSince(startedAt)))
         return String(format: "%d:%02d", seconds / 60, seconds % 60)
     }
