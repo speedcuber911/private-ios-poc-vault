@@ -17,6 +17,8 @@
 #   SIMCTL_CHILD_RELAY_UITEST_CREATE_EMAIL=...     email for that local account
 #   SIMCTL_CHILD_RELAY_UITEST_CREATE_PASSWORD=...  password for that local account
 #   SIMCTL_CHILD_RELAY_UITEST_SKIP_ONBOARDING=1    enter the signed-in app directly
+#   (RELAY_SIM_FIXTURE=1 is exported for you — it tells the app the local fixture
+#    server counts as its machine, so the signed-in UI is reachable without a trial)
 #   RELAY_SIM_SIGNED_OUT=1                         show the sign-in flow instead of the
 #                                                  default local preview account
 #
@@ -144,6 +146,14 @@ APP_PATH="$ROOT/ios/POCVault/build/Debug-iphonesimulator/Relay.app"
 xcrun simctl terminate "$SIM_ID" "$BUNDLE_ID" >/dev/null 2>&1 || true
 xcrun simctl uninstall "$SIM_ID" "$BUNDLE_ID" >/dev/null 2>&1 || true
 xcrun simctl install "$SIM_ID" "$APP_PATH"
+
+# Marks this run as the fixture-backed preview. AppConfiguration.isSimulatorFixtureRun
+# reads it, and it is what lets the app treat the local fixture server as a real
+# machine. Exported unconditionally — a signed-out preview still needs it the moment
+# the user signs in. It must NOT be inferred from "am I a simulator": xcodebuild test
+# is a simulator build too, and inferring it there made hasMachine unconditionally
+# true and broke TrialPairingTests.
+export SIMCTL_CHILD_RELAY_SIM_FIXTURE=1
 
 # The local fixture server owns this preview-only account. Keep the normal one-command
 # simulator workflow inside the product instead of dropping back to the sign-in screen
