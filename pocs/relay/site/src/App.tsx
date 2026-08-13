@@ -15,30 +15,34 @@ import TextPressure from './components/reactbits/TextPressure';
 const ease = [0.16, 1, 0.3, 1] as const;
 const installCommand = "curl --proto '=https' --tlsv1.2 -fsSL https://get.openrelay.sh/install.sh | sh";
 
-const capabilities = [
+const surfaceMoments = [
   {
-    id: 'files',
-    title: 'Files',
-    label: 'Start with the real workspace',
-    copy: 'Choose a registered folder. Relay sends the task to the machine that already has the code, tools, and context.',
+    id: 'start',
+    step: '01',
+    title: 'Start',
+    statement: 'Choose the real workspace.',
+    signal: 'WORKSPACE READY',
   },
   {
-    id: 'runs',
-    title: 'Runs',
-    label: 'Leave the long task running',
-    copy: 'Start Codex, Claude Code, or Cursor work, follow live progress, and cancel when the direction changes.',
+    id: 'watch',
+    step: '02',
+    title: 'Watch',
+    statement: 'See the run as it happens.',
+    signal: 'VERIFICATION LIVE',
   },
   {
-    id: 'threads',
-    title: 'Threads',
-    label: 'Continue without reconstructing',
-    copy: 'Every conversation stays attached to the workspace where it began, even after you leave the desk.',
+    id: 'steer',
+    step: '03',
+    title: 'Steer',
+    statement: 'Continue the same thread.',
+    signal: 'CONTEXT INTACT',
   },
   {
-    id: 'previews',
-    title: 'Previews',
-    label: 'See the result on your phone',
-    copy: 'Open authenticated POCs and bounded artifacts directly from the completed run.',
+    id: 'open',
+    step: '04',
+    title: 'Open',
+    statement: 'Review the finished work.',
+    signal: 'RESULT READY',
   },
 ];
 
@@ -81,55 +85,130 @@ function Reveal({ children, className = '', delay = 0 }: { children: React.React
 
 function LaptopVisual({
   lidRotation = 0,
-  screenOpacity = 1,
+  openOpacity = 1,
+  closedOpacity = 0,
 }: {
   lidRotation?: number | MotionValue<number>;
-  screenOpacity?: number | MotionValue<number>;
+  openOpacity?: number | MotionValue<number>;
+  closedOpacity?: number | MotionValue<number>;
 }) {
   return (
-    <div className="laptop">
-      <motion.div className="laptop-lid" style={{ rotateX: lidRotation }}>
-        <motion.div className="laptop-screen" style={{ opacity: screenOpacity }}>
-          <div className="laptop-toolbar">
-            <div><i /><i /><i /></div>
-            <span>relay / checkout</span>
-            <small>RUNNING</small>
-          </div>
-          <div className="laptop-workspace">
-            <div className="laptop-rail"><span>01</span><span>02</span><span>03</span></div>
-            <div className="laptop-task">
-              <small>CODEX · TASK</small>
-              <h3>Audit checkout failures and ship the fix.</h3>
-              <div className="laptop-step done"><Check size={12} /><span>Read workspace contract</span><small>done</small></div>
-              <div className="laptop-step done"><Check size={12} /><span>Trace the failed path</span><small>done</small></div>
-              <div className="laptop-step live"><i /><span>Run focused verification</span><small>live</small></div>
+    <div className="real-laptop">
+      <motion.div className="real-laptop-open" style={{ opacity: openOpacity }}>
+        <div className="real-laptop-base-photo"><img src="/devices/laptop-open-trim.webp" alt="" /></div>
+        <motion.div className="real-laptop-lid-photo" style={{ rotateX: lidRotation }}>
+          <img src="/devices/laptop-open-trim.webp" alt="" />
+          <div className="real-laptop-screen">
+            <div className="real-laptop-bar">
+              <span>Relay</span>
+              <small><i /> RUNNING</small>
+            </div>
+            <div className="real-laptop-task">
+              <small>CHECKOUT / CODEX</small>
+              <h3>Audit checkout failures<br />and ship the fix.</h3>
+              <div><Check size={10} /><span>Failure isolated</span><strong>DONE</strong></div>
+              <div><i /><span>Focused verification</span><strong>LIVE</strong></div>
             </div>
           </div>
         </motion.div>
       </motion.div>
-      <div className="laptop-base"><span /></div>
+      <motion.img className="real-laptop-closed" src="/devices/laptop-closed-trim.webp" alt="" style={{ opacity: closedOpacity }} />
     </div>
   );
 }
 
-function PhoneVisual() {
+type PhoneMode = 'start' | 'watch' | 'steer' | 'open';
+
+function PhoneVisual({
+  screenOpacity = 1,
+  mode = 'watch',
+}: {
+  screenOpacity?: number | MotionValue<number>;
+  mode?: PhoneMode;
+}) {
   return (
-    <div className="phone">
-      <div className="phone-frame">
-        <div className="phone-island" />
-        <div className="phone-screen">
-          <div className="phone-top"><strong>Relay</strong><span>Running <i /></span></div>
-          <div className="phone-context"><small>CHECKOUT · CODEX</small><strong>00:42</strong></div>
-          <h3>Checkout repair</h3>
-          <p className="phone-prompt">Audit checkout failures and ship the fix.</p>
-          <div className="phone-update">
-            <small>LIVE UPDATE</small>
-            <p>The failed payment path is isolated. Running the focused verification now.</p>
-          </div>
-          <div className="phone-result"><span>3 files changed</span><strong>checks passing</strong></div>
-          <div className="phone-action">Continue thread <ArrowUpRight size={13} /></div>
+    <div className="real-phone">
+      <img src="/devices/phone-v2-trim.webp" alt="" />
+      <motion.div className="real-phone-screen" style={{ opacity: screenOpacity }}>
+        <div className="real-phone-statusbar">
+          <strong>9:41</strong>
+          <div><i /><i /><span /></div>
         </div>
-      </div>
+        <div className="real-phone-nav">
+          <span>{mode === 'start' ? 'Workspaces' : 'Threads'}</span>
+          <strong>Relay</strong>
+          <i>KM</i>
+        </div>
+        <AnimatePresence mode="wait" initial={false}>
+          <motion.div
+            className={`real-phone-view real-phone-view-${mode}`}
+            key={mode}
+            initial={{ opacity: 0, x: 14, filter: 'blur(5px)' }}
+            animate={{ opacity: 1, x: 0, filter: 'blur(0px)' }}
+            exit={{ opacity: 0, x: -12, filter: 'blur(4px)' }}
+            transition={{ duration: 0.32, ease }}
+          >
+            {mode === 'start' && (
+              <>
+                <div className="phone-mode-kicker">NEW RUN / 01</div>
+                <div className="phone-mode-heading">Choose the<br />workspace.</div>
+                <div className="phone-workspace-list">
+                  <div className="active"><i>R</i><span><strong>relay</strong><small>~/work/relay</small></span><Check size={9} /></div>
+                  <div><i>R</i><span><strong>rocketizer</strong><small>~/work/rocketizer</small></span></div>
+                  <div><i>S</i><span><strong>scratch</strong><small>~/work/scratch</small></span></div>
+                </div>
+                <div className="phone-primary-action"><span>USE RELAY</span><ArrowUpRight size={10} /></div>
+              </>
+            )}
+
+            {mode === 'watch' && (
+              <>
+                <div className="real-phone-meta"><small>CHECKOUT · CODEX</small><span><i /> RUNNING</span></div>
+                <div className="real-phone-title">
+                  <h3>Checkout repair</h3>
+                  <strong>00:42</strong>
+                </div>
+                <div className="real-phone-user">Audit checkout failures and ship the fix.</div>
+                <div className="real-phone-update">
+                  <small>LIVE UPDATE</small>
+                  <p>Payment failure isolated. Verification is running now.</p>
+                  <div><i /><span>3 checks passed</span><strong>LIVE</strong></div>
+                </div>
+                <div className="real-phone-result">
+                  <div><small>RESULT</small><strong>Ready to review</strong></div>
+                  <ArrowUpRight size={10} />
+                </div>
+                <div className="real-phone-composer"><span>Continue thread</span><i><ArrowUpRight size={10} /></i></div>
+              </>
+            )}
+
+            {mode === 'steer' && (
+              <>
+                <div className="real-phone-meta"><small>CHECKOUT · CODEX</small><span><i /> RUNNING</span></div>
+                <div className="real-phone-title"><h3>Continue thread</h3><strong>00:46</strong></div>
+                <div className="phone-steer-agent"><small>CODEX</small><p>The payment path is fixed and the focused checks pass.</p><span><i /> Awaiting direction</span></div>
+                <div className="phone-steer-user">Run the full checkout suite too.</div>
+                <div className="phone-steer-live"><i /><span>CONTINUING WITH FULL SUITE</span></div>
+                <div className="real-phone-composer phone-composer-active"><span>Send another direction</span><i><ArrowUpRight size={10} /></i></div>
+              </>
+            )}
+
+            {mode === 'open' && (
+              <>
+                <div className="phone-mode-kicker">RUN COMPLETE / 04</div>
+                <div className="phone-complete-mark"><Check size={19} /></div>
+                <div className="phone-complete-heading">Ready to<br />review.</div>
+                <div className="phone-complete-proof"><span><strong>03</strong> files</span><span><strong>12</strong> checks</span></div>
+                <div className="phone-artifact-card">
+                  <div><small>PRIVATE PREVIEW</small><strong>Checkout recovery</strong></div>
+                  <ArrowUpRight size={11} />
+                </div>
+                <div className="phone-primary-action phone-open-action"><span>OPEN RESULT</span><ArrowUpRight size={10} /></div>
+              </>
+            )}
+          </motion.div>
+        </AnimatePresence>
+      </motion.div>
     </div>
   );
 }
@@ -153,19 +232,21 @@ function HandoffStory({ reducedMotion }: { reducedMotion: boolean }) {
   const [activeChapter, setActiveChapter] = useState(0);
   const { scrollYProgress } = useScroll({ target: ref, offset: ['start start', 'end end'] });
   const progress = useSpring(scrollYProgress, { stiffness: 105, damping: 25, mass: 0.22 });
-  const lidRotation = useTransform(progress, [0.12, 0.34], [0, -88]);
-  const screenOpacity = useTransform(progress, [0.12, 0.3], [1, 0.18]);
-  const laptopX = useTransform(progress, [0.18, 0.62], ['0vw', '-17vw']);
-  const laptopY = useTransform(progress, [0.18, 0.48], [0, 54]);
-  const laptopScale = useTransform(progress, [0.2, 0.62], [1, 0.7]);
-  const laptopOpacity = useTransform(progress, [0.58, 0.84], [1, 0.28]);
-  const phoneX = useTransform(progress, [0.38, 0.62, 0.86], ['12vw', '0vw', '-4vw']);
-  const phoneY = useTransform(progress, [0.38, 0.6], [62, 0]);
-  const phoneScale = useTransform(progress, [0.38, 0.62], [0.84, 1]);
-  const phoneOpacity = useTransform(progress, [0.36, 0.52], [0, 1]);
-  const signalProgress = useTransform(progress, [0.3, 0.58], [0, 1]);
-  const signalOpacity = useTransform(progress, [0.28, 0.4, 0.68, 0.78], [0, 1, 1, 0]);
-  const signalArrivalOpacity = useTransform(signalProgress, [0.9, 1], [0, 1]);
+  const lidRotation = useTransform(progress, [0.13, 0.3], [0, -82]);
+  const openLaptopOpacity = useTransform(progress, [0, 0.28, 0.34], [1, 1, 0]);
+  const closedLaptopOpacity = useTransform(progress, [0.28, 0.35, 0.78, 0.9], [0, 1, 1, 0.18]);
+  const laptopX = useTransform(progress, [0.3, 0.64], ['0vw', '-19vw']);
+  const laptopScale = useTransform(progress, [0.3, 0.64], [1, 0.72]);
+  const laptopOpacity = useTransform(progress, [0.72, 0.9], [1, 0.2]);
+  const phoneX = useTransform(progress, [0.42, 0.65, 0.9], ['13vw', '0vw', '-2vw']);
+  const phoneScale = useTransform(progress, [0.42, 0.66], [0.88, 1]);
+  const phoneRotateZ = useTransform(progress, [0.42, 0.67], [2, 0]);
+  const phoneOpacity = useTransform(progress, [0.39, 0.55], [0, 1]);
+  const phoneScreenOpacity = useTransform(progress, [0.43, 0.58], [0.35, 1]);
+  const signalProgress = useTransform(progress, [0.31, 0.61], [0, 1]);
+  const signalOpacity = useTransform(progress, [0.29, 0.4, 0.69, 0.8], [0, 1, 1, 0]);
+  const signalArrivalOpacity = useTransform(signalProgress, [0.86, 1], [0, 1]);
+  const transferStatusOpacity = useTransform(progress, [0.31, 0.39, 0.63, 0.72], [0, 1, 1, 0]);
   const landscapeScale = useTransform(progress, [0, 1], [1.08, 1]);
   const shadeOpacity = useTransform(progress, [0, 0.48, 1], [0.76, 0.62, 0.38]);
   const rulerScale = useSpring(scrollYProgress, { stiffness: 120, damping: 26, mass: 0.2 });
@@ -200,15 +281,26 @@ function HandoffStory({ reducedMotion }: { reducedMotion: boolean }) {
         </AnimatePresence>
 
         <div className="handoff-devices">
-          <motion.div className="laptop-motion" style={{ x: laptopX, y: laptopY, scale: laptopScale, opacity: laptopOpacity }}>
-            <LaptopVisual lidRotation={lidRotation} screenOpacity={screenOpacity} />
+          <motion.div className="laptop-motion" style={{ x: laptopX, scale: laptopScale, opacity: laptopOpacity }}>
+            <LaptopVisual
+              lidRotation={lidRotation}
+              openOpacity={openLaptopOpacity}
+              closedOpacity={closedLaptopOpacity}
+            />
           </motion.div>
           <motion.svg className="handoff-signal" viewBox="0 0 1000 430" preserveAspectRatio="none" style={{ opacity: signalOpacity }} aria-hidden="true">
-            <motion.path d="M 345 282 C 500 155, 620 150, 760 230" pathLength={signalProgress} />
-            <motion.circle cx="760" cy="230" r="7" style={{ opacity: signalArrivalOpacity }} />
+            <motion.path className="signal-halo" d="M 330 300 C 470 315, 565 122, 765 220" pathLength={signalProgress} />
+            <motion.path d="M 330 300 C 470 315, 565 122, 765 220" pathLength={signalProgress} />
+            <motion.path className="signal-trail signal-trail-one" d="M 330 300 C 470 315, 565 122, 765 220" pathLength={signalProgress} />
+            <motion.path className="signal-trail signal-trail-two" d="M 330 300 C 470 315, 565 122, 765 220" pathLength={signalProgress} />
+            <motion.circle cx="765" cy="220" r="8" style={{ opacity: signalArrivalOpacity }} />
+            <motion.circle className="signal-ring" cx="765" cy="220" r="18" style={{ opacity: signalArrivalOpacity }} />
           </motion.svg>
-          <motion.div className="phone-motion" style={{ x: phoneX, y: phoneY, scale: phoneScale, opacity: phoneOpacity }}>
-            <PhoneVisual />
+          <motion.div className="handoff-transfer-status" style={{ opacity: transferStatusOpacity }}>
+            <i /><span>RUN CONTINUES</span><strong>THREAD IN TRANSIT</strong>
+          </motion.div>
+          <motion.div className="phone-motion" style={{ x: phoneX, scale: phoneScale, rotateZ: phoneRotateZ, opacity: phoneOpacity }}>
+            <PhoneVisual screenOpacity={phoneScreenOpacity} />
           </motion.div>
         </div>
 
@@ -218,83 +310,78 @@ function HandoffStory({ reducedMotion }: { reducedMotion: boolean }) {
   );
 }
 
-function CapabilityPreview({ active }: { active: string }) {
-  return (
-    <AnimatePresence mode="wait">
-      <motion.div
-        className={`capability-preview preview-${active}`}
-        key={active}
-        initial={{ opacity: 0, y: 22, clipPath: 'inset(0 0 12% 0)' }}
-        animate={{ opacity: 1, y: 0, clipPath: 'inset(0 0 0% 0)' }}
-        exit={{ opacity: 0, y: -14, clipPath: 'inset(12% 0 0 0)' }}
-        transition={{ duration: 0.48, ease }}
-      >
-        <header><span>relay / product</span><small>PRIVATE NODE</small></header>
-        {active === 'files' && (
-          <div className="files-preview">
-            <div className="preview-path">workspaces / <strong>relay</strong></div>
-            {['product', 'relay-server', 'ios', 'AGENTS.md'].map((item, index) => (
-              <div className="file-line" key={item}><span>0{index + 1}</span><strong>{item}</strong><small>{index < 3 ? 'folder' : '12 KB'}</small></div>
-            ))}
-          </div>
-        )}
-        {active === 'runs' && (
-          <div className="runs-preview">
-            <div className="run-clock"><span>RUNNING</span><strong>00:42</strong></div>
-            <div className="run-prompt">“Audit checkout failures and ship the fix.”</div>
-            {['Read workspace contract', 'Trace the failed path', 'Run focused verification'].map((item, index) => (
-              <div className="run-line" key={item}><Check size={14} /><span>{item}</span><small>{index === 2 ? 'live' : 'done'}</small></div>
-            ))}
-          </div>
-        )}
-        {active === 'threads' && (
-          <div className="threads-preview">
-            <div className="thread-question">Make the failed checkout recoverable.</div>
-            <div className="thread-answer"><span>CODEX / TASK</span><p>The payment failure is isolated and the focused verification is running now.</p></div>
-            <div className="thread-proof">3 files changed <strong>checks passing</strong></div>
-          </div>
-        )}
-        {active === 'previews' && (
-          <div className="previews-preview">
-            <div className="preview-ready"><span>ARTIFACT 04</span><strong>READY</strong></div>
-            <div className="preview-stack"><i>HTML</i><i>CSS</i><i>JS</i></div>
-            <div className="preview-open">OPEN AUTHENTICATED PREVIEW <ArrowUpRight size={15} /></div>
-          </div>
-        )}
-      </motion.div>
-    </AnimatePresence>
-  );
-}
+function SurfaceSection() {
+  const [active, setActive] = useState(surfaceMoments[1].id);
+  const moment = surfaceMoments.find((item) => item.id === active) ?? surfaceMoments[0];
 
-function CapabilityIndex() {
-  const [active, setActive] = useState(capabilities[0].id);
   return (
-    <section className="capabilities" id="product">
-      <div className="capability-heading">
-        <span>02 — THE SURFACE</span>
-        <h2>Everything you need.<br />Nothing you do not.</h2>
+    <section className="surface-v3" id="product">
+      <div className="surface-v3-topline">
+        <span>02 — THE CONTROL SURFACE</span>
+        <small>NOT A REMOTE DESKTOP</small>
       </div>
-      <div className="capability-layout">
-        <div className="capability-list" role="tablist" aria-label="Relay capabilities">
-          {capabilities.map((capability, index) => (
+      <Reveal className="surface-v3-heading">
+        <h2>The whole run.<br /><em>In your hand.</em></h2>
+      </Reveal>
+
+      <div className={`surface-v3-stage moment-${moment.id}`}>
+        <div className="surface-v3-orbit" aria-hidden="true">
+          <i /><i /><i />
+        </div>
+        <AnimatePresence mode="wait">
+          <motion.div
+            className="surface-v3-statement"
+            key={moment.id}
+            initial={{ opacity: 0, y: 24 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -18 }}
+            transition={{ duration: 0.42, ease }}
+          >
+            <span>{moment.step} / 04</span>
+            <strong>{moment.title}</strong>
+            <p>{moment.statement}</p>
+          </motion.div>
+        </AnimatePresence>
+
+        <motion.div
+          className="surface-v3-phone"
+          animate={{ rotate: active === 'steer' ? -3 : active === 'open' ? 2 : 0, y: active === 'start' ? 8 : 0 }}
+          transition={{ duration: 0.7, ease }}
+        >
+          <div className="surface-v3-phone-aura" aria-hidden="true" />
+          <PhoneVisual mode={moment.id as PhoneMode} />
+        </motion.div>
+
+        <AnimatePresence mode="wait">
+          <motion.div
+            className="surface-v3-signal"
+            key={moment.signal}
+            initial={{ opacity: 0, x: 18 }}
+            animate={{ opacity: 1, x: 0 }}
+            exit={{ opacity: 0, x: -12 }}
+            transition={{ duration: 0.36, ease }}
+          >
+            <i /><span>{moment.signal}</span>
+          </motion.div>
+        </AnimatePresence>
+
+        <div className="surface-v3-rail" role="tablist" aria-label="Relay control moments">
+          {surfaceMoments.map((item) => (
             <button
               type="button"
               role="tab"
-              aria-selected={active === capability.id}
-              className={active === capability.id ? 'active' : ''}
-              key={capability.id}
-              onClick={() => setActive(capability.id)}
-              onPointerEnter={() => setActive(capability.id)}
-              onFocus={() => setActive(capability.id)}
+              aria-selected={active === item.id}
+              className={active === item.id ? 'active' : ''}
+              key={item.id}
+              onClick={() => setActive(item.id)}
+              onPointerEnter={() => setActive(item.id)}
+              onFocus={() => setActive(item.id)}
             >
-              <span>0{index + 1}</span>
-              <strong>{capability.title}</strong>
-              <div><small>{capability.label}</small><p>{capability.copy}</p></div>
-              <ArrowUpRight size={19} />
+              <span>{item.step}</span>
+              <strong>{item.title}</strong>
             </button>
           ))}
         </div>
-        <div className="capability-preview-wrap"><CapabilityPreview active={active} /></div>
       </div>
     </section>
   );
@@ -363,30 +450,95 @@ export default function App() {
               <p>Launch, watch, and continue agent work from your iPhone while the machine with your files does the execution.</p>
             </div>
             <div className="hero-product-line" aria-hidden="true"><span>WORKSPACE</span><i /><strong>RELAY</strong><i /><span>IPHONE</span></div>
+            <div className="hero-proof" aria-label="Relay product highlights">
+              <span><strong>03</strong> agent runtimes</span>
+              <span><strong>01</strong> continuous thread</span>
+              <span><strong>∞</strong> away from the desk</span>
+            </div>
             <a className="hero-scroll" href="#system"><span>See the handoff</span><ArrowDown size={16} /></a>
             <div className="hero-count">01 / 04</div>
           </motion.div>
         </section>
 
         <HandoffStory reducedMotion={reducedMotion} />
-        <CapabilityIndex />
+        <SurfaceSection />
 
-        <section className="privacy" id="privacy">
-          <div className="privacy-kicker">03 — THE BOUNDARY</div>
-          <Reveal><h2>Your machine.<br />Your accounts.<br />Your files.</h2></Reveal>
-          <div className="privacy-rules">
-            <Reveal delay={0.04}><span>01</span><p>Agent subscription state stays isolated on the runner.</p></Reveal>
-            <Reveal delay={0.1}><span>02</span><p>Every file and agent route stays inside registered workspace boundaries.</p></Reveal>
-            <Reveal delay={0.16}><span>03</span><p>Trial infrastructure is optional, short-lived, and named plainly when used.</p></Reveal>
+        <section className="boundary-v2" id="privacy">
+          <div className="boundary-v2-topline">
+            <span>03 — PRIVATE BY DESIGN</span>
+            <small>AUTHENTICATED CONTROL / BOUNDED EXECUTION</small>
           </div>
-          <div className="privacy-stamp">AUTHENTICATED CONTROL / BOUNDED EXECUTION</div>
+          <Reveal className="boundary-v2-heading">
+            <h2>Only the signal<br /><em>moves.</em></h2>
+          </Reveal>
+
+          <Reveal className="boundary-v2-field">
+            <div className="boundary-v2-local">
+              <div className="boundary-v2-rings" aria-hidden="true"><i /><i /><i /></div>
+              <span className="boundary-v2-label label-files">FILES</span>
+              <span className="boundary-v2-label label-tools">TOOLS</span>
+              <span className="boundary-v2-label label-auth">AUTH</span>
+              <div className="boundary-v2-core">
+                <small>EXECUTION</small>
+                <strong>RUNNER</strong>
+                <span><i /> LOCAL / ACTIVE</span>
+              </div>
+            </div>
+
+            <div className="boundary-v2-lanes" aria-label="Prompts, live state, and results cross the authenticated boundary">
+              <div><span>PROMPTS</span><i><b /></i></div>
+              <div><span>LIVE STATE</span><i><b /></i></div>
+              <div><span>RESULTS</span><i><b /></i></div>
+            </div>
+
+            <div className="boundary-v2-gate">
+              <span>AUTHENTICATED</span>
+              <i><b /></i>
+              <small>CONTROL ONLY</small>
+            </div>
+
+            <div className="boundary-v2-portable">
+              <div className="boundary-v2-portable-rings" aria-hidden="true"><i /><i /></div>
+              <div className="boundary-v2-relay-core">
+                <small>CONTROL</small>
+                <strong>RELAY</strong>
+                <span><i /> CONNECTED</span>
+              </div>
+              <div className="boundary-v2-device">IPHONE</div>
+            </div>
+          </Reveal>
+
+          <div className="boundary-v2-legend">
+            <Reveal delay={0.04}><small>STAYS ON THE RUNNER</small><strong>FILES · TOOLS · AUTH</strong></Reveal>
+            <Reveal delay={0.1}><small>MOVES WITH YOU</small><strong>PROMPTS · STATE · RESULTS</strong></Reveal>
+          </div>
         </section>
 
-        <section className="closing">
-          <div className="closing-intro">04 — KEEP THE THREAD</div>
-          <p>Close the lid.<br />Keep the thread.</p>
-          <TextPressure text="RELAY" className="closing-pressure" minFontSize={58} maxFontSize={190} />
-          <a href="#top" className="return-link">Return to the beginning <RotateCcw size={14} /></a>
+        <section className="closing closing-v2">
+          <div className="closing-v2-grid" aria-hidden="true" />
+          <div className="closing-v2-orbit" aria-hidden="true"><i /></div>
+          <div className="closing-v2-top">
+            <span>04 — KEEP MOVING</span>
+            <small>RELAY / PRIVATE BETA</small>
+          </div>
+          <Reveal className="closing-v2-copy">
+            <h2>Leave the desk.<br /><em>Not the work.</em></h2>
+            <p>Install Relay on the machine that holds your work. Carry the live thread from iPhone.</p>
+          </Reveal>
+          <Reveal className="closing-v2-action" delay={0.08}>
+            <div>
+              <small>INSTALL RELAY CLI</small>
+              <code><i>$</i> curl -fsSL get.openrelay.sh/install.sh | sh</code>
+            </div>
+            <button type="button" onClick={copyInstallCommand}>
+              {installCopied ? <Check size={16} /> : <Copy size={16} />}
+              <span>{installCopied ? 'COPIED' : 'COPY'}</span>
+            </button>
+          </Reveal>
+          <div className="closing-v2-bottom">
+            <strong>RELAY</strong>
+            <a href="#top" className="return-link">Back to top <RotateCcw size={14} /></a>
+          </div>
         </section>
       </main>
 
