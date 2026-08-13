@@ -7,6 +7,7 @@ interface TextPressureProps {
   text: string;
   className?: string;
   minFontSize?: number;
+  maxFontSize?: number;
   textColor?: string;
 }
 
@@ -17,6 +18,7 @@ export default function TextPressure({
   text,
   className = '',
   minFontSize = 48,
+  maxFontSize = 240,
   textColor = 'currentColor',
 }: TextPressureProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -32,8 +34,9 @@ export default function TextPressure({
     const container = containerRef.current;
     if (!container) return;
     const width = container.getBoundingClientRect().width;
-    setFontSize(Math.max(minFontSize, width / Math.max(text.length * 0.53, 1)));
-  }, [minFontSize, text.length]);
+    const fittedSize = width / Math.max(text.length * 0.7, 1);
+    setFontSize(Math.min(maxFontSize, Math.max(minFontSize, fittedSize)));
+  }, [maxFontSize, minFontSize, text.length]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -77,16 +80,16 @@ export default function TextPressure({
       lettersRef.current.forEach((letter) => {
         if (!letter) return;
         if (reducedMotion.current) {
-          letter.style.fontVariationSettings = "'wght' 520, 'wdth' 100, 'slnt' 0";
+          letter.style.fontVariationSettings = "'wght' 500, 'wdth' 100, 'slnt' 0";
           return;
         }
         const rect = letter.getBoundingClientRect();
         const center = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
         const raw = Math.max(0, 1 - distance(smoothedPointer.current, center) / maxDistance);
         const proximity = raw * raw * (3 - 2 * raw);
-        const weight = Math.round(260 + proximity * 700);
-        const width = Math.round(68 + proximity * 80);
-        const slant = (-7 + proximity * 7).toFixed(2);
+        const weight = Math.round(360 + proximity * 300);
+        const width = Math.round(92 + proximity * 18);
+        const slant = (-2 + proximity * 2).toFixed(2);
         letter.style.fontVariationSettings = `'wght' ${weight}, 'wdth' ${width}, 'slnt' ${slant}`;
       });
     };
