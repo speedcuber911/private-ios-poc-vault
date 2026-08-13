@@ -1209,6 +1209,26 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     return mapHandoff(db.prepare("SELECT * FROM handoffs WHERE id = ?").get(id));
   }
 
+  // The newest row for a node in one state. Exists for one caller: the push
+  // banner in notify.js, which has to name the handoff an event is about
+  // without the event naming it.
+  //
+  // A node's `handoff.ready` / `handoff.failed` event is content-free — type
+  // and node id, no handoff id (see notify.js's payload) — but the node calls
+  // POST /v1/node/handoffs/{id}/ready or .../fail FIRST and awaits it before
+  // posting the event (relayd handoff.mjs announceReady / announceFailed), so
+  // the row this returns has been in its terminal state for the duration of
+  // one HTTP round trip by the time the event arrives.
+  //
+  // `rowid` is the tiebreaker for the same reason it is on listHandoffsForRepo:
+  // `updated_at` is millisecond-resolution and SQLite makes no ordering
+  // guarantee among rows with an equal ORDER BY key.
+  function latestHandoffForNode(nodeId, state) {
+    return mapHandoff(db.prepare(
+      "SELECT * FROM handoffs WHERE node_id = ? AND state = ? ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+    ).get(nodeId, state));
+  }
+
   // `rowid` is the tiebreaker on both queries below: `created_at` is
   // millisecond-resolution, so two handoffs minted in the same millisecond
   // would otherwise sort nondeterministically (SQLite makes no ordering
@@ -1529,6 +1549,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     sweepNodeEvents,
     createHandoff,
     getHandoff,
+    latestHandoffForNode,
     listHandoffsForRepo,
     listPendingHandoffs,
     countPendingHandoffs,

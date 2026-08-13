@@ -11,11 +11,17 @@ enum RelayPushRoute: Equatable {
 
 /// APNs registration and routing.
 ///
-/// The payload the cloud sends is deliberately content-free — a node id, an
-/// event type, a timestamp and a sequence, under a top-level `relay` key
-/// (`cloud/src/apns.js` sends `{aps, relay}`). Nothing user-visible travels in
-/// the push: every detail is loaded from the node over mTLS after the tap, so a
-/// notification can never leak a title, a transcript or a credential.
+/// The routing payload is content-free — a node id, an event type, a timestamp
+/// and a sequence, under a top-level `relay` key (`cloud/src/apns.js` sends
+/// `{aps, relay}`). Everything this file reads comes from there.
+///
+/// The banner beside it (`aps.alert`) is not content-free, and deliberately so:
+/// a handoff banner names the repository and the branch, because a
+/// notification that cannot say WHICH session is ready is not worth the
+/// interruption. That is the whole of it — `cloud/src/notify.js` `bannerFor` is
+/// the single place that decides the text, and no transcript, prompt, manifest
+/// or credential is ever in it. Job details are still loaded from the node over
+/// mTLS after the tap.
 @MainActor
 final class RelayPushService: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
 

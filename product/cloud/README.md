@@ -88,15 +88,50 @@ registered pubkey (SPKI PEM or base64 raw 32 bytes accepted at registration).
 
 Push mapping (asserted in tests):
 
-- `job.needs_input`, `job.completed`, `job.failed` → **mutable** alert push
+- `job.needs_input`, `job.completed`, `job.failed`, `handoff.ready`,
+  `handoff.failed`, `credentials.failed` → **mutable** alert push
   (`apns-push-type: alert`, `mutable-content: 1`, categories
-  `RELAY_NEEDS_INPUT` / `RELAY_JOB_DONE` / `RELAY_JOB_FAILED`). The
-  Notification Service Extension fetches real content from the node over the
-  tunnel (mTLS) and rewrites the banner — content never rests here.
-- `job.state`, `job.silence`, `node.health` → **silent** background push
-  (`apns-push-type: background`, `content-available: 1`).
+  `RELAY_NEEDS_INPUT` / `RELAY_JOB_DONE` / `RELAY_JOB_FAILED` /
+  `RELAY_HANDOFF_READY` / `RELAY_HANDOFF_FAILED` /
+  `RELAY_CREDENTIALS_FAILED`).
+- `job.state`, `job.silence`, `node.health`, `credentials.installed` →
+  **silent** background push (`apns-push-type: background`,
+  `content-available: 1`).
 
 Events are retained 7 days (`EVENT_RETENTION_DAYS`), swept every minute.
+
+#### Banner text
+
+`notify.js` `bannerFor` is the single place that decides what a user reads, and
+therefore the single place that decides what Apple can read. It builds the
+banner from **this server's own tables**, never from the event — the event
+carries no text at all (see the content-free ingest schema above), so a node
+cannot influence a banner even by sending fields nobody asked for.
+
+- `handoff.ready` → *"Session ready" / "acme/widgets ·
+  relay/handoff-da52e722"*
+- `handoff.failed` → *"Handoff failed" / "acme/widgets ·
+  relay/handoff-da52e722 — couldn't clone the branch"*, where the explanation
+  comes from the five-code `HANDOFF_FAILURE_REASONS` vocabulary and never from
+  free text.
+- everything else → a fixed string per event type, disclosing nothing beyond
+  the fact that a push happened.
+
+**This discloses repo and branch names to Apple.** Both are already stored here
+(`POST /v1/handoffs` accepts exactly those two names), but a push payload is
+readable in a way the database is not, so it is a deliberate widening — made
+because a banner that cannot say *which* session is ready is not worth the
+interruption. Nothing follows it: no transcript, prompt, manifest, or session
+title. The handoff a banner names is found by looking up the newest row for
+that node in the matching terminal state, within a 5-minute window; outside the
+window, or with no matching row, the banner degrades to generic wording rather
+than naming a stale handoff.
+
+`mutable-content: 1` is still set on every alert push. A Notification Service
+Extension does not exist in the app today (an unresolvable `loc-key` is why
+every banner used to read literally `RELAY_EVENT`); if one is added it can
+rewrite this text from the node over mTLS, and the names can come back out of
+the payload.
 
 `apns.send()` never throws and never reports a rejected push as success: it
 returns a classified outcome (`delivered`, `unregistered`, `auth_failed`,
