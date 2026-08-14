@@ -78,6 +78,13 @@ export function createRelayBetterAuth({
       // proved the address. Trust Apple and allow the link; otherwise the
       // phone Sign in with Apple button permanently locks out anyone who
       // created the account from the web console first.
+      //
+      // Accepted risk (owner decision, 2026-08-14): with no verification
+      // mail, someone who pre-registers another person's email with a
+      // password keeps that password after the real owner links via Apple
+      // (pre-account-takeover). Tolerable at POC scale; when verification
+      // mail exists, send it and drop requireLocalEmailVerified back to
+      // the Better Auth default instead of widening trustedProviders.
       accountLinking: {
         enabled: true,
         trustedProviders: ["apple"],

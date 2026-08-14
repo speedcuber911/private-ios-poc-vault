@@ -282,7 +282,7 @@ cards, no colored dots.
 | `/login` | Sign in / Create account. Username, email on signup, password. Ember CTA. Mode switch. Text action: **Sign in with iPhone** (starts `client: "web"`, shows QR + human code). After signup → `/provisioning`. After sign-in → `/machines`. Preserve `#code=` and auto-approve if present. |
 | `/cli-login` | `DEVICE_LOGIN_URL` page. Behavior in §4.3. |
 | `/provisioning` | Creating → Booting → Ready. Pairing is not shown as a required web step. Failure: terracotta error + Retry. |
-| `/machines` | Hairline list: name, kind (`TRIAL` / `YOUR MACHINE`), status word, trial countdown. Ember “New machine” if entitled. At `nodes.max`, that action is the waitlist upsell; joined state is the small-caps word “On the waitlist.” |
+| `/machines` | Hairline list: name, kind (`TRIAL` / `YOUR MACHINE`), status word, trial countdown. Ember “New machine” if entitled. At `nodes.max`, that action is the waitlist upsell; joined state is the small-caps word “On the waitlist.” Per-row text action: **Unlink** on the hosted machine (the one `trial.nodeId` references — deletes it and its files), **Remove** on a BYO registration (drops the row only; the computer and its files are untouched, and the copy must say so). |
 | `/machines/:id` | Running and recent jobs/threads: status, duration, last event. Empty: “No runs yet.” Silent grant refresh. No files, no composer. |
 
 Marketing site (`pocs/relay/site`): add a Sign in link to the app origin
@@ -496,6 +496,14 @@ raw transport, PostgreSQL, Apple on the web, billing, re-pair.
   opaque device token. BYO phones keep mTLS. The gateway and the node
   both verify the grant JWT.
 - Grants are unrevocable until `exp` (§7). Accepted.
+- Account linking trusts Apple over an unverified local email
+  (`requireLocalEmailVerified: false`): Relay sends no verification
+  mail, so the Better Auth default would permanently lock out anyone
+  who signed up with a password before using Sign in with Apple.
+  Accepted trade-off (owner decision, 2026-08-14): a password
+  pre-registered on a victim's email survives the victim's Apple link
+  — pre-account-takeover. Revisit when verification mail ships; the
+  fix then is verification, not more trusted providers.
 
 ## 12. Non-goals
 

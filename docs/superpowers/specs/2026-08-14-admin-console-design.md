@@ -34,7 +34,7 @@ the existing web console.
 | Auth | Better Auth **admin plugin**. Built-in `admin` role (full control). No custom `superadmin` access-control role. |
 | Who is admin | The existing Relay account `parikshit.joon@gmail.com`, same Apple/password sign-in. |
 | UI | **Admin section on the existing web console**, not a separate origin and not APIs-only. |
-| v1 actions | Account list + trial/sandbox status + **Upgrade**, plus Better Auth **ban / impersonate / set-role**. |
+| v1 actions | Account list + trial/sandbox status + **Upgrade** + **Unlink**, plus Better Auth **ban / impersonate / set-role**. |
 | Impersonate other admins | **No** in v1. Do not grant `impersonate-admins`. |
 | `ADMIN_TOKEN` | **Keep** for `GET /v1/admin/nodes` scripts. New Admin UI uses a Better Auth admin session, not the token. |
 
@@ -220,7 +220,13 @@ Each account row:
 machine, drop the trial limit, allow their own computer.”
 
 Text actions on the same row: **Ban**, **Impersonate**, **Make admin**
-/ **Make user**. Do not add a second table.
+/ **Make user**, and **Unlink** when the account has a hosted machine —
+one the trial row still references (`trial.nodeId`), whatever its state;
+never a BYO registration. Unlink kills the sandbox, deletes the node,
+and marks the trial `destroyed` (`DELETE
+/v1/admin/accounts/:id/machine`; 409 `nothing_to_unlink` otherwise).
+Confirm copy: “Unlink deletes this hosted machine and its files.” Do
+not add a second table.
 
 After upgrade, Machines already renders `kind !== "trial"` as
 **YOUR MACHINE** and must not pass the trial into
