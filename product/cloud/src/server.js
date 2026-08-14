@@ -23,6 +23,7 @@ import { createDb } from "./db.js";
 import { createRegistry } from "./registry.js";
 import { createAuth, createAppleJwksFetcher } from "./auth.js";
 import { createRelayBetterAuth } from "./better-auth.js";
+import { webOriginStore } from "./web-origin.js";
 import { createPairing } from "./pairing.js";
 import { createNotify, parseNodePubkey } from "./notify.js";
 import { createApnsClient, createNoopTransport } from "./apns.js";
@@ -178,8 +179,8 @@ export function createApp({
       }
       if (!user) return null;
       const session = await ctx.internalAdapter.createSession(account.id);
-      if (!session?.token) return null;
-      return serializeSignedCookie(
+      if (!session?.token || !session?.id) return null;
+      const cookie = await serializeSignedCookie(
         ctx.authCookies.sessionToken.name,
         session.token,
         ctx.secret,
@@ -188,6 +189,7 @@ export function createApp({
           maxAge: ctx.sessionConfig.expiresIn,
         },
       );
+      return { cookie, sessionId: session.id };
     } catch {
       return null;
     }
@@ -388,6 +390,27 @@ export function createApp({
     }
     attachCors(req, res, config.trustedWebOrigins);
 
+    // The web session cookie is SameSite=None (a cross-origin SPA cannot use
+    // anything else), which is precisely the browser CSRF protection the
+    // bearer-only API used to get for free. Two guards stand in its place on
+    // the routes this file owns. `/api/auth/*` is deliberately excluded: Better
+    // Auth enforces its own trustedOrigins there, and Apple's form_post OAuth
+    // callback legitimately arrives as x-www-form-urlencoded.
+    if (path.startsWith("/v1/") && isStateChanging(method)) {
+      const origin = originOf(req);
+      // Browsers always send Origin on state-changing requests; native clients
+      // (iOS, the CLI, relayd, the trial sandbox) send none and are untouched.
+      if (origin && !originAllowed(origin, config)) {
+        return sendJson(res, 403, { error: "forbidden_origin" });
+      }
+      // Defense in depth for the same attack: these three content types are
+      // exactly the ones a cross-origin POST can use without a preflight, so
+      // they must never reach a JSON parser.
+      if (isBrowserSimpleContentType(req.headers["content-type"])) {
+        return sendJson(res, 415, { error: "unsupported_media_type" });
+      }
+    }
+
     // ── health ──────────────────────────────────────────────────────────
     if (method === "GET" && path === "/healthz") {
       return sendJson(res, 200, { ok: true });
@@ -396,7 +419,39 @@ export function createApp({
     // ── auth ────────────────────────────────────────────────────────────
     if (path === "/api/auth" || path.startsWith("/api/auth/")) {
       await auth.ready;
-      return betterAuth.handler(req, res);
+      const origin = originOf(req);
+      const store = { origin, capHit: false };
+      return webOriginStore.run(store, () => {
+        if (!store.origin || !(config.trustedWebOrigins || []).includes(store.origin)) {
+          return betterAuth.handler(req, res);
+        }
+        const origWriteHead = res.writeHead;
+        res.writeHead = function patchedCapWriteHead(statusCode, arg2, arg3) {
+          if (webOriginStore.getStore()?.capHit) {
+            const expire = "better-auth.session_token=; Max-Age=0; Path=/; HttpOnly";
+            if (typeof arg2 === "object" && arg2 !== null) {
+              return origWriteHead.call(this, 429, {
+                ...arg2,
+                "content-type": "application/json; charset=utf-8",
+                "set-cookie": expire,
+              }, arg3);
+            }
+            if (typeof arg3 === "object" && arg3 !== null) {
+              return origWriteHead.call(this, 429, arg2, {
+                ...arg3,
+                "content-type": "application/json; charset=utf-8",
+                "set-cookie": expire,
+              });
+            }
+            return origWriteHead.call(this, 429, {
+              "content-type": "application/json; charset=utf-8",
+              "set-cookie": expire,
+            });
+          }
+          return origWriteHead.call(this, statusCode, arg2, arg3);
+        };
+        return betterAuth.handler(req, res);
+      });
     }
 
     // Legacy endpoints remain during the native-client migration.
@@ -505,11 +560,26 @@ export function createApp({
       if (record.client === "web") {
         const account = registry.getAccount(record.accountId);
         if (!account) return sendJson(res, 400, { error: "invalid_grant" });
-        const cookie = await mintBetterAuthSessionCookie(account);
-        if (!cookie) return sendJson(res, 400, { error: "web_session_unavailable" });
+        const reserved = registry.reserveBrowserSession({
+          accountId: account.id,
+          displayName: record.machineName,
+          platform: record.platform,
+        });
+        if (reserved.status === "cap") {
+          return sendJson(res, 429, { error: "too_many_browsers" });
+        }
+        const minted = await mintBetterAuthSessionCookie(account);
+        if (!minted) {
+          registry.revokeBrowserSession(account.id, reserved.id);
+          return sendJson(res, 400, { error: "web_session_unavailable" });
+        }
+        registry.attachBrowserAuthSession(reserved.id, minted.sessionId);
         const consumed = registry.consumeDeviceCode(record.id);
-        if (!consumed) return sendJson(res, 400, { error: "invalid_grant" });
-        return sendJson(res, 200, { accountId: account.id }, { "set-cookie": cookie });
+        if (!consumed) {
+          registry.revokeBrowserSession(account.id, reserved.id);
+          return sendJson(res, 400, { error: "invalid_grant" });
+        }
+        return sendJson(res, 200, { accountId: account.id }, { "set-cookie": minted.cookie });
       }
       const connected = registry.connectCliComputer(record.id);
       if (!connected) return sendJson(res, 400, { error: "invalid_grant" });
@@ -888,6 +958,29 @@ export function createApp({
         ok: true,
         disconnected: publicCliComputer(disconnected),
       });
+    }
+
+    if (path === "/v1/auth/places" && method === "GET") {
+      return sendJson(res, 200, {
+        computer: publicCliComputer(registry.getCliComputerLink(account.id)),
+        browsers: registry.listBrowserSessions(account.id),
+      });
+    }
+
+    if (
+      method === "DELETE"
+      && seg[0] === "v1"
+      && seg[1] === "auth"
+      && seg[2] === "places"
+      && seg[3] === "browsers"
+      && seg[4]
+      && !seg[5]
+    ) {
+      const revoked = registry.revokeBrowserSession(account.id, seg[4]);
+      if (revoked.status !== "ok") {
+        return sendJson(res, 404, { error: "unknown_browser" });
+      }
+      return sendJson(res, 200, { ok: true });
     }
 
     if (method === "POST" && path === "/v1/auth/device/inspect") {
@@ -1376,6 +1469,42 @@ function baseHeaders() {
 function originOf(req) {
   const value = req.headers.origin;
   return typeof value === "string" ? value : "";
+}
+
+function isStateChanging(method) {
+  return method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE";
+}
+
+// The API's own origin is trusted too, so a browser pointed straight at the
+// control plane keeps working when no SPA origin is configured at all.
+// Compare Origin to originOnly(betterAuthBaseURL): Origin is scheme+host+port
+// and never carries a path, while BETTER_AUTH_URL is Better Auth's baseURL
+// and might.
+function originAllowed(origin, config) {
+  const origins = Array.isArray(config.trustedWebOrigins) ? config.trustedWebOrigins : [];
+  return origins.includes(origin) || origin === originOnly(config.betterAuthBaseURL);
+}
+
+function originOnly(value) {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return "";
+  }
+}
+
+// The CORS "simple" request content types: a cross-origin POST using one of
+// these is sent without a preflight, so the allowlist never sees it.
+const BROWSER_SIMPLE_CONTENT_TYPES = new Set([
+  "text/plain",
+  "application/x-www-form-urlencoded",
+  "multipart/form-data",
+]);
+
+function isBrowserSimpleContentType(value) {
+  if (typeof value !== "string") return false;
+  const essence = value.split(";")[0].trim().toLowerCase();
+  return BROWSER_SIMPLE_CONTENT_TYPES.has(essence);
 }
 
 // Exact-origin allowlist from config.trustedWebOrigins (RELAY_WEB_ORIGINS).

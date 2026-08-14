@@ -61,6 +61,7 @@
 		200000000000000000000065 /* CLILinkFlowModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000065 /* CLILinkFlowModel.swift */; };
 		200000000000000000000066 /* CLILinkScannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000066 /* CLILinkScannerView.swift */; };
 		200000000000000000000067 /* CLILinkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000067 /* CLILinkTests.swift */; };
+		200000000000000000000068 /* SignedInPlacesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000068 /* SignedInPlacesTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -132,6 +133,7 @@
 		100000000000000000000065 /* CLILinkFlowModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CLILinkFlowModel.swift; sourceTree = "<group>"; };
 		100000000000000000000066 /* CLILinkScannerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CLILinkScannerView.swift; sourceTree = "<group>"; };
 		100000000000000000000067 /* CLILinkTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CLILinkTests.swift; sourceTree = "<group>"; };
+		100000000000000000000068 /* SignedInPlacesTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignedInPlacesTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -197,6 +199,7 @@
 				1000000000000000000000A1 /* TrialMaterialPersistenceTests.swift */,
 				100000000000000000000063 /* HandoffTests.swift */,
 				100000000000000000000067 /* CLILinkTests.swift */,
+				100000000000000000000068 /* SignedInPlacesTests.swift */,
 			);
 			path = POCVaultTests;
 			sourceTree = "<group>";
@@ -476,6 +479,7 @@
 				2000000000000000000000A1 /* TrialMaterialPersistenceTests.swift in Sources */,
 				200000000000000000000063 /* HandoffTests.swift in Sources */,
 				200000000000000000000067 /* CLILinkTests.swift in Sources */,
+				200000000000000000000068 /* SignedInPlacesTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

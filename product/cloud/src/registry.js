@@ -5,6 +5,7 @@
 import { randomUUID } from "node:crypto";
 
 export const ENTITLEMENT_MAX_NODES = "nodes.max";
+export const BROWSER_SESSION_MAX = 10;
 
 // THE canonical email rule for the whole control plane. One human must map to
 // one row no matter which sign-in path they arrive on, so every write and
@@ -55,6 +56,21 @@ function ensureCliComputerSchema(db) {
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_cli_computer_links_account
       ON cli_computer_links (account_id);
+  `);
+}
+
+function ensureBrowserSessionsSchema(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS browser_sessions (
+      id                      TEXT PRIMARY KEY,
+      account_id              TEXT NOT NULL,
+      better_auth_session_id  TEXT UNIQUE,
+      display_name            TEXT,
+      platform                TEXT,
+      created_at              INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_browser_sessions_account
+      ON browser_sessions (account_id);
   `);
 }
 
@@ -292,6 +308,7 @@ function ensureDeviceApnsEnvironmentColumn(db) {
 
 export function createRegistry(db, { now = () => Date.now() } = {}) {
   ensureCliComputerSchema(db);
+  ensureBrowserSessionsSchema(db);
   ensureAuthSchema(db, now);
   ensureNodeEventSchema(db);
   ensureNodeEncColumn(db);
@@ -361,6 +378,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       }
       db.prepare("DELETE FROM device_codes WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM cli_computer_links WHERE account_id = ?").run(accountId);
+      db.prepare("DELETE FROM browser_sessions WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM repos WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM handoffs WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM sync_notices WHERE account_id = ?").run(accountId);
@@ -1145,6 +1163,106 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     }
   }
 
+  function reserveBrowserSession({ accountId, displayName, platform }) {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const { n } = db.prepare(
+        "SELECT COUNT(*) AS n FROM browser_sessions WHERE account_id = ?",
+      ).get(accountId);
+      if (Number(n) >= BROWSER_SESSION_MAX) {
+        db.exec("ROLLBACK");
+        return { status: "cap" };
+      }
+      const id = randomUUID();
+      db.prepare(
+        `INSERT INTO browser_sessions
+           (id, account_id, better_auth_session_id, display_name, platform, created_at)
+         VALUES (?, ?, NULL, ?, ?, ?)`,
+      ).run(id, accountId, displayName ?? null, platform ?? null, now());
+      db.exec("COMMIT");
+      return { status: "ok", id };
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  function attachBrowserAuthSession(id, betterAuthSessionId) {
+    if (!id || !betterAuthSessionId) return false;
+    const info = db.prepare(
+      `UPDATE browser_sessions
+       SET better_auth_session_id = ?
+       WHERE id = ? AND better_auth_session_id IS NULL`,
+    ).run(betterAuthSessionId, id);
+    return info.changes > 0;
+  }
+
+  function sessionExpiryMs(value) {
+    if (value == null) return 0;
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value < 1e12 ? value * 1000 : value;
+    }
+    const asNumber = Number(value);
+    if (Number.isFinite(asNumber) && asNumber > 0) {
+      return asNumber < 1e12 ? asNumber * 1000 : asNumber;
+    }
+    const parsed = Date.parse(String(value));
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  function listBrowserSessions(accountId) {
+    let rows;
+    try {
+      rows = db.prepare(
+        `SELECT b.id, b.display_name, b.platform, b.created_at, s.expiresAt AS expires_at
+         FROM browser_sessions b
+         INNER JOIN session s ON s.id = b.better_auth_session_id
+         WHERE b.account_id = ? AND b.better_auth_session_id IS NOT NULL
+         ORDER BY b.created_at DESC`,
+      ).all(accountId);
+    } catch (err) {
+      if (/no such table/i.test(err.message || "")) return [];
+      throw err;
+    }
+    const nowMs = now();
+    return rows
+      .filter((row) => sessionExpiryMs(row.expires_at) > nowMs)
+      .map((row) => ({
+        id: row.id,
+        name: row.display_name ?? null,
+        platform: row.platform ?? null,
+        createdAt: Number(row.created_at),
+      }));
+  }
+
+  function revokeBrowserSession(accountId, id) {
+    if (!id) return { status: "unknown" };
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = db.prepare(
+        "SELECT * FROM browser_sessions WHERE id = ? AND account_id = ?",
+      ).get(id, accountId);
+      if (!row) {
+        db.exec("ROLLBACK");
+        return { status: "unknown" };
+      }
+      if (row.better_auth_session_id) {
+        try {
+          db.prepare("DELETE FROM session WHERE id = ?").run(row.better_auth_session_id);
+        } catch (err) {
+          if (!/no such table/i.test(err.message || "")) throw err;
+        }
+      }
+      db.prepare("DELETE FROM browser_sessions WHERE id = ? AND account_id = ?")
+        .run(id, accountId);
+      db.exec("COMMIT");
+      return { status: "ok" };
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
   // Redeemed rows go too, not just expired ones: a consumed row holds no live
   // secret (the device code is stored only as sha256) and is not redeemable,
   // but it pins a dead user_code in the unique index and keeps a dead
@@ -1677,6 +1795,10 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     getCliComputerLink,
     getCliComputerLinkById,
     disconnectCliComputer,
+    reserveBrowserSession,
+    attachBrowserAuthSession,
+    listBrowserSessions,
+    revokeBrowserSession,
     sweepDeviceCodes,
     countLiveDeviceCodes,
     countLiveDeviceCodesForIp,

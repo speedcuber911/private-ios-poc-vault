@@ -58,6 +58,8 @@ ExperimentalWarning on Node 22 is expected.
 | `POST /v1/auth/device/token` | none | `cli`: session JWT + computer slot. `web`: Better Auth cookie, no CLI slot |
 | `POST /v1/auth/device/inspect` | session | lookup-first; returns `client`; `computer_already_linked` only for `cli` |
 | `POST /v1/auth/device/approve` | session | lookup-first; web may approve while a CLI computer is already linked |
+| `GET /v1/auth/places` | session | `{ computer, browsers }` — one CLI computer plus cookie browsers |
+| `DELETE /v1/auth/places/browsers/:id` | session | revoke that browser cookie; 404 `unknown_browser` if missing or foreign |
 | `POST /v1/waitlist` | none | `{email}`; idempotent |
 | `GET /v1/account` | session | account + entitlements |
 | `POST/GET /v1/devices`, `PATCH/DELETE /v1/devices/:id` | session | `apnsToken`, `platform`, `name`, `certSerials` |
@@ -210,7 +212,8 @@ the host at `https://<app-origin>/cli-login` is still an operator step.
 The user code rides in the URL hash so it never hits access logs.
 
 Web token redemption (`POST /v1/auth/device/token` with `client: "web"`)
-sets a Better Auth cookie (`SameSite=None`; `Secure` only when
+sets a Better Auth cookie (`SameSite=None` only when `RELAY_WEB_ORIGINS`
+is set, otherwise `Lax`; `Secure` only when
 `BETTER_AUTH_URL` is https). `RELAY_WEB_ORIGINS` (comma-separated exact
 origins) is appended to Better Auth `trustedOrigins` and is the CORS
 allowlist for credentialed JSON (`Access-Control-Allow-Credentials: true`,
@@ -225,6 +228,28 @@ user); the device code is not consumed.
 If `RELAY_WEB_ORIGINS` is set, `main.js` refuses to start unless
 `BETTER_AUTH_URL` is https — SameSite=None cookies are otherwise unusable
 from the app origin.
+
+#### CSRF on the cookie path
+
+`SameSite=None` is what lets the SPA send its cookie cross-origin, and it
+is also the browser CSRF protection the bearer-only API used to get for
+free. Two guards replace it on `/v1/*` state-changing methods (`POST`,
+`PUT`, `PATCH`, `DELETE`):
+
+- An `Origin` header that is present and is neither in `RELAY_WEB_ORIGINS`
+  nor equal to `BETTER_AUTH_URL` is `403 { "error": "forbidden_origin" }`.
+  Browsers always send `Origin` on these methods; iOS, the CLI, relayd and
+  the trial sandbox send none and are unaffected.
+- A body arriving as `text/plain`, `application/x-www-form-urlencoded`, or
+  `multipart/form-data` is `415 { "error": "unsupported_media_type" }`.
+  Those three are exactly the content types a cross-origin POST can use
+  *without* a preflight, so they must never reach a JSON parser.
+
+`/api/auth/*` is deliberately excluded from both: Better Auth enforces its
+own `trustedOrigins` there, and Apple's `form_post` OAuth callback is a
+legitimate `x-www-form-urlencoded` POST. Regression: `test/csrf.test.mjs`,
+which replays a cross-site approve of an attacker's `client=web` device
+code and asserts no session is ever minted.
 
 ### Browser activity grants
 

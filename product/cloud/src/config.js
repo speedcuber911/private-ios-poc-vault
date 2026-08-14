@@ -26,12 +26,21 @@ export function loadConfig(env = process.env) {
     // SESSION_SECRET remains the fallback during migration so existing
     // installations do not need two coordinated secret rotations.
     betterAuthSecret: env.BETTER_AUTH_SECRET || env.SESSION_SECRET || "",
-    betterAuthBaseURL:
+    // Trailing slashes are stripped: both of these are compared against an
+    // Origin header, which never carries one, and both feed the CORS echo and
+    // the CSRF origin allowlist. A stray slash in the env would otherwise
+    // reject every write from the very origin it was meant to permit.
+    // CSRF also compares Origin to originOnly(betterAuthBaseURL) so a path on
+    // BETTER_AUTH_URL (https://api.x.com/auth) cannot make the API origin
+    // forbidden. Do not set BETTER_AUTH_URL to a path-bearing URL anyway:
+    // Better Auth uses it as baseURL, not merely as an origin.
+    betterAuthBaseURL: stripTrailingSlash(
       env.BETTER_AUTH_URL ||
-      `http://${env.HOST || "127.0.0.1"}:${intFrom(env.PORT, 8790)}`,
+        `http://${env.HOST || "127.0.0.1"}:${intFrom(env.PORT, 8790)}`,
+    ),
     trustedWebOrigins: (env.RELAY_WEB_ORIGINS || "")
       .split(",")
-      .map((s) => s.trim())
+      .map((s) => stripTrailingSlash(s.trim()))
       .filter(Boolean),
 
     // Sign in with Apple. Comma-separated audience allowlist (bundle ids /
@@ -209,6 +218,10 @@ export function webOriginsRequireHttps(config) {
     config.trustedWebOrigins.length > 0 &&
     !String(config.betterAuthBaseURL || "").startsWith("https://")
   );
+}
+
+function stripTrailingSlash(value) {
+  return String(value || "").replace(/\/+$/, "");
 }
 
 function intFrom(value, fallback) {

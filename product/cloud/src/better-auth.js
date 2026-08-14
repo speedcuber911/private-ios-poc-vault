@@ -6,6 +6,7 @@ import { getMigrations } from "better-auth/db/migration";
 import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
 import { bearer, username } from "better-auth/plugins";
 import { ENTITLEMENT_MAX_NODES } from "./registry.js";
+import { webOriginStore } from "./web-origin.js";
 
 // `beforeAccountDelete` runs while the account's control-plane rows are still
 // readable and before any of them are dropped. It is where the caller releases
@@ -92,6 +93,35 @@ export function createRelayBetterAuth({
           },
         },
       },
+      session: {
+        create: {
+          after(session) {
+            try {
+              const store = webOriginStore.getStore();
+              const origin = store?.origin;
+              const trusted = config.trustedWebOrigins || [];
+              if (!origin || !trusted.includes(origin)) return;
+              const reserved = registry.reserveBrowserSession({
+                accountId: session.userId,
+                displayName: sanitizeBrowserName(session.userAgent),
+                platform: "web",
+              });
+              if (reserved.status === "cap") {
+                if (store) store.capHit = true;
+                try {
+                  db.prepare("DELETE FROM session WHERE id = ?").run(session.id);
+                } catch {
+                  /* table missing in tests that never migrate Better Auth */
+                }
+                return;
+              }
+              registry.attachBrowserAuthSession(reserved.id, session.id);
+            } catch {
+              /* never fail a sign-in because the sidecar write failed */
+            }
+          },
+        },
+      },
     },
     trustedOrigins: [
       config.betterAuthBaseURL,
@@ -99,7 +129,11 @@ export function createRelayBetterAuth({
     ],
     advanced: {
       defaultCookieAttributes: {
-        sameSite: "none",
+        // SameSite=None is what lets a cross-origin SPA send this cookie, and
+        // it is also what removes the browser's built-in CSRF protection. Pay
+        // that price only where a web origin is actually configured; every
+        // other deployment keeps Lax.
+        sameSite: (config.trustedWebOrigins || []).length > 0 ? "none" : "lax",
         secure: config.betterAuthBaseURL.startsWith("https://"),
         httpOnly: true,
       },
@@ -137,4 +171,11 @@ function ensureRelayAccount(registry, config, user) {
     );
   }
   return account;
+}
+
+function sanitizeBrowserName(value) {
+  if (typeof value !== "string") return "Browser";
+  const cleaned = value.replace(/[\u0000-\u001f\u007f]/g, "").trim();
+  if (!cleaned) return "Browser";
+  return cleaned.slice(0, 64);
 }

@@ -18,7 +18,7 @@ struct CLILinkScannerView: View {
                 content
             }
             .background(AppTheme.bgCanvas.ignoresSafeArea())
-            .navigationTitle("Link a computer")
+            .navigationTitle(scannerTitle)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -35,12 +35,12 @@ struct CLILinkScannerView: View {
             scanningBody
         case .inspecting:
             statusBody(title: "Checking code", detail: "Looking up the computer that requested this link…")
-        case .confirm(let machineName, let platform):
-            confirmBody(machineName: machineName, platform: platform)
+        case .confirm(let machineName, let platform, let client):
+            confirmBody(machineName: machineName, platform: platform, client: client)
         case .approving:
-            statusBody(title: "Linking", detail: "Approving this computer…")
-        case .approved(let machineName):
-            approvedBody(machineName: machineName)
+            statusBody(title: approvingTitle, detail: approvingDetail)
+        case .approved(let machineName, let client):
+            approvedBody(machineName: machineName, client: client)
         case .failed(let reason):
             failedBody(reason: reason)
         }
@@ -110,19 +110,21 @@ struct CLILinkScannerView: View {
         .background(AppTheme.textPrimary.opacity(0.05), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 
-    private func confirmBody(machineName: String?, platform: String?) -> some View {
+    private func confirmBody(machineName: String?, platform: String?, client: DeviceCodeClient) -> some View {
         VStack(alignment: .leading, spacing: 20) {
-            Text(machineName?.isEmpty == false ? machineName! : "Unknown computer")
+            Text(machineName?.isEmpty == false ? machineName! : (client == .web ? "This browser" : "Unknown computer"))
                 .font(AppTheme.serifFont(size: 28))
                 .foregroundStyle(AppTheme.textPrimary)
             Text(platformLabel(platform))
                 .font(AppTheme.uiFont(size: 15))
                 .foregroundStyle(AppTheme.textSecondary)
-            Text("Only continue if you just ran `relay login` on this computer.")
+            Text(client == .web
+                 ? "Only continue if you just tapped Sign in with iPhone in this browser."
+                 : "Only continue if you just ran `relay login` on this computer.")
                 .font(AppTheme.uiFont(size: 15))
                 .foregroundStyle(AppTheme.textPrimary)
             Spacer(minLength: 12)
-            Button("Link computer") {
+            Button(client == .web ? "Sign in this browser" : "Link computer") {
                 Task { await model.confirmLink() }
             }
             .buttonStyle(RelayPrimaryButtonStyle(isEnabled: true))
@@ -152,13 +154,13 @@ struct CLILinkScannerView: View {
         .frame(maxWidth: .infinity)
     }
 
-    private func approvedBody(machineName: String?) -> some View {
+    private func approvedBody(machineName: String?, client: DeviceCodeClient) -> some View {
         VStack(spacing: 16) {
             Spacer()
-            Text("Link approved")
+            Text(client == .web ? "Signed in" : "Link approved")
                 .font(AppTheme.serifFont(size: 28))
                 .foregroundStyle(AppTheme.textPrimary)
-            Text(approvalDetail(machineName))
+            Text(approvalDetail(machineName, client: client))
                 .font(AppTheme.uiFont(size: 15))
                 .foregroundStyle(AppTheme.textSecondary)
                 .multilineTextAlignment(.center)
@@ -169,9 +171,27 @@ struct CLILinkScannerView: View {
         .padding(24)
     }
 
-    private func approvalDetail(_ machineName: String?) -> String {
+    private func approvalDetail(_ machineName: String?, client: DeviceCodeClient) -> String {
+        if client == .web {
+            return "This browser is signed in."
+        }
         let computer = machineName?.isEmpty == false ? machineName! : "the computer"
         return "Finish `relay login` on \(computer). Account & Settings will show Connected after it receives access."
+    }
+
+    private var scannerTitle: String {
+        if case .confirm(_, _, .cli) = model.step { return "Link a computer" }
+        if case .approved(_, .cli) = model.step { return "Link a computer" }
+        if model.step == .approving && model.pendingClient == .cli { return "Link a computer" }
+        return "Approve a sign-in"
+    }
+
+    private var approvingTitle: String {
+        model.pendingClient == .web ? "Signing in" : "Linking"
+    }
+
+    private var approvingDetail: String {
+        model.pendingClient == .web ? "Signing this browser in…" : "Approving this computer…"
     }
 
     private func failedBody(reason: String) -> some View {
@@ -196,6 +216,7 @@ struct CLILinkScannerView: View {
         case "macos": return "macOS"
         case "linux": return "Linux"
         case "windows": return "Windows"
+        case "web": return "Web"
         case "other": return "Other platform"
         case .some(let value) where !value.isEmpty: return value
         default: return "Platform unknown"

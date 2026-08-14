@@ -207,6 +207,20 @@ CREATE TABLE IF NOT EXISTS cli_computer_links (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cli_computer_links_account
   ON cli_computer_links (account_id);
 
+-- Browser cookie sessions the phone can list and revoke. better_auth_session_id
+-- is null until mint completes; UNIQUE still allows multiple nulls. Cap is
+-- enforced in registry.reserveBrowserSession, not here.
+CREATE TABLE IF NOT EXISTS browser_sessions (
+  id                      TEXT PRIMARY KEY,
+  account_id              TEXT NOT NULL,
+  better_auth_session_id  TEXT UNIQUE,
+  display_name            TEXT,
+  platform                TEXT,
+  created_at              INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_browser_sessions_account
+  ON browser_sessions (account_id);
+
 CREATE TABLE IF NOT EXISTS repos (
   id TEXT PRIMARY KEY,
   account_id TEXT NOT NULL,
