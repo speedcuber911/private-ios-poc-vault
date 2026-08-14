@@ -320,7 +320,7 @@ async function routeRequest(req, res) {
 
   if (req.method === "POST" && url.pathname === "/v1/codex/jobs") {
     const body = await readBody(req);
-    const job = enqueueJob(body, auth.subject);
+    const job = await enqueueJob(body, auth.subject);
     return sendJson(res, 202, await toJobResponse(job, responseShape("preview")));
   }
 

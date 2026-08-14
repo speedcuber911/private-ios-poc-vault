@@ -1966,6 +1966,7 @@ test("lists provider-specific skills discovered from runner homes", async (t) =>
     CLAUDE_HOME: claudeHome,
     CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: tmpDir }]),
     CODEX_BIN: await makeFakeCodex(tmpDir),
+    CLAUDE_BIN: await makeArgEchoClaude(tmpDir),
   });
 
   try {
@@ -2217,6 +2218,45 @@ localTest("creates an async job in a registered workspace and persists output", 
     const jobs = await fetch(`${server.baseUrl}/v1/codex/jobs?limit=10`);
     assert.equal(jobs.status, 200);
     assert.equal((await jobs.json()).jobs[0].id, created.id);
+  } finally {
+    await server.stop();
+  }
+});
+
+localTest("rejects a signed-out Codex provider before queuing a job", "controls the runner auth-status response", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-auth-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  const signedOutCodex = path.join(tmpDir, "signed-out-codex");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  await fs.writeFile(
+    signedOutCodex,
+    [
+      "#!/bin/sh",
+      "if [ \"$1\" = \"--version\" ]; then echo \"fake-codex 9.9.9\"; exit 0; fi",
+      "if [ \"$1\" = \"login\" ] && [ \"$2\" = \"status\" ]; then echo \"Not logged in\" >&2; exit 1; fi",
+      "echo \"job unexpectedly started\" >&2",
+      "exit 9",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_BIN: signedOutCodex,
+  });
+  try {
+    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspaceId: "scratch", provider: "codex", prompt: "hello" }),
+    });
+    assert.equal(create.status, 503);
+    assert.match((await create.json()).error, /Codex is not connected.*relay sync-auth/);
+
+    const jobs = await (await fetch(`${server.baseUrl}/v1/codex/jobs`)).json();
+    assert.deepEqual(jobs.jobs, []);
   } finally {
     await server.stop();
   }

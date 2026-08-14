@@ -331,6 +331,13 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         return try decoder.decode(CodexListEnvelope<CodexModelDescriptor>.self, from: data).values
     }
 
+    /// Provider installation and authentication state from the linked computer.
+    /// relayd evaluates this under the same HOME/CODEX_HOME used for real tasks.
+    func fetchHarnesses() async throws -> [RelayHarnessStatus] {
+        let data = try await perform(path: "/v1/harness")
+        return try decoder.decode(CodexListEnvelope<RelayHarnessStatus>.self, from: data).values
+    }
+
     /// Discover the skills actually installed for one harness on the linked computer.
     /// The endpoint is provider-scoped so a Claude skill can never leak into a Codex run
     /// (or vice versa), and the returned descriptor contains no runner-local paths.
@@ -1193,7 +1200,7 @@ private struct CodexListEnvelope<Element: Decodable>: Decodable {
         }
 
         let container = try decoder.container(keyedBy: CodexDynamicCodingKey.self)
-        for key in ["items", "data", "results", "models", "workspaces", "jobs", "sessions", "threads", "handoffs", "skills", "approvals", "terminals"] {
+        for key in ["items", "data", "results", "models", "workspaces", "jobs", "sessions", "threads", "handoffs", "skills", "approvals", "terminals", "harnesses"] {
             if let codingKey = CodexDynamicCodingKey(stringValue: key),
                let values = try? container.decode([Element].self, forKey: codingKey) {
                 self.values = values

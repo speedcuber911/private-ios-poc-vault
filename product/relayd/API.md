@@ -587,6 +587,12 @@ appended to the prompt manifest (2781–2787); selected skill bodies are
 inlined into the prompt (≤ 20 KiB each, 2789–2811); the job is persisted
 and queued; audit `job_created`.
 
+Before any job record or attachment is created, relayd probes the selected
+provider under the same isolated `HOME`/`CODEX_HOME` used by the runner. A
+missing binary or confirmed signed-out session returns **503** with the
+provider-specific recovery action. An unknown login state from an older CLI is
+reported by `GET /v1/harness` but does not block an otherwise runnable job.
+
 Provider invocation (contract-relevant): prompt is delivered on **stdin**
 for codex/claude, as an argv for cursor (4229, 4344–4350); codex runs
 `codex exec -C <workspace> --skip-git-repo-check --ignore-rules` (+
@@ -1140,6 +1146,11 @@ Job responses and `jobStatusPayload` gain:
   "requestedAt": "…Z", "expiresAt": null
 }
 ```
+
+The login probe runs inside the exact provider environment used by jobs. For
+Codex and Claude, a confirmed signed-out state directs the operator to run
+`relay sync-auth` on the linked Mac; Relay's phone UI only reports readiness
+and never collects provider credentials.
 
 **`POST /v1/codex/jobs/:id/respond`**
 

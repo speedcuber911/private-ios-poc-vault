@@ -153,6 +153,13 @@ filesystem access from the workspace selection.
 `codex`, `claude`, and `cursor`; omitted provider defaults to `codex`. All job responses
 include the persisted provider.
 
+The server checks the selected CLI's login state under the isolated runner
+home before creating the job. A missing CLI or a confirmed signed-out provider
+returns `503` immediately, so a task cannot enter the queue and later fail with
+an unauthenticated provider request. Codex and Claude recovery is performed on
+the linked Mac with `relay sync-auth`; the iPhone never handles provider
+credentials.
+
 Codex jobs keep the existing `codex exec` and `codex exec resume` path. Cursor
 jobs use the authenticated Cursor Agent CLI in print mode, capture its JSON result,
 and resume with the saved Cursor session id. Claude

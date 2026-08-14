@@ -371,7 +371,7 @@ final class HandoffTests: XCTestCase {
 
     func testCardViewSourceUsesTheEditorialEmberIdiom() throws {
         let source = try AppSourceFixture.load("POCVault/Views/RelayHandoffCardView.swift")
-        XCTAssertTrue(source.contains("RelayCapsLabel"), "status and badges use the caps-label primitive")
+        XCTAssertTrue(source.contains("RelayProviderBadge"), "handoffs name and mark the owning provider")
         XCTAssertTrue(source.contains("AppTheme.monoFont"), "the branch renders in the mono face")
         XCTAssertTrue(source.contains("AppTheme.textSecondary"), "a ready state uses cream, not a success color")
         XCTAssertTrue(source.contains("RelayPrimaryButtonStyle"), "Continue is the screen's one ember action")

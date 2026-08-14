@@ -30,6 +30,10 @@ class SimulatorVaultServer(ThreadingHTTPServer):
         self.approval_resolution: dict | None = None
         self.terminals: dict[str, dict] = {}
         self.terminal_counter = 0
+        self.active_job_provider = "codex"
+        self.active_job_model: str | None = None
+        self.active_job_prompt = "Inspect the workspace."
+        self.active_job_tick = 0
         self.fixture_lock = threading.Lock()
 
 
@@ -60,6 +64,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/v1/mac-sessions":
             self.send_json({"index": simulator_mac_session_index()})
+            return
+        if path == "/v1/harness":
+            self.send_json({"harnesses": simulator_harnesses()})
             return
         if path.startswith("/v1/codex/"):
             self.serve_codex_fixture(path, query)
@@ -105,13 +112,24 @@ class Handler(BaseHTTPRequestHandler):
             self.serve_codex_chat_fixture()
             return
         if path == "/v1/codex/jobs":
+            body = self.read_json_body()
+            provider = str(body.get("provider") or "codex")
+            if provider not in {"codex", "claude", "cursor"}:
+                provider = "codex"
+            model = body.get("model")
+            prompt = body.get("prompt")
+            with self.server.fixture_lock:
+                self.server.active_job_provider = provider
+                self.server.active_job_model = str(model) if isinstance(model, str) and model else None
+                self.server.active_job_prompt = str(prompt) if isinstance(prompt, str) and prompt else "Inspect the workspace."
+                self.server.active_job_tick = 0
             self.send_json({
                 "id": "sim-job-running",
-                "job": codex_fixture_job(status="running", result=None),
+                "job": self.active_job_fixture(status="running", result=None),
             })
             return
         if path == "/v1/codex/jobs/sim-job-running/cancel":
-            self.send_json(codex_fixture_job(status="canceled", result="Simulator job canceled."))
+            self.send_json(self.active_job_fixture(status="canceled", result="Simulator job canceled."))
             return
         approval_match = re.fullmatch(r"/v1/codex/approvals/([^/]+)/decision", path)
         if approval_match:
@@ -284,7 +302,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(codex_fixture_job())
             return
         if path == "/v1/codex/jobs/sim-job-running":
-            self.send_json(codex_fixture_running_job_tick())
+            self.send_json(codex_fixture_running_job_tick(self.server))
             return
         if path == "/v1/codex/jobs/sim-job-running/stream":
             self.serve_codex_job_stream()
@@ -354,10 +372,16 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode("utf-8"))
             self.wfile.flush()
 
+        with self.server.fixture_lock:
+            provider = self.server.active_job_provider
+            model = self.server.active_job_model
+            prompt = self.server.active_job_prompt
+
         emit("status", {
             "id": "sim-job-running",
             "status": "running",
-            "provider": "codex",
+            "provider": provider,
+            "model": model,
             "workspaceId": "poc-vault",
             "createdAt": "2026-05-23T13:34:00Z",
             "startedAt": "2026-05-23T13:34:02Z",
@@ -375,7 +399,27 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             if delay > 0:
                 time.sleep(delay)
-        emit("done", codex_fixture_job(status="succeeded", id="sim-job-running"))
+        emit(
+            "done",
+            codex_fixture_job(
+                status="succeeded",
+                id="sim-job-running",
+                provider=provider,
+                model=model,
+                prompt=prompt,
+            ),
+        )
+
+    def active_job_fixture(self, status: str, result: str | None) -> dict:
+        with self.server.fixture_lock:
+            return codex_fixture_job(
+                status=status,
+                result=result,
+                id="sim-job-running",
+                provider=self.server.active_job_provider,
+                model=self.server.active_job_model,
+                prompt=self.server.active_job_prompt,
+            )
 
     def serve_codex_chat_fixture(self) -> None:
         body = self.read_json_body()
@@ -610,6 +654,32 @@ def simulator_mac_session_index() -> dict:
             }
         ],
     }
+
+
+def simulator_harnesses() -> list[dict]:
+    return [
+        {
+            "provider": "codex",
+            "installed": True,
+            "version": "OpenAI Codex v0.147.0",
+            "loggedIn": True,
+            "authKind": "subscription",
+        },
+        {
+            "provider": "claude",
+            "installed": True,
+            "version": "Claude Code simulator",
+            "loggedIn": True,
+            "authKind": "subscription",
+        },
+        {
+            "provider": "cursor",
+            "installed": True,
+            "version": "Cursor Agent simulator",
+            "loggedIn": True,
+            "authKind": "subscription",
+        },
+    ]
 
 
 def codex_fixture_workspace(id: str = "poc-vault", name: str = "POC Vault", path: str = "/srv/codex-workspaces/poc-vault") -> dict:
@@ -1275,7 +1345,6 @@ def codex_fixture_chat_thread_detail() -> dict:
 
 # Drives a simulated job lifecycle across poll ticks so the Task tab's live job card
 # shows queued -> running (growing logs) -> succeeded instead of a frozen card.
-_SIM_JOB_TICKS = {"n": 0}
 _SIM_JOB_STAGES = [
     ("running", "Scanning workspace…"),
     ("running", "Scanning workspace…\nReading recent activity…"),
@@ -1283,15 +1352,33 @@ _SIM_JOB_STAGES = [
 ]
 
 
-def codex_fixture_running_job_tick() -> dict:
-    n = _SIM_JOB_TICKS["n"]
-    _SIM_JOB_TICKS["n"] = n + 1
+def codex_fixture_running_job_tick(server: SimulatorVaultServer) -> dict:
+    with server.fixture_lock:
+        n = server.active_job_tick
+        server.active_job_tick = n + 1
+        provider = server.active_job_provider
+        model = server.active_job_model
+        prompt = server.active_job_prompt
     if n < len(_SIM_JOB_STAGES):
         status, log = _SIM_JOB_STAGES[n]
-        return codex_fixture_job(status="running", result=log, id="sim-job-running")
+        return codex_fixture_job(
+            status="running",
+            result=log,
+            id="sim-job-running",
+            provider=provider,
+            model=model,
+            prompt=prompt,
+        )
     # After the running stages, complete the job (same id so the card updates in place).
-    _SIM_JOB_TICKS["n"] = 0  # reset for the next submitted job
-    return codex_fixture_job(status="succeeded", id="sim-job-running")
+    with server.fixture_lock:
+        server.active_job_tick = 0  # reset for the next submitted job
+    return codex_fixture_job(
+        status="succeeded",
+        id="sim-job-running",
+        provider=provider,
+        model=model,
+        prompt=prompt,
+    )
 
 
 def codex_fixture_approval_job(server: SimulatorVaultServer) -> dict:
@@ -1314,19 +1401,27 @@ def codex_fixture_approval_job(server: SimulatorVaultServer) -> dict:
     }
 
 
-def codex_fixture_job(status: str = "succeeded", result: str | None = None, id: str | None = None) -> dict:
+def codex_fixture_job(
+    status: str = "succeeded",
+    result: str | None = None,
+    id: str | None = None,
+    provider: str = "codex",
+    model: str | None = None,
+    prompt: str = "List out all my linear issues for last one week and also carve out my action items from them.",
+) -> dict:
     result_text = codex_fixture_answer() if result is None and status == "succeeded" else result
     return {
         "id": id or ("sim-job-linear" if status == "succeeded" else "sim-job-running"),
-        "provider": "codex",
+        "provider": provider,
+        "model": model,
         "status": status,
         "workspaceId": "poc-vault",
         "workspaceName": "POC Vault",
-        "prompt": "List out all my linear issues for last one week and also carve out my action items from them.",
+        "prompt": prompt,
         "result": result_text,
         "resultTruncated": False,
         "logsIncluded": "compact",
-        "sessionId": "sim-thread-linear",
+        "sessionId": f"sim-{provider}-running-thread" if id == "sim-job-running" else "sim-thread-linear",
         "createdAt": "2026-05-23T13:34:00Z",
         "startedAt": "2026-05-23T13:34:02Z",
         "completedAt": None if status == "running" else "2026-05-23T13:35:30Z",

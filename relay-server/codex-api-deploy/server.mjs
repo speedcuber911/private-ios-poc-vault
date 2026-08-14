@@ -1,6 +1,6 @@
 import http from "node:http";
 import https from "node:https";
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -1694,6 +1694,87 @@ function healthPayload(authenticated) {
   };
 }
 
+function providerBinaryForReadiness(provider) {
+  if (provider === "claude") return claudeBin;
+  if (provider === "cursor") return cursorBin;
+  return codexBin;
+}
+
+function providerReadinessArgs(provider) {
+  if (provider === "claude") return ["auth", "status", "--json"];
+  if (provider === "cursor") return ["status", "--format", "json"];
+  return ["login", "status"];
+}
+
+function providerReadinessEnv(provider) {
+  const env = { ...process.env, HOME: runHome, CODEX_HOME: codexHome };
+  if (provider === "claude" || provider === "cursor") {
+    delete env.AWS_ACCESS_KEY_ID;
+    delete env.AWS_SECRET_ACCESS_KEY;
+    delete env.AWS_SESSION_TOKEN;
+    delete env.AWS_PROFILE;
+    delete env.AWS_DEFAULT_PROFILE;
+    delete env.AWS_REGION;
+    delete env.AWS_DEFAULT_REGION;
+    delete env.CLAUDE_CODE_USE_BEDROCK;
+    delete env.CLAUDE_AWS_PROFILE;
+  }
+  return env;
+}
+
+function parsedAuthJson(text) {
+  try {
+    const parsed = JSON.parse(String(text || "").trim());
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function providerIsConfirmedSignedOut(provider, output) {
+  const text = cleanApiText(output);
+  const parsed = parsedAuthJson(text);
+  if (provider === "claude" && parsed && typeof parsed.loggedIn === "boolean") return !parsed.loggedIn;
+  if (provider === "cursor" && parsed && typeof parsed.isAuthenticated === "boolean") return !parsed.isAuthenticated;
+  return provider === "codex" && /not logged in|signed out|no (?:valid )?(?:session|credentials?)/i.test(text);
+}
+
+function providerDisplayName(provider) {
+  if (provider === "claude") return "Claude Code";
+  if (provider === "cursor") return "Cursor";
+  return "Codex";
+}
+
+function assertProviderReady(provider) {
+  const binary = providerBinaryForReadiness(provider);
+  if (!fs.existsSync(binary)) {
+    throw Object.assign(new Error(`${providerDisplayName(provider)} is not installed on this computer.`), { status: 503 });
+  }
+  let confirmedSignedOut = false;
+  try {
+    const output = execFileSync(binary, providerReadinessArgs(provider), {
+      encoding: "utf8",
+      timeout: 10000,
+      env: providerReadinessEnv(provider),
+      cwd: runHome,
+    });
+    confirmedSignedOut = providerIsConfirmedSignedOut(provider, output);
+  } catch (error) {
+    const output = [error?.stdout, error?.stderr]
+      .map((value) => Buffer.isBuffer(value) ? value.toString("utf8") : String(value || ""))
+      .join("\n");
+    // Unknown/older status commands remain compatible. Only a provider's
+    // explicit signed-out result blocks a task.
+    confirmedSignedOut = providerIsConfirmedSignedOut(provider, output);
+  }
+  if (!confirmedSignedOut) return;
+  const displayName = providerDisplayName(provider);
+  const action = provider === "cursor"
+    ? "Run cursor-agent login on the computer, then try again."
+    : `Run relay sync-auth on your Mac to connect ${displayName}, then try again.`;
+  throw Object.assign(new Error(`${displayName} is not connected on this computer. ${action}`), { status: 503 });
+}
+
 function clampLimit(value) {
   const parsed = Number(value || "50");
   if (!Number.isFinite(parsed)) return 50;
@@ -2455,6 +2536,7 @@ function createJob(body, certSubject) {
   }
 
   const provider = cleanOptionalProvider(body.provider);
+  assertProviderReady(provider);
   const resumeSessionId = cleanOptionalSessionId(body.resumeSessionId);
   if (resumeSessionId) {
     const resumeMeta = findThreadResumeMeta(resumeSessionId);

@@ -40,6 +40,23 @@ process.env.CODEX_DATA_DIR ||= path.join(root, "data");
 process.env.CODEX_WORKSPACE_BROWSE_ROOT ||= workspaceRoot;
 process.env.CODEX_WORKSPACES ||= JSON.stringify([{ id: "welcome", name: "Welcome", path: path.join(workspaceRoot, "welcome") }]);
 process.env.CODEX_RUN_HOME ||= runHome;
+const fakeClaudeBin = path.join(root, "fake-claude");
+fs.writeFileSync(
+  fakeClaudeBin,
+  [
+    "#!/bin/sh",
+    "if [ \"$1\" = 'auth' ] && [ \"$2\" = 'status' ]; then",
+    "  printf '%s\\n' '{\"loggedIn\":true,\"authMethod\":\"subscription\"}'",
+    "  exit 0",
+    "fi",
+    "if [ \"$1\" = '--version' ]; then echo 'Claude Code test'; exit 0; fi",
+    "cat >/dev/null",
+    "echo 'continued handoff'",
+    "",
+  ].join("\n"),
+  { mode: 0o755 },
+);
+process.env.CLAUDE_BIN ||= fakeClaudeBin;
 
 const { initIdentity, identityPaths, readEncPublicKeyB64 } = await import("../src/identity.mjs");
 const { sealTo } = await import("../src/seal.mjs");
@@ -54,9 +71,9 @@ const { jobs, activeChildren, createJob } = await import("../src/jobs.mjs");
 
 // Bounded wait for a real job (one that actually went through enqueueJob) to
 // reach a terminal state, so a test that lets one run does not leave a
-// dangling child behind for a later test to trip over. `/usr/bin/claude`
-// does not exist on the test machine, so a job that resumes for real here
-// fails fast with ENOENT rather than hanging.
+// dangling child behind for a later test to trip over. The local fake Claude
+// fixture is connected and exits promptly, so the provider-readiness preflight
+// exercises the same path without depending on a developer machine login.
 async function waitForTerminalJob(id, { timeoutMs = 2000 } = {}) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {

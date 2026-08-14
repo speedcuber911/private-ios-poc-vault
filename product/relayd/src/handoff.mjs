@@ -1228,7 +1228,7 @@ async function continueHandoff(id, { prompt = null, certSubject = null } = {}) {
     throw Object.assign(new Error("a job is already running for this handoff"), { status: 409 });
   }
 
-  const job = enqueueJob(
+  const job = await enqueueJob(
     {
       workspaceId: record.workspaceId,
       provider: record.provider,

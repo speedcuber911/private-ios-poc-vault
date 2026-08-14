@@ -56,13 +56,21 @@ struct RelayHandoffCardView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .overlay {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(card.isActionable ? AppTheme.accent.opacity(0.35) : AppTheme.hairline, lineWidth: 1)
+                .stroke(card.isActionable ? sessionProvider.relayPresentation.accent.opacity(0.4) : AppTheme.hairline, lineWidth: 1)
         }
+        .overlay(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(sessionProvider.relayPresentation.accent)
+                .frame(width: 3)
+                .padding(.vertical, 12)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(sessionProvider.relayPresentation.title) handoff, \(card.statusLabel)")
     }
 
     private var header: some View {
         HStack(spacing: 8) {
-            RelayCapsLabel(text: harnessLabel, color: AppTheme.textTertiary, size: 9)
+            RelayProviderBadge(provider: sessionProvider, style: .capsule, size: 9)
             Spacer(minLength: 6)
             Text(card.statusLabel)
                 .font(AppTheme.uiFont(size: 11, weight: .semibold))
@@ -99,8 +107,10 @@ struct RelayHandoffCardView: View {
     /// the node allows another run once the last job ends — but says so, rather
     /// than pretending this is the first pickup.
     private var continueTitle: String {
-        if isContinuing { return "Starting" }
-        return card.lastJobID == nil ? "Continue this work" : "Continue again"
+        if isContinuing { return "Starting \(sessionProvider.relayPresentation.title)" }
+        return card.lastJobID == nil
+            ? "Continue with \(sessionProvider.relayPresentation.title)"
+            : "Continue again with \(sessionProvider.relayPresentation.title)"
     }
 
     /// Repository, source computer, and freshness are the useful parts of a
@@ -118,11 +128,11 @@ struct RelayHandoffCardView: View {
 
     /// The harness the laptop session belonged to, from the manifest; the
     /// runner provider is the fallback before the manifest has loaded.
-    private var harnessLabel: String {
+    private var sessionProvider: CodexProvider {
         if let harness = manifest?.harness {
-            return CodexProvider(rawProvider: harness).displayName
+            return CodexProvider(rawProvider: harness)
         }
-        return card.provider?.displayName ?? "Session"
+        return card.provider ?? .codex
     }
 
     private var statusColor: Color {
@@ -148,13 +158,16 @@ struct RelayMacSessionRow: View {
     var body: some View {
         Button(action: onStartFresh) {
             HStack(spacing: 12) {
+                RelayProviderMark(provider: provider, size: 17)
+                    .frame(width: 34, height: 34)
+                    .background(provider.relayPresentation.accent.opacity(0.1), in: RoundedRectangle(cornerRadius: 9))
                 VStack(alignment: .leading, spacing: 4) {
                     Text(session.displayTitle)
                         .font(AppTheme.uiFont(size: 14))
                         .foregroundStyle(AppTheme.textPrimary)
                         .lineLimit(1)
                     HStack(spacing: 8) {
-                        RelayCapsLabel(text: harnessLabel, color: AppTheme.textTertiary, size: 9)
+                        RelayProviderBadge(provider: provider, style: .plain, size: 8)
                         Text(metadata)
                             .font(AppTheme.monoFont(size: 10))
                             .foregroundStyle(AppTheme.textFaint)
@@ -163,18 +176,17 @@ struct RelayMacSessionRow: View {
                     }
                 }
                 Spacer(minLength: 6)
-                Text("Start fresh")
+                Text("Start \(provider.relayPresentation.title)")
                     .font(AppTheme.uiFont(size: 12, weight: .medium))
-                    .foregroundStyle(AppTheme.accent)
+                    .foregroundStyle(provider.relayPresentation.accent)
             }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel("Start a new \(provider.relayPresentation.title) session from \(session.displayTitle)")
     }
 
-    private var harnessLabel: String {
-        CodexProvider(rawProvider: session.harness).displayName
-    }
+    private var provider: CodexProvider { CodexProvider(rawProvider: session.harness) }
 
     private var metadata: String {
         guard let date = session.lastActiveDate else { return session.repo }

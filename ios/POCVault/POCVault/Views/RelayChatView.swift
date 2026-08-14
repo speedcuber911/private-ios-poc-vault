@@ -40,9 +40,11 @@ struct RelayChatView: View {
                         text: $viewModel.prompt,
                         sections: viewModel.pickerSections,
                         selectedChoice: viewModel.selectedChoice,
+                        threadProvider: viewModel.currentSessionProvider,
                         efforts: viewModel.availableEfforts,
                         selectedEffort: viewModel.effectiveEffort,
                         provider: viewModel.selectedTaskProvider,
+                        harnessStatus: viewModel.selectedHarnessStatus,
                         skills: viewModel.availableSkills,
                         selectedSkillIDs: viewModel.selectedSkillIDs,
                         claudePermissionMode: viewModel.claudePermissionMode,
@@ -136,6 +138,31 @@ struct RelayChatView: View {
                         .foregroundStyle(AppTheme.textTertiary)
                         .lineLimit(1)
                         .truncationMode(.head)
+                }
+                if let choice = viewModel.selectedChoice {
+                    HStack(spacing: 8) {
+                        RelayProviderBadge(
+                            provider: choice.executionProvider,
+                            detail: "\(choice.shortModelLabel) · \(choice.mode.label)",
+                            style: .plain,
+                            size: 9
+                        )
+                        if viewModel.currentSessionProvider != nil {
+                            RelayCapsLabel(text: "Provider locked", color: AppTheme.textFaint, size: 8)
+                        }
+                        if let harness = viewModel.selectedHarnessStatus {
+                            RelayCapsLabel(
+                                text: harness.shortStatus,
+                                color: harness.isConfirmedUnavailable
+                                    ? AppTheme.statusWarn
+                                    : harness.loggedIn == true
+                                        ? choice.executionProvider.relayPresentation.accent
+                                        : AppTheme.textFaint,
+                                size: 8
+                            )
+                        }
+                    }
+                    .padding(.top, 3)
                 }
             }
 
@@ -336,9 +363,11 @@ private struct RelayComposer: View {
     @Binding var text: String
     let sections: RelayModelPickerSections
     let selectedChoice: RelayModelChoice?
+    let threadProvider: CodexProvider?
     let efforts: [CodexReasoningEffort]
     let selectedEffort: CodexReasoningEffort?
     let provider: CodexProvider?
+    let harnessStatus: RelayHarnessStatus?
     let skills: [CodexSkillDescriptor]
     let selectedSkillIDs: Set<String>
     let claudePermissionMode: RelayClaudePermissionMode
@@ -361,6 +390,7 @@ private struct RelayComposer: View {
     @State private var showingModelPicker = false
     @State private var showingPermissionPicker = false
     @State private var showingSkillPicker = false
+    @State private var pendingProviderChoice: RelayModelChoice?
     @State private var skillSearch = ""
     @StateObject private var recorder = RelayPromptAudioRecorder()
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -402,16 +432,18 @@ private struct RelayComposer: View {
         ]
 
         if let provider {
-            commands.append(RelayComposerCommand(
-                id: "relay:permissions:\(provider.rawValue)",
-                command: "/permissions",
-                title: "\(RelayModelChoice.harnessTitle(for: provider)) permissions",
-                detail: provider == .claude
-                    ? "Choose the Claude Code permission mode"
-                    : "See the Codex runner's enforced access policy",
-                source: "\(RelayModelChoice.harnessTitle(for: provider)) setting",
-                action: .permissions
-            ))
+            if provider.hasTaskPermissionControls {
+                commands.append(RelayComposerCommand(
+                    id: "relay:permissions:\(provider.rawValue)",
+                    command: "/permissions",
+                    title: provider.relayPresentation.permissionsTitle ?? "Permissions",
+                    detail: provider == .claude
+                        ? "Choose the Claude Code permission mode"
+                        : "Choose the Codex runner's approval policy",
+                    source: "\(RelayModelChoice.harnessTitle(for: provider)) setting",
+                    action: .permissions
+                ))
+            }
             commands.append(RelayComposerCommand(
                 id: "relay:skills:\(provider.rawValue)",
                 command: "/skills",
@@ -441,11 +473,21 @@ private struct RelayComposer: View {
         }
     }
 
-    private func chipLabel(icon: String, text: String, badge: String? = nil) -> some View {
+    private func chipLabel(
+        icon: String,
+        text: String,
+        badge: String? = nil,
+        tint: Color = AppTheme.accent,
+        providerMark: CodexProvider? = nil
+    ) -> some View {
         HStack(spacing: 6) {
-            Image(systemName: icon)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(AppTheme.accent)
+            if let providerMark {
+                RelayProviderMark(provider: providerMark, size: 13)
+            } else {
+                Image(systemName: icon)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(tint)
+            }
             Text(text)
                 .font(AppTheme.uiFont(size: 11, weight: .semibold))
                 .tracking(0.8)
@@ -456,10 +498,10 @@ private struct RelayComposer: View {
             if let badge {
                 Text(badge)
                     .font(AppTheme.uiFont(size: 9, weight: .bold))
-                    .foregroundStyle(AppTheme.accent)
+                    .foregroundStyle(tint)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
-                    .background(AppTheme.accent.opacity(0.15), in: Capsule())
+                    .background(tint.opacity(0.15), in: Capsule())
                     .layoutPriority(1)
             }
             Image(systemName: "chevron.up.chevron.down")
@@ -472,7 +514,8 @@ private struct RelayComposer: View {
         .frame(minHeight: 34)
         .frame(maxWidth: usesAccessibilityLayout ? .infinity : 240, alignment: .leading)
         .fixedSize(horizontal: !usesAccessibilityLayout, vertical: false)
-        .overlay(Capsule().stroke(AppTheme.hairlineStrong, lineWidth: 1))
+        .background(providerMark == nil ? Color.clear : tint.opacity(0.07), in: Capsule())
+        .overlay(Capsule().stroke(providerMark == nil ? AppTheme.hairlineStrong : tint.opacity(0.3), lineWidth: 1))
     }
 
     /// Harness-first model picker: each agent harness (Codex, Claude Code, Cursor) is a
@@ -499,10 +542,13 @@ private struct RelayComposer: View {
                 }
             }
         } label: {
+            let selectedProvider = selectedChoice?.executionProvider
             chipLabel(
                 icon: "cpu",
                 text: selectedChoice?.chipLabel ?? "Model",
-                badge: selectedChoice?.mode.label
+                badge: selectedChoice?.mode.label,
+                tint: selectedProvider?.relayPresentation.accent ?? AppTheme.accent,
+                providerMark: selectedProvider
             )
         }
         .menuOrder(.fixed)
@@ -512,7 +558,7 @@ private struct RelayComposer: View {
 
     @ViewBuilder private func choiceButton(_ choice: RelayModelChoice, title: String) -> some View {
         Button {
-            onPickChoice(choice)
+            requestChoice(choice)
         } label: {
             if choice == selectedChoice {
                 Label(title, systemImage: "checkmark")
@@ -534,7 +580,8 @@ private struct RelayComposer: View {
         } label: {
             chipLabel(
                 icon: "gauge.with.dots.needle.50percent",
-                text: (selectedEffort ?? efforts.first(where: { $0 == .high }) ?? efforts.first)?.label ?? "Effort"
+                text: (selectedEffort ?? efforts.first(where: { $0 == .high }) ?? efforts.first)?.label ?? "Effort",
+                tint: selectedChoice?.executionProvider.relayPresentation.accent ?? AppTheme.accent
             )
         }
         .accessibilityIdentifier("relay-effort-chip")
@@ -544,9 +591,11 @@ private struct RelayComposer: View {
         Button {
             showingPermissionPicker = true
         } label: {
+            let scopedProvider = provider ?? .codex
             chipLabel(
                 icon: "checkmark.shield",
-                text: provider == .claude ? claudePermissionMode.label : codexApprovalPolicy.label
+                text: "\(scopedProvider.relayPresentation.permissionsTitle ?? "Permissions") · \(provider == .claude ? claudePermissionMode.label : codexApprovalPolicy.label)",
+                tint: scopedProvider.relayPresentation.accent
             )
         }
         .buttonStyle(.plain)
@@ -558,10 +607,12 @@ private struct RelayComposer: View {
         Button {
             showingSkillPicker = true
         } label: {
+            let scopedProvider = provider ?? .codex
             chipLabel(
                 icon: "hammer",
-                text: selectedSkillIDs.isEmpty ? "Skills" : "Skills",
-                badge: selectedSkillIDs.isEmpty ? nil : "\(selectedSkillIDs.count)"
+                text: scopedProvider.relayPresentation.skillsTitle,
+                badge: selectedSkillIDs.isEmpty ? nil : "\(selectedSkillIDs.count)",
+                tint: scopedProvider.relayPresentation.accent
             )
         }
         .buttonStyle(.plain)
@@ -584,8 +635,10 @@ private struct RelayComposer: View {
                     if !efforts.isEmpty {
                         effortPickerMenu
                     }
-                    if provider != nil {
+                    if provider?.hasTaskPermissionControls == true {
                         permissionChip
+                    }
+                    if provider != nil {
                         skillChip
                     }
                 }
@@ -598,12 +651,27 @@ private struct RelayComposer: View {
                         if !efforts.isEmpty {
                             effortPickerMenu
                         }
-                        if provider != nil {
+                        if provider?.hasTaskPermissionControls == true {
                             permissionChip
+                        }
+                        if provider != nil {
                             skillChip
                         }
                     }
                 }
+            }
+
+            if let harnessStatus, harnessStatus.isConfirmedUnavailable {
+                HStack(alignment: .top, spacing: 8) {
+                    RelayProviderMark(provider: harnessStatus.provider, size: 14)
+                    Text(harnessStatus.actionMessage ?? "This provider is not ready on the linked computer.")
+                        .font(AppTheme.uiFont(size: 11, weight: .medium))
+                        .foregroundStyle(AppTheme.statusWarn)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(.horizontal, 4)
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("relay-provider-readiness")
             }
 
             HStack(alignment: .bottom, spacing: 9) {
@@ -673,7 +741,7 @@ private struct RelayComposer: View {
                     .buttonStyle(.plain)
                     .disabled(!canSend)
                     .accessibilityIdentifier("relay-send")
-                    .accessibilityLabel("Send")
+                    .accessibilityLabel(harnessStatus?.isConfirmedUnavailable == true ? "Provider connection required" : "Send")
                     .transition(.scale.combined(with: .opacity))
                 }
             }
@@ -688,6 +756,13 @@ private struct RelayComposer: View {
         .padding(.top, 10)
         .padding(.bottom, Self.normalBottomPadding)
         .background(AppTheme.canvasBottom)
+        .overlay(alignment: .top) {
+            if let selectedChoice {
+                Rectangle()
+                    .fill(selectedChoice.executionProvider.relayPresentation.accent.opacity(0.8))
+                    .frame(height: 2)
+            }
+        }
         .animation(.easeOut(duration: 0.18), value: isFocused)
         .animation(.easeOut(duration: 0.16), value: slashContext)
         .sheet(isPresented: $showingModelPicker) {
@@ -698,6 +773,29 @@ private struct RelayComposer: View {
         }
         .sheet(isPresented: $showingSkillPicker) {
             skillPickerSheet
+        }
+        .confirmationDialog(
+            providerSwitchTitle,
+            isPresented: Binding(
+                get: { pendingProviderChoice != nil },
+                set: { if !$0 { pendingProviderChoice = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let choice = pendingProviderChoice {
+                Button("Start \(choice.executionProvider.relayPresentation.title) session") {
+                    onNewConversation()
+                    onPickChoice(choice)
+                    pendingProviderChoice = nil
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                pendingProviderChoice = nil
+            }
+        } message: {
+            if let choice = pendingProviderChoice, let threadProvider {
+                Text("This thread belongs to \(threadProvider.relayPresentation.title). Relay will keep it intact and start a new \(choice.executionProvider.relayPresentation.title) session.")
+            }
         }
     }
 
@@ -711,9 +809,7 @@ private struct RelayComposer: View {
                 )
                 Spacer()
                 if let provider {
-                    Text(RelayModelChoice.harnessTitle(for: provider))
-                        .font(AppTheme.uiFont(size: 11, weight: .medium))
-                        .foregroundStyle(AppTheme.textTertiary)
+                    RelayProviderBadge(provider: provider, style: .plain, size: 9)
                 }
             }
             .padding(.horizontal, 12)
@@ -736,7 +832,7 @@ private struct RelayComposer: View {
                                 HStack(alignment: .top, spacing: 10) {
                                     Text(command.command)
                                         .font(AppTheme.monoFont(size: 12, weight: .medium))
-                                        .foregroundStyle(AppTheme.accent)
+                                        .foregroundStyle(provider?.relayPresentation.accent ?? AppTheme.accent)
                                         .frame(width: 112, alignment: .leading)
 
                                     VStack(alignment: .leading, spacing: 3) {
@@ -757,7 +853,7 @@ private struct RelayComposer: View {
 
                                     if isSelectedSkill(command) {
                                         Image(systemName: "checkmark")
-                                            .foregroundStyle(AppTheme.accent)
+                                            .foregroundStyle(provider?.relayPresentation.accent ?? AppTheme.accent)
                                     }
                                 }
                                 .padding(.horizontal, 12)
@@ -830,13 +926,14 @@ private struct RelayComposer: View {
                         ForEach(sections.agents) { harness in
                             ForEach(harness.choices) { choice in
                                 Button {
-                                    onPickChoice(choice)
+                                    requestChoice(choice)
                                     showingModelPicker = false
                                 } label: {
                                     pickerRow(
                                         title: "\(harness.title) · \(choice.shortModelLabel)",
                                         detail: "Agent session",
-                                        selected: choice == selectedChoice
+                                        selected: choice == selectedChoice,
+                                        provider: choice.executionProvider
                                     )
                                 }
                             }
@@ -847,13 +944,14 @@ private struct RelayComposer: View {
                     Section("Chat models") {
                         ForEach(sections.chatModels) { choice in
                             Button {
-                                onPickChoice(choice)
+                                requestChoice(choice)
                                 showingModelPicker = false
                             } label: {
                                 pickerRow(
                                     title: choice.chipLabel,
                                     detail: "Conversation",
-                                    selected: choice == selectedChoice
+                                    selected: choice == selectedChoice,
+                                    provider: choice.executionProvider
                                 )
                             }
                         }
@@ -884,7 +982,8 @@ private struct RelayComposer: View {
                                 pickerRow(
                                     title: mode.label,
                                     detail: mode.detail,
-                                    selected: mode == claudePermissionMode
+                                    selected: mode == claudePermissionMode,
+                                    provider: .claude
                                 )
                             }
                         }
@@ -903,7 +1002,8 @@ private struct RelayComposer: View {
                                 pickerRow(
                                     title: policy.label,
                                     detail: policy.detail,
-                                    selected: policy == codexApprovalPolicy
+                                    selected: policy == codexApprovalPolicy,
+                                    provider: .codex
                                 )
                             }
                         }
@@ -917,7 +1017,7 @@ private struct RelayComposer: View {
             }
             .scrollContentBackground(.hidden)
             .background(AppTheme.bgCanvas)
-            .navigationTitle("Permissions")
+            .navigationTitle((provider ?? .codex).relayPresentation.permissionsTitle ?? "Permissions")
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { showingPermissionPicker = false }
@@ -932,13 +1032,15 @@ private struct RelayComposer: View {
             List {
                 if filteredSkills.isEmpty {
                     ContentUnavailableView(
-                        skillSearch.isEmpty ? "No installed skills" : "No matching skills",
+                        skillSearch.isEmpty
+                            ? "No installed \((provider ?? .codex).relayPresentation.skillsTitle.lowercased())"
+                            : "No matching \((provider ?? .codex).relayPresentation.skillsTitle.lowercased())",
                         systemImage: "hammer",
-                        description: Text("Relay shows only skills discovered from the selected provider on the linked computer.")
+                        description: Text("Relay shows only \((provider ?? .codex).relayPresentation.title) skills discovered on this runner.")
                     )
                     .listRowBackground(Color.clear)
                 } else {
-                    Section(RelayModelChoice.harnessTitle(for: provider ?? .codex)) {
+                    Section {
                         ForEach(filteredSkills) { skill in
                             Button {
                                 onToggleSkill(skill)
@@ -946,17 +1048,20 @@ private struct RelayComposer: View {
                                 pickerRow(
                                     title: skill.title,
                                     detail: skill.description,
-                                    selected: selectedSkillIDs.contains(skill.id)
+                                    selected: selectedSkillIDs.contains(skill.id),
+                                    provider: skill.provider
                                 )
                             }
                         }
+                    } header: {
+                        RelayProviderBadge(provider: provider ?? .codex, style: .plain, size: 9)
                     }
                 }
             }
             .searchable(text: $skillSearch, prompt: "Search installed skills")
             .scrollContentBackground(.hidden)
             .background(AppTheme.bgCanvas)
-            .navigationTitle("Skills")
+            .navigationTitle((provider ?? .codex).relayPresentation.skillsTitle)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { showingSkillPicker = false }
@@ -976,8 +1081,18 @@ private struct RelayComposer: View {
         }
     }
 
-    private func pickerRow(title: String, detail: String, selected: Bool) -> some View {
+    private func pickerRow(
+        title: String,
+        detail: String,
+        selected: Bool,
+        provider: CodexProvider? = nil
+    ) -> some View {
         HStack(alignment: .top, spacing: 12) {
+            if let provider {
+                RelayProviderMark(provider: provider, size: 16)
+                    .frame(width: 30, height: 30)
+                    .background(provider.relayPresentation.accent.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+            }
             VStack(alignment: .leading, spacing: 4) {
                 Text(title)
                     .font(AppTheme.uiFont(size: 15, weight: .semibold))
@@ -991,14 +1106,31 @@ private struct RelayComposer: View {
             if selected {
                 Image(systemName: "checkmark")
                     .font(AppTheme.uiFont(size: 13, weight: .semibold))
-                    .foregroundStyle(AppTheme.accent)
+                    .foregroundStyle(provider?.relayPresentation.accent ?? AppTheme.accent)
             }
         }
         .contentShape(Rectangle())
     }
 
     private var canSend: Bool {
-        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isSending && !isTranscribing && !recorder.isRecording
+        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !isSending
+            && !isTranscribing
+            && !recorder.isRecording
+            && harnessStatus?.isConfirmedUnavailable != true
+    }
+
+    private func requestChoice(_ choice: RelayModelChoice) {
+        guard let threadProvider, threadProvider != choice.executionProvider else {
+            onPickChoice(choice)
+            return
+        }
+        pendingProviderChoice = choice
+    }
+
+    private var providerSwitchTitle: String {
+        guard let choice = pendingProviderChoice else { return "Start a new provider session?" }
+        return "Start a new \(choice.executionProvider.relayPresentation.title) session?"
     }
 
     private func toggleRecording() {
@@ -1139,10 +1271,18 @@ private struct RelayChatBubble: View {
     private var messageColumn: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 6) {
-                RelayCapsLabel(
-                    text: bylineText,
-                    color: isUser ? AppTheme.onEmber.opacity(0.7) : AppTheme.accent
-                )
+                if isUser {
+                    RelayCapsLabel(text: "You", color: AppTheme.onEmber.opacity(0.7))
+                } else if let provider = item.provider {
+                    RelayProviderBadge(
+                        provider: provider,
+                        detail: item.modelLabel,
+                        style: .plain,
+                        size: 9
+                    )
+                } else {
+                    RelayCapsLabel(text: "Relay", color: AppTheme.accent)
+                }
                 if showCopied {
                     RelayCapsLabel(text: "Copied", color: AppTheme.textSecondary, size: 9)
                         .transition(.opacity)
@@ -1150,10 +1290,15 @@ private struct RelayChatBubble: View {
             }
 
             if showWaitingDots {
-                RelayTypingDots()
+                RelayTypingDots(tint: item.provider?.relayPresentation.accent ?? AppTheme.textTertiary)
                     .padding(.vertical, 2)
             } else {
-                RelayStreamingContent(text: item.text, isStreaming: item.isStreaming, userAligned: isUser)
+                RelayStreamingContent(
+                    text: item.text,
+                    isStreaming: item.isStreaming,
+                    userAligned: isUser,
+                    tint: item.provider?.relayPresentation.accent ?? AppTheme.accent
+                )
             }
 
             if let footer = footerText {
@@ -1162,13 +1307,6 @@ private struct RelayChatBubble: View {
                     .foregroundStyle(isUser ? AppTheme.onEmber.opacity(0.7) : AppTheme.textTertiary)
             }
         }
-    }
-
-    private var bylineText: String {
-        if isUser { return "You" }
-        let provider = item.provider?.displayName ?? "Relay"
-        if let model = item.modelLabel { return "\(provider) · \(model)" }
-        return provider
     }
 
     private func flashCopied() {
@@ -1200,13 +1338,14 @@ private struct RelayChatBubble: View {
 
 /// Animated three-dot "thinking" indicator shown before the first token arrives.
 private struct RelayTypingDots: View {
+    var tint: Color = AppTheme.textTertiary
     @State private var phase = 0.0
 
     var body: some View {
         HStack(spacing: 5) {
             ForEach(0..<3, id: \.self) { i in
                 Circle()
-                    .fill(AppTheme.textTertiary)
+                    .fill(tint)
                     .frame(width: 5, height: 5)
                     .scaleEffect(scale(for: i))
                     .opacity(0.5 + 0.5 * scale(for: i))
@@ -1231,6 +1370,7 @@ private struct RelayStreamingContent: View {
     let text: String
     let isStreaming: Bool
     let userAligned: Bool
+    var tint: Color = AppTheme.accent
     @State private var caretOn = true
 
     var body: some View {
@@ -1238,7 +1378,7 @@ private struct RelayStreamingContent: View {
             RelayMarkdownText(text: text, userAligned: userAligned)
             if isStreaming {
                 Rectangle()
-                    .fill(AppTheme.accent)
+                    .fill(tint)
                     .frame(width: 8, height: 16)
                     .opacity(caretOn ? 1 : 0)
                     .padding(.top, 2)
@@ -1268,8 +1408,13 @@ private struct RelayJobCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
+                RelayProviderBadge(
+                    provider: job.provider,
+                    detail: job.model,
+                    style: .capsule,
+                    size: 9
+                )
                 RelayStatusPill(status: job.status, startedAt: job.startedAt ?? job.createdAt)
-                RelayCapsLabel(text: job.provider.displayName, color: AppTheme.textTertiary)
                 Spacer()
                 // Status lives in the pill only (it used to repeat as plain text here);
                 // the trailing slot shows the run duration once the server reports one.
@@ -1286,8 +1431,8 @@ private struct RelayJobCard: View {
                 } else {
                     // No output yet but the job is live — show motion so it never looks frozen.
                     HStack(spacing: 8) {
-                        ProgressView().controlSize(.small).tint(AppTheme.accent)
-                        Text(job.status == .queued ? "Queued…" : "Working…")
+                        ProgressView().controlSize(.small).tint(job.provider.relayPresentation.accent)
+                        Text(job.status == .queued ? "Queued for \(job.provider.relayPresentation.title)…" : "\(job.provider.relayPresentation.title) is working…")
                             .font(AppTheme.uiFont(size: 13))
                             .foregroundStyle(AppTheme.textSecondary)
                     }
@@ -1305,15 +1450,23 @@ private struct RelayJobCard: View {
                 }
                 Spacer()
                 Button("View full log", action: onFullLog)
-                    .foregroundStyle(AppTheme.accent)
+                    .foregroundStyle(job.provider.relayPresentation.accent)
             }
             .font(AppTheme.uiFont(size: 13, weight: .medium))
         }
         .padding(14)
         .overlay {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(job.status.isActive ? AppTheme.accent.opacity(0.35) : AppTheme.hairline, lineWidth: 1)
+                .stroke(job.status.isActive ? job.provider.relayPresentation.accent.opacity(0.4) : AppTheme.hairline, lineWidth: 1)
         }
+        .overlay(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(job.provider.relayPresentation.accent)
+                .frame(width: 3)
+                .padding(.vertical, 12)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(job.provider.relayPresentation.title) job, \(job.status.label)")
         .onChange(of: job.status.isActive) { _, isActive in
             // Light tap when the job reaches a terminal state while the card is visible.
             if !isActive {
@@ -1488,7 +1641,7 @@ private struct RelayThreadDrawer: View {
             Section {
                 ForEach(index.sessions) { session in
                     RelayMacSessionRow(session: session, onStartFresh: {
-                        viewModel.prompt = "Continue the work from “\(session.displayTitle)”."
+                        viewModel.startFresh(from: session)
                         dismiss()
                     })
                     .listRowBackground(Color.clear)
@@ -1518,24 +1671,36 @@ private struct RelayThreadDrawer: View {
                 dismiss()
             }
         } label: {
-            VStack(alignment: .leading, spacing: 5) {
-                HStack(spacing: 6) {
+            HStack(alignment: .top, spacing: 10) {
+                RelayProviderMark(provider: historyProvider(item), size: 17)
+                    .frame(width: 34, height: 34)
+                    .background(historyProvider(item).relayPresentation.accent.opacity(0.1), in: RoundedRectangle(cornerRadius: 9))
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 6) {
+                        RelayProviderBadge(provider: historyProvider(item), style: .plain, size: 8)
+                        Spacer()
+                        if item.isActive {
+                            RelayCapsLabel(text: "Active", color: AppTheme.accentBright, size: 9)
+                        }
+                        RelayCapsLabel(text: historyModeLabel(item), color: historyProvider(item).relayPresentation.accent, size: 9)
+                    }
                     Text(item.title)
                         .foregroundStyle(AppTheme.textPrimary)
                         .lineLimit(1)
-                    Spacer()
-                    if item.isActive {
-                        RelayCapsLabel(text: "Active", color: AppTheme.accentBright, size: 9)
-                    }
-                    RelayCapsLabel(text: historyModeLabel(item), color: AppTheme.accent, size: 9)
+                    Text(item.preview)
+                        .font(.caption)
+                        .foregroundStyle(AppTheme.textTertiary)
+                        .lineLimit(2)
+                    Text(historyMetadata(item))
+                        .font(AppTheme.monoFont(size: 10))
+                        .foregroundStyle(AppTheme.textTertiary)
                 }
-                Text(item.preview)
-                    .font(.caption)
-                    .foregroundStyle(AppTheme.textTertiary)
-                    .lineLimit(2)
-                Text(historyMetadata(item))
-                    .font(AppTheme.monoFont(size: 10))
-                    .foregroundStyle(AppTheme.textTertiary)
+            }
+            .overlay(alignment: .leading) {
+                Rectangle()
+                    .fill(historyProvider(item).relayPresentation.accent.opacity(0.75))
+                    .frame(width: 2)
+                    .offset(x: -8)
             }
         }
         .listRowBackground(Color.clear)
@@ -1554,13 +1719,20 @@ private struct RelayThreadDrawer: View {
         switch item.source {
         case .thread(let thread):
             if thread.mode == .chat {
-                return "\(item.workspaceLabel) · \(thread.provider.displayName) · conversation"
+                return "\(item.workspaceLabel) · conversation"
             }
             let count = thread.jobCount
             let invocationText = count == 1 ? "1 invocation" : "\(count) invocations"
-            return "\(item.workspaceLabel) · \(thread.provider.displayName) · \(invocationText)"
+            return "\(item.workspaceLabel) · \(invocationText)"
         case .pendingJob(let job):
-            return "\(item.workspaceLabel) · \(job.provider.displayName) · invocation · \(job.status.label)"
+            return "\(item.workspaceLabel) · invocation · \(job.status.label)"
+        }
+    }
+
+    private func historyProvider(_ item: CodexThreadFeedItem) -> CodexProvider {
+        switch item.source {
+        case .thread(let thread): return thread.provider
+        case .pendingJob(let job): return job.provider
         }
     }
 }
@@ -1585,12 +1757,17 @@ private struct RelayEmptyConversation: View {
     let choice: RelayModelChoice?
 
     private var isTask: Bool { choice?.mode == .task }
+    private var provider: CodexProvider { choice?.executionProvider ?? .codex }
 
     var body: some View {
         VStack(spacing: 14) {
-            Image(systemName: isTask ? "terminal.fill" : "message.fill")
-                .font(.system(size: 30, weight: .medium))
-                .foregroundStyle(AppTheme.accent)
+            RelayProviderMark(provider: provider, size: 30)
+                .frame(width: 54, height: 54)
+                .background(provider.relayPresentation.accent.opacity(0.1), in: RoundedRectangle(cornerRadius: 16))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 16)
+                        .stroke(provider.relayPresentation.accent.opacity(0.25), lineWidth: 1)
+                }
 
             VStack(spacing: 6) {
                 Text(isTask ? "Run a task" : "Start a conversation")
@@ -1604,13 +1781,13 @@ private struct RelayEmptyConversation: View {
                     .multilineTextAlignment(.center)
             }
 
-            if let label = choice?.chipLabel {
-                Text(label)
-                    .font(AppTheme.uiFont(size: 12, weight: .medium))
-                    .foregroundStyle(AppTheme.textSecondary)
-                    .padding(.horizontal, 12)
-                    .frame(height: 30)
-                    .overlay(Capsule().stroke(AppTheme.hairlineStrong, lineWidth: 1))
+            if let choice {
+                RelayProviderBadge(
+                    provider: provider,
+                    detail: "\(choice.shortModelLabel) · \(choice.mode.label)",
+                    style: .capsule,
+                    size: 10
+                )
             }
         }
         .frame(maxWidth: .infinity, minHeight: 320, alignment: .center)
@@ -1633,22 +1810,32 @@ private struct RelayFullLogSheet: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                if let text {
-                    Text(text.isEmpty ? "No log output." : text)
-                        .font(AppTheme.monoFont(size: 12))
-                        .foregroundStyle(AppTheme.textPrimary)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(16)
-                } else {
-                    ProgressView("Loading full log…")
-                        .tint(AppTheme.accent)
-                        .foregroundStyle(AppTheme.textSecondary)
-                        .frame(maxWidth: .infinity, minHeight: 260)
+                VStack(alignment: .leading, spacing: 14) {
+                    RelayProviderBadge(
+                        provider: job.provider,
+                        detail: job.model,
+                        style: .capsule,
+                        size: 10
+                    )
+
+                    if let text {
+                        Text(text.isEmpty ? "No log output." : text)
+                            .font(AppTheme.monoFont(size: 12))
+                            .foregroundStyle(AppTheme.textPrimary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        ProgressView("Loading \(job.provider.relayPresentation.title) log…")
+                            .tint(job.provider.relayPresentation.accent)
+                            .foregroundStyle(AppTheme.textSecondary)
+                            .frame(maxWidth: .infinity, minHeight: 260)
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(16)
             }
             .background(AppTheme.bgCanvas)
-            .navigationTitle("Log")
+            .navigationTitle("\(job.provider.relayPresentation.title) log")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {

@@ -22,6 +22,7 @@ import { store } from "./store.mjs";
 import { emitEvent } from "./events.mjs";
 import { prepareJobWorkdir, completeJobWorktree } from "./worktree.mjs";
 import { ApprovalStore } from "./approval-store.mjs";
+import { assertProviderReady } from "./harness.mjs";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const codexJobRunner = path.join(moduleDir, "codex-job-runner.mjs");
@@ -227,7 +228,9 @@ function createJob(body, certSubject) {
 // The seven steps every new job needs, in one place: validate, register in the
 // live map, queue it, persist, audit, publish, and drain. Both the HTTP route
 // and the handoff continue-path go through here so they cannot drift.
-function enqueueJob(body, certSubject) {
+async function enqueueJob(body, certSubject) {
+  const provider = cleanOptionalProvider(body?.provider);
+  await assertProviderReady(provider);
   const job = createJob(body, certSubject);
   jobs.set(job.id, job);
   jobsState.queuedJobIds.push(job.id);

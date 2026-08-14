@@ -97,11 +97,47 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(CodexProvider.codex.modelOptions, [])
         XCTAssertEqual(CodexProvider.codex.defaultReasoningEffort, .xhigh)
 
-        XCTAssertEqual(CodexProvider.claude.displayName, "Claude")
+        XCTAssertEqual(CodexProvider.claude.displayName, "Claude Code")
         XCTAssertEqual(CodexProvider.claude.defaultModel, "")
         XCTAssertEqual(CodexProvider.claude.modelOptions, [])
         XCTAssertEqual(CodexProvider.claude.defaultReasoningEffort, .high)
         XCTAssertEqual(CodexProvider.claude.reasoningEffortOptions, CodexReasoningEffort.allCases)
+    }
+
+    func testRelayHarnessStatusSeparatesProviderReadinessAndRecovery() throws {
+        let signedOut = try JSONDecoder().decode(
+            RelayHarnessStatus.self,
+            from: Data("""
+            {
+              "provider": "codex",
+              "installed": true,
+              "version": "OpenAI Codex v0.147.0",
+              "loggedIn": false,
+              "authKind": "unknown"
+            }
+            """.utf8)
+        )
+        let connected = try JSONDecoder().decode(
+            RelayHarnessStatus.self,
+            from: Data("""
+            {
+              "provider": "claude",
+              "installed": true,
+              "loggedIn": true,
+              "authKind": "subscription"
+            }
+            """.utf8)
+        )
+
+        XCTAssertEqual(signedOut.provider, .codex)
+        XCTAssertTrue(signedOut.isConfirmedUnavailable)
+        XCTAssertEqual(signedOut.shortStatus, "Needs connection")
+        XCTAssertEqual(signedOut.actionMessage, "Run relay sync-auth on your Mac to connect Codex, then try again.")
+
+        XCTAssertEqual(connected.provider, .claude)
+        XCTAssertFalse(connected.isConfirmedUnavailable)
+        XCTAssertEqual(connected.shortStatus, "Connected")
+        XCTAssertNil(connected.actionMessage)
     }
 
     func testCodexModelDescriptorAllowsOptionalEffortLevels() throws {
@@ -361,6 +397,14 @@ final class ManifestTests: XCTestCase {
     func testCodexProviderTabIconsUseBrandAssets() throws {
         XCTAssertEqual(CodexProvider.codex.tabIconAssetName, "ChatGPTMark")
         XCTAssertEqual(CodexProvider.claude.tabIconAssetName, "ClaudeMark")
+        XCTAssertEqual(CodexProvider.cursor.tabIconAssetName, "cursorarrow")
+        XCTAssertEqual(CodexProvider.bedrock.tabIconAssetName, "cube.transparent")
+        XCTAssertEqual(CodexProvider.azure.tabIconAssetName, "cloud")
+        XCTAssertNotEqual(CodexProvider.cursor.tabIconAssetName, CodexProvider.codex.tabIconAssetName)
+        XCTAssertNotEqual(CodexProvider.bedrock.tabIconAssetName, CodexProvider.claude.tabIconAssetName)
+        XCTAssertTrue(CodexProvider.codex.hasTaskPermissionControls)
+        XCTAssertTrue(CodexProvider.claude.hasTaskPermissionControls)
+        XCTAssertFalse(CodexProvider.cursor.hasTaskPermissionControls)
     }
 
     func testRelayDesignTokensUseEditorialEmberPalette() throws {
@@ -1727,6 +1771,7 @@ final class ManifestTests: XCTestCase {
     /// icon is always `arrow.up`; the keyboard-dismissal invariants survive.
     func testRelayChatComposerIsHarnessFirstWithoutModeToggle() throws {
         let source = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
+        let viewModelSource = try AppSourceFixture.load("POCVault/Views/RelayChatViewModel.swift")
 
         // Dead controls from the mode-toggle era.
         XCTAssertFalse(source.contains("RelayWorkspaceSheet"))
@@ -1748,6 +1793,14 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(source.contains("relay-model-chip"))
         XCTAssertTrue(source.contains("relay-effort-chip"))
         XCTAssertTrue(source.contains("Image(systemName: \"arrow.up\")"))
+
+        // Provider readiness remains provider-scoped, visible, and blocks send before
+        // the draft is cleared. Authentication itself stays on the linked computer.
+        XCTAssertTrue(source.contains("relay-provider-readiness"))
+        XCTAssertTrue(source.contains("harnessStatus?.isConfirmedUnavailable != true"))
+        XCTAssertTrue(viewModelSource.contains("await refreshHarnesses()"))
+        XCTAssertTrue(viewModelSource.contains("status.isConfirmedUnavailable"))
+        XCTAssertTrue(viewModelSource.contains("let text = prompt.trimmingCharacters"))
 
         // Live SSE-fed job tail with the poll-driven fallback text.
         XCTAssertTrue(source.contains("liveTail"))
@@ -2227,6 +2280,23 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(taskChoice.id.contains("gpt-5.6-sol"))
         XCTAssertEqual(chatChoice, RelayModelChoice(model: model, mode: .chat))
         XCTAssertEqual(Set([chatChoice, taskChoice]).count, 2)
+    }
+
+    func testRelayModelChoiceExposesTheActualExecutionProvider() throws {
+        let models = try decodeCodexModels(
+            """
+            [
+              { "id": "claude-code-sonnet", "label": "Claude Code · Sonnet", "provider": "claude", "modes": ["task"] },
+              { "id": "bedrock-sonnet", "label": "Bedrock · Sonnet", "provider": "bedrock", "modes": ["task"] },
+              { "id": "azure-gpt-4o", "label": "Azure · GPT-4o", "provider": "azure", "modes": ["chat", "task"] }
+            ]
+            """
+        )
+
+        XCTAssertEqual(RelayModelChoice(model: models[0], mode: .task).executionProvider, .claude)
+        XCTAssertEqual(RelayModelChoice(model: models[1], mode: .task).executionProvider, .claude)
+        XCTAssertEqual(RelayModelChoice(model: models[2], mode: .chat).executionProvider, .azure)
+        XCTAssertEqual(RelayModelChoice(model: models[2], mode: .task).executionProvider, .codex)
     }
 
     func testCodexJobStreamEventDecodesRawSSEDataLines() throws {

@@ -66,6 +66,14 @@ struct RelayModelChoice: Identifiable, Hashable {
 
     var id: String { "\(model.id)#\(mode.rawValue)" }
 
+    /// The harness that actually owns the resulting session. Chat models retain their
+    /// catalog provider; task aliases such as Bedrock/Claude and Azure/Codex resolve to
+    /// the CLI that Relay launches. Keeping this on the choice gives every UI surface
+    /// one source of truth for provider switching and identity.
+    var executionProvider: CodexProvider {
+        mode == .task ? RelayChatViewModel.taskProvider(for: model) : model.provider
+    }
+
     /// The harness name shown for Agents grouping and the composer chip ("Codex",
     /// "Claude Code", "Cursor"). Purely presentational; rows still come only from the
     /// server catalog.
@@ -192,6 +200,7 @@ final class RelayChatViewModel: ObservableObject {
     @Published private(set) var threads: [CodexThread] = []
     @Published private(set) var jobs: [CodexJob] = []
     @Published private(set) var messages: [RelayConversationItem] = []
+    @Published private(set) var harnessesByProvider: [CodexProvider: RelayHarnessStatus] = [:]
     @Published private(set) var isLoading = false
     @Published private(set) var isSending = false
     @Published private(set) var isTranscribing = false
@@ -266,6 +275,10 @@ final class RelayChatViewModel: ObservableObject {
 
     var isStreaming: Bool { streamingMessageID != nil }
 
+    /// Provider locked to the open resumable session. A different provider must start a
+    /// new conversation instead of looking like an in-place model change.
+    var currentSessionProvider: CodexProvider? { currentThreadProvider }
+
     /// Unified, newest-first history for this exact folder. Server threads carry complete
     /// conversations; standalone jobs cover invocations whose provider never produced a
     /// resumable session (or whose session discovery has not completed yet). The extra
@@ -328,6 +341,11 @@ final class RelayChatViewModel: ObservableObject {
         return Self.taskProvider(for: choice.model)
     }
 
+    var selectedHarnessStatus: RelayHarnessStatus? {
+        guard let provider = selectedTaskProvider else { return nil }
+        return harnessesByProvider[provider]
+    }
+
     var availableSkills: [CodexSkillDescriptor] {
         guard let provider = selectedTaskProvider else { return [] }
         return skillsByProvider[provider] ?? []
@@ -383,6 +401,7 @@ final class RelayChatViewModel: ObservableObject {
         isLoading = true
         defer { isLoading = false }
         do {
+            await refreshHarnesses()
             models = try await client.fetchModels()
             ensureSelectedChoiceValid()
             await refreshSkills()
@@ -395,6 +414,17 @@ final class RelayChatViewModel: ObservableObject {
         #if DEBUG
         await runAutoDriveIfRequested()
         #endif
+    }
+
+    /// Readiness is independent per provider. Older personal nodes may not expose the
+    /// harness endpoint yet; keep their last known state and let the job endpoint decide.
+    func refreshHarnesses() async {
+        do {
+            let harnesses = try await client.fetchHarnesses()
+            harnessesByProvider = Dictionary(uniqueKeysWithValues: harnesses.map { ($0.provider, $0) })
+        } catch {
+            CodexDiagnostics.log("harness_refresh_failed", fields: ["error": String(describing: error)])
+        }
     }
 
     /// Refresh provider inventories independently. One unavailable harness must not hide
@@ -774,6 +804,13 @@ final class RelayChatViewModel: ObservableObject {
         isSending = true
         defer { isSending = false }
 
+        let provider = Self.taskProvider(for: model)
+        await refreshHarnesses()
+        if let status = harnessesByProvider[provider], status.isConfirmedUnavailable {
+            errorMessage = status.actionMessage ?? "\(provider.displayName) is not ready on this computer."
+            return
+        }
+
         // Folder history continues a task in this same workspace. A new task lazily
         // registers the current folder before touching the draft.
         let targetWorkspaceID: String?
@@ -795,8 +832,8 @@ final class RelayChatViewModel: ObservableObject {
             return
         }
         prompt = ""
+        errorMessage = nil
 
-        let provider = Self.taskProvider(for: model)
         // Only resume the existing session if it's the same provider AND same workspace,
         // otherwise the server rejects it ("session does not belong to workspace").
         let resumeID = (currentThreadProvider == provider && currentThreadWorkspaceID == workspaceID) ? currentThreadID : nil
@@ -828,6 +865,10 @@ final class RelayChatViewModel: ObservableObject {
             attachJobStream(to: job)
             await refreshThreads()
         } catch {
+            if prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                prompt = text
+            }
+            await refreshHarnesses()
             errorMessage = error.localizedDescription
             messages.append(RelayConversationItem(role: .status, text: error.localizedDescription, provider: provider))
         }
@@ -883,6 +924,23 @@ final class RelayChatViewModel: ObservableObject {
         currentThreadWorkspaceID = nil
         currentThreadWorkspaceName = nil
         messages = []
+    }
+
+    /// A Mac-session index row is metadata, not a portable transcript. Starting from it
+    /// therefore creates a clean session, but it must still select the same harness so a
+    /// Claude Code row can never silently open in Codex (or vice versa).
+    func startFresh(from session: RelayMacSession) {
+        startNewConversation()
+        let provider = CodexProvider(rawProvider: session.harness)
+        if let model = models.first(where: { $0.provider == provider && $0.supports(.task) }) {
+            selectChoice(RelayModelChoice(model: model, mode: .task))
+            errorMessage = nil
+        } else {
+            selectedChoice = nil
+            selectedEffort = nil
+            errorMessage = "\(provider.relayPresentation.title) is not currently available on this runner."
+        }
+        prompt = "Continue the work from “\(session.displayTitle)”."
     }
 
     func openThread(_ thread: CodexThread) async {

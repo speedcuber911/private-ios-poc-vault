@@ -351,7 +351,7 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
         case .codex:
             return "Codex"
         case .claude:
-            return "Claude"
+            return "Claude Code"
         case .cursor:
             return "Cursor"
         case .bedrock:
@@ -380,6 +380,58 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
 
     var reasoningEffortOptions: [CodexReasoningEffort] {
         CodexReasoningEffort.allCases
+    }
+}
+
+/// Provider readiness measured by relayd under the exact isolated account that
+/// executes tasks. A linked computer and an installed CLI are not enough: the
+/// selected provider must also have usable credentials in that runner home.
+struct RelayHarnessStatus: Decodable, Hashable, Identifiable {
+    let provider: CodexProvider
+    let installed: Bool
+    let version: String?
+    let loggedIn: Bool?
+    let authKind: String
+
+    var id: CodexProvider { provider }
+
+    private enum CodingKeys: String, CodingKey {
+        case provider
+        case installed
+        case version
+        case loggedIn
+        case authKind
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try container.decode(CodexProvider.self, forKey: .provider)
+        installed = (try? container.decodeIfPresent(Bool.self, forKey: .installed)) ?? false
+        version = try container.decodeIfPresent(String.self, forKey: .version)?.trimmedNonEmpty
+        loggedIn = try container.decodeIfPresent(Bool.self, forKey: .loggedIn)
+        authKind = (try container.decodeIfPresent(String.self, forKey: .authKind))?.trimmedNonEmpty ?? "unknown"
+    }
+
+    var isConfirmedUnavailable: Bool {
+        !installed || loggedIn == false
+    }
+
+    var shortStatus: String {
+        if !installed { return "Not installed" }
+        if loggedIn == false { return "Needs connection" }
+        if loggedIn == true { return "Connected" }
+        return "Status unknown"
+    }
+
+    var actionMessage: String? {
+        if !installed {
+            return "\(provider.displayName) is not installed on this computer."
+        }
+        guard loggedIn == false else { return nil }
+        if provider == .cursor {
+            return "Run cursor-agent login on the computer, then try again."
+        }
+        return "Run relay sync-auth on your Mac to connect \(provider.displayName), then try again."
     }
 }
 

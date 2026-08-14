@@ -30,7 +30,7 @@ async function startServer(extraEnv = {}) {
   const fakeCodex = path.join(dir, "fake-codex");
   fs.writeFileSync(
     fakeCodex,
-    `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "fake-codex 9.9.9"; exit 0; fi\ncat > /dev/null\necho "OK"\n`,
+    `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "fake-codex 9.9.9"; exit 0; fi\nif [ "$1" = "login" ] && [ "$2" = "status" ]; then echo "Logged in using ChatGPT"; exit 0; fi\ncat > /dev/null\necho "OK"\n`,
     { mode: 0o755 },
   );
 
@@ -41,7 +41,7 @@ async function startServer(extraEnv = {}) {
   const fakeClaude = path.join(dir, "fake-claude");
   fs.writeFileSync(
     fakeClaude,
-    `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "fake-claude 1.2.3"; exit 0; fi\nif [ "$1" = "login" ]; then\n  echo "Visit https://provider.example/device and enter code WXYZ-2345 to continue"\n  i=0\n  while [ ! -f "$HOME/login-confirmed" ] && [ $i -lt ${FAKE_CLI_PARK_ITERATIONS} ]; do sleep 0.1; i=$((i+1)); done\n  [ -f "$HOME/login-confirmed" ] && exit 0 || exit 1\nfi\nexit 0\n`,
+    `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "fake-claude 1.2.3"; exit 0; fi\nif [ "$1" = "auth" ] && [ "$2" = "status" ]; then echo '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}'; exit 0; fi\nif [ "$1" = "login" ]; then\n  echo "Visit https://provider.example/device and enter code WXYZ-2345 to continue"\n  i=0\n  while [ ! -f "$HOME/login-confirmed" ] && [ $i -lt ${FAKE_CLI_PARK_ITERATIONS} ]; do sleep 0.1; i=$((i+1)); done\n  [ -f "$HOME/login-confirmed" ] && exit 0 || exit 1\nfi\nexit 0\n`,
     { mode: 0o755 },
   );
 
@@ -109,15 +109,56 @@ test("GET /v1/harness detects installed CLIs with versions and capability flags"
 
     assert.equal(byProvider.codex.installed, true);
     assert.equal(byProvider.codex.version, "fake-codex 9.9.9");
+    assert.equal(byProvider.codex.loggedIn, true);
+    assert.equal(byProvider.codex.authKind, "subscription");
     assert.equal(byProvider.codex.supportsChat, true);
     assert.equal(byProvider.claude.installed, true);
     assert.equal(byProvider.claude.version, "fake-claude 1.2.3");
+    assert.equal(byProvider.claude.loggedIn, true);
     assert.equal(byProvider.claude.supportsApprovals, true);
     assert.equal(byProvider.cursor.installed, false);
     assert.equal(byProvider.cursor.version, null);
+    assert.equal(byProvider.cursor.loggedIn, false);
     assert.equal(byProvider.cursor.lastSmoke, null);
   } finally {
     await server.stop();
+  }
+});
+
+test("confirmed signed-out Codex is visible and jobs fail before entering the queue", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-harness-signed-out-"));
+  const signedOutCodex = writeFakeCli(
+    dir,
+    "signed-out-codex",
+    [
+      "#!/bin/sh",
+      "if [ \"$1\" = \"--version\" ]; then echo \"fake-codex 9.9.9\"; exit 0; fi",
+      "if [ \"$1\" = \"login\" ] && [ \"$2\" = \"status\" ]; then echo \"Not logged in\" >&2; exit 1; fi",
+      "echo \"job must not start\" >&2",
+      "exit 9",
+      "",
+    ].join("\n"),
+  );
+  const server = await startServer({ CODEX_BIN: signedOutCodex });
+  try {
+    const harnessResponse = await fetch(`${server.baseUrl}/v1/harness`);
+    assert.equal(harnessResponse.status, 200);
+    const codex = (await harnessResponse.json()).harnesses.find((entry) => entry.provider === "codex");
+    assert.equal(codex.loggedIn, false);
+
+    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspaceId: "scratch", provider: "codex", prompt: "Hello" }),
+    });
+    assert.equal(create.status, 503);
+    assert.match((await create.json()).error, /Codex is not connected.*relay sync-auth/);
+
+    const jobs = await (await fetch(`${server.baseUrl}/v1/codex/jobs`)).json();
+    assert.deepEqual(jobs.jobs, []);
+  } finally {
+    await server.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 

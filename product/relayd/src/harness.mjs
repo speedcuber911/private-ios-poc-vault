@@ -4,13 +4,13 @@
 // credentials over the API — only the provider's own public device-code
 // verification URL/code parsed from CLI stdout.
 
-import { spawn, execFileSync } from "node:child_process";
+import { execFile, spawn, execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { codexBin, claudeBin, cursorBin, runHome, allowedJobProviders } from "./config.mjs";
+import { codexBin, claudeBin, cursorBin, runHome, codexHome, allowedJobProviders } from "./config.mjs";
 import { nowIso, cleanApiText, suffixByBytes } from "./util.mjs";
 import { appendAudit } from "./audit.mjs";
 import { emitEvent } from "./events.mjs";
@@ -57,6 +57,96 @@ function loginArgsFor(provider) {
   return ["login"];
 }
 
+function authStatusArgsFor(provider) {
+  if (provider === "claude") return ["auth", "status", "--json"];
+  if (provider === "cursor") return ["status", "--format", "json"];
+  return ["login", "status"];
+}
+
+// Every readiness probe must see the same home and credential boundary as a
+// real job. A successful login in the operator's account is irrelevant when
+// the isolated Relay runner cannot read it.
+function providerEnv(provider) {
+  const env = {
+    ...process.env,
+    HOME: runHome,
+    CODEX_HOME: codexHome,
+  };
+  if (provider === "claude" || provider === "cursor") {
+    delete env.AWS_ACCESS_KEY_ID;
+    delete env.AWS_SECRET_ACCESS_KEY;
+    delete env.AWS_SESSION_TOKEN;
+    delete env.AWS_PROFILE;
+    delete env.AWS_DEFAULT_PROFILE;
+    delete env.AWS_REGION;
+    delete env.AWS_DEFAULT_REGION;
+    delete env.CLAUDE_CODE_USE_BEDROCK;
+    delete env.CLAUDE_AWS_PROFILE;
+  }
+  return env;
+}
+
+function jsonObject(text) {
+  try {
+    const parsed = JSON.parse(String(text || "").trim());
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function authKindFromText(value) {
+  const text = String(value || "").toLowerCase();
+  if (text.includes("api key") || text.includes("apikey")) return "api";
+  if (text.includes("chatgpt") || text.includes("subscription") || text.includes("oauth")) return "subscription";
+  return "unknown";
+}
+
+function parseProviderAuth(provider, output, commandSucceeded) {
+  const text = cleanApiText(output);
+  const parsed = jsonObject(text);
+  if (provider === "claude" && parsed && typeof parsed.loggedIn === "boolean") {
+    return {
+      loggedIn: parsed.loggedIn,
+      authKind: parsed.loggedIn ? authKindFromText(parsed.authMethod || parsed.apiProvider) : "unknown",
+    };
+  }
+  if (provider === "cursor" && parsed && typeof parsed.isAuthenticated === "boolean") {
+    const authKind = parsed.isAuthenticated
+      ? (parsed.hasRefreshToken ? "subscription" : parsed.hasAccessToken ? "api" : "unknown")
+      : "unknown";
+    return { loggedIn: parsed.isAuthenticated, authKind };
+  }
+  if (provider === "codex" && /not logged in|signed out|no (?:valid )?(?:session|credentials?)/i.test(text)) {
+    return { loggedIn: false, authKind: "unknown" };
+  }
+  if (commandSucceeded) {
+    return { loggedIn: true, authKind: authKindFromText(text) };
+  }
+  // Older or vendor-modified CLIs may not implement a status command. Keep
+  // that distinguishable from a confirmed signed-out state so an upgrade does
+  // not make a previously working provider unusable.
+  return { loggedIn: null, authKind: "unknown" };
+}
+
+function detectProviderAuth(provider) {
+  const bin = providerBinary(provider);
+  try {
+    const output = execFileSync(bin, authStatusArgsFor(provider), {
+      encoding: "utf8",
+      timeout: 10000,
+      env: providerEnv(provider),
+      cwd: runHome,
+    });
+    return parseProviderAuth(provider, output, true);
+  } catch (error) {
+    const output = [error?.stdout, error?.stderr]
+      .map((value) => Buffer.isBuffer(value) ? value.toString("utf8") : String(value || ""))
+      .join("\n");
+    return parseProviderAuth(provider, output, false);
+  }
+}
+
 function detectHarness(provider) {
   const bin = providerBinary(provider);
   let installed = false;
@@ -71,12 +161,14 @@ function detectHarness(provider) {
   } catch {
     // Missing binary or --version failure: version stays null.
   }
+  const auth = installed
+    ? detectProviderAuth(provider)
+    : { loggedIn: false, authKind: "unknown" };
   return {
     provider,
     installed,
     version,
-    loggedIn: null,
-    authKind: "unknown",
+    ...auth,
     ...providerCapabilities[provider],
     lastSmoke: lastSmokeByProvider.get(provider) || null,
   };
@@ -84,6 +176,48 @@ function detectHarness(provider) {
 
 function listHarnesses() {
   return [...allowedJobProviders].map((provider) => detectHarness(provider));
+}
+
+function providerDisplayName(provider) {
+  if (provider === "claude") return "Claude Code";
+  if (provider === "cursor") return "Cursor";
+  return "Codex";
+}
+
+function providerAuthResult(provider) {
+  const bin = providerBinary(provider);
+  return new Promise((resolve) => {
+    const child = execFile(bin, authStatusArgsFor(provider), {
+      encoding: "utf8",
+      timeout: 10000,
+      env: providerEnv(provider),
+      cwd: runHome,
+    }, (error, stdout, stderr) => {
+      resolve({
+        missing: error?.code === "ENOENT",
+        auth: parseProviderAuth(provider, `${stdout || ""}\n${stderr || ""}`, !error),
+      });
+    });
+    // Status commands are non-interactive. Close stdin explicitly so wrapper
+    // scripts that read stdin cannot stall the API request until the timeout.
+    child.stdin?.end();
+  });
+}
+
+async function assertProviderReady(provider) {
+  const cleanProvider = cleanHarnessProvider(provider);
+  const displayName = providerDisplayName(cleanProvider);
+  const result = await providerAuthResult(cleanProvider);
+  if (result.missing) {
+    throw Object.assign(new Error(`${displayName} is not installed on this computer.`), { status: 503 });
+  }
+  if (result.auth.loggedIn === false) {
+    const action = cleanProvider === "cursor"
+      ? "Run cursor-agent login on the computer, then try again."
+      : `Run relay sync-auth on your Mac to connect ${displayName}, then try again.`;
+    throw Object.assign(new Error(`${displayName} is not connected on this computer. ${action}`), { status: 503 });
+  }
+  return result.auth;
 }
 
 // --------------------------------------------------------------------------
@@ -239,8 +373,8 @@ function attachOpChild(op, child, { timeoutMs, onExpire, onStdout = null }) {
   return record;
 }
 
-function opEnv() {
-  return { ...process.env, HOME: runHome };
+function opEnv(provider) {
+  return providerEnv(provider);
 }
 
 // POST /v1/harness/:provider/login — spawns the CLI's device-code flow,
@@ -254,7 +388,7 @@ function startLoginOp(provider) {
   emitEvent("harness.changed", publicOp(op));
 
   const child = spawn(providerBinary(cleanProvider), loginArgsFor(cleanProvider), {
-    env: opEnv(),
+    env: opEnv(cleanProvider),
     stdio: ["ignore", "pipe", "pipe"],
   });
   attachOpChild(op, child, {
@@ -295,7 +429,7 @@ function startSmokeOp(provider) {
 
   const child = spawn(providerBinary(cleanProvider), args, {
     cwd: smokeDir,
-    env: opEnv(),
+    env: opEnv(cleanProvider),
     stdio: ["pipe", "pipe", "pipe"],
   });
   attachOpChild(op, child, { timeoutMs: smokeTimeoutMs, onExpire: "expired" });
@@ -322,6 +456,7 @@ export {
   cleanHarnessProvider,
   detectHarness,
   listHarnesses,
+  assertProviderReady,
   redactSecrets,
   publicOp,
   getOp,
