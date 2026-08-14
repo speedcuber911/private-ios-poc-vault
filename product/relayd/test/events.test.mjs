@@ -35,6 +35,7 @@ async function startServer(extraEnv = {}) {
       ...process.env,
       CODEX_API_HOST: "127.0.0.1",
       CODEX_API_PORT: String(port),
+      RELAYD_CODEX_TRANSPORT: "exec",
       CODEX_REQUIRE_MTLS: "false",
       // freePort() reserves ONE port; these daemons never exercise pairing, so
       // they bind exactly one listener and cannot squat on a port another test

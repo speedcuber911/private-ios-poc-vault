@@ -39,6 +39,146 @@ struct RelaySignedInPlaces: Decodable, Equatable {
     let browsers: [RelayBrowserSession]
 }
 
+struct CLIComputerLinkState: Equatable {
+    let computer: CLIComputerLink?
+    let foldersAvailable: Bool
+}
+
+protocol RelayComputerLinkAuthClient: AnyObject {
+    func computerLinkState(bearerToken: String) async throws -> CLIComputerLinkState
+    func disconnectComputer(bearerToken: String) async throws
+}
+
+extension RelayAuthClient: RelayComputerLinkAuthClient {}
+
+/// App-wide source of truth for the account's one CLI computer.
+///
+/// The file browser talks directly to the Relay node, while disconnecting a
+/// computer happens on the account control plane. Without shared state, a
+/// successful disconnect leaves the already-loaded node folders on screen.
+/// This store bridges those two surfaces and remembers the user's explicit
+/// disconnect across launches. Successful refreshes mirror the account
+/// service's authoritative folder-access state; the persisted value only
+/// prevents stale folders flashing while that refresh is in flight.
+@MainActor
+final class RelayComputerLinkStore: ObservableObject {
+    @Published private(set) var computer: CLIComputerLink?
+    @Published private(set) var hasLoaded = false
+    @Published private(set) var isLoading = false
+    @Published private(set) var isDisconnecting = false
+    @Published private(set) var errorMessage: String?
+    @Published private(set) var suppressedFolderAccountIDs: Set<String>
+
+    private let client: RelayComputerLinkAuthClient
+    private let defaults: UserDefaults
+    private var activeAccountID: String?
+    private var operationRevision = 0
+
+    private static let suppressedFolderAccountsKey =
+        "com.parikshit.pocvault.computer-disconnect.hidden-folder-accounts"
+
+    init(
+        client: RelayComputerLinkAuthClient,
+        defaults: UserDefaults = .standard
+    ) {
+        self.client = client
+        self.defaults = defaults
+        suppressedFolderAccountIDs = Set(
+            defaults.stringArray(forKey: Self.suppressedFolderAccountsKey) ?? []
+        )
+    }
+
+    func suppressesFolderAccess(for accountID: String?) -> Bool {
+        guard let accountID = accountID?.trimmedNonEmpty else { return false }
+        return suppressedFolderAccountIDs.contains(accountID)
+    }
+
+    func refresh(
+        bearerToken: String,
+        accountID: String,
+        showProgress: Bool = true
+    ) async {
+        switchToAccountIfNeeded(accountID)
+        guard !isLoading, !isDisconnecting else { return }
+
+        operationRevision += 1
+        let revision = operationRevision
+        if showProgress { isLoading = true }
+        errorMessage = nil
+        defer {
+            if revision == operationRevision, activeAccountID == accountID {
+                hasLoaded = true
+                if showProgress { isLoading = false }
+            }
+        }
+
+        do {
+            let loadedState = try await client.computerLinkState(bearerToken: bearerToken)
+            guard revision == operationRevision, activeAccountID == accountID else { return }
+            computer = loadedState.computer
+            setFolderAccessSuppressed(!loadedState.foldersAvailable, for: accountID)
+        } catch {
+            guard revision == operationRevision, activeAccountID == accountID,
+                  !isCancellation(error) else { return }
+            errorMessage = "Relay couldn't refresh the computer link."
+        }
+    }
+
+    func disconnect(bearerToken: String, accountID: String) async {
+        switchToAccountIfNeeded(accountID)
+        guard !isDisconnecting else { return }
+
+        // Invalidate an in-flight GET before issuing DELETE. Otherwise its
+        // older response can restore the computer (and its folders) after the
+        // disconnect has already succeeded.
+        operationRevision += 1
+        let revision = operationRevision
+        isLoading = false
+        isDisconnecting = true
+        errorMessage = nil
+        defer {
+            if revision == operationRevision, activeAccountID == accountID {
+                isDisconnecting = false
+            }
+        }
+
+        do {
+            try await client.disconnectComputer(bearerToken: bearerToken)
+            guard revision == operationRevision, activeAccountID == accountID else { return }
+            computer = nil
+            hasLoaded = true
+            setFolderAccessSuppressed(true, for: accountID)
+        } catch {
+            guard revision == operationRevision, activeAccountID == accountID,
+                  !isCancellation(error) else { return }
+            errorMessage = "Relay couldn't disconnect this computer. Try again."
+        }
+    }
+
+    private func switchToAccountIfNeeded(_ accountID: String) {
+        guard activeAccountID != accountID else { return }
+        operationRevision += 1
+        activeAccountID = accountID
+        computer = nil
+        hasLoaded = false
+        isLoading = false
+        isDisconnecting = false
+        errorMessage = nil
+    }
+
+    private func setFolderAccessSuppressed(_ suppressed: Bool, for accountID: String) {
+        if suppressed {
+            suppressedFolderAccountIDs.insert(accountID)
+        } else {
+            suppressedFolderAccountIDs.remove(accountID)
+        }
+        defaults.set(
+            suppressedFolderAccountIDs.sorted(),
+            forKey: Self.suppressedFolderAccountsKey
+        )
+    }
+}
+
 protocol CLILinkAuthClient: AnyObject {
     func deviceInspect(userCode: String, bearerToken: String) async throws -> DeviceCodeInspectResult
     func deviceApprove(userCode: String, bearerToken: String) async throws

@@ -7,9 +7,11 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 
-import { allowedThreadProviders, bedrockRegion, cleanDisplayName, cleanOptionalEndpoint, cleanOptionalFilePath, cleanEnvironmentVariableName, cleanOptionalAwsProfile } from "./config.mjs";
+import { allowedThreadProviders, bedrockRegion, cleanDisplayName, cleanOptionalEndpoint, cleanOptionalFilePath, cleanEnvironmentVariableName, cleanOptionalAwsProfile, codexBin, codexHome, runHome, codexTransport, workspaceBrowseRoot } from "./config.mjs";
+import { AppServerClient } from "./appserver-client.mjs";
 
 const modelCatalog = loadModelCatalog();
+let runtimeCodexModelsCache = { expiresAt: 0, models: null };
 
 function loadModelCatalog() {
   const configured = process.env.CODEX_MODEL_CATALOG
@@ -239,6 +241,53 @@ function publicModelCatalog() {
   });
 }
 
+async function publicRuntimeModelCatalog() {
+  const configured = publicModelCatalog();
+  if (codexTransport !== "app-server") return configured;
+  if (runtimeCodexModelsCache.models && runtimeCodexModelsCache.expiresAt > Date.now()) {
+    return mergeRuntimeCodexModels(configured, runtimeCodexModelsCache.models);
+  }
+  let client;
+  try {
+    client = new AppServerClient({
+      codexBin,
+      cwd: workspaceBrowseRoot,
+      env: { ...process.env, HOME: runHome, CODEX_HOME: codexHome },
+      requestTimeoutMs: 5000,
+    });
+    await client.start();
+    const response = await client.request("model/list", {});
+    const models = Array.isArray(response?.data) ? response.data.map(runtimeCodexDescriptor).filter(Boolean) : [];
+    if (models.length) runtimeCodexModelsCache = { models, expiresAt: Date.now() + 5 * 60 * 1000 };
+    return models.length ? mergeRuntimeCodexModels(configured, models) : configured;
+  } catch {
+    return configured;
+  } finally {
+    client?.stop();
+  }
+}
+
+function runtimeCodexDescriptor(model) {
+  if (!model || typeof model.id !== "string" || !/^[A-Za-z0-9._:/-]{1,180}$/.test(model.id)) return null;
+  const efforts = Array.isArray(model.supportedReasoningEfforts)
+    ? model.supportedReasoningEfforts.map((entry) => entry?.reasoningEffort).filter((value) => ["low", "medium", "high", "xhigh"].includes(value))
+    : [];
+  return {
+    id: `codex-${model.id}`,
+    label: `Codex · ${cleanDisplayName(model.displayName || model.name || model.id, "model label", 120)}`,
+    provider: "codex",
+    modes: ["task"],
+    taskModel: model.id,
+    effortLevels: efforts,
+  };
+}
+
+function mergeRuntimeCodexModels(configured, runtimeModels) {
+  const defaultEntry = configured.find((model) => model.provider === "codex" && !model.taskModel);
+  const otherProviders = configured.filter((model) => model.provider !== "codex");
+  return [...runtimeModels, ...(defaultEntry ? [defaultEntry] : []), ...otherProviders];
+}
+
 
 function findCatalogModel({ provider, model, mode }) {
   return modelCatalog.find(
@@ -278,6 +327,9 @@ export {
   cleanModelModes,
   cleanRequiredModelId,
   publicModelCatalog,
+  publicRuntimeModelCatalog,
+  runtimeCodexDescriptor,
+  mergeRuntimeCodexModels,
   findCatalogModel,
   cleanChatOptions,
 };

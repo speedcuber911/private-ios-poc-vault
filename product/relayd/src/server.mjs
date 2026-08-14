@@ -7,11 +7,11 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 
-import { host, port, requireMtls, allowedCertSubjects, maxConcurrent, maxBodyBytes, maxTranscriptionAudioBytes, proxyBaseUrl, proxyClientCertPath, proxyClientKeyPath, grantPublicKey, nodeId } from "./config.mjs";
+import { host, port, requireMtls, allowedCertSubjects, maxConcurrent, maxBodyBytes, maxTranscriptionAudioBytes, proxyBaseUrl, proxyClientCertPath, proxyClientKeyPath, grantPublicKey, nodeId, approvalsDir, codexBin, runHome, codexHome } from "./config.mjs";
 import { isJwtShaped, verifyBrowserGrant, activityScope, scopeCovers } from "./grant.mjs";
 import { sendJson, sendHtml, sendError, readBody, readBinaryBody, headerValue, clampLimit, isSafeJobId } from "./util.mjs";
-import { workspaces, workspaceList, publicWorkspace, workspaceDirectoryResponse, selectWorkspaceDirectory, createWorkspaceDirectory } from "./workspaces.mjs";
-import { publicModelCatalog } from "./catalog.mjs";
+import { workspaces, workspaceList, resolveWorkspaceById, publicWorkspace, workspaceDirectoryResponse, selectWorkspaceDirectory, createWorkspaceDirectory } from "./workspaces.mjs";
+import { publicRuntimeModelCatalog } from "./catalog.mjs";
 import { fsListResponse, serveFsFile } from "./fsapi.mjs";
 import { listProviderSkills, publicSkill } from "./skills.mjs";
 import { cleanThreadProviderFilter, workspaceForJob, listWorkspaceSessions, listWorkspaceThreads, resolveOptionalWorkspaceFilter, threadDetailResponse, deleteThread } from "./threads.mjs";
@@ -21,6 +21,23 @@ import { transcribeAudio, cleanAudioContentType, cleanAudioFilename } from "./tr
 import { jobsState, jobs, activeChildren, responseShape, wantsFullLogs, enqueueJob, cleanJobProviderFilter, normalizeJobProvider, cancelJob, streamJobEvents, toJobResponse } from "./jobs.mjs";
 import { codexThreadUiHtml } from "./ui.mjs";
 import { handleAdditionRoutes } from "./additions.mjs";
+import { computerAccessGate } from "./computeraccess.mjs";
+import { ApprovalStore, publicApproval, terminalDecisions } from "./approval-store.mjs";
+import { createTerminalService } from "./terminals.mjs";
+import { appendAudit } from "./audit.mjs";
+import { emitEvent } from "./events.mjs";
+
+const approvalStore = new ApprovalStore(approvalsDir);
+const terminalService = createTerminalService({
+  codexBin,
+  runHome,
+  codexHome,
+  resolveWorkspaceById,
+  readBody,
+  sendJson,
+  sendError,
+  appendAudit,
+});
 
 // SHA-256 of the device's bearer token, or null when this node authenticates
 // with client certificates instead. Re-read when the file changes, because the
@@ -105,6 +122,8 @@ function authorize(req, { pathname } = {}) {
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
       return { ok: false, status: 401, error: "device token is not valid" };
     }
+    const computerAccess = computerAccessGate.authorize();
+    if (!computerAccess.ok) return computerAccess;
     return { ok: true, subject: "trial-device" };
   }
 
@@ -153,7 +172,7 @@ async function routeRequest(req, res) {
   }
 
   if (req.method === "GET" && url.pathname === "/v1/codex/models") {
-    return sendJson(res, 200, { models: publicModelCatalog() });
+    return sendJson(res, 200, { models: await publicRuntimeModelCatalog() });
   }
 
   if (req.method === "POST" && url.pathname === "/v1/codex/chat") {
@@ -165,9 +184,39 @@ async function routeRequest(req, res) {
     return proxyCodexRequest(req, url, res);
   }
 
+  if (req.method === "GET" && url.pathname === "/v1/codex/approvals") {
+    const jobId = url.searchParams.get("jobId")?.trim() || null;
+    const status = url.searchParams.get("status")?.trim() || null;
+    if (jobId && !isSafeJobId(jobId)) return sendError(res, 400, "jobId is invalid");
+    if (status && status !== "pending" && status !== "resolved") return sendError(res, 400, "status must be pending or resolved");
+    return sendJson(res, 200, { approvals: approvalStore.list({ jobId, status }).map(publicApproval) });
+  }
+
+  const approvalMatch = url.pathname.match(/^\/v1\/codex\/approvals\/([^/]+)\/decision$/);
+  if (approvalMatch && req.method === "POST") {
+    const body = await readBody(req);
+    const decision = typeof body?.decision === "string" ? body.decision : "";
+    if (!terminalDecisions.has(decision)) return sendError(res, 400, "decision is invalid");
+    const record = approvalStore.decide(decodeURIComponent(approvalMatch[1]), decision, {
+      decidedBy: auth.subject || "phone",
+      message: body?.message,
+    });
+    appendAudit("approval_decided", jobs.get(record.jobId) || null, { approvalId: record.id, decision });
+    emitEvent("approval.resolved", publicApproval(record));
+    return sendJson(res, 200, { approval: publicApproval(record) });
+  }
+
+  if (await terminalService.route(req, res, url)) return;
+
   if (req.method === "GET" && url.pathname === "/v1/codex/skills") {
     const provider = cleanJobProviderFilter(url.searchParams.get("provider")) || "codex";
-    return sendJson(res, 200, { provider, skills: listProviderSkills(provider).map(publicSkill) });
+    const workspaceId = url.searchParams.get("workspaceId")?.trim() || null;
+    const workspace = workspaceId ? resolveWorkspaceById(workspaceId) : null;
+    if (workspaceId && !workspace) return sendError(res, 400, "unknown workspaceId");
+    return sendJson(res, 200, {
+      provider,
+      skills: listProviderSkills(provider, workspace?.path).map(publicSkill),
+    });
   }
 
   if (req.method === "GET" && url.pathname === "/v1/codex/workspaces") {

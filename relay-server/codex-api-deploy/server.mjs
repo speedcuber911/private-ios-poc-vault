@@ -5,6 +5,18 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const serverDir = path.dirname(fileURLToPath(import.meta.url));
+const installedHelperDir = path.join(serverDir, "helpers");
+const helperDir = process.env.RELAY_HELPER_DIR || (
+  fs.existsSync(path.join(installedHelperDir, "approval-store.mjs"))
+    ? installedHelperDir
+    : path.resolve(serverDir, "..", "..", "product", "relayd", "src")
+);
+const { ApprovalStore, publicApproval, terminalDecisions } = await import(pathToFileURL(path.join(helperDir, "approval-store.mjs")));
+const { createTerminalService } = await import(pathToFileURL(path.join(helperDir, "terminals.mjs")));
+const { AppServerClient } = await import(pathToFileURL(path.join(helperDir, "appserver-client.mjs")));
 
 const host = process.env.CODEX_API_HOST || "127.0.0.1";
 const port = parseIntegerEnv("CODEX_API_PORT", 8787, 1, 65535);
@@ -15,6 +27,7 @@ const jobsDir = path.join(dataDir, "jobs");
 const logsDir = path.join(dataDir, "logs");
 const attachmentsDir = path.join(dataDir, "attachments");
 const artifactsDir = path.join(dataDir, "artifacts");
+const approvalsDir = path.join(dataDir, "approvals");
 const auditPath = path.join(dataDir, "audit.jsonl");
 const codexBin = process.env.CODEX_BIN || "/usr/bin/codex";
 const claudeBin = process.env.CLAUDE_BIN || "/usr/bin/claude";
@@ -25,6 +38,7 @@ const claudeHome = process.env.CLAUDE_HOME || path.join(runHome, ".claude");
 const npmCacheDir = process.env.NPM_CONFIG_CACHE || process.env.npm_config_cache || path.join(runHome, ".npm-cache");
 const bunCacheDir = process.env.BUN_INSTALL_CACHE_DIR || path.join(runHome, ".bun-cache");
 const dangerousMode = parseBooleanEnv("CODEX_DANGEROUS_MODE", true);
+const codexTransport = process.env.RELAYD_CODEX_TRANSPORT === "exec" ? "exec" : "app-server";
 const maxConcurrent = parseIntegerEnv("CODEX_MAX_CONCURRENT", 1, 1, 16);
 const maxJobStreams = parseIntegerEnv("CODEX_MAX_JOB_STREAMS", 8, 1, 64);
 const jobStreamHeartbeatMs = parseIntegerEnv("CODEX_JOB_STREAM_HEARTBEAT_MS", 15000, 50, 120000);
@@ -84,7 +98,8 @@ const allowedReasoningEfforts = new Set(["low", "medium", "high", "xhigh"]);
 const allowedJobProviders = new Set(["codex", "claude", "cursor"]);
 const allowedChatProviders = new Set(["codex", "azure", "bedrock"]);
 const allowedThreadProviders = new Set([...allowedJobProviders, ...allowedChatProviders]);
-const allowedClaudePermissionModes = new Set(["acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"]);
+const allowedClaudePermissionModes = new Set(["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"]);
+const allowedCodexApprovalPolicies = new Set(["untrusted", "on-failure", "on-request", "never"]);
 const claudeAwsProfile = cleanOptionalAwsProfile(process.env.CLAUDE_AWS_PROFILE);
 if (claudeAwsProfile && claudeAwsProfile !== "sigiq") {
   throw new Error("Bedrock access requires CLAUDE_AWS_PROFILE=sigiq; leave it unset for direct Claude subscription auth.");
@@ -114,6 +129,7 @@ const proxyBaseUrl = cleanOptionalEndpoint(process.env.CODEX_PROXY_BASE_URL || p
 const proxyClientCertPath = cleanOptionalFilePath(process.env.CODEX_PROXY_CLIENT_CERT || process.env.CODEX_REMOTE_CLIENT_CERT);
 const proxyClientKeyPath = cleanOptionalFilePath(process.env.CODEX_PROXY_CLIENT_KEY || process.env.CODEX_REMOTE_CLIENT_KEY);
 const modelCatalog = loadModelCatalog();
+let runtimeCodexModelsCache = { expiresAt: 0, models: null };
 const chatsDir = path.join(dataDir, "chats");
 const jobs = new Map();
 const dynamicWorkspaces = new Map();
@@ -128,9 +144,21 @@ fs.mkdirSync(jobsDir, { recursive: true });
 fs.mkdirSync(logsDir, { recursive: true });
 fs.mkdirSync(attachmentsDir, { recursive: true });
 fs.mkdirSync(artifactsDir, { recursive: true });
+fs.mkdirSync(approvalsDir, { recursive: true, mode: 0o700 });
 fs.mkdirSync(chatsDir, { recursive: true });
 
 const workspaces = loadWorkspaces();
+const approvalStore = new ApprovalStore(approvalsDir);
+const terminalService = createTerminalService({
+  codexBin,
+  runHome,
+  codexHome,
+  resolveWorkspaceById,
+  readBody,
+  sendJson,
+  sendError,
+  appendAudit,
+});
 loadPersistedJobs();
 processQueue();
 
@@ -360,6 +388,53 @@ function publicModelCatalog() {
     } = model;
     return publicModel;
   });
+}
+
+async function publicRuntimeModelCatalog() {
+  const configured = publicModelCatalog();
+  if (codexTransport !== "app-server") return configured;
+  if (runtimeCodexModelsCache.models && runtimeCodexModelsCache.expiresAt > Date.now()) {
+    return mergeRuntimeCodexModels(configured, runtimeCodexModelsCache.models);
+  }
+  let client;
+  try {
+    client = new AppServerClient({
+      codexBin,
+      cwd: workspaceBrowseRoot,
+      env: { ...process.env, HOME: runHome, CODEX_HOME: codexHome },
+      requestTimeoutMs: 5000,
+    });
+    await client.start();
+    const response = await client.request("model/list", {});
+    const models = Array.isArray(response?.data) ? response.data.map(runtimeCodexDescriptor).filter(Boolean) : [];
+    if (models.length) runtimeCodexModelsCache = { models, expiresAt: Date.now() + 5 * 60 * 1000 };
+    return models.length ? mergeRuntimeCodexModels(configured, models) : configured;
+  } catch {
+    return configured;
+  } finally {
+    client?.stop();
+  }
+}
+
+function runtimeCodexDescriptor(model) {
+  if (!model || typeof model.id !== "string" || !/^[A-Za-z0-9._:/-]{1,180}$/.test(model.id)) return null;
+  const efforts = Array.isArray(model.supportedReasoningEfforts)
+    ? model.supportedReasoningEfforts.map((entry) => entry?.reasoningEffort).filter((value) => ["low", "medium", "high", "xhigh"].includes(value))
+    : [];
+  return {
+    id: `codex-${model.id}`,
+    label: `Codex · ${cleanDisplayName(model.displayName || model.name || model.id, "model label", 120)}`,
+    provider: "codex",
+    modes: ["task"],
+    taskModel: model.id,
+    effortLevels: efforts,
+  };
+}
+
+function mergeRuntimeCodexModels(configured, runtimeModels) {
+  const defaultEntry = configured.find((model) => model.provider === "codex" && !model.taskModel);
+  const otherProviders = configured.filter((model) => model.provider !== "codex");
+  return [...runtimeModels, ...(defaultEntry ? [defaultEntry] : []), ...otherProviders];
 }
 
 function findCatalogModel({ provider, model, mode }) {
@@ -1186,7 +1261,7 @@ function loadPersistedJobs() {
       job.provider = normalizeJobProvider(job.provider);
       job.artifacts = sanitizePersistedArtifacts(job);
       ensureLogPaths(job);
-      if (job.status === "running") {
+      if (job.status === "running" || job.status === "waiting_for_approval") {
         const finishedAt = nowIso();
         job.status = "failed";
         job.updatedAt = finishedAt;
@@ -1412,7 +1487,7 @@ async function routeRequest(req, res) {
   }
 
   if (req.method === "GET" && url.pathname === "/v1/codex/models") {
-    return sendJson(res, 200, { models: publicModelCatalog() });
+    return sendJson(res, 200, { models: await publicRuntimeModelCatalog() });
   }
 
   if (req.method === "POST" && url.pathname === "/v1/codex/chat") {
@@ -1424,9 +1499,38 @@ async function routeRequest(req, res) {
     return proxyCodexRequest(req, url, res);
   }
 
+  if (req.method === "GET" && url.pathname === "/v1/codex/approvals") {
+    const jobId = url.searchParams.get("jobId")?.trim() || null;
+    const status = url.searchParams.get("status")?.trim() || null;
+    if (jobId && !isSafeJobId(jobId)) return sendError(res, 400, "jobId is invalid");
+    if (status && status !== "pending" && status !== "resolved") return sendError(res, 400, "status must be pending or resolved");
+    return sendJson(res, 200, { approvals: approvalStore.list({ jobId, status }).map(publicApproval) });
+  }
+
+  const approvalMatch = url.pathname.match(/^\/v1\/codex\/approvals\/([^/]+)\/decision$/);
+  if (approvalMatch && req.method === "POST") {
+    const body = await readBody(req);
+    const decision = typeof body?.decision === "string" ? body.decision : "";
+    if (!terminalDecisions.has(decision)) return sendError(res, 400, "decision is invalid");
+    const record = approvalStore.decide(decodeURIComponent(approvalMatch[1]), decision, {
+      decidedBy: auth.subject || "phone",
+      message: body?.message,
+    });
+    appendAudit("approval_decided", jobs.get(record.jobId) || null, { approvalId: record.id, decision });
+    return sendJson(res, 200, { approval: publicApproval(record) });
+  }
+
+  if (await terminalService.route(req, res, url)) return;
+
   if (req.method === "GET" && url.pathname === "/v1/codex/skills") {
     const provider = cleanJobProviderFilter(url.searchParams.get("provider")) || "codex";
-    return sendJson(res, 200, { provider, skills: listProviderSkills(provider).map(publicSkill) });
+    const workspaceId = url.searchParams.get("workspaceId")?.trim() || null;
+    const workspace = workspaceId ? resolveWorkspaceById(workspaceId) : null;
+    if (workspaceId && !workspace) return sendError(res, 400, "unknown workspaceId");
+    return sendJson(res, 200, {
+      provider,
+      skills: listProviderSkills(provider, workspace?.path).map(publicSkill),
+    });
   }
 
   if (req.method === "GET" && url.pathname === "/v1/codex/workspaces") {
@@ -2374,10 +2478,11 @@ function createJob(body, certSubject) {
   const createdAt = nowIso();
   const timeoutMs = Math.min(Math.max(Math.trunc(requestedTimeout), 1000), maxTimeoutMs);
   const attachments = saveJobAttachments(id, body.attachments);
-  const selectedSkills = cleanSelectedSkills(provider, body.skills);
+  const selectedSkills = cleanSelectedSkills(provider, body.skills, workspace.path);
   const codexPrompt = promptWithAttachments(promptWithSelectedSkills(body.prompt, provider, selectedSkills), attachments);
   const requestedPermissionMode = cleanOptionalClaudePermissionMode(body.permissionMode);
-  const permissionMode = provider === "claude" && dangerousMode ? "bypassPermissions" : requestedPermissionMode;
+  const permissionMode = provider === "claude" ? (requestedPermissionMode || "manual") : null;
+  const approvalPolicy = cleanOptionalCodexApprovalPolicy(body.approvalPolicy);
   pruneRuntimeCachesIfIdle();
   const job = {
     id,
@@ -2389,6 +2494,7 @@ function createJob(body, certSubject) {
     prompt: body.prompt,
     codexPrompt,
     skills: selectedSkills.map((skill) => skill.id),
+    skillInputs: selectedSkills.map((skill) => ({ name: skill.name, path: skill.file, kind: skill.kind || "skill" })),
     attachments,
     createdAt,
     updatedAt: createdAt,
@@ -2408,6 +2514,7 @@ function createJob(body, certSubject) {
     model: cleanProviderModel(provider, body.model),
     reasoningEffort: provider === "codex" ? cleanOptionalReasoningEffort(body.reasoningEffort) : null,
     permissionMode: provider === "claude" ? permissionMode : null,
+    approvalPolicy: provider === "codex" ? approvalPolicy : null,
     resumeSessionId,
     sessionId: resumeSessionId || (provider === "claude" ? crypto.randomUUID() : null),
   };
@@ -2478,8 +2585,8 @@ function normalizeJobProvider(value) {
   return allowedJobProviders.has(value) ? value : "codex";
 }
 
-function listProviderSkills(provider) {
-  const roots = skillRoots(provider);
+function listProviderSkills(provider, workspacePath = null) {
+  const roots = skillRoots(provider, workspacePath);
   const skills = [];
   const seen = new Set();
 
@@ -2496,10 +2603,16 @@ function listProviderSkills(provider) {
   return sortSkills(skills);
 }
 
-function skillRoots(provider) {
+function skillRoots(provider, workspacePath = null) {
+  const projectRoot = typeof workspacePath === "string" && workspacePath.trim()
+    ? path.resolve(workspacePath)
+    : null;
   if (provider === "claude") {
     return uniqueExistingDirectories([
+      projectRoot && path.join(projectRoot, ".claude", "commands"),
+      projectRoot && path.join(projectRoot, ".claude", "skills"),
       ...splitPathList(process.env.CLAUDE_SKILL_DIRS),
+      path.join(claudeHome, "commands"),
       path.join(claudeHome, "skills"),
       path.join(claudeHome, "plugins", "cache"),
     ]);
@@ -2514,7 +2627,11 @@ function skillRoots(provider) {
   }
 
   return uniqueExistingDirectories([
+    projectRoot && path.join(projectRoot, ".codex", "prompts"),
+    projectRoot && path.join(projectRoot, ".codex", "skills"),
+    projectRoot && path.join(projectRoot, ".agents", "skills"),
     ...splitPathList(process.env.CODEX_SKILL_DIRS),
+    path.join(codexHome, "prompts"),
     path.join(codexHome, "skills"),
     path.join(codexHome, "plugins", "cache"),
     path.join(codexHome, "superpowers"),
@@ -2540,7 +2657,7 @@ function uniqueExistingDirectories(entries) {
   return result;
 }
 
-function findSkillFiles(root, depth, maxDepth, files) {
+function findSkillFiles(root, depth, maxDepth, files, includeMarkdown = isCommandRoot(root)) {
   if (files.length >= maxSkillDiscoveryFiles || depth > maxDepth) return files;
   let entries;
   try {
@@ -2552,13 +2669,16 @@ function findSkillFiles(root, depth, maxDepth, files) {
   for (const entry of entries) {
     if (files.length >= maxSkillDiscoveryFiles) break;
     if (entry.isSymbolicLink()) continue;
-    if (entry.name === "SKILL.md" && entry.isFile()) {
+    if (entry.isFile() && (
+      entry.name === "SKILL.md"
+      || (includeMarkdown && entry.name.toLowerCase().endsWith(".md"))
+    )) {
       files.push(path.join(root, entry.name));
       continue;
     }
     if (!entry.isDirectory()) continue;
     if (entry.name === "node_modules" || entry.name === ".git" || entry.name === ".cursor" || entry.name === ".windsurf") continue;
-    findSkillFiles(path.join(root, entry.name), depth + 1, maxDepth, files);
+    findSkillFiles(path.join(root, entry.name), depth + 1, maxDepth, files, includeMarkdown);
   }
   return files;
 }
@@ -2573,6 +2693,25 @@ function parseSkillFile(provider, root, file) {
 
   const frontmatter = raw.match(/^---\s*\n([\s\S]*?)\n---\s*(?:\n|$)/);
   const fields = frontmatter ? parseFrontmatter(frontmatter[1]) : {};
+  if (isCommandRoot(root)) {
+    const relative = path.relative(root, file).replace(/\.md$/i, "");
+    const name = relative
+      .split(path.sep)
+      .map(cleanSkillIdPart)
+      .filter(Boolean)
+      .join(":");
+    if (!name) return null;
+    return {
+      id: `command:${name}`,
+      name,
+      title: cleanSkillMetadata(fields.name) || titleize(path.basename(file, path.extname(file))),
+      provider,
+      group: "Commands",
+      kind: "command",
+      description: cleanSkillMetadata(fields.description) || "Installed custom slash command.",
+      file,
+    };
+  }
   const name = cleanSkillIdPart(cleanSkillMetadata(fields.name) || path.basename(path.dirname(file)));
   if (!name) return null;
   const description = cleanSkillMetadata(fields.description) || "";
@@ -2584,9 +2723,15 @@ function parseSkillFile(provider, root, file) {
     title: titleize(name),
     provider,
     group: plugin ? titleize(plugin) : "Personal",
+    kind: "skill",
     description,
     file,
   };
+}
+
+function isCommandRoot(root) {
+  const name = path.basename(root).toLowerCase();
+  return name === "commands" || name === "prompts";
 }
 
 function parseFrontmatter(value) {
@@ -2656,6 +2801,7 @@ function publicSkill(skill) {
     title: skill.title,
     provider: skill.provider,
     group: skill.group,
+    kind: skill.kind || "skill",
     description: skill.description,
   };
 }
@@ -2684,7 +2830,15 @@ function cleanOptionalClaudePermissionMode(value) {
   return cleaned;
 }
 
-function cleanSelectedSkills(provider, value) {
+function cleanOptionalCodexApprovalPolicy(value) {
+  if (value === undefined || value === null || value === "") return "on-request";
+  if (typeof value !== "string" || !allowedCodexApprovalPolicies.has(value.trim())) {
+    throw Object.assign(new Error("approvalPolicy must be untrusted, on-failure, on-request, or never"), { status: 400 });
+  }
+  return value.trim();
+}
+
+function cleanSelectedSkills(provider, value, workspacePath = null) {
   if (value === undefined || value === null) return [];
   if (!Array.isArray(value)) {
     throw Object.assign(new Error("skills must be an array of skill ids"), { status: 400 });
@@ -2693,7 +2847,7 @@ function cleanSelectedSkills(provider, value) {
     throw Object.assign(new Error(`skills may include at most ${maxJobSkills} entries`), { status: 400 });
   }
 
-  const available = new Map(listProviderSkills(provider).map((skill) => [skill.id, skill]));
+  const available = new Map(listProviderSkills(provider, workspacePath).map((skill) => [skill.id, skill]));
   const selected = [];
   const seen = new Set();
   for (const entry of value) {
@@ -4137,6 +4291,7 @@ function cancelJob(job) {
   }
 
   active.cancelRequested = true;
+  approvalStore.cancelPendingForJob(job.id, "Job cancelled from Relay.");
   job.updatedAt = nowIso();
   job.error = "cancellation requested";
   touchJob(job, "job_cancel_requested");
@@ -4182,21 +4337,27 @@ function startJob(job) {
     timedOut: false,
     killTimer: null,
     timeoutTimer: null,
+    timeoutRemainingMs: job.timeoutMs,
+    timeoutStartedAt: null,
+    approvalPollTimer: null,
+    pendingApprovalCount: 0,
     stdoutStream,
     stderrStream,
     sessionIdsBefore: job.provider === "codex" && !job.resumeSessionId ? workspaceSessionIdSet(job.workspacePath) : null,
   };
   activeChildren.set(job.id, active);
 
-  active.timeoutTimer = setTimeout(() => {
+  active.onTimeout = () => {
     active.timedOut = true;
     job.timedOut = true;
     job.updatedAt = nowIso();
     job.error = "job timed out";
     touchJob(job, "job_timeout_requested");
     terminateChild(active);
-  }, job.timeoutMs);
-  active.timeoutTimer.unref();
+  };
+  armJobTimeout(job, active);
+  active.approvalPollTimer = setInterval(() => pollJobApprovals(job, active), 200);
+  active.approvalPollTimer.unref();
 
   child.stdout.on("data", (chunk) => {
     stdout = appendBounded(stdout, chunk);
@@ -4245,13 +4406,15 @@ function startJob(job) {
 function buildJobArgs(job) {
   if (job.provider === "claude") return buildClaudeArgs(job);
   if (job.provider === "cursor") return buildCursorArgs(job);
-  return buildCodexArgs(job);
+  return codexTransport === "app-server"
+    ? [path.join(helperDir, "codex-job-runner.mjs")]
+    : buildCodexArgs(job);
 }
 
 function jobBinary(provider) {
   if (provider === "claude") return claudeBin;
   if (provider === "cursor") return cursorBin;
-  return codexBin;
+  return codexTransport === "app-server" ? process.execPath : codexBin;
 }
 
 function buildJobEnv(job) {
@@ -4269,7 +4432,19 @@ function buildJobEnv(job) {
     npm_config_update_notifier: process.env.npm_config_update_notifier || "false",
     BUN_INSTALL_CACHE_DIR: bunCacheDir,
     PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
+    RELAY_JOB_ID: job.id,
+    RELAY_WORKSPACE_PATH: job.workspacePath,
+    RELAY_RESULT_PATH: job.resultPath,
+    RELAY_SESSION_RESULT_PATH: path.join(logsDir, `${job.id}.session-id`),
+    RELAY_APPROVAL_DIR: approvalsDir,
+    RELAY_CODEX_BIN: codexBin,
+    RELAY_CODEX_APPROVAL_POLICY: job.approvalPolicy || "on-request",
+    RELAY_CODEX_SKILL_INPUTS: JSON.stringify(job.skillInputs || []),
   };
+
+  if (job.model) env.RELAY_MODEL = job.model;
+  if (job.reasoningEffort) env.RELAY_REASONING_EFFORT = job.reasoningEffort;
+  if (job.resumeSessionId) env.RELAY_RESUME_SESSION_ID = job.resumeSessionId;
 
   if (job.provider === "cursor") {
     // Direct Cursor subscription jobs never inherit ambient AWS credential or
@@ -4343,11 +4518,13 @@ function buildCodexResumeArgs(job) {
 
 function buildClaudeArgs(job) {
   const args = ["--print"];
-  if (dangerousMode) {
-    args.push("--dangerously-skip-permissions");
-  } else if (job.permissionMode) {
-    args.push("--permission-mode", job.permissionMode);
-  }
+  args.push("--permission-mode", job.permissionMode || "manual");
+  args.push("--mcp-config", JSON.stringify({
+    mcpServers: {
+      relay_approvals: { command: process.execPath, args: [path.join(helperDir, "claude-permission-mcp.mjs")] },
+    },
+  }));
+  args.push("--strict-mcp-config", "--permission-prompt-tool", "mcp__relay_approvals__approve");
   if (job.model) args.push("--model", job.model);
   if (job.resumeSessionId) {
     args.push("--resume", job.resumeSessionId);
@@ -4373,6 +4550,39 @@ function terminateChild(active) {
       if (active.child.exitCode === null) active.child.kill("SIGKILL");
     }, 5000);
     active.killTimer.unref();
+  }
+}
+
+function armJobTimeout(job, active) {
+  clearTimeout(active.timeoutTimer);
+  active.timeoutStartedAt = Date.now();
+  active.timeoutTimer = setTimeout(active.onTimeout, Math.max(active.timeoutRemainingMs, 1));
+  active.timeoutTimer.unref();
+}
+
+function pauseJobTimeout(active) {
+  if (!active.timeoutTimer) return;
+  clearTimeout(active.timeoutTimer);
+  active.timeoutTimer = null;
+  active.timeoutRemainingMs = Math.max(1, active.timeoutRemainingMs - (Date.now() - active.timeoutStartedAt));
+}
+
+function pollJobApprovals(job, active) {
+  if (active.finalized) return;
+  const count = approvalStore.pendingCount(job.id);
+  if (count === active.pendingApprovalCount) return;
+  const previous = active.pendingApprovalCount;
+  active.pendingApprovalCount = count;
+  if (previous === 0 && count > 0) {
+    pauseJobTimeout(active);
+    job.status = "waiting_for_approval";
+    job.updatedAt = nowIso();
+    touchJob(job, "job_waiting_for_approval", { count });
+  } else if (previous > 0 && count === 0) {
+    job.status = "running";
+    job.updatedAt = nowIso();
+    touchJob(job, "job_approval_resolved");
+    armJobTimeout(job, active);
   }
 }
 
@@ -4645,6 +4855,8 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
 
   clearTimeout(active.timeoutTimer);
   clearTimeout(active.killTimer);
+  clearInterval(active.approvalPollTimer);
+  approvalStore.cancelPendingForJob(job.id, "Job ended before this request was answered.");
   await Promise.all([finishStream(active.stdoutStream), finishStream(active.stderrStream)]);
   activeChildren.delete(job.id);
 
@@ -4663,7 +4875,8 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
   job.durationMs = durationMs(job.startedAt, finishedAt);
   job.exitCode = code;
   job.timedOut = active.timedOut;
-  job.sessionId ||= cursorResult?.sessionId || job.resumeSessionId || findNewWorkspaceSessionId(job, active.sessionIdsBefore);
+  const appServerSessionId = await readTextFileBounded(path.join(logsDir, `${job.id}.session-id`), 512).catch(() => "");
+  job.sessionId ||= cursorResult?.sessionId || appServerSessionId.trim() || job.resumeSessionId || findNewWorkspaceSessionId(job, active.sessionIdsBefore);
 
   if (active.cancelRequested) {
     job.status = "cancelled";
@@ -4864,6 +5077,7 @@ async function toJobResponse(job, shape = responseShape("preview")) {
     model: job.model || null,
     reasoningEffort: job.reasoningEffort || null,
     permissionMode: job.permissionMode || null,
+    approvalPolicy: job.approvalPolicy || null,
     skills: Array.isArray(job.skills) ? job.skills : [],
     resumeSessionId: job.resumeSessionId || null,
     sessionId: job.sessionId || job.resumeSessionId || null,

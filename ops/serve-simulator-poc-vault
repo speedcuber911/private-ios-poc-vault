@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,6 +26,11 @@ class SimulatorVaultServer(ThreadingHTTPServer):
         super().__init__(server_address, handler_class)
         self.manifest_dir = ROOT / "build" / "simulator"
         self.pocs_dir = ROOT / "pocs"
+        self.approval_pending = True
+        self.approval_resolution: dict | None = None
+        self.terminals: dict[str, dict] = {}
+        self.terminal_counter = 0
+        self.fixture_lock = threading.Lock()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -107,6 +113,92 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/codex/jobs/sim-job-running/cancel":
             self.send_json(codex_fixture_job(status="canceled", result="Simulator job canceled."))
             return
+        approval_match = re.fullmatch(r"/v1/codex/approvals/([^/]+)/decision", path)
+        if approval_match:
+            if approval_match.group(1) != "sim-approval-shell":
+                self.send_json_error(404, "approval was not found")
+                return
+            body = self.read_json_body()
+            decision = str(body.get("decision") or "")
+            if decision not in {"accept", "acceptForSession", "decline", "cancel"}:
+                self.send_json_error(400, "decision is invalid")
+                return
+            with self.server.fixture_lock:
+                self.server.approval_pending = False
+                self.server.approval_resolution = {
+                    "decision": decision,
+                    "decidedAt": "2026-08-14T11:00:30Z",
+                    "message": body.get("message"),
+                }
+            self.send_json({"approval": codex_fixture_approval(self.server)})
+            return
+        if path == "/v1/codex/terminals":
+            body = self.read_json_body()
+            workspace_id = str(body.get("workspaceId") or "")
+            workspace = next((item for item in _SIM_WORKSPACES if item["id"] == workspace_id), None)
+            if workspace is None:
+                self.send_json_error(400, "unknown workspaceId")
+                return
+            with self.server.fixture_lock:
+                self.server.terminal_counter += 1
+                terminal_id = f"sim-terminal-{self.server.terminal_counter}"
+                terminal = codex_fixture_terminal(
+                    terminal_id,
+                    workspace,
+                    cols=bounded_int(body.get("cols"), 80, 20, 240),
+                    rows=bounded_int(body.get("rows"), 24, 8, 100),
+                )
+                self.server.terminals[terminal_id] = {
+                    "terminal": terminal,
+                    "output": f"Relay terminal · {workspace['name']}\n$ ",
+                    "version": 0,
+                }
+            self.send_json({"terminal": terminal})
+            return
+        terminal_input_match = re.fullmatch(r"/v1/codex/terminals/([^/]+)/input", path)
+        if terminal_input_match:
+            body = self.read_json_body()
+            text = str(body.get("text") or "")
+            record = self.server.terminals.get(terminal_input_match.group(1))
+            if record is None:
+                self.send_json_error(404, "terminal was not found")
+                return
+            with self.server.fixture_lock:
+                command = text.strip()
+                record["output"] += text
+                if command == "pwd":
+                    workspace_id = record["terminal"]["workspaceId"]
+                    workspace = next(item for item in _SIM_WORKSPACES if item["id"] == workspace_id)
+                    record["output"] += f"{workspace['path']}\n$ "
+                elif command in {"exit", "logout"}:
+                    record["output"] += "logout\n"
+                    record["terminal"].update({
+                        "status": "exited",
+                        "updatedAt": "2026-08-14T11:01:00Z",
+                        "finishedAt": "2026-08-14T11:01:00Z",
+                        "exitCode": 0,
+                    })
+                elif command:
+                    record["output"] += f"simulator: {command}\n$ "
+                record["version"] += 1
+            self.send_json({"terminal": record["terminal"]})
+            return
+        terminal_close_match = re.fullmatch(r"/v1/codex/terminals/([^/]+)/close", path)
+        if terminal_close_match:
+            record = self.server.terminals.get(terminal_close_match.group(1))
+            if record is None:
+                self.send_json_error(404, "terminal was not found")
+                return
+            with self.server.fixture_lock:
+                record["terminal"].update({
+                    "status": "closed",
+                    "updatedAt": "2026-08-14T11:01:00Z",
+                    "finishedAt": "2026-08-14T11:01:00Z",
+                    "exitCode": record["terminal"].get("exitCode"),
+                })
+                record["version"] += 1
+            self.send_json({"terminal": record["terminal"]})
+            return
         if path == "/v1/codex/transcriptions":
             self.send_json({"text": "Simulator voice transcript", "durationMs": 1200})
             return
@@ -132,6 +224,25 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/codex/models":
             self.send_json({"models": codex_fixture_models()})
             return
+        if path == "/v1/codex/skills":
+            provider = parse_qs(query).get("provider", ["codex"])[0]
+            if provider not in {"codex", "claude", "cursor"}:
+                self.send_json_error(400, "provider is invalid")
+                return
+            self.send_json({"provider": provider, "skills": codex_fixture_skills(provider)})
+            return
+        if path == "/v1/codex/approvals":
+            params = parse_qs(query)
+            approval = codex_fixture_approval(self.server)
+            approvals = [approval]
+            job_id = params.get("jobId", [""])[0]
+            status = params.get("status", [""])[0]
+            if job_id and job_id != approval["jobId"]:
+                approvals = []
+            if status and status != approval["status"]:
+                approvals = []
+            self.send_json({"approvals": approvals})
+            return
         if path == "/v1/codex/workspaces":
             self.send_json({"workspaces": codex_fixture_workspaces()})
             return
@@ -145,7 +256,7 @@ class Handler(BaseHTTPRequestHandler):
             self.serve_codex_fs_file(parse_qs(query))
             return
         if path == "/v1/codex/jobs":
-            self.send_json({"jobs": [codex_fixture_job()]})
+            self.send_json({"jobs": [codex_fixture_approval_job(self.server), codex_fixture_job()]})
             return
         if path == "/v1/codex/sessions":
             self.send_json({"sessions": [codex_fixture_session()]})
@@ -178,7 +289,53 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/codex/jobs/sim-job-running/stream":
             self.serve_codex_job_stream()
             return
+        if path == "/v1/codex/jobs/sim-job-approval":
+            self.send_json(codex_fixture_approval_job(self.server))
+            return
+        terminal_stream_match = re.fullmatch(r"/v1/codex/terminals/([^/]+)/stream", path)
+        if terminal_stream_match:
+            self.serve_codex_terminal_stream(terminal_stream_match.group(1))
+            return
         self.send_error(404)
+
+    def serve_codex_terminal_stream(self, terminal_id: str) -> None:
+        record = self.server.terminals.get(terminal_id)
+        if record is None:
+            self.send_json_error(404, "terminal was not found")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        def emit(event: str, payload: dict) -> None:
+            self.wfile.write(f"event: {event}\n".encode("utf-8"))
+            self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode("utf-8"))
+            self.wfile.flush()
+
+        emitted_version = -1
+        try:
+            for _ in range(240):
+                with self.server.fixture_lock:
+                    snapshot = dict(record["terminal"])
+                    output = str(record["output"])
+                    version = int(record["version"])
+                if emitted_version == -1:
+                    emit("snapshot", {"terminal": snapshot, "output": output})
+                    emitted_version = version
+                elif version != emitted_version:
+                    emit("snapshot", {"terminal": snapshot, "output": output})
+                    emitted_version = version
+                if snapshot["status"] not in {"starting", "running"}:
+                    emit("done", {"terminal": snapshot})
+                    return
+                self.wfile.write(b": heartbeat\n\n")
+                self.wfile.flush()
+                time.sleep(0.25)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def serve_codex_job_stream(self) -> None:
         """Canned live-job SSE fixture mirroring /v1/codex/jobs/<id>/stream:
@@ -487,6 +644,82 @@ _SIM_WORKSPACE_CHILDREN = {
 
 def codex_fixture_workspaces() -> list[dict]:
     return [dict(ws) for ws in _SIM_WORKSPACES]
+
+
+def bounded_int(value: object, fallback: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return max(minimum, min(maximum, parsed))
+
+
+def codex_fixture_skills(provider: str) -> list[dict]:
+    """Public, provider-scoped descriptors matching live skill discovery.
+
+    The production runner scans the linked user's real config. These canned
+    descriptors only make that native flow testable without exposing operator
+    paths or depending on a developer's personal setup in simulator tests.
+    """
+    fixtures = {
+        "codex": [
+            ("codex:command:review", "review", "Review", "command", "Review the current workspace changes"),
+            ("codex:skill:scoped-main-sync", "scoped-main-sync", "Scoped main sync", "skill", "Safely sync a dirty worktree"),
+        ],
+        "claude": [
+            ("claude:command:review-pr", "review-pr", "Review PR", "command", "Review a pull request with Claude Code"),
+            ("claude:skill:frontend-design", "frontend-design", "Frontend design", "skill", "Build a polished product interface"),
+        ],
+        "cursor": [
+            ("cursor:skill:project-rules", "project-rules", "Project rules", "skill", "Apply the workspace's Cursor rules"),
+        ],
+    }
+    return [
+        {
+            "id": item_id,
+            "name": name,
+            "title": title,
+            "provider": provider,
+            "group": "Installed on simulator runner",
+            "kind": kind,
+            "description": description,
+        }
+        for item_id, name, title, kind, description in fixtures.get(provider, [])
+    ]
+
+
+def codex_fixture_approval(server: SimulatorVaultServer) -> dict:
+    pending = server.approval_pending
+    return {
+        "id": "sim-approval-shell",
+        "jobId": "sim-job-approval",
+        "provider": "claude",
+        "kind": "tool",
+        "title": "Run deployment command",
+        "reason": "Claude Code needs permission before it can run this command.",
+        "command": "./ops/deploy-poc --slug relay-demo",
+        "cwd": "/srv/codex-workspaces/poc-vault",
+        "toolName": "Bash",
+        "createdAt": "2026-08-14T11:00:00Z",
+        "status": "pending" if pending else "resolved",
+        "availableDecisions": ["accept", "acceptForSession", "decline", "cancel"],
+        "resolution": None if pending else server.approval_resolution,
+    }
+
+
+def codex_fixture_terminal(terminal_id: str, workspace: dict, cols: int, rows: int) -> dict:
+    return {
+        "id": terminal_id,
+        "workspaceId": workspace["id"],
+        "workspaceName": workspace["name"],
+        "status": "running",
+        "createdAt": "2026-08-14T11:00:00Z",
+        "updatedAt": "2026-08-14T11:00:00Z",
+        "finishedAt": None,
+        "exitCode": None,
+        "cols": cols,
+        "rows": rows,
+    }
 
 
 # --- Read-only files API fixtures (mirrors /v1/codex/fs/* on the live server) ---
@@ -1059,6 +1292,26 @@ def codex_fixture_running_job_tick() -> dict:
     # After the running stages, complete the job (same id so the card updates in place).
     _SIM_JOB_TICKS["n"] = 0  # reset for the next submitted job
     return codex_fixture_job(status="succeeded", id="sim-job-running")
+
+
+def codex_fixture_approval_job(server: SimulatorVaultServer) -> dict:
+    pending = server.approval_pending
+    return {
+        "id": "sim-job-approval",
+        "provider": "claude",
+        "status": "waiting_for_approval" if pending else "succeeded",
+        "workspaceId": "poc-vault",
+        "workspaceName": "POC Vault",
+        "prompt": "Deploy the Relay demo after reviewing the generated changes.",
+        "result": None if pending else "Approval resolved; the simulator run continued.",
+        "resultTruncated": False,
+        "logsIncluded": "compact",
+        "sessionId": "sim-claude-approval-thread",
+        "createdAt": "2026-08-14T10:59:30Z",
+        "startedAt": "2026-08-14T10:59:32Z",
+        "completedAt": None if pending else "2026-08-14T11:00:31Z",
+        "updatedAt": "2026-08-14T11:00:00Z" if pending else "2026-08-14T11:00:31Z",
+    }
 
 
 def codex_fixture_job(status: str = "succeeded", result: str | None = None, id: str | None = None) -> dict:

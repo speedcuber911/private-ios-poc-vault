@@ -39,6 +39,7 @@ import { appendAudit } from "./audit.mjs";
 import { identityPaths, readNodeId, getCaPem, ensureServerCert, isRevokedSerial } from "./identity.mjs";
 import { startTunnelService } from "./tunnel.mjs";
 import { startPairingListener, prunePairingSessions } from "./pairing.mjs";
+import { computerAccessGate } from "./computeraccess.mjs";
 
 loadPersistedJobs();
 processQueue();
@@ -149,23 +150,23 @@ startPairing();
 // RELAYD_HANDOFF_ENABLED=false switches off credential sync too, which the
 // message below says out loud rather than leaving the operator to discover.
 async function startHandoffPickup() {
-  if (!handoffEnabled || !cloudUrl) {
+  if (!cloudUrl) {
     console.log(
-      "relayd: handoff + credential-sync loop disabled (RELAYD_HANDOFF_ENABLED=false or no RELAYD_CLOUD_URL); " +
-        "`relay sync-auth` credentials will never be collected while it is off",
+      "relayd: cloud notifications and handoff pickup disabled (no RELAYD_CLOUD_URL)",
     );
     return;
   }
   try {
     const { createCloudClient } = await import("./cloudclient.mjs");
     const { startHandoffLoop, completeHandoffJob } = await import("./handoff.mjs");
-    const { setHandoffCompletionHook } = await import("./jobs.mjs");
+    const { setHandoffCompletionHook, setJobNotificationHook } = await import("./jobs.mjs");
     const { installFromNotice } = await import("./syncauth.mjs");
     setHandoffCompletionHook(completeHandoffJob);
     // `cloud` is referenced inside the handler, which only ever runs after
     // createCloudClient has returned and this binding is initialized.
     const cloud = createCloudClient({
       cloudUrl,
+      onComputerAccess: (lease) => computerAccessGate.applyLease(lease),
       onNotice: (notice) =>
         installFromNotice(notice, {
           cloudUrl,
@@ -177,8 +178,13 @@ async function startHandoffPickup() {
           postEvent: (type) => cloud.postEvent(type),
         }),
     });
-    startHandoffLoop({ cloud, waitSec: handoffPollWaitSec });
-    console.log(`relayd: handoff + credential-sync loop started against ${cloudUrl}`);
+    setJobNotificationHook((type, job) => cloud.postEvent(type, { jobId: job.id }));
+    if (handoffEnabled) {
+      startHandoffLoop({ cloud, waitSec: handoffPollWaitSec });
+      console.log(`relayd: handoff + credential-sync loop and job notifications started against ${cloudUrl}`);
+    } else {
+      console.log(`relayd: job notifications started against ${cloudUrl}; handoff pickup is disabled`);
+    }
   } catch (error) {
     console.error(`relayd: handoff loop failed to start — ${error?.message || String(error)}`);
     appendAudit("handoff_loop_start_failed", null, { error: error?.message || String(error) });

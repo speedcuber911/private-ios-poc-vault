@@ -482,6 +482,7 @@ test("server on RELAYD_STORE=sqlite persists jobs across restarts", async () => 
     CODEX_WORKSPACE_BROWSE_ROOT: dir,
     CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
     CODEX_BIN: fakeCodex,
+    RELAYD_CODEX_TRANSPORT: "exec",
     RELAYD_STORE: "sqlite",
   };
 

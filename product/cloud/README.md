@@ -6,10 +6,11 @@ generated in code, INTEGER epoch-ms timestamps, base64 TEXT for binary — so a
 Postgres client can replace it without touching the API layer.
 
 The guiding rule from the product plan holds everywhere: **the cloud is a
-rendezvous, not a platform.** No content storage, no CA keys, no data-path
-auth. Cloud sessions authorize rendezvous, pairing, push routing and registry
-CRUD — never file reads, never job submission. The node data path is mTLS-only
-and does not transit this server.
+rendezvous, not a platform.** No content storage and no CA keys. Cloud sessions
+never read files or submit jobs, and node data never transits this server.
+Managed/token-authenticated nodes do renew one short account-access lease on
+their existing signed long-poll: this lets an owner disconnect a computer and
+revoke the node data path without making the cloud a proxy for that path.
 
 ## Layout
 
@@ -52,6 +53,7 @@ ExperimentalWarning on Node 22 is expected.
 | `POST /api/auth/delete-user` | Better Auth bearer | hard-delete auth + Relay control-plane account data |
 | `POST /v1/auth/apple` | none | `{identityToken}` → session + refresh |
 | `POST /v1/auth/refresh` | none | rotating single-use refresh tokens |
+| `GET/DELETE /v1/auth/device/link` | session | read or disconnect the account's linked computer; DELETE durably revokes managed-node access until a replacement is approved |
 | `POST /v1/auth/magic-link/request` | none | always 202/400 — no enumeration |
 | `POST /v1/auth/magic-link/confirm` | none | `{token}` → session |
 | `POST /v1/auth/device/start` | none | `{client: "cli"\|"web"}` (default `cli`) → device code; `verificationUri` from `DEVICE_LOGIN_URL` |
@@ -74,7 +76,7 @@ ExperimentalWarning on Node 22 is expected.
 | `POST/GET /v1/repos` | session | register a `owner/name` GitHub repo for handoffs, or list the account's |
 | `POST /v1/handoffs` | session | `{handoffId, repo, branch, nodeId}`; records the row the node will collect. 404 `unknown_repo` if the repo was never registered, `unknown_node` if the node is not the account's |
 | `GET /v1/handoffs?repo=` | session | the account's handoffs for one repo — this is what `relay status` reads |
-| `GET /v1/node/handoffs` | ed25519 request signature | node long-poll; leases pending rows to the caller |
+| `GET /v1/node/handoffs` | ed25519 request signature | node long-poll; leases pending rows and renews the short account-access decision consumed locally by relayd |
 | `POST /v1/node/handoffs/ack` | ed25519 request signature | confirms a leased batch → `delivered` |
 | `POST /v1/node/handoffs/:id/ready` | ed25519 request signature | terminal success, set after the import completes |
 | `POST /v1/node/handoffs/:id/fail` | ed25519 request signature | terminal failure; `reason` must be one of a closed vocabulary |

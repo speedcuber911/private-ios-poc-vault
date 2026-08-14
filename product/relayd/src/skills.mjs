@@ -10,8 +10,8 @@ import path from "node:path";
 import { runHome, codexHome, claudeHome, maxSkillDiscoveryFiles, splitPathList } from "./config.mjs";
 import { cleanApiText } from "./util.mjs";
 
-function listProviderSkills(provider) {
-  const roots = skillRoots(provider);
+function listProviderSkills(provider, workspacePath = null) {
+  const roots = skillRoots(provider, workspacePath);
   const skills = [];
   const seen = new Set();
 
@@ -29,10 +29,16 @@ function listProviderSkills(provider) {
 }
 
 
-function skillRoots(provider) {
+function skillRoots(provider, workspacePath = null) {
+  const projectRoot = typeof workspacePath === "string" && workspacePath.trim()
+    ? path.resolve(workspacePath)
+    : null;
   if (provider === "claude") {
     return uniqueExistingDirectories([
+      projectRoot && path.join(projectRoot, ".claude", "commands"),
+      projectRoot && path.join(projectRoot, ".claude", "skills"),
       ...splitPathList(process.env.CLAUDE_SKILL_DIRS),
+      path.join(claudeHome, "commands"),
       path.join(claudeHome, "skills"),
       path.join(claudeHome, "plugins", "cache"),
     ]);
@@ -47,7 +53,11 @@ function skillRoots(provider) {
   }
 
   return uniqueExistingDirectories([
+    projectRoot && path.join(projectRoot, ".codex", "prompts"),
+    projectRoot && path.join(projectRoot, ".codex", "skills"),
+    projectRoot && path.join(projectRoot, ".agents", "skills"),
     ...splitPathList(process.env.CODEX_SKILL_DIRS),
+    path.join(codexHome, "prompts"),
     path.join(codexHome, "skills"),
     path.join(codexHome, "plugins", "cache"),
     path.join(codexHome, "superpowers"),
@@ -75,7 +85,7 @@ function uniqueExistingDirectories(entries) {
 }
 
 
-function findSkillFiles(root, depth, maxDepth, files) {
+function findSkillFiles(root, depth, maxDepth, files, includeMarkdown = isCommandRoot(root)) {
   if (files.length >= maxSkillDiscoveryFiles || depth > maxDepth) return files;
   let entries;
   try {
@@ -87,13 +97,16 @@ function findSkillFiles(root, depth, maxDepth, files) {
   for (const entry of entries) {
     if (files.length >= maxSkillDiscoveryFiles) break;
     if (entry.isSymbolicLink()) continue;
-    if (entry.name === "SKILL.md" && entry.isFile()) {
+    if (entry.isFile() && (
+      entry.name === "SKILL.md"
+      || (includeMarkdown && entry.name.toLowerCase().endsWith(".md"))
+    )) {
       files.push(path.join(root, entry.name));
       continue;
     }
     if (!entry.isDirectory()) continue;
     if (entry.name === "node_modules" || entry.name === ".git" || entry.name === ".cursor" || entry.name === ".windsurf") continue;
-    findSkillFiles(path.join(root, entry.name), depth + 1, maxDepth, files);
+    findSkillFiles(path.join(root, entry.name), depth + 1, maxDepth, files, includeMarkdown);
   }
   return files;
 }
@@ -109,6 +122,25 @@ function parseSkillFile(provider, root, file) {
 
   const frontmatter = raw.match(/^---\s*\n([\s\S]*?)\n---\s*(?:\n|$)/);
   const fields = frontmatter ? parseFrontmatter(frontmatter[1]) : {};
+  if (isCommandRoot(root)) {
+    const relative = path.relative(root, file).replace(/\.md$/i, "");
+    const name = relative
+      .split(path.sep)
+      .map(cleanSkillIdPart)
+      .filter(Boolean)
+      .join(":");
+    if (!name) return null;
+    return {
+      id: `command:${name}`,
+      name,
+      title: cleanSkillMetadata(fields.name) || titleize(path.basename(file, path.extname(file))),
+      provider,
+      group: "Commands",
+      kind: "command",
+      description: cleanSkillMetadata(fields.description) || "Installed custom slash command.",
+      file,
+    };
+  }
   const name = cleanSkillIdPart(cleanSkillMetadata(fields.name) || path.basename(path.dirname(file)));
   if (!name) return null;
   const description = cleanSkillMetadata(fields.description) || "";
@@ -120,9 +152,16 @@ function parseSkillFile(provider, root, file) {
     title: titleize(name),
     provider,
     group: plugin ? titleize(plugin) : "Personal",
+    kind: "skill",
     description,
     file,
   };
+}
+
+
+function isCommandRoot(root) {
+  const name = path.basename(root).toLowerCase();
+  return name === "commands" || name === "prompts";
 }
 
 
@@ -200,6 +239,7 @@ function publicSkill(skill) {
     title: skill.title,
     provider: skill.provider,
     group: skill.group,
+    kind: skill.kind || "skill",
     description: skill.description,
   };
 }

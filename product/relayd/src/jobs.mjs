@@ -6,8 +6,9 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-import { dataDir, jobsDir, logsDir, attachmentsDir, artifactsDir, codexBin, claudeBin, cursorBin, runHome, codexHome, npmCacheDir, bunCacheDir, maxConcurrent, maxJobStreams, jobStreamHeartbeatMs, maxBodyBytes, maxJobAttachments, maxJobAttachmentBytes, maxJobAttachmentTotalBytes, maxOutputBytes, maxJobSkills, maxSkillPromptBytes, responseOutputBytes, listOutputBytes, maxTimeoutMs, defaultTimeoutMs, terminalStatuses, allowedReasoningEfforts, allowedJobProviders, allowedClaudePermissionModes, claudeAwsProfile, claudeAwsRegion, claudeDefaultModel, cleanOptionalModel, normalizeClaudeModel, realpathOrResolve } from "./config.mjs";
+import { dataDir, jobsDir, logsDir, attachmentsDir, artifactsDir, approvalsDir, codexBin, claudeBin, cursorBin, runHome, codexHome, npmCacheDir, bunCacheDir, codexTransport, maxConcurrent, maxJobStreams, jobStreamHeartbeatMs, maxBodyBytes, maxJobAttachments, maxJobAttachmentBytes, maxJobAttachmentTotalBytes, maxOutputBytes, maxJobSkills, maxSkillPromptBytes, responseOutputBytes, listOutputBytes, maxTimeoutMs, defaultTimeoutMs, terminalStatuses, allowedReasoningEfforts, allowedJobProviders, allowedClaudePermissionModes, allowedCodexApprovalPolicies, claudeAwsProfile, claudeAwsRegion, claudeDefaultModel, cleanOptionalModel, normalizeClaudeModel, realpathOrResolve } from "./config.mjs";
 import { nowIso, durationMs, sendError, initSse, sendSse, isSafeJobId, headerValue, shapeTextPayload, prefixByBytes, cleanAssistantResult, cleanApiText, readTextFileBounded } from "./util.mjs";
 import { appendAudit } from "./audit.mjs";
 import { resolveWorkspaceById, cleanWorkspaceId } from "./workspaces.mjs";
@@ -20,6 +21,11 @@ import { buildCursorArgs, parseCursorResult } from "./adapters/cursor.mjs";
 import { store } from "./store.mjs";
 import { emitEvent } from "./events.mjs";
 import { prepareJobWorkdir, completeJobWorktree } from "./worktree.mjs";
+import { ApprovalStore } from "./approval-store.mjs";
+
+const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+const codexJobRunner = path.join(moduleDir, "codex-job-runner.mjs");
+const approvalStore = new ApprovalStore(approvalsDir);
 
 const jobsState = { queuedJobIds: [] };
 
@@ -27,9 +33,14 @@ const jobsState = { queuedJobIds: [] };
 // never depends on handoff.mjs and the module graph stays acyclic (handoff.mjs
 // imports enqueueJob from here).
 let handoffCompletionHook = async () => null;
+let jobNotificationHook = async () => null;
 
 function setHandoffCompletionHook(hook) {
   handoffCompletionHook = hook;
+}
+
+function setJobNotificationHook(hook) {
+  jobNotificationHook = typeof hook === "function" ? hook : async () => null;
 }
 
 const jobs = new Map();
@@ -50,7 +61,7 @@ function loadPersistedJobs() {
       job.provider = normalizeJobProvider(job.provider);
       job.artifacts = sanitizePersistedArtifacts(job);
       ensureLogPaths(job);
-      if (job.status === "running") {
+      if (job.status === "running" || job.status === "waiting_for_approval") {
         const finishedAt = nowIso();
         job.status = "failed";
         job.updatedAt = finishedAt;
@@ -166,9 +177,10 @@ function createJob(body, certSubject) {
   const createdAt = nowIso();
   const timeoutMs = Math.min(Math.max(Math.trunc(requestedTimeout), 1000), maxTimeoutMs);
   const attachments = saveJobAttachments(id, body.attachments);
-  const selectedSkills = cleanSelectedSkills(provider, body.skills);
+  const selectedSkills = cleanSelectedSkills(provider, body.skills, workspace.path);
   const codexPrompt = promptWithAttachments(promptWithSelectedSkills(body.prompt, provider, selectedSkills), attachments);
   const permissionMode = cleanOptionalClaudePermissionMode(body.permissionMode);
+  const approvalPolicy = cleanOptionalCodexApprovalPolicy(body.approvalPolicy);
   pruneRuntimeCachesIfIdle();
   const job = {
     id,
@@ -180,6 +192,7 @@ function createJob(body, certSubject) {
     prompt: body.prompt,
     codexPrompt,
     skills: selectedSkills.map((skill) => skill.id),
+    skillInputs: selectedSkills.map((skill) => ({ name: skill.name, path: skill.file, kind: skill.kind || "skill" })),
     attachments,
     createdAt,
     updatedAt: createdAt,
@@ -198,7 +211,8 @@ function createJob(body, certSubject) {
     timeoutMs,
     model: cleanProviderModel(provider, body.model),
     reasoningEffort: provider === "codex" ? cleanOptionalReasoningEffort(body.reasoningEffort) : null,
-    permissionMode: provider === "claude" ? permissionMode : null,
+    permissionMode: provider === "claude" ? (permissionMode || "manual") : null,
+    approvalPolicy: provider === "codex" ? approvalPolicy : null,
     resumeSessionId,
     sessionId: resumeSessionId || (provider === "claude" ? crypto.randomUUID() : null),
   };
@@ -283,7 +297,16 @@ function cleanOptionalClaudePermissionMode(value) {
 }
 
 
-function cleanSelectedSkills(provider, value) {
+function cleanOptionalCodexApprovalPolicy(value) {
+  if (value === undefined || value === null || value === "") return "on-request";
+  if (typeof value !== "string" || !allowedCodexApprovalPolicies.has(value.trim())) {
+    throw Object.assign(new Error("approvalPolicy must be untrusted, on-failure, on-request, or never"), { status: 400 });
+  }
+  return value.trim();
+}
+
+
+function cleanSelectedSkills(provider, value, workspacePath = null) {
   if (value === undefined || value === null) return [];
   if (!Array.isArray(value)) {
     throw Object.assign(new Error("skills must be an array of skill ids"), { status: 400 });
@@ -292,7 +315,7 @@ function cleanSelectedSkills(provider, value) {
     throw Object.assign(new Error(`skills may include at most ${maxJobSkills} entries`), { status: 400 });
   }
 
-  const available = new Map(listProviderSkills(provider).map((skill) => [skill.id, skill]));
+  const available = new Map(listProviderSkills(provider, workspacePath).map((skill) => [skill.id, skill]));
   const selected = [];
   const seen = new Set();
   for (const entry of value) {
@@ -498,6 +521,7 @@ function cancelJob(job) {
   }
 
   active.cancelRequested = true;
+  approvalStore.cancelPendingForJob(job.id, "Job cancelled from Relay.");
   job.updatedAt = nowIso();
   job.error = "cancellation requested";
   touchJob(job, "job_cancel_requested");
@@ -549,21 +573,29 @@ function startJob(job) {
     timedOut: false,
     killTimer: null,
     timeoutTimer: null,
+    timeoutRemainingMs: job.timeoutMs,
+    timeoutStartedAt: null,
+    approvalPollTimer: null,
+    pendingApprovalCount: 0,
     stdoutStream,
     stderrStream,
     sessionIdsBefore: job.provider === "codex" && !job.resumeSessionId ? workspaceSessionIdSet(job.workspacePath) : null,
   };
   activeChildren.set(job.id, active);
 
-  active.timeoutTimer = setTimeout(() => {
+  armJobTimeout(job, active);
+  active.approvalPollTimer = setInterval(() => pollJobApprovals(job, active), 200);
+  active.approvalPollTimer.unref();
+
+  function onTimeout() {
     active.timedOut = true;
     job.timedOut = true;
     job.updatedAt = nowIso();
     job.error = "job timed out";
     touchJob(job, "job_timeout_requested");
     terminateChild(active);
-  }, job.timeoutMs);
-  active.timeoutTimer.unref();
+  }
+  active.onTimeout = onTimeout;
 
   child.stdout.on("data", (chunk) => {
     stdout = appendBounded(stdout, chunk);
@@ -613,14 +645,14 @@ function startJob(job) {
 function buildJobArgs(job) {
   if (job.provider === "claude") return buildClaudeArgs(job);
   if (job.provider === "cursor") return buildCursorArgs(job);
-  return buildCodexArgs(job);
+  return codexTransport === "app-server" ? [codexJobRunner] : buildCodexArgs(job);
 }
 
 
 function jobBinary(provider) {
   if (provider === "claude") return claudeBin;
   if (provider === "cursor") return cursorBin;
-  return codexBin;
+  return codexTransport === "app-server" ? process.execPath : codexBin;
 }
 
 
@@ -639,7 +671,19 @@ function buildJobEnv(job) {
     npm_config_update_notifier: process.env.npm_config_update_notifier || "false",
     BUN_INSTALL_CACHE_DIR: bunCacheDir,
     PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
+    RELAY_JOB_ID: job.id,
+    RELAY_WORKSPACE_PATH: job.worktree?.path || job.workspacePath,
+    RELAY_RESULT_PATH: job.resultPath,
+    RELAY_SESSION_RESULT_PATH: path.join(logsDir, `${job.id}.session-id`),
+    RELAY_APPROVAL_DIR: approvalsDir,
+    RELAY_CODEX_BIN: codexBin,
+    RELAY_CODEX_APPROVAL_POLICY: job.approvalPolicy || "on-request",
+    RELAY_CODEX_SKILL_INPUTS: JSON.stringify(job.skillInputs || []),
   };
+
+  if (job.model) env.RELAY_MODEL = job.model;
+  if (job.reasoningEffort) env.RELAY_REASONING_EFFORT = job.reasoningEffort;
+  if (job.resumeSessionId) env.RELAY_RESUME_SESSION_ID = job.resumeSessionId;
 
   if (job.provider === "cursor") {
     // Direct Cursor subscription jobs never inherit ambient AWS credential or
@@ -692,6 +736,47 @@ function terminateChild(active) {
       if (active.child.exitCode === null) active.child.kill("SIGKILL");
     }, 5000);
     active.killTimer.unref();
+  }
+}
+
+function armJobTimeout(job, active) {
+  clearTimeout(active.timeoutTimer);
+  active.timeoutStartedAt = Date.now();
+  active.timeoutTimer = setTimeout(active.onTimeout || (() => {
+    active.timedOut = true;
+    job.timedOut = true;
+    job.updatedAt = nowIso();
+    job.error = "job timed out";
+    touchJob(job, "job_timeout_requested");
+    terminateChild(active);
+  }), Math.max(active.timeoutRemainingMs, 1));
+  active.timeoutTimer.unref();
+}
+
+function pauseJobTimeout(active) {
+  if (!active.timeoutTimer) return;
+  clearTimeout(active.timeoutTimer);
+  active.timeoutTimer = null;
+  active.timeoutRemainingMs = Math.max(1, active.timeoutRemainingMs - (Date.now() - active.timeoutStartedAt));
+}
+
+function pollJobApprovals(job, active) {
+  if (active.finalized) return;
+  const count = approvalStore.pendingCount(job.id);
+  if (count === active.pendingApprovalCount) return;
+  const previous = active.pendingApprovalCount;
+  active.pendingApprovalCount = count;
+  if (previous === 0 && count > 0) {
+    pauseJobTimeout(active);
+    job.status = "waiting_for_approval";
+    job.updatedAt = nowIso();
+    touchJob(job, "job_waiting_for_approval", { count });
+    void jobNotificationHook("job.needs_input", job).catch(() => null);
+  } else if (previous > 0 && count === 0) {
+    job.status = "running";
+    job.updatedAt = nowIso();
+    touchJob(job, "job_approval_resolved");
+    armJobTimeout(job, active);
   }
 }
 
@@ -1039,6 +1124,8 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
 
   clearTimeout(active.timeoutTimer);
   clearTimeout(active.killTimer);
+  clearInterval(active.approvalPollTimer);
+  approvalStore.cancelPendingForJob(job.id, "Job ended before this request was answered.");
   await Promise.all([finishStream(active.stdoutStream), finishStream(active.stderrStream)]);
   activeChildren.delete(job.id);
 
@@ -1057,7 +1144,8 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
   job.durationMs = durationMs(job.startedAt, finishedAt);
   job.exitCode = code;
   job.timedOut = active.timedOut;
-  job.sessionId ||= cursorResult?.sessionId || job.resumeSessionId || findNewWorkspaceSessionId(job, active.sessionIdsBefore);
+  const appServerSessionId = await readTextFileBounded(path.join(logsDir, `${job.id}.session-id`), 512).catch(() => "");
+  job.sessionId ||= cursorResult?.sessionId || appServerSessionId.trim() || job.resumeSessionId || findNewWorkspaceSessionId(job, active.sessionIdsBefore);
 
   if (active.cancelRequested) {
     job.status = "cancelled";
@@ -1103,6 +1191,8 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
   await handoffCompletionHook(job).catch(() => null);
 
   touchJob(job, "job_finished", { code, signal });
+  const notificationType = job.status === "succeeded" ? "job.completed" : "job.failed";
+  void jobNotificationHook(notificationType, job).catch(() => null);
   pruneRuntimeCachesIfIdle();
   scheduleRuntimeCachePrune();
   processQueue();
@@ -1262,6 +1352,7 @@ async function toJobResponse(job, shape = responseShape("preview")) {
     model: job.model || null,
     reasoningEffort: job.reasoningEffort || null,
     permissionMode: job.permissionMode || null,
+    approvalPolicy: job.approvalPolicy || null,
     skills: Array.isArray(job.skills) ? job.skills : [],
     resumeSessionId: job.resumeSessionId || null,
     sessionId: job.sessionId || job.resumeSessionId || null,
@@ -1289,6 +1380,7 @@ export {
   jobStreamSubscribers,
   activeJobStreamCount,
   setHandoffCompletionHook,
+  setJobNotificationHook,
   loadPersistedJobs,
   ensureLogPaths,
   jobPath,
@@ -1303,6 +1395,7 @@ export {
   normalizeJobProvider,
   cleanOptionalReasoningEffort,
   cleanOptionalClaudePermissionMode,
+  cleanOptionalCodexApprovalPolicy,
   cleanSelectedSkills,
   saveJobAttachments,
   decodeAttachmentData,

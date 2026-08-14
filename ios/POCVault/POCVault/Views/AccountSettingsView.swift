@@ -4,7 +4,9 @@ struct AccountSettingsView: View {
     @ObservedObject var accountStore: RelayAccountStore
     @ObservedObject var nodeStore: RelayNodeStore
     @ObservedObject var identityStore: ClientIdentityStore
+    @ObservedObject var computerLinkStore: RelayComputerLinkStore
     let trialClient: RelayTrialClient
+    var showsDismissButton = true
     @Environment(\.dismiss) private var dismiss
 
     @State private var showingDeleteConfirmation = false
@@ -12,13 +14,9 @@ struct AccountSettingsView: View {
     @State private var isDeletingTrial = false
     @State private var trialDeleteError: String?
     @State private var showingCLILink = false
-    @State private var linkedComputer: CLIComputerLink?
     @State private var browsers: [RelayBrowserSession] = []
-    @State private var didLoadLinkedComputer = false
-    @State private var isLoadingLinkedComputer = false
-    @State private var isDisconnectingComputer = false
     @State private var isRemovingBrowser = false
-    @State private var linkedComputerError: String?
+    @State private var signedInPlacesError: String?
     @State private var showingDisconnectConfirmation = false
     @State private var browserToRemove: RelayBrowserSession?
 
@@ -39,14 +37,14 @@ struct AccountSettingsView: View {
                     }
 
                     Section {
-                        if !didLoadLinkedComputer && isLoadingLinkedComputer {
+                        if !computerLinkStore.hasLoaded && computerLinkStore.isLoading {
                             HStack(spacing: 10) {
                                 ProgressView()
                                 Text("Checking signed-in places…")
                                     .foregroundStyle(AppTheme.textSecondary)
                             }
                         } else {
-                            if let linkedComputer {
+                            if let linkedComputer = computerLinkStore.computer {
                                 LabeledContent("Computer", value: computerName(linkedComputer))
                                 LabeledContent("Status", value: computerStatus(linkedComputer))
                                 if let platform = linkedComputer.platform {
@@ -64,7 +62,7 @@ struct AccountSettingsView: View {
                                 Button("Disconnect computer", role: .destructive) {
                                     showingDisconnectConfirmation = true
                                 }
-                                .disabled(isDisconnectingComputer || isRemovingBrowser)
+                                .disabled(computerLinkStore.isDisconnecting || isRemovingBrowser)
                                 .accessibilityIdentifier("relay-disconnect-computer")
                             }
 
@@ -82,19 +80,23 @@ struct AccountSettingsView: View {
                                 Button("Remove", role: .destructive) {
                                     browserToRemove = browser
                                 }
-                                .disabled(isDisconnectingComputer || isRemovingBrowser)
+                                .disabled(computerLinkStore.isDisconnecting || isRemovingBrowser)
                                 .accessibilityIdentifier("relay-remove-browser")
                             }
 
                             Button("Approve a sign-in") {
                                 showingCLILink = true
                             }
-                            .disabled(isLoadingLinkedComputer || isDisconnectingComputer || isRemovingBrowser)
+                            .disabled(
+                                computerLinkStore.isLoading
+                                    || computerLinkStore.isDisconnecting
+                                    || isRemovingBrowser
+                            )
                             .accessibilityIdentifier("relay-approve-sign-in")
                         }
 
-                        if let linkedComputerError {
-                            Label(linkedComputerError, systemImage: "exclamationmark.triangle.fill")
+                        if let signedInError = signedInPlacesError ?? computerLinkStore.errorMessage {
+                            Label(signedInError, systemImage: "exclamationmark.triangle.fill")
                                 .foregroundStyle(AppTheme.statusError)
 
                             Button("Try again") {
@@ -173,8 +175,10 @@ struct AccountSettingsView: View {
             .navigationTitle("Account & Settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
+                if showsDismissButton {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done") { dismiss() }
+                    }
                 }
             }
             .alert("Delete your Relay account?", isPresented: $showingDeleteConfirmation) {
@@ -196,7 +200,7 @@ struct AccountSettingsView: View {
                 Text("This action cannot be undone. Data on servers you own is not deleted.")
             }
             .confirmationDialog(
-                "Disconnect \(linkedComputer.map(computerName) ?? "computer")?",
+                "Disconnect \(computerLinkStore.computer.map(computerName) ?? "computer")?",
                 isPresented: $showingDisconnectConfirmation,
                 titleVisibility: .visible
             ) {
@@ -205,7 +209,7 @@ struct AccountSettingsView: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("Relay will revoke this computer’s CLI access. You can link a different computer afterward.")
+                Text("Relay will revoke this computer’s CLI access and hide its folders on this phone. Files on the Relay machine are not deleted.")
             }
             .confirmationDialog(
                 "Remove \(browserToRemove.map(browserName) ?? "browser")?",
@@ -248,13 +252,13 @@ struct AccountSettingsView: View {
             .task {
                 await loadLinkedComputer()
             }
-            .task(id: linkedComputer?.id) {
-                guard linkedComputer?.status == .connecting else { return }
+            .task(id: computerLinkStore.computer?.id) {
+                guard computerLinkStore.computer?.status == .connecting else { return }
                 for _ in 0..<30 {
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
                     guard !Task.isCancelled else { return }
                     await loadLinkedComputer(showProgress: false)
-                    if linkedComputer?.status != .connecting { return }
+                    if computerLinkStore.computer?.status != .connecting { return }
                 }
             }
         }
@@ -262,7 +266,15 @@ struct AccountSettingsView: View {
     }
 
     private var computerFooter: String {
-        "Only one computer can be linked at a time — disconnect it before linking another. Each signed-in browser can use the web console; Remove signs that browser out. Approve a sign-in scans the QR from Sign in with iPhone, or from `relay login` when no computer is linked."
+        guard let linkedComputer = computerLinkStore.computer else {
+            return "Approve a sign-in scans the QR from Sign in with iPhone or `relay login`. Only one computer can be linked at a time; browsers are managed separately."
+        }
+        switch linkedComputer.status {
+        case .connecting:
+            return "Link approved. Finish `relay login` on the computer; Relay will mark it Connected when sign-in completes."
+        case .connected:
+            return "This computer can use the Relay CLI and hand off sessions. Each listed browser can use the web console; Remove signs only that browser out."
+        }
     }
 
     private var versionText: String {
@@ -288,50 +300,37 @@ struct AccountSettingsView: View {
     }
 
     private func loadLinkedComputer(showProgress: Bool = true) async {
-        guard let bearer = accountStore.currentSessionToken else {
-            linkedComputer = nil
+        guard let bearer = accountStore.currentSessionToken,
+              let accountID = accountStore.user?.id else {
             browsers = []
-            didLoadLinkedComputer = true
             return
         }
-        if showProgress { isLoadingLinkedComputer = true }
-        linkedComputerError = nil
-        defer {
-            didLoadLinkedComputer = true
-            if showProgress { isLoadingLinkedComputer = false }
-        }
+        signedInPlacesError = nil
+        await computerLinkStore.refresh(
+            bearerToken: bearer,
+            accountID: accountID,
+            showProgress: showProgress
+        )
         do {
             let places = try await RelayAuthClient(
                 baseURL: AppConfiguration.authBaseURL
             ).signedInPlaces(bearerToken: bearer)
-            linkedComputer = places.computer
             browsers = places.browsers
         } catch {
-            linkedComputerError = "Relay couldn't refresh signed-in places."
+            signedInPlacesError = "Relay couldn't refresh signed-in places."
         }
     }
 
     private func disconnectLinkedComputer() async {
-        guard let bearer = accountStore.currentSessionToken else { return }
-        isDisconnectingComputer = true
-        linkedComputerError = nil
-        defer { isDisconnectingComputer = false }
-        do {
-            try await RelayAuthClient(
-                baseURL: AppConfiguration.authBaseURL
-            ).disconnectComputer(bearerToken: bearer)
-            linkedComputer = nil
-            browsers = []
-            didLoadLinkedComputer = true
-        } catch {
-            linkedComputerError = "Relay couldn't disconnect this computer. Try again."
-        }
+        guard let bearer = accountStore.currentSessionToken,
+              let accountID = accountStore.user?.id else { return }
+        await computerLinkStore.disconnect(bearerToken: bearer, accountID: accountID)
     }
 
     private func removeBrowser(_ browser: RelayBrowserSession) async {
         guard let bearer = accountStore.currentSessionToken else { return }
         isRemovingBrowser = true
-        linkedComputerError = nil
+        signedInPlacesError = nil
         defer {
             isRemovingBrowser = false
             browserToRemove = nil
@@ -345,12 +344,12 @@ struct AccountSettingsView: View {
             if case .server(let status, let code, _) = error,
                status == 404, code == "unknown_browser" {
                 browsers.removeAll { $0.id == browser.id }
-                linkedComputerError = "That browser is already signed out."
+                signedInPlacesError = "That browser is already signed out."
                 return
             }
-            linkedComputerError = "Relay couldn't remove this browser. Try again."
+            signedInPlacesError = "Relay couldn't remove this browser. Try again."
         } catch {
-            linkedComputerError = "Relay couldn't remove this browser. Try again."
+            signedInPlacesError = "Relay couldn't remove this browser. Try again."
         }
     }
 

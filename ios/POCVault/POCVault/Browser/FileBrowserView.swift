@@ -3,20 +3,20 @@ import UIKit
 
 /// One folder screen of the workspace file browser — the app's root surface.
 ///
-/// Rows are full-width with hairline dividers on the warm canvas gradient for a
+/// Rows are full-width with hairline dividers on the warm flat canvas for a
 /// Files-app feel. Folders drill in, files route to the viewer, the terminal toolbar
 /// icon opens this folder's chat cover, and the root screen additionally exposes
-/// Library / Status / Diagnostics behind the ellipsis menu.
+/// Library / Diagnostics behind the ellipsis menu. Sessions and Settings stay in
+/// their dedicated bottom tabs instead of being duplicated here.
 struct FileBrowserView: View {
     @StateObject private var viewModel: FileBrowserViewModel
     private let isRoot: Bool
     private let onOpenFolder: (String) -> Void
     private let onOpenFile: (CodexWorkspaceDirectoryEntry) -> Void
     private let onOpenChat: (_ folderPath: String?, _ workspaceID: String?) -> Void
+    private let onOpenTerminal: (_ workspaceID: String, _ workspaceName: String) -> Void
     private let onOpenLibrary: (() -> Void)?
-    private let onOpenStatus: (() -> Void)?
     private let onOpenDiagnostics: (() -> Void)?
-    private let onOpenAccount: (() -> Void)?
 
     @State private var showingCreateFolder = false
     @State private var newFolderName = ""
@@ -28,20 +28,18 @@ struct FileBrowserView: View {
         onOpenFolder: @escaping (String) -> Void,
         onOpenFile: @escaping (CodexWorkspaceDirectoryEntry) -> Void,
         onOpenChat: @escaping (_ folderPath: String?, _ workspaceID: String?) -> Void,
+        onOpenTerminal: @escaping (_ workspaceID: String, _ workspaceName: String) -> Void,
         onOpenLibrary: (() -> Void)? = nil,
-        onOpenStatus: (() -> Void)? = nil,
-        onOpenDiagnostics: (() -> Void)? = nil,
-        onOpenAccount: (() -> Void)? = nil
+        onOpenDiagnostics: (() -> Void)? = nil
     ) {
         _viewModel = StateObject(wrappedValue: FileBrowserViewModel(client: client, path: folderPath))
         self.isRoot = isRoot
         self.onOpenFolder = onOpenFolder
         self.onOpenFile = onOpenFile
         self.onOpenChat = onOpenChat
+        self.onOpenTerminal = onOpenTerminal
         self.onOpenLibrary = onOpenLibrary
-        self.onOpenStatus = onOpenStatus
         self.onOpenDiagnostics = onOpenDiagnostics
-        self.onOpenAccount = onOpenAccount
     }
 
     var body: some View {
@@ -104,6 +102,31 @@ struct FileBrowserView: View {
                     FileBrowserErrorBanner(text: error)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 10)
+                }
+
+                if !isRoot, let workspace = viewModel.listing?.selectedWorkspace {
+                    Button {
+                        onOpenTerminal(workspace.id, workspace.name)
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "terminal.fill")
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Open terminal").font(AppTheme.uiFont(size: 16, weight: .semibold))
+                                Text("Live shell in this workspace").font(AppTheme.uiFont(size: 12))
+                            }
+                            Spacer()
+                            Image(systemName: "arrow.up.right")
+                        }
+                        .foregroundStyle(AppTheme.onEmber)
+                        .padding(.horizontal, 16)
+                        .frame(height: 64)
+                        .background(AppTheme.accent)
+                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 14)
+                    .accessibilityIdentifier("relay-open-terminal")
                 }
 
                 if viewModel.visibleEntries.isEmpty {
@@ -246,10 +269,11 @@ struct FileBrowserView: View {
             Button {
                 onOpenChat(viewModel.path, viewModel.listing?.selectedWorkspace?.id)
             } label: {
-                Image(systemName: "apple.terminal")
+                Label("New session", systemImage: "plus.bubble")
+                    .font(AppTheme.uiFont(size: 13, weight: .semibold))
                     .foregroundStyle(AppTheme.accent)
             }
-            .accessibilityLabel("Open chat for this folder")
+            .accessibilityLabel("Start a new agent session in this folder")
             .accessibilityIdentifier("relay-open-chat")
         }
 
@@ -271,25 +295,11 @@ struct FileBrowserView: View {
                             Label("Library", systemImage: "square.grid.2x2")
                         }
                     }
-                    if let onOpenStatus {
-                        Button {
-                            onOpenStatus()
-                        } label: {
-                            Label("Status", systemImage: "waveform.path.ecg")
-                        }
-                    }
                     if let onOpenDiagnostics {
                         Button {
                             onOpenDiagnostics()
                         } label: {
                             Label("Diagnostics", systemImage: "stethoscope")
-                        }
-                    }
-                    if let onOpenAccount {
-                        Button {
-                            onOpenAccount()
-                        } label: {
-                            Label("Account & Settings", systemImage: "person.crop.circle")
                         }
                     }
                 }

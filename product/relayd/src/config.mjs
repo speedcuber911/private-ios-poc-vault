@@ -25,6 +25,8 @@ const attachmentsDir = path.join(dataDir, "attachments");
 
 const artifactsDir = path.join(dataDir, "artifacts");
 
+const approvalsDir = path.join(dataDir, "approvals");
+
 const auditPath = path.join(dataDir, "audit.jsonl");
 
 // Where a harness CLI actually lives.
@@ -93,6 +95,8 @@ const npmCacheDir = process.env.NPM_CONFIG_CACHE || process.env.npm_config_cache
 const bunCacheDir = process.env.BUN_INSTALL_CACHE_DIR || path.join(runHome, ".bun-cache");
 
 const dangerousMode = parseBooleanEnv("CODEX_DANGEROUS_MODE", true);
+
+const codexTransport = parseEnumEnv("RELAYD_CODEX_TRANSPORT", "app-server", ["app-server", "exec"]);
 
 const maxConcurrent = parseIntegerEnv("CODEX_MAX_CONCURRENT", 1, 1, 16);
 
@@ -184,7 +188,9 @@ const allowedChatProviders = new Set(["codex", "azure", "bedrock"]);
 
 const allowedThreadProviders = new Set([...allowedJobProviders, ...allowedChatProviders]);
 
-const allowedClaudePermissionModes = new Set(["acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"]);
+const allowedClaudePermissionModes = new Set(["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"]);
+
+const allowedCodexApprovalPolicies = new Set(["untrusted", "on-failure", "on-request", "never"]);
 
 const claudeAwsProfile = cleanOptionalAwsProfile(process.env.CLAUDE_AWS_PROFILE);
 
@@ -883,6 +889,7 @@ export {
   logsDir,
   attachmentsDir,
   artifactsDir,
+  approvalsDir,
   auditPath,
   codexBin,
   claudeBin,
@@ -894,6 +901,7 @@ export {
   npmCacheDir,
   bunCacheDir,
   dangerousMode,
+  codexTransport,
   maxConcurrent,
   maxJobStreams,
   jobStreamHeartbeatMs,
@@ -926,6 +934,7 @@ export {
   allowedChatProviders,
   allowedThreadProviders,
   allowedClaudePermissionModes,
+  allowedCodexApprovalPolicies,
   claudeAwsProfile,
   claudeAwsRegion,
   bedrockRegion,

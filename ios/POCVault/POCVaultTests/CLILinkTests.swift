@@ -114,6 +114,90 @@ final class CLILinkTests: XCTestCase {
         XCTAssertFalse(CLILinkFlowModel.staleCodeMessage(for: .web).contains("`relay login`"))
         XCTAssertTrue(CLILinkFlowModel.staleCodeMessage(for: .cli).contains("`relay login`"))
     }
+
+    func testDisconnectHidesFoldersAcrossRelaunchUntilAComputerIsLinkedAgain() async throws {
+        let suite = "relay-computer-link-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let accountID = "account-1"
+        let computer = CLIComputerLink(
+            id: "computer-1",
+            machineName: "Komal's Mac",
+            platform: "macos",
+            status: .connected,
+            connectedAt: 2,
+            createdAt: 1
+        )
+        let stub = StubComputerLinkAuth(computer: computer)
+        let store = RelayComputerLinkStore(client: stub, defaults: defaults)
+
+        await store.refresh(bearerToken: "phone-session", accountID: accountID)
+        XCTAssertEqual(store.computer, computer)
+        XCTAssertFalse(store.suppressesFolderAccess(for: accountID))
+
+        await store.disconnect(bearerToken: "phone-session", accountID: accountID)
+        XCTAssertNil(store.computer)
+        XCTAssertTrue(store.suppressesFolderAccess(for: accountID))
+        XCTAssertEqual(stub.disconnectCount, 1)
+
+        let relaunchedStub = StubComputerLinkAuth(computer: nil, foldersAvailable: false)
+        let relaunchedStore = RelayComputerLinkStore(client: relaunchedStub, defaults: defaults)
+        XCTAssertTrue(relaunchedStore.suppressesFolderAccess(for: accountID))
+
+        relaunchedStub.computer = computer
+        relaunchedStub.foldersAvailable = true
+        await relaunchedStore.refresh(bearerToken: "phone-session", accountID: accountID)
+        XCTAssertFalse(relaunchedStore.suppressesFolderAccess(for: accountID))
+    }
+
+    func testFreshInstallUsesBackendRevocationEvenWithoutLocalDisconnectHistory() async throws {
+        let suite = "relay-computer-link-server-truth-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let accountID = "account-server-truth"
+        let stub = StubComputerLinkAuth(computer: nil, foldersAvailable: false)
+        let store = RelayComputerLinkStore(client: stub, defaults: defaults)
+        XCTAssertFalse(store.suppressesFolderAccess(for: accountID))
+
+        await store.refresh(bearerToken: "phone-session", accountID: accountID)
+
+        XCTAssertTrue(store.suppressesFolderAccess(for: accountID))
+        XCTAssertNil(store.computer)
+    }
+
+    func testStaleLinkRefreshCannotRestoreFoldersAfterDisconnect() async throws {
+        let suite = "relay-computer-link-race-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let accountID = "account-race"
+        let computer = CLIComputerLink(
+            id: "computer-race",
+            machineName: "Slow Mac",
+            platform: "macos",
+            status: .connected,
+            connectedAt: 2,
+            createdAt: 1
+        )
+        let stub = StubComputerLinkAuth(computer: computer)
+        stub.linkResponseDelay = 100_000_000
+        let store = RelayComputerLinkStore(client: stub, defaults: defaults)
+
+        let staleRefresh = Task {
+            await store.refresh(bearerToken: "phone-session", accountID: accountID)
+        }
+        try await Task.sleep(nanoseconds: 10_000_000)
+        await store.disconnect(bearerToken: "phone-session", accountID: accountID)
+        await staleRefresh.value
+
+        XCTAssertNil(store.computer)
+        XCTAssertTrue(store.suppressesFolderAccess(for: accountID))
+    }
 }
 
 private final class StubCLILinkAuth: CLILinkAuthClient {
@@ -132,5 +216,34 @@ private final class StubCLILinkAuth: CLILinkAuthClient {
     func deviceApprove(userCode: String, bearerToken: String) async throws {
         lastApproveCode = userCode
         if let approveError { throw approveError }
+    }
+}
+
+private final class StubComputerLinkAuth: RelayComputerLinkAuthClient {
+    var computer: CLIComputerLink?
+    var foldersAvailable: Bool
+    var linkResponseDelay: UInt64 = 0
+    private(set) var disconnectCount = 0
+
+    init(computer: CLIComputerLink?, foldersAvailable: Bool = true) {
+        self.computer = computer
+        self.foldersAvailable = foldersAvailable
+    }
+
+    func computerLinkState(bearerToken: String) async throws -> CLIComputerLinkState {
+        let response = CLIComputerLinkState(
+            computer: computer,
+            foldersAvailable: foldersAvailable
+        )
+        if linkResponseDelay > 0 {
+            try await Task.sleep(nanoseconds: linkResponseDelay)
+        }
+        return response
+    }
+
+    func disconnectComputer(bearerToken: String) async throws {
+        disconnectCount += 1
+        computer = nil
+        foldersAvailable = false
     }
 }

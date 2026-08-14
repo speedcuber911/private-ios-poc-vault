@@ -65,8 +65,8 @@ if ! id -u "$RUNNER_USER" >/dev/null 2>&1; then
   useradd --system --create-home --home-dir "$DATA_DIR/run-home" --shell /bin/bash "$RUNNER_USER"
 fi
 
-install -d -m 0755 -o root -g root "$INSTALL_DIR" "$(dirname "$ENV_PATH")" "$(dirname "$NGINX_CONF_PATH")"
-install -d -m 0750 -o "$RUNNER_USER" -g "$RUNNER_USER" "$DATA_DIR" "$DATA_DIR/jobs" "$DATA_DIR/logs" "$DATA_DIR/run-home"
+install -d -m 0755 -o root -g root "$INSTALL_DIR" "$INSTALL_DIR/helpers" "$(dirname "$ENV_PATH")" "$(dirname "$NGINX_CONF_PATH")"
+install -d -m 0750 -o "$RUNNER_USER" -g "$RUNNER_USER" "$DATA_DIR" "$DATA_DIR/jobs" "$DATA_DIR/logs" "$DATA_DIR/approvals" "$DATA_DIR/run-home"
 install -d -m 0755 -o "$RUNNER_USER" -g "$RUNNER_USER" "$WORKSPACE_ROOT" "$WORKSPACE_ROOT/scratch" "$WORKSPACE_ROOT/poc-vault" "$WORKSPACE_ROOT/sigiq"
 install -d -m 0755 -o root -g root "$CODEX_MTLS_DIR"
 
@@ -84,6 +84,9 @@ fi
 python3 "$ROOT/ops/render-codex-api-config" --config "$CONFIG_FILE" --output-dir "$TMP_RENDER_DIR"
 
 install -m 0644 -o root -g root "$ROOT/relay-server/codex-api-deploy/server.mjs" "$INSTALL_DIR/server.mjs"
+for helper in approval-store.mjs appserver-client.mjs codex-job-runner.mjs claude-permission-mcp.mjs terminals.mjs; do
+  install -m 0644 -o root -g root "$ROOT/product/relayd/src/$helper" "$INSTALL_DIR/helpers/$helper"
+done
 install -m 0644 -o root -g root "$ROOT/relay-server/codex-api-deploy/codex-api.service" "$SERVICE_PATH"
 install -m 0600 -o root -g root "$TMP_RENDER_DIR/codex-api.env" "$ENV_PATH"
 install -m 0644 -o root -g root "$TMP_RENDER_DIR/codex-api.nginx.conf" "$NGINX_CONF_PATH"

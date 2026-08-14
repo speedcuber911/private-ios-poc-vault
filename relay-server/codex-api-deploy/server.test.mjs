@@ -71,6 +71,7 @@ async function startServer(env) {
       ...(await isolatedRunnerEnv()),
       CODEX_API_HOST: "127.0.0.1",
       CODEX_API_PORT: String(port),
+      RELAYD_CODEX_TRANSPORT: "exec",
       CLAUDE_CODE_USE_BEDROCK: "",
       CLAUDE_AWS_PROFILE: "sigiq",
       CLAUDE_AWS_REGION: "",
@@ -1495,6 +1496,18 @@ test("lists provider-specific skills discovered from runner homes", async () => 
     description: "Use when Claude should debug a failure.",
     body: "Claude debug process.",
   });
+  await fs.mkdir(path.join(tmpDir, ".claude", "commands"), { recursive: true });
+  await fs.writeFile(
+    path.join(tmpDir, ".claude", "commands", "project-review.md"),
+    "---\ndescription: Review this project's current changes.\n---\nReview the current diff carefully.\n",
+    "utf8",
+  );
+  await fs.mkdir(path.join(tmpDir, ".claude", "commands", "team"), { recursive: true });
+  await fs.writeFile(
+    path.join(tmpDir, ".claude", "commands", "team", "release.md"),
+    "---\ndescription: Prepare this project's release.\n---\nPrepare the release carefully.\n",
+    "utf8",
+  );
 
   const server = await startServer({
     CODEX_REQUIRE_MTLS: "false",
@@ -1520,6 +1533,28 @@ test("lists provider-specific skills discovered from runner homes", async () => 
     const claudeBody = await claudeSkills.json();
     assert.deepEqual(claudeBody.skills.map((skill) => skill.id), ["claude-debug"]);
     assert.equal(claudeBody.skills[0].provider, "claude");
+
+    const projectCommands = await fetch(`${server.baseUrl}/v1/codex/skills?provider=claude&workspaceId=scratch`);
+    assert.equal(projectCommands.status, 200);
+    const projectBody = await projectCommands.json();
+    assert.deepEqual(projectBody.skills.map((skill) => skill.id), ["command:project-review", "command:team:release", "claude-debug"]);
+    assert.equal(projectBody.skills[0].name, "project-review");
+    assert.equal(projectBody.skills[0].kind, "command");
+    assert.equal(projectBody.skills[0].description, "Review this project's current changes.");
+
+    const selectedCommand = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: "scratch",
+        provider: "claude",
+        prompt: "Do the review",
+        skills: ["command:project-review"],
+      }),
+    });
+    assert.equal(selectedCommand.status, 202);
+    const selectedJob = await selectedCommand.json();
+    assert.deepEqual(selectedJob.skills, ["command:project-review"]);
   } finally {
     await server.stop();
   }
@@ -2498,11 +2533,15 @@ test("runs Claude jobs with configured binary, stdin prompt, and stdout result",
     assert.equal(job.status, "succeeded");
     assert.equal(job.provider, "claude");
     assert.equal(job.sessionId, created.sessionId);
-    assert.equal(job.permissionMode, "bypassPermissions");
+    assert.equal(job.permissionMode, "plan");
     assert.equal(job.model, "sonnet");
     assert.equal(job.reasoningEffort, null);
-    assert.match(job.stdout, new RegExp(`claude args: .*\\[--print\\].*\\[--dangerously-skip-permissions\\].*\\[--model\\] \\[sonnet\\].*\\[--session-id\\] \\[${created.sessionId}\\]`));
-    assert.doesNotMatch(job.stdout, /--permission-mode/);
+    assert.match(job.stdout, /claude args: .*\[--print\]/);
+    assert.match(job.stdout, /\[--model\] \[sonnet\]/);
+    assert.match(job.stdout, /\[--permission-mode\] \[plan\]/);
+    assert.match(job.stdout, /\[--permission-prompt-tool\] \[mcp__relay_approvals__approve\]/);
+    assert.match(job.stdout, new RegExp(`\\[--session-id\\] \\[${created.sessionId}\\]`));
+    assert.doesNotMatch(job.stdout, /--dangerously-skip-permissions/);
     assert.doesNotMatch(job.stdout, /--effort/);
     assert.match(job.stdout, /claude aws profile:sigiq/);
     assert.match(job.stdout, /claude aws access:\n/);

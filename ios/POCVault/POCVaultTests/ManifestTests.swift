@@ -417,34 +417,42 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(chatSource.contains("TimelineView"))
     }
 
-    func testRootIsFileBrowserNavigationStack() throws {
+    func testRootUsesThreeNativeTabsWhileKeepingFileBrowserNavigation() throws {
         let source = try AppSourceFixture.load("POCVault/POCVaultApp.swift")
+        let browserSource = try AppSourceFixture.load("POCVault/Browser/FileBrowserView.swift")
 
-        // The app root is a single NavigationStack over the file browser, routed by
-        // BrowserRoute. The old four-tab shell must be gone.
+        // Workspaces keeps its real BrowserRoute navigation inside the new, deliberately
+        // small Workspaces / Sessions / Settings information architecture.
         XCTAssertTrue(source.contains("NavigationStack(path: $browserPath)"))
         XCTAssertTrue(source.contains(".navigationDestination(for: BrowserRoute.self)"))
         XCTAssertTrue(source.contains("case folder(path: String)"))
         XCTAssertTrue(source.contains("case file(entry: CodexWorkspaceDirectoryEntry)"))
         XCTAssertTrue(source.contains("FileViewerView("))
         XCTAssertFalse(source.contains("FileViewerPlaceholderView"))
-        XCTAssertFalse(source.contains("TabView("))
-        XCTAssertFalse(source.contains(".tabItem"))
-        XCTAssertFalse(source.contains("RelayRootTab"))
+        XCTAssertTrue(source.contains("TabView(selection: $selectedRootTab)"))
+        XCTAssertTrue(source.contains("Label(\"Workspaces\""))
+        XCTAssertTrue(source.contains("Label(\"Sessions\""))
+        XCTAssertTrue(source.contains("Label(\"Settings\""))
+        XCTAssertTrue(source.contains("RelayRootTab"))
         XCTAssertFalse(source.contains("RelayTabBar"))
 
+        // Settings and profile are root tabs only; the workspace menu does not
+        // duplicate them as separate destinations.
+        XCTAssertFalse(browserSource.contains("Label(\"Account & Settings\""))
+        XCTAssertFalse(browserSource.contains("Label(\"Status\""))
+
         // Library embeds its own NavigationStack, so it presents as a full-screen cover
-        // (nesting stacks is illegal); Status/Diagnostics are sheets; chat is a cover.
+        // (nesting stacks is illegal); Diagnostics stays a sheet and chat a cover.
         XCTAssertTrue(source.contains(".fullScreenCover(isPresented: $showingLibrary)"))
         XCTAssertTrue(source.contains(".fullScreenCover(item: $chatLaunch)"))
-        XCTAssertTrue(source.contains(".sheet(isPresented: $showingStatus)"))
+        XCTAssertFalse(source.contains(".sheet(isPresented: $showingStatus)"))
         XCTAssertTrue(source.contains(".sheet(isPresented: $showingDiagnostics)"))
 
         // Job monitoring runs app-wide through the session store, still policy-guarded.
         XCTAssertTrue(source.contains("chatSessionStore.monitorActiveWorkWhileAppIsOpen()"))
         XCTAssertTrue(source.contains("CodexAgentMonitorPolicy.shouldStartAppMonitor"))
 
-        // Deep-link hooks: the tab hook is dead; browser/chat hooks replace it.
+        // Deep-link hooks still use semantic destinations rather than a numeric tab id.
         XCTAssertFalse(source.contains("RELAY_UITEST_TAB"))
         XCTAssertTrue(source.contains("RELAY_UITEST_PATH"))
         XCTAssertTrue(source.contains("RELAY_UITEST_FILE"))
@@ -565,6 +573,78 @@ final class ManifestTests: XCTestCase {
 
         XCTAssertEqual(legacyJob.provider, .codex)
         XCTAssertEqual(claudeJob.provider, .claude)
+    }
+
+    func testCodexJobDecodesWaitingForApprovalAsActiveAttention() throws {
+        let job = try decodeCodexJob(
+            """
+            {
+              "id": "job-waiting",
+              "workspaceId": "scratch",
+              "status": "waiting_for_approval",
+              "provider": "codex"
+            }
+            """
+        )
+
+        XCTAssertEqual(job.status, .waitingForApproval)
+        XCTAssertTrue(job.status.isActive)
+        XCTAssertTrue(job.status.needsAttention)
+    }
+
+    func testCodexApprovalDecodesSanitizedRuntimePayload() throws {
+        let data = Data(
+            """
+            {
+              "id": "approval-1",
+              "jobId": "job-waiting",
+              "provider": "codex",
+              "kind": "command",
+              "title": "Run command",
+              "reason": "Needs access outside the workspace",
+              "command": "npm test",
+              "cwd": "/srv/workspace",
+              "toolName": null,
+              "createdAt": "2026-08-14T10:50:36.581Z",
+              "status": "pending",
+              "availableDecisions": ["accept", "decline", "cancel"],
+              "resolution": null
+            }
+            """.utf8
+        )
+
+        let approval = try CodexClient.makeDecoder().decode(CodexApproval.self, from: data)
+
+        XCTAssertEqual(approval.id, "approval-1")
+        XCTAssertEqual(approval.provider, .codex)
+        XCTAssertEqual(approval.command, "npm test")
+        XCTAssertTrue(approval.isPending)
+        XCTAssertNotNil(approval.createdAt)
+    }
+
+    func testCodexTerminalDecodesLiveRuntimePayload() throws {
+        let data = Data(
+            """
+            {
+              "id": "terminal-1",
+              "workspaceId": "scratch",
+              "workspaceName": "Scratch",
+              "status": "running",
+              "createdAt": "2026-08-14T10:50:36.581Z",
+              "updatedAt": "2026-08-14T10:50:37.000Z",
+              "finishedAt": null,
+              "exitCode": null,
+              "cols": 80,
+              "rows": 24
+            }
+            """.utf8
+        )
+
+        let terminal = try CodexClient.makeDecoder().decode(CodexTerminal.self, from: data)
+
+        XCTAssertEqual(terminal.workspaceId, "scratch")
+        XCTAssertEqual(terminal.cols, 80)
+        XCTAssertTrue(terminal.isRunning)
     }
 
     func testCodexJobDisplayOutputUsesErrorForFailedJobs() throws {
@@ -1281,6 +1361,65 @@ final class ManifestTests: XCTestCase {
         let payload = try JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any]
 
         XCTAssertEqual(payload?["provider"] as? String, "claude")
+    }
+
+    func testCodexCreateJobRequestKeepsProviderPermissionsAndSkillsIndependent() throws {
+        let request = CodexCreateJobRequest(
+            workspaceId: "scratch",
+            prompt: "use my configured workflow",
+            timeoutMs: 120_000,
+            model: "sonnet",
+            provider: .claude,
+            permissionMode: "acceptEdits",
+            skills: ["claude-debug", "superpowers:tdd"]
+        )
+
+        let payload = try JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any]
+
+        XCTAssertEqual(payload?["provider"] as? String, "claude")
+        XCTAssertEqual(payload?["permissionMode"] as? String, "acceptEdits")
+        XCTAssertEqual(payload?["skills"] as? [String], ["claude-debug", "superpowers:tdd"])
+    }
+
+    func testCodexCreateJobRequestEncodesProviderSpecificApprovalPolicy() throws {
+        let request = CodexCreateJobRequest(
+            workspaceId: "scratch",
+            prompt: "run the checks",
+            timeoutMs: 120_000,
+            model: "gpt-5.5",
+            provider: .codex,
+            approvalPolicy: "on-request"
+        )
+
+        let payload = try JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any]
+
+        XCTAssertEqual(payload?["provider"] as? String, "codex")
+        XCTAssertEqual(payload?["approvalPolicy"] as? String, "on-request")
+        XCTAssertNil(payload?["permissionMode"])
+    }
+
+    func testRelaySlashContextWorksAfterWhitespaceAndUsesTheCurrentCaret() throws {
+        let text = "Keep this paragraph.\nThen /review the current diff."
+        let caret = try XCTUnwrap(text.range(of: "/rev")?.upperBound)
+        let location = text.utf16.distance(from: text.utf16.startIndex, to: caret.samePosition(in: text.utf16)!)
+
+        let context = try XCTUnwrap(RelaySlashContext.find(
+            in: text,
+            selection: NSRange(location: location, length: 0)
+        ))
+
+        XCTAssertEqual(context.query, "rev")
+        XCTAssertEqual((text as NSString).substring(with: context.range), "/review")
+    }
+
+    func testRelaySlashContextDoesNotTreatURLOrPathSlashAsACommand() throws {
+        let text = "Open https://example.com/docs"
+        let location = (text as NSString).length
+
+        XCTAssertNil(RelaySlashContext.find(
+            in: text,
+            selection: NSRange(location: location, length: 0)
+        ))
     }
 
     func testCodexCreateJobRequestEncodesAttachments() throws {

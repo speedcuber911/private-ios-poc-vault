@@ -226,6 +226,7 @@ test("integration: RELAYD_WORKTREE_MODE=true runs the job in a worktree and push
       CODEX_WORKSPACE_BROWSE_ROOT: jail,
       CODEX_WORKSPACES: JSON.stringify([{ id: "repo", name: "Repo", path: workspace }]),
       CODEX_BIN: fakeCodex,
+      RELAYD_CODEX_TRANSPORT: "exec",
       RELAYD_WORKTREE_MODE: "true",
     },
     stdio: ["ignore", "pipe", "pipe"],

@@ -221,6 +221,16 @@ CREATE TABLE IF NOT EXISTS browser_sessions (
 CREATE INDEX IF NOT EXISTS idx_browser_sessions_account
   ON browser_sessions (account_id);
 
+-- A row is a durable owner-triggered revocation of the node data path. It is
+-- deliberately separate from cli_computer_links: a brand-new account may use
+-- its instant trial before linking a laptop, while an account that explicitly
+-- disconnects a computer must stay revoked across app reinstalls and service
+-- restarts until a replacement computer is approved.
+CREATE TABLE IF NOT EXISTS cli_computer_access_revocations (
+  account_id  TEXT PRIMARY KEY,
+  revoked_at  INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS repos (
   id TEXT PRIMARY KEY,
   account_id TEXT NOT NULL,

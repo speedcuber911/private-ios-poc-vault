@@ -1,5 +1,20 @@
 # Codex API Deploy Files
 
+## Relay native controls
+
+The production job path defaults to `RELAYD_CODEX_TRANSPORT=app-server`. Codex jobs use
+`codex app-server --stdio` for streamed items and real command/file approvals. Claude
+Code remains on the user's direct CLI subscription and uses Relay's local MCP permission
+prompt tool; this feature does not route Claude through Bedrock.
+
+`ops/install-codex-api.sh` installs the runtime helpers under
+`/opt/codex-api/helpers` and prepares `/var/lib/codex-api/approvals` with private
+permissions. The phone receives only sanitized approval metadata; auth state stays in
+the isolated runner home.
+
+`RELAYD_CODEX_TRANSPORT=exec` is retained as a compatibility escape hatch and for legacy
+fixtures. That transport cannot provide interactive phone approvals.
+
 This directory contains the deployable files for the async Codex/Claude/Cursor job
 service.
 
@@ -99,17 +114,20 @@ On the EC2 host, `ops/install-codex-api.sh` renders and installs those files to
 
 ## Providers And Resumable Sessions
 
-`GET /v1/codex/models` returns the protected model catalog used by Relay. The
-catalog comes from `CODEX_MODEL_CATALOG` in `/etc/codex-api.env`; keep it
-server-side so the iOS app never ships model ids in the binary.
+`GET /v1/codex/models` returns the protected model catalog used by Relay. When
+the app-server transport is enabled, Relay asks the installed Codex CLI for its
+current model list and replaces the configured Codex rows with that live list.
+Other providers still come from `CODEX_MODEL_CATALOG` in `/etc/codex-api.env`;
+keep the catalog server-side so the iOS app never ships model ids in the binary.
 
 By default, `ops/render-codex-api-config` derives `CODEX_MODEL_CATALOG` from
 `OPENCODE_CONFIG_PATH` (`~/.config/opencode/opencode.jsonc`) when that file is
 available. Duplicate Azure deployments collapse to one visible entry per model id;
 the retained `provider/model` id still selects the server-side route. The renderer
-also appends Codex CLI and Claude Code Task entries. Their optional public
+also appends fallback Codex CLI and Claude Code Task entries. Their optional public
 `taskModel` value tells Relay which model id or alias to submit with a job, while an
-entry without it uses the runner default. The public catalog omits internal routing
+entry without it uses the runner default. Live Codex discovery supersedes these
+fallback Codex rows whenever the installed CLI responds. The public catalog omits internal routing
 fields such as API key file paths, Azure base URLs, and Bedrock regions.
 
 `POST /v1/codex/chat` streams synchronous chat as SSE. It supports `codex`,

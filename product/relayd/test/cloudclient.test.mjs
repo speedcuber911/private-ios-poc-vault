@@ -45,15 +45,24 @@ function freshNode() {
 
 test("pollHandoffs signs the exact method, path, node id, and timestamp", async () => {
   const node = freshNode();
+  const accessLeases = [];
   const cloud = await startFakeCloud((res) => {
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ handoffs: [{ id: "abc123", repo: "me/relay", branch: "relay/handoff-x" }] }));
+    res.end(JSON.stringify({
+      handoffs: [{ id: "abc123", repo: "me/relay", branch: "relay/handoff-x" }],
+      computerAccess: { allowed: true, leaseSec: 45 },
+    }));
   });
   try {
-    const client = createCloudClient({ cloudUrl: cloud.url, baseDir: node.baseDir });
+    const client = createCloudClient({
+      cloudUrl: cloud.url,
+      baseDir: node.baseDir,
+      onComputerAccess: (lease) => accessLeases.push(lease),
+    });
     const handoffs = await client.pollHandoffs(20);
 
     assert.deepEqual(handoffs, [{ id: "abc123", repo: "me/relay", branch: "relay/handoff-x" }]);
+    assert.deepEqual(accessLeases, [{ allowed: true, leaseSec: 45 }]);
     const call = cloud.calls[0];
     assert.equal(call.url, "/v1/node/handoffs?wait=20");
     assert.equal(call.headers["x-relay-node"], node.nodeId);
@@ -62,6 +71,22 @@ test("pollHandoffs signs the exact method, path, node id, and timestamp", async 
       `${SIGNING_LABEL}\nGET\n/v1/node/handoffs?wait=20\n${node.nodeId}\n${call.headers["x-relay-ts"]}`, "utf8");
     const signature = Buffer.from(call.headers["x-relay-signature"], "base64url");
     assert.ok(crypto.verify(null, input, node.publicKey, signature), "the signature verifies against the node key");
+  } finally { await cloud.close(); }
+});
+
+test("a managed cloud client refuses a poll that omits its computer-access lease", async () => {
+  const node = freshNode();
+  const cloud = await startFakeCloud((res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ handoffs: [] }));
+  });
+  try {
+    const client = createCloudClient({
+      cloudUrl: cloud.url,
+      baseDir: node.baseDir,
+      onComputerAccess: () => { throw new Error("cloud_poll_invalid_computer_access"); },
+    });
+    await assert.rejects(client.pollHandoffs(20), /cloud_poll_invalid_computer_access/);
   } finally { await cloud.close(); }
 });
 

@@ -1,5 +1,24 @@
 # Relay Node API v1 — Contract Freeze (W0)
 
+## Native runtime controls (implemented)
+
+Relay uses the installed, signed-in provider CLIs on the linked computer. Provider
+credentials and raw tool inputs never leave that computer.
+
+- `GET /v1/codex/skills?provider=<codex|claude>&workspaceId=<id>` returns sanitized
+  metadata for real global and workspace skills/commands discovered on that runner.
+- Codex jobs accept `approvalPolicy` (`on-request`, `untrusted`, or `never`). Claude
+  jobs accept `permissionMode` (`manual`, `acceptEdits`, `plan`, `dontAsk`, or `auto`).
+- `GET /v1/codex/approvals?status=pending&jobId=<id>` lists blocked runtime requests.
+  `POST /v1/codex/approvals/:id/decision` accepts `accept`, `acceptForSession`,
+  `decline`, or `cancel`.
+- `POST /v1/codex/terminals` starts a sandboxed PTY in a registered workspace. The
+  returned id supports `/stream`, `/input`, `/resize`, and `/close` subroutes.
+
+Approval responses omit provider request ids and raw tool payloads. Terminal sessions
+are restricted to the selected workspace, have no network access, and do not source the
+runner's login profile.
+
 > Status: contract freeze, derived verbatim from
 > `relay-server/codex-api-deploy/server.mjs` (6,642 lines) and validated
 > against `relay-server/codex-api-deploy/server.test.mjs` (59 tests).
@@ -41,7 +60,7 @@
   `/^artifact-[0-9]{3}$/` (`isSafeArtifactId`, 1602–1604). Non-matching ids
   return 404 before any lookup.
 
-### 1.2 Auth model (mTLS with forwarded-subject re-check)
+### 1.2 Auth model (mTLS or trial device token, with local re-check)
 
 `authorize` (1370–1387), applied to every route except `GET /healthz`
 (gate at 1401–1404):
@@ -60,8 +79,13 @@
   entirely; the subject header, if present, is still propagated.
 - The authorized subject is threaded through as `certSubject` into job
   records, chat threads, audit log lines, and echoed in job responses.
-- There are **no bearer tokens, API keys, cookies, or sessions** anywhere on
-  the node API. mTLS (via the gateway re-check) is the only data-path auth.
+- Personal/BYO nodes use mTLS. Trial nodes whose
+  `RELAYD_DEVICE_TOKEN_HASH_FILE` is configured use a host-scoped bearer token
+  derived during pairing; only its SHA-256 is stored by the node.
+- A token-authenticated node enrolled with relay-cloud also requires a current
+  account-access lease received on its signed handoff long-poll. Missing or
+  expired lease → **503**; an owner-disconnected computer → **403**. The cloud
+  never receives the file/job request itself.
 - `POST /v1/pair` is **never routable on this listener** — it is refused with
   a 404 before `authorize` runs, so the data port does not even reveal that it
   exists. Pairing has its own listener (§2.3).
@@ -150,7 +174,7 @@ All from env, parsed at 9–124. Contract-relevant defaults:
 | `CODEX_MAX_TRANSCRIPTION_AUDIO_BYTES` | 25 MiB | transcription body cap |
 | `CODEX_THREAD_SUMMARY_CHARACTERS` | 240 | summary text truncation |
 | `CODEX_WORKSPACES` | 3 seeded entries | static workspace registry (JSON array of `{id,name,path}`, 169–205) |
-| `CODEX_MODEL_CATALOG` | built-in | model catalog (227–235) |
+| `CODEX_MODEL_CATALOG` | built-in | fallback model catalog and non-Codex providers; app-server installs discover Codex models live |
 | `CODEX_DANGEROUS_MODE` | `true` | harness sandbox bypass flags |
 | `CODEX_PROXY_BASE_URL` (+ client cert/key paths) | unset | dev proxy mode (§1.20) |
 
@@ -294,18 +318,26 @@ any response** (2077–2093, 2195–2276).
 ### 1.10 `GET /v1/codex/skills` (1427–1430)
 
 Query: `provider` — optional, `codex|claude|cursor` (400 otherwise; default
-`codex`). 200:
+`codex`); `workspaceId` — optional registered workspace whose project-local
+commands/skills should be included (400 when unknown). 200:
 
 ```json
 {"provider": "codex", "skills": [
   {"id": "superpowers:brainstorming", "name": "brainstorming",
    "title": "Brainstorming", "provider": "codex",
-   "group": "Superpowers", "description": "…"}
+   "group": "Superpowers", "kind": "skill", "description": "…"},
+  {"id": "command:review", "name": "review", "title": "Review",
+   "provider": "codex", "group": "Commands", "kind": "command",
+   "description": "…"}
 ]}
 ```
 
 Skills are discovered by scanning provider-specific roots for `SKILL.md`
-files (depth ≤ 10, ≤ `CODEX_MAX_SKILL_DISCOVERY_FILES`; 2475–2558);
+files. Installed Claude command markdown under `.claude/commands` and Codex
+prompt markdown under `.codex/prompts` are returned as `kind: "command"`;
+workspace-local roots are included only when that `workspaceId` is requested.
+Discovery remains bounded (depth ≤ 10, ≤
+`CODEX_MAX_SKILL_DISCOVERY_FILES`; 2475–2558);
 frontmatter `name`/`description` parsed with a minimal YAML reader
 (2586–2607). The on-disk `file` path is internal and stripped by
 `publicSkill` (2646–2655).
@@ -726,8 +758,8 @@ development convenience, not part of the product surface.
 Everything below is new surface designed for relayd v1. Conventions carried
 over: camelCase JSON, `{"error": "…"}` failures, `sendSse` event grammar,
 bounded lists with `limit` + `truncated`, ISO-8601 UTC timestamps,
-UUID ids, mTLS-only data-path auth (client cert required in both listen
-modes; no tokens). New route namespaces drop the legacy `/codex` segment;
+UUID ids, the same node data-path auth described in §1.2. New route namespaces
+drop the legacy `/codex` segment;
 existing `/v1/codex/*` routes remain frozen as-is.
 
 ### 2.1 Resumable SSE via `Last-Event-ID`

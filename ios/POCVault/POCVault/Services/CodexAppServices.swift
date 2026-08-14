@@ -91,7 +91,7 @@ struct CodexCompletionSignal: Equatable {
             return "\(provider.displayName) needs attention"
         case .canceled:
             return "\(provider.displayName) was canceled"
-        case .queued, .running, .canceling, .unknown:
+        case .queued, .running, .waitingForApproval, .canceling, .unknown:
             return "\(provider.displayName) updated"
         }
     }
@@ -106,7 +106,7 @@ struct CodexCompletionSignal: Equatable {
             return "\(provider.displayName) timed out: \(subject)"
         case .canceled:
             return "\(provider.displayName) was canceled: \(subject)"
-        case .queued, .running, .canceling, .unknown:
+        case .queued, .running, .waitingForApproval, .canceling, .unknown:
             return "\(provider.displayName) updated: \(subject)"
         }
     }
@@ -136,7 +136,7 @@ private extension CodexJobStatus {
         switch self {
         case .succeeded, .failed, .canceled, .timeout:
             return true
-        case .queued, .running, .canceling, .unknown:
+        case .queued, .running, .waitingForApproval, .canceling, .unknown:
             return false
         }
     }
@@ -149,7 +149,7 @@ private extension CodexJob {
             return displayOutput?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
         case .failed, .timeout, .canceled:
             return true
-        case .queued, .running, .canceling, .unknown:
+        case .queued, .running, .waitingForApproval, .canceling, .unknown:
             return false
         }
     }
@@ -162,7 +162,7 @@ private extension CodexThread {
             return lastResult?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
         case .some(.failed), .some(.timeout), .some(.canceled):
             return true
-        case .some(.queued), .some(.running), .some(.canceling), .some(.unknown), .none:
+        case .some(.queued), .some(.running), .some(.waitingForApproval), .some(.canceling), .some(.unknown), .none:
             return false
         }
     }

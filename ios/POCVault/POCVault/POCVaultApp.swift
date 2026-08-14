@@ -10,6 +10,7 @@ struct POCVaultApp: App {
     @StateObject private var statusFeedViewModel: StatusFeedViewModel
     @StateObject private var accountStore: RelayAccountStore
     @StateObject private var nodeStore: RelayNodeStore
+    @StateObject private var computerLinkStore: RelayComputerLinkStore
     @StateObject private var pushService: RelayPushService
     private let manifestClient: ManifestClient
     private let codexClient: CodexClient
@@ -48,7 +49,10 @@ struct POCVaultApp: App {
         ))
         _statusFeedViewModel = StateObject(wrappedValue: StatusFeedViewModel(client: codexClient))
         _accountStore = StateObject(wrappedValue: accountStore)
-        _pushService = StateObject(wrappedValue: RelayPushService(accountStore: accountStore))
+        _computerLinkStore = StateObject(wrappedValue: RelayComputerLinkStore(
+            client: RelayAuthClient(baseURL: AppConfiguration.authBaseURL)
+        ))
+        _pushService = StateObject(wrappedValue: RelayPushService(accountStore: accountStore, codexClient: codexClient))
         self.manifestClient = manifestClient
         self.codexClient = codexClient
         self.trialClient = RelayTrialClient(baseURL: AppConfiguration.authBaseURL)
@@ -56,51 +60,7 @@ struct POCVaultApp: App {
 
     var body: some Scene {
         WindowGroup {
-            Group {
-                switch accountStore.phase {
-                case .restoring:
-                    RelayRestoringView()
-                case .signedOut:
-                    AuthenticationView(accountStore: accountStore)
-                case .onboarding:
-                    RelayOnboardingView(
-                        accountStore: accountStore,
-                        nodeStore: nodeStore,
-                        identityStore: identityStore,
-                        trialClient: trialClient
-                    )
-                case .ready where !nodeStore.hasMachine:
-                    // Signed in, but nothing to talk to: the trial was lost or
-                    // never adopted and no personal install was configured.
-                    // Falling through to the browser here is what made a
-                    // machine-less account look broken rather than empty — it
-                    // fired requests at the baked-in default host and reported
-                    // that host's TLS failure. Offer the machine instead.
-                    RelayOnboardingView(
-                        accountStore: accountStore,
-                        nodeStore: nodeStore,
-                        identityStore: identityStore,
-                        trialClient: trialClient
-                    )
-                case .ready:
-                    POCVaultRootView(
-                        libraryViewModel: libraryViewModel,
-                        statusFeedViewModel: statusFeedViewModel,
-                        chatSessionStore: chatSessionStore,
-                        accountStore: accountStore,
-                        identityStore: identityStore,
-                        nodeStore: nodeStore,
-                        manifestClient: manifestClient,
-                        codexClient: codexClient,
-                        trialClient: trialClient,
-                        pushService: pushService
-                    )
-                    // Adopting (or losing) a machine restarts the browser stack so
-                    // listings refetch; the shared client and the chat/status
-                    // stores survive it.
-                    .id(nodeStore.effectiveBaseURL)
-                }
-            }
+            phaseContent
             // Repointing happens here rather than in `body`: constructing a client
             // per body evaluation leaked a URLSession every time SwiftUI re-ran it.
             .onChange(of: nodeStore.effectiveBaseURL, initial: true) { _, newBaseURL in
@@ -112,6 +72,54 @@ struct POCVaultApp: App {
                 await applyAuthenticationUITestHooks()
                 #endif
             }
+        }
+    }
+
+    @ViewBuilder
+    private var phaseContent: some View {
+        switch accountStore.phase {
+        case .restoring:
+            RelayRestoringView()
+        case .signedOut:
+            AuthenticationView(accountStore: accountStore)
+        case .onboarding:
+            RelayOnboardingView(
+                accountStore: accountStore,
+                nodeStore: nodeStore,
+                identityStore: identityStore,
+                trialClient: trialClient
+            )
+        case .ready where !nodeStore.hasMachine:
+            // Signed in, but nothing to talk to: the trial was lost or
+            // never adopted and no personal install was configured.
+            // Falling through to the browser here is what made a
+            // machine-less account look broken rather than empty — it
+            // fired requests at the baked-in default host and reported
+            // that host's TLS failure. Offer the machine instead.
+            RelayOnboardingView(
+                accountStore: accountStore,
+                nodeStore: nodeStore,
+                identityStore: identityStore,
+                trialClient: trialClient
+            )
+        case .ready:
+            POCVaultRootView(
+                libraryViewModel: libraryViewModel,
+                statusFeedViewModel: statusFeedViewModel,
+                chatSessionStore: chatSessionStore,
+                accountStore: accountStore,
+                identityStore: identityStore,
+                nodeStore: nodeStore,
+                computerLinkStore: computerLinkStore,
+                manifestClient: manifestClient,
+                codexClient: codexClient,
+                trialClient: trialClient,
+                pushService: pushService
+            )
+            // Adopting (or losing) a machine restarts the browser stack so
+            // listings refetch; the shared client and the chat/status
+            // stores survive it.
+            .id(nodeStore.effectiveBaseURL)
         }
     }
 
@@ -155,6 +163,18 @@ enum BrowserRoute: Hashable {
     case file(entry: CodexWorkspaceDirectoryEntry)
 }
 
+private enum RelayRootTab: Hashable {
+    case workspaces
+    case sessions
+    case settings
+}
+
+private struct RelayTerminalLaunch: Identifiable {
+    let id = UUID()
+    let workspaceID: String
+    let workspaceName: String
+}
+
 struct POCVaultRootView: View {
     @ObservedObject var libraryViewModel: LibraryViewModel
     @ObservedObject var statusFeedViewModel: StatusFeedViewModel
@@ -162,6 +182,7 @@ struct POCVaultRootView: View {
     @ObservedObject var accountStore: RelayAccountStore
     @ObservedObject var identityStore: ClientIdentityStore
     @ObservedObject var nodeStore: RelayNodeStore
+    @ObservedObject var computerLinkStore: RelayComputerLinkStore
     let manifestClient: ManifestClient
     let codexClient: CodexClient
     let trialClient: RelayTrialClient
@@ -170,30 +191,16 @@ struct POCVaultRootView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var browserPath: [BrowserRoute] = []
     @State private var chatLaunch: RelayChatLaunch?
+    @State private var terminalLaunch: RelayTerminalLaunch?
     /// Raised when a handoff push is tapped: the threads list is where handoff
     /// cards live, so that is where the tap has to land.
     @State private var opensThreadsForHandoff = false
+    @State private var selectedRootTab = RelayRootTab.workspaces
     @State private var showingLibrary = false
-    @State private var showingStatus = false
     @State private var showingDiagnostics = false
-    @State private var showingAccount = false
 
     var body: some View {
-        NavigationStack(path: $browserPath) {
-            browserScreen(folderPath: nil, isRoot: true)
-                .navigationDestination(for: BrowserRoute.self) { route in
-                    switch route {
-                    case .folder(let path):
-                        browserScreen(folderPath: path, isRoot: false)
-                    case .file(let entry):
-                        FileViewerView(
-                            client: codexClient,
-                            identityStore: identityStore,
-                            entry: entry
-                        )
-                    }
-                }
-        }
+        mainTabs
         .tint(AppTheme.accent)
         .preferredColorScheme(.dark)
         // Library embeds its own NavigationStack, so it must present full screen — never
@@ -208,25 +215,18 @@ struct POCVaultRootView: View {
                 threadsRequest: $opensThreadsForHandoff
             )
         }
-        .sheet(isPresented: $showingStatus) {
-            CodexStatusView(
-                feedViewModel: statusFeedViewModel,
-                identityStore: identityStore,
-                manifestClient: manifestClient
+        .fullScreenCover(item: $terminalLaunch) { launch in
+            RelayTerminalView(
+                client: codexClient,
+                workspaceID: launch.workspaceID,
+                workspaceName: launch.workspaceName,
+                onDismiss: { terminalLaunch = nil }
             )
         }
         .sheet(isPresented: $showingDiagnostics) {
             DiagnosticsView(
                 identityStore: identityStore,
                 manifestClient: manifestClient
-            )
-        }
-        .sheet(isPresented: $showingAccount) {
-            AccountSettingsView(
-                accountStore: accountStore,
-                nodeStore: nodeStore,
-                identityStore: identityStore,
-                trialClient: trialClient
             )
         }
         .task {
@@ -248,18 +248,46 @@ struct POCVaultRootView: View {
         // A handoff push carries no content — only a node id and an event type —
         // so the tap opens the threads list and the card loads from the node.
         .onChange(of: pushService.pendingRoute) { _, route in
-            guard case .handoff = route else { return }
-            pushService.clearPendingRoute()
-            if chatLaunch == nil {
-                openChat(folderPath: nil, workspaceID: nil)
+            guard let route, !foldersAreHiddenAfterComputerDisconnect else { return }
+            switch route {
+            case .handoff:
+                pushService.clearPendingRoute()
+                if chatLaunch == nil {
+                    openChat(folderPath: nil, workspaceID: nil)
+                }
+                opensThreadsForHandoff = true
+            case .job(_, let jobID):
+                pushService.clearPendingRoute()
+                selectedRootTab = .sessions
+                Task {
+                    await statusFeedViewModel.refresh()
+                    guard let item = statusFeedViewModel.feedItems.first(where: { item in
+                        if case .pendingJob(let job) = item.source { return job.id == jobID }
+                        return false
+                    }) else { return }
+                    openSession(item)
+                }
+            case .none:
+                break
             }
-            opensThreadsForHandoff = true
+        }
+        .onChange(of: foldersAreHiddenAfterComputerDisconnect) { _, isHidden in
+            guard isHidden else { return }
+            browserPath.removeAll()
+            chatLaunch = nil
         }
         // A trial machine expires on the server's clock, so the countdown and
         // the expiry banner are only honest if we re-read state on foreground.
         .task(id: scenePhase) {
-            guard scenePhase == .active, nodeStore.trial != nil,
-                  let bearer = accountStore.currentSessionToken else { return }
+            guard scenePhase == .active,
+                  let bearer = accountStore.currentSessionToken,
+                  let accountID = accountStore.user?.id else { return }
+            await computerLinkStore.refresh(
+                bearerToken: bearer,
+                accountID: accountID,
+                showProgress: !computerLinkStore.hasLoaded
+            )
+            guard nodeStore.trial != nil else { return }
             // Only an authoritative "no trial" may forget the machine — see
             // RelayNodeStore.applyRefresh. A `try?` here once turned every
             // offline foreground into permanent, unrecoverable loss.
@@ -269,9 +297,9 @@ struct POCVaultRootView: View {
                 nodeStore.applyRefresh(.failure(error))
             }
         }
-        .task {
+        .task(id: foldersAreHiddenAfterComputerDisconnect) {
             // App-wide job monitor + completion notifications, owned by the session store.
-            guard shouldStartAgentMonitor else { return }
+            guard !foldersAreHiddenAfterComputerDisconnect, shouldStartAgentMonitor else { return }
             await chatSessionStore.monitorActiveWorkWhileAppIsOpen()
         }
         #if DEBUG
@@ -279,6 +307,94 @@ struct POCVaultRootView: View {
             applyUITestHooks()
         }
         #endif
+    }
+
+    private var mainTabs: some View {
+        TabView(selection: $selectedRootTab) {
+            Group {
+                if foldersAreHiddenAfterComputerDisconnect {
+                    disconnectedComputerScreen
+                } else {
+                    browserNavigation
+                }
+            }
+            .tag(RelayRootTab.workspaces)
+            .tabItem { Label("Workspaces", systemImage: "square.grid.2x2") }
+
+            CodexStatusView(
+                feedViewModel: statusFeedViewModel,
+                identityStore: identityStore,
+                manifestClient: manifestClient,
+                onOpenItem: openSession,
+                onNewSession: { selectedRootTab = .workspaces }
+            )
+            .tag(RelayRootTab.sessions)
+            .tabItem { Label("Sessions", systemImage: "bubble.left.and.text.bubble.right") }
+            .badge(statusFeedViewModel.approvals.count)
+
+            AccountSettingsView(
+                accountStore: accountStore,
+                nodeStore: nodeStore,
+                identityStore: identityStore,
+                computerLinkStore: computerLinkStore,
+                trialClient: trialClient,
+                showsDismissButton: false
+            )
+            .tag(RelayRootTab.settings)
+            .tabItem { Label("Settings", systemImage: "gearshape") }
+        }
+        .toolbarBackground(AppTheme.canvasBottom, for: .tabBar)
+        .toolbarBackground(.visible, for: .tabBar)
+    }
+
+    private var browserNavigation: some View {
+        NavigationStack(path: $browserPath) {
+            browserScreen(folderPath: nil, isRoot: true)
+                .navigationDestination(for: BrowserRoute.self) { route in
+                    switch route {
+                    case .folder(let path):
+                        browserScreen(folderPath: path, isRoot: false)
+                    case .file(let entry):
+                        FileViewerView(
+                            client: codexClient,
+                            identityStore: identityStore,
+                            entry: entry
+                        )
+                    }
+                }
+        }
+    }
+
+    private var disconnectedComputerScreen: some View {
+        NavigationStack {
+            ZStack {
+                AppTheme.canvasGradient.ignoresSafeArea()
+                VStack(spacing: 14) {
+                    Image(systemName: "desktopcomputer.trianglebadge.exclamationmark")
+                        .font(.system(size: 34, weight: .medium))
+                        .foregroundStyle(AppTheme.textTertiary)
+                    Text("Computer disconnected")
+                        .font(AppTheme.serifFont(size: 26))
+                        .foregroundStyle(AppTheme.textPrimary)
+                    Text("Its folders are hidden on this phone. Link a computer to show folders again; files on the Relay machine were not deleted.")
+                        .font(AppTheme.uiFont(size: 14))
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .multilineTextAlignment(.center)
+                        .lineSpacing(3)
+                        .padding(.horizontal, 28)
+                    Button("Link a computer") {
+                        selectedRootTab = .settings
+                    }
+                    .buttonStyle(RelayPrimaryButtonStyle())
+                    .padding(.horizontal, 32)
+                    .padding(.top, 8)
+                }
+            }
+        }
+    }
+
+    private var foldersAreHiddenAfterComputerDisconnect: Bool {
+        computerLinkStore.suppressesFolderAccess(for: accountStore.user?.id)
     }
 
     private func browserScreen(folderPath: String?, isRoot: Bool) -> some View {
@@ -295,10 +411,11 @@ struct POCVaultRootView: View {
             onOpenChat: { path, workspaceID in
                 openChat(folderPath: path, workspaceID: workspaceID)
             },
+            onOpenTerminal: { workspaceID, workspaceName in
+                terminalLaunch = RelayTerminalLaunch(workspaceID: workspaceID, workspaceName: workspaceName)
+            },
             onOpenLibrary: isRoot ? { showingLibrary = true } : nil,
-            onOpenStatus: isRoot ? { showingStatus = true } : nil,
-            onOpenDiagnostics: isRoot ? { showingDiagnostics = true } : nil,
-            onOpenAccount: isRoot ? { showingAccount = true } : nil
+            onOpenDiagnostics: isRoot ? { showingDiagnostics = true } : nil
         )
         // Only at the root: the countdown is about the machine as a whole, so
         // repeating it on every drilled-in folder would be noise.
@@ -329,6 +446,12 @@ struct POCVaultRootView: View {
 
     private func openChat(folderPath: String?, workspaceID: String?) {
         chatLaunch = chatSessionStore.launch(folderPath: folderPath, workspaceID: workspaceID)
+    }
+
+    private func openSession(_ item: CodexThreadFeedItem) {
+        let launch = chatSessionStore.launch(folderPath: nil, workspaceID: item.workspaceID)
+        chatLaunch = launch
+        Task { await launch.viewModel.openHistoryItem(item) }
     }
 
     private var libraryCover: some View {
@@ -389,9 +512,9 @@ struct POCVaultRootView: View {
         case "library":
             showingLibrary = true
         case "status":
-            showingStatus = true
+            selectedRootTab = .sessions
         case "account":
-            showingAccount = true
+            selectedRootTab = .settings
         default:
             break
         }
@@ -435,6 +558,7 @@ extension CodexProvider {
 final class StatusFeedViewModel: ObservableObject {
     @Published private(set) var threads: [CodexThread] = []
     @Published private(set) var jobs: [CodexJob] = []
+    @Published private(set) var approvals: [CodexApproval] = []
     @Published private(set) var isRefreshing = false
     @Published private(set) var errorMessage: String?
 
@@ -460,10 +584,23 @@ final class StatusFeedViewModel: ObservableObject {
         do {
             async let threadRequest = client.fetchThreads(provider: nil, workspaceID: nil, limit: 80)
             async let jobRequest = client.fetchJobs(provider: nil, workspaceID: nil, limit: 30)
+            async let approvalRequest = client.fetchApprovals(pendingOnly: true)
             threads = try await threadRequest
             jobs = try await jobRequest
+            approvals = try await approvalRequest
             errorMessage = nil
             hasLoaded = true
+        } catch {
+            guard !isCancellation(error) else { return }
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func decide(_ approval: CodexApproval, _ decision: CodexApprovalDecision) async {
+        do {
+            _ = try await client.decideApproval(id: approval.id, decision: decision)
+            approvals.removeAll { $0.id == approval.id }
+            await refresh()
         } catch {
             guard !isCancellation(error) else { return }
             errorMessage = error.localizedDescription
@@ -475,6 +612,8 @@ private struct CodexStatusView: View {
     @ObservedObject var feedViewModel: StatusFeedViewModel
     @ObservedObject var identityStore: ClientIdentityStore
     let manifestClient: ManifestClient
+    let onOpenItem: (CodexThreadFeedItem) -> Void
+    let onNewSession: () -> Void
     @State private var selectedSection = StatusSection.activity
 
     var body: some View {
@@ -483,12 +622,25 @@ private struct CodexStatusView: View {
                 AppTheme.bgCanvas.ignoresSafeArea()
 
                 VStack(alignment: .leading, spacing: 0) {
-                    Text("Status")
-                        .font(AppTheme.serifFont(size: 28))
-                        .foregroundStyle(AppTheme.textPrimary)
-                        .padding(.horizontal, 20)
-                        .padding(.top, 16)
-                        .padding(.bottom, 16)
+                    HStack {
+                        Text("Sessions")
+                            .font(AppTheme.serifFont(size: 32))
+                            .foregroundStyle(AppTheme.textPrimary)
+                        Spacer()
+                        Button(action: onNewSession) {
+                            Image(systemName: "plus")
+                                .font(AppTheme.uiFont(size: 18, weight: .semibold))
+                                .foregroundStyle(AppTheme.textPrimary)
+                                .frame(width: 40, height: 40)
+                                .background(AppTheme.canvasTop, in: Circle())
+                                .overlay { Circle().stroke(AppTheme.hairlineStrong, lineWidth: 1) }
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Choose a workspace for a new session")
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.top, 16)
+                    .padding(.bottom, 16)
 
                     HStack(spacing: 18) {
                         ForEach(StatusSection.allCases) { section in
@@ -525,6 +677,23 @@ private struct CodexStatusView: View {
                                         .padding(.bottom, 12)
                                 }
 
+                                if !feedViewModel.approvals.isEmpty {
+                                    RelayCapsLabel(text: "Needs attention", color: AppTheme.statusWarn)
+                                        .padding(.horizontal, 20)
+                                        .padding(.bottom, 8)
+                                    ForEach(feedViewModel.approvals) { approval in
+                                        RelayApprovalCard(
+                                            approval: approval,
+                                            onOpen: { openApproval(approval) },
+                                            onDecision: { decision in
+                                                Task { await feedViewModel.decide(approval, decision) }
+                                            }
+                                        )
+                                        .padding(.horizontal, 16)
+                                        .padding(.bottom, 10)
+                                    }
+                                }
+
                                 Text(summaryText)
                                     .font(.system(size: 13))
                                     .foregroundStyle(AppTheme.textSecondary)
@@ -533,7 +702,12 @@ private struct CodexStatusView: View {
 
                                 LazyVStack(spacing: 0) {
                                     ForEach(Array(feedViewModel.feedItems.prefix(24))) { item in
-                                        CodexActivityRow(item: item)
+                                        Button {
+                                            onOpenItem(item)
+                                        } label: {
+                                            CodexActivityRow(item: item)
+                                        }
+                                        .buttonStyle(.plain)
                                     }
                                 }
                                 .overlay(alignment: .top) {
@@ -574,6 +748,57 @@ private struct CodexStatusView: View {
             return "\(items.count) threads · all agents"
         }
         return "\(activeCount) active · \(items.count) recent"
+    }
+
+    private func openApproval(_ approval: CodexApproval) {
+        guard let item = feedViewModel.feedItems.first(where: { item in
+            if case .pendingJob(let job) = item.source { return job.id == approval.jobId }
+            return false
+        }) else { return }
+        onOpenItem(item)
+    }
+}
+
+private struct RelayApprovalCard: View {
+    let approval: CodexApproval
+    let onOpen: () -> Void
+    let onDecision: (CodexApprovalDecision) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label(approval.title, systemImage: "checkmark.shield")
+                    .font(AppTheme.uiFont(size: 15, weight: .semibold))
+                    .foregroundStyle(AppTheme.textPrimary)
+                Spacer()
+                RelayCapsLabel(text: approval.provider.displayName, color: AppTheme.statusWarn, size: 9)
+            }
+            if let command = approval.command?.trimmedNonEmpty {
+                Text(command)
+                    .font(AppTheme.monoFont(size: 12))
+                    .foregroundStyle(AppTheme.textSecondary)
+                    .lineLimit(4)
+            }
+            if let reason = approval.reason?.trimmedNonEmpty {
+                Text(reason)
+                    .font(AppTheme.uiFont(size: 12))
+                    .foregroundStyle(AppTheme.textSecondary)
+            }
+            HStack(spacing: 10) {
+                Button("Deny") { onDecision(.decline) }
+                    .buttonStyle(.bordered)
+                Button("Open", action: onOpen)
+                    .buttonStyle(.bordered)
+                Spacer()
+                Button("Approve") { onDecision(.accept) }
+                    .buttonStyle(.borderedProminent)
+                    .tint(AppTheme.accent)
+            }
+        }
+        .padding(14)
+        .background(AppTheme.canvasTop)
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(AppTheme.statusWarn.opacity(0.45), lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
     }
 }
 
@@ -662,7 +887,7 @@ private struct CodexActivityRow: View {
     private var statusColor: Color {
         guard let status = item.status else { return AppTheme.textTertiary }
         switch status {
-        case .queued, .running, .canceling:
+        case .queued, .running, .waitingForApproval, .canceling:
             return AppTheme.accentBright
         case .succeeded:
             return AppTheme.textSecondary
@@ -689,11 +914,9 @@ enum AppTheme {
     static let canvasBottom = Color(hex: 0x151310)
     /// Solid canvas for sheets and fills that cannot take the gradient.
     static let bgCanvas = Color(hex: 0x1A1815)
-    static let canvasGradient = LinearGradient(
-        colors: [canvasTop, canvasBottom],
-        startPoint: .top,
-        endPoint: .bottom
-    )
+    // Relay uses a flat canvas. Keep the historical property name so older views
+    // adopt the flatter treatment without each screen carrying its own background.
+    static let canvasGradient = canvasBottom
 
     // Ink — cream at four opacity steps. Success/neutral status text uses these.
     static let textPrimary = ink
@@ -710,11 +933,7 @@ enum AppTheme {
     static let accentBright = Color(hex: 0xE8965C)
     static let accentDeep = Color(hex: 0xC96F35)
     static let onEmber = Color(hex: 0x1C1207)
-    static let accentGradient = LinearGradient(
-        colors: [accentBright, accentDeep],
-        startPoint: .topLeading,
-        endPoint: .bottomTrailing
-    )
+    static let accentGradient = accent
     static let userBubbleGradient = accentGradient
 
     // Status text colors (words, not shapes). Success stays cream on purpose.
@@ -778,7 +997,6 @@ struct RelayPrimaryButtonStyle: ButtonStyle {
                     Capsule().stroke(AppTheme.hairline, lineWidth: 1)
                 }
             }
-            .shadow(color: isEnabled ? AppTheme.emberShadow : .clear, radius: 20, y: 6)
             .opacity(configuration.isPressed ? 0.85 : 1)
     }
 }

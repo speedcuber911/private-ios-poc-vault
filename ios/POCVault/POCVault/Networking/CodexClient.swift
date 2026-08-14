@@ -331,6 +331,21 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         return try decoder.decode(CodexListEnvelope<CodexModelDescriptor>.self, from: data).values
     }
 
+    /// Discover the skills actually installed for one harness on the linked computer.
+    /// The endpoint is provider-scoped so a Claude skill can never leak into a Codex run
+    /// (or vice versa), and the returned descriptor contains no runner-local paths.
+    func fetchSkills(provider: CodexProvider, workspaceID: String? = nil) async throws -> [CodexSkillDescriptor] {
+        var queryItems = [URLQueryItem(name: "provider", value: provider.rawValue)]
+        if let workspaceID = workspaceID?.trimmingCharacters(in: .whitespacesAndNewlines), !workspaceID.isEmpty {
+            queryItems.append(URLQueryItem(name: "workspaceId", value: workspaceID))
+        }
+        let data = try await perform(
+            path: "/v1/codex/skills",
+            queryItems: queryItems
+        )
+        return try decoder.decode(CodexListEnvelope<CodexSkillDescriptor>.self, from: data).values
+    }
+
     func fetchWorkspaceDirectories(path: String? = nil, query: String? = nil) async throws -> CodexWorkspaceDirectoryListing {
         var queryItems: [URLQueryItem] = []
         if let path = path?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty {
@@ -483,6 +498,89 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
             throw CodexClientError.emptyResponse
         }
         return try decoder.decode(CodexCreateJobResponse.self, from: responseData)
+    }
+
+    func fetchApprovals(jobID: String? = nil, pendingOnly: Bool = false) async throws -> [CodexApproval] {
+        var query: [URLQueryItem] = []
+        if let jobID { query.append(URLQueryItem(name: "jobId", value: jobID)) }
+        if pendingOnly { query.append(URLQueryItem(name: "status", value: "pending")) }
+        let data = try await perform(path: "/v1/codex/approvals", queryItems: query)
+        return try decoder.decode(CodexListEnvelope<CodexApproval>.self, from: data).values
+    }
+
+    func decideApproval(id: String, decision: CodexApprovalDecision, message: String? = nil) async throws -> CodexApproval {
+        var payload: [String: String] = ["decision": decision.rawValue]
+        if let message { payload["message"] = message }
+        let data = try await perform(
+            path: "/v1/codex/approvals/\(Self.pathComponent(id))/decision",
+            method: "POST",
+            body: try JSONEncoder().encode(payload)
+        )
+        return try decoder.decode(CodexApprovalEnvelope.self, from: data).approval
+    }
+
+    func decideFirstPendingApproval(jobID: String, decision: CodexApprovalDecision) async throws {
+        guard let approval = try await fetchApprovals(jobID: jobID, pendingOnly: true).first else { return }
+        _ = try await decideApproval(id: approval.id, decision: decision)
+    }
+
+    func createTerminal(workspaceID: String, cols: Int = 80, rows: Int = 24) async throws -> CodexTerminal {
+        let body = try JSONSerialization.data(withJSONObject: ["workspaceId": workspaceID, "cols": cols, "rows": rows])
+        let data = try await perform(path: "/v1/codex/terminals", method: "POST", body: body)
+        return try decoder.decode(CodexTerminalEnvelope.self, from: data).terminal
+    }
+
+    func sendTerminalInput(id: String, text: String) async throws {
+        let body = try JSONSerialization.data(withJSONObject: ["text": text])
+        _ = try await perform(path: "/v1/codex/terminals/\(Self.pathComponent(id))/input", method: "POST", body: body)
+    }
+
+    func closeTerminal(id: String) async throws {
+        _ = try await perform(path: "/v1/codex/terminals/\(Self.pathComponent(id))/close", method: "POST", body: Data("{}".utf8))
+    }
+
+    func terminalEvents(id: String) -> AsyncThrowingStream<CodexTerminalStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let url = endpoint(path: "/v1/codex/terminals/\(Self.pathComponent(id))/stream", queryItems: [])
+                    var request = URLRequest(url: url)
+                    applyDeviceToken(to: &request, url: url)
+                    request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                    let (bytes, response) = try await session.bytes(for: request)
+                    guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                        throw CodexClientError.httpFailure((response as? HTTPURLResponse)?.statusCode ?? 0, nil)
+                    }
+                    var event = ""
+                    var data = ""
+                    for try await line in bytes.lines {
+                        if Task.isCancelled { break }
+                        if line.isEmpty {
+                            if let decoded = Self.decodeTerminalEvent(event: event, data: data) { continuation.yield(decoded) }
+                            event = ""; data = ""
+                        } else if line.hasPrefix("event:") {
+                            event = String(line.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+                        } else if line.hasPrefix("data:") {
+                            data += String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+                        }
+                    }
+                    continuation.finish()
+                } catch { continuation.finish(throwing: error) }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    private static func decodeTerminalEvent(event: String, data: String) -> CodexTerminalStreamEvent? {
+        guard let payload = try? JSONSerialization.jsonObject(with: Data(data.utf8)) as? [String: Any] else { return nil }
+        if event == "output", let text = payload["text"] as? String { return .output(text) }
+        let decoder = makeDecoder()
+        if event == "snapshot", let output = payload["output"] as? String,
+           let terminal = payload["terminal"], let bytes = try? JSONSerialization.data(withJSONObject: terminal),
+           let decoded = try? decoder.decode(CodexTerminal.self, from: bytes) { return .snapshot(terminal: decoded, output: output) }
+        if event == "done", let terminal = payload["terminal"], let bytes = try? JSONSerialization.data(withJSONObject: terminal),
+           let decoded = try? decoder.decode(CodexTerminal.self, from: bytes) { return .done(decoded) }
+        return nil
     }
 
     func fetchJob(id: String, includeFullLogs: Bool = false) async throws -> CodexJob {
@@ -1095,7 +1193,7 @@ private struct CodexListEnvelope<Element: Decodable>: Decodable {
         }
 
         let container = try decoder.container(keyedBy: CodexDynamicCodingKey.self)
-        for key in ["items", "data", "results", "models", "workspaces", "jobs", "sessions", "threads", "handoffs"] {
+        for key in ["items", "data", "results", "models", "workspaces", "jobs", "sessions", "threads", "handoffs", "skills", "approvals", "terminals"] {
             if let codingKey = CodexDynamicCodingKey(stringValue: key),
                let values = try? container.decode([Element].self, forKey: codingKey) {
                 self.values = values
@@ -1106,6 +1204,9 @@ private struct CodexListEnvelope<Element: Decodable>: Decodable {
         self.values = []
     }
 }
+
+private struct CodexApprovalEnvelope: Decodable { let approval: CodexApproval }
+private struct CodexTerminalEnvelope: Decodable { let terminal: CodexTerminal }
 
 private struct RelayHandoffEnvelope: Decodable {
     let handoff: RelayHandoffDetail

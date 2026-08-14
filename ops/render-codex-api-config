@@ -315,6 +315,7 @@ def render_env(config: dict[str, str], output: Path) -> None:
         ("CODEX_ALLOWED_CERT_SUBJECTS", "CN=iphone,CN=parikshit-mac"),
         ("CODEX_DATA_DIR", "/var/lib/codex-api"),
         ("CODEX_BIN", "/usr/bin/codex"),
+        ("RELAYD_CODEX_TRANSPORT", "app-server"),
         ("CLAUDE_BIN", "/usr/bin/claude"),
         ("CURSOR_BIN", "/var/lib/codex-api/run-home/.local/bin/cursor-agent"),
         ("CLAUDE_CODE_USE_BEDROCK", ""),

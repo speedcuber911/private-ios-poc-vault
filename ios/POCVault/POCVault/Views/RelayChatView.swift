@@ -17,7 +17,7 @@ struct RelayChatView: View {
     var body: some View {
         NavigationStack {
             ZStack {
-                AppTheme.canvasGradient.ignoresSafeArea()
+                AppTheme.bgCanvas.ignoresSafeArea()
 
                 VStack(spacing: 0) {
                     topBar
@@ -37,11 +37,20 @@ struct RelayChatView: View {
                     selectedChoice: viewModel.selectedChoice,
                     efforts: viewModel.availableEfforts,
                     selectedEffort: viewModel.effectiveEffort,
+                    provider: viewModel.selectedTaskProvider,
+                    skills: viewModel.availableSkills,
+                    selectedSkillIDs: viewModel.selectedSkillIDs,
+                    claudePermissionMode: viewModel.claudePermissionMode,
+                    codexApprovalPolicy: viewModel.codexApprovalPolicy,
                     isSending: viewModel.isSending,
                     isStreaming: viewModel.isStreaming,
                     isTranscribing: viewModel.isTranscribing,
                     onPickChoice: { viewModel.selectChoice($0) },
                     onPickEffort: { viewModel.selectEffort($0) },
+                    onToggleSkill: { viewModel.toggleSkill($0) },
+                    onPickClaudePermission: { viewModel.claudePermissionMode = $0 },
+                    onPickCodexApproval: { viewModel.codexApprovalPolicy = $0 },
+                    onNewConversation: { viewModel.startNewConversation() },
                     onVoice: { fileURL in
                         Task { await viewModel.transcribePromptAudio(fileURL: fileURL) }
                     },
@@ -264,9 +273,8 @@ struct RelayChatView: View {
                     .font(.system(size: 14, weight: .bold))
                     .foregroundStyle(AppTheme.textPrimary)
                     .frame(width: 38, height: 38)
-                    .background(.ultraThinMaterial, in: Circle())
+                    .background(AppTheme.canvasTop, in: Circle())
                     .overlay { Circle().stroke(AppTheme.hairline, lineWidth: 0.6) }
-                    .shadow(color: AppTheme.shadowColor, radius: 8, y: 3)
             }
             .buttonStyle(.plain)
             .padding(.trailing, 16)
@@ -278,6 +286,24 @@ struct RelayChatView: View {
     private static let bottomAnchor = "relay-bottom-anchor"
 }
 
+private struct RelayComposerCommand: Identifiable {
+    enum Action {
+        case model
+        case permissions
+        case skills
+        case newConversation
+        case review
+        case skill(CodexSkillDescriptor)
+    }
+
+    let id: String
+    let command: String
+    let title: String
+    let detail: String
+    let source: String
+    let action: Action
+}
+
 private struct RelayComposer: View {
     private static let normalBottomPadding: CGFloat = 8
 
@@ -286,21 +312,108 @@ private struct RelayComposer: View {
     let selectedChoice: RelayModelChoice?
     let efforts: [CodexReasoningEffort]
     let selectedEffort: CodexReasoningEffort?
+    let provider: CodexProvider?
+    let skills: [CodexSkillDescriptor]
+    let selectedSkillIDs: Set<String>
+    let claudePermissionMode: RelayClaudePermissionMode
+    let codexApprovalPolicy: RelayCodexApprovalPolicy
     let isSending: Bool
     let isStreaming: Bool
     let isTranscribing: Bool
     let onPickChoice: (RelayModelChoice) -> Void
     let onPickEffort: (CodexReasoningEffort) -> Void
+    let onToggleSkill: (CodexSkillDescriptor) -> Void
+    let onPickClaudePermission: (RelayClaudePermissionMode) -> Void
+    let onPickCodexApproval: (RelayCodexApprovalPolicy) -> Void
+    let onNewConversation: () -> Void
     let onVoice: (URL) -> Void
     let onSend: () -> Void
     let onStop: () -> Void
-    @FocusState private var isFocused: Bool
+    @State private var isFocused = false
+    @State private var editorSelection = NSRange(location: 0, length: 0)
+    @State private var editorHeight: CGFloat = 36
+    @State private var showingModelPicker = false
+    @State private var showingPermissionPicker = false
+    @State private var showingSkillPicker = false
+    @State private var skillSearch = ""
     @StateObject private var recorder = RelayPromptAudioRecorder()
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     /// Accessibility text sizes trade the compact pill layout for legibility: chips take
     /// the full row and wrap instead of truncating the harness + model name.
     private var usesAccessibilityLayout: Bool { dynamicTypeSize.isAccessibilitySize }
+
+    private var slashContext: RelaySlashContext? {
+        RelaySlashContext.find(in: text, selection: editorSelection)
+    }
+
+    private var slashCommands: [RelayComposerCommand] {
+        var commands = [
+            RelayComposerCommand(
+                id: "relay:model",
+                command: "/model",
+                title: "Change model",
+                detail: "Choose an agent and model",
+                source: "Relay action",
+                action: .model
+            ),
+            RelayComposerCommand(
+                id: "relay:new",
+                command: "/new",
+                title: "New session",
+                detail: "Start a clean conversation in this workspace",
+                source: "Relay action",
+                action: .newConversation
+            ),
+            RelayComposerCommand(
+                id: "relay:review",
+                command: "/review",
+                title: "Review changes",
+                detail: "Ask the selected agent for a focused code review",
+                source: "Relay action",
+                action: .review
+            )
+        ]
+
+        if let provider {
+            commands.append(RelayComposerCommand(
+                id: "relay:permissions:\(provider.rawValue)",
+                command: "/permissions",
+                title: "\(RelayModelChoice.harnessTitle(for: provider)) permissions",
+                detail: provider == .claude
+                    ? "Choose the Claude Code permission mode"
+                    : "See the Codex runner's enforced access policy",
+                source: "\(RelayModelChoice.harnessTitle(for: provider)) setting",
+                action: .permissions
+            ))
+            commands.append(RelayComposerCommand(
+                id: "relay:skills:\(provider.rawValue)",
+                command: "/skills",
+                title: "Installed skills",
+                detail: "Choose from this computer's \(RelayModelChoice.harnessTitle(for: provider)) skills",
+                source: "Relay action",
+                action: .skills
+            ))
+        }
+
+        commands.append(contentsOf: skills.map { skill in
+            RelayComposerCommand(
+                id: "skill:\(skill.provider.rawValue):\(skill.id)",
+                command: "/\(skill.name)",
+                title: skill.title,
+                detail: skill.description,
+                source: "Installed \(RelayModelChoice.harnessTitle(for: skill.provider)) \(skill.isCommand ? "command" : "skill")",
+                action: .skill(skill)
+            )
+        })
+
+        guard let query = slashContext?.query, !query.isEmpty else { return commands }
+        return commands.filter {
+            $0.command.dropFirst().lowercased().contains(query)
+                || $0.title.lowercased().contains(query)
+                || $0.detail.lowercased().contains(query)
+        }
+    }
 
     private func chipLabel(icon: String, text: String, badge: String? = nil) -> some View {
         HStack(spacing: 6) {
@@ -401,8 +514,42 @@ private struct RelayComposer: View {
         .accessibilityIdentifier("relay-effort-chip")
     }
 
+    private var permissionChip: some View {
+        Button {
+            showingPermissionPicker = true
+        } label: {
+            chipLabel(
+                icon: "checkmark.shield",
+                text: provider == .claude ? claudePermissionMode.label : codexApprovalPolicy.label
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("relay-permission-chip")
+        .accessibilityLabel("\(RelayModelChoice.harnessTitle(for: provider ?? .codex)) permissions")
+    }
+
+    private var skillChip: some View {
+        Button {
+            showingSkillPicker = true
+        } label: {
+            chipLabel(
+                icon: "hammer",
+                text: selectedSkillIDs.isEmpty ? "Skills" : "Skills",
+                badge: selectedSkillIDs.isEmpty ? nil : "\(selectedSkillIDs.count)"
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("relay-skill-chip")
+        .accessibilityLabel("Skills, \(selectedSkillIDs.count) selected")
+    }
+
     var body: some View {
         VStack(spacing: 10) {
+            if slashContext != nil {
+                slashPalette
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+
             if usesAccessibilityLayout {
                 // Full-width stacked chips so harness + model stay legible at
                 // accessibility text sizes (the mode badge remains in the chip).
@@ -411,17 +558,25 @@ private struct RelayComposer: View {
                     if !efforts.isEmpty {
                         effortPickerMenu
                     }
+                    if provider != nil {
+                        permissionChip
+                        skillChip
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             } else {
-                HStack(spacing: 8) {
-                    modelPickerMenu
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        modelPickerMenu
 
-                    if !efforts.isEmpty {
-                        effortPickerMenu
+                        if !efforts.isEmpty {
+                            effortPickerMenu
+                        }
+                        if provider != nil {
+                            permissionChip
+                            skillChip
+                        }
                     }
-
-                    Spacer(minLength: 0)
                 }
             }
 
@@ -446,18 +601,28 @@ private struct RelayComposer: View {
                 .disabled(isSending || isTranscribing)
                 .accessibilityLabel(recorder.isRecording ? "Stop recording" : "Record prompt")
 
-                TextField("Message...", text: $text, axis: .vertical)
-                    .font(AppTheme.uiFont(size: 15))
-                    .lineLimit(1...6)
-                    .textFieldStyle(.plain)
-                    .focused($isFocused)
-                    .foregroundStyle(AppTheme.textPrimary)
-                    .padding(.vertical, 8)
+                ZStack(alignment: .leading) {
+                    if text.isEmpty {
+                        Text("Message…")
+                            .font(AppTheme.uiFont(size: 15))
+                            .foregroundStyle(AppTheme.textTertiary)
+                            .allowsHitTesting(false)
+                    }
+                    RelayCommandTextEditor(
+                        text: $text,
+                        selection: $editorSelection,
+                        isFocused: $isFocused,
+                        height: $editorHeight
+                    )
+                    .frame(height: editorHeight)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 6)
 
                 if isStreaming {
                     Button(action: onStop) {
                         ZStack {
-                            Circle().fill(AppTheme.accentGradient).frame(width: 34, height: 34)
+                            Circle().fill(AppTheme.accent).frame(width: 34, height: 34)
                             RoundedRectangle(cornerRadius: 3).fill(.white).frame(width: 12, height: 12)
                         }
                     }
@@ -472,7 +637,7 @@ private struct RelayComposer: View {
                     } label: {
                         ZStack {
                             Circle()
-                                .fill(canSend ? AnyShapeStyle(AppTheme.accentGradient) : AnyShapeStyle(AppTheme.textPrimary.opacity(0.08)))
+                                .fill(canSend ? AnyShapeStyle(AppTheme.accent) : AnyShapeStyle(AppTheme.textPrimary.opacity(0.08)))
                                 .frame(width: 34, height: 34)
                             Image(systemName: "arrow.up")
                                 .font(.system(size: 15, weight: .bold))
@@ -498,6 +663,312 @@ private struct RelayComposer: View {
         .padding(.bottom, Self.normalBottomPadding)
         .background(AppTheme.canvasBottom)
         .animation(.easeOut(duration: 0.18), value: isFocused)
+        .animation(.easeOut(duration: 0.16), value: slashContext)
+        .sheet(isPresented: $showingModelPicker) {
+            modelPickerSheet
+        }
+        .sheet(isPresented: $showingPermissionPicker) {
+            permissionPickerSheet
+        }
+        .sheet(isPresented: $showingSkillPicker) {
+            skillPickerSheet
+        }
+    }
+
+    private var slashPalette: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                RelayCapsLabel(
+                    text: slashContext?.query.isEmpty == false ? "Matching commands" : "Commands and installed skills",
+                    color: AppTheme.textSecondary,
+                    size: 9
+                )
+                Spacer()
+                if let provider {
+                    Text(RelayModelChoice.harnessTitle(for: provider))
+                        .font(AppTheme.uiFont(size: 11, weight: .medium))
+                        .foregroundStyle(AppTheme.textTertiary)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+
+            Divider().overlay(AppTheme.hairline)
+
+            if slashCommands.isEmpty {
+                Text("No command or installed skill matches this text.")
+                    .font(AppTheme.uiFont(size: 13))
+                    .foregroundStyle(AppTheme.textSecondary)
+                    .padding(12)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(slashCommands) { command in
+                            Button {
+                                apply(command)
+                            } label: {
+                                HStack(alignment: .top, spacing: 10) {
+                                    Text(command.command)
+                                        .font(AppTheme.monoFont(size: 12, weight: .medium))
+                                        .foregroundStyle(AppTheme.accent)
+                                        .frame(width: 112, alignment: .leading)
+
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(command.title)
+                                            .font(AppTheme.uiFont(size: 13, weight: .semibold))
+                                            .foregroundStyle(AppTheme.textPrimary)
+                                        Text(command.detail)
+                                            .font(AppTheme.uiFont(size: 11))
+                                            .foregroundStyle(AppTheme.textSecondary)
+                                            .lineLimit(2)
+                                        Text(command.source)
+                                            .font(AppTheme.uiFont(size: 9, weight: .medium))
+                                            .foregroundStyle(AppTheme.textTertiary)
+                                            .textCase(.uppercase)
+                                            .tracking(0.7)
+                                    }
+                                    Spacer(minLength: 0)
+
+                                    if isSelectedSkill(command) {
+                                        Image(systemName: "checkmark")
+                                            .foregroundStyle(AppTheme.accent)
+                                    }
+                                }
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 10)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+
+                            if command.id != slashCommands.last?.id {
+                                Divider().overlay(AppTheme.hairline).padding(.leading, 134)
+                            }
+                        }
+                    }
+                }
+                .frame(maxHeight: 248)
+            }
+        }
+        .background(AppTheme.canvasTop)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(AppTheme.hairlineStrong, lineWidth: 1)
+        }
+        .accessibilityIdentifier("relay-slash-palette")
+    }
+
+    private func isSelectedSkill(_ command: RelayComposerCommand) -> Bool {
+        guard case .skill(let skill) = command.action else { return false }
+        return selectedSkillIDs.contains(skill.id)
+    }
+
+    private func apply(_ command: RelayComposerCommand) {
+        switch command.action {
+        case .model:
+            replaceSlashToken(with: "")
+            showingModelPicker = true
+        case .permissions:
+            replaceSlashToken(with: "")
+            showingPermissionPicker = true
+        case .skills:
+            replaceSlashToken(with: "")
+            showingSkillPicker = true
+        case .newConversation:
+            replaceSlashToken(with: "")
+            onNewConversation()
+        case .review:
+            replaceSlashToken(with: "Review the current changes for correctness, regressions, and missing tests.")
+        case .skill(let skill):
+            replaceSlashToken(with: "")
+            onToggleSkill(skill)
+        }
+    }
+
+    private func replaceSlashToken(with replacement: String) {
+        guard let context = slashContext else { return }
+        let value = NSMutableString(string: text)
+        value.replaceCharacters(in: context.range, with: replacement)
+        text = value as String
+        editorSelection = NSRange(
+            location: context.range.location + (replacement as NSString).length,
+            length: 0
+        )
+    }
+
+    private var modelPickerSheet: some View {
+        NavigationStack {
+            List {
+                if !sections.agents.isEmpty {
+                    Section("Agents") {
+                        ForEach(sections.agents) { harness in
+                            ForEach(harness.choices) { choice in
+                                Button {
+                                    onPickChoice(choice)
+                                    showingModelPicker = false
+                                } label: {
+                                    pickerRow(
+                                        title: "\(harness.title) · \(choice.shortModelLabel)",
+                                        detail: "Agent session",
+                                        selected: choice == selectedChoice
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+                if !sections.chatModels.isEmpty {
+                    Section("Chat models") {
+                        ForEach(sections.chatModels) { choice in
+                            Button {
+                                onPickChoice(choice)
+                                showingModelPicker = false
+                            } label: {
+                                pickerRow(
+                                    title: choice.chipLabel,
+                                    detail: "Conversation",
+                                    selected: choice == selectedChoice
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            .scrollContentBackground(.hidden)
+            .background(AppTheme.bgCanvas)
+            .navigationTitle("Model")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { showingModelPicker = false }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    private var permissionPickerSheet: some View {
+        NavigationStack {
+            List {
+                if provider == .claude {
+                    Section("Claude Code") {
+                        ForEach(RelayClaudePermissionMode.allCases) { mode in
+                            Button {
+                                onPickClaudePermission(mode)
+                            } label: {
+                                pickerRow(
+                                    title: mode.label,
+                                    detail: mode.detail,
+                                    selected: mode == claudePermissionMode
+                                )
+                            }
+                        }
+                    }
+                    Section {
+                        Text("This setting is sent only to Claude Code jobs. Codex keeps its own independent runner policy.")
+                            .font(AppTheme.uiFont(size: 12))
+                            .foregroundStyle(AppTheme.textSecondary)
+                    }
+                } else {
+                    Section("Codex") {
+                        ForEach(RelayCodexApprovalPolicy.allCases) { policy in
+                            Button {
+                                onPickCodexApproval(policy)
+                            } label: {
+                                pickerRow(
+                                    title: policy.label,
+                                    detail: policy.detail,
+                                    selected: policy == codexApprovalPolicy
+                                )
+                            }
+                        }
+                    }
+                    Section {
+                        Text("This policy is sent only to Codex. Claude Code keeps its own independent permission mode.")
+                            .font(AppTheme.uiFont(size: 12))
+                            .foregroundStyle(AppTheme.textSecondary)
+                    }
+                }
+            }
+            .scrollContentBackground(.hidden)
+            .background(AppTheme.bgCanvas)
+            .navigationTitle("Permissions")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { showingPermissionPicker = false }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    private var skillPickerSheet: some View {
+        NavigationStack {
+            List {
+                if filteredSkills.isEmpty {
+                    ContentUnavailableView(
+                        skillSearch.isEmpty ? "No installed skills" : "No matching skills",
+                        systemImage: "hammer",
+                        description: Text("Relay shows only skills discovered from the selected provider on the linked computer.")
+                    )
+                    .listRowBackground(Color.clear)
+                } else {
+                    Section(RelayModelChoice.harnessTitle(for: provider ?? .codex)) {
+                        ForEach(filteredSkills) { skill in
+                            Button {
+                                onToggleSkill(skill)
+                            } label: {
+                                pickerRow(
+                                    title: skill.title,
+                                    detail: skill.description,
+                                    selected: selectedSkillIDs.contains(skill.id)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            .searchable(text: $skillSearch, prompt: "Search installed skills")
+            .scrollContentBackground(.hidden)
+            .background(AppTheme.bgCanvas)
+            .navigationTitle("Skills")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { showingSkillPicker = false }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    private var filteredSkills: [CodexSkillDescriptor] {
+        let query = skillSearch.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return skills }
+        return skills.filter {
+            $0.name.lowercased().contains(query)
+                || $0.title.lowercased().contains(query)
+                || $0.description.lowercased().contains(query)
+        }
+    }
+
+    private func pickerRow(title: String, detail: String, selected: Bool) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(AppTheme.uiFont(size: 15, weight: .semibold))
+                    .foregroundStyle(AppTheme.textPrimary)
+                Text(detail)
+                    .font(AppTheme.uiFont(size: 12))
+                    .foregroundStyle(AppTheme.textSecondary)
+                    .multilineTextAlignment(.leading)
+            }
+            Spacer()
+            if selected {
+                Image(systemName: "checkmark")
+                    .font(AppTheme.uiFont(size: 13, weight: .semibold))
+                    .foregroundStyle(AppTheme.accent)
+            }
+        }
+        .contentShape(Rectangle())
     }
 
     private var canSend: Bool {
@@ -518,6 +989,94 @@ private struct RelayComposer: View {
     }
 }
 
+/// UITextView bridge used only for caret reporting. SwiftUI's iOS 17 text field does not
+/// expose the insertion point, but slash discovery must follow the caret when the user
+/// types `/` in the middle of an existing draft.
+private struct RelayCommandTextEditor: UIViewRepresentable {
+    @Binding var text: String
+    @Binding var selection: NSRange
+    @Binding var isFocused: Bool
+    @Binding var height: CGFloat
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    func makeUIView(context: Context) -> UITextView {
+        let view = UITextView()
+        view.delegate = context.coordinator
+        view.backgroundColor = .clear
+        view.textColor = UIColor(AppTheme.textPrimary)
+        view.tintColor = UIColor(AppTheme.accent)
+        view.font = UIFont(name: "DMSans-9ptRegular", size: 15) ?? .systemFont(ofSize: 15)
+        view.textContainerInset = UIEdgeInsets(top: 7, left: 0, bottom: 7, right: 0)
+        view.textContainer.lineFragmentPadding = 0
+        view.keyboardDismissMode = .interactive
+        view.adjustsFontForContentSizeCategory = true
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return view
+    }
+
+    func updateUIView(_ view: UITextView, context: Context) {
+        context.coordinator.parent = self
+        if view.text != text {
+            view.text = text
+        }
+        let safeLocation = min(selection.location, (view.text as NSString).length)
+        let safeSelection = NSRange(location: safeLocation, length: 0)
+        if view.selectedRange != safeSelection {
+            view.selectedRange = safeSelection
+        }
+        if isFocused, !view.isFirstResponder {
+            view.becomeFirstResponder()
+        } else if !isFocused, view.isFirstResponder {
+            view.resignFirstResponder()
+        }
+        context.coordinator.updateHeight(for: view)
+    }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        var parent: RelayCommandTextEditor
+
+        init(parent: RelayCommandTextEditor) {
+            self.parent = parent
+        }
+
+        func textViewDidBeginEditing(_ textView: UITextView) {
+            parent.isFocused = true
+            parent.selection = textView.selectedRange
+        }
+
+        func textViewDidEndEditing(_ textView: UITextView) {
+            parent.isFocused = false
+            parent.selection = textView.selectedRange
+        }
+
+        func textViewDidChange(_ textView: UITextView) {
+            parent.text = textView.text
+            parent.selection = textView.selectedRange
+            updateHeight(for: textView)
+        }
+
+        func textViewDidChangeSelection(_ textView: UITextView) {
+            parent.selection = textView.selectedRange
+        }
+
+        func updateHeight(for textView: UITextView) {
+            let width = max(textView.bounds.width, 120)
+            let fitting = textView.sizeThatFits(
+                CGSize(width: width, height: CGFloat.greatestFiniteMagnitude)
+            ).height
+            let next = min(max(fitting, 36), 120)
+            textView.isScrollEnabled = fitting > 120
+            guard abs(parent.height - next) > 0.5 else { return }
+            DispatchQueue.main.async { [weak self] in
+                self?.parent.height = next
+            }
+        }
+    }
+}
+
 private struct RelayChatBubble: View {
     let item: RelayConversationItem
     @State private var showCopied = false
@@ -533,9 +1092,8 @@ private struct RelayChatBubble: View {
                     messageColumn
                         .padding(.horizontal, 14)
                         .padding(.vertical, 11)
-                        .background(AppTheme.userBubbleGradient)
+                        .background(AppTheme.accent)
                         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                        .shadow(color: AppTheme.shadowColor.opacity(0.4), radius: 10, y: 4)
                 } else {
                     messageColumn
                         .padding(.vertical, 2)
@@ -800,6 +1358,8 @@ private extension CodexJobStatus {
         switch self {
         case .queued, .running, .canceling:
             return AppTheme.accentBright
+        case .waitingForApproval:
+            return AppTheme.statusWarn
         case .succeeded:
             return AppTheme.textSecondary
         case .failed:
@@ -1006,7 +1566,7 @@ private struct RelayEmptyConversation: View {
         VStack(spacing: 14) {
             Image(systemName: isTask ? "terminal.fill" : "message.fill")
                 .font(.system(size: 30, weight: .medium))
-                .foregroundStyle(AppTheme.accentGradient)
+                .foregroundStyle(AppTheme.accent)
 
             VStack(spacing: 6) {
                 Text(isTask ? "Run a task" : "Start a conversation")

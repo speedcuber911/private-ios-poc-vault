@@ -261,6 +261,12 @@ export function createApp({
     for (const entry of waiters) entry.settle();
   }
 
+  function wakeAccountNodeWaiters(accountId) {
+    for (const node of registry.listNodes(accountId)) {
+      wakeHandoffWaiters(node.id);
+    }
+  }
+
   // `req` is the parked long-poll's own request; a "close" on it — the
   // client disconnecting, a proxy dropping the connection, anything short of
   // a normal response — releases the waiter immediately rather than pinning
@@ -814,6 +820,10 @@ export function createApp({
         notices: leasedNotices.map(({ id, pairingId, secret, leaseToken }) => ({
           id, pairingId, secret, lease: leaseToken,
         })),
+        computerAccess: {
+          allowed: !registry.isCliComputerAccessRevoked(verified.node.accountId),
+          leaseSec: config.computerAccessLeaseSec,
+        },
       });
     }
 
@@ -949,14 +959,17 @@ export function createApp({
     if (path === "/v1/auth/device/link" && method === "GET") {
       return sendJson(res, 200, {
         computer: publicCliComputer(registry.getCliComputerLink(account.id)),
+        foldersAvailable: !registry.isCliComputerAccessRevoked(account.id),
       });
     }
 
     if (path === "/v1/auth/device/link" && method === "DELETE") {
       const disconnected = registry.disconnectCliComputer(account.id);
+      wakeAccountNodeWaiters(account.id);
       return sendJson(res, 200, {
         ok: true,
         disconnected: publicCliComputer(disconnected),
+        foldersAvailable: false,
       });
     }
 
@@ -1045,7 +1058,12 @@ export function createApp({
       if (approved.status !== "approved") {
         return sendJson(res, 404, { error: "unknown_user_code" });
       }
-      return sendJson(res, 200, { ok: true, computer: publicCliComputer(approved.link) });
+      wakeAccountNodeWaiters(account.id);
+      return sendJson(res, 200, {
+        ok: true,
+        computer: publicCliComputer(approved.link),
+        foldersAvailable: true,
+      });
     }
 
     if (method === "GET" && path === "/v1/account") {

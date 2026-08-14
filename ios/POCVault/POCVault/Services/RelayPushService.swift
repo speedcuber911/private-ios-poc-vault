@@ -25,12 +25,16 @@ enum RelayPushRoute: Equatable {
 @MainActor
 final class RelayPushService: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
 
+    private static let approveAction = "RELAY_APPROVE"
+    private static let denyAction = "RELAY_DENY"
+
     @Published private(set) var pendingRoute: RelayPushRoute?
     @Published private(set) var isRegistered = false
 
     private let accountStore: RelayAccountStore
     private let authBaseURL: URL
     private let session: URLSession
+    private let codexClient: CodexClient
     /// The token iOS handed us before an account session existed. Registration
     /// needs a bearer token, and the token only arrives once per launch, so it
     /// is held here until sign-in makes the call possible.
@@ -38,10 +42,12 @@ final class RelayPushService: NSObject, ObservableObject, UNUserNotificationCent
 
     init(
         accountStore: RelayAccountStore,
+        codexClient: CodexClient,
         authBaseURL: URL = AppConfiguration.authBaseURL,
         session: URLSession = .shared
     ) {
         self.accountStore = accountStore
+        self.codexClient = codexClient
         self.authBaseURL = authBaseURL
         self.session = session
         super.init()
@@ -52,6 +58,16 @@ final class RelayPushService: NSObject, ObservableObject, UNUserNotificationCent
     func registerForPushNotifications() {
         let center = UNUserNotificationCenter.current()
         center.delegate = self
+        center.setNotificationCategories([
+            UNNotificationCategory(
+                identifier: "RELAY_NEEDS_INPUT",
+                actions: [
+                    UNNotificationAction(identifier: Self.approveAction, title: "Approve", options: [.foreground]),
+                    UNNotificationAction(identifier: Self.denyAction, title: "Deny", options: [.destructive])
+                ],
+                intentIdentifiers: []
+            )
+        ])
         center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
             guard granted else {
                 CodexDiagnostics.log("push_authorization_denied")
@@ -168,6 +184,13 @@ final class RelayPushService: NSObject, ObservableObject, UNUserNotificationCent
     ) async {
         let route = Self.route(from: response.notification.request.content.userInfo)
         guard route != .none else { return }
+        if case .job(_, let jobID) = route {
+            if response.actionIdentifier == "RELAY_APPROVE" {
+                try? await codexClient.decideFirstPendingApproval(jobID: jobID, decision: .accept)
+            } else if response.actionIdentifier == "RELAY_DENY" {
+                try? await codexClient.decideFirstPendingApproval(jobID: jobID, decision: .decline)
+            }
+        }
         await MainActor.run { self.pendingRoute = route }
     }
 }

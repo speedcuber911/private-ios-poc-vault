@@ -205,6 +205,14 @@ export function loadConfig(env = process.env) {
     // connection), so the normal case never comes close to this window —
     // it only bounds how long a genuinely partitioned handoff stays stuck.
     handoffLeaseSec: Math.max(1, intFrom(env.HANDOFF_LEASE_SEC, 30)),
+
+    // relayd treats this as a short, renewable authorization lease for its
+    // account's data path. Disconnect wakes the long-poll immediately; the
+    // lease also bounds stale access when the node cannot reach the cloud.
+    computerAccessLeaseSec: Math.min(
+      120,
+      Math.max(10, intFrom(env.COMPUTER_ACCESS_LEASE_SEC, 45)),
+    ),
   };
 }
 

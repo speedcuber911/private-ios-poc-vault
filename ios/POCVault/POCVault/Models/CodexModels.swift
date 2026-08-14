@@ -383,6 +383,131 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
     }
 }
 
+/// Public metadata returned by Relay's provider-scoped skill discovery endpoint.
+/// File paths and skill bodies deliberately stay on the runner; the phone only needs
+/// enough information to search and select a real installed skill.
+struct CodexSkillDescriptor: Decodable, Hashable, Identifiable {
+    let id: String
+    let name: String
+    let title: String
+    let provider: CodexProvider
+    let group: String
+    let kind: String?
+    let description: String
+
+    var isCommand: Bool { kind == "command" }
+}
+
+/// Claude Code's non-destructive permission modes supported by the current Relay job
+/// contract. `bypassPermissions` remains server/operator-only and is never offered by
+/// the phone as an ordinary convenience setting.
+enum RelayClaudePermissionMode: String, CaseIterable, Identifiable, Codable {
+    case manual
+    case plan
+    case acceptEdits
+    case dontAsk
+    case auto
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .manual:
+            return "Ask every time"
+        case .plan:
+            return "Plan only"
+        case .acceptEdits:
+            return "Accept edits"
+        case .dontAsk:
+            return "Deny prompts"
+        case .auto:
+            return "Auto"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .manual:
+            return "Pause Claude Code and ask this phone when a tool needs approval."
+        case .plan:
+            return "Inspect and plan without changing files."
+        case .acceptEdits:
+            return "Allow file edits; other tools keep Claude's normal rules."
+        case .dontAsk:
+            return "Reject tools that would need an interactive approval."
+        case .auto:
+            return "Let the installed Claude Code choose its automatic policy."
+        }
+    }
+}
+
+enum RelayCodexApprovalPolicy: String, CaseIterable, Identifiable, Codable {
+    case onRequest = "on-request"
+    case untrusted
+    case never
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .onRequest: return "Ask when needed"
+        case .untrusted: return "Ask for untrusted commands"
+        case .never: return "Never ask"
+        }
+    }
+    var detail: String {
+        switch self {
+        case .onRequest: return "Codex decides when an exact command or file change needs your approval."
+        case .untrusted: return "Known-safe reads can run; other commands pause for approval."
+        case .never: return "Codex cannot ask. Operations outside the workspace sandbox are rejected."
+        }
+    }
+}
+
+/// The slash fragment touching the current caret. A command starts at the beginning of
+/// the draft or after whitespace, so `/` discovery works in a later paragraph without
+/// treating URL and file-path slashes as commands.
+struct RelaySlashContext: Equatable {
+    let range: NSRange
+    let query: String
+
+    static func find(in text: String, selection: NSRange) -> RelaySlashContext? {
+        let value = text as NSString
+        guard selection.length == 0, selection.location >= 0, selection.location <= value.length else {
+            return nil
+        }
+
+        let whitespace = CharacterSet.whitespacesAndNewlines
+        var start = selection.location
+        while start > 0 {
+            let scalar = value.character(at: start - 1)
+            guard let unicode = UnicodeScalar(scalar), !whitespace.contains(unicode) else { break }
+            start -= 1
+        }
+        guard start < value.length, value.substring(with: NSRange(location: start, length: 1)) == "/" else {
+            return nil
+        }
+        if start > 0 {
+            let previous = value.character(at: start - 1)
+            guard let scalar = UnicodeScalar(previous), whitespace.contains(scalar) else { return nil }
+        }
+
+        var end = selection.location
+        while end < value.length {
+            let scalar = value.character(at: end)
+            guard let unicode = UnicodeScalar(scalar), !whitespace.contains(unicode) else { break }
+            end += 1
+        }
+
+        let typedRange = NSRange(location: start, length: selection.location - start)
+        let typed = value.substring(with: typedRange)
+        guard !typed.dropFirst().contains("/") else { return nil }
+        return RelaySlashContext(
+            range: NSRange(location: start, length: end - start),
+            query: String(typed.dropFirst()).lowercased()
+        )
+    }
+}
+
 enum RelayInteractionMode: String, CaseIterable, Codable, Identifiable {
     case chat
     case task
@@ -451,6 +576,7 @@ struct CodexModelDescriptor: Decodable, Hashable, Identifiable {
 enum CodexJobStatus: Hashable, Codable {
     case queued
     case running
+    case waitingForApproval
     case succeeded
     case failed
     case canceling
@@ -468,6 +594,8 @@ enum CodexJobStatus: Hashable, Codable {
             self = .queued
         case "running", "active", "in_progress", "in-progress", "processing":
             self = .running
+        case "waiting_for_approval", "waiting-for-approval", "needs_input":
+            self = .waitingForApproval
         case "succeeded", "success", "completed", "complete", "done", "passed":
             self = .succeeded
         case "failed", "failure", "errored", "error":
@@ -505,6 +633,8 @@ enum CodexJobStatus: Hashable, Codable {
             return "queued"
         case .running:
             return "running"
+        case .waitingForApproval:
+            return "waiting_for_approval"
         case .succeeded:
             return "succeeded"
         case .failed:
@@ -526,6 +656,8 @@ enum CodexJobStatus: Hashable, Codable {
             return "Queued"
         case .running:
             return "Running"
+        case .waitingForApproval:
+            return "Needs approval"
         case .succeeded:
             return "Succeeded"
         case .failed:
@@ -543,7 +675,7 @@ enum CodexJobStatus: Hashable, Codable {
 
     var isActive: Bool {
         switch self {
-        case .queued, .running, .canceling:
+        case .queued, .running, .waitingForApproval, .canceling:
             return true
         case .succeeded, .failed, .canceled, .timeout, .unknown:
             return false
@@ -552,12 +684,64 @@ enum CodexJobStatus: Hashable, Codable {
 
     var needsAttention: Bool {
         switch self {
-        case .failed, .timeout:
+        case .waitingForApproval, .failed, .timeout:
             return true
         case .queued, .running, .succeeded, .canceling, .canceled, .unknown:
             return false
         }
     }
+}
+
+struct CodexApprovalResolution: Decodable, Hashable {
+    let decision: String
+    let decidedAt: Date?
+    let message: String?
+}
+
+struct CodexApproval: Decodable, Hashable, Identifiable {
+    let id: String
+    let jobId: String
+    let provider: CodexProvider
+    let kind: String
+    let title: String
+    let reason: String?
+    let command: String?
+    let cwd: String?
+    let toolName: String?
+    let createdAt: Date?
+    let status: String
+    let availableDecisions: [String]
+    let resolution: CodexApprovalResolution?
+
+    var isPending: Bool { status == "pending" }
+}
+
+enum CodexApprovalDecision: String, Encodable {
+    case accept
+    case acceptForSession
+    case decline
+    case cancel
+}
+
+struct CodexTerminal: Decodable, Hashable, Identifiable {
+    let id: String
+    let workspaceId: String
+    let workspaceName: String
+    let status: String
+    let createdAt: Date?
+    let updatedAt: Date?
+    let finishedAt: Date?
+    let exitCode: Int?
+    let cols: Int
+    let rows: Int
+
+    var isRunning: Bool { status == "running" || status == "starting" }
+}
+
+enum CodexTerminalStreamEvent: Hashable {
+    case snapshot(terminal: CodexTerminal, output: String)
+    case output(String)
+    case done(CodexTerminal)
 }
 
 struct CodexThread: Decodable, Hashable, Identifiable {
@@ -1450,6 +1634,9 @@ struct CodexCreateJobRequest: Encodable {
     let model: String?
     let reasoningEffort: String?
     let provider: CodexProvider
+    let permissionMode: String?
+    let approvalPolicy: String?
+    let skills: [String]?
     let attachments: [CodexJobAttachment]?
     let resumeSessionId: String?
 
@@ -1460,6 +1647,9 @@ struct CodexCreateJobRequest: Encodable {
         model: String? = nil,
         reasoningEffort: String? = nil,
         provider: CodexProvider = .defaultProvider,
+        permissionMode: String? = nil,
+        approvalPolicy: String? = nil,
+        skills: [String] = [],
         attachments: [CodexJobAttachment] = [],
         resumeSessionId: String? = nil
     ) {
@@ -1469,6 +1659,9 @@ struct CodexCreateJobRequest: Encodable {
         self.model = model
         self.reasoningEffort = reasoningEffort
         self.provider = provider
+        self.permissionMode = permissionMode
+        self.approvalPolicy = approvalPolicy
+        self.skills = skills.isEmpty ? nil : Array(skills.prefix(6))
         self.attachments = attachments.isEmpty ? nil : attachments
         self.resumeSessionId = resumeSessionId
     }

@@ -187,6 +187,8 @@ enum RelayModelDiscovery {
 @MainActor
 final class RelayChatViewModel: ObservableObject {
     @Published private(set) var models: [CodexModelDescriptor] = []
+    @Published private(set) var skillsByProvider: [CodexProvider: [CodexSkillDescriptor]] = [:]
+    @Published private(set) var selectedSkillIDsByProvider: [CodexProvider: Set<String>] = [:]
     @Published private(set) var threads: [CodexThread] = []
     @Published private(set) var jobs: [CodexJob] = []
     @Published private(set) var messages: [RelayConversationItem] = []
@@ -200,6 +202,19 @@ final class RelayChatViewModel: ObservableObject {
     /// User-chosen reasoning effort for task jobs (nil = model default). Reset when the
     /// selected choice changes so we never send an effort the model doesn't support.
     @Published var selectedEffort: CodexReasoningEffort?
+    /// Claude's permission policy is deliberately provider-specific. Codex keeps its
+    /// runner-enforced sandbox policy until the backend has a true interactive approval
+    /// channel; we do not present a phone toggle that the current executor would ignore.
+    @Published var claudePermissionMode: RelayClaudePermissionMode {
+        didSet {
+            UserDefaults.standard.set(claudePermissionMode.rawValue, forKey: Self.claudePermissionDefaultsKey)
+        }
+    }
+    @Published var codexApprovalPolicy: RelayCodexApprovalPolicy {
+        didSet {
+            UserDefaults.standard.set(codexApprovalPolicy.rawValue, forKey: Self.codexApprovalDefaultsKey)
+        }
+    }
     @Published var prompt = ""
     @Published var errorMessage: String?
     /// Live stdout/stderr tail per active job id, fed by the job SSE stream. Cleared when
@@ -246,6 +261,8 @@ final class RelayChatViewModel: ObservableObject {
     private var jobStreamTasks: [String: Task<Void, Never>] = [:]
 
     private static let liveTailCharacterCap = 12_000
+    private static let claudePermissionDefaultsKey = "relay.claude.permissionMode"
+    private static let codexApprovalDefaultsKey = "relay.codex.approvalPolicy"
 
     var isStreaming: Bool { streamingMessageID != nil }
 
@@ -267,6 +284,11 @@ final class RelayChatViewModel: ObservableObject {
         self.client = client
         self.workspaceID = workspaceID?.trimmedNonEmpty
         self.workspacePath = workspacePath?.trimmedNonEmpty
+        let savedClaudeMode = UserDefaults.standard.string(forKey: Self.claudePermissionDefaultsKey)
+        self.claudePermissionMode = RelayClaudePermissionMode(rawValue: savedClaudeMode ?? "") ?? .manual
+        self.codexApprovalPolicy = RelayCodexApprovalPolicy(
+            rawValue: UserDefaults.standard.string(forKey: Self.codexApprovalDefaultsKey) ?? ""
+        ) ?? .onRequest
     }
 
     /// Folder name for the chat top bar ("Relay" for the root chat).
@@ -287,6 +309,7 @@ final class RelayChatViewModel: ObservableObject {
     func adoptWorkspaceID(_ id: String) {
         guard workspaceID == nil, let trimmed = id.trimmedNonEmpty else { return }
         workspaceID = trimmed
+        Task { await refreshSkills() }
     }
 
     // MARK: - Model selection
@@ -298,6 +321,32 @@ final class RelayChatViewModel: ObservableObject {
     func selectChoice(_ choice: RelayModelChoice) {
         selectedChoice = choice
         selectedEffort = nil  // fall back to the new model's default until the user picks
+    }
+
+    var selectedTaskProvider: CodexProvider? {
+        guard let choice = selectedChoice, choice.mode == .task else { return nil }
+        return Self.taskProvider(for: choice.model)
+    }
+
+    var availableSkills: [CodexSkillDescriptor] {
+        guard let provider = selectedTaskProvider else { return [] }
+        return skillsByProvider[provider] ?? []
+    }
+
+    var selectedSkillIDs: Set<String> {
+        guard let provider = selectedTaskProvider else { return [] }
+        return selectedSkillIDsByProvider[provider] ?? []
+    }
+
+    func toggleSkill(_ skill: CodexSkillDescriptor) {
+        guard skill.provider == selectedTaskProvider else { return }
+        var selected = selectedSkillIDsByProvider[skill.provider] ?? []
+        if selected.contains(skill.id) {
+            selected.remove(skill.id)
+        } else if selected.count < 6 {
+            selected.insert(skill.id)
+        }
+        selectedSkillIDsByProvider[skill.provider] = selected
     }
 
     /// Effort levels the selected task model exposes (from the catalog), as typed options.
@@ -336,6 +385,7 @@ final class RelayChatViewModel: ObservableObject {
         do {
             models = try await client.fetchModels()
             ensureSelectedChoiceValid()
+            await refreshSkills()
             await refreshThreads()
             await refreshHandoffs()
             errorMessage = nil
@@ -345,6 +395,33 @@ final class RelayChatViewModel: ObservableObject {
         #if DEBUG
         await runAutoDriveIfRequested()
         #endif
+    }
+
+    /// Refresh provider inventories independently. One unavailable harness must not hide
+    /// another harness's installed skills or fail the rest of chat bootstrap.
+    func refreshSkills() async {
+        let providers = Set(
+            models
+                .filter { $0.supports(.task) }
+                .map { Self.taskProvider(for: $0) }
+        )
+        var discovered = skillsByProvider
+        for provider in providers {
+            do {
+                discovered[provider] = try await client.fetchSkills(provider: provider, workspaceID: workspaceID)
+            } catch {
+                CodexDiagnostics.log("skill_refresh_failed", fields: [
+                    "provider": provider.rawValue,
+                    "error": String(describing: error)
+                ])
+            }
+        }
+        skillsByProvider = discovered
+        for provider in providers {
+            let validIDs = Set((discovered[provider] ?? []).map(\.id))
+            selectedSkillIDsByProvider[provider] = (selectedSkillIDsByProvider[provider] ?? [])
+                .intersection(validIDs)
+        }
     }
 
     /// Load only this folder's threads and invocations. A folder whose dynamic workspace
@@ -532,6 +609,7 @@ final class RelayChatViewModel: ObservableObject {
             let workspace = try await client.selectWorkspace(path: workspacePath)
             workspaceID = workspace.id
             registeredWorkspaceName = workspace.name
+            await refreshSkills()
             return workspace.id
         } catch {
             errorMessage = "Couldn't register this folder as a workspace: \(error.localizedDescription)"
@@ -703,6 +781,9 @@ final class RelayChatViewModel: ObservableObject {
                 model: Self.taskModelParameter(for: model),
                 reasoningEffort: effectiveEffort?.rawValue,
                 provider: provider,
+                permissionMode: provider == .claude ? claudePermissionMode.rawValue : nil,
+                approvalPolicy: provider == .codex ? codexApprovalPolicy.rawValue : nil,
+                skills: Array(selectedSkillIDsByProvider[provider] ?? []).sorted(),
                 resumeSessionId: resumeID
             ))
             let job: CodexJob
