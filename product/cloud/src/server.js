@@ -156,6 +156,24 @@ export function createApp({
     });
   }
 
+  async function unlinkHostedNode(node) {
+    if (!node) return { error: "nothing_to_unlink" };
+    const trial = registry.getTrialByNodeId(node.id);
+    if (trial?.sandboxId) {
+      await releaseSandbox(trial, "unlinked");
+    }
+    registry.deleteNode(node.accountId, node.id);
+    if (trial) {
+      registry.updateTrial(trial.id, {
+        state: "destroyed",
+        enrollTokenHash: null,
+        sandboxId: null,
+        nodeId: null,
+      });
+    }
+    return { ok: true };
+  }
+
   // Web device-code redemption: Better Auth 1.6.26 has no auth.api.createSession.
   // Password sign-ups already share the registry id (ensureRelayAccount).
   // Apple-only accounts have a registry row and no `user` row — create one
@@ -992,6 +1010,31 @@ export function createApp({
       });
     }
 
+    if (
+      method === "DELETE" &&
+      seg.length === 5 &&
+      seg[0] === "v1" &&
+      seg[1] === "admin" &&
+      seg[2] === "accounts" &&
+      seg[4] === "machine"
+    ) {
+      if (!callerIsAdmin()) return sendJson(res, 403, { error: "forbidden" });
+      if (!registry.getAccount(seg[3]) && !readBetterAuthUser(db, seg[3])) {
+        return sendJson(res, 404, { error: "unknown_account" });
+      }
+      const target = publicAdminAccount(db, registry, seg[3]);
+      const nodeId = target.trial?.nodeId || target.nodes?.[0]?.id || null;
+      const node = nodeId ? registry.getNode(nodeId) : null;
+      if (!node) {
+        return sendJson(res, 409, { error: "nothing_to_unlink" });
+      }
+      await unlinkHostedNode(node);
+      return sendJson(res, 200, {
+        ok: true,
+        account: publicAdminAccount(db, registry, seg[3]),
+      });
+    }
+
     if (path === "/v1/auth/device/link" && method === "GET") {
       return sendJson(res, 200, {
         computer: publicCliComputer(registry.getCliComputerLink(account.id)),
@@ -1238,14 +1281,7 @@ export function createApp({
       }
       if (method === "GET") return sendJson(res, 200, { node });
       if (method === "DELETE") {
-        const trial = registry.getTrialByNodeId(node.id);
-        if (trial?.sandboxId) {
-          await releaseSandbox(trial, "node_deleted");
-        }
-        registry.deleteNode(account.id, node.id);
-        if (trial?.sandboxId) {
-          registry.updateTrial(trial.id, { state: "destroyed", enrollTokenHash: null });
-        }
+        await unlinkHostedNode(node);
         return sendJson(res, 204, null);
       }
     }

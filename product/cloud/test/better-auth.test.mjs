@@ -84,3 +84,48 @@ test("Better Auth gates Relay, supports username sign-in, and hard-deletes the a
     await t.close();
   }
 });
+
+// Komal's block: a password account is created first (email unverified —
+// Relay never sends verification mail). Sign in with Apple for that same
+// address then 401s "account not linked" because Better Auth refuses to
+// attach Apple onto an unverified local user. Apple already proved the
+// address; the phone login must land on the existing account.
+test("Sign in with Apple links onto an existing password account with the same email", async () => {
+  const t = await startTestApp({
+    env: { APPLE_CLIENT_SECRET: "test-apple-client-secret-must-be-long" },
+  });
+  const origin = t.config.betterAuthBaseURL;
+  try {
+    const signup = await api(t.baseUrl, "POST", "/api/auth/sign-up/email", {
+      headers: { origin },
+      body: {
+        email: "komal@example.com",
+        name: "Komal",
+        username: "komaldev",
+        password: "correct-horse-battery",
+      },
+    });
+    assert.equal(signup.status, 200);
+    const passwordUserId = signup.json.user.id;
+
+    const token = t.idp.mintIdentityToken({
+      sub: "komal-apple-sub",
+      email: "komal@example.com",
+      email_verified: true,
+    });
+    const apple = await api(t.baseUrl, "POST", "/api/auth/sign-in/social", {
+      headers: { origin },
+      body: {
+        provider: "apple",
+        requestSignUp: true,
+        idToken: { token },
+      },
+    });
+    assert.equal(apple.status, 200, apple.json && JSON.stringify(apple.json));
+    assert.equal(apple.json.user.id, passwordUserId);
+    assert.equal(apple.json.user.email, "komal@example.com");
+  } finally {
+    await t.close();
+  }
+});
+

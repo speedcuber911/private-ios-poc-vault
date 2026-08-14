@@ -39,4 +39,16 @@ final class AccountTests: XCTestCase {
 
         XCTAssertEqual(error.localizedDescription, "The username or password is incorrect.")
     }
+
+    func testAppleLinkConflictExplainsTheOtherAccount() throws {
+        let data = try XCTUnwrap(
+            #"{"message":"account not linked","code":"OAUTH_LINK_ERROR"}"#
+                .data(using: .utf8)
+        )
+        let error = RelayAuthClientError.decode(status: 401, data: data)
+        XCTAssertEqual(
+            error.localizedDescription,
+            "This Apple ID is already used on a different Relay account. Sign in with your username and password, or use the Apple ID that created that account."
+        )
+    }
 }

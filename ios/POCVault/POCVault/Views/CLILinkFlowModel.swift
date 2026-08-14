@@ -37,11 +37,28 @@ struct RelayBrowserSession: Decodable, Equatable, Identifiable {
 struct RelaySignedInPlaces: Decodable, Equatable {
     let computer: CLIComputerLink?
     let browsers: [RelayBrowserSession]
+    var foldersAvailable: Bool? = nil
 }
 
-struct CLIComputerLinkState: Equatable {
+struct CLIComputerLinkState: Equatable, Decodable {
     let computer: CLIComputerLink?
     let foldersAvailable: Bool
+
+    init(computer: CLIComputerLink?, foldersAvailable: Bool) {
+        self.computer = computer
+        self.foldersAvailable = foldersAvailable
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        computer = try container.decodeIfPresent(CLIComputerLink.self, forKey: .computer)
+        foldersAvailable = try container.decodeIfPresent(Bool.self, forKey: .foldersAvailable) ?? true
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case computer
+        case foldersAvailable
+    }
 }
 
 protocol RelayComputerLinkAuthClient: AnyObject {
@@ -121,6 +138,21 @@ final class RelayComputerLinkStore: ObservableObject {
             guard revision == operationRevision, activeAccountID == accountID,
                   !isCancellation(error) else { return }
             errorMessage = "Relay couldn't refresh the computer link."
+        }
+    }
+
+    /// Settings lists signed-in places from `/v1/auth/places`. That payload is
+    /// enough to show the computer even when `/v1/auth/device/link` is missing
+    /// `foldersAvailable` or otherwise fails to decode.
+    func adoptPlaces(_ places: RelaySignedInPlaces, accountID: String) {
+        switchToAccountIfNeeded(accountID)
+        operationRevision += 1
+        computer = places.computer
+        hasLoaded = true
+        isLoading = false
+        errorMessage = nil
+        if let foldersAvailable = places.foldersAvailable {
+            setFolderAccessSuppressed(!foldersAvailable, for: accountID)
         }
     }
 

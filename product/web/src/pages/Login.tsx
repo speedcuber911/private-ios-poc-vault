@@ -12,6 +12,9 @@ const AUTH_ERRORS: Record<string, string> = {
   USERNAME_IS_ALREADY_TAKEN: "That username is already taken.",
   USER_ALREADY_EXISTS: "An account already exists for that email.",
   PASSWORD_TOO_SHORT: "Use a password with at least 8 characters.",
+  OAUTH_LINK_ERROR: "This Apple ID is already used on a different Relay account. Sign in with your username and password, or use the Apple ID that created that account.",
+  SOCIAL_ACCOUNT_ALREADY_LINKED: "This Apple ID is already used on a different Relay account. Sign in with your username and password, or use the Apple ID that created that account.",
+  LINKED_ACCOUNT_ALREADY_EXISTS: "This Apple ID is already used on a different Relay account. Sign in with your username and password, or use the Apple ID that created that account.",
 };
 
 function authErrorMessage(json: { code?: string; message?: string; error?: string } | null) {

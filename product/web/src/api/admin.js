@@ -6,6 +6,9 @@ import { cloud as defaultCloud } from "./cloud.js";
 export const UPGRADE_CONFIRM_COPY =
   "Keep this hosted machine, drop the trial limit, allow their own computer.";
 
+export const UNLINK_CONFIRM_COPY =
+  "Unlink deletes this hosted machine and its files.";
+
 const TRIAL_STATES = new Set([
   "creating",
   "ready",
@@ -47,6 +50,10 @@ export function canUpgrade(account) {
   const state = account?.trial?.state;
   const nodeId = account?.trial?.nodeId;
   return (state === "creating" || state === "ready") && Boolean(nodeId);
+}
+
+export function canUnlink(account) {
+  return Boolean(hostedMachineId(account));
 }
 
 export function canImpersonate(account) {
@@ -92,6 +99,24 @@ export async function confirmAndUpgrade(
   return upgrade(accountId);
 }
 
+/**
+ * @param {string} accountId
+ * @param {{
+ *   confirm?: (message?: string) => boolean,
+ *   unlink: (id: string) => Promise<{ ok?: boolean, status?: number, json?: { error?: string } | null, cancelled?: boolean }>,
+ * }} opts
+ */
+export async function confirmAndUnlink(
+  accountId,
+  {
+    confirm = globalThis.confirm?.bind(globalThis),
+    unlink,
+  } = {},
+) {
+  if (!confirm(UNLINK_CONFIRM_COPY)) return { cancelled: true };
+  return unlink(accountId);
+}
+
 export function createAdmin({ cloud = defaultCloud } = {}) {
   function listAccounts() {
     return cloud.cloudFetch("/v1/admin/accounts");
@@ -103,7 +128,13 @@ export function createAdmin({ cloud = defaultCloud } = {}) {
     });
   }
 
-  return { listAccounts, upgradeAccount };
+  function unlinkMachine(id) {
+    return cloud.cloudFetch(`/v1/admin/accounts/${encodeURIComponent(id)}/machine`, {
+      method: "DELETE",
+    });
+  }
+
+  return { listAccounts, upgradeAccount, unlinkMachine };
 }
 
 export const admin = createAdmin();

@@ -29,6 +29,8 @@ enum RelayAuthClientError: Error, LocalizedError, Equatable {
                 return "Sign in with Apple is not configured on the Relay server yet."
             case "computer_already_linked":
                 return "A computer is already connected. Disconnect it before linking another one."
+            case "OAUTH_LINK_ERROR", "SOCIAL_ACCOUNT_ALREADY_LINKED", "LINKED_ACCOUNT_ALREADY_EXISTS":
+                return "This Apple ID is already used on a different Relay account. Sign in with your username and password, or use the Apple ID that created that account."
             default:
                 return message
             }
@@ -188,19 +190,12 @@ final class RelayAuthClient {
     }
 
     func computerLinkState(bearerToken: String) async throws -> CLIComputerLinkState {
-        struct Payload: Decodable {
-            let computer: CLIComputerLink?
-            let foldersAvailable: Bool
-        }
-        guard let response: Payload = try await request(
+        guard let response: CLIComputerLinkState = try await request(
             method: "GET",
             path: "/v1/auth/device/link",
             bearerToken: bearerToken
         ) else { throw RelayAuthClientError.invalidResponse }
-        return CLIComputerLinkState(
-            computer: response.computer,
-            foldersAvailable: response.foldersAvailable
-        )
+        return response
     }
 
     func disconnectComputer(bearerToken: String) async throws {

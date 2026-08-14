@@ -452,6 +452,13 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(source.contains("chatSessionStore.monitorActiveWorkWhileAppIsOpen()"))
         XCTAssertTrue(source.contains("CodexAgentMonitorPolicy.shouldStartAppMonitor"))
 
+        // Settings lives under the tab bar, so the Form must not bounce when
+        // the page fits and must keep Security's footer above the tabs.
+        let settings = try AppSourceFixture.load("POCVault/Views/AccountSettingsView.swift")
+        XCTAssertTrue(settings.contains("scrollBounceBehavior(.basedOnSize)"))
+        XCTAssertTrue(settings.contains("contentMargins(.bottom"))
+        XCTAssertTrue(settings.contains("adoptPlaces(") || settings.contains("adoptPlaces ("))
+
         // Deep-link hooks still use semantic destinations rather than a numeric tab id.
         XCTAssertFalse(source.contains("RELAY_UITEST_TAB"))
         XCTAssertTrue(source.contains("RELAY_UITEST_PATH"))

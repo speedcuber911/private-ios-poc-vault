@@ -4,7 +4,9 @@ import {
   admin as defaultAdmin,
   adminRouteFor,
   canImpersonate,
+  canUnlink,
   canUpgrade,
+  confirmAndUnlink,
   confirmAndUpgrade,
   hostedMachineId,
   isAdminRole,
@@ -45,6 +47,7 @@ export function Admin({
   const [rowError, setRowError] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [upgradingId, setUpgradingId] = useState<string | null>(null);
+  const [unlinkingId, setUnlinkingId] = useState<string | null>(null);
   const [actingId, setActingId] = useState<string | null>(null);
   const onNeedLoginRef = useRef(onNeedLogin);
   const onForbiddenRef = useRef(onForbidden);
@@ -123,6 +126,32 @@ export function Admin({
     }
   }
 
+  async function unlink(account: AccountRow) {
+    if (!canUnlink(account) || unlinkingId) return;
+    setUnlinkingId(account.id);
+    setRowError((current) => {
+      const next = { ...current };
+      delete next[account.id];
+      return next;
+    });
+    try {
+      const result = await confirmAndUnlink(account.id, {
+        unlink: (id) => defaultAdmin.unlinkMachine(id),
+      });
+      if ("cancelled" in result && result.cancelled) return;
+      const word = upgradeErrorWord(result);
+      if (word) {
+        setRowError((current) => ({ ...current, [account.id]: word }));
+        return;
+      }
+      await loadAccounts();
+    } catch {
+      setRowError((current) => ({ ...current, [account.id]: "FAILED" }));
+    } finally {
+      setUnlinkingId(null);
+    }
+  }
+
   async function runAuthAction(accountId: string, action: () => Promise<{ error?: { message?: string } | null }>) {
     if (actingId) return;
     setActingId(accountId);
@@ -173,9 +202,6 @@ export function Admin({
           <h1 className="page-title">Admin</h1>
         </div>
       </div>
-      <button type="button" className="btn-text back" onClick={onForbidden}>
-        Machines
-      </button>
 
       {!loading && accounts.length === 0 && !error ? <p className="muted">No accounts yet</p> : null}
 
@@ -185,6 +211,7 @@ export function Admin({
           const machineId = hostedMachineId(account);
           const max = nodesMax(account.entitlements);
           const eligible = canUpgrade(account);
+          const unlinkOk = canUnlink(account);
           const impersonateOk = canImpersonate(account);
           const rowWord = rowError[account.id];
           return (
@@ -213,6 +240,14 @@ export function Admin({
                   onClick={() => void upgrade(account)}
                 >
                   Upgrade
+                </button>
+                <button
+                  type="button"
+                  className="btn-text"
+                  disabled={!unlinkOk || unlinkingId === account.id}
+                  onClick={() => void unlink(account)}
+                >
+                  Unlink
                 </button>
                 <button
                   type="button"

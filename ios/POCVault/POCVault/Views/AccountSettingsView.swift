@@ -167,6 +167,8 @@ struct AccountSettingsView: View {
                 }
             }
             .scrollContentBackground(.hidden)
+            .scrollBounceBehavior(.basedOnSize)
+            .contentMargins(.bottom, showsDismissButton ? 0 : 56, for: .scrollContent)
             .refreshable {
                 await loadLinkedComputer()
             }
@@ -316,6 +318,7 @@ struct AccountSettingsView: View {
                 baseURL: AppConfiguration.authBaseURL
             ).signedInPlaces(bearerToken: bearer)
             browsers = places.browsers
+            computerLinkStore.adoptPlaces(places, accountID: accountID)
         } catch {
             signedInPlacesError = "Relay couldn't refresh signed-in places."
         }

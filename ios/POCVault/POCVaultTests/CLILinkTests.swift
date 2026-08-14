@@ -198,6 +198,61 @@ final class CLILinkTests: XCTestCase {
         XCTAssertNil(store.computer)
         XCTAssertTrue(store.suppressesFolderAccess(for: accountID))
     }
+
+    /// Live cloud can serve GET /v1/auth/device/link as `{ computer }` without
+    /// `foldersAvailable`. That field arrived later than `/v1/auth/places`, so a
+    /// required Bool makes Settings show "couldn't refresh the computer link"
+    /// even when places loaded fine.
+    func testLinkStateDecodesWhenFoldersAvailableIsOmitted() throws {
+        let state = try JSONDecoder().decode(
+            CLIComputerLinkState.self,
+            from: Data(#"{ "computer": null }"#.utf8)
+        )
+        XCTAssertNil(state.computer)
+        XCTAssertTrue(state.foldersAvailable)
+    }
+
+    func testLinkStateHonorsFoldersAvailableFalse() throws {
+        let state = try JSONDecoder().decode(
+            CLIComputerLinkState.self,
+            from: Data(#"{ "computer": null, "foldersAvailable": false }"#.utf8)
+        )
+        XCTAssertFalse(state.foldersAvailable)
+    }
+
+    /// Settings lists computers from places. A failed device/link refresh must
+    /// not hide a computer that places already returned, or keep the error
+    /// banner after places succeeded.
+    func testPlacesRecoverLinkedComputerWhenDeviceLinkRefreshFails() async throws {
+        let suite = "relay-computer-link-places-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let accountID = "account-places"
+        let computer = CLIComputerLink(
+            id: "computer-places",
+            machineName: "Parikshit's Mac",
+            platform: "macos",
+            status: .connected,
+            connectedAt: 2,
+            createdAt: 1
+        )
+        let stub = StubComputerLinkAuth(computer: computer)
+        stub.linkError = RelayAuthClientError.invalidResponse
+        let store = RelayComputerLinkStore(client: stub, defaults: defaults)
+
+        await store.refresh(bearerToken: "phone-session", accountID: accountID)
+        XCTAssertEqual(store.errorMessage, "Relay couldn't refresh the computer link.")
+        XCTAssertNil(store.computer)
+
+        store.adoptPlaces(
+            RelaySignedInPlaces(computer: computer, browsers: []),
+            accountID: accountID
+        )
+        XCTAssertEqual(store.computer, computer)
+        XCTAssertNil(store.errorMessage)
+    }
 }
 
 private final class StubCLILinkAuth: CLILinkAuthClient {
@@ -223,6 +278,7 @@ private final class StubComputerLinkAuth: RelayComputerLinkAuthClient {
     var computer: CLIComputerLink?
     var foldersAvailable: Bool
     var linkResponseDelay: UInt64 = 0
+    var linkError: Error?
     private(set) var disconnectCount = 0
 
     init(computer: CLIComputerLink?, foldersAvailable: Bool = true) {
@@ -231,6 +287,7 @@ private final class StubComputerLinkAuth: RelayComputerLinkAuthClient {
     }
 
     func computerLinkState(bearerToken: String) async throws -> CLIComputerLinkState {
+        if let linkError { throw linkError }
         let response = CLIComputerLinkState(
             computer: computer,
             foldersAvailable: foldersAvailable

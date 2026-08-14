@@ -411,6 +411,21 @@ test("joinWaitlist posts the account email with credentials and does not delete 
   );
 });
 
+test("unlinkNode DELETEs /v1/nodes/:id with credentials include", async () => {
+  const calls = [];
+  const api = trialWith(({ path, method, credentials }) => {
+    calls.push({ path, method, credentials });
+    return { status: 204, json: null };
+  });
+  const result = await api.unlinkNode("node-00112233aabbccdd");
+  assert.equal(result.status, 204);
+  assert.deepEqual(calls[0], {
+    path: "/v1/nodes/node-00112233aabbccdd",
+    method: "DELETE",
+    credentials: "include",
+  });
+});
+
 test("trial API does not offer destroy", () => {
   const api = trialWith(() => ({ status: 200, json: {} }));
   assert.equal(typeof api.destroy, "undefined");

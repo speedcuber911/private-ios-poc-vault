@@ -85,6 +85,7 @@ ExperimentalWarning on Node 22 is expected.
 | `GET /v1/admin/nodes` | `Bearer $ADMIN_TOKEN` | ops-only; response omits pubkeys |
 | `GET /v1/admin/accounts` | Better Auth admin session | paginated `{ accounts }` with trial, nodes, entitlements; newest first; `limit` default 50 max 100 |
 | `POST /v1/admin/accounts/:id/upgrade` | Better Auth admin session | keep the hosted sandbox, set trial `upgraded`, raise `nodes.max` to at least 2 |
+| `DELETE /v1/admin/accounts/:id/machine` | Better Auth admin session | kill the hosted sandbox, delete the node, set trial `destroyed`; 409 `nothing_to_unlink` if none |
 
 All responses carry `cache-control: no-store` and
 `x-content-type-options: nosniff`. All body reads are bounded (JSON 32 KiB,

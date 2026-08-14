@@ -178,6 +178,12 @@ export function createTrial({
     });
   }
 
+  function unlinkNode(id) {
+    return cloud.cloudFetch(`/v1/nodes/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+  }
+
   return {
     startTrial,
     getCurrent,
@@ -185,6 +191,7 @@ export function createTrial({
     listNodes,
     getAccount,
     joinWaitlist,
+    unlinkNode,
   };
 }
 

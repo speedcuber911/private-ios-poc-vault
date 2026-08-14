@@ -18,6 +18,7 @@
   --accent-gradient: linear-gradient(135deg, var(--ember-bright), var(--ember-deep));
   --ember-shadow: 0 6px 20px color-mix(in srgb, var(--ember-deep) 25%, transparent);
   --shadow: 0 6px 20px color-mix(in srgb, #000 35%, transparent);
+  --page-width: 640px;
   --font-serif: "New York", "Iowan Old Style", "Apple Garamond", Palatino, "Palatino Linotype", ui-serif, Georgia, serif;
   --font-sans: "DM Sans", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "DM Mono", ui-monospace, Menlo, monospace;
@@ -319,7 +320,7 @@ a {
 
 .canvas-page {
   flex-direction: column;
-  align-items: flex-start;
+  align-items: center;
   justify-content: flex-start;
   padding-top: 48px;
 }
@@ -327,10 +328,18 @@ a {
 .chrome {
   display: flex;
   flex-wrap: wrap;
-  justify-content: flex-end;
+  justify-content: space-between;
+  align-items: baseline;
   gap: 8px 16px;
-  width: min(100%, 560px);
+  width: min(100%, var(--page-width));
   margin: 0 0 8px;
+}
+
+.chrome-end {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin-left: auto;
 }
 
 .chrome .btn-text {
@@ -338,8 +347,9 @@ a {
   margin: 0;
 }
 
-.page {
-  width: min(100%, 560px);
+.page,
+.page-admin {
+  width: min(100%, var(--page-width));
 }
 
 .page-title {
@@ -390,6 +400,23 @@ a {
 
 .machine-list li + li {
   border-top: 1px solid var(--hairline);
+}
+
+.machine-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 16px;
+}
+
+.machine-item .btn-text {
+  align-self: center;
+  margin: 0;
+}
+
+.machine-item .btn-text:disabled {
+  color: var(--ink-faint);
+  cursor: default;
 }
 
 .machine-row {
@@ -458,10 +485,6 @@ a {
   height: 36px;
   padding: 0 18px;
   font-size: 13px;
-}
-
-.page-admin {
-  width: min(100%, 720px);
 }
 
 .admin-row {

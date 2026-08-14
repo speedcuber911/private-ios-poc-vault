@@ -24,7 +24,7 @@ function machineIdFrom(route: string) {
 
 export default function App() {
   const [route, setRoute] = useState(currentPath);
-  const [nav, setNav] = useState({ showAdmin: false, impersonating: false });
+  const [nav, setNav] = useState({ signedIn: false, showAdmin: false, impersonating: false });
   const [sessionTick, setSessionTick] = useState(0);
 
   useEffect(() => {
@@ -47,7 +47,7 @@ export default function App() {
 
   useEffect(() => {
     if (authRoute) {
-      setNav({ showAdmin: false, impersonating: false });
+      setNav({ signedIn: false, showAdmin: false, impersonating: false });
       return;
     }
     let cancelled = false;
@@ -58,11 +58,12 @@ export default function App() {
         const user = result?.data?.user;
         const session = result?.data?.session;
         setNav({
+          signedIn: Boolean(user),
           showAdmin: shouldShowAdminNav({ signedIn: Boolean(user), role: user?.role }),
           impersonating: isImpersonating(session),
         });
       } catch {
-        if (!cancelled) setNav({ showAdmin: false, impersonating: false });
+        if (!cancelled) setNav({ signedIn: false, showAdmin: false, impersonating: false });
       }
     })();
     return () => {
@@ -128,17 +129,24 @@ export default function App() {
 
   return (
     <main className={authRoute ? "canvas" : "canvas canvas-page"}>
-      {!authRoute && (nav.showAdmin || nav.impersonating) ? (
+      {!authRoute && nav.signedIn ? (
         <nav className="chrome" aria-label="Console">
-          {nav.showAdmin ? (
-            <button type="button" className="btn-text" onClick={() => navigate("/admin")}>
-              Admin
-            </button>
-          ) : null}
-          {nav.impersonating ? (
-            <button type="button" className="btn-text" onClick={() => void stopImpersonating()}>
-              Stop impersonating
-            </button>
+          <button type="button" className="btn-text" onClick={() => navigate("/machines")}>
+            Machines
+          </button>
+          {nav.showAdmin || nav.impersonating ? (
+            <div className="chrome-end">
+              {nav.showAdmin ? (
+                <button type="button" className="btn-text" onClick={() => navigate("/admin")}>
+                  Admin
+                </button>
+              ) : null}
+              {nav.impersonating ? (
+                <button type="button" className="btn-text" onClick={() => void stopImpersonating()}>
+                  Stop impersonating
+                </button>
+              ) : null}
+            </div>
           ) : null}
         </nav>
       ) : null}

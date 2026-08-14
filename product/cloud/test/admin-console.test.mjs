@@ -366,6 +366,51 @@ test("trial routes after upgrade: current is upgraded, POST is spent, DELETE is 
   }
 });
 
+test("DELETE /v1/admin/accounts/:id/machine unlinks the hosted sandbox and deletes it", async () => {
+  const { t, provisioner } = await startAdminApp();
+  try {
+    const admin = await signUp(t, { email: ADMIN_EMAIL, username: "ops_unlink" });
+    const customer = await signUp(t, { email: "unlink@example.test", username: "unlink_user" });
+    await api(t.baseUrl, "POST", "/v1/trial-nodes", {
+      body: PAIRING,
+      ...authed(customer.token),
+    });
+    const seeded = seedReadyTrial(t, customer.user.id);
+
+    const forbidden = await api(
+      t.baseUrl,
+      "DELETE",
+      `/v1/admin/accounts/${customer.user.id}/machine`,
+      ba(t, customer.token),
+    );
+    assert.equal(forbidden.status, 403);
+
+    const unlinked = await api(
+      t.baseUrl,
+      "DELETE",
+      `/v1/admin/accounts/${customer.user.id}/machine`,
+      ba(t, admin.token),
+    );
+    assert.equal(unlinked.status, 200);
+    assert.equal(unlinked.json.ok, true);
+    assert.ok(provisioner.killed.includes(seeded.sandboxId));
+    assert.equal(t.app.registry.getNode(seeded.nodeId), null);
+    assert.equal(t.app.registry.getTrialByAccount(customer.user.id).state, "destroyed");
+    assert.equal(t.app.registry.getTrialByAccount(customer.user.id).sandboxId, null);
+
+    const empty = await api(
+      t.baseUrl,
+      "DELETE",
+      `/v1/admin/accounts/${customer.user.id}/machine`,
+      ba(t, admin.token),
+    );
+    assert.equal(empty.status, 409);
+    assert.equal(empty.json.error, "nothing_to_unlink");
+  } finally {
+    await t.close();
+  }
+});
+
 test("DELETE /v1/nodes/:id on an upgraded node kills the sandbox and sets trial destroyed", async () => {
   const { t, provisioner } = await startAdminApp();
   try {

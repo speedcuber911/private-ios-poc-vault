@@ -72,6 +72,17 @@ export function createRelayBetterAuth({
     plugins: [username(), bearer(), admin()],
     account: {
       encryptOAuthTokens: true,
+      // Relay never sends verification mail, so password accounts stay
+      // emailVerified=false. Better Auth's default then refuses to attach
+      // Apple to that row ("account not linked") even though Apple already
+      // proved the address. Trust Apple and allow the link; otherwise the
+      // phone Sign in with Apple button permanently locks out anyone who
+      // created the account from the web console first.
+      accountLinking: {
+        enabled: true,
+        trustedProviders: ["apple"],
+        requireLocalEmailVerified: false,
+      },
     },
     user: {
       deleteUser: {

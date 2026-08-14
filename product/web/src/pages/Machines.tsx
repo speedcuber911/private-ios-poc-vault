@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { RelayMark } from "./Login";
+import { confirmAndUnlink } from "../api/admin.js";
 import {
   decideMachineAction,
   kindWord,
@@ -38,6 +39,7 @@ export function Machines({
   const [waitlistJoined, setWaitlistJoined] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [joining, setJoining] = useState(false);
+  const [unlinkingId, setUnlinkingId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const onNeedLoginRef = useRef(onNeedLogin);
   onNeedLoginRef.current = onNeedLogin;
@@ -93,6 +95,36 @@ export function Machines({
     }
   }
 
+  async function unlink(node: NodeRow) {
+    if (unlinkingId) return;
+    setUnlinkingId(node.id);
+    setError(null);
+    try {
+      const result = await confirmAndUnlink(node.id, {
+        unlink: (id) => defaultTrial.unlinkNode(id),
+      });
+      if ("cancelled" in result && result.cancelled) return;
+      if (!result.ok) {
+        setError("Relay couldn't unlink that machine.");
+        return;
+      }
+      const [listed, current] = await Promise.all([
+        defaultTrial.listNodes(),
+        defaultTrial.getCurrent(),
+      ]);
+      if (!listed.ok) {
+        setError("Can't reach the Relay control plane.");
+        return;
+      }
+      setNodes(listed.json?.nodes ?? []);
+      setTrial(current.ok ? current.json?.trial ?? null : null);
+    } catch {
+      setError("Can't reach the Relay control plane.");
+    } finally {
+      setUnlinkingId(null);
+    }
+  }
+
   return (
     <div className="page">
       <div className="brand">
@@ -113,13 +145,21 @@ export function Machines({
           });
           const live = status.startsWith("TRIAL ·") || status === "READY";
           return (
-            <li key={node.id}>
+            <li key={node.id} className="machine-item">
               <button type="button" className="machine-row" onClick={() => onOpen(node.id)}>
                 <span className="machine-row-name">{node.name || "Machine"}</span>
                 <span className="kind-word">{kindWord(node.kind)}</span>
                 <span className={live ? "status-word status-live" : status === "FAILED" || status === "EXPIRED" ? "status-word status-error" : "status-word"}>
                   {status}
                 </span>
+              </button>
+              <button
+                type="button"
+                className="btn-text"
+                disabled={unlinkingId === node.id}
+                onClick={() => void unlink(node)}
+              >
+                Unlink
               </button>
             </li>
           );
