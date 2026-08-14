@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createCloud } from "../src/api/cloud.js";
 import { kindWord, machineStatusWord } from "../src/api/trial.js";
 import {
+  REMOVE_CONFIRM_COPY,
   UNLINK_CONFIRM_COPY,
   UPGRADE_CONFIRM_COPY,
   adminRouteFor,
@@ -98,9 +99,16 @@ test("trialStateWord is a small-caps state or NONE", () => {
 
 test("canUnlink is true when the account has a hosted machine", () => {
   assert.equal(canUnlink({ trial: { nodeId: "node-1" } }), true);
-  assert.equal(canUnlink({ trial: null, nodes: [{ id: "byo-1" }] }), true);
+  assert.equal(canUnlink({ trial: null, nodes: [{ id: "byo-1" }] }), false);
   assert.equal(canUnlink({ trial: { nodeId: null }, nodes: [] }), false);
   assert.equal(canUnlink({ trial: null, nodes: [] }), false);
+  assert.equal(
+    canUnlink({
+      trial: { state: "upgraded", nodeId: "hosted-1" },
+      nodes: [{ id: "hosted-1", kind: "byo" }, { id: "byo-2" }],
+    }),
+    true,
+  );
 });
 
 test("canUpgrade requires creating or ready plus a hosted nodeId", () => {
@@ -129,8 +137,15 @@ test("hostedMachineId and nodes.max come from the account row", () => {
     hostedMachineId({ trial: { nodeId: "node-9" }, nodes: [{ id: "other" }] }),
     "node-9",
   );
-  assert.equal(hostedMachineId({ trial: null, nodes: [{ id: "byo-1" }] }), "byo-1");
+  assert.equal(hostedMachineId({ trial: null, nodes: [{ id: "byo-1" }] }), null);
   assert.equal(hostedMachineId({ trial: null, nodes: [] }), null);
+  assert.equal(
+    hostedMachineId({
+      trial: { state: "upgraded", nodeId: "hosted-1" },
+      nodes: [{ id: "hosted-1", kind: "byo" }, { id: "byo-2" }],
+    }),
+    "hosted-1",
+  );
   assert.equal(nodesMax([{ feature: "nodes.max", value: "2" }]), "2");
   assert.equal(nodesMax([]), "0");
 });
@@ -139,6 +154,13 @@ test("unlink confirm copy is the operator warning", () => {
   assert.equal(
     UNLINK_CONFIRM_COPY,
     "Unlink deletes this hosted machine and its files.",
+  );
+});
+
+test("remove confirm copy warns that the computer and files stay", () => {
+  assert.equal(
+    REMOVE_CONFIRM_COPY,
+    "Remove this machine from your account. Your computer and its files are untouched.",
   );
 });
 
@@ -231,6 +253,26 @@ test("unlink confirm does not delete when the operator cancels", async () => {
   });
   assert.equal(result.cancelled, true);
   assert.equal(deleted, false);
+});
+
+test("confirmAndUnlink passes an optional message to confirm and defaults to UNLINK_CONFIRM_COPY", async () => {
+  const seen = [];
+  await confirmAndUnlink("acc-1", {
+    confirm: (copy) => {
+      seen.push(copy);
+      return false;
+    },
+    unlink: async () => ({ ok: true, status: 200, json: {} }),
+  });
+  await confirmAndUnlink("acc-1", {
+    message: REMOVE_CONFIRM_COPY,
+    confirm: (copy) => {
+      seen.push(copy);
+      return false;
+    },
+    unlink: async () => ({ ok: true, status: 200, json: {} }),
+  });
+  assert.deepEqual(seen, [UNLINK_CONFIRM_COPY, REMOVE_CONFIRM_COPY]);
 });
 
 test("409 nothing_to_upgrade is a short error word and does not throw", () => {

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { RelayMark } from "./Login";
-import { confirmAndUnlink } from "../api/admin.js";
+import { confirmAndUnlink, REMOVE_CONFIRM_COPY, UNLINK_CONFIRM_COPY } from "../api/admin.js";
 import {
   decideMachineAction,
   kindWord,
@@ -97,10 +97,12 @@ export function Machines({
 
   async function unlink(node: NodeRow) {
     if (unlinkingId) return;
+    const hosted = trial?.nodeId === node.id;
     setUnlinkingId(node.id);
     setError(null);
     try {
       const result = await confirmAndUnlink(node.id, {
+        message: hosted ? UNLINK_CONFIRM_COPY : REMOVE_CONFIRM_COPY,
         unlink: (id) => defaultTrial.unlinkNode(id),
       });
       if ("cancelled" in result && result.cancelled) return;
@@ -144,6 +146,7 @@ export function Machines({
             now,
           });
           const live = status.startsWith("TRIAL ·") || status === "READY";
+          const hosted = trial?.nodeId === node.id;
           return (
             <li key={node.id} className="machine-item">
               <button type="button" className="machine-row" onClick={() => onOpen(node.id)}>
@@ -159,7 +162,7 @@ export function Machines({
                 disabled={unlinkingId === node.id}
                 onClick={() => void unlink(node)}
               >
-                Unlink
+                {hosted ? "Unlink" : "Remove"}
               </button>
             </li>
           );

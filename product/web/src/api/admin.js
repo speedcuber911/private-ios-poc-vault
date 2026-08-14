@@ -9,6 +9,9 @@ export const UPGRADE_CONFIRM_COPY =
 export const UNLINK_CONFIRM_COPY =
   "Unlink deletes this hosted machine and its files.";
 
+export const REMOVE_CONFIRM_COPY =
+  "Remove this machine from your account. Your computer and its files are untouched.";
+
 const TRIAL_STATES = new Set([
   "creating",
   "ready",
@@ -65,7 +68,7 @@ export function roleActionLabel(role) {
 }
 
 export function hostedMachineId(account) {
-  return account?.trial?.nodeId || account?.nodes?.[0]?.id || null;
+  return account?.trial?.nodeId || null;
 }
 
 export function nodesMax(entitlements = []) {
@@ -104,6 +107,7 @@ export async function confirmAndUpgrade(
  * @param {{
  *   confirm?: (message?: string) => boolean,
  *   unlink: (id: string) => Promise<{ ok?: boolean, status?: number, json?: { error?: string } | null, cancelled?: boolean }>,
+ *   message?: string,
  * }} opts
  */
 export async function confirmAndUnlink(
@@ -111,9 +115,10 @@ export async function confirmAndUnlink(
   {
     confirm = globalThis.confirm?.bind(globalThis),
     unlink,
+    message = UNLINK_CONFIRM_COPY,
   } = {},
 ) {
-  if (!confirm(UNLINK_CONFIRM_COPY)) return { cancelled: true };
+  if (!confirm(message)) return { cancelled: true };
   return unlink(accountId);
 }
 

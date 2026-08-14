@@ -1023,7 +1023,7 @@ export function createApp({
         return sendJson(res, 404, { error: "unknown_account" });
       }
       const target = publicAdminAccount(db, registry, seg[3]);
-      const nodeId = target.trial?.nodeId || target.nodes?.[0]?.id || null;
+      const nodeId = target.trial?.nodeId || null;
       const node = nodeId ? registry.getNode(nodeId) : null;
       if (!node) {
         return sendJson(res, 409, { error: "nothing_to_unlink" });

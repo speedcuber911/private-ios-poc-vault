@@ -411,6 +411,34 @@ test("DELETE /v1/admin/accounts/:id/machine unlinks the hosted sandbox and delet
   }
 });
 
+test("DELETE /v1/admin/accounts/:id/machine refuses BYO-only accounts and leaves the node", async () => {
+  const { t } = await startAdminApp();
+  try {
+    const admin = await signUp(t, { email: ADMIN_EMAIL, username: "ops_byo_unlink" });
+    const customer = await signUp(t, { email: "byo-only@example.test", username: "byo_only" });
+    const node = t.app.registry.createNode(customer.user.id, {
+      id: "node-byoonly000001",
+      kind: "byo",
+      name: "My laptop",
+      pubkey: "pk-byo",
+      version: null,
+    });
+    assert.equal(t.app.registry.getTrialByAccount(customer.user.id), null);
+
+    const refused = await api(
+      t.baseUrl,
+      "DELETE",
+      `/v1/admin/accounts/${customer.user.id}/machine`,
+      ba(t, admin.token),
+    );
+    assert.equal(refused.status, 409);
+    assert.equal(refused.json.error, "nothing_to_unlink");
+    assert.ok(t.app.registry.getNode(node.id), "BYO node must still exist after admin unlink refusal");
+  } finally {
+    await t.close();
+  }
+});
+
 test("DELETE /v1/nodes/:id on an upgraded node kills the sandbox and sets trial destroyed", async () => {
   const { t, provisioner } = await startAdminApp();
   try {
