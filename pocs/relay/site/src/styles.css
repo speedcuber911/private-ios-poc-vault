@@ -93,7 +93,7 @@ a:focus-visible, button:focus-visible { outline: 1px solid var(--accent); outlin
   text-transform: uppercase;
   user-select: none;
 }
-.text-pressure h1 span { display: inline-block; transform: translateZ(0); }
+.text-pressure h1 span { display: inline-block; }
 .hero-pressure { position: absolute; z-index: 3; top: 17%; left: var(--gutter); width: calc(100% - (var(--gutter) * 2)); height: 25%; color: var(--paper); }
 .hero-label { position: absolute; z-index: 4; top: 14%; font-family: var(--mono); font-size: 9px; letter-spacing: 0.14em; color: rgba(241, 237, 228, 0.52); }
 .hero-label-left { left: var(--gutter); }
@@ -4956,4 +4956,3 @@ footer a:hover { color: var(--paper); }
     font-size: 10px;
   }
 }
-
