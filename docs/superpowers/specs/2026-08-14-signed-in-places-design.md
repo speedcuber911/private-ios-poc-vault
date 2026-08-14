@@ -69,7 +69,8 @@ sessions and CLI JWTs never get a row.
 browser_sessions (
   id                      TEXT PRIMARY KEY,  -- public revoke id
   account_id              TEXT NOT NULL,
-  better_auth_session_id  TEXT NOT NULL UNIQUE,
+  better_auth_session_id  TEXT UNIQUE,       -- null until mint completes
+
   display_name            TEXT,
   platform                TEXT,
   created_at              INTEGER NOT NULL
@@ -79,8 +80,11 @@ CREATE INDEX idx_browser_sessions_account ON browser_sessions (account_id);
 
 `id` is a new opaque id (same random-id style as other registry rows).
 Responses never include Better Auth session tokens or cookie values.
-`better_auth_session_id` is the Better Auth `session.id` used to delete
-the cookie session.
+`better_auth_session_id` is the Better Auth `session.id`. Revoke does
+**not** call Better Auth's revoke API (that keys off the session
+**token**, which we do not store). Delete the `session` row by `id`
+with a direct SQL `DELETE FROM session WHERE id = ?` on the same
+DatabaseSync, then delete the sidecar row, in one transaction.
 
 Write a row when:
 
@@ -100,13 +104,25 @@ sidecar rows whose Better Auth session is missing or expired. Account
 delete already wipes registry rows; also delete `browser_sessions` for
 that `account_id`.
 
-Cap: before minting a web cookie or inserting a password-login sidecar,
-count live browser rows for the account. If count ≥ 10, do not mint /
-do not insert. Device-code token returns `429 { "error":
-"too_many_browsers" }`. Password web sign-in that would exceed the cap
-must not leave a usable cookie: delete the Better Auth session just
-created and return the same 429 (Better Auth's own handler may have
-already set the cookie — clear it with `Set-Cookie` max-age 0).
+Cap: live-count and sidecar INSERT share one `BEGIN IMMEDIATE`
+transaction on the registry's DatabaseSync (SQLite's single writer
+makes that sufficient; a count-then-insert without the lock lets two
+sign-ins at 9 rows land 11). **Do not `await` inside that
+transaction** — this process shares one DatabaseSync across requests,
+so a yield would let another request join the open transaction.
+createSession is async (`internalAdapter`), so: (1) BEGIN IMMEDIATE,
+count live rows, INSERT a sidecar reservation if count < 10, COMMIT;
+(2) mint the Better Auth session; (3) UPDATE the sidecar with
+`better_auth_session_id`. If mint fails, DELETE the reservation. The
+11th INSERT hits the count under the lock and returns `cap`.
+Device-code token returns `429 { "error": "too_many_browsers" }`.
+Password web sign-in that would exceed the cap must not leave a
+usable cookie: delete the Better Auth session just created and return
+the same 429 (Better Auth's own handler may have already set the
+cookie — clear it with `Set-Cookie` max-age 0). List and revoke ignore
+reservations whose `better_auth_session_id` is still null after a
+short grace (treat as not live). `better_auth_session_id` is nullable
+until step (3); SQLite UNIQUE still allows multiple nulls.
 
 ### 3.2 Existing CLI rules (unchanged, restated)
 
@@ -288,8 +304,9 @@ row. Deleting a browser does not sign out the caller unless the caller
   computer plus two browsers; expired Better Auth session omitted.
   Revoke: own browser 200 then cookie 401; foreign/unknown 404;
   revoke does not drop the CLI link; disconnect computer does not
-  drop browsers. Cap: 10th web token succeeds, 11th 429, no 11th
-  sidecar row. Password web origin inserts a sidecar; iOS-style
+  drop browsers. Direct `session` row delete (not token-keyed revoke
+  API). Cap: 10th web token succeeds, 11th 429, no 11th sidecar row;
+  two concurrent mints at 9 rows still cannot persist an 11th. Password web origin inserts a sidecar; iOS-style
   `/api/auth` without that Origin does not. Existing device-code
   tests remain: web approve with CLI linked; CLI inspect/approve 409
   when linked.

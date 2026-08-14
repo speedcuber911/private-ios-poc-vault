@@ -90,6 +90,11 @@ if [[ "$reuse_release" == false ]]; then
   )
   touch "$release_dir/.relay-release-ready"
   chown -R root:root "$release_dir"
+  # Host umask 0077 (and `cp -a` of a mktemp source) can leave the tree
+  # 0700/0600 root:root. Directories-only chmod makes systemd CHDIR succeed
+  # and then node fails opening main.js as relaycloud. a+rX: everyone can
+  # read; execute only on dirs and files that already have an execute bit.
+  chmod -R a+rX "$release_dir"
 fi
 
 install -d -m 0755 -o root -g root /opt/relay-cloud/releases

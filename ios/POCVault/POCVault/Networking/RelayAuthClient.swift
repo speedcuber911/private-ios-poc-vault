@@ -159,6 +159,7 @@ final class RelayAuthClient {
             let platform: String?
             let createdAt: Int64
             let expiresAt: Int64
+            let client: String?
         }
         guard let response: Payload = try await request(
             method: "POST",
@@ -170,7 +171,8 @@ final class RelayAuthClient {
             machineName: response.machineName,
             platform: response.platform,
             createdAt: response.createdAt,
-            expiresAt: response.expiresAt
+            expiresAt: response.expiresAt,
+            client: response.client == "web" ? .web : .cli
         )
     }
 
@@ -200,6 +202,25 @@ final class RelayAuthClient {
         guard let response: Payload = try await request(
             method: "DELETE",
             path: "/v1/auth/device/link",
+            bearerToken: bearerToken
+        ) else { throw RelayAuthClientError.invalidResponse }
+        guard response.ok else { throw RelayAuthClientError.invalidResponse }
+    }
+
+    func signedInPlaces(bearerToken: String) async throws -> RelaySignedInPlaces {
+        guard let response: RelaySignedInPlaces = try await request(
+            method: "GET",
+            path: "/v1/auth/places",
+            bearerToken: bearerToken
+        ) else { throw RelayAuthClientError.invalidResponse }
+        return response
+    }
+
+    func removeBrowser(id: String, bearerToken: String) async throws {
+        struct Payload: Decodable { let ok: Bool }
+        guard let response: Payload = try await request(
+            method: "DELETE",
+            path: "/v1/auth/places/browsers/\(id)",
             bearerToken: bearerToken
         ) else { throw RelayAuthClientError.invalidResponse }
         guard response.ok else { throw RelayAuthClientError.invalidResponse }

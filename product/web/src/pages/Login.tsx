@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { cloud } from "../api/cloud.js";
-import { device as defaultDevice, qrPayloadFromStart } from "../api/device.js";
+import { device as defaultDevice, qrPayloadFromStart, iphonePollErrorMessage } from "../api/device.js";
 import { drawQrToCanvas } from "../api/qr.js";
 
 type Mode = "signIn" | "createAccount";
@@ -134,11 +134,7 @@ function IphonePanel({
           return;
         }
         if (granted.json?.error === "aborted") return;
-        if (granted.json?.error === "expired_token") {
-          setError("That code isn't valid anymore.");
-          return;
-        }
-        setError("Relay could not complete that request.");
+        setError(iphonePollErrorMessage(granted.json?.error));
       } catch {
         if (!ac.signal.aborted) setError("Can't reach the Relay control plane.");
       }

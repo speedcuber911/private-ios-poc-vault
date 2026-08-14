@@ -134,5 +134,13 @@ export function createDevice({
   };
 }
 
+export function iphonePollErrorMessage(error) {
+  if (error === "expired_token") return "That code isn't valid anymore.";
+  if (error === "too_many_browsers") {
+    return "This account already has 10 signed-in browsers. Remove one from the Relay app, then try again.";
+  }
+  return "Relay could not complete that request.";
+}
+
 export const device = createDevice();
 export { CLI_CONFIRM_COPY };

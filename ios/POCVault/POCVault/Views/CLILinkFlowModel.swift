@@ -1,10 +1,16 @@
 import Foundation
 
+enum DeviceCodeClient: String, Equatable {
+    case cli
+    case web
+}
+
 struct DeviceCodeInspectResult: Equatable {
     let machineName: String?
     let platform: String?
     let createdAt: Int64
     let expiresAt: Int64
+    let client: DeviceCodeClient
 }
 
 struct CLIComputerLink: Decodable, Equatable, Identifiable {
@@ -21,6 +27,18 @@ struct CLIComputerLink: Decodable, Equatable, Identifiable {
     let createdAt: Int64
 }
 
+struct RelayBrowserSession: Decodable, Equatable, Identifiable {
+    let id: String
+    let name: String?
+    let platform: String?
+    let createdAt: Int64
+}
+
+struct RelaySignedInPlaces: Decodable, Equatable {
+    let computer: CLIComputerLink?
+    let browsers: [RelayBrowserSession]
+}
+
 protocol CLILinkAuthClient: AnyObject {
     func deviceInspect(userCode: String, bearerToken: String) async throws -> DeviceCodeInspectResult
     func deviceApprove(userCode: String, bearerToken: String) async throws
@@ -35,18 +53,24 @@ final class CLILinkFlowModel: ObservableObject {
     enum Step: Equatable {
         case scanning
         case inspecting
-        case confirm(machineName: String?, platform: String?)
+        case confirm(machineName: String?, platform: String?, client: DeviceCodeClient)
         case approving
-        case approved(machineName: String?)
+        case approved(machineName: String?, client: DeviceCodeClient)
         case failed(String)
     }
 
     static let staleCodeMessage =
         "That code isn't valid anymore. Run `relay login` on your computer to get a fresh one."
+    static let webStaleCodeMessage =
+        "That code isn't valid anymore. Open Sign in with iPhone again to get a fresh one."
     static let networkRetryMessage =
         "Couldn't reach Relay. Check your connection and try again."
     static let alreadyLinkedMessage =
         "A computer is already connected. Disconnect it in Account & Settings before linking another one."
+
+    static func staleCodeMessage(for client: DeviceCodeClient) -> String {
+        client == .web ? webStaleCodeMessage : staleCodeMessage
+    }
 
     @Published private(set) var step: Step = .scanning
     @Published var manualCode: String = ""
@@ -55,6 +79,7 @@ final class CLILinkFlowModel: ObservableObject {
     private let bearerToken: String
     private var pendingUserCode: String?
     private var pendingMachineName: String?
+    private(set) var pendingClient: DeviceCodeClient = .cli
 
     init(authClient: CLILinkAuthClient, bearerToken: String) {
         self.authClient = authClient
@@ -64,6 +89,7 @@ final class CLILinkFlowModel: ObservableObject {
     func resetToScanning() {
         pendingUserCode = nil
         pendingMachineName = nil
+        pendingClient = .cli
         manualCode = ""
         step = .scanning
     }
@@ -84,9 +110,9 @@ final class CLILinkFlowModel: ObservableObject {
         step = .approving
         do {
             try await authClient.deviceApprove(userCode: userCode, bearerToken: bearerToken)
-            step = .approved(machineName: pendingMachineName)
+            step = .approved(machineName: pendingMachineName, client: pendingClient)
         } catch let error as RelayAuthClientError {
-            step = .failed(Self.message(for: error))
+            step = .failed(Self.message(for: error, client: pendingClient))
         } catch {
             step = .failed(Self.networkRetryMessage)
         }
@@ -95,6 +121,7 @@ final class CLILinkFlowModel: ObservableObject {
     func cancelConfirm() {
         pendingUserCode = nil
         pendingMachineName = nil
+        pendingClient = .cli
         step = .scanning
     }
 
@@ -108,26 +135,30 @@ final class CLILinkFlowModel: ObservableObject {
         do {
             let info = try await authClient.deviceInspect(userCode: userCode, bearerToken: bearerToken)
             pendingMachineName = info.machineName
-            step = .confirm(machineName: info.machineName, platform: info.platform)
+            pendingClient = info.client
+            step = .confirm(machineName: info.machineName, platform: info.platform, client: info.client)
         } catch let error as RelayAuthClientError {
             pendingUserCode = nil
             pendingMachineName = nil
-            step = .failed(Self.message(for: error))
+            let client = pendingClient
+            pendingClient = .cli
+            step = .failed(Self.message(for: error, client: client))
         } catch {
             pendingUserCode = nil
             pendingMachineName = nil
+            pendingClient = .cli
             step = .failed(Self.networkRetryMessage)
         }
     }
 
-    private static func message(for error: RelayAuthClientError) -> String {
+    private static func message(for error: RelayAuthClientError, client: DeviceCodeClient = .cli) -> String {
         switch error {
         case .server(let status, let code, _) where status == 409 && code == "computer_already_linked":
             return alreadyLinkedMessage
         case .server(let status, _, _) where status == 404 || status == 429:
-            return staleCodeMessage
+            return staleCodeMessage(for: client)
         case .invalidResponse, .missingSessionToken:
-            return staleCodeMessage
+            return staleCodeMessage(for: client)
         case .server:
             return networkRetryMessage
         }

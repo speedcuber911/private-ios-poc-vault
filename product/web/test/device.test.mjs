@@ -7,6 +7,7 @@ import {
   parseUserCodeFromHash,
   qrPayloadFromStart,
   decideCliLogin,
+  iphonePollErrorMessage,
 } from "../src/api/device.js";
 
 function mockFetch(handler) {
@@ -228,4 +229,10 @@ test("decideCliLogin never auto-approves a web code as CLI", () => {
     }),
     { action: "login" },
   );
+});
+
+test("iphonePollErrorMessage explains the browser cap", () => {
+  assert.match(iphonePollErrorMessage("too_many_browsers"), /10 signed-in browsers/);
+  assert.match(iphonePollErrorMessage("expired_token"), /isn't valid anymore/);
+  assert.match(iphonePollErrorMessage("other"), /could not complete/);
 });

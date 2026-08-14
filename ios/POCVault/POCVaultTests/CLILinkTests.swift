@@ -48,16 +48,17 @@ final class CLILinkTests: XCTestCase {
             machineName: "dev-box",
             platform: "macos",
             createdAt: 1,
-            expiresAt: 2
+            expiresAt: 2,
+            client: .cli
         )
         let model = CLILinkFlowModel(authClient: stub, bearerToken: "tok")
 
         await model.submitScannedPayload("https://relay.example/cli-login#code=ABCD-EFGH")
-        XCTAssertEqual(model.step, .confirm(machineName: "dev-box", platform: "macos"))
+        XCTAssertEqual(model.step, .confirm(machineName: "dev-box", platform: "macos", client: .cli))
         XCTAssertEqual(stub.lastInspectCode, "ABCD-EFGH")
 
         await model.confirmLink()
-        XCTAssertEqual(model.step, .approved(machineName: "dev-box"))
+        XCTAssertEqual(model.step, .approved(machineName: "dev-box", client: .cli))
         XCTAssertEqual(stub.lastApproveCode, "ABCD-EFGH")
     }
 
@@ -88,6 +89,30 @@ final class CLILinkTests: XCTestCase {
         await model.submitManualCode()
 
         XCTAssertEqual(model.step, .failed(CLILinkFlowModel.alreadyLinkedMessage))
+    }
+
+    func testFlowWebClientUsesBrowserConfirmCopy() async {
+        let stub = StubCLILinkAuth()
+        stub.inspectResult = DeviceCodeInspectResult(
+            machineName: "This browser",
+            platform: "web",
+            createdAt: 1,
+            expiresAt: 2,
+            client: .web
+        )
+        let model = CLILinkFlowModel(authClient: stub, bearerToken: "tok")
+        await model.submitScannedPayload("https://relay.example/cli-login#code=ABCD-EFGH")
+        XCTAssertEqual(
+            model.step,
+            .confirm(machineName: "This browser", platform: "web", client: .web)
+        )
+        await model.confirmLink()
+        XCTAssertEqual(model.step, .approved(machineName: "This browser", client: .web))
+    }
+
+    func testWebStaleCopyDoesNotMentionRelayLogin() {
+        XCTAssertFalse(CLILinkFlowModel.staleCodeMessage(for: .web).contains("`relay login`"))
+        XCTAssertTrue(CLILinkFlowModel.staleCodeMessage(for: .cli).contains("`relay login`"))
     }
 }
 
