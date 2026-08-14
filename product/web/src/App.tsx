@@ -71,8 +71,13 @@ export default function App() {
   }, [authRoute, route, sessionTick]);
 
   async function stopImpersonating() {
-    await cloud.authClient.admin.stopImpersonating();
-    setSessionTick((tick) => tick + 1);
+    try {
+      await cloud.authClient.admin.stopImpersonating();
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setSessionTick((tick) => tick + 1);
+    }
   }
 
   let screen = (
