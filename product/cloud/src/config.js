@@ -1,6 +1,8 @@
 // Relay Cloud configuration. All values come from the environment; nothing is
 // read from disk here. No secrets are ever echoed back in logs or responses.
 
+import { normalizeEmail } from "./registry.js";
+
 // Margin between Relay's own destroy point (ttl + grace) and the sandbox-level
 // auto-kill we hand the platform. The reaper runs every 60 s, so an hour is
 // ample for it to act first; in the normal case Relay destroys the sandbox and
@@ -94,6 +96,13 @@ export function loadConfig(env = process.env) {
     // never authorize file reads or job submission on any node).
     adminToken: env.ADMIN_TOKEN || "",
     brokerToken: env.BROKER_TOKEN || "",
+    // Better Auth admin plugin pinning. Comma-separated emails, compared after
+    // normalizeEmail. A matching session is an admin even if set-role demoted
+    // the stored role; Relay never hard-codes a production address here.
+    adminEmails: (env.RELAY_ADMIN_EMAILS || "")
+      .split(",")
+      .map((s) => normalizeEmail(s))
+      .filter(Boolean),
 
     // APNs token auth (provider JWT, ES256). When unset, main.js wires a
     // no-op transport and pushes are recorded as skipped.

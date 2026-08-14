@@ -364,6 +364,49 @@ test("trial create: retry after user delete reuses the row instead of burning th
   }
 });
 
+test("trial current: upgraded returns 200, not no_trial; POST is spent; DELETE is blocked", async () => {
+  const provisioner = makeFakeProvisioner();
+  const t = await startTestApp({ env: TRIAL_ENV, provisioner });
+  try {
+    const s = await signIn(t);
+    await api(t.baseUrl, "POST", "/v1/trial-nodes", { body: PAIRING, ...authed(s.sessionToken) });
+    const trial = t.app.registry.getTrialByAccount(s.accountId);
+    t.app.registry.createNode(s.accountId, {
+      id: "node-00112233aabbccdd",
+      kind: "trial",
+      name: "Trial machine",
+      pubkey: "pk",
+      version: null,
+    });
+    t.app.registry.updateTrial(trial.id, {
+      state: "upgraded",
+      nodeId: "node-00112233aabbccdd",
+      sandboxId: "sbx_1",
+    });
+
+    const current = await api(t.baseUrl, "GET", "/v1/trial-nodes/current", authed(s.sessionToken));
+    assert.equal(current.status, 200);
+    assert.equal(current.json.trial.state, "upgraded");
+
+    const create = await api(t.baseUrl, "POST", "/v1/trial-nodes", {
+      body: PAIRING,
+      ...authed(s.sessionToken),
+    });
+    assert.equal(create.status, 409);
+    assert.equal(create.json.error, "trial_already_used");
+    assert.equal(t.app.registry.getTrialByAccount(s.accountId).state, "upgraded");
+    assert.equal(provisioner.created.length, 1);
+
+    const del = await api(t.baseUrl, "DELETE", "/v1/trial-nodes/current", authed(s.sessionToken));
+    assert.equal(del.status, 409);
+    assert.equal(del.json.error, "trial_not_deletable");
+    assert.equal(t.app.registry.getTrialByAccount(s.accountId).state, "upgraded");
+    assert.deepEqual(provisioner.killed, []);
+  } finally {
+    await t.close();
+  }
+});
+
 test("trial create: expired still 409s — the TTL was spent", async () => {
   const provisioner = makeFakeProvisioner();
   const t = await startTestApp({ env: TRIAL_ENV, provisioner });

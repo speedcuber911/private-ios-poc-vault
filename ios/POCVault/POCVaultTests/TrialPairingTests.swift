@@ -39,6 +39,13 @@ final class TrialPairingTests: XCTestCase {
         XCTAssertEqual(trial.nodeURL, URL(string: "https://node-0011223344556677.tun.test"))
     }
 
+    func testTrialNodeDecodesUpgradedState() throws {
+        let json = #"{"id":"t1","state":"upgraded","nodeId":"node-0011223344556677","sni":"node-0011223344556677.tun.test","createdAt":1000,"expiresAt":2000}"#
+        let trial = try JSONDecoder().decode(RelayTrialNode.self, from: Data(json.utf8))
+        XCTAssertEqual(trial.state, .upgraded)
+        XCTAssertEqual(trial.nodeURL, URL(string: "https://node-0011223344556677.tun.test"))
+    }
+
     func testTrialEnvelopeDecoding() throws {
         let json = #"{"trial":{"id":"t1","state":"creating","nodeId":null,"sni":null,"createdAt":1,"expiresAt":2}}"#
         let trial = try RelayTrialClient.decodeTrialEnvelope(Data(json.utf8))
@@ -94,6 +101,16 @@ final class TrialPairingTests: XCTestCase {
         XCTAssertEqual(trial.remainingDescription(now: Date(timeIntervalSince1970: 0)), "2 days left")
         XCTAssertEqual(trial.remainingDescription(now: Date(timeIntervalSince1970: 169_200)), "1 hour left")
         XCTAssertEqual(trial.remainingDescription(now: Date(timeIntervalSince1970: 200_000)), "Trial expired")
+    }
+
+    func testUpgradedRemainingDescriptionIsNotACountdown() throws {
+        let trial = try Self.upgradedTrial()
+        let description = trial.remainingDescription(now: Date(timeIntervalSince1970: 0))
+        XCTAssertEqual(description, "")
+        XCTAssertFalse(
+            description.contains("left"),
+            "upgraded must not show a TTL countdown, got: \(description)"
+        )
     }
 
     @MainActor
@@ -322,6 +339,57 @@ final class TrialPairingTests: XCTestCase {
         XCTAssertTrue(store.hasMachine)
     }
 
+    @MainActor
+    func testTrialRefreshOfUpgradedKeepsTheNodeURL() throws {
+        let suite = "trial-refresh-upgraded-tests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+
+        let store = RelayNodeStore(defaults: defaults)
+        store.adoptTrial(try Self.readyTrial())
+        store.applyRefresh(.success(try Self.upgradedTrial()))
+
+        XCTAssertEqual(store.trial?.state, .upgraded)
+        XCTAssertEqual(store.activeNodeURL, URL(string: "https://node-0011223344556677.tun.test"))
+        XCTAssertTrue(store.hasMachine)
+
+        let restored = RelayNodeStore(defaults: defaults)
+        XCTAssertEqual(restored.trial?.state, .upgraded)
+        XCTAssertEqual(restored.activeNodeURL, URL(string: "https://node-0011223344556677.tun.test"))
+    }
+
+    @MainActor
+    func testTrialRefreshNoTrialStillClearsAnUpgradedMachine() throws {
+        let suite = "trial-refresh-upgraded-no-trial-tests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+
+        let store = RelayNodeStore(defaults: defaults)
+        store.adoptTrial(try Self.readyTrial())
+        store.applyRefresh(.success(try Self.upgradedTrial()))
+        store.applyRefresh(.failure(RelayTrialClientError.noTrial))
+
+        XCTAssertNil(store.trial)
+        XCTAssertNil(store.activeNodeURL)
+        XCTAssertNil(RelayNodeStore(defaults: defaults).trial)
+    }
+
+    func testStatusBannerVisibilityByTrialState() throws {
+        XCTAssertTrue(try Self.trial(state: "creating").showsStatusBanner)
+        XCTAssertTrue(try Self.readyTrial().showsStatusBanner)
+        XCTAssertTrue(try Self.expiredTrial().showsStatusBanner)
+        XCTAssertFalse(try Self.upgradedTrial().showsStatusBanner)
+        XCTAssertFalse(try Self.trial(state: "destroyed").showsStatusBanner)
+        XCTAssertFalse(try Self.trial(state: "failed").showsStatusBanner)
+    }
+
+    func testTrialMachineSectionIsHiddenWhenUpgraded() throws {
+        XCTAssertFalse(try Self.upgradedTrial().showsTrialMachineSection)
+        XCTAssertTrue(try Self.readyTrial().showsTrialMachineSection)
+        XCTAssertTrue(try Self.expiredTrial().showsTrialMachineSection)
+        XCTAssertTrue(try Self.trial(state: "creating").showsTrialMachineSection)
+    }
+
     // MARK: - Fixtures
 
     /// Every non-authoritative failure shape the foreground refresh can hit:
@@ -342,6 +410,17 @@ final class TrialPairingTests: XCTestCase {
 
     private static func expiredTrial() throws -> RelayTrialNode {
         let json = #"{"id":"t1","state":"expired","nodeId":"node-0011223344556677","sni":"node-0011223344556677.tun.test","createdAt":1,"expiresAt":2}"#
+        return try JSONDecoder().decode(RelayTrialNode.self, from: Data(json.utf8))
+    }
+
+    /// Far-future `expiresAt` so a mistaken countdown would read "2 days left".
+    private static func upgradedTrial() throws -> RelayTrialNode {
+        let json = #"{"id":"t1","state":"upgraded","nodeId":"node-0011223344556677","sni":"node-0011223344556677.tun.test","createdAt":0,"expiresAt":172800000}"#
+        return try JSONDecoder().decode(RelayTrialNode.self, from: Data(json.utf8))
+    }
+
+    private static func trial(state: String) throws -> RelayTrialNode {
+        let json = #"{"id":"t1","state":"\#(state)","nodeId":"node-0011223344556677","sni":"node-0011223344556677.tun.test","createdAt":1,"expiresAt":2}"#
         return try JSONDecoder().decode(RelayTrialNode.self, from: Data(json.utf8))
     }
 

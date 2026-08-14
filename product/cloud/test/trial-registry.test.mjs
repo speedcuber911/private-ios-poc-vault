@@ -56,6 +56,49 @@ test("createNode accepts an explicit id and keeps generating ids otherwise", () 
   assert.match(generated.id, /^[0-9a-f-]{36}$/);
 });
 
+test("upgradeTrialAccount converts a live trial and skips upgraded rows in due/active scans", () => {
+  const { registry, clock } = freshRegistry();
+  const acct = registry.createAccount({ email: "u@example.com" });
+  registry.setEntitlement(acct.id, "nodes.max", "1");
+  const trial = registry.createTrialNode({
+    accountId: acct.id,
+    enrollTokenHash: "h",
+    expiresAt: clock.t + 100,
+  });
+  registry.createNode(acct.id, {
+    id: "node-0123456789abcdef",
+    kind: "trial",
+    name: "Trial machine",
+    pubkey: "pk",
+    version: null,
+  });
+  registry.updateTrial(trial.id, {
+    state: "ready",
+    nodeId: "node-0123456789abcdef",
+    sandboxId: "sbx_keep",
+  });
+
+  assert.equal(registry.upgradeTrialAccount("missing").error, "unknown_account");
+  const result = registry.upgradeTrialAccount(acct.id);
+  assert.equal(result.ok, true);
+  assert.equal(registry.getNode("node-0123456789abcdef").kind, "byo");
+  assert.equal(registry.getNode("node-0123456789abcdef").name, "Machine");
+  const upgraded = registry.getTrialByAccount(acct.id);
+  assert.equal(upgraded.state, "upgraded");
+  assert.equal(upgraded.sandboxId, "sbx_keep");
+  assert.equal(registry.getEntitlement(acct.id, "nodes.max"), "2");
+
+  const again = registry.upgradeTrialAccount(acct.id);
+  assert.equal(again.ok, true);
+
+  clock.t += 10_000;
+  assert.equal(registry.listTrialsDue(clock.t).length, 0);
+  assert.equal(registry.countActiveTrials(), 0);
+
+  const empty = registry.createAccount({ email: "n@example.com" });
+  assert.equal(registry.upgradeTrialAccount(empty.id).error, "nothing_to_upgrade");
+});
+
 test("deleteAccount removes trial rows", () => {
   const { registry, clock } = freshRegistry();
   const acct = registry.createAccount({ email: "d@example.com" });

@@ -49,3 +49,40 @@ test("reaper: expiry pauses, grace destroys, idempotent", async () => {
     await t.close();
   }
 });
+
+test("reaper: upgraded rows past expires_at are not paused or destroyed", async () => {
+  const paused = [];
+  const killed = [];
+  const provisioner = {
+    async createSandbox() { return { sandboxId: "sbx_up" }; },
+    async writeSandboxFile() { return true; },
+    async pauseSandbox(id) { paused.push(id); return true; },
+    async killSandbox(id) { killed.push(id); return true; },
+  };
+  const t = await startTestApp({ env: TRIAL_ENV, provisioner });
+  try {
+    const s = await signIn(t);
+    await api(t.baseUrl, "POST", "/v1/trial-nodes", { body: PAIRING, ...authed(s.sessionToken) });
+    const trial = t.app.registry.getTrialByAccount(s.accountId);
+    t.app.registry.createNode(s.accountId, {
+      id: "node-00112233aabbccdd",
+      kind: "byo",
+      name: "Machine",
+      pubkey: "pk",
+      version: null,
+    });
+    t.app.registry.updateTrial(trial.id, {
+      state: "upgraded",
+      nodeId: "node-00112233aabbccdd",
+    });
+
+    t.clock.t += 20_000;
+    await t.app.sweepTrials();
+    assert.deepEqual(paused, []);
+    assert.deepEqual(killed, []);
+    assert.equal(t.app.registry.getTrialByAccount(s.accountId).state, "upgraded");
+    assert.ok(t.app.registry.getNode("node-00112233aabbccdd"));
+  } finally {
+    await t.close();
+  }
+});

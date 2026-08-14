@@ -426,7 +426,7 @@ struct POCVaultRootView: View {
         // Only at the root: the countdown is about the machine as a whole, so
         // repeating it on every drilled-in folder would be noise.
         .safeAreaInset(edge: .top) {
-            if isRoot, let trial = nodeStore.trial, trial.state != .destroyed {
+            if isRoot, let trial = nodeStore.trial, trial.showsStatusBanner {
                 TrialStatusBanner(
                     trial: trial,
                     client: codexClient,

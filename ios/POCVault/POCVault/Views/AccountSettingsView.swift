@@ -138,7 +138,7 @@ struct AccountSettingsView: View {
                     }
                 }
 
-                if let trial = nodeStore.trial {
+                if let trial = nodeStore.trial, trial.showsTrialMachineSection {
                     Section {
                         LabeledContent("Status", value: Self.stateLabel(for: trial.state))
                         LabeledContent("Expires", value: Self.expiryFormatter.string(from: trial.expiresDate))
@@ -388,6 +388,7 @@ struct AccountSettingsView: View {
         case .expired: return "Expired"
         case .destroyed: return "Destroyed"
         case .failed: return "Failed"
+        case .upgraded: return "Upgraded"
         }
     }
 

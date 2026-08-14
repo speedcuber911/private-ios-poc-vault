@@ -4,8 +4,8 @@
 import { betterAuth } from "better-auth";
 import { getMigrations } from "better-auth/db/migration";
 import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
-import { bearer, username } from "better-auth/plugins";
-import { ENTITLEMENT_MAX_NODES } from "./registry.js";
+import { bearer, username, admin } from "better-auth/plugins";
+import { ENTITLEMENT_MAX_NODES, normalizeEmail } from "./registry.js";
 import { webOriginStore } from "./web-origin.js";
 
 // `beforeAccountDelete` runs while the account's control-plane rows are still
@@ -69,7 +69,7 @@ export function createRelayBetterAuth({
       revokeSessionsOnPasswordReset: true,
     },
     socialProviders,
-    plugins: [username(), bearer()],
+    plugins: [username(), bearer(), admin()],
     account: {
       encryptOAuthTokens: true,
     },
@@ -90,6 +90,7 @@ export function createRelayBetterAuth({
         create: {
           after(user) {
             ensureRelayAccount(registry, config, user);
+            pinAdminRoleIfNeeded(db, config, user);
           },
         },
       },
@@ -142,7 +143,10 @@ export function createRelayBetterAuth({
 
   const auth = betterAuth(options);
   const handler = toNodeHandler(auth);
-  const ready = getMigrations(options).then(({ runMigrations }) => runMigrations());
+  const ready = getMigrations(options).then(async ({ runMigrations }) => {
+    await runMigrations();
+    pinAdminEmails(db, config);
+  });
 
   return {
     auth,
@@ -155,9 +159,84 @@ export function createRelayBetterAuth({
         headers: fromNodeHeaders(req.headers),
       });
       if (!result?.user) return null;
+      pinAdminRoleIfNeeded(db, config, result.user);
       return ensureRelayAccount(registry, config, result.user);
     },
   };
+}
+
+export function roleIncludesAdmin(role) {
+  return String(role || "")
+    .split(",")
+    .map((part) => part.trim())
+    .includes("admin");
+}
+
+export function isPinnedAdminEmail(email, config) {
+  const normalized = normalizeEmail(email);
+  return Boolean(normalized && (config.adminEmails || []).includes(normalized));
+}
+
+export function isRelayAdmin(user, account, config) {
+  return (
+    roleIncludesAdmin(user?.role) ||
+    isPinnedAdminEmail(user?.email || account?.email, config)
+  );
+}
+
+export function readBetterAuthUser(db, id) {
+  if (!id) return null;
+  try {
+    return (
+      db.prepare("SELECT id, email, name, role, banned FROM user WHERE id = ?").get(id) ||
+      null
+    );
+  } catch {
+    return null;
+  }
+}
+
+export function listBetterAuthUsers(db, { limit = 50, offset = 0 } = {}) {
+  try {
+    const columns = db.prepare("PRAGMA table_info(user)").all().map((c) => c.name);
+    const created = columns.includes("createdAt")
+      ? "createdAt"
+      : columns.includes("created_at")
+        ? "created_at"
+        : "id";
+    return db
+      .prepare(
+        `SELECT id, email, name, role, banned, ${created} AS createdAt FROM user ORDER BY ${created} DESC LIMIT ? OFFSET ?`,
+      )
+      .all(limit, offset);
+  } catch {
+    return [];
+  }
+}
+
+function pinAdminRoleIfNeeded(db, config, user) {
+  if (!user?.id || !isPinnedAdminEmail(user.email, config)) return;
+  if (roleIncludesAdmin(user.role)) return;
+  pinAdminRole(db, user.id);
+  user.role = "admin";
+}
+
+function pinAdminRole(db, userId) {
+  try {
+    db.prepare("UPDATE user SET role = ? WHERE id = ?").run("admin", userId);
+  } catch {
+    /* migrations not applied yet */
+  }
+}
+
+function pinAdminEmails(db, config) {
+  for (const email of config.adminEmails || []) {
+    try {
+      db.prepare("UPDATE user SET role = 'admin' WHERE lower(email) = ?").run(email);
+    } catch {
+      /* table/column missing before migrations */
+    }
+  }
 }
 
 function ensureRelayAccount(registry, config, user) {

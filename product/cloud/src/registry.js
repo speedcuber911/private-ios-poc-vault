@@ -661,6 +661,23 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     }
   }
 
+  function updateNode(id, patch = {}) {
+    const sets = [];
+    const values = [];
+    if (patch.kind !== undefined) {
+      sets.push("kind = ?");
+      values.push(patch.kind);
+    }
+    if (patch.name !== undefined) {
+      sets.push("name = ?");
+      values.push(patch.name);
+    }
+    if (sets.length === 0) return getNode(id);
+    values.push(id);
+    db.prepare(`UPDATE nodes SET ${sets.join(", ")} WHERE id = ?`).run(...values);
+    return getNode(id);
+  }
+
   function touchNode(id, { version } = {}) {
     if (version !== undefined) {
       db.prepare("UPDATE nodes SET last_seen = ?, version = ? WHERE id = ?").run(
@@ -710,6 +727,11 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     return mapTrial(db.prepare("SELECT * FROM trial_nodes WHERE enroll_token_hash = ?").get(hash));
   }
 
+  function getTrialByNodeId(nodeId) {
+    if (!nodeId) return null;
+    return mapTrial(db.prepare("SELECT * FROM trial_nodes WHERE node_id = ?").get(nodeId));
+  }
+
   function updateTrial(id, patch) {
     const sets = [];
     const values = [];
@@ -743,6 +765,44 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
 
   function countActiveTrials() {
     return Number(db.prepare("SELECT COUNT(*) AS c FROM trial_nodes WHERE state IN ('creating','ready')").get().c);
+  }
+
+  function upgradeTrialAccount(accountId) {
+    if (!getAccount(accountId)) return { error: "unknown_account" };
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const trial = getTrialByAccount(accountId);
+      const node = trial?.nodeId ? getNode(trial.nodeId) : null;
+      const currentMax = Number.parseInt(
+        getEntitlement(accountId, ENTITLEMENT_MAX_NODES) ?? "0",
+        10,
+      );
+      const maxVal = Number.isFinite(currentMax) ? currentMax : 0;
+      if (trial?.state === "upgraded" && node?.kind === "byo" && maxVal >= 2) {
+        db.exec("COMMIT");
+        return { ok: true };
+      }
+      if (
+        !trial ||
+        (trial.state !== "creating" && trial.state !== "ready") ||
+        !trial.nodeId ||
+        !node
+      ) {
+        db.exec("ROLLBACK");
+        return { error: "nothing_to_upgrade" };
+      }
+      const nodePatch = {};
+      if (node.kind === "trial") nodePatch.kind = "byo";
+      if (node.name === "Trial machine") nodePatch.name = "Machine";
+      if (Object.keys(nodePatch).length > 0) updateNode(node.id, nodePatch);
+      updateTrial(trial.id, { state: "upgraded" });
+      if (maxVal < 2) setEntitlement(accountId, ENTITLEMENT_MAX_NODES, 2);
+      db.exec("COMMIT");
+      return { ok: true };
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
   }
 
   // ── sandbox orphans ─────────────────────────────────────────────────────
@@ -1788,16 +1848,19 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     listNodes,
     countNodes,
     deleteNode,
+    updateNode,
     touchNode,
     adminListNodes,
     createTrialNode,
     getTrialById,
     getTrialByAccount,
     getTrialByTokenHash,
+    getTrialByNodeId,
     updateTrial,
     listTrialsDue,
     listTrialsPastGrace,
     countActiveTrials,
+    upgradeTrialAccount,
     recordSandboxOrphan,
     listSandboxOrphans,
     clearSandboxOrphan,

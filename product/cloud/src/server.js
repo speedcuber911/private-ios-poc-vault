@@ -22,7 +22,7 @@ import { serializeSignedCookie } from "better-call";
 import { createDb } from "./db.js";
 import { createRegistry } from "./registry.js";
 import { createAuth, createAppleJwksFetcher } from "./auth.js";
-import { createRelayBetterAuth } from "./better-auth.js";
+import { createRelayBetterAuth, isRelayAdmin, readBetterAuthUser, listBetterAuthUsers } from "./better-auth.js";
 import { webOriginStore } from "./web-origin.js";
 import { createPairing } from "./pairing.js";
 import { createNotify, parseNodePubkey } from "./notify.js";
@@ -956,6 +956,42 @@ export function createApp({
     const account = await auth.authenticate(req);
     if (!account) return sendJson(res, 401, { error: "unauthorized" });
 
+    function callerIsAdmin() {
+      return isRelayAdmin(readBetterAuthUser(db, account.id), account, config);
+    }
+
+    if (path === "/v1/admin/accounts" && method === "GET") {
+      if (!callerIsAdmin()) return sendJson(res, 403, { error: "forbidden" });
+      const limit = pageLimit(url.searchParams.get("limit"));
+      const offset = pageOffset(url.searchParams.get("offset"));
+      const accounts = listBetterAuthUsers(db, { limit, offset }).map((user) =>
+        publicAdminAccount(db, registry, user.id),
+      );
+      return sendJson(res, 200, { accounts });
+    }
+
+    if (
+      method === "POST" &&
+      seg.length === 5 &&
+      seg[0] === "v1" &&
+      seg[1] === "admin" &&
+      seg[2] === "accounts" &&
+      seg[4] === "upgrade"
+    ) {
+      if (!callerIsAdmin()) return sendJson(res, 403, { error: "forbidden" });
+      const result = registry.upgradeTrialAccount(seg[3]);
+      if (result.error === "unknown_account") {
+        return sendJson(res, 404, { error: "unknown_account" });
+      }
+      if (result.error === "nothing_to_upgrade") {
+        return sendJson(res, 409, { error: "nothing_to_upgrade" });
+      }
+      return sendJson(res, 200, {
+        ok: true,
+        account: publicAdminAccount(db, registry, seg[3]),
+      });
+    }
+
     if (path === "/v1/auth/device/link" && method === "GET") {
       return sendJson(res, 200, {
         computer: publicCliComputer(registry.getCliComputerLink(account.id)),
@@ -1202,7 +1238,14 @@ export function createApp({
       }
       if (method === "GET") return sendJson(res, 200, { node });
       if (method === "DELETE") {
+        const trial = registry.getTrialByNodeId(node.id);
+        if (trial?.sandboxId) {
+          await releaseSandbox(trial, "node_deleted");
+        }
         registry.deleteNode(account.id, node.id);
+        if (trial?.sandboxId) {
+          registry.updateTrial(trial.id, { state: "destroyed", enrollTokenHash: null });
+        }
         return sendJson(res, 204, null);
       }
     }
@@ -1434,6 +1477,9 @@ export function createApp({
     if (path === "/v1/trial-nodes/current" && method === "DELETE") {
       const trial = registry.getTrialByAccount(account.id);
       if (!trial) return sendJson(res, 404, { error: "no_trial" });
+      if (trial.state === "upgraded") {
+        return sendJson(res, 409, { error: "trial_not_deletable" });
+      }
       await releaseSandbox(trial, "user_deleted_trial");
       if (trial.nodeId) registry.deleteNode(account.id, trial.nodeId);
       registry.updateTrial(trial.id, { state: "destroyed", enrollTokenHash: null });
@@ -1737,6 +1783,49 @@ function publicTrial(trial, config, registry) {
     createdAt: trial.createdAt,
     expiresAt: trial.expiresAt,
   };
+}
+
+function publicAdminAccount(db, registry, accountId) {
+  const user = readBetterAuthUser(db, accountId);
+  const account = registry.getAccount(accountId);
+  const trial = registry.getTrialByAccount(accountId);
+  return {
+    id: accountId,
+    email: user?.email || account?.email || null,
+    name: user?.name ?? null,
+    role: user?.role || "user",
+    banned: Boolean(user?.banned),
+    trial: trial
+      ? {
+          id: trial.id,
+          state: trial.state,
+          nodeId: trial.nodeId,
+          sandboxId: trial.sandboxId,
+          createdAt: trial.createdAt,
+          expiresAt: trial.expiresAt,
+        }
+      : null,
+    nodes: registry.listNodes(accountId).map((node) => ({
+      id: node.id,
+      kind: node.kind,
+      name: node.name,
+      lastSeen: node.lastSeen,
+      createdAt: node.createdAt,
+    })),
+    entitlements: registry.listEntitlements(accountId),
+  };
+}
+
+function pageLimit(raw, fallback = 50, max = 100) {
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) return fallback;
+  return Math.min(n, max);
+}
+
+function pageOffset(raw) {
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return n;
 }
 
 function publicCliComputer(link) {

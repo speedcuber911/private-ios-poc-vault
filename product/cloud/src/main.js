@@ -18,6 +18,9 @@ if (config.appleClientIds.length === 0) {
   console.warn("APPLE_CLIENT_IDS unset — Sign in with Apple will reject all tokens.");
 }
 if (!config.adminToken) console.warn("ADMIN_TOKEN unset — /v1/admin/* disabled.");
+if (config.adminEmails.length === 0) {
+  console.warn("RELAY_ADMIN_EMAILS unset — no env-pinned admin.");
+}
 if (!config.brokerToken) console.warn("BROKER_TOKEN unset — /v1/tunnel/* disabled.");
 
 // A half-configured trial feature fails silently and plausibly instead of

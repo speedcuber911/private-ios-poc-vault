@@ -162,6 +162,9 @@ final class RelayTrialFlowModel: ObservableObject {
             case .ready:
                 message =
                     "This account's trial machine is \(current.state.rawValue) and can't be adopted from here."
+            case .upgraded:
+                message =
+                    "This account's hosted machine is already set up and is no longer a trial."
             }
             step = .failed(message)
             return
@@ -190,7 +193,7 @@ final class RelayTrialFlowModel: ObservableObject {
         var attempts = 0
         while current.state != .ready {
             switch current.state {
-            case .expired, .destroyed, .failed:
+            case .expired, .destroyed, .failed, .upgraded:
                 throw RelayTrialFlowError.machineUnavailable(current.state)
             case .creating, .ready:
                 break
@@ -291,7 +294,7 @@ final class RelayTrialFlowModel: ObservableObject {
                 return "The trial machine was destroyed before it finished starting."
             case .failed:
                 return "The trial machine failed to start."
-            case .creating, .ready:
+            case .creating, .ready, .upgraded:
                 return "The trial machine could not be reached."
             }
         case .machineTimedOut:

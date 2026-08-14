@@ -1,7 +1,7 @@
 import Foundation
 
 struct RelayTrialNode: Codable, Equatable {
-    enum State: String, Codable { case creating, ready, expired, destroyed, failed }
+    enum State: String, Codable { case creating, ready, expired, destroyed, failed, upgraded }
     let id: String
     let state: State
     let nodeId: String?
@@ -18,6 +18,8 @@ struct RelayTrialNode: Codable, Equatable {
         switch state {
         case .expired, .destroyed, .failed:
             return "Trial expired"
+        case .upgraded:
+            return ""
         case .creating, .ready:
             break
         }
@@ -29,5 +31,23 @@ struct RelayTrialNode: Codable, Equatable {
         }
         let hours = max(1, Int((remaining / 3_600).rounded(.up)))
         return "\(hours) hour\(hours == 1 ? "" : "s") left"
+    }
+
+    /// Root-browser trial chrome: countdown capsule or expiry banner.
+    /// Hidden once the machine is no longer a trial (`upgraded`) or never
+    /// became a usable trial (`destroyed` / `failed`).
+    var showsStatusBanner: Bool {
+        switch state {
+        case .creating, .ready, .expired:
+            return true
+        case .upgraded, .destroyed, .failed:
+            return false
+        }
+    }
+
+    /// Account → Trial machine (status + delete). Hidden after upgrade so
+    /// the gifted machine is not presented as a deletable trial.
+    var showsTrialMachineSection: Bool {
+        state != .upgraded
     }
 }

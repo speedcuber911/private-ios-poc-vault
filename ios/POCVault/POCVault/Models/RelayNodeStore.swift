@@ -73,7 +73,7 @@ final class RelayNodeStore: ObservableObject {
         // nothing connecting the two. A dead pointer is worse than none —
         // `hasMachine` can then route to the trial flow instead.
         switch trial.state {
-        case .ready, .creating:
+        case .ready, .creating, .upgraded:
             activeNodeURL = trial.nodeURL
         case .expired, .destroyed, .failed:
             activeNodeURL = nil

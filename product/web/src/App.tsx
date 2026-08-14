@@ -1,6 +1,9 @@
 import { useEffect, useState } from "react";
 import { parseUserCodeFromHash } from "./api/device.js";
+import { cloud } from "./api/cloud.js";
+import { isImpersonating, shouldShowAdminNav } from "./api/admin.js";
 import { Activity } from "./pages/Activity";
+import { Admin } from "./pages/Admin";
 import { CliLogin } from "./pages/CliLogin";
 import { Login } from "./pages/Login";
 import { Machines } from "./pages/Machines";
@@ -21,6 +24,8 @@ function machineIdFrom(route: string) {
 
 export default function App() {
   const [route, setRoute] = useState(currentPath);
+  const [nav, setNav] = useState({ showAdmin: false, impersonating: false });
+  const [sessionTick, setSessionTick] = useState(0);
 
   useEffect(() => {
     if (currentPath() === "/") {
@@ -39,6 +44,36 @@ export default function App() {
 
   const machineId = machineIdFrom(route);
   const authRoute = route === "/login" || route === "/cli-login";
+
+  useEffect(() => {
+    if (authRoute) {
+      setNav({ showAdmin: false, impersonating: false });
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const result = await cloud.authClient.getSession();
+        if (cancelled) return;
+        const user = result?.data?.user;
+        const session = result?.data?.session;
+        setNav({
+          showAdmin: shouldShowAdminNav({ signedIn: Boolean(user), role: user?.role }),
+          impersonating: isImpersonating(session),
+        });
+      } catch {
+        if (!cancelled) setNav({ showAdmin: false, impersonating: false });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [authRoute, route, sessionTick]);
+
+  async function stopImpersonating() {
+    await cloud.authClient.admin.stopImpersonating();
+    setSessionTick((tick) => tick + 1);
+  }
 
   let screen = (
     <Login
@@ -65,6 +100,17 @@ export default function App() {
     );
   } else if (machineId) {
     screen = <Activity nodeId={machineId} onBack={() => navigate("/machines")} />;
+  } else if (route === "/admin") {
+    screen = (
+      <Admin
+        onNeedLogin={() => navigate("/login")}
+        onForbidden={() => navigate("/machines")}
+        onImpersonated={() => {
+          setSessionTick((tick) => tick + 1);
+          navigate("/machines");
+        }}
+      />
+    );
   } else if (route === "/machines") {
     screen = (
       <Machines
@@ -75,5 +121,23 @@ export default function App() {
     );
   }
 
-  return <main className={authRoute ? "canvas" : "canvas canvas-page"}>{screen}</main>;
+  return (
+    <main className={authRoute ? "canvas" : "canvas canvas-page"}>
+      {!authRoute && (nav.showAdmin || nav.impersonating) ? (
+        <nav className="chrome" aria-label="Console">
+          {nav.showAdmin ? (
+            <button type="button" className="btn-text" onClick={() => navigate("/admin")}>
+              Admin
+            </button>
+          ) : null}
+          {nav.impersonating ? (
+            <button type="button" className="btn-text" onClick={() => void stopImpersonating()}>
+              Stop impersonating
+            </button>
+          ) : null}
+        </nav>
+      ) : null}
+      {screen}
+    </main>
+  );
 }

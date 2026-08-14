@@ -2,7 +2,7 @@
 // Origin comes from VITE_RELAY_CLOUD_URL so this SPA is not pinned to one host.
 
 import { createAuthClient } from "better-auth/client";
-import { usernameClient } from "better-auth/client/plugins";
+import { adminClient, usernameClient } from "better-auth/client/plugins";
 
 function envCloudUrl() {
   const env =
@@ -74,7 +74,7 @@ export function createCloud({
       credentials: "include",
       customFetchImpl: fetchImpl,
     },
-    plugins: [usernameClient()],
+    plugins: [usernameClient(), adminClient()],
   });
 
   return { baseUrl: root, cloudFetch, signUp, signIn, authClient };
