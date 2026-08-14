@@ -38,9 +38,9 @@ final class ClientIdentityStore: ObservableObject {
     /// "trial-device" is the CN a trial machine issues — see
     /// `product/relayd/src/trialpair.mjs`, which signs the device CSR with
     /// `-subj "/CN=trial-device"`. Without it here, a trial identity sitting in
-    /// the keychain could never be recovered, and the trial cannot simply be
-    /// re-run: the pairing slots are put-once and the account gets one trial
-    /// for its lifetime.
+    /// the keychain could never be recovered. Pairing slots are put-once, so
+    /// a still-running machine cannot reissue a credential; a destroyed or
+    /// failed trial can be retried as a new machine.
     private static let preferredClientCertificateNames = ["iphone", "trial-device"]
 
     @Published private(set) var lastImportedCertificateName: String?
@@ -74,8 +74,8 @@ final class ClientIdentityStore: ObservableObject {
     /// that describes it read false, so `RelayTrialFlowModel.adoptExistingTrial`
     /// told the user their credential "can't be reissued" while it sat in the
     /// keychain. Worse, the device token is derived from a pairing secret that
-    /// exists only at pairing time, so losing it really was unrecoverable — the
-    /// account's one trial was spent and the machine unreachable.
+    /// exists only at pairing time, so losing it really was unrecoverable while
+    /// that machine is still running. A destroyed or failed trial can be retried.
     ///
     /// `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`: survives reinstall,
     /// available to background refresh, and never leaves this device in a backup

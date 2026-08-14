@@ -56,10 +56,11 @@ final class RelayNodeStore: ObservableObject {
     /// necessarily repointing the app: the current node URL is kept, and one is
     /// set only if none was active yet.
     ///
-    /// Deliberately non-optional. Forgetting a machine is a destructive,
-    /// unrecoverable act (the cloud answers `trial_already_used` for every state
-    /// but `failed`), so it has to go through `clear()` — never through a nil
-    /// that a `try?` could have produced.
+    /// Deliberately non-optional. Forgetting a machine is a destructive act
+    /// (a live `creating`/`ready` trial 409s `trial_already_used`; `expired`
+    /// is spent), so it has to go through `clear()` — never through a nil
+    /// that a `try?` could have produced. `failed` and `destroyed` can be
+    /// retried in place by the cloud.
     func updateTrial(_ trial: RelayTrialNode) {
         self.trial = trial
         persist(trial)

@@ -125,16 +125,16 @@ final class RelayTrialFlowModel: ObservableObject {
 
     /// Recovers from `trial_already_used`, which is not one situation but three.
     ///
-    /// A trial is one per account for the life of the account, so this error is
-    /// permanent — but it says nothing about whether the user has a working
-    /// machine. Re-entering this flow only means THIS DEVICE has no pointer to
-    /// one, which happens on a reinstall, a second device, or after the node
-    /// store is cleared. The machine itself may be alive and reachable.
+    /// Re-entering this flow only means THIS DEVICE has no pointer to a
+    /// machine, which happens on a reinstall, a second device, or after the
+    /// node store is cleared. The machine itself may still be alive.
     ///
-    /// The one case that cannot be recovered here is a live machine this device
-    /// has no credential for: the pairing rendezvous is put-once and the node
-    /// only ever runs `runTrialPairing` at boot, so there is no way to reissue
-    /// one. Say that plainly instead of implying the user did something wrong.
+    /// `failed` and `destroyed` are retried by `POST /v1/trial-nodes` in
+    /// place, so this path should not see them after the cloud is current.
+    /// `expired` is spent. A live machine this device has no credential for
+    /// cannot be re-paired: the rendezvous is put-once and `runTrialPairing`
+    /// only runs at boot. Say that plainly instead of implying the user did
+    /// something wrong.
     private func adoptExistingTrial(bearer: String) async {
         let current: RelayTrialNode
         do {
@@ -145,10 +145,25 @@ final class RelayTrialFlowModel: ObservableObject {
         }
 
         guard current.state == .ready, let host = current.sni else {
-            step = .failed(
-                "This account's trial machine is \(current.state.rawValue) and a trial can only be created once, "
-                + "so a replacement can't be started here."
-            )
+            let message: String
+            switch current.state {
+            case .destroyed:
+                message =
+                    "The previous trial machine was deleted. Try instantly again to start a replacement."
+            case .failed:
+                message =
+                    "The previous trial machine failed to start. Try instantly again to start a replacement."
+            case .expired:
+                message =
+                    "This account's trial has expired, so a replacement can't be started here."
+            case .creating:
+                message =
+                    "This account's trial machine is still starting. Wait for it to finish, then come back."
+            case .ready:
+                message =
+                    "This account's trial machine is \(current.state.rawValue) and can't be adopted from here."
+            }
+            step = .failed(message)
             return
         }
 

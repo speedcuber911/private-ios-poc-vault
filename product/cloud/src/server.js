@@ -1310,13 +1310,14 @@ export function createApp({
       if (!/^[0-9a-f-]{36}$/.test(pairingId) || !/^[A-Za-z0-9_-]{22,128}$/.test(pairingSecret)) {
         return sendJson(res, 400, { error: "pairing_required" });
       }
-      // One trial per account is abuse control over actual provisioned
-      // machines: a provision that never produced a machine (state
-      // "failed") must not permanently burn the account's only trial, so
-      // only that state is retryable — every other state is legitimately
-      // spent and still 409s.
+      // One live trial per account: creating/ready still 409, and expired
+      // is spent (the TTL ran). failed never produced a machine; destroyed
+      // means the user (or the reaper) already tore it down. Both must be
+      // retryable in place — otherwise Delete trial machine burns the
+      // account with no way back.
       const existingTrial = registry.getTrialByAccount(account.id);
-      if (existingTrial && existingTrial.state !== "failed") {
+      const retryable = existingTrial?.state === "failed" || existingTrial?.state === "destroyed";
+      if (existingTrial && !retryable) {
         return sendJson(res, 409, { error: "trial_already_used" });
       }
       if (registry.countActiveTrials() >= config.trial.maxActive) {
@@ -1324,8 +1325,8 @@ export function createApp({
       }
       const enrollToken = randomBytes(32).toString("base64url");
       const expiresAt = now() + config.trial.ttlSec * 1000;
-      // trial_nodes.account_id is UNIQUE, so a retry reuses the failed row
-      // in place rather than inserting a second one.
+      // trial_nodes.account_id is UNIQUE, so a retry reuses the failed or
+      // destroyed row in place rather than inserting a second one.
       const trial = existingTrial
         ? registry.updateTrial(existingTrial.id, {
             state: "creating",

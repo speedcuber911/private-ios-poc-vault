@@ -145,7 +145,7 @@ export function Provisioning({
       {isRetryableProvisioning(stage) ? (
         <div className="actions">
           <button type="button" className="btn-primary" disabled={working} onClick={() => retry()}>
-            {working ? "Retrying…" : "Retry"}
+            {working ? "Retrying…" : stage === "destroyed" ? "Start a new trial" : "Retry"}
           </button>
         </div>
       ) : null}

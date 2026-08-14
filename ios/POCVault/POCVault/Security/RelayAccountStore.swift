@@ -170,11 +170,9 @@ final class RelayAccountStore: ObservableObject {
         // Machine access is purged when the account CHANGES, not when a session
         // ends. Signing out used to purge, which is safe but permanent: a
         // trial's pairing slots are put-once, so the moment this device drops
-        // the identity, the machine it belongs to — still running, still paid
-        // for, still holding the user's files — can never be reached from here
-        // again. Signing back in cannot undo it, and the control plane answers
-        // `trial_already_used` to every attempt to replace it, leaving the
-        // account with a machine it cannot open and no way to get another.
+        // the identity, a still-running machine can never be reached from here
+        // again. Signing back in cannot undo that. A destroyed or failed trial
+        // can be retried as a new machine; a live one cannot.
         //
         // Doing it here keeps the property that mattered: a DIFFERENT account
         // signing in on this phone still inherits nothing.

@@ -156,7 +156,7 @@ struct AccountSettingsView: View {
                     } header: {
                         Text("Trial machine")
                     } footer: {
-                        Text("Deleting removes the trial machine and its data immediately. Connect your own machine any time to keep working.")
+                        Text("Deleting removes the trial machine and its data immediately. You can start a new trial afterwards, or connect your own machine to keep working.")
                     }
                 }
 

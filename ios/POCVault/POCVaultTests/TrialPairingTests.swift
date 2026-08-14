@@ -467,7 +467,7 @@ extension TrialPairingTests {
     }
 
     @MainActor
-    func testAlreadyUsedWithADestroyedMachineNamesTheState() async {
+    func testAlreadyUsedWithADestroyedMachineDoesNotBurnTheLifetimeCap() async {
         StubTrialURLProtocol.routes = [
             "/v1/pairing/sessions": (201, "{\"pairingId\":\"p1\",\"expiresAt\":9999999999999}"),
             "/v1/trial-nodes": (409, "{\"error\":\"trial_already_used\"}"),
@@ -480,7 +480,30 @@ extension TrialPairingTests {
         guard case .failed(let message) = flow.step else {
             return XCTFail("expected .failed, got \(flow.step)")
         }
-        XCTAssertTrue(message.contains("destroyed"), "the state the user is actually in must be named: \(message)")
+        XCTAssertTrue(message.contains("deleted"), "the state the user is actually in must be named: \(message)")
+        XCTAssertTrue(message.contains("replacement"), "got: \(message)")
+        XCTAssertFalse(
+            message.contains("can only be created once"),
+            "a deleted machine must not be described as a lifetime cap: \(message)"
+        )
+        XCTAssertNil(nodeStore.trial)
+    }
+
+    @MainActor
+    func testAlreadyUsedWithAnExpiredMachineNamesTheSpentTrial() async {
+        StubTrialURLProtocol.routes = [
+            "/v1/pairing/sessions": (201, "{\"pairingId\":\"p1\",\"expiresAt\":9999999999999}"),
+            "/v1/trial-nodes": (409, "{\"error\":\"trial_already_used\"}"),
+            "/v1/trial-nodes/current": (200, trialJSON(state: "expired", sni: nil)),
+        ]
+        let (flow, nodeStore) = makeFlow("trial-adopt-expired")
+
+        await flow.start(bearer: "b", deviceName: "Test")
+
+        guard case .failed(let message) = flow.step else {
+            return XCTFail("expected .failed, got \(flow.step)")
+        }
+        XCTAssertTrue(message.contains("expired"), "got: \(message)")
         XCTAssertNil(nodeStore.trial)
     }
 }

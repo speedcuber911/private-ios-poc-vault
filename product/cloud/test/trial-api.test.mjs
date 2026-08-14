@@ -318,3 +318,67 @@ test("trial delete: kills sandbox, removes node row, marks destroyed", async () 
     await t.close();
   }
 });
+
+test("trial create: retry after user delete reuses the row instead of burning the trial", async () => {
+  const provisioner = makeFakeProvisioner();
+  const t = await startTestApp({ env: TRIAL_ENV, provisioner });
+  try {
+    const s = await signIn(t);
+    await api(t.baseUrl, "POST", "/v1/trial-nodes", { body: PAIRING, ...authed(s.sessionToken) });
+    const trial = t.app.registry.getTrialByAccount(s.accountId);
+    t.app.registry.createNode(s.accountId, {
+      id: "node-00112233aabbccdd",
+      kind: "trial",
+      name: "Trial machine",
+      pubkey: "pk",
+      version: null,
+    });
+    t.app.registry.updateTrial(trial.id, {
+      state: "ready",
+      nodeId: "node-00112233aabbccdd",
+      sandboxId: "sbx_1",
+    });
+
+    const del = await api(t.baseUrl, "DELETE", "/v1/trial-nodes/current", authed(s.sessionToken));
+    assert.equal(del.status, 204);
+    const destroyed = t.app.registry.getTrialByAccount(s.accountId);
+    assert.equal(destroyed.state, "destroyed");
+    assert.equal(destroyed.enrollTokenHash, null);
+
+    const res = await api(t.baseUrl, "POST", "/v1/trial-nodes", { body: PAIRING, ...authed(s.sessionToken) });
+    assert.equal(res.status, 201);
+    assert.equal(res.json.trial.state, "creating");
+    assert.equal(res.json.trial.id, destroyed.id, "must reuse the same row, not insert a second one");
+
+    const reused = t.app.registry.getTrialByAccount(s.accountId);
+    assert.equal(reused.id, destroyed.id);
+    assert.equal(reused.state, "creating");
+    assert.equal(reused.nodeId, null, "replacement has not enrolled yet");
+    assert.notEqual(reused.sandboxId, "sbx_1", "must not keep the deleted sandbox id");
+    assert.ok(reused.sandboxId, "must record the replacement sandbox");
+    assert.ok(reused.enrollTokenHash, "must have a freshly generated enroll token hash");
+    assert.equal(provisioner.created.length, 2, "must provision a replacement sandbox");
+    assert.deepEqual(provisioner.killed, ["sbx_1"]);
+  } finally {
+    await t.close();
+  }
+});
+
+test("trial create: expired still 409s — the TTL was spent", async () => {
+  const provisioner = makeFakeProvisioner();
+  const t = await startTestApp({ env: TRIAL_ENV, provisioner });
+  try {
+    const s = await signIn(t);
+    await api(t.baseUrl, "POST", "/v1/trial-nodes", { body: PAIRING, ...authed(s.sessionToken) });
+    const trial = t.app.registry.getTrialByAccount(s.accountId);
+    t.app.registry.updateTrial(trial.id, { state: "expired" });
+
+    const res = await api(t.baseUrl, "POST", "/v1/trial-nodes", { body: PAIRING, ...authed(s.sessionToken) });
+    assert.equal(res.status, 409);
+    assert.equal(res.json.error, "trial_already_used");
+    assert.equal(t.app.registry.getTrialByAccount(s.accountId).state, "expired");
+    assert.equal(provisioner.created.length, 1);
+  } finally {
+    await t.close();
+  }
+});

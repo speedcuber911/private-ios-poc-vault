@@ -44,7 +44,7 @@ export function isProvisioningTerminal(state) {
 }
 
 export function isRetryableProvisioning(state) {
-  return state === "failed";
+  return state === "failed" || state === "destroyed";
 }
 
 /**

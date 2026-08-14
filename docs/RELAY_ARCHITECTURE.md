@@ -190,9 +190,9 @@ meaningful.
 - **`sync-auth` produces no visible change.** The model catalog is built once
   at daemon boot from env vars and never inspects credentials, so a successful
   sync has nothing to show in the app. Credentials do reach jobs.
-- **Deleting a trial in the app is a one-way door.** `DELETE` sets state
-  `destroyed`, and only `failed` is retryable, so the button permanently burns
-  the account's one trial with no in-app way back.
+- **Deleting a trial used to be a one-way door.** `DELETE` still sets state
+  `destroyed`, but `POST /v1/trial-nodes` now retries `destroyed` (and
+  `failed`) in place so a replacement can start. `expired` still 409s.
 - **No Notification Service Extension.** `mutable-content` is set so one could
   take over the banner later and move the names back out of the payload.
 - **No `relay logout`.** Nothing unbinds a CLI from an account.

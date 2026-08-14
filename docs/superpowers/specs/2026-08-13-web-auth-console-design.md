@@ -343,9 +343,9 @@ to logs.
 - **Auto-approve after login fails** — show the CLI confirm again. Do
   not loop approve.
 - **Trial** — `trial_unavailable`, `trial_capacity`, `trial_already_used`,
-  and `failed` (retry in place) keep today's meanings. Do not offer a
-  casual destroy: `DELETE` sets `destroyed` and burns the one trial
-  (known gap, inherited).
+  and `failed`/`destroyed` (retry in place) keep today's meanings.
+  `DELETE` sets `destroyed`; a later create retries the same row. `expired`
+  still 409s.
 - **Grant / gateway / node down** — “Can't reach this machine.” No
   placeholder activity that looks live.
 - **Waitlist** — failure is shown; success is “On the waitlist.”

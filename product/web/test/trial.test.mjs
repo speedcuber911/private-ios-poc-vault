@@ -317,15 +317,15 @@ test("provisioningStage maps expired and destroyed to terminal stages, not Creat
   assert.notEqual(provisioningStage({ state: "destroyed", nodeId: null }).stage, "creating");
 });
 
-test("failed is retryable; expired and destroyed are spent terminals that do not poll", () => {
+test("failed and destroyed are retryable; expired is a spent terminal that does not poll", () => {
   assert.equal(isProvisioningTerminal("ready"), true);
   assert.equal(isProvisioningTerminal("failed"), true);
   assert.equal(isProvisioningTerminal("expired"), true);
   assert.equal(isProvisioningTerminal("destroyed"), true);
   assert.equal(isProvisioningTerminal("creating"), false);
   assert.equal(isRetryableProvisioning("failed"), true);
+  assert.equal(isRetryableProvisioning("destroyed"), true);
   assert.equal(isRetryableProvisioning("expired"), false);
-  assert.equal(isRetryableProvisioning("destroyed"), false);
   assert.equal(isRetryableProvisioning("ready"), false);
   assert.equal(isRetryableProvisioning("creating"), false);
 });

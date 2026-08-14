@@ -67,8 +67,8 @@ ExperimentalWarning on Node 22 is expected.
 | `POST/GET /v1/devices`, `PATCH/DELETE /v1/devices/:id` | session | `apnsToken`, `platform`, `name`, `certSerials` |
 | `POST/GET /v1/nodes`, `GET/DELETE /v1/nodes/:id` | session | create is entitlement-gated (`nodes.max`) and validates the ed25519 pubkey |
 | `POST /v1/nodes/:id/browser-grants` | session | `{ grant, expiresIn: 900, gatewayUrl }`; Ed25519 (`alg: EdDSA`); 503 if grant keys or `GRANT_GATEWAY_URL` unset |
-| `POST /v1/trial-nodes` | session | body `{pairingId, pairingSecret}`; provisions a trial sandbox for the account; 404 `trial_unavailable` when no provisioner is configured, 409 `trial_already_used` (unless the account's existing trial is `failed`, in which case it's retried in place), 503 `trial_capacity`, 502 `provision_failed` |
-| `GET/DELETE /v1/trial-nodes/current` | session | poll trial state, or tear it down early (kills the sandbox, deletes the node) |
+| `POST /v1/trial-nodes` | session | body `{pairingId, pairingSecret}`; provisions a trial sandbox for the account; 404 `trial_unavailable` when no provisioner is configured, 409 `trial_already_used` (unless the account's existing trial is `failed` or `destroyed`, in which case it's retried in place), 503 `trial_capacity`, 502 `provision_failed` |
+| `GET/DELETE /v1/trial-nodes/current` | session | poll trial state, or tear it down early (kills the sandbox, deletes the node); `DELETE` 409 `trial_not_deletable` when state is `upgraded` |
 | `POST /v1/trial-nodes/enroll` | single-use enroll token (`{token}` in body) | the sandbox's own bootstrap call — registers its node identity, burns the token, returns `{ok, sni}` |
 | `POST /v1/pairing/sessions` | session | → `{pairingId, secret, expiresAt}`; only the sha256 of the secret is stored |
 | `POST/GET /v1/pairing/sessions/:id/device-blob` | `X-Pairing-Auth` | opaque bytes (CSR direction); ≤64 KiB |
@@ -83,6 +83,8 @@ ExperimentalWarning on Node 22 is expected.
 | `POST /v1/node-events` | ed25519 body signature | see below |
 | `GET /v1/tunnel/nodes/:nodeId` | `Bearer $BROKER_TOKEN` | broker authorization hook, see contract |
 | `GET /v1/admin/nodes` | `Bearer $ADMIN_TOKEN` | ops-only; response omits pubkeys |
+| `GET /v1/admin/accounts` | Better Auth admin session | paginated `{ accounts }` with trial, nodes, entitlements; newest first; `limit` default 50 max 100 |
+| `POST /v1/admin/accounts/:id/upgrade` | Better Auth admin session | keep the hosted sandbox, set trial `upgraded`, raise `nodes.max` to at least 2 |
 
 All responses carry `cache-control: no-store` and
 `x-content-type-options: nosniff`. All body reads are bounded (JSON 32 KiB,
@@ -303,22 +305,18 @@ caller. If `E2B_API_URL` is unset the provisioner is `null` and the route
 404s `trial_unavailable`, which is how the fork screen's "Try instantly"
 option feature-flags itself off.
 
-**Retry after a failed provision.** `trial_nodes.account_id` is `UNIQUE`, so
-in the ordinary case a second `POST /v1/trial-nodes` for an account that
-already has a row 409s `trial_already_used` — the one-trial-per-account cap
-is enforced over *provisioned machines*, not raw call attempts. The one
-exception: if `provisioner.createSandbox()` throws, the existing row is
-updated to `state: "failed"` (`enrollTokenHash` cleared) and the call
-returns `502 provision_failed` instead of inserting a second row. Because
-`existingTrial.state !== "failed"` is the only condition that still 409s, a
-subsequent `POST /v1/trial-nodes` from that account is treated as a retry:
-it reuses the same row in place — resetting it to `state: "creating"` with a
-fresh `enrollTokenHash` and `expiresAt`, and clearing `nodeId`/`sandboxId` —
-rather than being rejected or minting a second lifetime trial. Every other
-state (`creating`, `ready`, `expired`, `destroyed`) is legitimately spent and
-still 409s. This exists because a transient provisioner failure (the Cube
-host briefly unreachable, a template pull failure, etc.) must not
-permanently burn the account's one lifetime trial.
+**Retry after a failed provision or a deleted machine.** `trial_nodes.account_id`
+is `UNIQUE`, so in the ordinary case a second `POST /v1/trial-nodes` for an
+account that already has a row 409s `trial_already_used` — the cap is one
+*live* trial, not raw call attempts. Two states are retried in place instead
+of 409ing: `failed` (provision never produced a machine) and `destroyed`
+(the user deleted the machine, or the reaper tore it down after grace).
+A subsequent `POST /v1/trial-nodes` reuses the same row — resetting it to
+`state: "creating"` with a fresh `enrollTokenHash` and `expiresAt`, and
+clearing `nodeId`/`sandboxId`. `creating` and `ready` still 409 (already
+live). `expired` still 409 (the TTL was spent; the paused sandbox is still
+there during grace). This exists so a transient provisioner failure or an
+in-app Delete cannot permanently burn the account.
 
 The sandbox calls back to `POST /v1/trial-nodes/enroll` with its freshly
 generated node identity pubkey; the cloud verifies the token against
@@ -473,6 +471,7 @@ APPLE_CLIENT_IDS=<app-bundle-id>,<services-id>
 APPLE_CLIENT_SECRET=<Apple ES256 client-secret JWT>
 MAGIC_LINK_BASE_URL=https://<domain>/auth/confirm
 ADMIN_TOKEN=<random>
+RELAY_ADMIN_EMAILS=<comma-separated operator emails>
 BROKER_TOKEN=<random>
 # APNs — all FOUR are required together. If any one is missing the service
 # starts normally, logs "APNs credentials unset — pushes will be skipped,
