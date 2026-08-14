@@ -471,6 +471,21 @@ final class RelayChatViewModel: ObservableObject {
         }
     }
 
+    /// The folder on disk for a handoff checkout, when this chat is not already
+    /// scoped there. Used so Continue after a push (which opens the root chat)
+    /// can move the conversation into that folder instead of sending from nowhere.
+    func resolveHandoffFolder(_ card: RelayHandoffCard) async -> (path: String, workspaceID: String)? {
+        guard let workspaceID = card.workspaceID else { return nil }
+        if let workspacePath, self.workspaceID == workspaceID {
+            return (workspacePath, workspaceID)
+        }
+        let listing = try? await client.fetchDirectory(path: nil, limit: 200)
+        guard let path = listing?.entries.first(where: { $0.workspaceId == workspaceID })?.path else {
+            return nil
+        }
+        return (path, workspaceID)
+    }
+
     /// Resume the handed-off session as an ordinary job in its own worktree, so
     /// it streams over the existing job SSE. The conversation then continues
     /// that session: follow-up task messages target the handoff's workspace.
@@ -760,7 +775,9 @@ final class RelayChatViewModel: ObservableObject {
         }
         guard let workspaceID = targetWorkspaceID else {
             if workspacePath == nil {
-                errorMessage = "Open a folder to run tasks — the root chat has no workspace."
+                errorMessage = handoffs.contains(where: \.isActionable)
+                    ? "Continue the handed-off session, or open a folder, to run this."
+                    : "Open a folder to run tasks — the root chat has no workspace."
             } else if currentThreadID != nil {
                 errorMessage = "This conversation does not have a task workspace. Start a new conversation from the folder to run a task."
             }

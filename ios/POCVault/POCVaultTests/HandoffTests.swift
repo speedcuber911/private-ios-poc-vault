@@ -227,6 +227,59 @@ final class HandoffTests: XCTestCase {
         XCTAssertNil(viewModel.macSessions, "a failed refresh must not fabricate an index")
     }
 
+    /// A handoff push opens the root chat (no folder). Sending a Claude Code /
+    /// task prompt from there must not pretend a workspace exists — that is the
+    /// "not in a folder" error after tapping the notification.
+    @MainActor
+    func testTaskSendFromRootChatNamesTheMissingFolder() async throws {
+        let viewModel = RelayChatViewModel(client: makeOfflineCodexClient(), workspaceID: nil, workspacePath: nil)
+        viewModel.selectChoice(RelayModelChoice(model: try claudeTaskModel(), mode: .task))
+        viewModel.prompt = "keep going"
+        await viewModel.sendCurrentPrompt()
+
+        let message = try XCTUnwrap(viewModel.errorMessage)
+        XCTAssertTrue(message.localizedCaseInsensitiveContains("folder"), "got: \(message)")
+        XCTAssertEqual(viewModel.prompt, "keep going", "a blocked send must not drop the draft")
+    }
+
+    /// After Continue adopts the handoff workspace, a follow-up task must not
+    /// dead-end on the root-chat folder error — the machine already has a folder.
+    @MainActor
+    func testAdoptedHandoffWorkspaceDoesNotBlockFollowUpAsRootChat() async throws {
+        let viewModel = RelayChatViewModel(client: makeOfflineCodexClient(), workspaceID: nil, workspacePath: nil)
+        viewModel.adoptWorkspaceID("dir-handoff-abc123")
+        viewModel.selectChoice(RelayModelChoice(model: try claudeTaskModel(), mode: .task))
+        viewModel.prompt = "keep going"
+        await viewModel.sendCurrentPrompt()
+
+        if let message = viewModel.errorMessage {
+            XCTAssertFalse(
+                message.localizedCaseInsensitiveContains("folder"),
+                "an adopted handoff workspace is enough to send: \(message)"
+            )
+        }
+    }
+
+    /// Continue from a different folder (the root chat after a push) must move
+    /// the conversation into the handoff checkout, not keep sending from root.
+    func testContinueRebindsTheChatToTheHandoffFolder() throws {
+        let chat = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
+        XCTAssertTrue(chat.contains("onBindChatToFolder"), "Continue from a handoff must rebind the open chat to that folder")
+        XCTAssertTrue(chat.contains("resolveHandoffFolder"))
+        let app = try AppSourceFixture.load("POCVault/POCVaultApp.swift")
+        XCTAssertTrue(app.contains("onBindChatToFolder"))
+        XCTAssertTrue(app.contains("continueHandoff"))
+    }
+
+    /// The composer chips sitting in an empty ScrollView bounce after a handoff
+    /// push (medium threads sheet + root chat with no messages). Pin them.
+    func testHandoffThreadsSheetDoesNotLeaveTheComposerScrollable() throws {
+        let source = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
+        XCTAssertTrue(source.contains("scrollBounceBehavior(.basedOnSize)"))
+        XCTAssertTrue(source.contains("showingThreads"), "the composer must not stay interactive under the threads sheet")
+        XCTAssertTrue(source.contains("threadsPreferLarge") || source.contains("presentationDetents([.large])"))
+    }
+
     /// Continue is only offered for a ready handoff; an importing or failed one
     /// must not be sent to a node that would answer 409.
     @MainActor
@@ -349,5 +402,16 @@ final class HandoffTests: XCTestCase {
     /// fails fast — the offline path, without a stub server.
     private func makeOfflineCodexClient() -> CodexClient {
         CodexClient(baseURL: URL(string: "http://127.0.0.1:9")!, identityStore: ClientIdentityStore())
+    }
+
+    private func claudeTaskModel() throws -> CodexModelDescriptor {
+        try CodexClient.makeDecoder().decode(
+            [CodexModelDescriptor].self,
+            from: Data("""
+            [{ "id": "claude-code-sonnet", "label": "Claude Code · Sonnet",
+               "provider": "claude", "modes": ["task"], "taskModel": "sonnet",
+               "effortLevels": ["low", "medium", "high"] }]
+            """.utf8)
+        ).first!
     }
 }

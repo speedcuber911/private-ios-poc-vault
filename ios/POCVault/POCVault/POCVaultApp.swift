@@ -212,7 +212,13 @@ struct POCVaultRootView: View {
             RelayChatView(
                 viewModel: launch.viewModel,
                 onDismiss: { chatLaunch = nil },
-                threadsRequest: $opensThreadsForHandoff
+                threadsRequest: $opensThreadsForHandoff,
+                onBindChatToFolder: { path, workspaceID, card in
+                    opensThreadsForHandoff = false
+                    let next = chatSessionStore.launch(folderPath: path, workspaceID: workspaceID)
+                    chatLaunch = next
+                    Task { await next.viewModel.continueHandoff(card) }
+                }
             )
         }
         .fullScreenCover(item: $terminalLaunch) { launch in

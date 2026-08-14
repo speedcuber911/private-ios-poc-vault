@@ -11,7 +11,11 @@ struct RelayChatView: View {
     /// which is where handoff cards live. Lowered again once honored, so a second
     /// push after the sheet was closed still opens it.
     var threadsRequest: Binding<Bool> = .constant(false)
+    /// Continue from a handoff opened in the wrong chat (the root, after a push)
+    /// rebinds the cover to that checkout folder, then resumes there.
+    var onBindChatToFolder: ((_ folderPath: String, _ workspaceID: String?, _ card: RelayHandoffCard) -> Void)? = nil
     @State private var showingThreads = false
+    @State private var threadsPreferLarge = false
     @State private var fullLogRequest: RelayFullLogRequest?
 
     var body: some View {
@@ -31,38 +35,40 @@ struct RelayChatView: View {
             }
             .toolbar(.hidden, for: .navigationBar)
             .safeAreaInset(edge: .bottom) {
-                RelayComposer(
-                    text: $viewModel.prompt,
-                    sections: viewModel.pickerSections,
-                    selectedChoice: viewModel.selectedChoice,
-                    efforts: viewModel.availableEfforts,
-                    selectedEffort: viewModel.effectiveEffort,
-                    provider: viewModel.selectedTaskProvider,
-                    skills: viewModel.availableSkills,
-                    selectedSkillIDs: viewModel.selectedSkillIDs,
-                    claudePermissionMode: viewModel.claudePermissionMode,
-                    codexApprovalPolicy: viewModel.codexApprovalPolicy,
-                    isSending: viewModel.isSending,
-                    isStreaming: viewModel.isStreaming,
-                    isTranscribing: viewModel.isTranscribing,
-                    onPickChoice: { viewModel.selectChoice($0) },
-                    onPickEffort: { viewModel.selectEffort($0) },
-                    onToggleSkill: { viewModel.toggleSkill($0) },
-                    onPickClaudePermission: { viewModel.claudePermissionMode = $0 },
-                    onPickCodexApproval: { viewModel.codexApprovalPolicy = $0 },
-                    onNewConversation: { viewModel.startNewConversation() },
-                    onVoice: { fileURL in
-                        Task { await viewModel.transcribePromptAudio(fileURL: fileURL) }
-                    },
-                    onSend: {
-                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                        Task { await viewModel.sendCurrentPrompt() }
-                    },
-                    onStop: {
-                        UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
-                        viewModel.stopStreaming()
-                    }
-                )
+                if !showingThreads {
+                    RelayComposer(
+                        text: $viewModel.prompt,
+                        sections: viewModel.pickerSections,
+                        selectedChoice: viewModel.selectedChoice,
+                        efforts: viewModel.availableEfforts,
+                        selectedEffort: viewModel.effectiveEffort,
+                        provider: viewModel.selectedTaskProvider,
+                        skills: viewModel.availableSkills,
+                        selectedSkillIDs: viewModel.selectedSkillIDs,
+                        claudePermissionMode: viewModel.claudePermissionMode,
+                        codexApprovalPolicy: viewModel.codexApprovalPolicy,
+                        isSending: viewModel.isSending,
+                        isStreaming: viewModel.isStreaming,
+                        isTranscribing: viewModel.isTranscribing,
+                        onPickChoice: { viewModel.selectChoice($0) },
+                        onPickEffort: { viewModel.selectEffort($0) },
+                        onToggleSkill: { viewModel.toggleSkill($0) },
+                        onPickClaudePermission: { viewModel.claudePermissionMode = $0 },
+                        onPickCodexApproval: { viewModel.codexApprovalPolicy = $0 },
+                        onNewConversation: { viewModel.startNewConversation() },
+                        onVoice: { fileURL in
+                            Task { await viewModel.transcribePromptAudio(fileURL: fileURL) }
+                        },
+                        onSend: {
+                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                            Task { await viewModel.sendCurrentPrompt() }
+                        },
+                        onStop: {
+                            UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+                            viewModel.stopStreaming()
+                        }
+                    )
+                }
             }
             .task {
                 honorThreadsRequest()
@@ -75,8 +81,13 @@ struct RelayChatView: View {
                 await viewModel.refreshThreads()
             }
             .sheet(isPresented: $showingThreads) {
-                RelayThreadDrawer(viewModel: viewModel)
-                    .presentationDetents([.medium, .large])
+                RelayThreadDrawer(
+                    viewModel: viewModel,
+                    onContinueHandoff: { card in
+                        Task { await continueHandoff(card) }
+                    }
+                )
+                    .presentationDetents(threadsPreferLarge ? [.large] : [.medium, .large])
                     .presentationDragIndicator(.visible)
             }
             .sheet(item: $fullLogRequest) { request in
@@ -137,6 +148,7 @@ struct RelayChatView: View {
 
     private var threadAccessBar: some View {
         Button {
+            threadsPreferLarge = false
             showingThreads = true
         } label: {
             HStack(spacing: 10) {
@@ -184,7 +196,20 @@ struct RelayChatView: View {
     private func honorThreadsRequest() {
         guard threadsRequest.wrappedValue else { return }
         threadsRequest.wrappedValue = false
+        threadsPreferLarge = true
         showingThreads = true
+    }
+
+    private func continueHandoff(_ card: RelayHandoffCard) async {
+        if let target = await viewModel.resolveHandoffFolder(card),
+           target.path != viewModel.workspacePath,
+           let onBindChatToFolder {
+            showingThreads = false
+            onBindChatToFolder(target.path, target.workspaceID, card)
+            return
+        }
+        await viewModel.continueHandoff(card)
+        showingThreads = false
     }
 
     private func dismissKeyboard() {
@@ -242,6 +267,7 @@ struct RelayChatView: View {
                 .padding(.bottom, 20)
             }
             .scrollDismissesKeyboard(.interactively)
+            .scrollBounceBehavior(.basedOnSize)
             .animation(.spring(response: 0.36, dampingFraction: 0.82), value: viewModel.messages.count)
             .onChange(of: viewModel.messages.count) { _, _ in scrollToBottom(proxy) }
             .onChange(of: streamingTextLength) { _, _ in scrollToBottom(proxy, animated: false) }
@@ -1372,6 +1398,7 @@ private extension CodexJobStatus {
 
 private struct RelayThreadDrawer: View {
     @ObservedObject var viewModel: RelayChatViewModel
+    var onContinueHandoff: (RelayHandoffCard) -> Void = { _ in }
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -1438,10 +1465,7 @@ private struct RelayThreadDrawer: View {
                         manifest: viewModel.handoffManifests[card.id],
                         isContinuing: viewModel.continuingHandoffIDs.contains(card.id),
                         onContinue: {
-                            Task {
-                                await viewModel.continueHandoff(card)
-                                dismiss()
-                            }
+                            onContinueHandoff(card)
                         }
                     )
                     .listRowBackground(Color.clear)
