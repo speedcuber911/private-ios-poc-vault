@@ -479,11 +479,22 @@ final class RelayChatViewModel: ObservableObject {
         if let workspacePath, self.workspaceID == workspaceID {
             return (workspacePath, workspaceID)
         }
-        let listing = try? await client.fetchDirectory(path: nil, limit: 200)
-        guard let path = listing?.entries.first(where: { $0.workspaceId == workspaceID })?.path else {
-            return nil
+        let pageLimit = 200
+        let maxPages = 10
+        var offset = 0
+        for _ in 0..<maxPages {
+            guard let listing = try? await client.fetchDirectory(path: nil, offset: offset, limit: pageLimit) else {
+                return nil
+            }
+            if let path = listing.entries.first(where: { $0.workspaceId == workspaceID })?.path {
+                return (path, workspaceID)
+            }
+            if listing.entries.isEmpty || !listing.truncated {
+                return nil
+            }
+            offset += listing.entries.count
         }
-        return (path, workspaceID)
+        return nil
     }
 
     /// Resume the handed-off session as an ordinary job in its own worktree, so
