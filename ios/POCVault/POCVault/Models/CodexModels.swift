@@ -351,7 +351,7 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
         case .codex:
             return "Codex"
         case .claude:
-            return "Claude"
+            return "Claude Code"
         case .cursor:
             return "Cursor"
         case .bedrock:

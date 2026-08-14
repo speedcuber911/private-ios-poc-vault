@@ -66,6 +66,14 @@ struct RelayModelChoice: Identifiable, Hashable {
 
     var id: String { "\(model.id)#\(mode.rawValue)" }
 
+    /// The harness that actually owns the resulting session. Chat models retain their
+    /// catalog provider; task aliases such as Bedrock/Claude and Azure/Codex resolve to
+    /// the CLI that Relay launches. Keeping this on the choice gives every UI surface
+    /// one source of truth for provider switching and identity.
+    var executionProvider: CodexProvider {
+        mode == .task ? RelayChatViewModel.taskProvider(for: model) : model.provider
+    }
+
     /// The harness name shown for Agents grouping and the composer chip ("Codex",
     /// "Claude Code", "Cursor"). Purely presentational; rows still come only from the
     /// server catalog.
@@ -265,6 +273,10 @@ final class RelayChatViewModel: ObservableObject {
     private static let codexApprovalDefaultsKey = "relay.codex.approvalPolicy"
 
     var isStreaming: Bool { streamingMessageID != nil }
+
+    /// Provider locked to the open resumable session. A different provider must start a
+    /// new conversation instead of looking like an in-place model change.
+    var currentSessionProvider: CodexProvider? { currentThreadProvider }
 
     /// Unified, newest-first history for this exact folder. Server threads carry complete
     /// conversations; standalone jobs cover invocations whose provider never produced a
@@ -872,6 +884,18 @@ final class RelayChatViewModel: ObservableObject {
         currentThreadWorkspaceID = nil
         currentThreadWorkspaceName = nil
         messages = []
+    }
+
+    /// A Mac-session index row is metadata, not a portable transcript. Starting from it
+    /// therefore creates a clean session, but it must still select the same harness so a
+    /// Claude Code row can never silently open in Codex (or vice versa).
+    func startFresh(from session: RelayMacSession) {
+        startNewConversation()
+        let provider = CodexProvider(rawProvider: session.harness)
+        if let model = models.first(where: { $0.provider == provider && $0.supports(.task) }) {
+            selectChoice(RelayModelChoice(model: model, mode: .task))
+        }
+        prompt = "Continue the work from “\(session.displayTitle)”."
     }
 
     func openThread(_ thread: CodexThread) async {

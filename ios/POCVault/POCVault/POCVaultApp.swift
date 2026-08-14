@@ -531,29 +531,141 @@ struct POCVaultRootView: View {
     #endif
 }
 
+struct RelayProviderPresentation {
+    let title: String
+    let assetName: String?
+    let systemImage: String
+    let accent: Color
+    let permissionsTitle: String
+    let skillsTitle: String
+}
+
 extension CodexProvider {
-    var tabIconAssetName: String {
+    /// One provider identity map for every screen. Provider color is deliberately
+    /// separate from status color: a failed Codex run remains red, while the Codex mark
+    /// stays sea-glass; a waiting Claude Code run remains yellow, while its mark stays
+    /// clay. Text + mark always accompany color for accessibility.
+    var relayPresentation: RelayProviderPresentation {
         switch self {
         case .codex:
-            return "ChatGPTMark"
+            return RelayProviderPresentation(
+                title: "Codex",
+                assetName: "ChatGPTMark",
+                systemImage: "command",
+                accent: Color(hex: 0x78B8B0),
+                permissionsTitle: "Codex approvals",
+                skillsTitle: "Codex skills"
+            )
         case .claude:
-            return "ClaudeMark"
+            return RelayProviderPresentation(
+                title: "Claude Code",
+                assetName: "ClaudeMark",
+                systemImage: "sparkles",
+                accent: Color(hex: 0xD69A69),
+                permissionsTitle: "Claude Code permissions",
+                skillsTitle: "Claude Code skills"
+            )
         case .cursor:
-            return "ChatGPTMark"
+            return RelayProviderPresentation(
+                title: "Cursor",
+                assetName: nil,
+                systemImage: "cursorarrow",
+                accent: Color(hex: 0xA89DD8),
+                permissionsTitle: "Cursor permissions",
+                skillsTitle: "Cursor skills"
+            )
         case .bedrock:
-            return "ClaudeMark"
+            return RelayProviderPresentation(
+                title: "Bedrock",
+                assetName: nil,
+                systemImage: "cube.transparent",
+                accent: Color(hex: 0xD4AA64),
+                permissionsTitle: "Bedrock permissions",
+                skillsTitle: "Bedrock skills"
+            )
         case .azure:
-            return "ChatGPTMark"
+            return RelayProviderPresentation(
+                title: "Azure",
+                assetName: nil,
+                systemImage: "cloud",
+                accent: Color(hex: 0x78A9D8),
+                permissionsTitle: "Azure approvals",
+                skillsTitle: "Azure skills"
+            )
         }
     }
 
-    var activityTint: Color {
-        switch self {
-        case .codex:
-            return AppTheme.textSecondary
-        case .claude, .cursor, .bedrock, .azure:
-            return AppTheme.accent
+    /// Retained for existing callers/tests, but no longer aliases unrelated providers to
+    /// the Codex or Claude artwork.
+    var tabIconAssetName: String {
+        relayPresentation.assetName ?? relayPresentation.systemImage
+    }
+
+    var activityTint: Color { relayPresentation.accent }
+}
+
+enum RelayProviderBadgeStyle: Equatable {
+    case plain
+    case capsule
+}
+
+struct RelayProviderMark: View {
+    let provider: CodexProvider
+    var size: CGFloat = 15
+
+    var body: some View {
+        Group {
+            if let assetName = provider.relayPresentation.assetName {
+                Image(assetName)
+                    .resizable()
+                    .renderingMode(.template)
+                    .scaledToFit()
+            } else {
+                Image(systemName: provider.relayPresentation.systemImage)
+                    .resizable()
+                    .scaledToFit()
+            }
         }
+        .foregroundStyle(provider.relayPresentation.accent)
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
+    }
+}
+
+struct RelayProviderBadge: View {
+    let provider: CodexProvider
+    var detail: String? = nil
+    var style: RelayProviderBadgeStyle = .capsule
+    var size: CGFloat = 10
+
+    var body: some View {
+        HStack(spacing: 6) {
+            RelayProviderMark(provider: provider, size: size + 3)
+            Text(label.uppercased())
+                .font(AppTheme.uiFont(size: size, weight: .semibold))
+                .tracking(0.9)
+                .foregroundStyle(provider.relayPresentation.accent)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, style == .capsule ? 9 : 0)
+        .padding(.vertical, style == .capsule ? 5 : 0)
+        .background {
+            if style == .capsule {
+                Capsule().fill(provider.relayPresentation.accent.opacity(0.11))
+            }
+        }
+        .overlay {
+            if style == .capsule {
+                Capsule().stroke(provider.relayPresentation.accent.opacity(0.28), lineWidth: 1)
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(label)
+    }
+
+    private var label: String {
+        guard let detail = detail?.trimmedNonEmpty else { return provider.relayPresentation.title }
+        return "\(provider.relayPresentation.title) · \(detail)"
     }
 }
 
@@ -621,6 +733,7 @@ private struct CodexStatusView: View {
     let onOpenItem: (CodexThreadFeedItem) -> Void
     let onNewSession: () -> Void
     @State private var selectedSection = StatusSection.activity
+    @State private var providerFilter: CodexProvider?
 
     var body: some View {
         NavigationStack {
@@ -683,11 +796,14 @@ private struct CodexStatusView: View {
                                         .padding(.bottom, 12)
                                 }
 
-                                if !feedViewModel.approvals.isEmpty {
+                                providerFilterBar
+                                    .padding(.bottom, 14)
+
+                                if !displayedApprovals.isEmpty {
                                     RelayCapsLabel(text: "Needs attention", color: AppTheme.statusWarn)
                                         .padding(.horizontal, 20)
                                         .padding(.bottom, 8)
-                                    ForEach(feedViewModel.approvals) { approval in
+                                    ForEach(displayedApprovals) { approval in
                                         RelayApprovalCard(
                                             approval: approval,
                                             onOpen: { openApproval(approval) },
@@ -707,7 +823,7 @@ private struct CodexStatusView: View {
                                     .padding(.bottom, 12)
 
                                 LazyVStack(spacing: 0) {
-                                    ForEach(Array(feedViewModel.feedItems.prefix(24))) { item in
+                                    ForEach(Array(displayedItems.prefix(24))) { item in
                                         Button {
                                             onOpenItem(item)
                                         } label: {
@@ -748,12 +864,70 @@ private struct CodexStatusView: View {
     }
 
     private var summaryText: String {
-        let items = feedViewModel.feedItems
+        let items = displayedItems
         let activeCount = items.filter(\.isActive).count
+        let scope = providerFilter?.relayPresentation.title ?? "all agents"
         if activeCount == 0 {
-            return "\(items.count) threads · all agents"
+            return "\(items.count) threads · \(scope)"
         }
-        return "\(activeCount) active · \(items.count) recent"
+        return "\(activeCount) active · \(items.count) recent · \(scope)"
+    }
+
+    private var displayedItems: [CodexThreadFeedItem] {
+        guard let providerFilter else { return feedViewModel.feedItems }
+        return feedViewModel.feedItems.filter { $0.provider == providerFilter }
+    }
+
+    private var displayedApprovals: [CodexApproval] {
+        guard let providerFilter else { return feedViewModel.approvals }
+        return feedViewModel.approvals.filter { $0.provider == providerFilter }
+    }
+
+    private var availableProviders: [CodexProvider] {
+        let providers = Set(feedViewModel.feedItems.map(\.provider) + feedViewModel.approvals.map(\.provider))
+        return CodexProvider.allCases.filter(providers.contains)
+    }
+
+    private var providerFilterBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                Button {
+                    providerFilter = nil
+                } label: {
+                    Text("ALL")
+                        .font(AppTheme.uiFont(size: 10, weight: .semibold))
+                        .tracking(0.9)
+                        .foregroundStyle(providerFilter == nil ? AppTheme.textPrimary : AppTheme.textTertiary)
+                        .padding(.horizontal, 12)
+                        .frame(height: 30)
+                        .background(providerFilter == nil ? AppTheme.textPrimary.opacity(0.08) : Color.clear, in: Capsule())
+                        .overlay(Capsule().stroke(providerFilter == nil ? AppTheme.hairlineStrong : AppTheme.hairline, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+
+                ForEach(availableProviders) { provider in
+                    Button {
+                        providerFilter = provider
+                    } label: {
+                        RelayProviderBadge(
+                            provider: provider,
+                            style: providerFilter == provider ? .capsule : .plain,
+                            size: 9
+                        )
+                        .frame(height: 30)
+                        .padding(.horizontal, providerFilter == provider ? 0 : 9)
+                        .overlay {
+                            if providerFilter != provider {
+                                Capsule().stroke(AppTheme.hairline, lineWidth: 1)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 20)
+        }
+        .accessibilityLabel("Filter sessions by provider")
     }
 
     private func openApproval(_ approval: CodexApproval) {
@@ -773,12 +947,13 @@ private struct RelayApprovalCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Label(approval.title, systemImage: "checkmark.shield")
-                    .font(AppTheme.uiFont(size: 15, weight: .semibold))
-                    .foregroundStyle(AppTheme.textPrimary)
+                RelayProviderBadge(provider: approval.provider, style: .capsule, size: 9)
                 Spacer()
-                RelayCapsLabel(text: approval.provider.displayName, color: AppTheme.statusWarn, size: 9)
+                RelayCapsLabel(text: "Needs approval", color: AppTheme.statusWarn, size: 9)
             }
+            Label(approval.title, systemImage: "checkmark.shield")
+                .font(AppTheme.uiFont(size: 15, weight: .semibold))
+                .foregroundStyle(AppTheme.textPrimary)
             if let command = approval.command?.trimmedNonEmpty {
                 Text(command)
                     .font(AppTheme.monoFont(size: 12))
@@ -798,13 +973,21 @@ private struct RelayApprovalCard: View {
                 Spacer()
                 Button("Approve") { onDecision(.accept) }
                     .buttonStyle(.borderedProminent)
-                    .tint(AppTheme.accent)
+                    .tint(approval.provider.relayPresentation.accent)
             }
         }
         .padding(14)
         .background(AppTheme.canvasTop)
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(AppTheme.statusWarn.opacity(0.45), lineWidth: 1))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(approval.provider.relayPresentation.accent.opacity(0.4), lineWidth: 1))
+        .overlay(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(approval.provider.relayPresentation.accent)
+                .frame(width: 3)
+                .padding(.vertical, 12)
+        }
         .clipShape(RoundedRectangle(cornerRadius: 14))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(approval.provider.relayPresentation.title) approval request")
     }
 }
 
@@ -842,11 +1025,13 @@ private struct CodexActivityRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Image(systemName: "message")
-                .font(.system(size: 15))
-                .foregroundStyle(AppTheme.textSecondary)
+            RelayProviderMark(provider: provider, size: 17)
                 .frame(width: 32, height: 32)
-                .background(AppTheme.textPrimary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .background(provider.relayPresentation.accent.opacity(0.11), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(provider.relayPresentation.accent.opacity(0.24), lineWidth: 1)
+                }
 
             VStack(alignment: .leading, spacing: 5) {
                 Text(item.title)
@@ -856,14 +1041,10 @@ private struct CodexActivityRow: View {
                     .fixedSize(horizontal: false, vertical: true)
 
                 HStack(spacing: 7) {
+                    RelayProviderBadge(provider: provider, style: .plain, size: 9)
                     Text("\(item.workspaceLabel) · \(timestampText)")
                         .font(.system(size: 11))
                         .foregroundStyle(AppTheme.textSecondary)
-                    RelayCapsLabel(
-                        text: provider.displayName,
-                        color: provider == .codex ? AppTheme.textTertiary : AppTheme.accent,
-                        size: 9
-                    )
                     RelayCapsLabel(
                         text: item.status?.label ?? "Thread",
                         color: statusColor,
@@ -877,12 +1058,19 @@ private struct CodexActivityRow: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
+        .overlay(alignment: .leading) {
+            Rectangle()
+                .fill(provider.relayPresentation.accent.opacity(0.75))
+                .frame(width: 2)
+        }
         .overlay(alignment: .bottom) {
             Rectangle()
                 .fill(AppTheme.hairline)
                 .frame(height: 0.5)
                 .padding(.leading, 62)
         }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(provider.relayPresentation.title), \(item.title)")
     }
 
     private var timestampText: String {
