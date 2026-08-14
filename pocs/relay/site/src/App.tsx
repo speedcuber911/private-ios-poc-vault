@@ -14,6 +14,8 @@ import TextPressure from './components/reactbits/TextPressure';
 
 const ease = [0.16, 1, 0.3, 1] as const;
 const installCommand = "curl --proto '=https' --tlsv1.2 -fsSL https://get.openrelay.sh/install.sh | sh";
+const relayAppOrigin = import.meta.env.VITE_RELAY_APP_ORIGIN || 'https://app.openrelay.sh';
+const appLoginUrl = `${relayAppOrigin}/login`;
 
 const surfaceMoments = [
   {
@@ -562,7 +564,7 @@ export default function App() {
           <a href="#product">Product</a>
           <a href="#privacy">Cloud</a>
         </nav>
-        <a className="beta-link" href="#product">Private beta <ArrowUpRight size={13} /></a>
+        <a className="beta-link" href={appLoginUrl}>Sign in <ArrowUpRight size={13} /></a>
       </header>
 
       <main>
@@ -583,7 +585,10 @@ export default function App() {
             </div>
             <div className="hero-copy">
               <h2>Start it at your desk.<br /><em>Carry it anywhere.</em></h2>
-              <p>Launch, watch, and continue agent work from your iPhone while the machine with your files does the execution.</p>
+              <div className="hero-copy-aside">
+                <p>Launch, watch, and continue agent work from your iPhone while the machine with your files does the execution.</p>
+                <a className="app-entry app-entry-hero" href={appLoginUrl}>Open the app <ArrowUpRight size={14} /></a>
+              </div>
             </div>
             <div className="hero-product-line" aria-hidden="true"><span>WORKSPACE</span><i /><strong>RELAY</strong><i /><span>IPHONE</span></div>
             <a className="hero-scroll" href="#system"><span>See the handoff</span><ArrowDown size={16} /></a>
@@ -614,6 +619,11 @@ export default function App() {
                   <span>{installCopied ? 'COPIED' : 'COPY'}</span>
                 </button>
               </Reveal>
+              <a className="app-entry app-entry-closing" href={appLoginUrl}>
+                <small>WEB CONSOLE</small>
+                <span>Open the app</span>
+                <ArrowUpRight size={16} />
+              </a>
               <div className="closing-v4-note"><span>The runner keeps the workspace. iPhone keeps the thread.</span></div>
             </div>
             <Reveal className="closing-v4-device" delay={0.1}>
@@ -632,7 +642,7 @@ export default function App() {
         <a href="#top" className="brand">Relay</a>
         <p>Private iPhone control for remote agent work.</p>
         <div><span>CODEX</span><span>CLAUDE CODE</span><span>CURSOR</span></div>
-        <small>2026 / PRIVATE BETA</small>
+        <small><a href={appLoginUrl}>Sign in</a> / 2026</small>
       </footer>
     </div>
   );
