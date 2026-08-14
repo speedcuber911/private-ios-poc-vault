@@ -407,7 +407,7 @@ test("trial current: upgraded returns 200, not no_trial; POST is spent; DELETE i
   }
 });
 
-test("trial create: expired still 409s — the TTL was spent", async () => {
+test("trial create: expired still 409s until deleted or reaped", async () => {
   const provisioner = makeFakeProvisioner();
   const t = await startTestApp({ env: TRIAL_ENV, provisioner });
   try {

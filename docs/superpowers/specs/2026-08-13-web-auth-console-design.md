@@ -345,7 +345,9 @@ to logs.
 - **Trial** — `trial_unavailable`, `trial_capacity`, `trial_already_used`,
   and `failed`/`destroyed` (retry in place) keep today's meanings.
   `DELETE` sets `destroyed`; a later create retries the same row. `expired`
-  still 409s.
+  still 409s until the row is deleted or reaped — either path sets
+  `destroyed`, which is retryable, so the cap is one live trial per
+  account, not one per lifetime.
 - **Grant / gateway / node down** — “Can't reach this machine.” No
   placeholder activity that looks live.
 - **Waitlist** — failure is shown; success is “On the waitlist.”
@@ -474,8 +476,7 @@ pattern as existing on-host secrets: never in the repo or CI variables.
 ### 10.8 Untouched
 
 Handoff sealing, APNs banner rules, Cube provisioner contracts, broker
-raw transport, PostgreSQL, Apple on the web, billing, re-pair, trial
-destroy recovery.
+raw transport, PostgreSQL, Apple on the web, billing, re-pair.
 
 ## 11. Security posture
 
@@ -501,7 +502,7 @@ destroy recovery.
 - File browser, chat composer, or full iPhone parity.
 - Sign in with Apple or magic link on the website.
 - Checkout, Stripe, or raising `nodes.max` automatically.
-- Re-pair for a lost phone cert; casual trial destroy/recreate.
+- Re-pair for a lost phone cert.
 - Cloud proxy of jobs/files/prompts.
 - Client certificates in the browser.
 - Universal links / system-camera login (payload remains URL-shaped).
