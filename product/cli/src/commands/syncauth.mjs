@@ -177,6 +177,13 @@ async function deliverSealedBundle({ api, nodeId, nodeEncPubkey, kind, payload }
     // command has: the bundle is sealed and stored, the user is told their
     // logins are on the sandbox, and nothing ever collects them. The status
     // is the only detail carried — never the secret, never a credential.
+    // unknown_node means the pin itself is stale; re-running sync-auth cannot
+    // fix that — the machine must be re-pinned first.
+    if (notice.status === 404 && notice.json?.error === "unknown_node") {
+      throw new Error(
+        "sync_notice_failed_404: the cloud no longer knows this machine — run `relay login` to re-pin it, then run relay sync-auth again",
+      );
+    }
     throw new Error(
       `sync_notice_failed_${notice.status}: your machine was never told where to collect these logins — run relay sync-auth again`,
     );

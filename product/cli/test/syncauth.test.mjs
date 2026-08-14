@@ -16,7 +16,7 @@ function homeWithCreds(node) {
   return home;
 }
 
-function recordingCloud({ noticeStatus = 201 } = {}) {
+function recordingCloud({ noticeStatus = 201, noticeBody = { notice: { id: "notice-1", state: "pending" } } } = {}) {
   const calls = [];
   return {
     calls,
@@ -27,7 +27,7 @@ function recordingCloud({ noticeStatus = 201 } = {}) {
         return { status: 201, json: async () => ({ pairingId: "11111111-1111-4111-8111-111111111111", expiresAt: 1 }) };
       }
       if (pathname === "/v1/sync-auth/notices") {
-        return { status: noticeStatus, json: async () => ({ notice: { id: "notice-1", state: "pending" } }) };
+        return { status: noticeStatus, json: async () => noticeBody };
       }
       return { status: 204, json: async () => null };
     },
@@ -296,6 +296,34 @@ test("a notice the cloud refuses fails the command instead of reporting a sync t
     (error) => {
       assert.match(error.message, /sync_notice_failed_503/);
       assert.match(error.message, /relay sync-auth/, "the error must tell the user what to do next");
+      assert.ok(!error.message.includes("ghp_never_announced"), "an error must never carry a credential");
+      return true;
+    },
+  );
+
+  assert.ok(!lines.join("\n").includes("Sent github login"),
+    "nothing may claim a credential reached the machine when the machine was never told");
+});
+
+// A stale/deleted/foreign node pin yields 404 unknown_node. Re-running
+// sync-auth cannot fix that — the pin itself is wrong — so the error must
+// point at `relay login`, not loop the user back into sync-auth.
+test("a notice the cloud refuses fails the command instead of reporting a sync that never lands — unknown_node points at re-pin", async () => {
+  const node = generateEncKeyPair();
+  const home = homeWithCreds(node);
+  const cloud = recordingCloud({ noticeStatus: 404, noticeBody: { error: "unknown_node" } });
+  const lines = [];
+
+  await assert.rejects(
+    () => cmdSyncAuth([], {
+      home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl, log: (line) => lines.push(line),
+      execFileImpl: async () => ({ stdout: "ghp_never_announced\n" }),
+      requireGitHubRepoImpl: async () => { throw new Error("not a repo"); },
+    }),
+    (error) => {
+      assert.match(error.message, /sync_notice_failed_404/);
+      assert.match(error.message, /relay login/);
+      assert.match(error.message, /re-pin/);
       assert.ok(!error.message.includes("ghp_never_announced"), "an error must never carry a credential");
       return true;
     },
