@@ -772,16 +772,18 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     db.exec("BEGIN IMMEDIATE");
     try {
       const trial = getTrialByAccount(accountId);
+      // Already upgraded: true no-op. Do not re-raise entitlements or touch the
+      // node — admin may have lowered max_nodes or renamed/deleted the node.
+      if (trial?.state === "upgraded") {
+        db.exec("COMMIT");
+        return { ok: true };
+      }
       const node = trial?.nodeId ? getNode(trial.nodeId) : null;
       const currentMax = Number.parseInt(
         getEntitlement(accountId, ENTITLEMENT_MAX_NODES) ?? "0",
         10,
       );
       const maxVal = Number.isFinite(currentMax) ? currentMax : 0;
-      if (trial?.state === "upgraded" && node?.kind === "byo" && maxVal >= 2) {
-        db.exec("COMMIT");
-        return { ok: true };
-      }
       if (
         !trial ||
         (trial.state !== "creating" && trial.state !== "ready") ||

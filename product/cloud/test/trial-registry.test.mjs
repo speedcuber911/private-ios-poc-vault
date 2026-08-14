@@ -99,6 +99,37 @@ test("upgradeTrialAccount converts a live trial and skips upgraded rows in due/a
   assert.equal(registry.upgradeTrialAccount(empty.id).error, "nothing_to_upgrade");
 });
 
+test("upgradeTrialAccount retry is a no-op even when max_nodes was lowered", () => {
+  const { registry, clock } = freshRegistry();
+  const acct = registry.createAccount({ email: "retry@example.com" });
+  registry.setEntitlement(acct.id, "nodes.max", "1");
+  const trial = registry.createTrialNode({
+    accountId: acct.id,
+    enrollTokenHash: "h-retry",
+    expiresAt: clock.t + 100,
+  });
+  registry.createNode(acct.id, {
+    id: "node-fedcba9876543210",
+    kind: "trial",
+    name: "Trial machine",
+    pubkey: "pk",
+    version: null,
+  });
+  registry.updateTrial(trial.id, {
+    state: "ready",
+    nodeId: "node-fedcba9876543210",
+    sandboxId: "sbx_retry",
+  });
+
+  assert.equal(registry.upgradeTrialAccount(acct.id).ok, true);
+  assert.equal(registry.getEntitlement(acct.id, "nodes.max"), "2");
+
+  registry.setEntitlement(acct.id, "nodes.max", "1");
+  const again = registry.upgradeTrialAccount(acct.id);
+  assert.equal(again.ok, true);
+  assert.equal(registry.getEntitlement(acct.id, "nodes.max"), "1");
+});
+
 test("deleteAccount removes trial rows", () => {
   const { registry, clock } = freshRegistry();
   const acct = registry.createAccount({ email: "d@example.com" });
