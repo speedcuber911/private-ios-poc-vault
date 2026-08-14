@@ -31,7 +31,13 @@ test("the CLI's production control plane is the same host the iOS app falls back
   // this constant; the `#else` branch is the one that ships. Comparing against
   // the wrong branch is not a hypothetical — the first version of this test did
   // exactly that and failed against the simulator's loopback URL.
-  const simulatorBranch = swift.indexOf("#if targetEnvironment(simulator)");
+  //
+  // Locate AppConfiguration first: an earlier `#if targetEnvironment(simulator)`
+  // (push registration) precedes the AppConfiguration block and must not be
+  // used as the slice origin.
+  const appConfiguration = swift.indexOf("enum AppConfiguration");
+  assert.notEqual(appConfiguration, -1, "POCVaultApp.swift no longer declares AppConfiguration");
+  const simulatorBranch = swift.indexOf("#if targetEnvironment(simulator)", appConfiguration);
   assert.notEqual(simulatorBranch, -1, "POCVaultApp.swift no longer has a simulator build branch");
   const deviceBranch = swift.indexOf("\n#else", simulatorBranch);
   const endOfBranch = swift.indexOf("\n#endif", deviceBranch);

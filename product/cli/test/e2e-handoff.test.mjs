@@ -178,30 +178,80 @@ process.stdin.on("end", () => {
   { mode: 0o755 },
 );
 
-// The Codex twin. Codex does NOT put its answer on stdout — relayd reads it
-// back out of the `-o <file>` path it passed (jobs.mjs finishJob), so a fake
-// that only printed to stdout would "succeed" with an empty result and hide a
-// broken resume. It records CODEX_HOME too, because that is where the rollout
-// it is resuming had to be staged.
+// The Codex twin. relayd's default transport is `codex app-server --stdio`
+// (appserver-client.mjs → codex-job-runner.mjs): initialize handshake, then
+// thread/resume + turn/start, with the answer written via agentMessage /
+// turn/completed notifications into RELAY_RESULT_PATH. An old one-shot
+// `codex exec resume … -o` script never answers initialize and the job times
+// out. Record CODEX_HOME too — that is where the rollout had to be staged.
 fs.writeFileSync(
   fakeCodex,
   `#!/usr/bin/env node
 const fs = require("node:fs");
-const chunks = [];
-process.stdin.on("data", (chunk) => chunks.push(chunk));
-process.stdin.on("end", () => {
-  const argv = process.argv.slice(2);
-  const outAt = argv.indexOf("-o");
-  fs.writeFileSync(${JSON.stringify(codexHarnessLog)}, JSON.stringify({
-    argv,
-    cwd: process.cwd(),
-    home: process.env.HOME,
-    codexHome: process.env.CODEX_HOME,
-    pid: process.pid,
-    prompt: Buffer.concat(chunks).toString("utf8"),
-  }));
-  if (outAt !== -1) fs.writeFileSync(argv[outAt + 1], "CODEX-RESUMED-OK\\n");
-  process.stdout.write("codex exec finished\\n");
+const readline = require("node:readline");
+
+const argv = process.argv.slice(2);
+if (argv[0] !== "app-server") {
+  process.stderr.write("fake-codex: expected app-server --stdio, got " + JSON.stringify(argv) + "\\n");
+  process.exit(2);
+}
+
+const invocation = {
+  argv,
+  cwd: process.cwd(),
+  home: process.env.HOME,
+  codexHome: process.env.CODEX_HOME,
+  pid: process.pid,
+  prompt: null,
+  resume: null,
+  method: null,
+};
+
+function reply(id, result) {
+  process.stdout.write(JSON.stringify({ id, result }) + "\\n");
+}
+
+function notify(method, params) {
+  process.stdout.write(JSON.stringify({ method, params }) + "\\n");
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  let message;
+  try {
+    message = JSON.parse(line);
+  } catch {
+    return;
+  }
+  if (!message || !message.method) return;
+  if (message.method === "initialize") {
+    reply(message.id, {});
+    return;
+  }
+  if (message.method === "initialized") return;
+  if (message.method === "thread/resume") {
+    invocation.method = "thread/resume";
+    invocation.resume = message.params || {};
+    const threadId = message.params?.threadId;
+    reply(message.id, { thread: { id: threadId } });
+    fs.writeFileSync(${JSON.stringify(codexHarnessLog)}, JSON.stringify(invocation));
+    return;
+  }
+  if (message.method === "turn/start") {
+    const text = (message.params?.input || [])
+      .filter((part) => part && part.type === "text" && typeof part.text === "string")
+      .map((part) => part.text)
+      .join("");
+    invocation.prompt = text;
+    fs.writeFileSync(${JSON.stringify(codexHarnessLog)}, JSON.stringify(invocation));
+    reply(message.id, { turn: { id: "turn-1" } });
+    notify("item/completed", { item: { type: "agentMessage", text: "CODEX-RESUMED-OK" } });
+    notify("turn/completed", { turn: { status: "completed" } });
+    return;
+  }
+  if (message.id !== undefined) {
+    reply(message.id, {});
+  }
 });
 `,
   { mode: 0o755 },
@@ -1051,14 +1101,19 @@ test("codex claim 4: continuing the handoff really resumes the fake codex with t
   const finished = await runToCompletion(job);
   assert.equal(finished.status, "succeeded", `the resume job failed: ${finished.error}`);
   assert.equal(finished.exitCode, 0);
-  assert.equal(finished.result, "CODEX-RESUMED-OK", "codex's answer comes from the -o file, not stdout");
+  assert.equal(finished.result, "CODEX-RESUMED-OK", "codex's answer comes from the app-server agentMessage, not stdout");
 
   const invocation = JSON.parse(await waitFor("the fake codex to record its invocation", () =>
     (fs.existsSync(codexHarnessLog) ? fs.readFileSync(codexHarnessLog, "utf8") : null)));
-  assert.ok(invocation.argv.includes("resume"), `codex was not asked to resume: ${JSON.stringify(invocation.argv)}`);
   assert.ok(
-    invocation.argv.includes(CODEX_SESSION_ID),
-    `codex resumed the wrong rollout: ${JSON.stringify(invocation.argv)}`,
+    invocation.argv[0] === "app-server" && invocation.argv.includes("--stdio"),
+    `codex must be spawned as app-server --stdio: ${JSON.stringify(invocation.argv)}`,
+  );
+  assert.equal(invocation.method, "thread/resume", `codex was not asked to resume: ${JSON.stringify(invocation)}`);
+  assert.equal(
+    invocation.resume?.threadId,
+    CODEX_SESSION_ID,
+    `codex resumed the wrong rollout: ${JSON.stringify(invocation.resume)}`,
   );
   assert.equal(invocation.cwd, s.checkout, "codex must run inside the imported checkout");
   assert.equal(invocation.home, runHome);
