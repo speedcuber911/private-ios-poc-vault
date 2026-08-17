@@ -964,6 +964,8 @@ final class RelayChatViewModel: ObservableObject {
         currentThreadWorkspaceID = nil
         currentThreadWorkspaceName = nil
         messages = []
+        prompt = ""
+        errorMessage = nil
     }
 
     /// A Mac-session index row is metadata, not a portable transcript. Starting from it

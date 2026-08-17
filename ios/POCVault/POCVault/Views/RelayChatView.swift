@@ -14,9 +14,14 @@ struct RelayChatView: View {
     /// Continue from a handoff opened in the wrong chat (the root, after a push)
     /// rebinds the cover to that checkout folder, then resumes there.
     var onBindChatToFolder: ((_ folderPath: String, _ workspaceID: String?, _ card: RelayHandoffCard) -> Void)? = nil
+    /// New-session entry points ask for the owning agent/model after the server catalog
+    /// has loaded. Existing-thread and push entry points leave the picker closed.
+    var presentsProviderPickerOnAppear = false
     @State private var showingThreads = false
     @State private var threadsPreferLarge = false
     @State private var fullLogRequest: RelayFullLogRequest?
+    @State private var modelPickerRequest = 0
+    @State private var didHandleInitialProviderPicker = false
 
     var body: some View {
         NavigationStack {
@@ -40,6 +45,7 @@ struct RelayChatView: View {
                         text: $viewModel.prompt,
                         sections: viewModel.pickerSections,
                         selectedChoice: viewModel.selectedChoice,
+                        modelPickerRequest: modelPickerRequest,
                         threadProvider: viewModel.currentSessionProvider,
                         efforts: viewModel.availableEfforts,
                         selectedEffort: viewModel.effectiveEffort,
@@ -75,6 +81,10 @@ struct RelayChatView: View {
             .task {
                 honorThreadsRequest()
                 await viewModel.bootstrap()
+                if presentsProviderPickerOnAppear, !didHandleInitialProviderPicker {
+                    didHandleInitialProviderPicker = true
+                    modelPickerRequest += 1
+                }
             }
             .onChange(of: threadsRequest.wrappedValue) { _, _ in
                 honorThreadsRequest()
@@ -117,7 +127,7 @@ struct RelayChatView: View {
             }
 
             Button {
-                viewModel.startNewConversation()
+                startNewConversation()
             } label: {
                 Image(systemName: "square.and.pencil")
                     .font(AppTheme.uiFont(size: 16, weight: .semibold))
@@ -225,6 +235,11 @@ struct RelayChatView: View {
         threadsRequest.wrappedValue = false
         threadsPreferLarge = true
         showingThreads = true
+    }
+
+    private func startNewConversation() {
+        viewModel.startNewConversation()
+        modelPickerRequest += 1
     }
 
     private func continueHandoff(_ card: RelayHandoffCard) async {
@@ -363,6 +378,7 @@ private struct RelayComposer: View {
     @Binding var text: String
     let sections: RelayModelPickerSections
     let selectedChoice: RelayModelChoice?
+    let modelPickerRequest: Int
     let threadProvider: CodexProvider?
     let efforts: [CodexReasoningEffort]
     let selectedEffort: CodexReasoningEffort?
@@ -764,6 +780,9 @@ private struct RelayComposer: View {
         }
         .sheet(isPresented: $showingSkillPicker) {
             skillPickerSheet
+        }
+        .onChange(of: modelPickerRequest) { _, _ in
+            showingModelPicker = true
         }
     }
 

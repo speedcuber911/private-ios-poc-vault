@@ -218,7 +218,8 @@ struct POCVaultRootView: View {
                     let next = chatSessionStore.launch(folderPath: path, workspaceID: workspaceID)
                     chatLaunch = next
                     Task { await next.viewModel.continueHandoff(card) }
-                }
+                },
+                presentsProviderPickerOnAppear: launch.presentsProviderPicker
             )
         }
         .fullScreenCover(item: $terminalLaunch) { launch in
@@ -415,7 +416,7 @@ struct POCVaultRootView: View {
                 browserPath.append(.file(entry: entry))
             },
             onOpenChat: { path, workspaceID in
-                openChat(folderPath: path, workspaceID: workspaceID)
+                openNewSession(folderPath: path, workspaceID: workspaceID)
             },
             onOpenTerminal: { workspaceID, workspaceName in
                 terminalLaunch = RelayTerminalLaunch(workspaceID: workspaceID, workspaceName: workspaceName)
@@ -452,6 +453,10 @@ struct POCVaultRootView: View {
 
     private func openChat(folderPath: String?, workspaceID: String?) {
         chatLaunch = chatSessionStore.launch(folderPath: folderPath, workspaceID: workspaceID)
+    }
+
+    private func openNewSession(folderPath: String?, workspaceID: String?) {
+        chatLaunch = chatSessionStore.launchNewSession(folderPath: folderPath, workspaceID: workspaceID)
     }
 
     private func openSession(_ item: CodexThreadFeedItem) {

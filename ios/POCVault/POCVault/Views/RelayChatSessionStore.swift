@@ -6,6 +6,10 @@ import Foundation
 struct RelayChatLaunch: Identifiable {
     let id: String
     let viewModel: RelayChatViewModel
+    /// A launch from a "New session" affordance starts with a clean draft and
+    /// immediately asks which runner/model should own it. History and push routes
+    /// leave this false because they open a specific existing conversation.
+    let presentsProviderPicker: Bool
 }
 
 /// App-wide cache of per-folder chat view models plus the single background job monitor.
@@ -99,7 +103,21 @@ final class RelayChatSessionStore: ObservableObject {
     func launch(folderPath: String?, workspaceID: String? = nil) -> RelayChatLaunch {
         RelayChatLaunch(
             id: Self.canonicalKey(forFolderPath: folderPath),
-            viewModel: session(forFolderPath: folderPath, workspaceID: workspaceID)
+            viewModel: session(forFolderPath: folderPath, workspaceID: workspaceID),
+            presentsProviderPicker: false
+        )
+    }
+
+    /// Start a genuinely new session in a folder even when its cached view model is
+    /// still showing an older thread. The cache remains valuable for live streams and
+    /// folder metadata; only its foreground conversation state is reset.
+    func launchNewSession(folderPath: String?, workspaceID: String? = nil) -> RelayChatLaunch {
+        let viewModel = session(forFolderPath: folderPath, workspaceID: workspaceID)
+        viewModel.startNewConversation()
+        return RelayChatLaunch(
+            id: Self.canonicalKey(forFolderPath: folderPath),
+            viewModel: viewModel,
+            presentsProviderPicker: true
         )
     }
 

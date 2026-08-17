@@ -551,6 +551,11 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(source.contains("RELAY_UITEST_FILE"))
         XCTAssertTrue(source.contains("RELAY_UITEST_CHAT"))
         XCTAssertTrue(source.contains("RELAY_UITEST_OPEN"))
+
+        // The folder toolbar says "New session", so it must not use the ordinary
+        // cached-chat launch path that can reopen the folder's current thread.
+        XCTAssertTrue(source.contains("openNewSession(folderPath: path, workspaceID: workspaceID)"))
+        XCTAssertTrue(source.contains("chatSessionStore.launchNewSession"))
     }
 
     @MainActor
@@ -615,6 +620,30 @@ final class ManifestTests: XCTestCase {
         XCTAssertNil(store.cachedSession(forFolderPath: "/srv/codex-workspaces/streaming"))
         XCTAssertNil(store.cachedSession(forFolderPath: "/srv/codex-workspaces/idle"))
         XCTAssertNotNil(store.cachedSession(forFolderPath: "/srv/codex-workspaces/next"))
+    }
+
+    @MainActor
+    func testNewSessionLaunchResetsCachedDraftAndRequestsProviderPicker() async throws {
+        let store = RelayChatSessionStore(
+            client: makeOfflineCodexClient(),
+            capacity: 2,
+            isPinned: { _ in false }
+        )
+        let cached = store.session(forFolderPath: "/srv/codex-workspaces/alpha", workspaceID: "ws-alpha")
+        cached.prompt = "continue the old conversation"
+        cached.errorMessage = "old error"
+
+        let launch = store.launchNewSession(
+            folderPath: "/srv/codex-workspaces/alpha/",
+            workspaceID: "ws-alpha"
+        )
+
+        XCTAssertTrue(launch.viewModel === cached, "The folder cache should be reused without reopening its old thread")
+        XCTAssertTrue(launch.presentsProviderPicker, "A new session should ask whether to use Codex, Claude Code, or another available runner")
+        XCTAssertTrue(cached.prompt.isEmpty)
+        XCTAssertNil(cached.errorMessage)
+        XCTAssertTrue(cached.messages.isEmpty)
+        XCTAssertNil(cached.currentSessionProvider)
     }
 
     /// A client pointed at a closed local port: constructing view models never fires
@@ -1907,6 +1936,7 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(source.contains("relay-model-chip"))
         XCTAssertTrue(source.contains("relay-effort-chip"))
         XCTAssertTrue(source.contains("Image(systemName: \"arrow.up\")"))
+        XCTAssertTrue(source.contains(".onChange(of: modelPickerRequest)"))
 
         // Provider readiness remains provider-scoped, visible, and blocks send before
         // the draft is cleared. Authentication itself stays on the linked computer.
