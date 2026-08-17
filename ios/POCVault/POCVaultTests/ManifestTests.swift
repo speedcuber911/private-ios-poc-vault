@@ -245,6 +245,18 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(sections.chatModels.allSatisfy { $0.mode == .chat })
     }
 
+    func testRelayModelPickerLocksAnActiveThreadToItsProvider() throws {
+        let sections = RelayModelDiscovery.sections(from: try decodeCodexModels(liveShapeCatalogJSON))
+
+        let claudeThread = sections.restricted(to: .claude)
+        XCTAssertFalse(claudeThread.isEmpty)
+        XCTAssertTrue(claudeThread.allChoices.allSatisfy { $0.executionProvider == .claude })
+        XCTAssertEqual(claudeThread.agents.map(\.provider), [.claude])
+        XCTAssertTrue(claudeThread.chatModels.isEmpty)
+
+        XCTAssertEqual(sections.restricted(to: nil), sections, "New Conversation restores the full provider catalog")
+    }
+
     /// A harness missing from the catalog produces no group — the client never
     /// synthesizes providers. A single-entry harness (Cursor Auto) shows exactly one row.
     func testRelayModelDiscoveryOmitsMissingHarnessesAndNeverSynthesizesRows() throws {
@@ -1821,6 +1833,31 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(source.contains("#selector(UIResponder.resignFirstResponder)"))
     }
 
+    func testRelayComposerKeepsControlsInOnePinnedHorizontalBar() throws {
+        let source = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
+        let controlBarSource = try sourceSnippet(
+            in: source,
+            from: "private var controlBar: some View",
+            to: "var body: some View"
+        )
+
+        XCTAssertTrue(controlBarSource.contains("ScrollView(.horizontal, showsIndicators: false)"))
+        XCTAssertTrue(controlBarSource.contains("HStack(spacing: 8)"))
+        XCTAssertTrue(controlBarSource.contains(".frame(height: 36)"))
+        XCTAssertTrue(controlBarSource.contains("relay-control-bar"))
+        XCTAssertFalse(controlBarSource.contains("VStack"))
+        XCTAssertFalse(source.contains("usesAccessibilityLayout"))
+    }
+
+    func testRelayComposerDoesNotOfferCrossProviderSwitchingInsideAThread() throws {
+        let source = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
+
+        XCTAssertTrue(source.contains("sections.restricted(to: threadProvider)"))
+        XCTAssertTrue(source.contains("threadProvider == nil || choice.executionProvider == threadProvider"))
+        XCTAssertFalse(source.contains("pendingProviderChoice"))
+        XCTAssertFalse(source.contains("providerSwitchTitle"))
+    }
+
     /// Revamp I4: the composer is harness-first. The mode toggle, workspace chip, and
     /// the in-chat workspace browser are gone (the file browser owns folder navigation);
     /// the picker groups Agents per harness with a flat Chat models section; the send
@@ -1843,9 +1880,9 @@ final class ManifestTests: XCTestCase {
         // Harness-first picker: Agents submenus per harness + flat Chat models.
         XCTAssertTrue(source.contains("Section(\"Agents\")"))
         XCTAssertTrue(source.contains("Section(\"Chat models\")"))
-        XCTAssertTrue(source.contains("ForEach(sections.agents)"))
+        XCTAssertTrue(source.contains("ForEach(visibleSections.agents)"))
         XCTAssertTrue(source.contains("Menu(harness.title)"))
-        XCTAssertTrue(source.contains("ForEach(sections.chatModels)"))
+        XCTAssertTrue(source.contains("ForEach(visibleSections.chatModels)"))
         XCTAssertTrue(source.contains("relay-model-chip"))
         XCTAssertTrue(source.contains("relay-effort-chip"))
         XCTAssertTrue(source.contains("Image(systemName: \"arrow.up\")"))

@@ -8,7 +8,7 @@ import { execFileSync } from "node:child_process";
 
 const {
   importSession, rewriteSessionCwd, claudeProjectSlug, summaryPrompt,
-  assertContained, SessionImportSecurityError,
+  assertContained, codexRolloutLeafName, repairLegacyCodexRollout, SessionImportSecurityError,
 } = await import("../src/sessionimport.mjs");
 // The shared contract this module now stages by. Imported directly (it is
 // deliberately dependency-free) rather than through util.mjs, whose config.mjs
@@ -169,6 +169,18 @@ test("claudeProjectSlug matches Claude Code's directory naming", () => {
   assert.equal(claudeProjectSlug("/srv/relay-workspaces/handoff-abc"), "-srv-relay-workspaces-handoff-abc");
 });
 
+test("codex rollouts use the native filename shape app-server discovers", () => {
+  const sessionId = "0199aaaa-bbbb-4ccc-8ddd-eeeeffff0000";
+  assert.equal(
+    codexRolloutLeafName(sessionId, Date.parse("2026-08-11T09:00:00.000Z")),
+    `rollout-2026-08-11T09-00-00-${sessionId}.jsonl`,
+  );
+  assert.equal(
+    codexRolloutLeafName(sessionId, "not-a-date"),
+    `rollout-1970-01-01T00-00-00-${sessionId}.jsonl`,
+  );
+});
+
 test("rewriteSessionCwd retargets the cwd without corrupting other text", () => {
   const line = JSON.stringify({ type: "user", cwd: FROM_CWD, message: `edit ${FROM_CWD}/src/a.ts and keep /Users/dev/other` });
   const rewritten = rewriteSessionCwd(`${line}\n`, { fromCwd: FROM_CWD, toCwd: TO_CWD });
@@ -222,7 +234,7 @@ test("a codex rollout is staged under the codex home with its recorded cwd retar
     sessionBytes: rollout, runHome, codexHome, worktreePath: TO_CWD,
   });
 
-  const staged = path.join(codexHome, "sessions", `${sessionId}.jsonl`);
+  const staged = path.join(codexHome, "sessions", codexRolloutLeafName(sessionId, manifest().createdAt));
   const stagedText = fs.readFileSync(staged, "utf8");
   const stagedMeta = JSON.parse(stagedText.split("\n")[0]);
 
@@ -253,7 +265,35 @@ test("a codex rollout whose cwd already equals the worktree is staged byte-for-b
     sessionBytes: rollout, runHome, codexHome, worktreePath: TO_CWD,
   });
 
-  assert.deepEqual(fs.readFileSync(path.join(codexHome, "sessions", `${sessionId}.jsonl`)), rollout);
+  assert.deepEqual(
+    fs.readFileSync(path.join(codexHome, "sessions", codexRolloutLeafName(sessionId, manifest().createdAt))),
+    rollout,
+  );
+});
+
+test("a ready handoff staged under the old bare id is repaired for native Codex discovery", () => {
+  const { codexHome } = homes();
+  const sessionId = "0199cccc-dddd-4eee-8fff-000011112222";
+  const createdAt = Date.parse("2026-08-11T09:00:00.000Z");
+  const sessionsDir = path.join(codexHome, "sessions");
+  fs.mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
+  const rollout = Buffer.from(
+    `${JSON.stringify({ type: "session_meta", payload: { id: sessionId, cwd: TO_CWD } })}\n`,
+    "utf8",
+  );
+  const legacy = path.join(sessionsDir, `${sessionId}.jsonl`);
+  fs.writeFileSync(legacy, rollout, { mode: 0o600 });
+
+  const repaired = repairLegacyCodexRollout({ codexHome, sessionId, createdAt });
+
+  assert.equal(path.basename(repaired), codexRolloutLeafName(sessionId, createdAt));
+  assert.deepEqual(fs.readFileSync(repaired), rollout);
+  assert.deepEqual(fs.readFileSync(legacy), rollout, "the recoverable legacy copy is retained");
+  assert.equal(
+    repairLegacyCodexRollout({ codexHome, sessionId, createdAt }),
+    repaired,
+    "repair is idempotent once the native rollout exists",
+  );
 });
 
 test("re-importing over a session file we staged earlier replaces it", () => {
@@ -603,7 +643,10 @@ const LINK_ATTACKS = [
     code: "jail_escape_symlinked_leaf",
     setup: (a) => {
       fs.mkdirSync(a.sessionsDir, { recursive: true, mode: 0o700 });
-      fs.symlinkSync(a.victim, path.join(a.sessionsDir, "55555555-6666-4444-8444-555555555555.jsonl"));
+      fs.symlinkSync(
+        a.victim,
+        path.join(a.sessionsDir, codexRolloutLeafName("55555555-6666-4444-8444-555555555555", manifest().createdAt)),
+      );
       return attackCodex(a);
     },
   },
@@ -624,7 +667,10 @@ const LINK_ATTACKS = [
     code: "jail_escape_hardlinked_leaf",
     setup: (a) => {
       fs.mkdirSync(a.sessionsDir, { recursive: true, mode: 0o700 });
-      fs.linkSync(a.victim, path.join(a.sessionsDir, "55555555-6666-4444-8444-555555555555.jsonl"));
+      fs.linkSync(
+        a.victim,
+        path.join(a.sessionsDir, codexRolloutLeafName("55555555-6666-4444-8444-555555555555", manifest().createdAt)),
+      );
       return attackCodex(a);
     },
   },

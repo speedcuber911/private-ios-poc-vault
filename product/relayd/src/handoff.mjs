@@ -134,7 +134,7 @@ import { execFile } from "node:child_process";
 import { workspaceBrowseRoot, runHome as configuredRunHome, codexHome, gitBin } from "./config.mjs";
 import { identityPaths, readEncPrivateKeyPem } from "./identity.mjs";
 import { openSealed } from "./seal.mjs";
-import { importSession } from "./sessionimport.mjs";
+import { importSession, repairLegacyCodexRollout } from "./sessionimport.mjs";
 import { browseWorkspaceForPath, resolvedPathWithinRoot } from "./workspaces.mjs";
 import { store } from "./store.mjs";
 import { emitEvent } from "./events.mjs";
@@ -1226,6 +1226,21 @@ async function continueHandoff(id, { prompt = null, certSubject = null } = {}) {
   // concurrently in one checkout.
   if (activeJobFor(record)) {
     throw Object.assign(new Error("a job is already running for this handoff"), { status: 409 });
+  }
+
+  if (record.provider === "codex" && record.resumeSessionId) {
+    try {
+      repairLegacyCodexRollout({
+        codexHome,
+        sessionId: record.resumeSessionId,
+        createdAt: record.manifest?.createdAt,
+      });
+    } catch (error) {
+      throw Object.assign(new Error("the handed-off Codex session could not be prepared for resume"), {
+        status: 409,
+        code: error?.code || "codex_rollout_repair_failed",
+      });
+    }
   }
 
   const job = await enqueueJob(

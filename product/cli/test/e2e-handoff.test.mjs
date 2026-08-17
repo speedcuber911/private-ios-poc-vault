@@ -1046,8 +1046,12 @@ test("codex claim 2: the rollout crosses byte-exact and is staged with the lapto
   const opened = openSealed(readEncPrivateKeyPem(identityPaths(identityDir)), sealed);
   assert.deepEqual(opened, Buffer.from(s.rollout, "utf8"), "the rollout crossed the wire byte-for-byte");
 
-  // (b) staged where Codex's own resume looks: <CODEX_HOME>/sessions/<id>.jsonl.
-  const staged = path.join(process.env.CODEX_HOME, "sessions", `${CODEX_SESSION_ID}.jsonl`);
+  // (b) staged under Codex's native rollout filename shape. A bare
+  //     `<id>.jsonl` contains valid bytes but app-server does not discover it.
+  const stagedName = fs.readdirSync(path.join(process.env.CODEX_HOME, "sessions"))
+    .find((name) => name.startsWith("rollout-") && name.endsWith(`-${CODEX_SESSION_ID}.jsonl`));
+  assert.ok(stagedName, "the staged Codex session must retain a native rollout filename");
+  const staged = path.join(process.env.CODEX_HOME, "sessions", stagedName);
   assert.ok(fs.existsSync(staged), `the rollout must be staged at ${path.relative(root, staged)}`);
   const stagedText = fs.readFileSync(staged, "utf8");
 
@@ -1066,6 +1070,10 @@ test("codex claim 2: the rollout crosses byte-exact and is staged with the lapto
     s.rollout,
     "the rewrite must touch the cwd and nothing else",
   );
+
+  // Simulate a handoff imported by the previous relayd build. Its record is
+  // already ready, so Continue must repair the old bare-id layout in place.
+  fs.renameSync(staged, path.join(process.env.CODEX_HOME, "sessions", `${CODEX_SESSION_ID}.jsonl`));
 
   // (d) the uncommitted work crossed too.
   assert.equal(fs.readFileSync(path.join(s.checkout, "wip.txt"), "utf8"), WIP_BODY);
@@ -1093,6 +1101,11 @@ test("codex claim 4: continuing the handoff really resumes the fake codex with t
   // THE claim. Before the fix this threw 400 at one of three places before a
   // harness was ever spawned.
   const job = await continueHandoff(s.record.id, { prompt: "keep going on the migration" });
+  assert.ok(
+    fs.readdirSync(path.join(process.env.CODEX_HOME, "sessions"))
+      .some((name) => name.startsWith("rollout-") && name.endsWith(`-${CODEX_SESSION_ID}.jsonl`)),
+    "Continue repairs a pre-fix bare-id rollout before spawning Codex",
+  );
   assert.deepEqual(
     { workspaceId: job.workspaceId, provider: job.provider, resumeSessionId: job.resumeSessionId },
     { workspaceId: s.record.workspaceId, provider: "codex", resumeSessionId: CODEX_SESSION_ID },

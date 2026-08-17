@@ -390,14 +390,14 @@ private struct RelayComposer: View {
     @State private var showingModelPicker = false
     @State private var showingPermissionPicker = false
     @State private var showingSkillPicker = false
-    @State private var pendingProviderChoice: RelayModelChoice?
     @State private var skillSearch = ""
     @StateObject private var recorder = RelayPromptAudioRecorder()
-    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
-    /// Accessibility text sizes trade the compact pill layout for legibility: chips take
-    /// the full row and wrap instead of truncating the harness + model name.
-    private var usesAccessibilityLayout: Bool { dynamicTypeSize.isAccessibilitySize }
+    /// Provider identity is part of the thread, not a mutable composer setting.
+    /// A clean conversation has no provider yet and therefore sees the full catalog.
+    private var visibleSections: RelayModelPickerSections {
+        sections.restricted(to: threadProvider)
+    }
 
     private var slashContext: RelaySlashContext? {
         RelaySlashContext.find(in: text, selection: editorSelection)
@@ -492,8 +492,7 @@ private struct RelayComposer: View {
                 .font(AppTheme.uiFont(size: 11, weight: .semibold))
                 .tracking(0.8)
                 .textCase(.uppercase)
-                .lineLimit(usesAccessibilityLayout ? 3 : 1)
-                .multilineTextAlignment(.leading)
+                .lineLimit(1)
                 .truncationMode(.tail)
             if let badge {
                 Text(badge)
@@ -512,8 +511,8 @@ private struct RelayComposer: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .frame(minHeight: 34)
-        .frame(maxWidth: usesAccessibilityLayout ? .infinity : 240, alignment: .leading)
-        .fixedSize(horizontal: !usesAccessibilityLayout, vertical: false)
+        .frame(maxWidth: 240, alignment: .leading)
+        .fixedSize(horizontal: true, vertical: false)
         .background(providerMark == nil ? Color.clear : tint.opacity(0.07), in: Capsule())
         .overlay(Capsule().stroke(providerMark == nil ? AppTheme.hairlineStrong : tint.opacity(0.3), lineWidth: 1))
     }
@@ -523,9 +522,9 @@ private struct RelayComposer: View {
     /// "Chat models" section. Both render only what the server catalog advertises.
     private var modelPickerMenu: some View {
         Menu {
-            if !sections.agents.isEmpty {
+            if !visibleSections.agents.isEmpty {
                 Section("Agents") {
-                    ForEach(sections.agents) { harness in
+                    ForEach(visibleSections.agents) { harness in
                         Menu(harness.title) {
                             ForEach(harness.choices) { choice in
                                 choiceButton(choice, title: choice.shortModelLabel)
@@ -534,9 +533,9 @@ private struct RelayComposer: View {
                     }
                 }
             }
-            if !sections.chatModels.isEmpty {
+            if !visibleSections.chatModels.isEmpty {
                 Section("Chat models") {
-                    ForEach(sections.chatModels) { choice in
+                    ForEach(visibleSections.chatModels) { choice in
                         choiceButton(choice, title: choice.chipLabel)
                     }
                 }
@@ -553,7 +552,7 @@ private struct RelayComposer: View {
         }
         .menuOrder(.fixed)
         .accessibilityIdentifier("relay-model-chip")
-        .accessibilityLabel("Choose model")
+        .accessibilityLabel(threadProvider == nil ? "Choose provider and model" : "Choose model for this provider")
     }
 
     @ViewBuilder private func choiceButton(_ choice: RelayModelChoice, title: String) -> some View {
@@ -620,6 +619,30 @@ private struct RelayComposer: View {
         .accessibilityLabel("Skills, \(selectedSkillIDs.count) selected")
     }
 
+    /// A single pinned control rail. It never participates in the conversation's
+    /// vertical scrolling or turns into a stacked layout; narrow widths and large text
+    /// move sideways inside this rail instead.
+    private var controlBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                modelPickerMenu
+
+                if !efforts.isEmpty {
+                    effortPickerMenu
+                }
+                if provider?.hasTaskPermissionControls == true {
+                    permissionChip
+                }
+                if provider != nil {
+                    skillChip
+                }
+            }
+            .padding(.horizontal, 1)
+        }
+        .frame(height: 36)
+        .accessibilityIdentifier("relay-control-bar")
+    }
+
     var body: some View {
         VStack(spacing: 10) {
             if slashContext != nil {
@@ -627,39 +650,7 @@ private struct RelayComposer: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
-            if usesAccessibilityLayout {
-                // Full-width stacked chips so harness + model stay legible at
-                // accessibility text sizes (the mode badge remains in the chip).
-                VStack(alignment: .leading, spacing: 8) {
-                    modelPickerMenu
-                    if !efforts.isEmpty {
-                        effortPickerMenu
-                    }
-                    if provider?.hasTaskPermissionControls == true {
-                        permissionChip
-                    }
-                    if provider != nil {
-                        skillChip
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        modelPickerMenu
-
-                        if !efforts.isEmpty {
-                            effortPickerMenu
-                        }
-                        if provider?.hasTaskPermissionControls == true {
-                            permissionChip
-                        }
-                        if provider != nil {
-                            skillChip
-                        }
-                    }
-                }
-            }
+            controlBar
 
             if let harnessStatus, harnessStatus.isConfirmedUnavailable {
                 HStack(alignment: .top, spacing: 8) {
@@ -773,29 +764,6 @@ private struct RelayComposer: View {
         }
         .sheet(isPresented: $showingSkillPicker) {
             skillPickerSheet
-        }
-        .confirmationDialog(
-            providerSwitchTitle,
-            isPresented: Binding(
-                get: { pendingProviderChoice != nil },
-                set: { if !$0 { pendingProviderChoice = nil } }
-            ),
-            titleVisibility: .visible
-        ) {
-            if let choice = pendingProviderChoice {
-                Button("Start \(choice.executionProvider.relayPresentation.title) session") {
-                    onNewConversation()
-                    onPickChoice(choice)
-                    pendingProviderChoice = nil
-                }
-            }
-            Button("Cancel", role: .cancel) {
-                pendingProviderChoice = nil
-            }
-        } message: {
-            if let choice = pendingProviderChoice, let threadProvider {
-                Text("This thread belongs to \(threadProvider.relayPresentation.title). Relay will keep it intact and start a new \(choice.executionProvider.relayPresentation.title) session.")
-            }
         }
     }
 
@@ -921,9 +889,9 @@ private struct RelayComposer: View {
     private var modelPickerSheet: some View {
         NavigationStack {
             List {
-                if !sections.agents.isEmpty {
+                if !visibleSections.agents.isEmpty {
                     Section("Agents") {
-                        ForEach(sections.agents) { harness in
+                        ForEach(visibleSections.agents) { harness in
                             ForEach(harness.choices) { choice in
                                 Button {
                                     requestChoice(choice)
@@ -940,9 +908,9 @@ private struct RelayComposer: View {
                         }
                     }
                 }
-                if !sections.chatModels.isEmpty {
+                if !visibleSections.chatModels.isEmpty {
                     Section("Chat models") {
-                        ForEach(sections.chatModels) { choice in
+                        ForEach(visibleSections.chatModels) { choice in
                             Button {
                                 requestChoice(choice)
                                 showingModelPicker = false
@@ -1121,16 +1089,8 @@ private struct RelayComposer: View {
     }
 
     private func requestChoice(_ choice: RelayModelChoice) {
-        guard let threadProvider, threadProvider != choice.executionProvider else {
-            onPickChoice(choice)
-            return
-        }
-        pendingProviderChoice = choice
-    }
-
-    private var providerSwitchTitle: String {
-        guard let choice = pendingProviderChoice else { return "Start a new provider session?" }
-        return "Start a new \(choice.executionProvider.relayPresentation.title) session?"
+        guard threadProvider == nil || choice.executionProvider == threadProvider else { return }
+        onPickChoice(choice)
     }
 
     private func toggleRecording() {

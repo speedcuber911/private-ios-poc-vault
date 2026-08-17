@@ -165,6 +165,21 @@ struct RelayModelPickerSections: Hashable {
     var defaultChoice: RelayModelChoice? {
         chatModels.first ?? agents.first?.choices.first
     }
+
+    /// An active thread belongs to exactly one harness. Keep model changes inside
+    /// that provider; clearing the thread (New Conversation) passes nil and restores
+    /// the complete server-advertised catalog.
+    func restricted(to provider: CodexProvider?) -> RelayModelPickerSections {
+        guard let provider else { return self }
+
+        let scopedAgents = agents.compactMap { group -> RelayHarnessGroup? in
+            let choices = group.choices.filter { $0.executionProvider == provider }
+            guard !choices.isEmpty else { return nil }
+            return RelayHarnessGroup(provider: group.provider, choices: choices)
+        }
+        let scopedChatModels = chatModels.filter { $0.executionProvider == provider }
+        return RelayModelPickerSections(agents: scopedAgents, chatModels: scopedChatModels)
+    }
 }
 
 enum RelayModelDiscovery {

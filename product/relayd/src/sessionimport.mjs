@@ -63,11 +63,11 @@
 //      component is pinned individually, so there is no "jail root" width to
 //      get wrong.
 //   3. The content is written to a file we created ourselves under a
-//      128-bit-random name with O_CREAT|O_EXCL|O_NOFOLLOW — never to
-//      `<sessionId>.jsonl`, which an attacker may have pre-placed as a symlink
-//      or a HARD LINK (a hard link has no link-ness to detect at the path
-//      level, and O_NOFOLLOW does not see it). There is no O_TRUNC anywhere:
-//      nothing is destroyed before it has been validated.
+//      128-bit-random name with O_CREAT|O_EXCL|O_NOFOLLOW — never directly to
+//      its final transcript/rollout name, which an attacker may have pre-planted
+//      as a symlink or a HARD LINK (a hard link has no link-ness to detect at
+//      the path level, and O_NOFOLLOW does not see it). There is no O_TRUNC
+//      anywhere: nothing is destroyed before it has been validated.
 //   4. Once that fd is open we stop using paths for the write: the fd names an
 //      inode, so no later swap can redirect the bytes. Identity, regular-file
 //      -ness, nlink and location are checked on the fd, before AND after the
@@ -207,6 +207,103 @@ function assertSafeSessionId(sessionId) {
   return sessionId;
 }
 
+// Codex app-server does not discover an arbitrary `<threadId>.jsonl` file.
+// Its native session store uses `rollout-<timestamp>-<threadId>.jsonl`; resume
+// by UUID returns `no rollout found` when the same valid bytes are staged under
+// the bare id. The timestamp is only a discovery filename component, so use the
+// sealed handoff's creation time and fall back deterministically when absent.
+// Every byte of the returned leaf is constructed here from fixed punctuation,
+// a normalized ISO date, and the already allow-listed session id.
+function codexRolloutLeafName(sessionId, createdAt = null) {
+  const safeSessionId = assertSafeSessionId(sessionId);
+  const date = new Date(createdAt ?? 0);
+  const normalized = Number.isFinite(date.getTime()) ? date : new Date(0);
+  const timestamp = normalized.toISOString().slice(0, 19).replaceAll(":", "-");
+  return `rollout-${timestamp}-${safeSessionId}.jsonl`;
+}
+
+const MAX_REPAIR_ROLLOUT_BYTES = 20 * 1024 * 1024;
+
+// Read an already-staged rollout through a pinned descriptor. This is only for
+// migrating the old `<threadId>.jsonl` layout; new imports always go through
+// writeStagedFile below. Missing files are ordinary (there may be no legacy
+// handoff), while every unsafe or unbounded shape fails closed.
+function readExistingRollout(filePath) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  } catch (err) {
+    if (err?.code === "ENOENT") return null;
+    throw wrapFsError("legacy_rollout_open_failed", "cannot open the staged Codex rollout", err);
+  }
+
+  try {
+    const before = guarded("legacy_rollout_verify_failed", "cannot verify the staged Codex rollout", () => fs.fstatSync(fd));
+    if (!before.isFile() || before.nlink !== 1) {
+      throw refuse("legacy_rollout_unsafe", "the staged Codex rollout is not a private regular file");
+    }
+    if (before.size > MAX_REPAIR_ROLLOUT_BYTES) {
+      throw refuse("legacy_rollout_too_large", "the staged Codex rollout is too large to migrate");
+    }
+    const contents = guarded("legacy_rollout_read_failed", "cannot read the staged Codex rollout", () => fs.readFileSync(fd));
+    const after = guarded("legacy_rollout_verify_failed", "cannot re-verify the staged Codex rollout", () => fs.fstatSync(fd));
+    if (after.dev !== before.dev || after.ino !== before.ino || after.nlink !== 1 || after.size !== contents.length) {
+      throw refuse("legacy_rollout_race", "the staged Codex rollout changed while it was read");
+    }
+    return contents;
+  } finally {
+    try { fs.closeSync(fd); } catch { /* fd is ours; nothing more to do */ }
+  }
+}
+
+function rolloutDeclaresSessionId(contents, sessionId) {
+  const prefix = contents.subarray(0, Math.min(contents.length, 256 * 1024)).toString("utf8");
+  for (const line of prefix.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line);
+      if (entry?.type === "session_meta") return entry.payload?.id === sessionId;
+    } catch {
+      // A partial line at the bounded-read edge is expected; keep looking.
+    }
+  }
+  return false;
+}
+
+// Handoffs imported before the native-filename fix may already be `ready`
+// with `<CODEX_HOME>/sessions/<threadId>.jsonl`. Ready imports are idempotent,
+// so redeploying alone would never restage them. Continue calls this once to
+// publish the same validated bytes under Codex's discoverable rollout name.
+// The legacy file is deliberately retained as a recoverable fallback.
+function repairLegacyCodexRollout({ codexHome, sessionId, createdAt = null }) {
+  const safeSessionId = assertSafeSessionId(sessionId);
+  const realRoot = resolveJailRoot(codexHome);
+  const sessionsDir = buildStagingDir(realRoot, ["sessions"]);
+  const nativeName = codexRolloutLeafName(safeSessionId, createdAt);
+  const nativePath = path.join(sessionsDir, nativeName);
+  const existingNative = readExistingRollout(nativePath);
+  if (existingNative) {
+    if (!rolloutDeclaresSessionId(existingNative, safeSessionId)) {
+      throw refuse("legacy_rollout_mismatch", "the native Codex rollout declares a different session id");
+    }
+    return nativePath;
+  }
+
+  const legacyPath = path.join(sessionsDir, `${safeSessionId}.jsonl`);
+  const legacyBytes = readExistingRollout(legacyPath);
+  if (!legacyBytes) return null;
+  if (!rolloutDeclaresSessionId(legacyBytes, safeSessionId)) {
+    throw refuse("legacy_rollout_mismatch", "the legacy Codex rollout declares a different session id");
+  }
+
+  return stageSessionFile({
+    jailRoot: realRoot,
+    components: ["sessions"],
+    leafName: nativeName,
+    contents: legacyBytes,
+  });
+}
+
 // A single path component we are about to create. `.claude`/`projects`/
 // `sessions` are literals, and `claudeProjectSlug` can only emit
 // [A-Za-z0-9-] for a NON-EMPTY cwd — but it can fire today: an empty
@@ -237,15 +334,15 @@ function assertSafeComponent(component, position) {
 // vs "/srv/relay-evil") cannot pass. Exported and directly unit-tested below.
 //
 // Honest note on the one call site in this module (inside stageSessionFile):
-// `leafName` there is always `${sessionId}.jsonl` with `sessionId` already
-// through `assertSafeSessionId`'s allow-list, so the joined path is provably
-// always a child of `stagingDir` — that call can never actually refuse
-// anything (confirmed by mutation testing: deleting it leaves the suite
+// `leafName` is either `${sessionId}.jsonl` or the value returned by
+// `codexRolloutLeafName`; both are constructed from a session id already
+// through `assertSafeSessionId`'s allow-list. The joined path is therefore
+// provably always a child of `stagingDir` — that call can never actually
+// refuse anything (confirmed by mutation testing: deleting it leaves the suite
 // green). It is not a "layer of defense" there; the per-component descent in
-// buildStagingDir/ensureRealChildDir is what actually holds the jail. The
-// call is kept only so this exported helper has a call site inside the
-// module that uses it, should a future change to leafName's construction
-// ever make the check meaningful again.
+// buildStagingDir/ensureRealChildDir is what actually holds the jail. The call
+// is kept so this exported helper has a call site inside the module, should a
+// future change to leafName construction make the check meaningful again.
 function assertContained(baseDir, filePath) {
   const resolvedBase = path.resolve(baseDir);
   const resolvedFile = path.resolve(filePath);
@@ -732,7 +829,7 @@ function importSession({ manifest, sessionBytes, runHome, codexHome, worktreePat
     stageSessionFile({
       jailRoot: codexHome,
       components: ["sessions"],
-      leafName: `${sessionId}.jsonl`,
+      leafName: codexRolloutLeafName(sessionId, manifest.createdAt),
       contents: rewritten,
     });
     return { provider: "codex", requestedHarness, resumeSessionId: sessionId, primedPrompt: null };
@@ -746,6 +843,8 @@ export {
   SessionImportSecurityError,
   assertContained,
   claudeProjectSlug,
+  codexRolloutLeafName,
+  repairLegacyCodexRollout,
   rewriteSessionCwd,
   summaryPrompt,
   importSession,
