@@ -5,7 +5,7 @@ A Cube/E2B template for running the Relay agent in a sandboxed, tunneled environ
 ## Template Contents
 
 - **Base**: Ubuntu 24.04 with Node 22, curl, git, ripgrep, and dependencies
-- **Harness CLIs**: `@openai/codex`, `@anthropic-ai/claude-code` (preinstalled, unauthenticated)
+- **Harness CLIs**: `@openai/codex`, `@anthropic-ai/claude-code`, `@moonshot-ai/kimi-code` (preinstalled, unauthenticated)
 - **Runtime User**: Non-root `relay` account
 - **Workspaces**: Jail at `/srv/relay-workspaces` with a seeded welcome workspace
 - **Init**: `start.sh` (no systemd; runs as PID 1)

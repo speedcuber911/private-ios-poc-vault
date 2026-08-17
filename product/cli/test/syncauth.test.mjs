@@ -57,6 +57,9 @@ test("credentials are collected, sealed to the node, and delivered over the rend
     fs.writeFileSync(path.join(home, ".claude", ".credentials.json"), '{"token":"claude-token"}');
     fs.mkdirSync(path.join(home, ".codex"), { recursive: true });
     fs.writeFileSync(path.join(home, ".codex", "auth.json"), '{"token":"codex-token"}');
+    fs.mkdirSync(path.join(home, ".kimi-code", "credentials"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".kimi-code", "credentials", "kimi-code.json"), '{"access_token":"kimi-token"}');
+    fs.writeFileSync(path.join(home, ".kimi-code", "config.toml"), 'default_model = "kimi-code/k3"\n');
 
     const cloud = recordingCloud();
     lines = [];
@@ -82,15 +85,18 @@ test("credentials are collected, sealed to the node, and delivered over the rend
   assert.ok(sessionCall,
     "could not mint an authToken needing a base64url substitution character after 40 attempts — the test premise is broken, not the code under test");
 
-  assert.deepEqual(result.installed.sort(), ["claude", "codex", "github"]);
+  assert.deepEqual(result.installed.sort(), ["claude", "codex", "github", "kimi"]);
   assert.equal(bundle.kind, "sync-auth");
   assert.equal(bundle.github.token, "ghp_from_gh_cli");
   assert.equal(bundle.claude.credentials, '{"token":"claude-token"}');
+  assert.equal(bundle.kimi.credentials, '{"access_token":"kimi-token"}');
+  assert.equal(bundle.kimi.config, 'default_model = "kimi-code/k3"\n');
 
   assert.equal(sessionCall.body.kind, "sync-auth");
   assert.match(sessionCall.body.authToken, /^[A-Za-z0-9_-]{43}$/, "the rendezvous sees a derived token, not the secret");
   assert.ok(!lines.join("\n").includes("ghp_from_gh_cli"), "no credential is ever printed");
   assert.ok(!lines.join("\n").includes("claude-token"));
+  assert.ok(!lines.join("\n").includes("kimi-token"));
 });
 
 test("missing credentials are reported honestly rather than faked", async () => {
@@ -105,8 +111,9 @@ test("missing credentials are reported honestly rather than faked", async () => 
   });
 
   assert.deepEqual(result.installed, []);
-  assert.deepEqual(result.skipped.sort(), ["claude", "codex", "github"]);
+  assert.deepEqual(result.skipped.sort(), ["claude", "codex", "github", "kimi"]);
   assert.match(lines.join("\n"), /cursor/i, "cursor's on-box login requirement is stated");
+  assert.match(lines.join("\n"), /kimi/i, "Kimi's missing local login is stated");
 });
 
 test("authTokenFor is deterministic per secret and never returns the secret", () => {
@@ -188,7 +195,29 @@ test("collectCredentialBundle never includes an empty member", async () => {
   assert.equal(bundle.codex.auth, '{"token":"only-codex"}');
   assert.equal(bundle.github, undefined);
   assert.equal(bundle.claude, undefined);
-  assert.deepEqual(skipped.sort(), ["claude", "github"]);
+  assert.equal(bundle.kimi, undefined);
+  assert.deepEqual(skipped.sort(), ["claude", "github", "kimi"]);
+});
+
+test("collectCredentialBundle honors KIMI_CODE_HOME and requires credentials plus config", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-kimi-home-"));
+  const kimiCodeHome = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-kimi-code-home-"));
+  fs.mkdirSync(path.join(kimiCodeHome, "credentials"), { recursive: true });
+  fs.writeFileSync(path.join(kimiCodeHome, "credentials", "kimi-code.json"), '{"refresh_token":"kimi-refresh"}');
+
+  let collected = await collectCredentialBundle({
+    home, kimiCodeHome, execFileImpl: async () => { throw new Error("no gh"); },
+  });
+  assert.equal(collected.bundle.kimi, undefined, "a token without its generated provider config is not a usable login");
+  assert.ok(collected.skipped.includes("kimi"));
+
+  fs.writeFileSync(path.join(kimiCodeHome, "config.toml"), 'default_model = "kimi-code/k3"\n');
+  collected = await collectCredentialBundle({
+    home, kimiCodeHome, execFileImpl: async () => { throw new Error("no gh"); },
+  });
+  assert.equal(collected.bundle.kimi.credentials, '{"refresh_token":"kimi-refresh"}');
+  assert.equal(collected.bundle.kimi.config, 'default_model = "kimi-code/k3"\n');
+  assert.ok(!collected.skipped.includes("kimi"));
 });
 
 // Not reachable through the real execFileAsync (Node's promisified execFile

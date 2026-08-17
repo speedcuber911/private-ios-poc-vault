@@ -439,9 +439,6 @@ struct RelayHarnessStatus: Decodable, Hashable, Identifiable {
         if provider == .cursor {
             return "Run cursor-agent login on the computer, then try again."
         }
-        if provider == .kimi {
-            return "Run kimi login on the computer, then try again."
-        }
         return "Run relay sync-auth on your Mac to connect \(provider.displayName), then try again."
     }
 }

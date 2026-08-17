@@ -51,6 +51,8 @@ const NODE_ID = "node-aabbccddeeff0011";
 const GITHUB_TOKEN = "ghp_end_to_end_credential_MARKER_do_not_leak";
 const CLAUDE_CREDENTIALS = '{"accessToken":"claude_end_to_end_MARKER"}';
 const CODEX_AUTH = '{"OPENAI_API_KEY":"codex_end_to_end_MARKER"}';
+const KIMI_CREDENTIALS = '{"refresh_token":"kimi_end_to_end_MARKER"}';
+const KIMI_CONFIG = 'default_model = "kimi-code/k3"\n';
 
 // A node identity as relayd would have after enroll: an ed25519 key it signs
 // poll requests with, and an X25519 keypair whose public half the cloud
@@ -107,6 +109,7 @@ test("a credential collected by relay sync-auth on the laptop ends up installed 
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "relay-e2e-sandbox-"));
   const runHome = path.join(sandbox, "home");
   const codexHome = path.join(sandbox, "codex");
+  const kimiHome = path.join(sandbox, "kimi");
   const dataDir = path.join(sandbox, "data");
 
   try {
@@ -126,6 +129,9 @@ test("a credential collected by relay sync-auth on the laptop ends up installed 
     fs.writeFileSync(path.join(laptopHome, ".claude", ".credentials.json"), CLAUDE_CREDENTIALS);
     fs.mkdirSync(path.join(laptopHome, ".codex"), { recursive: true });
     fs.writeFileSync(path.join(laptopHome, ".codex", "auth.json"), CODEX_AUTH);
+    fs.mkdirSync(path.join(laptopHome, ".kimi-code", "credentials"), { recursive: true });
+    fs.writeFileSync(path.join(laptopHome, ".kimi-code", "credentials", "kimi-code.json"), KIMI_CREDENTIALS);
+    fs.writeFileSync(path.join(laptopHome, ".kimi-code", "config.toml"), KIMI_CONFIG);
 
     // ── `relay sync-auth`, for real, against the real server ──────────────
     const printed = [];
@@ -138,7 +144,7 @@ test("a credential collected by relay sync-auth on the laptop ends up installed 
       // half is covered by its own leg below.
       requireGitHubRepoImpl: async () => { throw new Error("not a repo"); },
     });
-    assert.deepEqual(result.installed.sort(), ["claude", "codex", "github"]);
+    assert.deepEqual(result.installed.sort(), ["claude", "codex", "github", "kimi"]);
     assert.ok(!printed.join("\n").includes(GITHUB_TOKEN), "the command never prints a credential");
 
     // ── the blob the cloud DID store is the sealed one, and it is real
@@ -165,12 +171,12 @@ test("a credential collected by relay sync-auth on the laptop ends up installed 
 
     // ── the sandbox collects, verifies the MAC, unseals and installs ──────
     const installed = await installFromNotice(notice, {
-      cloudUrl: t.baseUrl, runHome, codexHome, dataDir,
+      cloudUrl: t.baseUrl, runHome, codexHome, kimiHome, dataDir,
       identityBaseDir: identity.baseDir,
       emit: () => {},
     });
     assert.equal(installed.ok, true, `install failed: ${installed.reason}`);
-    assert.deepEqual(installed.installed.sort(), ["claude", "codex", "github"]);
+    assert.deepEqual(installed.installed.sort(), ["claude", "codex", "github", "kimi"]);
 
     // ── THE CLAIM: the exact bytes the laptop collected are on the sandbox ─
     const gitCredentials = path.join(runHome, ".git-credentials");
@@ -182,10 +188,14 @@ test("a credential collected by relay sync-auth on the laptop ends up installed 
     assert.equal(fs.statSync(path.join(runHome, ".claude", ".credentials.json")).mode & 0o777, 0o600);
     assert.equal(fs.readFileSync(path.join(codexHome, "auth.json"), "utf8"), CODEX_AUTH);
     assert.equal(fs.statSync(path.join(codexHome, "auth.json")).mode & 0o777, 0o600);
+    assert.equal(fs.readFileSync(path.join(kimiHome, "credentials", "kimi-code.json"), "utf8"), KIMI_CREDENTIALS);
+    assert.equal(fs.readFileSync(path.join(kimiHome, "config.toml"), "utf8"), KIMI_CONFIG);
+    assert.equal(fs.statSync(path.join(kimiHome, "credentials", "kimi-code.json")).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(path.join(kimiHome, "config.toml")).mode & 0o777, 0o600);
 
     // ── and no credential ever existed in cleartext on the control plane ──
     const stored = everyStoredValue(t.app.db);
-    for (const marker of [GITHUB_TOKEN, "claude_end_to_end_MARKER", "codex_end_to_end_MARKER"]) {
+    for (const marker of [GITHUB_TOKEN, "claude_end_to_end_MARKER", "codex_end_to_end_MARKER", "kimi_end_to_end_MARKER"]) {
       assert.ok(!stored.some((value) => value.includes(marker)),
         `${marker} must never appear anywhere in the control plane's database`);
     }

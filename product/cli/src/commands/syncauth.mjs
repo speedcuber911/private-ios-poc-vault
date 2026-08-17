@@ -103,8 +103,16 @@ async function readClaudeKeychain({ execFileImpl, platform }) {
 // machine is reported by name in `skipped`, not silently omitted. Cursor has
 // no portable credential at all (v0), so it is never even attempted here —
 // cmdSyncAuth states its on-box login requirement unconditionally instead.
+//
+// Kimi's OAuth token and the config that references it are both portable
+// parts of KIMI_CODE_HOME. Copying only credentials/kimi-code.json leaves a
+// fresh runner without the managed provider/model definitions produced by
+// `kimi login`; copying only config.toml leaves it signed out. They therefore
+// travel as one optional bundle member and are installed atomically per file
+// by relayd's hardened credential writer.
 async function collectCredentialBundle({
   home = os.homedir(), execFileImpl = execFileAsync, platform = process.platform,
+  kimiCodeHome = process.env.KIMI_CODE_HOME || null,
 } = {}) {
   const bundle = { v: 1, kind: "sync-auth" };
   const skipped = [];
@@ -138,6 +146,15 @@ async function collectCredentialBundle({
   const codex = readIfPresent(path.join(home, ".codex", "auth.json"));
   if (codex) bundle.codex = { auth: codex };
   else skipped.push("codex");
+
+  const kimiHome = kimiCodeHome || path.join(home, ".kimi-code");
+  const kimiCredentials = readIfPresent(path.join(kimiHome, "credentials", "kimi-code.json"));
+  const kimiConfig = readIfPresent(path.join(kimiHome, "config.toml"));
+  if (kimiCredentials && kimiConfig) {
+    bundle.kimi = { credentials: kimiCredentials, config: kimiConfig };
+  } else {
+    skipped.push("kimi");
+  }
 
   return { bundle, skipped };
 }
@@ -229,7 +246,7 @@ async function cmdSyncAuth(args = [], deps = {}) {
   // Shells out to `gh` and reads harness config; slow enough to look stuck.
   const { bundle, skipped } = await progress.run("Collecting your local logins",
     () => collectCredentialBundle({ home: home || os.homedir(), execFileImpl }));
-  const installed = ["github", "claude", "codex"].filter((name) => bundle[name]);
+  const installed = ["github", "claude", "codex", "kimi"].filter((name) => bundle[name]);
 
   const api = createCloudApi({
     baseUrl,
@@ -261,6 +278,7 @@ async function cmdSyncAuth(args = [], deps = {}) {
     if (name === "github") log("  No GitHub token found — run `gh auth login`, or create a fine-grained PAT scoped to your repo.");
     if (name === "claude") log("  No Claude Code login found — run `claude` and sign in, then re-run this.");
     if (name === "codex") log("  No Codex login found on this machine.");
+    if (name === "kimi") log("  No Kimi Code login found — run `kimi login`, then re-run this.");
   }
   log("  Cursor has no portable login — sign in to Cursor on the machine itself.");
   log("");

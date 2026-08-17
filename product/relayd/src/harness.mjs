@@ -312,9 +312,7 @@ async function assertProviderReady(provider, requirements = {}) {
   if (result.auth.loggedIn === false) {
     const action = cleanProvider === "cursor"
       ? "Run cursor-agent login on the computer, then try again."
-      : cleanProvider === "kimi"
-        ? "Run kimi login on the computer, then try again."
-        : `Run relay sync-auth on your Mac to connect ${displayName}, then try again.`;
+      : `Run relay sync-auth on your Mac to connect ${displayName}, then try again.`;
     throw Object.assign(new Error(`${displayName} is not connected on this computer. ${action}`), { status: 503 });
   }
   if (cleanProvider === "claude" && requirements.reasoningEffort && !providerTaskControls(cleanProvider).reasoningEffort) {

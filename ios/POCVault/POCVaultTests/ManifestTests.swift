@@ -157,7 +157,7 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(connected.shortStatus, "Connected")
         XCTAssertNil(connected.actionMessage)
         XCTAssertEqual(kimiSignedOut.provider, .kimi)
-        XCTAssertEqual(kimiSignedOut.actionMessage, "Run kimi login on the computer, then try again.")
+        XCTAssertEqual(kimiSignedOut.actionMessage, "Run relay sync-auth on your Mac to connect Kimi K3, then try again.")
     }
 
     func testCodexModelDescriptorAllowsOptionalEffortLevels() throws {

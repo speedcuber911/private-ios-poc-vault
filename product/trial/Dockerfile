@@ -1,6 +1,6 @@
 # Relay trial machine template (Cube / E2B). No systemd: the sandbox runs
 # start.sh as its init. Harness CLIs are preinstalled but UNAUTHENTICATED —
-# the user connects their own subscriptions (device-code login) after boot.
+# the user connects their own subscriptions after boot.
 #
 # BASE IMAGE IS NOT NEGOTIABLE. Cube talks to every sandbox exclusively
 # through `envd`, an in-container daemon on :49983 — it serves the template
@@ -34,20 +34,20 @@ RUN useradd --system --create-home --shell /bin/bash relay \
     && chmod 0750 /srv/relay-workspaces
 
 # Harness CLIs, pinned at template-build time (versions recorded in the image).
-# Codex/Claude Code install into the global npm prefix (/opt/node), which is
+# Codex/Claude Code/Kimi install into the global npm prefix (/opt/node), which is
 # not HOME-relative. Cursor's installer writes to $HOME/.local/bin, so it
 # must run with HOME=/home/relay (relayd's cursorBin default resolves to
 # $CODEX_RUN_HOME/.local/bin/cursor-agent, and start.sh sets
 # CODEX_RUN_HOME=/home/relay) — otherwise it lands in /root and the runtime
 # `relay` user never sees it. A Cursor install failure only degrades one of
-# three harnesses and must not fail the whole image build, but it must leave
+# four harnesses and must not fail the whole image build, but it must leave
 # a visible signal instead of being silently swallowed.
 # `pipefail` is essential here, not stylistic: without it the pipeline's exit
 # status is bash's, and a curl that never reaches cursor.com pipes zero bytes
 # into a bash that exits 0 — so the warning below would never fire on the one
 # failure mode it exists to catch.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-RUN npm install -g @openai/codex @anthropic-ai/claude-code
+RUN npm install -g @openai/codex @anthropic-ai/claude-code @moonshot-ai/kimi-code
 RUN if curl -fsSL https://cursor.com/install | HOME=/home/relay bash; then \
       echo "cursor-agent installed"; \
     else \

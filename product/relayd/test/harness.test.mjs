@@ -171,6 +171,45 @@ test("confirmed signed-out Codex is visible and jobs fail before entering the qu
   }
 });
 
+test("signed-out Kimi directs the user to relay sync-auth before queueing", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-harness-kimi-signed-out-"));
+  const kimiHome = path.join(dir, "kimi-home");
+  fs.mkdirSync(kimiHome, { recursive: true });
+  const signedOutKimi = writeFakeCli(
+    dir,
+    "signed-out-kimi",
+    [
+      "#!/bin/sh",
+      "if [ \"$1\" = \"--version\" ]; then echo \"kimi 0.36.1\"; exit 0; fi",
+      "echo \"job must not start\" >&2",
+      "exit 9",
+      "",
+    ].join("\n"),
+  );
+  const server = await startServer({ KIMI_BIN: signedOutKimi, KIMI_CODE_HOME: kimiHome });
+  try {
+    const harnessResponse = await fetch(`${server.baseUrl}/v1/harness`);
+    assert.equal(harnessResponse.status, 200);
+    const kimi = (await harnessResponse.json()).harnesses.find((entry) => entry.provider === "kimi");
+    assert.equal(kimi.installed, true);
+    assert.equal(kimi.loggedIn, false);
+
+    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspaceId: "scratch", provider: "kimi", prompt: "Hello" }),
+    });
+    assert.equal(create.status, 503);
+    assert.match((await create.json()).error, /Kimi K3 is not connected.*relay sync-auth/);
+
+    const jobs = await (await fetch(`${server.baseUrl}/v1/codex/jobs`)).json();
+    assert.deepEqual(jobs.jobs, []);
+  } finally {
+    await server.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("login op: captures verification URL + user code, confirms on completion", async () => {
   const server = await startServer();
   try {

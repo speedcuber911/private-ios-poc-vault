@@ -257,7 +257,11 @@ async function collectRendezvousBlob({ cloudUrl, pairingId, authToken, macKey, f
 // no portable credential file and is never a bundle member — it is not
 // listed in `installed` or `skipped` here, by design (v0 tells the operator
 // to log in on the sandbox later, rather than pretending it synced).
-function installCredentialBundle(bundle, { runHome, codexHome }) {
+function installCredentialBundle(bundle, {
+  runHome,
+  codexHome,
+  kimiHome = path.join(runHome, ".kimi-code"),
+}) {
   if (bundle?.v !== SUPPORTED_VERSION) throw new Error("unsupported_bundle_version");
   if (bundle?.kind !== "sync-auth") throw new Error("unexpected_bundle_kind");
 
@@ -287,6 +291,20 @@ function installCredentialBundle(bundle, { runHome, codexHome }) {
     installed.push("codex");
   } else {
     skipped.push("codex");
+  }
+
+  // Kimi's generated config carries the managed OAuth/provider reference and
+  // model aliases; the OAuth token alone is not a complete login on a fresh
+  // runner. Both values came from fixed paths selected by the CLI and both
+  // destinations are fixed here — bundle content never chooses a path.
+  const kimiCredentials = stringField(bundle.kimi?.credentials);
+  const kimiConfig = stringField(bundle.kimi?.config);
+  if (kimiCredentials && kimiConfig) {
+    writePrivateFile(kimiHome, ["config.toml"], kimiConfig);
+    writePrivateFile(kimiHome, ["credentials", "kimi-code.json"], kimiCredentials);
+    installed.push("kimi");
+  } else {
+    skipped.push("kimi");
   }
 
   return { installed, skipped };
@@ -380,6 +398,7 @@ async function installFromNotice(notice, {
   cloudUrl,
   runHome,
   codexHome,
+  kimiHome = path.join(runHome, ".kimi-code"),
   dataDir,
   identityBaseDir = undefined,
   fetchImpl = fetch,
@@ -460,7 +479,7 @@ async function installFromNotice(notice, {
       await report("credentials.installed", { pairingId, kind: "session-index", installed: [], skipped: [] });
       return { ok: true, kind: "session-index", installed: [], skipped: [] };
     }
-    const { installed, skipped } = installCredentialBundle(bundle, { runHome, codexHome });
+    const { installed, skipped } = installCredentialBundle(bundle, { runHome, codexHome, kimiHome });
     await report("credentials.installed", { pairingId, kind: "sync-auth", installed, skipped });
     return { ok: true, kind: "sync-auth", installed, skipped };
   } catch (error) {

@@ -53,7 +53,12 @@ function readAuditSince(sinceLength) {
 
 function homes() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-syncauth-"));
-  return { runHome: path.join(root, "home"), codexHome: path.join(root, "codex"), dataDir: root };
+  return {
+    runHome: path.join(root, "home"),
+    codexHome: path.join(root, "codex"),
+    kimiHome: path.join(root, "kimi"),
+    dataDir: root,
+  };
 }
 
 // Recursively scans every regular file under `rootDir` and returns the full
@@ -118,15 +123,19 @@ function findTmpLeftovers(rootDir) {
 }
 
 test("a full bundle installs every credential 0600 in the runner home", () => {
-  const { runHome, codexHome } = homes();
+  const { runHome, codexHome, kimiHome } = homes();
   const result = installCredentialBundle({
     v: 1, kind: "sync-auth",
     github: { token: "ghp_example" },
     claude: { credentials: '{"token":"claude"}' },
     codex: { auth: '{"token":"codex"}' },
-  }, { runHome, codexHome });
+    kimi: {
+      credentials: '{"refresh_token":"kimi"}',
+      config: 'default_model = "kimi-code/k3"\n',
+    },
+  }, { runHome, codexHome, kimiHome });
 
-  assert.deepEqual(result.installed.sort(), ["claude", "codex", "github"]);
+  assert.deepEqual(result.installed.sort(), ["claude", "codex", "github", "kimi"]);
   assert.deepEqual(result.skipped, []);
 
   const gitCredentials = path.join(runHome, ".git-credentials");
@@ -134,6 +143,10 @@ test("a full bundle installs every credential 0600 in the runner home", () => {
   assert.equal(fs.statSync(gitCredentials).mode & 0o777, 0o600);
   assert.equal(fs.statSync(path.join(runHome, ".claude", ".credentials.json")).mode & 0o777, 0o600);
   assert.equal(fs.readFileSync(path.join(codexHome, "auth.json"), "utf8"), '{"token":"codex"}');
+  assert.equal(fs.readFileSync(path.join(kimiHome, "credentials", "kimi-code.json"), "utf8"), '{"refresh_token":"kimi"}');
+  assert.equal(fs.readFileSync(path.join(kimiHome, "config.toml"), "utf8"), 'default_model = "kimi-code/k3"\n');
+  assert.equal(fs.statSync(path.join(kimiHome, "credentials", "kimi-code.json")).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(path.join(kimiHome, "config.toml")).mode & 0o777, 0o600);
   assert.match(fs.readFileSync(path.join(runHome, ".gitconfig"), "utf8"), /helper = store/);
 });
 
@@ -143,7 +156,7 @@ test("absent members are reported as skipped rather than silently ignored", () =
     { runHome, codexHome });
 
   assert.deepEqual(result.installed, ["github"]);
-  assert.deepEqual(result.skipped.sort(), ["claude", "codex"]);
+  assert.deepEqual(result.skipped.sort(), ["claude", "codex", "kimi"]);
   assert.equal(fs.existsSync(path.join(runHome, ".claude", ".credentials.json")), false);
 });
 
@@ -536,10 +549,14 @@ const SYNC_BUNDLE = {
   github: { token: "ghp_notice_path_MARKER" },
   claude: { credentials: '{"token":"claude_notice_MARKER"}' },
   codex: { auth: '{"token":"codex_notice_MARKER"}' },
+  kimi: {
+    credentials: '{"refresh_token":"kimi_notice_MARKER"}',
+    config: 'default_model = "kimi-code/k3"\n',
+  },
 };
 
 test("a notice makes the node collect, verify, unseal and install the sealed bundle", async () => {
-  const { runHome, codexHome, dataDir } = homes();
+  const { runHome, codexHome, kimiHome, dataDir } = homes();
   const node = freshNodeIdentity();
   const { blob, tag } = sealedFor(node.encPubkeyB64, SYNC_BUNDLE);
   const cloud = await startFakeRendezvous(serveSealed(blob, tag));
@@ -550,14 +567,14 @@ test("a notice makes the node collect, verify, unseal and install the sealed bun
     const result = await installFromNotice(
       { pairingId: "11111111-1111-4111-8111-111111111111", secret: NOTICE_SECRET },
       {
-        cloudUrl: cloud.url, runHome, codexHome, dataDir, identityBaseDir: node.baseDir,
+        cloudUrl: cloud.url, runHome, codexHome, kimiHome, dataDir, identityBaseDir: node.baseDir,
         emit: sink.emit, postEvent: sink.postEvent,
       },
     );
 
     assert.equal(result.ok, true);
     assert.equal(result.kind, "sync-auth");
-    assert.deepEqual(result.installed.sort(), ["claude", "codex", "github"]);
+    assert.deepEqual(result.installed.sort(), ["claude", "codex", "github", "kimi"]);
 
     // The credentials actually landed, at the real modes on disk.
     const gitCredentials = path.join(runHome, ".git-credentials");
@@ -565,6 +582,8 @@ test("a notice makes the node collect, verify, unseal and install the sealed bun
     assert.equal(fs.statSync(gitCredentials).mode & 0o777, 0o600);
     assert.equal(fs.statSync(path.join(runHome, ".claude", ".credentials.json")).mode & 0o777, 0o600);
     assert.equal(fs.statSync(path.join(codexHome, "auth.json")).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(path.join(kimiHome, "credentials", "kimi-code.json")).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(path.join(kimiHome, "config.toml")).mode & 0o777, 0o600);
     assert.equal(fs.statSync(runHome).mode & 0o777, 0o700, "the runner home itself must be 0700");
 
     // The slot GET presented the DERIVED auth token, never the secret itself.
@@ -577,7 +596,7 @@ test("a notice makes the node collect, verify, unseal and install the sealed bun
     const audit = readAuditSince(auditSince);
     const installedLine = audit.find((entry) => entry.event === "credential_sync_installed");
     assert.ok(installedLine, `expected a credential_sync_installed audit line, saw ${JSON.stringify(audit)}`);
-    assert.deepEqual(installedLine.installed.sort(), ["claude", "codex", "github"]);
+    assert.deepEqual(installedLine.installed.sort(), ["claude", "codex", "github", "kimi"]);
 
     assert.deepEqual(sink.events.map((event) => event.name), ["credentials.installed"]);
     assert.deepEqual(sink.pushed.map((event) => event.type), ["credentials.installed"]);
@@ -585,7 +604,7 @@ test("a notice makes the node collect, verify, unseal and install the sealed bun
     // Nothing anywhere may carry a credential or the rendezvous secret.
     const spoken = JSON.stringify({ audit, events: sink.events, pushed: sink.pushed, result });
     for (const secretish of [
-      "ghp_notice_path_MARKER", "claude_notice_MARKER", "codex_notice_MARKER", NOTICE_SECRET,
+      "ghp_notice_path_MARKER", "claude_notice_MARKER", "codex_notice_MARKER", "kimi_notice_MARKER", NOTICE_SECRET,
     ]) {
       assert.ok(!spoken.includes(secretish), `${secretish} must never reach an audit line, an event or a return value`);
     }

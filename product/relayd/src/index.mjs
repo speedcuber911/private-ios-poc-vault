@@ -31,6 +31,7 @@ import {
   dataDir,
   runHome,
   codexHome,
+  kimiHome,
 } from "./config.mjs";
 import { loadPersistedJobs, processQueue } from "./jobs.mjs";
 import { routeRequest } from "./server.mjs";
@@ -172,6 +173,7 @@ async function startHandoffPickup() {
           cloudUrl,
           runHome,
           codexHome,
+          kimiHome,
           dataDir,
           // So a failed sync also reaches the user's phone, not just this
           // node's audit log and event feed.
