@@ -8,7 +8,13 @@ credentials and raw tool inputs never leave that computer.
 - `GET /v1/codex/skills?provider=<codex|claude>&workspaceId=<id>` returns sanitized
   metadata for real global and workspace skills/commands discovered on that runner.
 - Codex jobs accept `approvalPolicy` (`on-request`, `untrusted`, or `never`). Claude
-  jobs accept `permissionMode` (`manual`, `acceptEdits`, `plan`, `dontAsk`, or `auto`).
+  jobs accept `permissionMode` (`manual`, legacy alias `default`, `acceptEdits`, `plan`,
+  `dontAsk`, or `auto`). Current runners normalize `default` to `manual`.
+- Codex and Claude jobs accept catalog-advertised `model` and `reasoningEffort` values.
+  Relay rejects provider/model/control mismatches instead of silently dropping fields;
+  Claude effort is passed as `--effort` only when the installed CLI advertises it.
+- Started jobs expose a sanitized `execution` receipt containing the provider, transport,
+  binary/version, normalized model, effort, permission/approval policy, sandbox, and skill ids.
 - `GET /v1/codex/approvals?status=pending&jobId=<id>` lists blocked runtime requests.
   `POST /v1/codex/approvals/:id/decision` accepts `accept`, `acceptForSession`,
   `decline`, or `cancel`.
@@ -20,8 +26,8 @@ are restricted to the selected workspace, have no network access, and do not sou
 runner's login profile.
 
 > Status: contract freeze, derived verbatim from
-> `relay-server/codex-api-deploy/server.mjs` (6,642 lines) and validated
-> against `relay-server/codex-api-deploy/server.test.mjs` (59 tests).
+> `relay-server/codex-api-deploy/server.mjs` (7,296 lines) and validated
+> against `relay-server/codex-api-deploy/server.test.mjs` (63 tests).
 > All line numbers cite `server.mjs` unless noted. Domains and hosts are
 > genericized (`<domain>`, `<node-id>`); no live endpoints appear here.
 >
@@ -175,7 +181,7 @@ All from env, parsed at 9–124. Contract-relevant defaults:
 | `CODEX_THREAD_SUMMARY_CHARACTERS` | 240 | summary text truncation |
 | `CODEX_WORKSPACES` | 3 seeded entries | static workspace registry (JSON array of `{id,name,path}`, 169–205) |
 | `CODEX_MODEL_CATALOG` | built-in | fallback model catalog and non-Codex providers; app-server installs discover Codex models live |
-| `CODEX_DANGEROUS_MODE` | `true` | harness sandbox bypass flags |
+| `CODEX_DANGEROUS_MODE` | `false` | legacy chat execution policy; task jobs always use `workspace-write` and their selected approval policy |
 | `CODEX_PROXY_BASE_URL` (+ client cert/key paths) | unset | dev proxy mode (§1.20) |
 
 Default secret denylist (77–80), matched case-insensitively against entry
@@ -569,8 +575,9 @@ unknown), `provider` (`codex|claude|cursor`), `limit` (default 50, clamp
   "prompt": "…",                      // required non-empty; ≤ body cap
   "provider": "codex",               // optional codex|claude|cursor (default codex)
   "model": "gpt-5-codex",            // optional; ^[A-Za-z0-9._:-]{1,100}$; claude aliases sonnet/opus/haiku resolve via env (99–104, 2431–2440)
-  "reasoningEffort": "high",         // optional; codex only; low|medium|high|xhigh
-  "permissionMode": "acceptEdits",   // optional; claude only; acceptEdits|auto|bypassPermissions|default|dontAsk|plan (87)
+  "reasoningEffort": "high",         // optional; codex or claude when advertised by the selected task model
+  "permissionMode": "acceptEdits",   // optional; claude only; acceptEdits|auto|bypassPermissions|default|manual|dontAsk|plan; default normalizes to manual (87)
+  "approvalPolicy": "on-request",    // optional; codex only; untrusted|on-failure|on-request|never
   "timeoutMs": 600000,                // optional; >0; clamped to [1000, CODEX_MAX_TIMEOUT_MS]
   "resumeSessionId": "<uuid>",        // optional; session must exist, match provider AND workspace (2349–2361)
   "skills": ["superpowers:tdd"],     // optional; ≤6; each must exist for provider (2681–2710)
@@ -583,26 +590,31 @@ unknown), `provider` (`codex|claude|cursor`), `limit` (default 50, clamp
 
 Response: **202** with a preview-shaped job response (§1.16). Effects:
 attachments are written under the data dir and their runner-local paths
-appended to the prompt manifest (2781–2787); selected skill bodies are
-inlined into the prompt (≤ 20 KiB each, 2789–2811); the job is persisted
-and queued; audit `job_created`.
+appended to the prompt manifest (2781–2787). Selected skill bodies are inlined
+for Claude, Cursor, and the legacy Codex exec transport; Codex app-server jobs
+receive one structured skill input instead, avoiding duplicate instructions.
+The job is then persisted and queued; audit `job_created`.
 
-Before any job record or attachment is created, relayd probes the selected
-provider under the same isolated `HOME`/`CODEX_HOME` used by the runner. A
+Before any job record or attachment is created, relayd validates the model,
+effort, and provider-specific control fields against the advertised task catalog,
+then probes the selected provider under the same isolated `HOME`/`CODEX_HOME`
+used by the runner. A
 missing binary or confirmed signed-out session returns **503** with the
-provider-specific recovery action. An unknown login state from an older CLI is
-reported by `GET /v1/harness` but does not block an otherwise runnable job.
+provider-specific recovery action. Claude effort additionally requires the exact
+installed CLI's `--help` output to advertise `--effort`.
 
 Provider invocation (contract-relevant): prompt is delivered on **stdin**
-for codex/claude, as an argv for cursor (4229, 4344–4350); codex runs
-`codex exec -C <workspace> --skip-git-repo-check --ignore-rules` (+
-`--dangerously-bypass-approvals-and-sandbox` in dangerous mode, else
-`--sandbox workspace-write -a never`) with `-o <resultPath>` (4303–4317);
-claude runs `claude --print` (+ `--dangerously-skip-permissions`) with
-`--session-id <uuid>` server-minted up front, result read from stdout
-(4331–4342); cursor runs `cursor-agent -p --force --trust --workspace …
+for codex/claude, as an argv for cursor. Codex app-server jobs send `model`,
+`effort`, `approvalPolicy`, `approvalsReviewer=user`, and `sandbox=workspace-write`
+on thread/turn requests. The compatibility exec transport uses
+`-a <approvalPolicy> --sandbox workspace-write` as top-level Codex flags and
+never adds the bypass flag. Placing them before `exec` keeps the controls valid
+for both new jobs and `exec resume` jobs.
+Claude runs `claude --print --model … --effort … --permission-mode …` with the
+Relay approval MCP and a server-minted `--session-id`; cursor runs
+`cursor-agent -p --force --trust --workspace …
 --output-format json`, result parsed from the JSON envelope incl.
-`session_id` (4344–4350, 4695–4706). AWS/Bedrock credentials are scrubbed
+`session_id`. AWS/Bedrock credentials are scrubbed
 from the child env for direct claude/cursor jobs (4244–4300).
 
 Session-id semantics: claude = server-minted upfront; cursor = parsed from
@@ -646,8 +658,15 @@ preview fields), `preview` = 64 KiB, `compact` = 4 KiB. stdout/stderr are
   "result": "…", "resultPreview": "…", "resultBytes": 456, "resultTruncated": false,
   "error": "",                         // cleaned; "" when none (A6)
   "certSubject": "CN=allowed",
-  "model": null, "reasoningEffort": null, "permissionMode": null,
+  "model": null, "reasoningEffort": null, "permissionMode": null, "approvalPolicy": "on-request",
   "skills": [],
+  "execution": {
+    "provider": "codex", "transport": "app-server",
+    "binary": "codex", "binaryVersion": "codex-cli 0.142.2",
+    "model": null, "reasoningEffort": null,
+    "permissionMode": null, "approvalPolicy": "on-request",
+    "sandbox": "workspace-write", "skills": [], "launchedAt": "…"
+  },
   "resumeSessionId": null,
   "sessionId": "<uuid>"                // null until discovered
 }
@@ -1084,6 +1103,11 @@ capability flags (the catalog honesty rules extended):
   "installed": true, "version": "2.1.0",
   "loggedIn": true, "authKind": "subscription",   // subscription|api|unknown
   "supportsApprovals": true, "supportsResume": true, "supportsChat": false,
+  "taskControls": {
+    "model": true, "reasoningEffort": true,
+    "permissionModes": ["manual", "acceptEdits", "plan", "dontAsk", "auto"],
+    "approvalPolicies": []
+  },
   "lastSmoke": {"status": "succeeded", "finishedAt": "…Z", "jobId": "<uuid>"}  // or null
 }]}
 ```
@@ -1388,7 +1412,7 @@ is the one field guaranteed to contain repository content.
 ## Conformance notes
 
 - Baseline suite: `relay-server/codex-api-deploy/server.test.mjs` —
-  59 `node:test` tests spawning the real server on a loopback port with
+  63 `node:test` tests spawning the real server on a loopback port with
   fake harness binaries. W0 promotes this file into an
   implementation-agnostic suite (parameterize the base URL; keep the fake
   binaries) so the Node relayd and the later Go port run identically

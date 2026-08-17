@@ -7,13 +7,16 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 
-import { dangerousMode } from "../config.mjs";
-
 function buildCodexArgs(job) {
   if (job.resumeSessionId) return buildCodexResumeArgs(job);
-  const args = ["exec", "-C", job.worktree?.path || job.workspacePath, "--skip-git-repo-check", "--ignore-rules"];
-  if (dangerousMode) args.push("--dangerously-bypass-approvals-and-sandbox");
-  else args.push("--sandbox", "workspace-write", "-a", "never");
+  // Approval and sandbox are top-level Codex flags. Keeping them before
+  // `exec` also makes them valid for the narrower `exec resume` parser.
+  const args = [
+    "-a", job.approvalPolicy || "on-request",
+    "--sandbox", "workspace-write",
+    "exec", "-C", job.worktree?.path || job.workspacePath,
+    "--skip-git-repo-check", "--ignore-rules",
+  ];
   if (job.model) args.push("-m", job.model);
   if (job.reasoningEffort) args.push("-c", `model_reasoning_effort="${job.reasoningEffort}"`);
   args.push("-o", job.resultPath, "-");
@@ -22,8 +25,11 @@ function buildCodexArgs(job) {
 
 
 function buildCodexResumeArgs(job) {
-  const args = ["exec", "resume", "--skip-git-repo-check", "--ignore-rules"];
-  if (dangerousMode) args.push("--dangerously-bypass-approvals-and-sandbox");
+  const args = [
+    "-a", job.approvalPolicy || "on-request",
+    "--sandbox", "workspace-write",
+    "exec", "resume", "--skip-git-repo-check", "--ignore-rules",
+  ];
   if (job.model) args.push("-m", job.model);
   if (job.reasoningEffort) args.push("-c", `model_reasoning_effort="${job.reasoningEffort}"`);
   args.push("-o", job.resultPath, job.resumeSessionId, "-");

@@ -1818,6 +1818,22 @@ private struct RelayFullLogSheet: View {
                         size: 10
                     )
 
+                    if let receipt = job.execution {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("EXECUTION RECEIPT")
+                                .font(AppTheme.monoFont(size: 10))
+                                .foregroundStyle(AppTheme.textTertiary)
+                            Text(receipt.summaryLines.joined(separator: "\n"))
+                                .font(AppTheme.monoFont(size: 11))
+                                .foregroundStyle(AppTheme.textSecondary)
+                                .textSelection(.enabled)
+                        }
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.white.opacity(0.04))
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    }
+
                     if let text {
                         Text(text.isEmpty ? "No log output." : text)
                             .font(AppTheme.monoFont(size: 12))

@@ -330,7 +330,7 @@ def render_env(config: dict[str, str], output: Path) -> None:
         ("AWS_DEFAULT_REGION", aws_default_region),
         ("CODEX_RUN_HOME", "/var/lib/codex-api/run-home"),
         ("CODEX_HOME", "/var/lib/codex-api/run-home/.codex"),
-        ("CODEX_DANGEROUS_MODE", "true"),
+        ("CODEX_DANGEROUS_MODE", "false"),
         ("CODEX_MAX_CONCURRENT", "1"),
         ("CODEX_MAX_JOB_STREAMS", "8"),
         ("CODEX_JOB_STREAM_HEARTBEAT_MS", "15000"),

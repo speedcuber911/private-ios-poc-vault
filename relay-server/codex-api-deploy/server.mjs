@@ -98,7 +98,7 @@ const allowedReasoningEfforts = new Set(["low", "medium", "high", "xhigh"]);
 const allowedJobProviders = new Set(["codex", "claude", "cursor"]);
 const allowedChatProviders = new Set(["codex", "azure", "bedrock"]);
 const allowedThreadProviders = new Set([...allowedJobProviders, ...allowedChatProviders]);
-const allowedClaudePermissionModes = new Set(["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"]);
+const allowedClaudePermissionModes = new Set(["acceptEdits", "auto", "bypassPermissions", "default", "manual", "dontAsk", "plan"]);
 const allowedCodexApprovalPolicies = new Set(["untrusted", "on-failure", "on-request", "never"]);
 const claudeAwsProfile = cleanOptionalAwsProfile(process.env.CLAUDE_AWS_PROFILE);
 if (claudeAwsProfile && claudeAwsProfile !== "sigiq") {
@@ -130,6 +130,44 @@ const proxyClientCertPath = cleanOptionalFilePath(process.env.CODEX_PROXY_CLIENT
 const proxyClientKeyPath = cleanOptionalFilePath(process.env.CODEX_PROXY_CLIENT_KEY || process.env.CODEX_REMOTE_CLIENT_KEY);
 const modelCatalog = loadModelCatalog();
 let runtimeCodexModelsCache = { expiresAt: 0, models: null };
+const providerVersionCache = new Map();
+const providerVersionCacheMs = 5 * 60 * 1000;
+const providerHelpCache = new Map();
+const providerCapabilities = {
+  codex: {
+    supportsApprovals: true,
+    supportsResume: true,
+    supportsChat: true,
+    taskControls: {
+      model: true,
+      reasoningEffort: true,
+      permissionModes: [],
+      approvalPolicies: ["untrusted", "on-failure", "on-request", "never"],
+    },
+  },
+  claude: {
+    supportsApprovals: true,
+    supportsResume: true,
+    supportsChat: false,
+    taskControls: {
+      model: true,
+      reasoningEffort: true,
+      permissionModes: ["manual", "acceptEdits", "plan", "dontAsk", "auto"],
+      approvalPolicies: [],
+    },
+  },
+  cursor: {
+    supportsApprovals: false,
+    supportsResume: true,
+    supportsChat: false,
+    taskControls: {
+      model: true,
+      reasoningEffort: false,
+      permissionModes: [],
+      approvalPolicies: [],
+    },
+  },
+};
 const chatsDir = path.join(dataDir, "chats");
 const jobs = new Map();
 const dynamicWorkspaces = new Map();
@@ -263,30 +301,90 @@ function loadModelCatalog() {
 }
 
 function defaultModelCatalog() {
-  const bedrockChatModel = process.env.BEDROCK_CHAT_MODEL || "anthropic.claude-3-5-sonnet-20241022-v2:0";
   const catalog = [
-    {
-      id: bedrockChatModel,
-      label: "Claude Sonnet (Bedrock)",
-      provider: "bedrock",
-      modes: ["chat"],
-      defaultOptions: { temperature: 0.7, maxTokens: 4096 },
-      effortLevels: ["low", "medium", "high"],
-    },
     {
       id: "codex-cli",
       label: "Codex CLI",
       provider: "codex",
       modes: ["task"],
+      effortLevels: ["low", "medium", "high", "xhigh"],
+    },
+    {
+      id: "codex-gpt-5.6-sol",
+      label: "Codex · GPT-5.6 Sol",
+      provider: "codex",
+      modes: ["task"],
+      taskModel: "gpt-5.6-sol",
+      effortLevels: ["low", "medium", "high", "xhigh"],
+    },
+    {
+      id: "codex-gpt-5.6-terra",
+      label: "Codex · GPT-5.6 Terra",
+      provider: "codex",
+      modes: ["task"],
+      taskModel: "gpt-5.6-terra",
+      effortLevels: ["low", "medium", "high", "xhigh"],
+    },
+    {
+      id: "codex-gpt-5.6-luna",
+      label: "Codex · GPT-5.6 Luna",
+      provider: "codex",
+      modes: ["task"],
+      taskModel: "gpt-5.6-luna",
+      effortLevels: ["low", "medium", "high", "xhigh"],
     },
     {
       id: "claude-code",
-      label: "Claude Code (Bedrock/SigiQ)",
+      label: "Claude Code",
       provider: "claude",
       modes: ["task"],
       effortLevels: ["low", "medium", "high"],
     },
+    {
+      id: "claude-code-sonnet",
+      label: "Claude Code · Sonnet",
+      provider: "claude",
+      modes: ["task"],
+      taskModel: "sonnet",
+      effortLevels: ["low", "medium", "high"],
+    },
+    {
+      id: "claude-code-opus",
+      label: "Claude Code · Opus",
+      provider: "claude",
+      modes: ["task"],
+      taskModel: "opus",
+      effortLevels: ["low", "medium", "high"],
+    },
+    {
+      id: "claude-code-haiku",
+      label: "Claude Code · Haiku",
+      provider: "claude",
+      modes: ["task"],
+      taskModel: "haiku",
+      effortLevels: ["low", "medium", "high"],
+    },
   ];
+  if (fs.existsSync(cursorBin)) {
+    catalog.push({
+      id: "cursor-agent-auto",
+      label: "Cursor Agent · Auto",
+      provider: "cursor",
+      modes: ["task"],
+      taskModel: "auto",
+      effortLevels: [],
+    });
+  }
+  if (process.env.BEDROCK_CHAT_MODEL) {
+    catalog.unshift({
+      id: process.env.BEDROCK_CHAT_MODEL,
+      label: "Claude Sonnet (Bedrock)",
+      provider: "bedrock",
+      modes: ["chat"],
+      defaultOptions: { temperature: 0.7, maxTokens: 4096 },
+      effortLevels: ["low", "medium", "high"],
+    });
+  }
   if (process.env.AZURE_OPENAI_DEPLOYMENT) {
     catalog.push({
       id: process.env.AZURE_OPENAI_DEPLOYMENT,
@@ -441,6 +539,39 @@ function findCatalogModel({ provider, model, mode }) {
   return modelCatalog.find(
     (entry) => entry.provider === provider && entry.id === model && entry.modes.includes(mode),
   );
+}
+
+function validateTaskSelectionFromCatalog(catalog, { provider, model, reasoningEffort }) {
+  const taskEntries = catalog.filter(
+    (entry) => entry.provider === provider && Array.isArray(entry.modes) && entry.modes.includes("task"),
+  );
+  if (taskEntries.length === 0) {
+    throw Object.assign(new Error(`${provider} is not available for task execution`), { status: 400 });
+  }
+  const modelEntries = model
+    ? taskEntries.filter((entry) => entry.taskModel === model)
+    : taskEntries.filter((entry) => !entry.taskModel);
+  if (model && modelEntries.length === 0) {
+    throw Object.assign(new Error(`model is not available for ${provider}: ${model}`), { status: 400 });
+  }
+  if (reasoningEffort) {
+    const effortEntries = model ? modelEntries : (modelEntries.length ? modelEntries : taskEntries);
+    const supported = effortEntries.some(
+      (entry) => Array.isArray(entry.effortLevels) && entry.effortLevels.includes(reasoningEffort),
+    );
+    if (!supported) {
+      const label = model || "the provider default model";
+      throw Object.assign(
+        new Error(`reasoningEffort ${reasoningEffort} is not supported by ${provider} model ${label}`),
+        { status: 400 },
+      );
+    }
+  }
+  return { model, reasoningEffort };
+}
+
+async function validateRuntimeTaskSelection(selection) {
+  return validateTaskSelectionFromCatalog(await publicRuntimeModelCatalog(), selection);
 }
 
 function browseWorkspaceForPath(workspacePath, { materialize = false } = {}) {
@@ -1482,6 +1613,10 @@ async function routeRequest(req, res) {
     return sendJson(res, 200, healthPayload(true));
   }
 
+  if (req.method === "GET" && url.pathname === "/v1/harness") {
+    return sendJson(res, 200, { harnesses: listHarnesses() });
+  }
+
   if (req.method === "GET" && url.pathname === "/v1/codex/ui") {
     return sendHtml(res, 200, codexThreadUiHtml());
   }
@@ -1635,7 +1770,17 @@ async function routeRequest(req, res) {
 
   if (req.method === "POST" && url.pathname === "/v1/codex/jobs") {
     const body = await readBody(req);
-    const job = createJob(body, auth.subject);
+    const provider = cleanOptionalProvider(body?.provider);
+    validateProviderControlFields(provider, body || {});
+    const requestedModel = cleanOptionalModel(body?.model);
+    const requestedReasoningEffort = cleanOptionalReasoningEffort(body?.reasoningEffort);
+    const taskSelection = await validateRuntimeTaskSelection({
+      provider,
+      model: requestedModel,
+      reasoningEffort: requestedReasoningEffort,
+    });
+    assertProviderReady(provider, taskSelection);
+    const job = createJob(body, auth.subject, taskSelection);
     jobs.set(job.id, job);
     queuedJobIds.push(job.id);
     persistJob(job);
@@ -1745,7 +1890,86 @@ function providerDisplayName(provider) {
   return "Codex";
 }
 
-function assertProviderReady(provider) {
+function providerAuthKind(value) {
+  const text = String(value || "").toLowerCase();
+  if (text.includes("api key") || text.includes("apikey")) return "api";
+  if (text.includes("chatgpt") || text.includes("subscription") || text.includes("oauth")) return "subscription";
+  return "unknown";
+}
+
+function providerAuthState(provider, output, commandSucceeded) {
+  const text = cleanApiText(output);
+  const parsed = parsedAuthJson(text);
+  if (provider === "claude" && parsed && typeof parsed.loggedIn === "boolean") {
+    return {
+      loggedIn: parsed.loggedIn,
+      authKind: parsed.loggedIn ? providerAuthKind(parsed.authMethod || parsed.apiProvider) : "unknown",
+    };
+  }
+  if (provider === "cursor" && parsed && typeof parsed.isAuthenticated === "boolean") {
+    return {
+      loggedIn: parsed.isAuthenticated,
+      authKind: parsed.isAuthenticated
+        ? (parsed.hasRefreshToken ? "subscription" : parsed.hasAccessToken ? "api" : "unknown")
+        : "unknown",
+    };
+  }
+  if (provider === "codex" && providerIsConfirmedSignedOut(provider, text)) {
+    return { loggedIn: false, authKind: "unknown" };
+  }
+  return commandSucceeded
+    ? { loggedIn: true, authKind: providerAuthKind(text) }
+    : { loggedIn: null, authKind: "unknown" };
+}
+
+function detectProviderAuth(provider) {
+  const binary = providerBinaryForReadiness(provider);
+  try {
+    const output = execFileSync(binary, providerReadinessArgs(provider), {
+      encoding: "utf8",
+      timeout: 10000,
+      env: providerReadinessEnv(provider),
+      cwd: runHome,
+    });
+    return providerAuthState(provider, output, true);
+  } catch (error) {
+    const output = [error?.stdout, error?.stderr]
+      .map((value) => Buffer.isBuffer(value) ? value.toString("utf8") : String(value || ""))
+      .join("\n");
+    return providerAuthState(provider, output, false);
+  }
+}
+
+function providerTaskControls(provider) {
+  const declared = providerCapabilities[provider].taskControls;
+  return provider === "claude"
+    ? { ...declared, reasoningEffort: claudeSupportsEffort() }
+    : declared;
+}
+
+function detectHarness(provider) {
+  const binary = providerBinaryForReadiness(provider);
+  const version = detectProviderVersion(provider);
+  const installed = fs.existsSync(binary) || Boolean(version);
+  const auth = installed
+    ? detectProviderAuth(provider)
+    : { loggedIn: false, authKind: "unknown" };
+  return {
+    provider,
+    installed,
+    version,
+    ...auth,
+    ...providerCapabilities[provider],
+    taskControls: providerTaskControls(provider),
+    lastSmoke: null,
+  };
+}
+
+function listHarnesses() {
+  return [...allowedJobProviders].map((provider) => detectHarness(provider));
+}
+
+function assertProviderReady(provider, requirements = {}) {
   const binary = providerBinaryForReadiness(provider);
   if (!fs.existsSync(binary)) {
     throw Object.assign(new Error(`${providerDisplayName(provider)} is not installed on this computer.`), { status: 503 });
@@ -1767,12 +1991,54 @@ function assertProviderReady(provider) {
     // explicit signed-out result blocks a task.
     confirmedSignedOut = providerIsConfirmedSignedOut(provider, output);
   }
-  if (!confirmedSignedOut) return;
-  const displayName = providerDisplayName(provider);
-  const action = provider === "cursor"
-    ? "Run cursor-agent login on the computer, then try again."
-    : `Run relay sync-auth on your Mac to connect ${displayName}, then try again.`;
-  throw Object.assign(new Error(`${displayName} is not connected on this computer. ${action}`), { status: 503 });
+  if (confirmedSignedOut) {
+    const displayName = providerDisplayName(provider);
+    const action = provider === "cursor"
+      ? "Run cursor-agent login on the computer, then try again."
+      : `Run relay sync-auth on your Mac to connect ${displayName}, then try again.`;
+    throw Object.assign(new Error(`${displayName} is not connected on this computer. ${action}`), { status: 503 });
+  }
+  if (provider === "claude" && requirements.reasoningEffort && !claudeSupportsEffort()) {
+    throw Object.assign(
+      new Error("The installed Claude Code does not support --effort. Upgrade Claude Code on this computer, then try again."),
+      { status: 503 },
+    );
+  }
+}
+
+function claudeSupportsEffort() {
+  const cached = providerHelpCache.get("claude");
+  if (cached && cached.binary === claudeBin && cached.expiresAt > Date.now()) return cached.supported;
+  let supported = false;
+  try {
+    const help = cleanApiText(execFileSync(claudeBin, ["--help"], {
+      encoding: "utf8",
+      timeout: 10000,
+      env: providerReadinessEnv("claude"),
+      cwd: runHome,
+    }));
+    supported = /(?:^|\s)--effort(?:\s|$)/m.test(help);
+  } catch {}
+  providerHelpCache.set("claude", { binary: claudeBin, supported, expiresAt: Date.now() + providerVersionCacheMs });
+  return supported;
+}
+
+function detectProviderVersion(provider) {
+  const binary = providerBinaryForReadiness(provider);
+  const cached = providerVersionCache.get(provider);
+  if (cached && cached.binary === binary && cached.expiresAt > Date.now()) return cached.version;
+  let version = null;
+  try {
+    const output = execFileSync(binary, ["--version"], {
+      encoding: "utf8",
+      timeout: 10000,
+      env: providerReadinessEnv(provider),
+      cwd: runHome,
+    }).trim();
+    version = cleanApiText(output.split("\n")[0] || "").trim() || null;
+  } catch {}
+  providerVersionCache.set(provider, { binary, version, expiresAt: Date.now() + providerVersionCacheMs });
+  return version;
 }
 
 function clampLimit(value) {
@@ -2516,7 +2782,7 @@ function awsSigningKey(secretAccessKey, dateStamp, region, service) {
   return crypto.createHmac("sha256", kService).update("aws4_request").digest();
 }
 
-function createJob(body, certSubject) {
+function createJob(body, certSubject, validatedTaskSelection = null) {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     throw Object.assign(new Error("request body must be a JSON object"), { status: 400 });
   }
@@ -2536,7 +2802,14 @@ function createJob(body, certSubject) {
   }
 
   const provider = cleanOptionalProvider(body.provider);
-  assertProviderReady(provider);
+  validateProviderControlFields(provider, body);
+  const requestedModel = cleanOptionalModel(body.model);
+  const requestedReasoningEffort = cleanOptionalReasoningEffort(body.reasoningEffort);
+  const taskSelection = validatedTaskSelection || validateTaskSelectionFromCatalog(publicModelCatalog(), {
+    provider,
+    model: requestedModel,
+    reasoningEffort: requestedReasoningEffort,
+  });
   const resumeSessionId = cleanOptionalSessionId(body.resumeSessionId);
   if (resumeSessionId) {
     const resumeMeta = findThreadResumeMeta(resumeSessionId);
@@ -2561,10 +2834,13 @@ function createJob(body, certSubject) {
   const timeoutMs = Math.min(Math.max(Math.trunc(requestedTimeout), 1000), maxTimeoutMs);
   const attachments = saveJobAttachments(id, body.attachments);
   const selectedSkills = cleanSelectedSkills(provider, body.skills, workspace.path);
-  const codexPrompt = promptWithAttachments(promptWithSelectedSkills(body.prompt, provider, selectedSkills), attachments);
-  const requestedPermissionMode = cleanOptionalClaudePermissionMode(body.permissionMode);
-  const permissionMode = provider === "claude" ? (requestedPermissionMode || "manual") : null;
-  const approvalPolicy = cleanOptionalCodexApprovalPolicy(body.approvalPolicy);
+  const codexPrompt = buildJobPrompt(body.prompt, provider, selectedSkills, attachments);
+  const permissionMode = provider === "claude"
+    ? (cleanOptionalClaudePermissionMode(body.permissionMode) || "manual")
+    : null;
+  const approvalPolicy = provider === "codex"
+    ? cleanOptionalCodexApprovalPolicy(body.approvalPolicy)
+    : null;
   pruneRuntimeCachesIfIdle();
   const job = {
     id,
@@ -2593,10 +2869,11 @@ function createJob(body, certSubject) {
     error: null,
     certSubject,
     timeoutMs,
-    model: cleanProviderModel(provider, body.model),
-    reasoningEffort: provider === "codex" ? cleanOptionalReasoningEffort(body.reasoningEffort) : null,
-    permissionMode: provider === "claude" ? permissionMode : null,
-    approvalPolicy: provider === "codex" ? approvalPolicy : null,
+    model: cleanProviderModel(provider, taskSelection.model),
+    reasoningEffort: provider === "codex" || provider === "claude" ? taskSelection.reasoningEffort : null,
+    permissionMode,
+    approvalPolicy,
+    execution: null,
     resumeSessionId,
     sessionId: resumeSessionId || (provider === "claude" ? crypto.randomUUID() : null),
   };
@@ -2605,6 +2882,19 @@ function createJob(body, certSubject) {
   fs.writeFileSync(job.stderrPath, "", "utf8");
   fs.writeFileSync(job.resultPath, "", "utf8");
   return job;
+}
+
+function hasControlValue(value) {
+  return value !== undefined && value !== null && value !== "";
+}
+
+function validateProviderControlFields(provider, body) {
+  if (provider !== "claude" && hasControlValue(body.permissionMode)) {
+    throw Object.assign(new Error("permissionMode is supported only for Claude jobs"), { status: 400 });
+  }
+  if (provider !== "codex" && hasControlValue(body.approvalPolicy)) {
+    throw Object.assign(new Error("approvalPolicy is supported only for Codex jobs"), { status: 400 });
+  }
 }
 
 function cleanOptionalModel(value) {
@@ -2909,7 +3199,7 @@ function cleanOptionalClaudePermissionMode(value) {
   if (!allowedClaudePermissionModes.has(cleaned)) {
     throw Object.assign(new Error("permissionMode must be a supported Claude permission mode"), { status: 400 });
   }
-  return cleaned;
+  return cleaned === "default" ? "manual" : cleaned;
 }
 
 function cleanOptionalCodexApprovalPolicy(value) {
@@ -3038,6 +3328,13 @@ function promptWithSelectedSkills(prompt, provider, skills) {
     })
     .join("\n\n---\n\n");
   return `Selected ${label} skills are included below. Follow these SKILL.md instructions when they are relevant to the task.\n\n${blocks}\n\nUser task:\n${prompt}`;
+}
+
+function buildJobPrompt(prompt, provider, skills, attachments) {
+  const promptWithSkills = provider === "codex" && codexTransport === "app-server"
+    ? prompt
+    : promptWithSelectedSkills(prompt, provider, skills);
+  return promptWithAttachments(promptWithSkills, attachments);
 }
 
 function boundedSkillBody(file) {
@@ -4397,6 +4694,7 @@ function startJob(job) {
   job.updatedAt = startedAt;
   job.error = null;
   job.timedOut = false;
+  job.execution = buildExecutionReceipt(job);
   touchJob(job, "job_started");
 
   const stdoutStream = fs.createWriteStream(job.stdoutPath, { flags: "a" });
@@ -4521,7 +4819,9 @@ function buildJobEnv(job) {
     RELAY_APPROVAL_DIR: approvalsDir,
     RELAY_CODEX_BIN: codexBin,
     RELAY_CODEX_APPROVAL_POLICY: job.approvalPolicy || "on-request",
-    RELAY_CODEX_SKILL_INPUTS: JSON.stringify(job.skillInputs || []),
+    RELAY_CODEX_SKILL_INPUTS: JSON.stringify(
+      job.provider === "codex" && codexTransport === "app-server" ? (job.skillInputs || []) : [],
+    ),
   };
 
   if (job.model) env.RELAY_MODEL = job.model;
@@ -4570,15 +4870,54 @@ function buildJobEnv(job) {
   return env;
 }
 
+function buildExecutionReceipt(job) {
+  const provider = normalizeJobProvider(job.provider);
+  const providerBin = provider === "claude" ? claudeBin : provider === "cursor" ? cursorBin : codexBin;
+  return {
+    provider,
+    transport: provider === "codex" ? codexTransport : "cli",
+    binary: cleanApiText(path.basename(providerBin)).slice(0, 160) || null,
+    binaryVersion: cleanApiText(detectProviderVersion(provider)).slice(0, 160) || null,
+    model: job.model || null,
+    reasoningEffort: job.reasoningEffort || null,
+    permissionMode: job.permissionMode || null,
+    approvalPolicy: job.approvalPolicy || null,
+    sandbox: provider === "codex" ? "workspace-write" : null,
+    skills: Array.isArray(job.skills) ? [...job.skills] : [],
+    launchedAt: nowIso(),
+  };
+}
+
+function publicExecutionReceipt(receipt) {
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) return null;
+  return {
+    provider: normalizeJobProvider(receipt.provider),
+    transport: ["app-server", "exec", "cli"].includes(receipt.transport) ? receipt.transport : "cli",
+    binary: cleanApiText(receipt.binary).slice(0, 160) || null,
+    binaryVersion: cleanApiText(receipt.binaryVersion).slice(0, 160) || null,
+    model: cleanApiText(receipt.model).slice(0, 180) || null,
+    reasoningEffort: allowedReasoningEfforts.has(receipt.reasoningEffort) ? receipt.reasoningEffort : null,
+    permissionMode: allowedClaudePermissionModes.has(receipt.permissionMode) ? receipt.permissionMode : null,
+    approvalPolicy: allowedCodexApprovalPolicies.has(receipt.approvalPolicy) ? receipt.approvalPolicy : null,
+    sandbox: receipt.sandbox === "workspace-write" ? receipt.sandbox : null,
+    skills: Array.isArray(receipt.skills)
+      ? receipt.skills.filter((value) => typeof value === "string").map((value) => cleanApiText(value).slice(0, 160))
+      : [],
+    launchedAt: cleanApiText(receipt.launchedAt).slice(0, 64) || null,
+  };
+}
+
 function buildCodexArgs(job) {
   if (job.resumeSessionId) return buildCodexResumeArgs(job);
 
-  const args = ["exec", "-C", job.workspacePath, "--skip-git-repo-check", "--ignore-rules"];
-  if (dangerousMode) {
-    args.push("--dangerously-bypass-approvals-and-sandbox");
-  } else {
-    args.push("--sandbox", "workspace-write", "-a", "never");
-  }
+  // Approval and sandbox are top-level Codex flags. Keeping them before
+  // `exec` also makes them valid for the narrower `exec resume` parser.
+  const args = [
+    "-a", job.approvalPolicy || "on-request",
+    "--sandbox", "workspace-write",
+    "exec", "-C", job.workspacePath,
+    "--skip-git-repo-check", "--ignore-rules",
+  ];
   if (job.model) args.push("-m", job.model);
   if (job.reasoningEffort) args.push("-c", `model_reasoning_effort="${job.reasoningEffort}"`);
   args.push("-o", job.resultPath);
@@ -4587,10 +4926,11 @@ function buildCodexArgs(job) {
 }
 
 function buildCodexResumeArgs(job) {
-  const args = ["exec", "resume", "--skip-git-repo-check", "--ignore-rules"];
-  if (dangerousMode) {
-    args.push("--dangerously-bypass-approvals-and-sandbox");
-  }
+  const args = [
+    "-a", job.approvalPolicy || "on-request",
+    "--sandbox", "workspace-write",
+    "exec", "resume", "--skip-git-repo-check", "--ignore-rules",
+  ];
   if (job.model) args.push("-m", job.model);
   if (job.reasoningEffort) args.push("-c", `model_reasoning_effort="${job.reasoningEffort}"`);
   args.push("-o", job.resultPath);
@@ -4608,6 +4948,7 @@ function buildClaudeArgs(job) {
   }));
   args.push("--strict-mcp-config", "--permission-prompt-tool", "mcp__relay_approvals__approve");
   if (job.model) args.push("--model", job.model);
+  if (job.reasoningEffort) args.push("--effort", job.reasoningEffort);
   if (job.resumeSessionId) {
     args.push("--resume", job.resumeSessionId);
   } else {
@@ -5161,6 +5502,7 @@ async function toJobResponse(job, shape = responseShape("preview")) {
     permissionMode: job.permissionMode || null,
     approvalPolicy: job.approvalPolicy || null,
     skills: Array.isArray(job.skills) ? job.skills : [],
+    execution: publicExecutionReceipt(job.execution),
     resumeSessionId: job.resumeSessionId || null,
     sessionId: job.sessionId || job.resumeSessionId || null,
   };

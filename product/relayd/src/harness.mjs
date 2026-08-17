@@ -21,12 +21,46 @@ const loginTimeoutMs = 10 * 60 * 1000;
 
 const smokeTimeoutMs = 2 * 60 * 1000;
 
+const providerVersionCache = new Map();
+const providerVersionCacheMs = 5 * 60 * 1000;
+const providerHelpCache = new Map();
+
 // Static capability flags per provider adapter (extraction judgment call —
 // mirrors what the job engine supports today).
 const providerCapabilities = {
-  codex: { supportsApprovals: false, supportsResume: true, supportsChat: true },
-  claude: { supportsApprovals: true, supportsResume: true, supportsChat: false },
-  cursor: { supportsApprovals: false, supportsResume: true, supportsChat: false },
+  codex: {
+    supportsApprovals: true,
+    supportsResume: true,
+    supportsChat: true,
+    taskControls: {
+      model: true,
+      reasoningEffort: true,
+      permissionModes: [],
+      approvalPolicies: ["untrusted", "on-failure", "on-request", "never"],
+    },
+  },
+  claude: {
+    supportsApprovals: true,
+    supportsResume: true,
+    supportsChat: false,
+    taskControls: {
+      model: true,
+      reasoningEffort: true,
+      permissionModes: ["manual", "acceptEdits", "plan", "dontAsk", "auto"],
+      approvalPolicies: [],
+    },
+  },
+  cursor: {
+    supportsApprovals: false,
+    supportsResume: true,
+    supportsChat: false,
+    taskControls: {
+      model: true,
+      reasoningEffort: false,
+      permissionModes: [],
+      approvalPolicies: [],
+    },
+  },
 };
 
 function providerBinary(provider) {
@@ -147,20 +181,55 @@ function detectProviderAuth(provider) {
   }
 }
 
+function detectProviderVersion(provider) {
+  const bin = providerBinary(provider);
+  const cached = providerVersionCache.get(provider);
+  if (cached && cached.bin === bin && cached.expiresAt > Date.now()) return cached.version;
+  let version = null;
+  try {
+    const output = execFileSync(bin, ["--version"], {
+      encoding: "utf8",
+      timeout: 10000,
+      env: providerEnv(provider),
+      cwd: runHome,
+    }).trim();
+    version = cleanApiText(output.split("\n")[0] || "").trim() || null;
+  } catch {}
+  providerVersionCache.set(provider, { bin, version, expiresAt: Date.now() + providerVersionCacheMs });
+  return version;
+}
+
+function providerHelp(provider) {
+  const bin = providerBinary(provider);
+  const cached = providerHelpCache.get(provider);
+  if (cached && cached.bin === bin && cached.expiresAt > Date.now()) return cached.text;
+  let help = "";
+  try {
+    help = cleanApiText(execFileSync(bin, ["--help"], {
+      encoding: "utf8",
+      timeout: 10000,
+      env: providerEnv(provider),
+      cwd: runHome,
+    }));
+  } catch {}
+  providerHelpCache.set(provider, { bin, text: help, expiresAt: Date.now() + providerVersionCacheMs });
+  return help;
+}
+
+function providerTaskControls(provider) {
+  const declared = providerCapabilities[provider].taskControls;
+  if (provider !== "claude") return declared;
+  return { ...declared, reasoningEffort: /(?:^|\s)--effort(?:\s|$)/m.test(providerHelp(provider)) };
+}
+
 function detectHarness(provider) {
   const bin = providerBinary(provider);
   let installed = false;
-  let version = null;
   if (fs.existsSync(bin)) {
     installed = true;
   }
-  try {
-    const output = execFileSync(bin, ["--version"], { encoding: "utf8", timeout: 10000 }).trim();
-    installed = true;
-    version = cleanApiText(output.split("\n")[0] || "").trim() || null;
-  } catch {
-    // Missing binary or --version failure: version stays null.
-  }
+  const version = detectProviderVersion(provider);
+  if (version) installed = true;
   const auth = installed
     ? detectProviderAuth(provider)
     : { loggedIn: false, authKind: "unknown" };
@@ -170,6 +239,7 @@ function detectHarness(provider) {
     version,
     ...auth,
     ...providerCapabilities[provider],
+    taskControls: providerTaskControls(provider),
     lastSmoke: lastSmokeByProvider.get(provider) || null,
   };
 }
@@ -204,7 +274,7 @@ function providerAuthResult(provider) {
   });
 }
 
-async function assertProviderReady(provider) {
+async function assertProviderReady(provider, requirements = {}) {
   const cleanProvider = cleanHarnessProvider(provider);
   const displayName = providerDisplayName(cleanProvider);
   const result = await providerAuthResult(cleanProvider);
@@ -217,7 +287,13 @@ async function assertProviderReady(provider) {
       : `Run relay sync-auth on your Mac to connect ${displayName}, then try again.`;
     throw Object.assign(new Error(`${displayName} is not connected on this computer. ${action}`), { status: 503 });
   }
-  return result.auth;
+  if (cleanProvider === "claude" && requirements.reasoningEffort && !providerTaskControls(cleanProvider).reasoningEffort) {
+    throw Object.assign(
+      new Error("The installed Claude Code does not support --effort. Upgrade Claude Code on this computer, then try again."),
+      { status: 503 },
+    );
+  }
+  return { ...result.auth, version: detectProviderVersion(cleanProvider) };
 }
 
 // --------------------------------------------------------------------------
@@ -455,6 +531,8 @@ export {
   providerBinary,
   cleanHarnessProvider,
   detectHarness,
+  detectProviderVersion,
+  providerTaskControls,
   listHarnesses,
   assertProviderReady,
   redactSecrets,

@@ -22,7 +22,8 @@ import { store } from "./store.mjs";
 import { emitEvent } from "./events.mjs";
 import { prepareJobWorkdir, completeJobWorktree } from "./worktree.mjs";
 import { ApprovalStore } from "./approval-store.mjs";
-import { assertProviderReady } from "./harness.mjs";
+import { assertProviderReady, detectProviderVersion } from "./harness.mjs";
+import { validateConfiguredTaskSelection, validateRuntimeTaskSelection } from "./catalog.mjs";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const codexJobRunner = path.join(moduleDir, "codex-job-runner.mjs");
@@ -135,7 +136,7 @@ function wantsFullLogs(searchParams) {
 }
 
 
-function createJob(body, certSubject) {
+function createJob(body, certSubject, validatedTaskSelection = null) {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     throw Object.assign(new Error("request body must be a JSON object"), { status: 400 });
   }
@@ -155,6 +156,14 @@ function createJob(body, certSubject) {
   }
 
   const provider = cleanOptionalProvider(body.provider);
+  validateProviderControlFields(provider, body);
+  const requestedModel = cleanOptionalModel(body.model);
+  const requestedReasoningEffort = cleanOptionalReasoningEffort(body.reasoningEffort);
+  const taskSelection = validatedTaskSelection || validateConfiguredTaskSelection({
+    provider,
+    model: requestedModel,
+    reasoningEffort: requestedReasoningEffort,
+  });
   const resumeSessionId = cleanOptionalSessionId(body.resumeSessionId);
   if (resumeSessionId) {
     const resumeMeta = findThreadResumeMeta(resumeSessionId);
@@ -179,9 +188,13 @@ function createJob(body, certSubject) {
   const timeoutMs = Math.min(Math.max(Math.trunc(requestedTimeout), 1000), maxTimeoutMs);
   const attachments = saveJobAttachments(id, body.attachments);
   const selectedSkills = cleanSelectedSkills(provider, body.skills, workspace.path);
-  const codexPrompt = promptWithAttachments(promptWithSelectedSkills(body.prompt, provider, selectedSkills), attachments);
-  const permissionMode = cleanOptionalClaudePermissionMode(body.permissionMode);
-  const approvalPolicy = cleanOptionalCodexApprovalPolicy(body.approvalPolicy);
+  const codexPrompt = buildJobPrompt(body.prompt, provider, selectedSkills, attachments);
+  const permissionMode = provider === "claude"
+    ? (cleanOptionalClaudePermissionMode(body.permissionMode) || "manual")
+    : null;
+  const approvalPolicy = provider === "codex"
+    ? cleanOptionalCodexApprovalPolicy(body.approvalPolicy)
+    : null;
   pruneRuntimeCachesIfIdle();
   const job = {
     id,
@@ -210,10 +223,11 @@ function createJob(body, certSubject) {
     error: null,
     certSubject,
     timeoutMs,
-    model: cleanProviderModel(provider, body.model),
-    reasoningEffort: provider === "codex" ? cleanOptionalReasoningEffort(body.reasoningEffort) : null,
-    permissionMode: provider === "claude" ? (permissionMode || "manual") : null,
-    approvalPolicy: provider === "codex" ? approvalPolicy : null,
+    model: cleanProviderModel(provider, taskSelection.model),
+    reasoningEffort: provider === "codex" || provider === "claude" ? taskSelection.reasoningEffort : null,
+    permissionMode,
+    approvalPolicy,
+    execution: null,
     resumeSessionId,
     sessionId: resumeSessionId || (provider === "claude" ? crypto.randomUUID() : null),
   };
@@ -230,8 +244,16 @@ function createJob(body, certSubject) {
 // and the handoff continue-path go through here so they cannot drift.
 async function enqueueJob(body, certSubject) {
   const provider = cleanOptionalProvider(body?.provider);
-  await assertProviderReady(provider);
-  const job = createJob(body, certSubject);
+  validateProviderControlFields(provider, body || {});
+  const requestedModel = cleanOptionalModel(body?.model);
+  const requestedReasoningEffort = cleanOptionalReasoningEffort(body?.reasoningEffort);
+  const taskSelection = await validateRuntimeTaskSelection({
+    provider,
+    model: requestedModel,
+    reasoningEffort: requestedReasoningEffort,
+  });
+  await assertProviderReady(provider, taskSelection);
+  const job = createJob(body, certSubject, taskSelection);
   jobs.set(job.id, job);
   jobsState.queuedJobIds.push(job.id);
   persistJob(job);
@@ -239,6 +261,21 @@ async function enqueueJob(body, certSubject) {
   emitJobStateEvent(job);
   processQueue();
   return job;
+}
+
+
+function hasControlValue(value) {
+  return value !== undefined && value !== null && value !== "";
+}
+
+
+function validateProviderControlFields(provider, body) {
+  if (provider !== "claude" && hasControlValue(body.permissionMode)) {
+    throw Object.assign(new Error("permissionMode is supported only for Claude jobs"), { status: 400 });
+  }
+  if (provider !== "codex" && hasControlValue(body.approvalPolicy)) {
+    throw Object.assign(new Error("approvalPolicy is supported only for Codex jobs"), { status: 400 });
+  }
 }
 
 
@@ -296,7 +333,7 @@ function cleanOptionalClaudePermissionMode(value) {
   if (!allowedClaudePermissionModes.has(cleaned)) {
     throw Object.assign(new Error("permissionMode must be a supported Claude permission mode"), { status: 400 });
   }
-  return cleaned;
+  return cleaned === "default" ? "manual" : cleaned;
 }
 
 
@@ -436,6 +473,14 @@ function promptWithSelectedSkills(prompt, provider, skills) {
 }
 
 
+function buildJobPrompt(prompt, provider, skills, attachments) {
+  const promptWithSkills = provider === "codex" && codexTransport === "app-server"
+    ? prompt
+    : promptWithSelectedSkills(prompt, provider, skills);
+  return promptWithAttachments(promptWithSkills, attachments);
+}
+
+
 function boundedSkillBody(file) {
   let text;
   try {
@@ -550,6 +595,7 @@ function startJob(job) {
   job.updatedAt = startedAt;
   job.error = null;
   job.timedOut = false;
+  job.execution = buildExecutionReceipt(job);
   // W2-MODULES worktree handoff v0: when enabled and the workspace is a git
   // repo inside the jail, the job runs in a dedicated git worktree on branch
   // relay/<job-id-prefix>. No-op (null) when disabled — the default.
@@ -681,7 +727,9 @@ function buildJobEnv(job) {
     RELAY_APPROVAL_DIR: approvalsDir,
     RELAY_CODEX_BIN: codexBin,
     RELAY_CODEX_APPROVAL_POLICY: job.approvalPolicy || "on-request",
-    RELAY_CODEX_SKILL_INPUTS: JSON.stringify(job.skillInputs || []),
+    RELAY_CODEX_SKILL_INPUTS: JSON.stringify(
+      job.provider === "codex" && codexTransport === "app-server" ? (job.skillInputs || []) : [],
+    ),
   };
 
   if (job.model) env.RELAY_MODEL = job.model;
@@ -728,6 +776,45 @@ function buildJobEnv(job) {
   }
 
   return env;
+}
+
+
+function buildExecutionReceipt(job) {
+  const provider = normalizeJobProvider(job.provider);
+  const providerBin = provider === "claude" ? claudeBin : provider === "cursor" ? cursorBin : codexBin;
+  return {
+    provider,
+    transport: provider === "codex" ? codexTransport : "cli",
+    binary: cleanApiText(path.basename(providerBin)).slice(0, 160) || null,
+    binaryVersion: cleanApiText(detectProviderVersion(provider)).slice(0, 160) || null,
+    model: job.model || null,
+    reasoningEffort: job.reasoningEffort || null,
+    permissionMode: job.permissionMode || null,
+    approvalPolicy: job.approvalPolicy || null,
+    sandbox: provider === "codex" ? "workspace-write" : null,
+    skills: Array.isArray(job.skills) ? [...job.skills] : [],
+    launchedAt: nowIso(),
+  };
+}
+
+
+function publicExecutionReceipt(receipt) {
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) return null;
+  return {
+    provider: normalizeJobProvider(receipt.provider),
+    transport: ["app-server", "exec", "cli"].includes(receipt.transport) ? receipt.transport : "cli",
+    binary: cleanApiText(receipt.binary).slice(0, 160) || null,
+    binaryVersion: cleanApiText(receipt.binaryVersion).slice(0, 160) || null,
+    model: cleanApiText(receipt.model).slice(0, 180) || null,
+    reasoningEffort: allowedReasoningEfforts.has(receipt.reasoningEffort) ? receipt.reasoningEffort : null,
+    permissionMode: allowedClaudePermissionModes.has(receipt.permissionMode) ? receipt.permissionMode : null,
+    approvalPolicy: allowedCodexApprovalPolicies.has(receipt.approvalPolicy) ? receipt.approvalPolicy : null,
+    sandbox: receipt.sandbox === "workspace-write" ? receipt.sandbox : null,
+    skills: Array.isArray(receipt.skills)
+      ? receipt.skills.filter((value) => typeof value === "string").map((value) => cleanApiText(value).slice(0, 160))
+      : [],
+    launchedAt: cleanApiText(receipt.launchedAt).slice(0, 64) || null,
+  };
 }
 
 
@@ -1357,6 +1444,7 @@ async function toJobResponse(job, shape = responseShape("preview")) {
     permissionMode: job.permissionMode || null,
     approvalPolicy: job.approvalPolicy || null,
     skills: Array.isArray(job.skills) ? job.skills : [],
+    execution: publicExecutionReceipt(job.execution),
     resumeSessionId: job.resumeSessionId || null,
     sessionId: job.sessionId || job.resumeSessionId || null,
   };
@@ -1399,6 +1487,7 @@ export {
   cleanOptionalReasoningEffort,
   cleanOptionalClaudePermissionMode,
   cleanOptionalCodexApprovalPolicy,
+  validateProviderControlFields,
   cleanSelectedSkills,
   saveJobAttachments,
   decodeAttachmentData,
@@ -1406,6 +1495,7 @@ export {
   cleanAttachmentContentType,
   promptWithAttachments,
   promptWithSelectedSkills,
+  buildJobPrompt,
   boundedSkillBody,
   removePersistedJobFiles,
   removePathInsideRoot,
@@ -1416,6 +1506,8 @@ export {
   buildJobArgs,
   jobBinary,
   buildJobEnv,
+  buildExecutionReceipt,
+  publicExecutionReceipt,
   terminateChild,
   touchJob,
   jobStreamChunkBytes,

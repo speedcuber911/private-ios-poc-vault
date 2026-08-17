@@ -7,7 +7,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 
-import { allowedThreadProviders, bedrockRegion, cleanDisplayName, cleanOptionalEndpoint, cleanOptionalFilePath, cleanEnvironmentVariableName, cleanOptionalAwsProfile, codexBin, codexHome, runHome, codexTransport, workspaceBrowseRoot } from "./config.mjs";
+import { allowedThreadProviders, bedrockRegion, cleanDisplayName, cleanOptionalEndpoint, cleanOptionalFilePath, cleanEnvironmentVariableName, cleanOptionalAwsProfile, codexBin, cursorBin, codexHome, runHome, codexTransport, workspaceBrowseRoot } from "./config.mjs";
 import { AppServerClient } from "./appserver-client.mjs";
 
 const modelCatalog = loadModelCatalog();
@@ -116,6 +116,16 @@ function defaultModelCatalog() {
       effortLevels: ["low", "medium", "high"],
     },
   ];
+  if (fs.existsSync(cursorBin)) {
+    catalog.push({
+      id: "cursor-agent-auto",
+      label: "Cursor Agent · Auto",
+      provider: "cursor",
+      modes: ["task"],
+      taskModel: "auto",
+      effortLevels: [],
+    });
+  }
   // Bedrock is opt-in, exactly like Azure below it. It was unconditional, so
   // every node — including every trial sandbox — advertised a "Claude Sonnet
   // (Bedrock)" chat model that could not work: Bedrock needs AWS credentials
@@ -296,6 +306,52 @@ function findCatalogModel({ provider, model, mode }) {
 }
 
 
+function validateTaskSelectionFromCatalog(catalog, { provider, model, reasoningEffort }) {
+  const taskEntries = catalog.filter(
+    (entry) => entry.provider === provider && Array.isArray(entry.modes) && entry.modes.includes("task"),
+  );
+  if (taskEntries.length === 0) {
+    throw Object.assign(new Error(`${provider} is not available for task execution`), { status: 400 });
+  }
+
+  const modelEntries = model
+    ? taskEntries.filter((entry) => entry.taskModel === model)
+    : taskEntries.filter((entry) => !entry.taskModel);
+  if (model && modelEntries.length === 0) {
+    throw Object.assign(new Error(`model is not available for ${provider}: ${model}`), { status: 400 });
+  }
+
+  if (reasoningEffort) {
+    // A catalog without an explicit default row still has a provider default at
+    // the CLI layer (Claude is the common case). In that case the union of the
+    // provider's advertised task rows is the only honest default capability.
+    const effortEntries = model ? modelEntries : (modelEntries.length ? modelEntries : taskEntries);
+    const supported = effortEntries.some(
+      (entry) => Array.isArray(entry.effortLevels) && entry.effortLevels.includes(reasoningEffort),
+    );
+    if (!supported) {
+      const label = model || "the provider default model";
+      throw Object.assign(
+        new Error(`reasoningEffort ${reasoningEffort} is not supported by ${provider} model ${label}`),
+        { status: 400 },
+      );
+    }
+  }
+
+  return { model, reasoningEffort };
+}
+
+
+function validateConfiguredTaskSelection(selection) {
+  return validateTaskSelectionFromCatalog(publicModelCatalog(), selection);
+}
+
+
+async function validateRuntimeTaskSelection(selection) {
+  return validateTaskSelectionFromCatalog(await publicRuntimeModelCatalog(), selection);
+}
+
+
 function cleanChatOptions(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const options = {};
@@ -331,5 +387,8 @@ export {
   runtimeCodexDescriptor,
   mergeRuntimeCodexModels,
   findCatalogModel,
+  validateTaskSelectionFromCatalog,
+  validateConfiguredTaskSelection,
+  validateRuntimeTaskSelection,
   cleanChatOptions,
 };

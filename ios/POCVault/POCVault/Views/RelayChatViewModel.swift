@@ -371,6 +371,7 @@ final class RelayChatViewModel: ObservableObject {
     /// Chat requests carry no effort, so chat-mode selections expose none.
     var availableEfforts: [CodexReasoningEffort] {
         guard let choice = selectedChoice, choice.mode == .task else { return [] }
+        if selectedHarnessStatus?.taskControls?.reasoningEffort == false { return [] }
         return choice.model.effortLevels.compactMap { CodexReasoningEffort(rawValue: $0.lowercased()) }
     }
 
@@ -810,6 +811,24 @@ final class RelayChatViewModel: ObservableObject {
             errorMessage = status.actionMessage ?? "\(provider.displayName) is not ready on this computer."
             return
         }
+        if let controls = harnessesByProvider[provider]?.taskControls {
+            if Self.taskModelParameter(for: model) != nil, !controls.model {
+                errorMessage = "This \(provider.displayName) runner does not support model selection."
+                return
+            }
+            if effectiveEffort != nil, !controls.reasoningEffort {
+                errorMessage = "This \(provider.displayName) runner does not support effort selection."
+                return
+            }
+            if provider == .claude, !controls.permissionModes.contains(claudePermissionMode.rawValue) {
+                errorMessage = "This Claude Code runner does not support the selected permission mode."
+                return
+            }
+            if provider == .codex, !controls.approvalPolicies.contains(codexApprovalPolicy.rawValue) {
+                errorMessage = "This Codex runner does not support the selected approval policy."
+                return
+            }
+        }
 
         // Folder history continues a task in this same workspace. A new task lazily
         // registers the current folder before touching the draft.
@@ -846,7 +865,7 @@ final class RelayChatViewModel: ObservableObject {
                 model: Self.taskModelParameter(for: model),
                 reasoningEffort: effectiveEffort?.rawValue,
                 provider: provider,
-                permissionMode: provider == .claude ? claudePermissionMode.rawValue : nil,
+                permissionMode: provider == .claude ? claudePermissionMode.apiValue : nil,
                 approvalPolicy: provider == .codex ? codexApprovalPolicy.rawValue : nil,
                 skills: Array(selectedSkillIDsByProvider[provider] ?? []).sorted(),
                 resumeSessionId: resumeID

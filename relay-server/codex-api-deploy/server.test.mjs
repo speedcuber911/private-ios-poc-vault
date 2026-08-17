@@ -436,6 +436,7 @@ async function makeArgEchoClaude(tmpDir) {
     fakeClaude,
     [
       "#!/bin/sh",
+      "if [ \"$1\" = '--help' ]; then echo '  --model <model>  --effort <level>  --permission-mode <mode>'; exit 0; fi",
       "prompt=$(cat)",
       "printf 'claude args:'",
       "for arg in \"$@\"; do printf ' [%s]' \"$arg\"; done",
@@ -659,6 +660,9 @@ test("mTLS allowlist gates API routes while healthz remains public", async () =>
     const blockedModels = await fetch(`${server.baseUrl}/v1/codex/models`);
     assert.equal(blockedModels.status, 401);
 
+    const blockedHarnesses = await fetch(`${server.baseUrl}/v1/harness`);
+    assert.equal(blockedHarnesses.status, 401);
+
     const allowed = await fetch(`${server.baseUrl}/v1/codex/health`, {
       headers: {
         "X-SSL-Client-Verify": "SUCCESS",
@@ -674,6 +678,14 @@ test("mTLS allowlist gates API routes while healthz remains public", async () =>
       },
     });
     assert.equal(allowedModels.status, 200);
+
+    const allowedHarnesses = await fetch(`${server.baseUrl}/v1/harness`, {
+      headers: {
+        "X-SSL-Client-Verify": "SUCCESS",
+        "X-SSL-Client-S-DN": "CN=allowed",
+      },
+    });
+    assert.equal(allowedHarnesses.status, 200);
   } finally {
     await server.stop();
   }
@@ -702,6 +714,39 @@ test("starts without an AWS profile for direct subscription runners", async () =
   try {
     const response = await fetch(`${server.baseUrl}/healthz`);
     assert.equal(response.status, 200);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("reports provider-separated harness readiness and task controls", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  const cursor = await makeFakeCursor(tmpDir, "0198ebd4-4b90-7a45-b2ec-94bc5b228002");
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_BIN: await makeFakeCodex(tmpDir),
+    CLAUDE_BIN: await makeArgEchoClaude(tmpDir),
+    CURSOR_BIN: cursor.fakeCursor,
+  });
+  try {
+    const response = await fetch(`${server.baseUrl}/v1/harness`);
+    assert.equal(response.status, 200);
+    const { harnesses } = await response.json();
+    assert.deepEqual(harnesses.map((harness) => harness.provider).sort(), ["claude", "codex", "cursor"]);
+
+    const codex = harnesses.find((harness) => harness.provider === "codex");
+    const claude = harnesses.find((harness) => harness.provider === "claude");
+    const cursorHarness = harnesses.find((harness) => harness.provider === "cursor");
+    assert.equal(codex.taskControls.reasoningEffort, true);
+    assert.deepEqual(codex.taskControls.approvalPolicies, ["untrusted", "on-failure", "on-request", "never"]);
+    assert.equal(claude.taskControls.reasoningEffort, true);
+    assert.deepEqual(claude.taskControls.permissionModes, ["manual", "acceptEdits", "plan", "dontAsk", "auto"]);
+    assert.equal(cursorHarness.taskControls.reasoningEffort, false);
+    assert.equal(cursorHarness.supportsApprovals, false);
   } finally {
     await server.stop();
   }
@@ -1605,7 +1650,7 @@ test("resumes only sessions that belong to the selected workspace", async () => 
       body: JSON.stringify({
         workspaceId: "scratch",
         prompt: "hello again",
-        model: "gpt-5.5",
+        model: "gpt-5.6-sol",
         reasoningEffort: "high",
         resumeSessionId: allowedSessionId,
       }),
@@ -1627,7 +1672,7 @@ test("resumes only sessions that belong to the selected workspace", async () => 
 
     assert.equal(job.status, "succeeded");
     assert.equal(job.sessionId, allowedSessionId);
-    assert.match(job.stdout, new RegExp(`args: \\[exec\\] \\[resume\\].*\\[-m\\] \\[gpt-5.5\\].*\\[-c\\] \\[model_reasoning_effort="high"\\].*\\[-o\\].*\\[${allowedSessionId}\\] \\[-\\]`));
+    assert.match(job.stdout, new RegExp(`args: \\[-a\\] \\[on-request\\] \\[--sandbox\\] \\[workspace-write\\] \\[exec\\] \\[resume\\].*\\[-m\\] \\[gpt-5.6-sol\\].*\\[-c\\] \\[model_reasoning_effort="high"\\].*\\[-o\\].*\\[${allowedSessionId}\\] \\[-\\]`));
     assert.match(job.stdout, /prompt:hello again/);
   } finally {
     await server.stop();
@@ -2364,14 +2409,14 @@ test("passes model and reasoning effort to codex exec", async () => {
       body: JSON.stringify({
         workspaceId: "scratch",
         prompt: "knobs",
-        model: "gpt-5.4",
+        model: "gpt-5.6-sol",
         reasoningEffort: "low",
         timeoutMs: 5000,
       }),
     });
     assert.equal(create.status, 202);
     const created = await create.json();
-    assert.equal(created.model, "gpt-5.4");
+    assert.equal(created.model, "gpt-5.6-sol");
     assert.equal(created.reasoningEffort, "low");
 
     let job;
@@ -2385,7 +2430,105 @@ test("passes model and reasoning effort to codex exec", async () => {
     }
 
     assert.equal(job.status, "succeeded");
-    assert.match(job.stdout, /args: \[exec\].*\[-m\] \[gpt-5.4\].*\[-c\] \[model_reasoning_effort="low"\].*\[-o\]/);
+    assert.match(job.stdout, /args: \[-a\] \[on-request\] \[--sandbox\] \[workspace-write\] \[exec\].*\[-m\] \[gpt-5.6-sol\].*\[-c\] \[model_reasoning_effort="low"\].*\[-o\]/);
+    assert.deepEqual(
+      {
+        provider: job.execution.provider,
+        transport: job.execution.transport,
+        binary: job.execution.binary,
+        model: job.execution.model,
+        reasoningEffort: job.execution.reasoningEffort,
+        approvalPolicy: job.execution.approvalPolicy,
+        sandbox: job.execution.sandbox,
+      },
+      {
+        provider: "codex",
+        transport: "exec",
+        binary: "fake-codex-args",
+        model: "gpt-5.6-sol",
+        reasoningEffort: "low",
+        approvalPolicy: "on-request",
+        sandbox: "workspace-write",
+      },
+    );
+    assert.match(job.execution.binaryVersion, /args: \[--version\]/);
+    assert.match(job.execution.launchedAt, /^\d{4}-\d{2}-\d{2}T/);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("rejects provider/model and provider/control mismatches before queueing", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  const cursor = await makeFakeCursor(tmpDir, "0198ebd4-4b90-7a45-b2ec-94bc5b228001");
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_BIN: await makeFakeCodex(tmpDir),
+    CLAUDE_BIN: await makeArgEchoClaude(tmpDir),
+    CURSOR_BIN: cursor.fakeCursor,
+  });
+  try {
+    const cases = [
+      [{ provider: "claude", model: "gpt-5.6-sol" }, /model is not available for claude/],
+      [{ provider: "codex", model: "sonnet" }, /model is not available for codex/],
+      [{ provider: "codex", permissionMode: "plan" }, /permissionMode is supported only for Claude/],
+      [{ provider: "claude", approvalPolicy: "never" }, /approvalPolicy is supported only for Codex/],
+      [{ provider: "cursor", reasoningEffort: "high" }, /reasoningEffort high is not supported by cursor/],
+    ];
+    for (const [fields, expected] of cases) {
+      const response = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ workspaceId: "scratch", prompt: "must reject", ...fields }),
+      });
+      assert.equal(response.status, 400);
+      assert.match((await response.json()).error, expected);
+    }
+    assert.deepEqual((await (await fetch(`${server.baseUrl}/v1/codex/jobs`)).json()).jobs, []);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("rejects Claude effort when the installed CLI does not advertise --effort", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  const oldClaude = path.join(tmpDir, "old-claude");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  await fs.writeFile(oldClaude, [
+    "#!/bin/sh",
+    "if [ \"$1\" = 'auth' ]; then echo '{\"loggedIn\":true,\"authMethod\":\"claude.ai\"}'; exit 0; fi",
+    "if [ \"$1\" = '--help' ]; then echo '  --model <model>  --permission-mode <mode>'; exit 0; fi",
+    "if [ \"$1\" = '--version' ]; then echo 'old-claude 1.0'; exit 0; fi",
+    "echo 'job must not start' >&2",
+    "exit 9",
+    "",
+  ].join("\n"), { mode: 0o755 });
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_BIN: await makeFakeCodex(tmpDir),
+    CLAUDE_BIN: oldClaude,
+  });
+  try {
+    const response = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: "scratch",
+        provider: "claude",
+        model: "sonnet",
+        reasoningEffort: "high",
+        prompt: "must reject",
+      }),
+    });
+    assert.equal(response.status, 503);
+    assert.match((await response.json()).error, /does not support --effort/);
   } finally {
     await server.stop();
   }
@@ -2560,7 +2703,7 @@ test("runs Claude jobs with configured binary, stdin prompt, and stdout result",
         prompt: "explain the run",
         model: "sonnet",
         reasoningEffort: "high",
-        permissionMode: "plan",
+        permissionMode: "default",
         timeoutMs: 5000,
       }),
     });
@@ -2573,21 +2716,28 @@ test("runs Claude jobs with configured binary, stdin prompt, and stdout result",
     assert.equal(job.status, "succeeded");
     assert.equal(job.provider, "claude");
     assert.equal(job.sessionId, created.sessionId);
-    assert.equal(job.permissionMode, "plan");
+    assert.equal(job.permissionMode, "manual");
     assert.equal(job.model, "sonnet");
-    assert.equal(job.reasoningEffort, null);
+    assert.equal(job.reasoningEffort, "high");
     assert.match(job.stdout, /claude args: .*\[--print\]/);
     assert.match(job.stdout, /\[--model\] \[sonnet\]/);
-    assert.match(job.stdout, /\[--permission-mode\] \[plan\]/);
+    assert.match(job.stdout, /\[--permission-mode\] \[manual\]/);
     assert.match(job.stdout, /\[--permission-prompt-tool\] \[mcp__relay_approvals__approve\]/);
     assert.match(job.stdout, new RegExp(`\\[--session-id\\] \\[${created.sessionId}\\]`));
     assert.doesNotMatch(job.stdout, /--dangerously-skip-permissions/);
-    assert.doesNotMatch(job.stdout, /--effort/);
+    assert.match(job.stdout, /\[--effort\] \[high\]/);
     assert.match(job.stdout, /claude aws profile:sigiq/);
     assert.match(job.stdout, /claude aws access:\n/);
     assert.match(job.stdout, new RegExp(`claude cwd:${realWorkspaceDir}`));
     assert.match(job.stdout, /claude prompt:explain the run/);
     assert.equal(job.result, job.stdout.trim());
+    assert.equal(job.execution.provider, "claude");
+    assert.equal(job.execution.transport, "cli");
+    assert.equal(job.execution.binary, "fake-claude-args");
+    assert.equal(job.execution.model, "sonnet");
+    assert.equal(job.execution.reasoningEffort, "high");
+    assert.equal(job.execution.permissionMode, "manual");
+    assert.equal(job.execution.approvalPolicy, null);
   } finally {
     await server.stop();
   }

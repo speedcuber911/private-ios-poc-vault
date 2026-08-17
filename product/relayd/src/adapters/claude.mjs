@@ -13,6 +13,7 @@ const permissionServer = path.resolve(path.dirname(fileURLToPath(import.meta.url
 function buildClaudeArgs(job) {
   const args = ["--print"];
   if (job.model) args.push("--model", job.model);
+  if (job.reasoningEffort) args.push("--effort", job.reasoningEffort);
   args.push("--permission-mode", job.permissionMode || "manual");
   args.push("--mcp-config", JSON.stringify({
     mcpServers: {

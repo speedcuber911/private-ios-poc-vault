@@ -392,6 +392,7 @@ struct RelayHarnessStatus: Decodable, Hashable, Identifiable {
     let version: String?
     let loggedIn: Bool?
     let authKind: String
+    let taskControls: RelayHarnessTaskControls?
 
     var id: CodexProvider { provider }
 
@@ -401,6 +402,7 @@ struct RelayHarnessStatus: Decodable, Hashable, Identifiable {
         case version
         case loggedIn
         case authKind
+        case taskControls
     }
 
     init(from decoder: Decoder) throws {
@@ -410,6 +412,7 @@ struct RelayHarnessStatus: Decodable, Hashable, Identifiable {
         version = try container.decodeIfPresent(String.self, forKey: .version)?.trimmedNonEmpty
         loggedIn = try container.decodeIfPresent(Bool.self, forKey: .loggedIn)
         authKind = (try container.decodeIfPresent(String.self, forKey: .authKind))?.trimmedNonEmpty ?? "unknown"
+        taskControls = try container.decodeIfPresent(RelayHarnessTaskControls.self, forKey: .taskControls)
     }
 
     var isConfirmedUnavailable: Bool {
@@ -432,6 +435,28 @@ struct RelayHarnessStatus: Decodable, Hashable, Identifiable {
             return "Run cursor-agent login on the computer, then try again."
         }
         return "Run relay sync-auth on your Mac to connect \(provider.displayName), then try again."
+    }
+}
+
+struct RelayHarnessTaskControls: Decodable, Hashable {
+    let model: Bool
+    let reasoningEffort: Bool
+    let permissionModes: [String]
+    let approvalPolicies: [String]
+
+    private enum CodingKeys: String, CodingKey {
+        case model
+        case reasoningEffort
+        case permissionModes
+        case approvalPolicies
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        model = (try container.decodeIfPresent(Bool.self, forKey: .model)) ?? false
+        reasoningEffort = (try container.decodeIfPresent(Bool.self, forKey: .reasoningEffort)) ?? false
+        permissionModes = (try container.decodeIfPresent([String].self, forKey: .permissionModes)) ?? []
+        approvalPolicies = (try container.decodeIfPresent([String].self, forKey: .approvalPolicies)) ?? []
     }
 }
 
@@ -461,6 +486,19 @@ enum RelayClaudePermissionMode: String, CaseIterable, Identifiable, Codable {
     case auto
 
     var id: String { rawValue }
+
+    /// Older Relay runners called Claude's interactive default mode `default`,
+    /// while current Claude Code calls it `manual`. Keep the legacy wire value so
+    /// a freshly updated phone can still submit work to a runner that has not yet
+    /// upgraded; current runners normalize it back to `manual` before execution.
+    var apiValue: String {
+        switch self {
+        case .manual:
+            return "default"
+        case .plan, .acceptEdits, .dontAsk, .auto:
+            return rawValue
+        }
+    }
 
     var label: String {
         switch self {
@@ -1333,6 +1371,10 @@ struct CodexJob: Decodable, Hashable, Identifiable {
     let certSubject: String?
     let model: String?
     let reasoningEffort: String?
+    let permissionMode: String?
+    let approvalPolicy: String?
+    let skills: [String]
+    let execution: CodexExecutionReceipt?
     let logsIncluded: String?
     let sessionId: String?
     let resumeSessionId: String?
@@ -1375,6 +1417,10 @@ struct CodexJob: Decodable, Hashable, Identifiable {
         case certSubject
         case model
         case reasoningEffort
+        case permissionMode
+        case approvalPolicy
+        case skills
+        case execution
         case logsIncluded
         case sessionId
         case resumeSessionId
@@ -1435,6 +1481,10 @@ struct CodexJob: Decodable, Hashable, Identifiable {
         self.certSubject = try container.decodeLooseStringIfPresent(forKey: .certSubject)
         self.model = try container.decodeLooseStringIfPresent(forKey: .model)
         self.reasoningEffort = try container.decodeLooseStringIfPresent(forKey: .reasoningEffort)
+        self.permissionMode = try container.decodeLooseStringIfPresent(forKey: .permissionMode)
+        self.approvalPolicy = try container.decodeLooseStringIfPresent(forKey: .approvalPolicy)
+        self.skills = (try? container.decodeIfPresent([String].self, forKey: .skills)) ?? []
+        self.execution = try container.decodeIfPresent(CodexExecutionReceipt.self, forKey: .execution)
         self.logsIncluded = try container.decodeLooseStringIfPresent(forKey: .logsIncluded)
         self.sessionId = try container.decodeLooseStringIfPresent(forKey: .sessionId)
         let resumeSessionID = try container.decodeLooseStringIfPresent(forKey: .resumeSessionId)
@@ -1577,6 +1627,62 @@ struct CodexJob: Decodable, Hashable, Identifiable {
             originalCharacterCount: originalCount,
             isTruncated: didTruncate
         )
+    }
+}
+
+struct CodexExecutionReceipt: Decodable, Hashable {
+    let provider: CodexProvider
+    let transport: String
+    let binary: String?
+    let binaryVersion: String?
+    let model: String?
+    let reasoningEffort: String?
+    let permissionMode: String?
+    let approvalPolicy: String?
+    let sandbox: String?
+    let skills: [String]
+    let launchedAt: Date?
+
+    private enum CodingKeys: String, CodingKey {
+        case provider
+        case transport
+        case binary
+        case binaryVersion
+        case model
+        case reasoningEffort
+        case permissionMode
+        case approvalPolicy
+        case sandbox
+        case skills
+        case launchedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        provider = (try container.decodeIfPresent(CodexProvider.self, forKey: .provider)) ?? .defaultProvider
+        transport = (try container.decodeIfPresent(String.self, forKey: .transport))?.trimmedNonEmpty ?? "unknown"
+        binary = try container.decodeLooseStringIfPresent(forKey: .binary)
+        binaryVersion = try container.decodeLooseStringIfPresent(forKey: .binaryVersion)
+        model = try container.decodeLooseStringIfPresent(forKey: .model)
+        reasoningEffort = try container.decodeLooseStringIfPresent(forKey: .reasoningEffort)
+        permissionMode = try container.decodeLooseStringIfPresent(forKey: .permissionMode)
+        approvalPolicy = try container.decodeLooseStringIfPresent(forKey: .approvalPolicy)
+        sandbox = try container.decodeLooseStringIfPresent(forKey: .sandbox)
+        skills = (try? container.decodeIfPresent([String].self, forKey: .skills)) ?? []
+        launchedAt = try container.decodeLossyDateIfPresent(forKey: .launchedAt)
+    }
+
+    var summaryLines: [String] {
+        var lines = ["Provider: \(provider.displayName)", "Transport: \(transport)"]
+        if let binary { lines.append("Binary: \(binary)") }
+        if let binaryVersion { lines.append("Version: \(binaryVersion)") }
+        if let model { lines.append("Model: \(model)") }
+        if let reasoningEffort { lines.append("Effort: \(reasoningEffort)") }
+        if let permissionMode { lines.append("Claude permission: \(permissionMode)") }
+        if let approvalPolicy { lines.append("Codex approvals: \(approvalPolicy)") }
+        if let sandbox { lines.append("Sandbox: \(sandbox)") }
+        if !skills.isEmpty { lines.append("Skills: \(skills.joined(separator: ", "))") }
+        return lines
     }
 }
 

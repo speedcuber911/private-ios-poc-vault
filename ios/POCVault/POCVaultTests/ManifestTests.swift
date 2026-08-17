@@ -113,7 +113,13 @@ final class ManifestTests: XCTestCase {
               "installed": true,
               "version": "OpenAI Codex v0.147.0",
               "loggedIn": false,
-              "authKind": "unknown"
+              "authKind": "unknown",
+              "taskControls": {
+                "model": true,
+                "reasoningEffort": true,
+                "permissionModes": [],
+                "approvalPolicies": ["untrusted", "on-request", "never"]
+              }
             }
             """.utf8)
         )
@@ -133,6 +139,9 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(signedOut.isConfirmedUnavailable)
         XCTAssertEqual(signedOut.shortStatus, "Needs connection")
         XCTAssertEqual(signedOut.actionMessage, "Run relay sync-auth on your Mac to connect Codex, then try again.")
+        XCTAssertEqual(signedOut.taskControls?.model, true)
+        XCTAssertEqual(signedOut.taskControls?.reasoningEffort, true)
+        XCTAssertEqual(signedOut.taskControls?.approvalPolicies, ["untrusted", "on-request", "never"])
 
         XCTAssertEqual(connected.provider, .claude)
         XCTAssertFalse(connected.isConfirmedUnavailable)
@@ -624,6 +633,45 @@ final class ManifestTests: XCTestCase {
 
         XCTAssertEqual(legacyJob.provider, .codex)
         XCTAssertEqual(claudeJob.provider, .claude)
+    }
+
+    func testCodexJobDecodesProviderSpecificControlsAndExecutionReceipt() throws {
+        let job = try decodeCodexJob(
+            """
+            {
+              "id": "job-claude-receipt",
+              "status": "succeeded",
+              "provider": "claude",
+              "model": "sonnet",
+              "reasoningEffort": "high",
+              "permissionMode": "manual",
+              "approvalPolicy": null,
+              "skills": ["claude-debug"],
+              "execution": {
+                "provider": "claude",
+                "transport": "cli",
+                "binary": "claude",
+                "binaryVersion": "2.1.232 (Claude Code)",
+                "model": "sonnet",
+                "reasoningEffort": "high",
+                "permissionMode": "manual",
+                "approvalPolicy": null,
+                "sandbox": null,
+                "skills": ["claude-debug"],
+                "launchedAt": "2026-08-17T08:30:00.000Z"
+              }
+            }
+            """
+        )
+
+        XCTAssertEqual(job.permissionMode, "manual")
+        XCTAssertNil(job.approvalPolicy)
+        XCTAssertEqual(job.skills, ["claude-debug"])
+        XCTAssertEqual(job.execution?.provider, .claude)
+        XCTAssertEqual(job.execution?.binaryVersion, "2.1.232 (Claude Code)")
+        XCTAssertEqual(job.execution?.reasoningEffort, "high")
+        XCTAssertEqual(job.execution?.summaryLines.last, "Skills: claude-debug")
+        XCTAssertNotNil(job.execution?.launchedAt)
     }
 
     func testCodexJobDecodesWaitingForApprovalAsActiveAttention() throws {
@@ -1430,6 +1478,14 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(payload?["provider"] as? String, "claude")
         XCTAssertEqual(payload?["permissionMode"] as? String, "acceptEdits")
         XCTAssertEqual(payload?["skills"] as? [String], ["claude-debug", "superpowers:tdd"])
+    }
+
+    func testClaudeManualPermissionUsesLegacyCompatibleWireValue() {
+        XCTAssertEqual(RelayClaudePermissionMode.manual.apiValue, "default")
+        XCTAssertEqual(RelayClaudePermissionMode.plan.apiValue, "plan")
+        XCTAssertEqual(RelayClaudePermissionMode.acceptEdits.apiValue, "acceptEdits")
+        XCTAssertEqual(RelayClaudePermissionMode.dontAsk.apiValue, "dontAsk")
+        XCTAssertEqual(RelayClaudePermissionMode.auto.apiValue, "auto")
     }
 
     func testCodexCreateJobRequestEncodesProviderSpecificApprovalPolicy() throws {

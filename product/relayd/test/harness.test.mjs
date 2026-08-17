@@ -41,7 +41,7 @@ async function startServer(extraEnv = {}) {
   const fakeClaude = path.join(dir, "fake-claude");
   fs.writeFileSync(
     fakeClaude,
-    `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "fake-claude 1.2.3"; exit 0; fi\nif [ "$1" = "auth" ] && [ "$2" = "status" ]; then echo '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}'; exit 0; fi\nif [ "$1" = "login" ]; then\n  echo "Visit https://provider.example/device and enter code WXYZ-2345 to continue"\n  i=0\n  while [ ! -f "$HOME/login-confirmed" ] && [ $i -lt ${FAKE_CLI_PARK_ITERATIONS} ]; do sleep 0.1; i=$((i+1)); done\n  [ -f "$HOME/login-confirmed" ] && exit 0 || exit 1\nfi\nexit 0\n`,
+    `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "fake-claude 1.2.3"; exit 0; fi\nif [ "$1" = "--help" ]; then echo "  --model <model>  --effort <level>  --permission-mode <mode>"; exit 0; fi\nif [ "$1" = "auth" ] && [ "$2" = "status" ]; then echo '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}'; exit 0; fi\nif [ "$1" = "login" ]; then\n  echo "Visit https://provider.example/device and enter code WXYZ-2345 to continue"\n  i=0\n  while [ ! -f "$HOME/login-confirmed" ] && [ $i -lt ${FAKE_CLI_PARK_ITERATIONS} ]; do sleep 0.1; i=$((i+1)); done\n  [ -f "$HOME/login-confirmed" ] && exit 0 || exit 1\nfi\nexit 0\n`,
     { mode: 0o755 },
   );
 
@@ -112,10 +112,14 @@ test("GET /v1/harness detects installed CLIs with versions and capability flags"
     assert.equal(byProvider.codex.loggedIn, true);
     assert.equal(byProvider.codex.authKind, "subscription");
     assert.equal(byProvider.codex.supportsChat, true);
+    assert.equal(byProvider.codex.supportsApprovals, true);
+    assert.equal(byProvider.codex.taskControls.reasoningEffort, true);
+    assert.deepEqual(byProvider.codex.taskControls.approvalPolicies, ["untrusted", "on-failure", "on-request", "never"]);
     assert.equal(byProvider.claude.installed, true);
     assert.equal(byProvider.claude.version, "fake-claude 1.2.3");
     assert.equal(byProvider.claude.loggedIn, true);
     assert.equal(byProvider.claude.supportsApprovals, true);
+    assert.deepEqual(byProvider.claude.taskControls.permissionModes, ["manual", "acceptEdits", "plan", "dontAsk", "auto"]);
     assert.equal(byProvider.cursor.installed, false);
     assert.equal(byProvider.cursor.version, null);
     assert.equal(byProvider.cursor.loggedIn, false);

@@ -188,7 +188,7 @@ const allowedChatProviders = new Set(["codex", "azure", "bedrock"]);
 
 const allowedThreadProviders = new Set([...allowedJobProviders, ...allowedChatProviders]);
 
-const allowedClaudePermissionModes = new Set(["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"]);
+const allowedClaudePermissionModes = new Set(["acceptEdits", "auto", "bypassPermissions", "default", "manual", "dontAsk", "plan"]);
 
 const allowedCodexApprovalPolicies = new Set(["untrusted", "on-failure", "on-request", "never"]);
 
