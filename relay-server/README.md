@@ -1,7 +1,7 @@
 # Relay Server Workspace
 
 This workspace owns the EC2-side Relay backend used by the Relay iPhone app,
-including its Codex/Claude/Cursor job API. It lives inside
+including its Codex/Claude/Cursor/Kimi job API. It lives inside
 `/Users/pariksj/Desktop/poc-vault/relay-server` so the iOS app and server runner
 can be changed together when their contract moves. Existing `/v1/codex/*`
 routes remain stable for client compatibility.
@@ -20,7 +20,7 @@ owner AWS account / configured region / POC Vault EC2
 
 ## What It Provides
 
-The server exposes an async job API for Codex, Claude, and Cursor providers:
+The server exposes an async job API for Codex, Claude, Cursor, and Kimi providers:
 
 - `GET /healthz`: public process health for uptime checks.
 - `GET /v1/codex/health`: authenticated health.
@@ -54,7 +54,7 @@ The server exposes an async job API for Codex, Claude, and Cursor providers:
   transcript messages plus compact job previews.
 - `GET /v1/codex/jobs?provider=codex&limit=50`: persistent job history.
 - `POST /v1/codex/jobs`: enqueue a provider job. `provider` is optional and
-  defaults to `codex`; `claude` and `cursor` are also supported.
+  defaults to `codex`; `claude`, `cursor`, and `kimi` are also supported.
 - `GET /v1/codex/jobs/<id>`: job detail with stdout, stderr, result, and status.
 - `GET /v1/codex/jobs/<id>/stream?stdoutOffset=0&stderrOffset=0`: live SSE
   stream for one job: an immediate `status` snapshot, bounded replay of the
@@ -124,6 +124,8 @@ Provider binaries are configured with:
 CODEX_BIN=/usr/bin/codex
 CLAUDE_BIN=/usr/bin/claude
 CURSOR_BIN=/var/lib/codex-api/run-home/.local/bin/cursor-agent
+KIMI_BIN=/var/lib/codex-api/run-home/.local/bin/kimi
+KIMI_CODE_HOME=/var/lib/codex-api/run-home/.kimi-code
 CLAUDE_CODE_USE_BEDROCK=
 CLAUDE_AWS_PROFILE=
 BEDROCK_REGION=us-east-1
@@ -146,8 +148,10 @@ by `/v1/codex/models`.
 
 Codex jobs use the existing `codex exec` / `codex exec resume` commands. Cursor
 jobs use the authenticated Cursor Agent CLI in print mode and retain its session
-id for follow-ups; like direct Claude jobs, Cursor jobs run with ambient AWS
-credential and Bedrock variables stripped from the environment. Claude
+id for follow-ups. Kimi jobs use the authenticated Kimi Code CLI in headless
+stream-JSON mode, select `kimi-code/k3`, and resume using the saved Kimi session
+id. Like direct Claude jobs, Cursor and Kimi jobs run with ambient AWS credential
+and Bedrock variables stripped from the environment. Claude
 jobs run in the selected workspace, read prompts from stdin, use non-interactive
 `--print` mode, pass `--model` / `--effort` when supplied, and use
 `--session-id <uuid>` for fresh jobs or `--resume <session-id>` for follow-ups.
@@ -167,7 +171,7 @@ GET /v1/codex/models
 Each entry declares `id`, `label`, `provider`, and supported `modes`. A Task entry
 can also declare `taskModel` and `effortLevels`. Chat mode supports direct Codex
 subscription models, Azure bearer-key profiles, and optional SigiQ Bedrock.
-Task mode uses the async job providers `codex`, `cursor`, and `claude`.
+Task mode uses the async job providers `codex`, `cursor`, `claude`, and `kimi`.
 
 Synchronous chat streams from:
 
@@ -218,7 +222,7 @@ The remote `sigiq` workspace is a folder-level project containing the SigiQ
 repository checkouts used by Relay agent runs.
 
 Relay can browse below the workspace root, select a child directory such as
-`/srv/codex-workspaces/sigiq/ai-tutor`, and run Codex, Cursor, or Claude from that exact
+`/srv/codex-workspaces/sigiq/ai-tutor`, and run Codex, Cursor, Claude, or Kimi from that exact
 directory. The API resolves real paths, rejects traversal and symlink escapes,
 skips hidden directories in listings, and derives stable `dir-*` workspace ids
 from the selected relative path. It does not accept arbitrary EC2 paths.
@@ -286,7 +290,7 @@ and provider sessions discovered from persisted job metadata, but it should not
 return transcript content.
 
 `GET /v1/codex/jobs`, `/sessions`, `/threads`, and `/threads/<sessionId>` accept
-optional `provider=codex|claude|cursor` filters. Thread summaries include `provider`.
+optional `provider=codex|claude|cursor|kimi` filters. Thread summaries include `provider`.
 Threads are provider-locked: follow-ups must use the same provider as the original
 job.
 
@@ -301,7 +305,7 @@ shows bounded transcript messages, and can open full job logs intentionally.
 
 ## Job Artifacts
 
-When a successful Codex, Claude, or Cursor answer contains fenced code blocks, the API
+When a successful Codex, Claude, Cursor, or Kimi answer contains fenced code blocks, the API
 extracts them into job-scoped artifacts under the runner data directory. Job
 responses include artifact metadata and mTLS-protected `rawURL` / `previewURL`
 routes. Raw routes download files with attachment headers; preview routes render

@@ -9,7 +9,7 @@ import path from "node:path";
 
 import { runHome, codexHome, threadSummaryCharacters, workspaceBrowseRoot, terminalStatuses, allowedThreadProviders, realpathOrResolve } from "./config.mjs";
 import { isSafeJobId, cleanApiText } from "./util.mjs";
-import { isResumableSessionId } from "./sessionid.mjs";
+import { isResumableSessionId, isKimiSessionId } from "./sessionid.mjs";
 import { appendAudit } from "./audit.mjs";
 import { dynamicWorkspaces, workspaces, resolveWorkspaceById, browseWorkspaceForPath, cleanWorkspaceId, pathBelongsToRoot } from "./workspaces.mjs";
 import { listChatThreads, chatThreadDetailResponse, deleteChatThread } from "./chat.mjs";
@@ -22,7 +22,7 @@ function cleanThreadProviderFilter(value) {
   }
   const normalized = value.trim().toLowerCase();
   if (!allowedThreadProviders.has(normalized)) {
-    throw Object.assign(new Error("provider must be codex, claude, cursor, azure, or bedrock"), { status: 400 });
+    throw Object.assign(new Error("provider must be codex, claude, cursor, kimi, azure, or bedrock"), { status: 400 });
   }
   return normalized;
 }
@@ -34,9 +34,10 @@ function cleanThreadProviderFilter(value) {
 // `sessionimport.mjs` now stages by — rather than a second opinion of its own.
 // While the two disagreed, a Codex handoff was staged successfully and then
 // rejected here 400 `resumeSessionId is invalid`, every single time.
-function cleanOptionalSessionId(value) {
+function cleanOptionalSessionId(value, provider = "codex") {
   if (value === undefined || value === null || value === "") return null;
-  if (!isResumableSessionId(value)) {
+  const valid = provider === "kimi" ? isKimiSessionId(value) : isResumableSessionId(value);
+  if (!valid) {
     throw Object.assign(new Error("resumeSessionId is invalid"), { status: 400 });
   }
   return value;
@@ -134,9 +135,9 @@ function findThreadResumeMeta(sessionId) {
 
   // A session with no job yet is either a Codex rollout or a freshly staged
   // Claude handoff transcript -- check both layouts sessionimport.mjs can
-  // have written before giving up. Cursor never stages a resumable session
-  // file (see importSession's summary-primed fallback), so there is no third
-  // layout to check: continueHandoff never sends a resumeSessionId for one.
+  // have written before giving up. Cursor and Kimi never stage resumable
+  // session files (see importSession's summary-primed fallback), so there is
+  // no additional layout to check.
   const sessionMeta = findSessionMeta(sessionId) || findClaudeSessionMeta(sessionId);
   if (!sessionMeta) return null;
   return {

@@ -10,7 +10,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { codexBin, claudeBin, cursorBin, runHome, codexHome, allowedJobProviders } from "./config.mjs";
+import { codexBin, claudeBin, cursorBin, kimiBin, runHome, codexHome, kimiHome, allowedJobProviders } from "./config.mjs";
 import { nowIso, cleanApiText, suffixByBytes } from "./util.mjs";
 import { appendAudit } from "./audit.mjs";
 import { emitEvent } from "./events.mjs";
@@ -61,18 +61,30 @@ const providerCapabilities = {
       approvalPolicies: [],
     },
   },
+  kimi: {
+    supportsApprovals: false,
+    supportsResume: true,
+    supportsChat: false,
+    taskControls: {
+      model: true,
+      reasoningEffort: false,
+      permissionModes: [],
+      approvalPolicies: [],
+    },
+  },
 };
 
 function providerBinary(provider) {
   if (provider === "claude") return claudeBin;
   if (provider === "cursor") return cursorBin;
+  if (provider === "kimi") return kimiBin;
   return codexBin;
 }
 
 function cleanHarnessProvider(value) {
   const normalized = String(value || "").trim().toLowerCase();
   if (!allowedJobProviders.has(normalized)) {
-    throw Object.assign(new Error("provider must be codex, claude, or cursor"), { status: 400 });
+    throw Object.assign(new Error("provider must be codex, claude, cursor, or kimi"), { status: 400 });
   }
   return normalized;
 }
@@ -105,8 +117,9 @@ function providerEnv(provider) {
     ...process.env,
     HOME: runHome,
     CODEX_HOME: codexHome,
+    KIMI_CODE_HOME: kimiHome,
   };
-  if (provider === "claude" || provider === "cursor") {
+  if (provider === "claude" || provider === "cursor" || provider === "kimi") {
     delete env.AWS_ACCESS_KEY_ID;
     delete env.AWS_SECRET_ACCESS_KEY;
     delete env.AWS_SESSION_TOKEN;
@@ -118,6 +131,16 @@ function providerEnv(provider) {
     delete env.CLAUDE_AWS_PROFILE;
   }
   return env;
+}
+
+function detectKimiAuth() {
+  const credentialsDir = path.join(kimiHome, "credentials");
+  try {
+    const hasCredential = fs.readdirSync(credentialsDir, { withFileTypes: true })
+      .some((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".json"));
+    if (hasCredential) return { loggedIn: true, authKind: "subscription" };
+  } catch {}
+  return { loggedIn: false, authKind: "unknown" };
 }
 
 function jsonObject(text) {
@@ -164,6 +187,7 @@ function parseProviderAuth(provider, output, commandSucceeded) {
 }
 
 function detectProviderAuth(provider) {
+  if (provider === "kimi") return detectKimiAuth();
   const bin = providerBinary(provider);
   try {
     const output = execFileSync(bin, authStatusArgsFor(provider), {
@@ -251,11 +275,15 @@ function listHarnesses() {
 function providerDisplayName(provider) {
   if (provider === "claude") return "Claude Code";
   if (provider === "cursor") return "Cursor";
+  if (provider === "kimi") return "Kimi K3";
   return "Codex";
 }
 
 function providerAuthResult(provider) {
   const bin = providerBinary(provider);
+  if (provider === "kimi") {
+    return Promise.resolve({ missing: !fs.existsSync(bin), auth: detectKimiAuth() });
+  }
   return new Promise((resolve) => {
     const child = execFile(bin, authStatusArgsFor(provider), {
       encoding: "utf8",
@@ -284,7 +312,9 @@ async function assertProviderReady(provider, requirements = {}) {
   if (result.auth.loggedIn === false) {
     const action = cleanProvider === "cursor"
       ? "Run cursor-agent login on the computer, then try again."
-      : `Run relay sync-auth on your Mac to connect ${displayName}, then try again.`;
+      : cleanProvider === "kimi"
+        ? "Run kimi login on the computer, then try again."
+        : `Run relay sync-auth on your Mac to connect ${displayName}, then try again.`;
     throw Object.assign(new Error(`${displayName} is not connected on this computer. ${action}`), { status: 503 });
   }
   if (cleanProvider === "claude" && requirements.reasoningEffort && !providerTaskControls(cleanProvider).reasoningEffort) {
@@ -497,6 +527,8 @@ function startSmokeOp(provider) {
   let args;
   if (cleanProvider === "cursor") {
     args = ["-p", "--force", "--trust", "--workspace", smokeDir, "--output-format", "json", prompt];
+  } else if (cleanProvider === "kimi") {
+    args = ["--model", "kimi-code/k3", "--prompt", prompt, "--output-format", "stream-json"];
   } else if (cleanProvider === "claude") {
     args = ["--print"];
   } else {
@@ -510,7 +542,7 @@ function startSmokeOp(provider) {
   });
   attachOpChild(op, child, { timeoutMs: smokeTimeoutMs, onExpire: "expired" });
   child.stdin.on("error", () => {});
-  if (cleanProvider !== "cursor") child.stdin.end(prompt);
+  if (cleanProvider !== "cursor" && cleanProvider !== "kimi") child.stdin.end(prompt);
   else child.stdin.end();
 
   child.on("close", (code) => {

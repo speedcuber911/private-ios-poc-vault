@@ -61,6 +61,7 @@ and they never touch GitHub. What it looks for:
 | Claude Code | `~/.claude/.credentials.json`, or — on macOS — the login Keychain item `Claude Code-credentials` |
 | Codex | `~/.codex/auth.json` |
 | Cursor | no portable login exists; sign in on the sandbox itself |
+| Kimi Code | no portable login is synchronized; run `kimi login` on the sandbox itself |
 
 The Keychain lookup matters on macOS: Claude Code stores its login there and
 **not** in `~/.claude/.credentials.json`, which is the Linux location. Reading

@@ -5,7 +5,7 @@
 Relay uses the installed, signed-in provider CLIs on the linked computer. Provider
 credentials and raw tool inputs never leave that computer.
 
-- `GET /v1/codex/skills?provider=<codex|claude>&workspaceId=<id>` returns sanitized
+- `GET /v1/codex/skills?provider=<codex|claude|cursor|kimi>&workspaceId=<id>` returns sanitized
   metadata for real global and workspace skills/commands discovered on that runner.
 - Codex jobs accept `approvalPolicy` (`on-request`, `untrusted`, or `never`). Claude
   jobs accept `permissionMode` (`manual`, legacy alias `default`, `acceptEdits`, `plan`,
@@ -259,7 +259,7 @@ the machine contract but frozen as an existing route.
 {
   "id": "gpt-4o",
   "label": "GPT-4o (Azure)",
-  "provider": "azure",            // codex|claude|cursor|azure|bedrock
+  "provider": "azure",            // codex|claude|cursor|kimi|azure|bedrock
   "modes": ["chat"],              // subset of ["chat","task"]
   "azureDeployment": "gpt-4o",    // optional
   "taskModel": "opus",            // optional: model id the app passes to POST /jobs
@@ -323,7 +323,7 @@ any response** (2077–2093, 2195–2276).
 
 ### 1.10 `GET /v1/codex/skills` (1427–1430)
 
-Query: `provider` — optional, `codex|claude|cursor` (400 otherwise; default
+Query: `provider` — optional, `codex|claude|cursor|kimi` (400 otherwise; default
 `codex`); `workspaceId` — optional registered workspace whose project-local
 commands/skills should be included (400 when unknown). 200:
 
@@ -462,7 +462,7 @@ Serving semantics (935–998):
 3401–3459) — provider CLI sessions found under the runner's
 `CODEX_HOME/sessions` (`*.jsonl` with a `session_meta` line, 3365–3395)
 merged with in-memory job sessions. Query: `workspaceId` (400 if not
-registered), `provider` (any of `codex|claude|cursor|azure|bedrock`),
+registered), `provider` (any of `codex|claude|cursor|kimi|azure|bedrock`),
 `limit` (default 50, clamp 1–200; `clampLimit` 1592–1596). Sessions whose
 cwd lies outside every workspace are excluded. 200:
 
@@ -562,7 +562,7 @@ running` (1179–1215). Queue is FIFO by `createdAt` with
 exposed (gap; see Part 2 §2.8).
 
 **`GET /v1/codex/jobs`** (1516–1529) — query `workspaceId` (400 if
-unknown), `provider` (`codex|claude|cursor`), `limit` (default 50, clamp
+unknown), `provider` (`codex|claude|cursor|kimi`), `limit` (default 50, clamp
 1–200). Newest-first, sliced; each entry is a **compact** job response
 (4 KiB text fields). No offset/cursor (ambiguity A2).
 200 `{"jobs": [ …job responses… ]}`.
@@ -573,8 +573,8 @@ unknown), `provider` (`codex|claude|cursor`), `limit` (default 50, clamp
 {
   "workspaceId": "scratch",          // required, must resolve (static or dynamic)
   "prompt": "…",                      // required non-empty; ≤ body cap
-  "provider": "codex",               // optional codex|claude|cursor (default codex)
-  "model": "gpt-5-codex",            // optional; ^[A-Za-z0-9._:-]{1,100}$; claude aliases sonnet/opus/haiku resolve via env (99–104, 2431–2440)
+  "provider": "codex",               // optional codex|claude|cursor|kimi (default codex)
+  "model": "gpt-5-codex",            // optional provider model id; slashes are allowed for ids such as kimi-code/k3
   "reasoningEffort": "high",         // optional; codex or claude when advertised by the selected task model
   "permissionMode": "acceptEdits",   // optional; claude only; acceptEdits|auto|bypassPermissions|default|manual|dontAsk|plan; default normalizes to manual (87)
   "approvalPolicy": "on-request",    // optional; codex only; untrusted|on-failure|on-request|never
@@ -591,7 +591,7 @@ unknown), `provider` (`codex|claude|cursor`), `limit` (default 50, clamp
 Response: **202** with a preview-shaped job response (§1.16). Effects:
 attachments are written under the data dir and their runner-local paths
 appended to the prompt manifest (2781–2787). Selected skill bodies are inlined
-for Claude, Cursor, and the legacy Codex exec transport; Codex app-server jobs
+for Claude, Cursor, Kimi, and the legacy Codex exec transport; Codex app-server jobs
 receive one structured skill input instead, avoiding duplicate instructions.
 The job is then persisted and queued; audit `job_created`.
 
@@ -604,7 +604,7 @@ provider-specific recovery action. Claude effort additionally requires the exact
 installed CLI's `--help` output to advertise `--effort`.
 
 Provider invocation (contract-relevant): prompt is delivered on **stdin**
-for codex/claude, as an argv for cursor. Codex app-server jobs send `model`,
+for codex/claude, as an argv for cursor/kimi. Codex app-server jobs send `model`,
 `effort`, `approvalPolicy`, `approvalsReviewer=user`, and `sandbox=workspace-write`
 on thread/turn requests. The compatibility exec transport uses
 `-a <approvalPolicy> --sandbox workspace-write` as top-level Codex flags and
@@ -614,11 +614,12 @@ Claude runs `claude --print --model … --effort … --permission-mode …` with
 Relay approval MCP and a server-minted `--session-id`; cursor runs
 `cursor-agent -p --force --trust --workspace …
 --output-format json`, result parsed from the JSON envelope incl.
-`session_id`. AWS/Bedrock credentials are scrubbed
-from the child env for direct claude/cursor jobs (4244–4300).
+`session_id`; kimi runs `kimi --model kimi-code/k3 --prompt …
+--output-format stream-json` and resumes with `--session`. AWS/Bedrock
+credentials are scrubbed from the child env for direct claude/cursor/kimi jobs.
 
 Session-id semantics: claude = server-minted upfront; cursor = parsed from
-result JSON; codex = discovered post-run by diffing the workspace's session
+result JSON; kimi = read from Kimi's session index/result events; codex = discovered post-run by diffing the workspace's session
 files (exactly one new file, 4769–4773); resume jobs keep the resumed id.
 
 **`GET /v1/codex/jobs/:id`** (1560–1569) — 200 job response. Shape:
@@ -1099,7 +1100,7 @@ capability flags (the catalog honesty rules extended):
 
 ```json
 {"harnesses": [{
-  "provider": "claude",              // codex|claude|cursor
+  "provider": "claude",              // codex|claude|cursor|kimi
   "installed": true, "version": "2.1.0",
   "loggedIn": true, "authKind": "subscription",   // subscription|api|unknown
   "supportsApprovals": true, "supportsResume": true, "supportsChat": false,

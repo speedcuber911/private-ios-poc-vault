@@ -45,7 +45,7 @@ async function pathExists(filePath) {
 function cleanTestProcessEnv() {
   return Object.fromEntries(
     Object.entries(process.env).filter(([name]) =>
-      !/^(?:AWS_|AZURE_|BEDROCK_|BUN_|CLAUDE_|CODEX_|CURSOR_|NPM_CONFIG_|npm_config_)/.test(name),
+      !/^(?:AWS_|AZURE_|BEDROCK_|BUN_|CLAUDE_|CODEX_|CURSOR_|KIMI_|NPM_CONFIG_|npm_config_)/.test(name),
     ),
   );
 }
@@ -56,6 +56,7 @@ async function isolatedRunnerEnv() {
     CODEX_RUN_HOME: runHome,
     CODEX_HOME: path.join(runHome, ".codex"),
     CLAUDE_HOME: path.join(runHome, ".claude"),
+    KIMI_CODE_HOME: path.join(runHome, ".kimi-code"),
     NPM_CONFIG_CACHE: path.join(runHome, ".npm-cache"),
     BUN_INSTALL_CACHE_DIR: path.join(runHome, ".bun-cache"),
   };
@@ -472,6 +473,27 @@ async function makeFakeCursor(tmpDir, sessionId) {
   return { fakeCursor, argsPath };
 }
 
+async function makeFakeKimi(tmpDir, sessionId) {
+  const fakeKimi = path.join(tmpDir, "fake-kimi");
+  const argsPath = path.join(tmpDir, "fake-kimi-args.txt");
+  await fs.writeFile(
+    fakeKimi,
+    [
+      "#!/bin/sh",
+      "if [ \"$1\" = '--version' ]; then echo 'kimi-code 0.28.0'; exit 0; fi",
+      `: > '${argsPath}'`,
+      `for arg in "$@"; do printf '%s\\n' "$arg" >> '${argsPath}'; done`,
+      "cat >/dev/null",
+      `printf '%s\\n' '${JSON.stringify({ type: "assistant", content: [{ type: "text", text: "intermediate" }] })}'`,
+      `printf '%s\\n' '${JSON.stringify({ role: "assistant", content: "kimi answer", sessionId })}'`,
+      "exit 0",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  return { fakeKimi, argsPath };
+}
+
 async function makeFailingStdoutClaude(tmpDir) {
   const fakeClaude = path.join(tmpDir, "fake-claude-failing-stdout");
   await fs.writeFile(
@@ -736,17 +758,21 @@ test("reports provider-separated harness readiness and task controls", async () 
     const response = await fetch(`${server.baseUrl}/v1/harness`);
     assert.equal(response.status, 200);
     const { harnesses } = await response.json();
-    assert.deepEqual(harnesses.map((harness) => harness.provider).sort(), ["claude", "codex", "cursor"]);
+    assert.deepEqual(harnesses.map((harness) => harness.provider).sort(), ["claude", "codex", "cursor", "kimi"]);
 
     const codex = harnesses.find((harness) => harness.provider === "codex");
     const claude = harnesses.find((harness) => harness.provider === "claude");
     const cursorHarness = harnesses.find((harness) => harness.provider === "cursor");
+    const kimi = harnesses.find((harness) => harness.provider === "kimi");
     assert.equal(codex.taskControls.reasoningEffort, true);
     assert.deepEqual(codex.taskControls.approvalPolicies, ["untrusted", "on-failure", "on-request", "never"]);
     assert.equal(claude.taskControls.reasoningEffort, true);
     assert.deepEqual(claude.taskControls.permissionModes, ["manual", "acceptEdits", "plan", "dontAsk", "auto"]);
     assert.equal(cursorHarness.taskControls.reasoningEffort, false);
     assert.equal(cursorHarness.supportsApprovals, false);
+    assert.equal(kimi.installed, false);
+    assert.equal(kimi.taskControls.model, true);
+    assert.equal(kimi.supportsResume, true);
   } finally {
     await server.stop();
   }
@@ -2917,6 +2943,84 @@ test("runs Cursor Agent jobs and persists the returned session id", async () => 
     assert.ok(args.includes("--model"));
     assert.ok(args.includes("auto"));
     assert.equal(args.at(-1), "check cursor");
+  } finally {
+    await server.stop();
+  }
+});
+
+test("runs and resumes Kimi K3 as its own provider", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-kimi-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  const runHome = path.join(tmpDir, "run-home");
+  const kimiHome = path.join(runHome, ".kimi-code");
+  const sessionId = "01J00000000000000000000001";
+  await fs.mkdir(workspaceDir, { recursive: true });
+  await fs.mkdir(path.join(kimiHome, "credentials"), { recursive: true });
+  await fs.writeFile(path.join(kimiHome, "credentials", "kimi-code.json"), "{}\n", { mode: 0o600 });
+  const kimi = await makeFakeKimi(tmpDir, sessionId);
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_RUN_HOME: runHome,
+    KIMI_CODE_HOME: kimiHome,
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_BIN: await makeFakeCodex(tmpDir),
+    KIMI_BIN: kimi.fakeKimi,
+    RELAYD_CODEX_TRANSPORT: "exec",
+  });
+  try {
+    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: "scratch",
+        provider: "kimi",
+        prompt: "check kimi",
+        model: "kimi-code/k3",
+        timeoutMs: 5000,
+      }),
+    });
+    const created = await create.json();
+    assert.equal(create.status, 202, JSON.stringify(created));
+    const first = await waitForJob(server.baseUrl, created.id);
+    assert.equal(first.status, "succeeded");
+    assert.equal(first.provider, "kimi");
+    assert.equal(first.model, "kimi-code/k3");
+    assert.equal(first.result, "kimi answer");
+    assert.equal(first.sessionId, sessionId);
+
+    const firstArgs = (await fs.readFile(kimi.argsPath, "utf8")).trim().split("\n");
+    assert.deepEqual(firstArgs, ["--model", "kimi-code/k3", "--prompt", "check kimi", "--output-format", "stream-json"]);
+
+    const detail = await fetch(`${server.baseUrl}/v1/codex/threads/${sessionId}?provider=kimi`);
+    assert.equal(detail.status, 200);
+    assert.equal((await detail.json()).thread.provider, "kimi");
+
+    const resume = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: "scratch",
+        provider: "kimi",
+        prompt: "continue kimi",
+        model: "kimi-code/k3",
+        resumeSessionId: sessionId,
+        timeoutMs: 5000,
+      }),
+    });
+    const resumed = await resume.json();
+    assert.equal(resume.status, 202, JSON.stringify(resumed));
+    const second = await waitForJob(server.baseUrl, resumed.id);
+    assert.equal(second.status, "succeeded");
+    assert.equal(second.sessionId, sessionId);
+
+    const resumeArgs = (await fs.readFile(kimi.argsPath, "utf8")).trim().split("\n");
+    assert.deepEqual(resumeArgs.slice(0, 2), ["--session", sessionId]);
+    assert.ok(resumeArgs.includes("continue kimi"));
+
+    const threads = await (await fetch(`${server.baseUrl}/v1/codex/threads?provider=kimi&limit=20`)).json();
+    assert.deepEqual(threads.threads.map((thread) => thread.sessionId), [sessionId]);
+    assert.equal(threads.threads[0].jobCount, 2);
   } finally {
     await server.stop();
   }

@@ -574,6 +574,15 @@ extension CodexProvider {
                 permissionsTitle: nil,
                 skillsTitle: "Cursor skills"
             )
+        case .kimi:
+            return RelayProviderPresentation(
+                title: "Kimi K3",
+                assetName: nil,
+                systemImage: "moon.stars",
+                accent: Color(hex: 0x71B7D6),
+                permissionsTitle: nil,
+                skillsTitle: "Kimi skills"
+            )
         case .bedrock:
             return RelayProviderPresentation(
                 title: "Bedrock",

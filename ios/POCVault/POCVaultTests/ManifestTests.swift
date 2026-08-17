@@ -102,6 +102,9 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(CodexProvider.claude.modelOptions, [])
         XCTAssertEqual(CodexProvider.claude.defaultReasoningEffort, .high)
         XCTAssertEqual(CodexProvider.claude.reasoningEffortOptions, CodexReasoningEffort.allCases)
+        XCTAssertEqual(CodexProvider.cursor.displayName, "Cursor")
+        XCTAssertEqual(CodexProvider.kimi.displayName, "Kimi K3")
+        XCTAssertEqual(CodexProvider.kimi.defaultReasoningEffort, .high)
     }
 
     func testRelayHarnessStatusSeparatesProviderReadinessAndRecovery() throws {
@@ -134,6 +137,12 @@ final class ManifestTests: XCTestCase {
             }
             """.utf8)
         )
+        let kimiSignedOut = try JSONDecoder().decode(
+            RelayHarnessStatus.self,
+            from: Data("""
+            { "provider": "kimi", "installed": true, "loggedIn": false, "authKind": "unknown" }
+            """.utf8)
+        )
 
         XCTAssertEqual(signedOut.provider, .codex)
         XCTAssertTrue(signedOut.isConfirmedUnavailable)
@@ -147,6 +156,8 @@ final class ManifestTests: XCTestCase {
         XCTAssertFalse(connected.isConfirmedUnavailable)
         XCTAssertEqual(connected.shortStatus, "Connected")
         XCTAssertNil(connected.actionMessage)
+        XCTAssertEqual(kimiSignedOut.provider, .kimi)
+        XCTAssertEqual(kimiSignedOut.actionMessage, "Run kimi login on the computer, then try again.")
     }
 
     func testCodexModelDescriptorAllowsOptionalEffortLevels() throws {
@@ -218,15 +229,15 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(events, [.delta("last token")])
     }
 
-    /// The live seven-entry catalog shape: Codex dual-mode Sol/Terra/Luna, Claude Code
-    /// task trio, Cursor Auto. Agents groups by harness; chat models stay flat.
+    /// The live eight-entry catalog shape: Codex dual-mode Sol/Terra/Luna, Claude Code
+    /// task trio, Cursor Auto, and Kimi K3. Agents group by harness; chat models stay flat.
     func testRelayModelDiscoveryGroupsAgentsByHarness() throws {
         let models = try decodeCodexModels(liveShapeCatalogJSON)
 
         let sections = RelayModelDiscovery.sections(from: models)
 
-        XCTAssertEqual(sections.agents.map(\.provider), [.codex, .claude, .cursor])
-        XCTAssertEqual(sections.agents.map(\.title), ["Codex", "Claude Code", "Cursor"])
+        XCTAssertEqual(sections.agents.map(\.provider), [.codex, .claude, .cursor, .kimi])
+        XCTAssertEqual(sections.agents.map(\.title), ["Codex", "Claude Code", "Cursor", "Kimi K3"])
         XCTAssertEqual(
             sections.agents[0].choices.map(\.model.id),
             ["codex-gpt-5.6-sol", "codex-gpt-5.6-terra", "codex-gpt-5.6-luna"]
@@ -277,6 +288,10 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(cursorGroup.choices.count, 1)
         XCTAssertEqual(cursorGroup.choices[0].shortModelLabel, "Auto")
         XCTAssertEqual(cursorGroup.choices[0].chipLabel, "Cursor · Auto")
+        let kimiGroup = try XCTUnwrap(full.agents.first { $0.provider == .kimi })
+        XCTAssertEqual(kimiGroup.choices.count, 1)
+        XCTAssertEqual(kimiGroup.choices[0].shortModelLabel, "K3")
+        XCTAssertEqual(kimiGroup.choices[0].chipLabel, "Kimi K3")
 
         XCTAssertTrue(RelayModelDiscovery.sections(from: []).isEmpty)
     }
@@ -309,6 +324,7 @@ final class ManifestTests: XCTestCase {
             """
             [
               { "id": "cursor-agent-auto", "label": "Cursor Agent · Auto", "provider": "cursor", "modes": ["task"], "taskModel": "auto" },
+              { "id": "kimi-k3", "label": "Kimi K3", "provider": "kimi", "modes": ["task"], "taskModel": "kimi-code/k3" },
               { "id": "codex-gpt-5.6-sol", "label": "Codex · GPT-5.6 Sol", "provider": "codex", "modes": ["chat", "task"], "taskModel": "gpt-5.6-sol" },
               { "id": "claude-code-opus", "label": "Claude Code · Opus", "provider": "claude", "modes": ["task"], "taskModel": "opus" },
               { "id": "gpt-4o", "label": "GPT-4o (Azure)", "provider": "azure", "modes": ["chat"], "azureDeployment": "gpt-4o" },
@@ -318,16 +334,18 @@ final class ManifestTests: XCTestCase {
         )
 
         XCTAssertEqual(RelayChatViewModel.taskProvider(for: models[0]), .cursor)
-        XCTAssertEqual(RelayChatViewModel.taskProvider(for: models[1]), .codex)
-        XCTAssertEqual(RelayChatViewModel.taskProvider(for: models[2]), .claude)
-        XCTAssertEqual(RelayChatViewModel.taskProvider(for: models[3]), .codex)
-        XCTAssertEqual(RelayChatViewModel.taskProvider(for: models[4]), .claude)
+        XCTAssertEqual(RelayChatViewModel.taskProvider(for: models[1]), .kimi)
+        XCTAssertEqual(RelayChatViewModel.taskProvider(for: models[2]), .codex)
+        XCTAssertEqual(RelayChatViewModel.taskProvider(for: models[3]), .claude)
+        XCTAssertEqual(RelayChatViewModel.taskProvider(for: models[4]), .codex)
+        XCTAssertEqual(RelayChatViewModel.taskProvider(for: models[5]), .claude)
 
         XCTAssertEqual(RelayChatViewModel.taskModelParameter(for: models[0]), "auto")
-        XCTAssertEqual(RelayChatViewModel.taskModelParameter(for: models[1]), "gpt-5.6-sol")
-        XCTAssertEqual(RelayChatViewModel.taskModelParameter(for: models[2]), "opus")
+        XCTAssertEqual(RelayChatViewModel.taskModelParameter(for: models[1]), "kimi-code/k3")
+        XCTAssertEqual(RelayChatViewModel.taskModelParameter(for: models[2]), "gpt-5.6-sol")
+        XCTAssertEqual(RelayChatViewModel.taskModelParameter(for: models[3]), "opus")
         // Bedrock alias without a taskModel and without chat support: runner default.
-        XCTAssertNil(RelayChatViewModel.taskModelParameter(for: models[4]))
+        XCTAssertNil(RelayChatViewModel.taskModelParameter(for: models[5]))
     }
 
     /// A dual-mode Codex model is selectable as either an agent (task) or a chat model,
@@ -410,7 +428,8 @@ final class ManifestTests: XCTestCase {
           { "id": "claude-code-sonnet", "label": "Claude Code · Sonnet", "provider": "claude", "modes": ["task"], "taskModel": "sonnet", "effortLevels": ["low", "medium", "high"] },
           { "id": "claude-code-opus", "label": "Claude Code · Opus", "provider": "claude", "modes": ["task"], "taskModel": "opus", "effortLevels": ["low", "medium", "high"] },
           { "id": "claude-code-haiku", "label": "Claude Code · Haiku", "provider": "claude", "modes": ["task"], "taskModel": "haiku", "effortLevels": ["low", "medium", "high"] },
-          { "id": "cursor-agent-auto", "label": "Cursor Agent · Auto", "provider": "cursor", "modes": ["task"], "taskModel": "auto", "effortLevels": [] }
+          { "id": "cursor-agent-auto", "label": "Cursor Agent · Auto", "provider": "cursor", "modes": ["task"], "taskModel": "auto", "effortLevels": [] },
+          { "id": "kimi-k3", "label": "Kimi K3", "provider": "kimi", "modes": ["task"], "taskModel": "kimi-code/k3", "effortLevels": [] }
         ]
         """
     }
@@ -419,6 +438,7 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(CodexProvider.codex.tabIconAssetName, "ChatGPTMark")
         XCTAssertEqual(CodexProvider.claude.tabIconAssetName, "ClaudeMark")
         XCTAssertEqual(CodexProvider.cursor.tabIconAssetName, "cursorarrow")
+        XCTAssertEqual(CodexProvider.kimi.tabIconAssetName, "moon.stars")
         XCTAssertEqual(CodexProvider.bedrock.tabIconAssetName, "cube.transparent")
         XCTAssertEqual(CodexProvider.azure.tabIconAssetName, "cloud")
         XCTAssertNotEqual(CodexProvider.cursor.tabIconAssetName, CodexProvider.codex.tabIconAssetName)
@@ -426,6 +446,7 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(CodexProvider.codex.hasTaskPermissionControls)
         XCTAssertTrue(CodexProvider.claude.hasTaskPermissionControls)
         XCTAssertFalse(CodexProvider.cursor.hasTaskPermissionControls)
+        XCTAssertFalse(CodexProvider.kimi.hasTaskPermissionControls)
     }
 
     func testRelayDesignTokensUseEditorialEmberPalette() throws {
@@ -2352,6 +2373,9 @@ final class ManifestTests: XCTestCase {
 
         let encoded = try JSONEncoder().encode(CodexProvider.cursor)
         XCTAssertEqual(String(data: encoded, encoding: .utf8), "\"cursor\"")
+        XCTAssertEqual(CodexProvider(rawProvider: "kimi-code"), .kimi)
+        let kimiEncoded = try JSONEncoder().encode(CodexProvider.kimi)
+        XCTAssertEqual(String(data: kimiEncoded, encoding: .utf8), "\"kimi\"")
     }
 
     func testRelayModelChoiceKeepsDualModeIdentitiesDistinct() throws {

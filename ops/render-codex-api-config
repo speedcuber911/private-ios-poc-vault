@@ -150,7 +150,8 @@ def catalog_from_opencode(path: Path) -> list[dict]:
 def task_catalog_entries() -> list[dict]:
     """Task-mode entries with selectable underlying models.
 
-    Codex: the current subscription models. Claude Code: Opus / Sonnet / Haiku aliases
+    Codex: the current subscription models. Claude Code: Opus / Sonnet / Haiku aliases.
+    Cursor Agent and Kimi K3 are direct-subscription task providers.
     resolved by the installed Claude CLI. The job runner picks the model from the
     `model` field of the submitted job; Bedrock is opt-in only when a SigiQ profile is
     explicitly configured.
@@ -176,6 +177,7 @@ def task_catalog_entries() -> list[dict]:
         {"id": "claude-code-opus", "label": "Claude Code · Opus", "provider": "claude", "modes": ["task"], "taskModel": "opus", "effortLevels": claude_effort},
         {"id": "claude-code-haiku", "label": "Claude Code · Haiku", "provider": "claude", "modes": ["task"], "taskModel": "haiku", "effortLevels": claude_effort},
         {"id": "cursor-agent-auto", "label": "Cursor Agent · Auto", "provider": "cursor", "modes": ["task"], "taskModel": "auto", "effortLevels": []},
+        {"id": "kimi-k3", "label": "Kimi K3", "provider": "kimi", "modes": ["task"], "taskModel": "kimi-code/k3", "effortLevels": []},
     ]
     # Curated subset of `cursor-agent --list-models`; verified live on-box
     # 2026-08-09 (--model passthrough smoke-tested as codex-runner). Re-verify
@@ -191,7 +193,6 @@ def task_catalog_entries() -> list[dict]:
         ("cursor-agent-opus-4.8-thinking", "Opus 4.8 Thinking", "claude-opus-4-8-thinking-high"),
         ("cursor-agent-fable-5-thinking", "Fable 5 Thinking (No ZDR)", "claude-fable-5-thinking-high"),
         ("cursor-agent-grok-4.5", "Grok 4.5", "cursor-grok-4.5-high"),
-        ("cursor-agent-kimi-k3", "Kimi K3", "kimi-k3-high"),
     ]
     entries += [
         {"id": mid, "label": f"Cursor Agent · {label}", "provider": "cursor", "modes": ["task"], "taskModel": tm, "effortLevels": []}
@@ -318,6 +319,7 @@ def render_env(config: dict[str, str], output: Path) -> None:
         ("RELAYD_CODEX_TRANSPORT", "app-server"),
         ("CLAUDE_BIN", "/usr/bin/claude"),
         ("CURSOR_BIN", "/var/lib/codex-api/run-home/.local/bin/cursor-agent"),
+        ("KIMI_BIN", "/var/lib/codex-api/run-home/.local/bin/kimi"),
         ("CLAUDE_CODE_USE_BEDROCK", ""),
         ("CLAUDE_AWS_PROFILE", ""),
         ("CLAUDE_DEFAULT_MODEL", "sonnet"),
@@ -330,6 +332,7 @@ def render_env(config: dict[str, str], output: Path) -> None:
         ("AWS_DEFAULT_REGION", aws_default_region),
         ("CODEX_RUN_HOME", "/var/lib/codex-api/run-home"),
         ("CODEX_HOME", "/var/lib/codex-api/run-home/.codex"),
+        ("KIMI_CODE_HOME", "/var/lib/codex-api/run-home/.kimi-code"),
         ("CODEX_DANGEROUS_MODE", "false"),
         ("CODEX_MAX_CONCURRENT", "1"),
         ("CODEX_MAX_JOB_STREAMS", "8"),

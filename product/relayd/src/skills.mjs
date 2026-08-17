@@ -7,7 +7,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 
-import { runHome, codexHome, claudeHome, maxSkillDiscoveryFiles, splitPathList } from "./config.mjs";
+import { runHome, codexHome, claudeHome, kimiHome, maxSkillDiscoveryFiles, splitPathList } from "./config.mjs";
 import { cleanApiText } from "./util.mjs";
 
 function listProviderSkills(provider, workspacePath = null) {
@@ -49,6 +49,16 @@ function skillRoots(provider, workspacePath = null) {
       ...splitPathList(process.env.CURSOR_SKILL_DIRS),
       path.join(runHome, ".cursor", "skills-cursor"),
       path.join(runHome, ".cursor", "skills"),
+    ]);
+  }
+
+  if (provider === "kimi") {
+    return uniqueExistingDirectories([
+      projectRoot && path.join(projectRoot, ".kimi-code", "skills"),
+      projectRoot && path.join(projectRoot, ".agents", "skills"),
+      ...splitPathList(process.env.KIMI_SKILL_DIRS),
+      path.join(kimiHome, "skills"),
+      path.join(runHome, ".agents", "skills"),
     ]);
   }
 

@@ -81,7 +81,7 @@ struct RelayModelChoice: Identifiable, Hashable {
         switch provider {
         case .claude:
             return "Claude Code"
-        case .codex, .cursor, .bedrock, .azure:
+        case .codex, .cursor, .kimi, .bedrock, .azure:
             return provider.displayName
         }
     }
@@ -92,6 +92,9 @@ struct RelayModelChoice: Identifiable, Hashable {
     /// read "GPT-5.6 Sol" under Codex, "Auto" under Cursor, "Sonnet" under Claude Code.
     var shortModelLabel: String {
         var text = model.label.trimmingCharacters(in: .whitespacesAndNewlines)
+        if model.provider == .kimi, ["kimi k3", "k3"].contains(text.lowercased()) {
+            return "K3"
+        }
         for alias in Self.labelAliases(for: model.provider) {
             let lowered = text.lowercased()
             if lowered.hasPrefix(alias.lowercased()) {
@@ -117,7 +120,8 @@ struct RelayModelChoice: Identifiable, Hashable {
 
     /// Composer chip text: harness plus model, e.g. "Codex · GPT-5.6 Sol" / "Cursor · Auto".
     var chipLabel: String {
-        "\(harnessTitle) · \(shortModelLabel)"
+        if model.provider == .kimi, shortModelLabel == "K3" { return "Kimi K3" }
+        return "\(harnessTitle) · \(shortModelLabel)"
     }
 
     private static func labelAliases(for provider: CodexProvider) -> [String] {
@@ -128,6 +132,8 @@ struct RelayModelChoice: Identifiable, Hashable {
             return ["Claude Code", "Claude"]
         case .cursor:
             return ["Cursor Agent", "Cursor"]
+        case .kimi:
+            return ["Kimi K3", "Kimi Code", "Kimi"]
         case .bedrock:
             return ["Bedrock"]
         case .azure:
@@ -183,8 +189,8 @@ struct RelayModelPickerSections: Hashable {
 }
 
 enum RelayModelDiscovery {
-    static let agentProviderOrder: [CodexProvider] = [.codex, .claude, .cursor, .bedrock, .azure]
-    static let chatProviderOrder: [CodexProvider] = [.codex, .azure, .bedrock, .claude, .cursor]
+    static let agentProviderOrder: [CodexProvider] = [.codex, .claude, .cursor, .kimi, .bedrock, .azure]
+    static let chatProviderOrder: [CodexProvider] = [.codex, .azure, .bedrock, .claude, .cursor, .kimi]
 
     /// Build the harness-first picker sections from the server catalog. Catalog order is
     /// preserved within each provider (the server curates it); providers absent from the
@@ -1207,6 +1213,8 @@ final class RelayChatViewModel: ObservableObject {
             return .claude
         case .cursor:
             return .cursor
+        case .kimi:
+            return .kimi
         case .codex, .azure:
             return .codex
         }

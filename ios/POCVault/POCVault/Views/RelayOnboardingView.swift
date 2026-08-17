@@ -33,7 +33,7 @@ struct RelayOnboardingView: View {
         OnboardingPage(
             icon: "rectangle.connected.to.line.below",
             title: "Your computer, from your phone",
-            detail: "Relay lets you start and continue Codex or Claude Code work without keeping your laptop open."
+            detail: "Relay lets you start and continue Codex, Claude Code, Cursor, or Kimi work without keeping your laptop open."
         ),
         OnboardingPage(
             icon: "lock.shield",
@@ -43,7 +43,7 @@ struct RelayOnboardingView: View {
         OnboardingPage(
             icon: "checkmark.seal",
             title: "Link your computer",
-            detail: "Run relay login on your computer and approve the one-time link here. Codex and Claude authentication stays on your computer and Relay machine."
+            detail: "Run relay login on your computer and approve the one-time link here. Provider authentication stays on your computer and Relay machine."
         )
     ]
 

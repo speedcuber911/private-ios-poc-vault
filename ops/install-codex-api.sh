@@ -94,6 +94,15 @@ install -m 0644 -o root -g root "$TMP_RENDER_DIR/codex-api.nginx.conf" "$NGINX_C
 if [[ ! -x "${CODEX_BIN:-/usr/bin/codex}" && ! -x /usr/bin/codex ]]; then
   echo "WARN codex CLI was not found. Install/login Codex for ${RUNNER_USER} before running jobs." >&2
 fi
+if [[ ! -x "${CLAUDE_BIN:-/usr/bin/claude}" && ! -x /usr/bin/claude ]]; then
+  echo "WARN Claude Code CLI was not found. Install/login Claude Code for ${RUNNER_USER} before running jobs." >&2
+fi
+if [[ ! -x "${CURSOR_BIN:-${DATA_DIR}/run-home/.local/bin/cursor-agent}" ]]; then
+  echo "WARN Cursor Agent CLI was not found. Install/login Cursor for ${RUNNER_USER} before running jobs." >&2
+fi
+if [[ ! -x "${KIMI_BIN:-${DATA_DIR}/run-home/.local/bin/kimi}" ]]; then
+  echo "WARN Kimi Code CLI was not found. Install it and run kimi login for ${RUNNER_USER} before running Kimi K3 jobs." >&2
+fi
 
 nginx -t
 systemctl daemon-reload
@@ -111,5 +120,6 @@ Codex API installed
 
 Next:
   - put Codex auth at ${DATA_DIR}/run-home/.codex/auth.json for ${RUNNER_USER}
+  - connect Cursor with cursor-agent login and Kimi K3 with kimi login as ${RUNNER_USER}
   - verify with curl against https://${CODEX_DOMAIN:-codex.pocs.example.com}/healthz
 SUMMARY

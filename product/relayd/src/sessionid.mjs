@@ -16,10 +16,10 @@
 // invalid` the instant the user pressed Continue: staged successfully,
 // unusable forever.
 //
-// THE CONTRACT, decided rather than widened: a resumable session id is a
-// lowercase UUID-shaped token — exactly the 36 characters `crypto.randomUUID()`
-// produces, which is also exactly what every harness this product resumes
-// actually emits:
+// THE CONTRACT, decided rather than widened: a resumable imported session id
+// is the lowercase UUID-shaped token emitted by Codex and Claude. Kimi Code
+// emits an opaque bounded id, so its wider shape is defined separately and is
+// never accepted by the handoff import path:
 //
 //   - Claude Code names its transcript `<uuid>.jsonl`;
 //   - Codex records `payload.id` in the rollout's `session_meta` line as a
@@ -27,29 +27,32 @@
 //     filename fragment is not the id, and treating it as one is the bug);
 //   - `cursor-agent` reports `session_id` as a UUID (`adapters/cursor.mjs`
 //     already validates it with this same predicate via `isSafeJobId`);
+//   - Kimi Code persists opaque session ids in KIMI_CODE_HOME/session_index.jsonl;
 //   - relayd's own job ids are `crypto.randomUUID()`.
-//
-// It was deliberately NOT widened to match sessionimport's old allow-list:
-// this same predicate backs `isSafeJobId`, which gates ids that become log
-// filenames and URL path segments, and every character this excludes
-// (`/`, `\`, `.`, NUL, newline, anything over 36 bytes) is one that has no
-// business in either. Narrowing sessionimport to it is strictly safer than it
-// was, and it makes "staged" and "resumable" the same set — which is the
-// property that was missing.
 //
 // Deliberately dependency-free (not even `config.mjs`, which creates
 // directories at import time) so the jail module `sessionimport.mjs` can
 // import it without pulling relayd's runtime configuration into a unit test.
 
-// Lowercase hex and dashes, exactly 36 characters. Positionally it is looser
-// than a strict RFC-4122 UUID (it does not pin the dash offsets or the version
-// nibble); that looseness is inherited from `isSafeJobId`, which has always had
-// it, and is harmless — every string it admits is still a single, plain,
-// bounded path component with no `.` and no separator.
 const RESUMABLE_SESSION_ID_RE = /^[a-f0-9-]{36}$/;
+const KIMI_SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 
 function isResumableSessionId(value) {
   return typeof value === "string" && RESUMABLE_SESSION_ID_RE.test(value);
 }
 
-export { RESUMABLE_SESSION_ID_RE, isResumableSessionId };
+function isKimiSessionId(value) {
+  return typeof value === "string" && KIMI_SESSION_ID_RE.test(value);
+}
+
+function isThreadSessionId(value) {
+  return isResumableSessionId(value) || isKimiSessionId(value);
+}
+
+export {
+  RESUMABLE_SESSION_ID_RE,
+  KIMI_SESSION_ID_RE,
+  isResumableSessionId,
+  isKimiSessionId,
+  isThreadSessionId,
+};

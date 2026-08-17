@@ -10,6 +10,7 @@ import path from "node:path";
 import { host, port, requireMtls, allowedCertSubjects, maxConcurrent, maxBodyBytes, maxTranscriptionAudioBytes, proxyBaseUrl, proxyClientCertPath, proxyClientKeyPath, grantPublicKey, nodeId, approvalsDir, codexBin, runHome, codexHome } from "./config.mjs";
 import { isJwtShaped, verifyBrowserGrant, activityScope, scopeCovers } from "./grant.mjs";
 import { sendJson, sendHtml, sendError, readBody, readBinaryBody, headerValue, clampLimit, isSafeJobId } from "./util.mjs";
+import { isThreadSessionId } from "./sessionid.mjs";
 import { workspaces, workspaceList, resolveWorkspaceById, publicWorkspace, workspaceDirectoryResponse, selectWorkspaceDirectory, createWorkspaceDirectory } from "./workspaces.mjs";
 import { publicRuntimeModelCatalog } from "./catalog.mjs";
 import { fsListResponse, serveFsFile } from "./fsapi.mjs";
@@ -276,7 +277,7 @@ async function routeRequest(req, res) {
   if (threadMatch && req.method === "GET") {
     const sessionId = decodeURIComponent(threadMatch[1]);
     const provider = cleanThreadProviderFilter(url.searchParams.get("provider"));
-    if (!isSafeJobId(sessionId)) return sendError(res, 404, "thread not found");
+    if (!isThreadSessionId(sessionId)) return sendError(res, 404, "thread not found");
     const detail = await threadDetailResponse(sessionId, { provider });
     if (!detail) return sendError(res, 404, "thread not found");
     return sendJson(res, 200, detail);
@@ -286,7 +287,7 @@ async function routeRequest(req, res) {
     const sessionId = decodeURIComponent(threadMatch[1]);
     const workspaceId = url.searchParams.get("workspaceId");
     const provider = cleanThreadProviderFilter(url.searchParams.get("provider"));
-    if (!isSafeJobId(sessionId)) return sendError(res, 404, "thread not found");
+    if (!isThreadSessionId(sessionId)) return sendError(res, 404, "thread not found");
     const deleted = deleteThread(sessionId, { workspaceId, provider, certSubject: auth.subject });
     if (!deleted) return sendError(res, 404, "thread not found");
     return sendJson(res, 200, deleted);

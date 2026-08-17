@@ -15,7 +15,7 @@ the isolated runner home.
 `RELAYD_CODEX_TRANSPORT=exec` is retained as a compatibility escape hatch and for legacy
 fixtures. That transport cannot provide interactive phone approvals.
 
-This directory contains the deployable files for the async Codex/Claude/Cursor job
+This directory contains the deployable files for the async Codex/Claude/Cursor/Kimi job
 service.
 
 ## Files
@@ -47,6 +47,8 @@ CODEX_ALLOWED_CERT_SUBJECTS=CN=iphone,CN=operator
 CODEX_BIN=/usr/bin/codex
 CLAUDE_BIN=/usr/bin/claude
 CURSOR_BIN=/var/lib/codex-api/run-home/.local/bin/cursor-agent
+KIMI_BIN=/var/lib/codex-api/run-home/.local/bin/kimi
+KIMI_CODE_HOME=/var/lib/codex-api/run-home/.kimi-code
 CLAUDE_CODE_USE_BEDROCK=
 CLAUDE_AWS_PROFILE=
 BEDROCK_REGION=us-east-1
@@ -150,19 +152,21 @@ it remains read-only. Azure chat remains context-only and never receives
 filesystem access from the workspace selection.
 
 `POST /v1/codex/jobs` accepts optional `provider`. Supported values are
-`codex`, `claude`, and `cursor`; omitted provider defaults to `codex`. All job responses
+`codex`, `claude`, `cursor`, and `kimi`; omitted provider defaults to `codex`. All job responses
 include the persisted provider.
 
 The server checks the selected CLI's login state under the isolated runner
 home before creating the job. A missing CLI or a confirmed signed-out provider
 returns `503` immediately, so a task cannot enter the queue and later fail with
-an unauthenticated provider request. Codex and Claude recovery is performed on
-the linked Mac with `relay sync-auth`; the iPhone never handles provider
-credentials.
+an unauthenticated provider request. Codex and Claude recovery can use
+`relay sync-auth`. Cursor and Kimi are signed in directly on the linked computer
+(`cursor-agent login` / `kimi login`); the iPhone never handles provider credentials.
 
 Codex jobs keep the existing `codex exec` and `codex exec resume` path. Cursor
 jobs use the authenticated Cursor Agent CLI in print mode, capture its JSON result,
-and resume with the saved Cursor session id. Claude
+and resume with the saved Cursor session id. Kimi jobs use `kimi --prompt` with
+stream-JSON output, default to `kimi-code/k3`, and resume with the saved Kimi
+session id. Claude
 jobs run `CLAUDE_BIN` in the selected workspace, read the prompt from stdin, use
 `--print`, pass `--model` and `--effort` when requested, and pass either
 `--session-id <uuid>` for a fresh Claude job or `--resume <session-id>` for a
@@ -172,7 +176,7 @@ permission mode requested by the client. Claude results come from stdout.
 
 For direct Claude subscription auth, leave `CLAUDE_CODE_USE_BEDROCK` and
 `CLAUDE_AWS_PROFILE` empty; ambient AWS credentials are stripped from Claude
-jobs. Cursor jobs get the same treatment: AWS access keys, profiles, regions,
+jobs. Cursor and Kimi jobs get the same treatment: AWS access keys, profiles, regions,
 and Bedrock variables are removed from the Cursor environment, which keeps
 direct Cursor subscription state in the isolated runner home as the only auth
 path. When Claude Code is intentionally run through Bedrock, set `CLAUDE_CODE_USE_BEDROCK=1`,
@@ -191,7 +195,7 @@ after its deployment passes a live request.
 
 `GET /v1/codex/jobs`, `GET /v1/codex/sessions`,
 `GET /v1/codex/threads`, and `GET /v1/codex/threads/<sessionId>` accept optional
-provider filters. Jobs remain `provider=codex|claude|cursor`; thread filters also
+provider filters. Jobs remain `provider=codex|claude|cursor|kimi`; thread filters also
 accept `provider=bedrock|azure` for chat threads.
 
 `GET /v1/codex/sessions` returns metadata only: Codex session files whose saved
@@ -223,7 +227,7 @@ provider-locked, so follow-ups must use the original provider.
 
 ## Job Artifacts
 
-Successful jobs from all three task providers parse fenced code blocks from the saved answer and expose them
+Successful jobs from all four task providers parse fenced code blocks from the saved answer and expose them
 as job-scoped artifacts. Job responses include `artifacts`, each with `id`,
 `kind`, `filename`, `title`, `language`, `contentType`, `bytes`, `rawURL`, and
 `previewURL`.

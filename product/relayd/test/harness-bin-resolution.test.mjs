@@ -29,8 +29,8 @@ function resolveUnder(env) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-data-"));
   try {
     const script =
-      `import { codexBin, claudeBin, cursorBin } from ${JSON.stringify(CONFIG)};` +
-      `process.stdout.write(JSON.stringify({ codexBin, claudeBin, cursorBin }));`;
+      `import { codexBin, claudeBin, cursorBin, kimiBin } from ${JSON.stringify(CONFIG)};` +
+      `process.stdout.write(JSON.stringify({ codexBin, claudeBin, cursorBin, kimiBin }));`;
     const out = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
       env: { ...process.env, CODEX_DATA_DIR: dataDir, ...env },
       encoding: "utf8",
@@ -119,6 +119,19 @@ test("cursor still resolves under CODEX_RUN_HOME", (t) => {
   const resolved = resolveUnder({ CODEX_RUN_HOME: home, CURSOR_BIN: "" });
 
   assert.equal(resolved.cursorBin, path.join(home, ".local", "bin", "cursor-agent"));
+});
+
+test("kimi resolves under CODEX_RUN_HOME and can be found on PATH", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-kimi-home-"));
+  const binDir = tempBinDir(["kimi"]);
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(binDir, { recursive: true, force: true }));
+
+  const fromHome = resolveUnder({ CODEX_RUN_HOME: home, PATH: "", KIMI_BIN: "" });
+  assert.equal(fromHome.kimiBin, path.join(home, ".local", "bin", "kimi"));
+
+  const fromPath = resolveUnder({ CODEX_RUN_HOME: home, PATH: binDir, KIMI_BIN: "" });
+  assert.equal(fromPath.kimiBin, path.join(binDir, "kimi"));
 });
 
 // A PATH entry that cannot be read must not abort resolution.

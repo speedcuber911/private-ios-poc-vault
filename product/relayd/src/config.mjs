@@ -80,6 +80,8 @@ const claudeBin = resolveHarnessBin(process.env.CLAUDE_BIN, "claude", "/usr/bin/
 
 const cursorBin = process.env.CURSOR_BIN || path.join(process.env.CODEX_RUN_HOME || process.env.HOME || "/home/ec2-user", ".local", "bin", "cursor-agent");
 
+const kimiBin = resolveHarnessBin(process.env.KIMI_BIN, "kimi", path.join(process.env.CODEX_RUN_HOME || process.env.HOME || "/home/ec2-user", ".local", "bin", "kimi"));
+
 // git binary used by worktree.mjs (job worktree push-back) and handoff.mjs
 // (handoff clone/commit/push). One definition so both stay in sync.
 const gitBin = process.env.RELAYD_GIT_BIN || "git";
@@ -89,6 +91,8 @@ const runHome = process.env.CODEX_RUN_HOME || process.env.HOME || "/home/ec2-use
 const codexHome = process.env.CODEX_HOME || path.join(runHome, ".codex");
 
 const claudeHome = process.env.CLAUDE_HOME || path.join(runHome, ".claude");
+
+const kimiHome = process.env.KIMI_CODE_HOME || path.join(runHome, ".kimi-code");
 
 const npmCacheDir = process.env.NPM_CONFIG_CACHE || process.env.npm_config_cache || path.join(runHome, ".npm-cache");
 
@@ -182,7 +186,7 @@ const terminalStatuses = new Set(["succeeded", "failed", "cancelled", "timeout"]
 
 const allowedReasoningEfforts = new Set(["low", "medium", "high", "xhigh"]);
 
-const allowedJobProviders = new Set(["codex", "claude", "cursor"]);
+const allowedJobProviders = new Set(["codex", "claude", "cursor", "kimi"]);
 
 const allowedChatProviders = new Set(["codex", "azure", "bedrock"]);
 
@@ -833,7 +837,7 @@ function compileDenyPattern(pattern) {
 
 function cleanOptionalModel(value) {
   if (value === undefined || value === null || value === "") return null;
-  if (typeof value !== "string" || !/^[A-Za-z0-9._:-]{1,100}$/.test(value)) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9._:/-]{1,180}$/.test(value)) {
     throw Object.assign(new Error("model is invalid"), { status: 400 });
   }
   return value;
@@ -894,10 +898,12 @@ export {
   codexBin,
   claudeBin,
   cursorBin,
+  kimiBin,
   gitBin,
   runHome,
   codexHome,
   claudeHome,
+  kimiHome,
   npmCacheDir,
   bunCacheDir,
   dangerousMode,

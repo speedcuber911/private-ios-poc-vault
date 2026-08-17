@@ -114,7 +114,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/codex/jobs":
             body = self.read_json_body()
             provider = str(body.get("provider") or "codex")
-            if provider not in {"codex", "claude", "cursor"}:
+            if provider not in {"codex", "claude", "cursor", "kimi"}:
                 provider = "codex"
             model = body.get("model")
             prompt = body.get("prompt")
@@ -244,7 +244,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/v1/codex/skills":
             provider = parse_qs(query).get("provider", ["codex"])[0]
-            if provider not in {"codex", "claude", "cursor"}:
+            if provider not in {"codex", "claude", "cursor", "kimi"}:
                 self.send_json_error(400, "provider is invalid")
                 return
             self.send_json({"provider": provider, "skills": codex_fixture_skills(provider)})
@@ -1061,6 +1061,7 @@ def _sim_task_entries() -> list[dict]:
         {"id": "claude-code-opus", "label": "Claude Code · Opus", "provider": "claude", "modes": ["task"], "taskModel": "opus", "effortLevels": claude_effort},
         {"id": "claude-code-haiku", "label": "Claude Code · Haiku", "provider": "claude", "modes": ["task"], "taskModel": "haiku", "effortLevels": claude_effort},
         {"id": "cursor-agent-auto", "label": "Cursor Agent · Auto", "provider": "cursor", "modes": ["task"], "taskModel": "auto", "effortLevels": []},
+        {"id": "kimi-k3", "label": "Kimi K3", "provider": "kimi", "modes": ["task"], "taskModel": "kimi-code/k3", "effortLevels": []},
     ]
     return entries
 

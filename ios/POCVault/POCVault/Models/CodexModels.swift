@@ -308,6 +308,7 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
     case codex
     case claude
     case cursor
+    case kimi
     case bedrock
     case azure
 
@@ -329,6 +330,8 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
             self = .claude
         case "cursor", "cursor-agent":
             self = .cursor
+        case "kimi", "kimi-code", "moonshot":
+            self = .kimi
         case "codex", "openai", .none:
             self = .codex
         default:
@@ -354,6 +357,8 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
             return "Claude Code"
         case .cursor:
             return "Cursor"
+        case .kimi:
+            return "Kimi K3"
         case .bedrock:
             return "Bedrock"
         case .azure:
@@ -373,7 +378,7 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .codex:
             return .xhigh
-        case .claude, .cursor, .bedrock, .azure:
+        case .claude, .cursor, .kimi, .bedrock, .azure:
             return .high
         }
     }
@@ -433,6 +438,9 @@ struct RelayHarnessStatus: Decodable, Hashable, Identifiable {
         guard loggedIn == false else { return nil }
         if provider == .cursor {
             return "Run cursor-agent login on the computer, then try again."
+        }
+        if provider == .kimi {
+            return "Run kimi login on the computer, then try again."
         }
         return "Run relay sync-auth on your Mac to connect \(provider.displayName), then try again."
     }

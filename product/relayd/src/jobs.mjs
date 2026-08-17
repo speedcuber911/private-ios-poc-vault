@@ -8,7 +8,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { dataDir, jobsDir, logsDir, attachmentsDir, artifactsDir, approvalsDir, codexBin, claudeBin, cursorBin, runHome, codexHome, npmCacheDir, bunCacheDir, codexTransport, maxConcurrent, maxJobStreams, jobStreamHeartbeatMs, maxBodyBytes, maxJobAttachments, maxJobAttachmentBytes, maxJobAttachmentTotalBytes, maxOutputBytes, maxJobSkills, maxSkillPromptBytes, responseOutputBytes, listOutputBytes, maxTimeoutMs, defaultTimeoutMs, terminalStatuses, allowedReasoningEfforts, allowedJobProviders, allowedClaudePermissionModes, allowedCodexApprovalPolicies, claudeAwsProfile, claudeAwsRegion, claudeDefaultModel, cleanOptionalModel, normalizeClaudeModel, realpathOrResolve } from "./config.mjs";
+import { dataDir, jobsDir, logsDir, attachmentsDir, artifactsDir, approvalsDir, codexBin, claudeBin, cursorBin, kimiBin, runHome, codexHome, kimiHome, npmCacheDir, bunCacheDir, codexTransport, maxConcurrent, maxJobStreams, jobStreamHeartbeatMs, maxBodyBytes, maxJobAttachments, maxJobAttachmentBytes, maxJobAttachmentTotalBytes, maxOutputBytes, maxJobSkills, maxSkillPromptBytes, responseOutputBytes, listOutputBytes, maxTimeoutMs, defaultTimeoutMs, terminalStatuses, allowedReasoningEfforts, allowedJobProviders, allowedClaudePermissionModes, allowedCodexApprovalPolicies, claudeAwsProfile, claudeAwsRegion, claudeDefaultModel, cleanOptionalModel, normalizeClaudeModel, realpathOrResolve } from "./config.mjs";
 import { nowIso, durationMs, sendError, initSse, sendSse, isSafeJobId, headerValue, shapeTextPayload, prefixByBytes, cleanAssistantResult, cleanApiText, readTextFileBounded } from "./util.mjs";
 import { appendAudit } from "./audit.mjs";
 import { resolveWorkspaceById, cleanWorkspaceId } from "./workspaces.mjs";
@@ -18,6 +18,8 @@ import { extractJobArtifacts, sanitizePersistedArtifacts, publicArtifactResponse
 import { buildCodexArgs } from "./adapters/codex.mjs";
 import { buildClaudeArgs } from "./adapters/claude.mjs";
 import { buildCursorArgs, parseCursorResult } from "./adapters/cursor.mjs";
+import { buildKimiArgs, parseKimiResult } from "./adapters/kimi.mjs";
+import { isResumableSessionId, isKimiSessionId } from "./sessionid.mjs";
 import { store } from "./store.mjs";
 import { emitEvent } from "./events.mjs";
 import { prepareJobWorkdir, completeJobWorktree } from "./worktree.mjs";
@@ -164,7 +166,7 @@ function createJob(body, certSubject, validatedTaskSelection = null) {
     model: requestedModel,
     reasoningEffort: requestedReasoningEffort,
   });
-  const resumeSessionId = cleanOptionalSessionId(body.resumeSessionId);
+  const resumeSessionId = cleanOptionalSessionId(body.resumeSessionId, provider);
   if (resumeSessionId) {
     const resumeMeta = findThreadResumeMeta(resumeSessionId);
     if (!resumeMeta) {
@@ -290,11 +292,11 @@ function cleanProviderModel(provider, value) {
 function cleanOptionalProvider(value) {
   if (value === undefined || value === null || value === "") return "codex";
   if (typeof value !== "string") {
-    throw Object.assign(new Error("provider must be codex, claude, or cursor"), { status: 400 });
+    throw Object.assign(new Error("provider must be codex, claude, cursor, or kimi"), { status: 400 });
   }
   const normalized = value.trim().toLowerCase();
   if (!allowedJobProviders.has(normalized)) {
-    throw Object.assign(new Error("provider must be codex, claude, or cursor"), { status: 400 });
+    throw Object.assign(new Error("provider must be codex, claude, cursor, or kimi"), { status: 400 });
   }
   return normalized;
 }
@@ -462,7 +464,13 @@ function promptWithAttachments(prompt, attachments) {
 
 function promptWithSelectedSkills(prompt, provider, skills) {
   if (!skills.length) return prompt;
-  const label = provider === "claude" ? "Claude" : provider === "cursor" ? "Cursor" : "Codex";
+  const label = provider === "claude"
+    ? "Claude"
+    : provider === "cursor"
+      ? "Cursor"
+      : provider === "kimi"
+        ? "Kimi"
+        : "Codex";
   const blocks = skills
     .map((skill) => {
       const body = boundedSkillBody(skill.file);
@@ -538,7 +546,10 @@ function removePathInsideRoot(target, rootDir) {
 
 function jobThreadId(job) {
   const sessionId = job?.sessionId || job?.resumeSessionId;
-  return typeof sessionId === "string" && isSafeJobId(sessionId) ? sessionId : null;
+  const valid = normalizeJobProvider(job?.provider) === "kimi"
+    ? isKimiSessionId(sessionId)
+    : isResumableSessionId(sessionId);
+  return valid ? sessionId : null;
 }
 
 
@@ -628,7 +639,13 @@ function startJob(job) {
     pendingApprovalCount: 0,
     stdoutStream,
     stderrStream,
-    sessionIdsBefore: job.provider === "codex" && !job.resumeSessionId ? workspaceSessionIdSet(job.workspacePath) : null,
+    sessionIdsBefore: !job.resumeSessionId
+      ? job.provider === "codex"
+        ? workspaceSessionIdSet(job.workspacePath)
+        : job.provider === "kimi"
+          ? kimiSessionIdSet()
+          : null
+      : null,
   };
   activeChildren.set(job.id, active);
 
@@ -694,6 +711,7 @@ function startJob(job) {
 function buildJobArgs(job) {
   if (job.provider === "claude") return buildClaudeArgs(job);
   if (job.provider === "cursor") return buildCursorArgs(job);
+  if (job.provider === "kimi") return buildKimiArgs(job);
   return codexTransport === "app-server" ? [codexJobRunner] : buildCodexArgs(job);
 }
 
@@ -701,6 +719,7 @@ function buildJobArgs(job) {
 function jobBinary(provider) {
   if (provider === "claude") return claudeBin;
   if (provider === "cursor") return cursorBin;
+  if (provider === "kimi") return kimiBin;
   return codexTransport === "app-server" ? process.execPath : codexBin;
 }
 
@@ -710,6 +729,7 @@ function buildJobEnv(job) {
     ...process.env,
     HOME: runHome,
     CODEX_HOME: codexHome,
+    KIMI_CODE_HOME: kimiHome,
     NPM_CONFIG_CACHE: npmCacheDir,
     npm_config_cache: npmCacheDir,
     NPM_CONFIG_LOGLEVEL: process.env.NPM_CONFIG_LOGLEVEL || "error",
@@ -736,9 +756,9 @@ function buildJobEnv(job) {
   if (job.reasoningEffort) env.RELAY_REASONING_EFFORT = job.reasoningEffort;
   if (job.resumeSessionId) env.RELAY_RESUME_SESSION_ID = job.resumeSessionId;
 
-  if (job.provider === "cursor") {
-    // Direct Cursor subscription jobs never inherit ambient AWS credential or
-    // Bedrock configuration, mirroring the direct Claude scrub.
+  if (job.provider === "cursor" || job.provider === "kimi") {
+    // Direct Cursor and Kimi subscription jobs never inherit ambient AWS
+    // credential or Bedrock configuration, mirroring direct Claude auth.
     delete env.AWS_ACCESS_KEY_ID;
     delete env.AWS_SECRET_ACCESS_KEY;
     delete env.AWS_SESSION_TOKEN;
@@ -781,7 +801,13 @@ function buildJobEnv(job) {
 
 function buildExecutionReceipt(job) {
   const provider = normalizeJobProvider(job.provider);
-  const providerBin = provider === "claude" ? claudeBin : provider === "cursor" ? cursorBin : codexBin;
+  const providerBin = provider === "claude"
+    ? claudeBin
+    : provider === "cursor"
+      ? cursorBin
+      : provider === "kimi"
+        ? kimiBin
+        : codexBin;
   return {
     provider,
     transport: provider === "codex" ? codexTransport : "cli",
@@ -1221,12 +1247,13 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
 
   const finishedAt = nowIso();
   const stderrText = cleanApiText(stderr).trim();
-  const stdoutResultProvider = job.provider === "claude" || job.provider === "cursor";
+  const stdoutResultProvider = job.provider === "claude" || job.provider === "cursor" || job.provider === "kimi";
   const resultText = stdoutResultProvider
     ? await readTextFileBounded(job.stdoutPath, maxOutputBytes)
     : await readTextFileBounded(job.resultPath, maxOutputBytes);
   const cursorResult = job.provider === "cursor" ? parseCursorResult(resultText) : null;
-  const cleanResult = cleanAssistantResult(cursorResult?.result ?? resultText).trim();
+  const kimiResult = job.provider === "kimi" ? parseKimiResult(resultText) : null;
+  const cleanResult = cleanAssistantResult(cursorResult?.result ?? kimiResult?.result ?? resultText).trim();
   const failedOutputText = stdoutResultProvider ? cleanResult : "";
 
   job.updatedAt = finishedAt;
@@ -1235,7 +1262,14 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
   job.exitCode = code;
   job.timedOut = active.timedOut;
   const appServerSessionId = await readTextFileBounded(path.join(logsDir, `${job.id}.session-id`), 512).catch(() => "");
-  job.sessionId ||= cursorResult?.sessionId || appServerSessionId.trim() || job.resumeSessionId || findNewWorkspaceSessionId(job, active.sessionIdsBefore);
+  job.sessionId ||=
+    cursorResult?.sessionId ||
+    kimiResult?.sessionId ||
+    appServerSessionId.trim() ||
+    job.resumeSessionId ||
+    (job.provider === "kimi"
+      ? findNewKimiSessionId(job.worktree?.path || job.workspacePath, active.sessionIdsBefore)
+      : findNewWorkspaceSessionId(job, active.sessionIdsBefore));
 
   if (active.cancelRequested) {
     job.status = "cancelled";
@@ -1253,7 +1287,8 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
     job.status = "failed";
     job.result = null;
     job.artifacts = [];
-    job.error = `${job.provider === "cursor" ? "Cursor" : "Claude"} exited successfully without producing output.`;
+    const providerName = job.provider === "cursor" ? "Cursor" : job.provider === "kimi" ? "Kimi K3" : "Claude";
+    job.error = `${providerName} exited successfully without producing output.`;
   } else if (code === 0) {
     job.status = "succeeded";
     job.result = cleanResult || null;
@@ -1355,6 +1390,42 @@ function appendBounded(current, chunk) {
 
 function workspaceSessionIdSet(workspacePath) {
   return new Set(workspaceSessionEntries(workspacePath).map((entry) => entry.id));
+}
+
+
+function kimiSessionIdSet() {
+  return new Set(kimiSessionEntries().map((entry) => entry.id));
+}
+
+
+function findNewKimiSessionId(workspacePath, sessionIdsBefore) {
+  if (!sessionIdsBefore) return null;
+  const resolvedWorkspacePath = realpathOrResolve(workspacePath);
+  const candidates = kimiSessionEntries().filter((entry) =>
+    !sessionIdsBefore.has(entry.id) && realpathOrResolve(entry.workDir) === resolvedWorkspacePath,
+  );
+  return candidates.length === 1 ? candidates[0].id : null;
+}
+
+
+function kimiSessionEntries() {
+  let raw;
+  try {
+    raw = fs.readFileSync(path.join(kimiHome, "session_index.jsonl"), "utf8");
+  } catch {
+    return [];
+  }
+  const entries = [];
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line);
+      if (!isKimiSessionId(entry?.sessionId)) continue;
+      if (typeof entry.workDir !== "string" || !entry.workDir || /[\0\r\n]/.test(entry.workDir)) continue;
+      entries.push({ id: entry.sessionId, workDir: entry.workDir });
+    } catch {}
+  }
+  return entries;
 }
 
 
@@ -1540,6 +1611,9 @@ export {
   workspaceSessionIdSet,
   findNewWorkspaceSessionId,
   workspaceSessionEntries,
+  kimiSessionIdSet,
+  findNewKimiSessionId,
+  kimiSessionEntries,
   toJobResponse,
   sanitizeAttachmentResponses,
 };

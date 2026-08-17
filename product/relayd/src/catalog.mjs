@@ -7,7 +7,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 
-import { allowedThreadProviders, bedrockRegion, cleanDisplayName, cleanOptionalEndpoint, cleanOptionalFilePath, cleanEnvironmentVariableName, cleanOptionalAwsProfile, codexBin, cursorBin, codexHome, runHome, codexTransport, workspaceBrowseRoot } from "./config.mjs";
+import { allowedThreadProviders, bedrockRegion, cleanDisplayName, cleanOptionalEndpoint, cleanOptionalFilePath, cleanEnvironmentVariableName, cleanOptionalAwsProfile, codexBin, cursorBin, kimiBin, codexHome, runHome, codexTransport, workspaceBrowseRoot } from "./config.mjs";
 import { AppServerClient } from "./appserver-client.mjs";
 
 const modelCatalog = loadModelCatalog();
@@ -126,6 +126,16 @@ function defaultModelCatalog() {
       effortLevels: [],
     });
   }
+  if (fs.existsSync(kimiBin)) {
+    catalog.push({
+      id: "kimi-k3",
+      label: "Kimi K3",
+      provider: "kimi",
+      modes: ["task"],
+      taskModel: "kimi-code/k3",
+      effortLevels: [],
+    });
+  }
   // Bedrock is opt-in, exactly like Azure below it. It was unconditional, so
   // every node — including every trial sandbox — advertised a "Claude Sonnet
   // (Bedrock)" chat model that could not work: Bedrock needs AWS credentials
@@ -210,7 +220,7 @@ function cleanModelProvider(value) {
   }
   const normalized = value.trim().toLowerCase();
   if (!allowedThreadProviders.has(normalized)) {
-    throw new Error("model provider must be codex, claude, cursor, azure, or bedrock");
+    throw new Error("model provider must be codex, claude, cursor, kimi, azure, or bedrock");
   }
   return normalized;
 }

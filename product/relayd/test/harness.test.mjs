@@ -63,6 +63,7 @@ async function startServer(extraEnv = {}) {
       CODEX_BIN: fakeCodex,
       CLAUDE_BIN: fakeClaude,
       CURSOR_BIN: path.join(dir, "missing-cursor"),
+      KIMI_BIN: path.join(dir, "missing-kimi"),
       ...extraEnv,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -124,6 +125,10 @@ test("GET /v1/harness detects installed CLIs with versions and capability flags"
     assert.equal(byProvider.cursor.version, null);
     assert.equal(byProvider.cursor.loggedIn, false);
     assert.equal(byProvider.cursor.lastSmoke, null);
+    assert.equal(byProvider.kimi.installed, false);
+    assert.equal(byProvider.kimi.loggedIn, false);
+    assert.equal(byProvider.kimi.taskControls.model, true);
+    assert.equal(byProvider.kimi.taskControls.reasoningEffort, false);
   } finally {
     await server.stop();
   }
@@ -219,7 +224,7 @@ test("smoke op: succeeds with output, updates lastSmoke; unknown provider is 400
 
     const bad = await fetch(`${server.baseUrl}/v1/harness/gemini/smoke`, { method: "POST" });
     assert.equal(bad.status, 400);
-    assert.match((await bad.json()).error, /provider must be codex, claude, or cursor/);
+    assert.match((await bad.json()).error, /provider must be codex, claude, cursor, or kimi/);
 
     // Smoke against a missing binary fails but doesn't wedge the op.
     const missing = await fetch(`${server.baseUrl}/v1/harness/cursor/smoke`, { method: "POST" });

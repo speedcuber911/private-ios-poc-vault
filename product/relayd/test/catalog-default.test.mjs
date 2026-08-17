@@ -22,6 +22,7 @@ import path from "node:path";
 
 process.env.CODEX_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-catalog-"));
 process.env.CURSOR_BIN = path.join(process.env.CODEX_DATA_DIR, "unconfigured-cursor-agent");
+process.env.KIMI_BIN = path.join(process.env.CODEX_DATA_DIR, "unconfigured-kimi");
 
 const { defaultModelCatalog } = await import("../src/catalog.mjs");
 

@@ -32,9 +32,11 @@ const auditPath = path.join(dataDir, "audit.jsonl");
 const codexBin = process.env.CODEX_BIN || "/usr/bin/codex";
 const claudeBin = process.env.CLAUDE_BIN || "/usr/bin/claude";
 const cursorBin = process.env.CURSOR_BIN || path.join(process.env.CODEX_RUN_HOME || process.env.HOME || "/home/ec2-user", ".local", "bin", "cursor-agent");
+const kimiBin = process.env.KIMI_BIN || path.join(process.env.CODEX_RUN_HOME || process.env.HOME || "/home/ec2-user", ".local", "bin", "kimi");
 const runHome = process.env.CODEX_RUN_HOME || process.env.HOME || "/home/ec2-user";
 const codexHome = process.env.CODEX_HOME || path.join(runHome, ".codex");
 const claudeHome = process.env.CLAUDE_HOME || path.join(runHome, ".claude");
+const kimiHome = process.env.KIMI_CODE_HOME || path.join(runHome, ".kimi-code");
 const npmCacheDir = process.env.NPM_CONFIG_CACHE || process.env.npm_config_cache || path.join(runHome, ".npm-cache");
 const bunCacheDir = process.env.BUN_INSTALL_CACHE_DIR || path.join(runHome, ".bun-cache");
 const dangerousMode = parseBooleanEnv("CODEX_DANGEROUS_MODE", true);
@@ -95,7 +97,7 @@ const fsReadDenylist = splitCsv(
 
 const terminalStatuses = new Set(["succeeded", "failed", "cancelled", "timeout"]);
 const allowedReasoningEfforts = new Set(["low", "medium", "high", "xhigh"]);
-const allowedJobProviders = new Set(["codex", "claude", "cursor"]);
+const allowedJobProviders = new Set(["codex", "claude", "cursor", "kimi"]);
 const allowedChatProviders = new Set(["codex", "azure", "bedrock"]);
 const allowedThreadProviders = new Set([...allowedJobProviders, ...allowedChatProviders]);
 const allowedClaudePermissionModes = new Set(["acceptEdits", "auto", "bypassPermissions", "default", "manual", "dontAsk", "plan"]);
@@ -157,6 +159,17 @@ const providerCapabilities = {
     },
   },
   cursor: {
+    supportsApprovals: false,
+    supportsResume: true,
+    supportsChat: false,
+    taskControls: {
+      model: true,
+      reasoningEffort: false,
+      permissionModes: [],
+      approvalPolicies: [],
+    },
+  },
+  kimi: {
     supportsApprovals: false,
     supportsResume: true,
     supportsChat: false,
@@ -375,6 +388,16 @@ function defaultModelCatalog() {
       effortLevels: [],
     });
   }
+  if (fs.existsSync(kimiBin)) {
+    catalog.push({
+      id: "kimi-k3",
+      label: "Kimi K3",
+      provider: "kimi",
+      modes: ["task"],
+      taskModel: "kimi-code/k3",
+      effortLevels: [],
+    });
+  }
   if (process.env.BEDROCK_CHAT_MODEL) {
     catalog.unshift({
       id: process.env.BEDROCK_CHAT_MODEL,
@@ -450,7 +473,7 @@ function cleanModelProvider(value) {
   }
   const normalized = value.trim().toLowerCase();
   if (!allowedThreadProviders.has(normalized)) {
-    throw new Error("model provider must be codex, claude, cursor, azure, or bedrock");
+    throw new Error("model provider must be codex, claude, cursor, kimi, azure, or bedrock");
   }
   return normalized;
 }
@@ -1726,7 +1749,7 @@ async function routeRequest(req, res) {
     const sessionId = decodeURIComponent(threadMatch[1]);
     const workspaceId = url.searchParams.get("workspaceId");
     const provider = cleanThreadProviderFilter(url.searchParams.get("provider"));
-    if (!isSafeJobId(sessionId)) return sendError(res, 404, "thread not found");
+    if (!isThreadSessionId(sessionId)) return sendError(res, 404, "thread not found");
     const detail = await threadDetailResponse(sessionId, { workspaceId, provider });
     if (!detail) return sendError(res, 404, "thread not found");
     return sendJson(res, 200, detail);
@@ -1736,7 +1759,7 @@ async function routeRequest(req, res) {
     const sessionId = decodeURIComponent(threadMatch[1]);
     const workspaceId = url.searchParams.get("workspaceId");
     const provider = cleanThreadProviderFilter(url.searchParams.get("provider"));
-    if (!isSafeJobId(sessionId)) return sendError(res, 404, "thread not found");
+    if (!isThreadSessionId(sessionId)) return sendError(res, 404, "thread not found");
     const deleted = deleteThread(sessionId, { workspaceId, provider, certSubject: auth.subject });
     if (!deleted) return sendError(res, 404, "thread not found");
     return sendJson(res, 200, deleted);
@@ -1842,6 +1865,7 @@ function healthPayload(authenticated) {
 function providerBinaryForReadiness(provider) {
   if (provider === "claude") return claudeBin;
   if (provider === "cursor") return cursorBin;
+  if (provider === "kimi") return kimiBin;
   return codexBin;
 }
 
@@ -1852,8 +1876,8 @@ function providerReadinessArgs(provider) {
 }
 
 function providerReadinessEnv(provider) {
-  const env = { ...process.env, HOME: runHome, CODEX_HOME: codexHome };
-  if (provider === "claude" || provider === "cursor") {
+  const env = { ...process.env, HOME: runHome, CODEX_HOME: codexHome, KIMI_CODE_HOME: kimiHome };
+  if (provider === "claude" || provider === "cursor" || provider === "kimi") {
     delete env.AWS_ACCESS_KEY_ID;
     delete env.AWS_SECRET_ACCESS_KEY;
     delete env.AWS_SESSION_TOKEN;
@@ -1865,6 +1889,15 @@ function providerReadinessEnv(provider) {
     delete env.CLAUDE_AWS_PROFILE;
   }
   return env;
+}
+
+function detectKimiAuth() {
+  try {
+    const hasCredential = fs.readdirSync(path.join(kimiHome, "credentials"), { withFileTypes: true })
+      .some((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".json"));
+    if (hasCredential) return { loggedIn: true, authKind: "subscription" };
+  } catch {}
+  return { loggedIn: false, authKind: "unknown" };
 }
 
 function parsedAuthJson(text) {
@@ -1887,6 +1920,7 @@ function providerIsConfirmedSignedOut(provider, output) {
 function providerDisplayName(provider) {
   if (provider === "claude") return "Claude Code";
   if (provider === "cursor") return "Cursor";
+  if (provider === "kimi") return "Kimi K3";
   return "Codex";
 }
 
@@ -1923,6 +1957,7 @@ function providerAuthState(provider, output, commandSucceeded) {
 }
 
 function detectProviderAuth(provider) {
+  if (provider === "kimi") return detectKimiAuth();
   const binary = providerBinaryForReadiness(provider);
   try {
     const output = execFileSync(binary, providerReadinessArgs(provider), {
@@ -1974,28 +2009,32 @@ function assertProviderReady(provider, requirements = {}) {
   if (!fs.existsSync(binary)) {
     throw Object.assign(new Error(`${providerDisplayName(provider)} is not installed on this computer.`), { status: 503 });
   }
-  let confirmedSignedOut = false;
-  try {
-    const output = execFileSync(binary, providerReadinessArgs(provider), {
-      encoding: "utf8",
-      timeout: 10000,
-      env: providerReadinessEnv(provider),
-      cwd: runHome,
-    });
-    confirmedSignedOut = providerIsConfirmedSignedOut(provider, output);
-  } catch (error) {
-    const output = [error?.stdout, error?.stderr]
-      .map((value) => Buffer.isBuffer(value) ? value.toString("utf8") : String(value || ""))
-      .join("\n");
-    // Unknown/older status commands remain compatible. Only a provider's
-    // explicit signed-out result blocks a task.
-    confirmedSignedOut = providerIsConfirmedSignedOut(provider, output);
+  let confirmedSignedOut = provider === "kimi" ? detectKimiAuth().loggedIn === false : false;
+  if (provider !== "kimi") {
+    try {
+      const output = execFileSync(binary, providerReadinessArgs(provider), {
+        encoding: "utf8",
+        timeout: 10000,
+        env: providerReadinessEnv(provider),
+        cwd: runHome,
+      });
+      confirmedSignedOut = providerIsConfirmedSignedOut(provider, output);
+    } catch (error) {
+      const output = [error?.stdout, error?.stderr]
+        .map((value) => Buffer.isBuffer(value) ? value.toString("utf8") : String(value || ""))
+        .join("\n");
+      // Unknown/older status commands remain compatible. Only a provider's
+      // explicit signed-out result blocks a task.
+      confirmedSignedOut = providerIsConfirmedSignedOut(provider, output);
+    }
   }
   if (confirmedSignedOut) {
     const displayName = providerDisplayName(provider);
     const action = provider === "cursor"
       ? "Run cursor-agent login on the computer, then try again."
-      : `Run relay sync-auth on your Mac to connect ${displayName}, then try again.`;
+      : provider === "kimi"
+        ? "Run kimi login on the computer, then try again."
+        : `Run relay sync-auth on your Mac to connect ${displayName}, then try again.`;
     throw Object.assign(new Error(`${displayName} is not connected on this computer. ${action}`), { status: 503 });
   }
   if (provider === "claude" && requirements.reasoningEffort && !claudeSupportsEffort()) {
@@ -2049,6 +2088,18 @@ function clampLimit(value) {
 
 function isSafeJobId(id) {
   return /^[a-f0-9-]{36}$/.test(id);
+}
+
+function isResumableSessionId(id) {
+  return typeof id === "string" && /^[a-f0-9-]{36}$/.test(id);
+}
+
+function isKimiSessionId(id) {
+  return typeof id === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(id);
+}
+
+function isThreadSessionId(id) {
+  return isResumableSessionId(id) || isKimiSessionId(id);
 }
 
 function isSafeArtifactId(id) {
@@ -2810,7 +2861,7 @@ function createJob(body, certSubject, validatedTaskSelection = null) {
     model: requestedModel,
     reasoningEffort: requestedReasoningEffort,
   });
-  const resumeSessionId = cleanOptionalSessionId(body.resumeSessionId);
+  const resumeSessionId = cleanOptionalSessionId(body.resumeSessionId, provider);
   if (resumeSessionId) {
     const resumeMeta = findThreadResumeMeta(resumeSessionId);
     if (!resumeMeta) {
@@ -2899,7 +2950,7 @@ function validateProviderControlFields(provider, body) {
 
 function cleanOptionalModel(value) {
   if (value === undefined || value === null || value === "") return null;
-  if (typeof value !== "string" || !/^[A-Za-z0-9._:-]{1,100}$/.test(value)) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9._:/-]{1,180}$/.test(value)) {
     throw Object.assign(new Error("model is invalid"), { status: 400 });
   }
   return value;
@@ -2927,11 +2978,11 @@ function normalizeClaudeModel(model) {
 function cleanOptionalProvider(value) {
   if (value === undefined || value === null || value === "") return "codex";
   if (typeof value !== "string") {
-    throw Object.assign(new Error("provider must be codex, claude, or cursor"), { status: 400 });
+    throw Object.assign(new Error("provider must be codex, claude, cursor, or kimi"), { status: 400 });
   }
   const normalized = value.trim().toLowerCase();
   if (!allowedJobProviders.has(normalized)) {
-    throw Object.assign(new Error("provider must be codex, claude, or cursor"), { status: 400 });
+    throw Object.assign(new Error("provider must be codex, claude, cursor, or kimi"), { status: 400 });
   }
   return normalized;
 }
@@ -2948,7 +2999,7 @@ function cleanThreadProviderFilter(value) {
   }
   const normalized = value.trim().toLowerCase();
   if (!allowedThreadProviders.has(normalized)) {
-    throw Object.assign(new Error("provider must be codex, claude, cursor, azure, or bedrock"), { status: 400 });
+    throw Object.assign(new Error("provider must be codex, claude, cursor, kimi, azure, or bedrock"), { status: 400 });
   }
   return normalized;
 }
@@ -2995,6 +3046,16 @@ function skillRoots(provider, workspacePath = null) {
       ...splitPathList(process.env.CURSOR_SKILL_DIRS),
       path.join(runHome, ".cursor", "skills-cursor"),
       path.join(runHome, ".cursor", "skills"),
+    ]);
+  }
+
+  if (provider === "kimi") {
+    return uniqueExistingDirectories([
+      projectRoot && path.join(projectRoot, ".kimi-code", "skills"),
+      projectRoot && path.join(projectRoot, ".agents", "skills"),
+      ...splitPathList(process.env.KIMI_SKILL_DIRS),
+      path.join(kimiHome, "skills"),
+      path.join(runHome, ".agents", "skills"),
     ]);
   }
 
@@ -3320,7 +3381,13 @@ function promptWithAttachments(prompt, attachments) {
 
 function promptWithSelectedSkills(prompt, provider, skills) {
   if (!skills.length) return prompt;
-  const label = provider === "claude" ? "Claude" : provider === "cursor" ? "Cursor" : "Codex";
+  const label = provider === "claude"
+    ? "Claude"
+    : provider === "cursor"
+      ? "Cursor"
+      : provider === "kimi"
+        ? "Kimi"
+        : "Codex";
   const blocks = skills
     .map((skill) => {
       const body = boundedSkillBody(skill.file);
@@ -3687,9 +3754,10 @@ function assembleStaticHtml(html, cssBlocks, jsBlocks) {
   return document;
 }
 
-function cleanOptionalSessionId(value) {
+function cleanOptionalSessionId(value, provider = "codex") {
   if (value === undefined || value === null || value === "") return null;
-  if (typeof value !== "string" || !isSafeJobId(value)) {
+  const valid = provider === "kimi" ? isKimiSessionId(value) : isResumableSessionId(value);
+  if (!valid) {
     throw Object.assign(new Error("resumeSessionId is invalid"), { status: 400 });
   }
   return value;
@@ -4243,7 +4311,10 @@ function removePathInsideRoot(target, rootDir) {
 
 function jobThreadId(job) {
   const sessionId = job?.sessionId || job?.resumeSessionId;
-  return typeof sessionId === "string" && isSafeJobId(sessionId) ? sessionId : null;
+  const valid = normalizeJobProvider(job?.provider) === "kimi"
+    ? isKimiSessionId(sessionId)
+    : isResumableSessionId(sessionId);
+  return valid ? sessionId : null;
 }
 
 function chatPath(threadId) {
@@ -4723,7 +4794,13 @@ function startJob(job) {
     pendingApprovalCount: 0,
     stdoutStream,
     stderrStream,
-    sessionIdsBefore: job.provider === "codex" && !job.resumeSessionId ? workspaceSessionIdSet(job.workspacePath) : null,
+    sessionIdsBefore: !job.resumeSessionId
+      ? job.provider === "codex"
+        ? workspaceSessionIdSet(job.workspacePath)
+        : job.provider === "kimi"
+          ? kimiSessionIdSet()
+          : null
+      : null,
   };
   activeChildren.set(job.id, active);
 
@@ -4786,6 +4863,7 @@ function startJob(job) {
 function buildJobArgs(job) {
   if (job.provider === "claude") return buildClaudeArgs(job);
   if (job.provider === "cursor") return buildCursorArgs(job);
+  if (job.provider === "kimi") return buildKimiArgs(job);
   return codexTransport === "app-server"
     ? [path.join(helperDir, "codex-job-runner.mjs")]
     : buildCodexArgs(job);
@@ -4794,6 +4872,7 @@ function buildJobArgs(job) {
 function jobBinary(provider) {
   if (provider === "claude") return claudeBin;
   if (provider === "cursor") return cursorBin;
+  if (provider === "kimi") return kimiBin;
   return codexTransport === "app-server" ? process.execPath : codexBin;
 }
 
@@ -4802,6 +4881,7 @@ function buildJobEnv(job) {
     ...process.env,
     HOME: runHome,
     CODEX_HOME: codexHome,
+    KIMI_CODE_HOME: kimiHome,
     NPM_CONFIG_CACHE: npmCacheDir,
     npm_config_cache: npmCacheDir,
     NPM_CONFIG_LOGLEVEL: process.env.NPM_CONFIG_LOGLEVEL || "error",
@@ -4828,9 +4908,9 @@ function buildJobEnv(job) {
   if (job.reasoningEffort) env.RELAY_REASONING_EFFORT = job.reasoningEffort;
   if (job.resumeSessionId) env.RELAY_RESUME_SESSION_ID = job.resumeSessionId;
 
-  if (job.provider === "cursor") {
-    // Direct Cursor subscription jobs never inherit ambient AWS credential or
-    // Bedrock configuration, mirroring the direct Claude scrub.
+  if (job.provider === "cursor" || job.provider === "kimi") {
+    // Direct Cursor and Kimi subscription jobs never inherit ambient AWS
+    // credential or Bedrock configuration, mirroring direct Claude auth.
     delete env.AWS_ACCESS_KEY_ID;
     delete env.AWS_SECRET_ACCESS_KEY;
     delete env.AWS_SESSION_TOKEN;
@@ -4872,7 +4952,13 @@ function buildJobEnv(job) {
 
 function buildExecutionReceipt(job) {
   const provider = normalizeJobProvider(job.provider);
-  const providerBin = provider === "claude" ? claudeBin : provider === "cursor" ? cursorBin : codexBin;
+  const providerBin = provider === "claude"
+    ? claudeBin
+    : provider === "cursor"
+      ? cursorBin
+      : provider === "kimi"
+        ? kimiBin
+        : codexBin;
   return {
     provider,
     transport: provider === "codex" ? codexTransport : "cli",
@@ -4962,6 +5048,14 @@ function buildCursorArgs(job) {
   if (job.model) args.push("--model", job.model);
   if (job.resumeSessionId) args.push("--resume", job.resumeSessionId);
   args.push(job.codexPrompt || job.prompt);
+  return args;
+}
+
+function buildKimiArgs(job) {
+  const args = [];
+  if (job.resumeSessionId) args.push("--session", job.resumeSessionId);
+  args.push("--model", job.model || "kimi-code/k3");
+  args.push("--prompt", job.codexPrompt || job.prompt, "--output-format", "stream-json");
   return args;
 }
 
@@ -5285,12 +5379,13 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
 
   const finishedAt = nowIso();
   const stderrText = cleanApiText(stderr).trim();
-  const stdoutResultProvider = job.provider === "claude" || job.provider === "cursor";
+  const stdoutResultProvider = job.provider === "claude" || job.provider === "cursor" || job.provider === "kimi";
   const resultText = stdoutResultProvider
     ? await readTextFileBounded(job.stdoutPath, maxOutputBytes)
     : await readTextFileBounded(job.resultPath, maxOutputBytes);
   const cursorResult = job.provider === "cursor" ? parseCursorResult(resultText) : null;
-  const cleanResult = cleanAssistantResult(cursorResult?.result ?? resultText).trim();
+  const kimiResult = job.provider === "kimi" ? parseKimiResult(resultText) : null;
+  const cleanResult = cleanAssistantResult(cursorResult?.result ?? kimiResult?.result ?? resultText).trim();
   const failedOutputText = stdoutResultProvider ? cleanResult : "";
 
   job.updatedAt = finishedAt;
@@ -5299,7 +5394,14 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
   job.exitCode = code;
   job.timedOut = active.timedOut;
   const appServerSessionId = await readTextFileBounded(path.join(logsDir, `${job.id}.session-id`), 512).catch(() => "");
-  job.sessionId ||= cursorResult?.sessionId || appServerSessionId.trim() || job.resumeSessionId || findNewWorkspaceSessionId(job, active.sessionIdsBefore);
+  job.sessionId ||=
+    cursorResult?.sessionId ||
+    kimiResult?.sessionId ||
+    appServerSessionId.trim() ||
+    job.resumeSessionId ||
+    (job.provider === "kimi"
+      ? findNewKimiSessionId(job.workspacePath, active.sessionIdsBefore)
+      : findNewWorkspaceSessionId(job, active.sessionIdsBefore));
 
   if (active.cancelRequested) {
     job.status = "cancelled";
@@ -5317,7 +5419,8 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
     job.status = "failed";
     job.result = null;
     job.artifacts = [];
-    job.error = `${job.provider === "cursor" ? "Cursor" : "Claude"} exited successfully without producing output.`;
+    const providerName = job.provider === "cursor" ? "Cursor" : job.provider === "kimi" ? "Kimi K3" : "Claude";
+    job.error = `${providerName} exited successfully without producing output.`;
   } else if (code === 0) {
     job.status = "succeeded";
     job.result = cleanResult || null;
@@ -5355,6 +5458,37 @@ function parseCursorResult(value) {
   } catch {
     return null;
   }
+}
+
+function kimiContentText(value) {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(kimiContentText).filter(Boolean).join("\n");
+  if (!value || typeof value !== "object") return "";
+  if (typeof value.text === "string") return value.text;
+  if (value.content !== undefined) return kimiContentText(value.content);
+  return "";
+}
+
+function parseKimiResult(value) {
+  let result = "";
+  let sessionId = null;
+  for (const line of cleanApiText(value).split("\n")) {
+    if (!line.trim()) continue;
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const candidateSessionId = entry?.sessionId || entry?.session_id || entry?.session?.id;
+    if (isKimiSessionId(candidateSessionId)) sessionId = candidateSessionId;
+    const message = entry?.message && typeof entry.message === "object" ? entry.message : entry;
+    const role = String(message?.role || message?.type || "").toLowerCase();
+    if (role !== "assistant") continue;
+    const text = kimiContentText(message.content ?? message.text).trim();
+    if (text) result = text;
+  }
+  return { result, sessionId };
 }
 
 function scheduleRuntimeCachePrune() {
@@ -5416,6 +5550,39 @@ function appendBounded(current, chunk) {
 
 function workspaceSessionIdSet(workspacePath) {
   return new Set(workspaceSessionEntries(workspacePath).map((entry) => entry.id));
+}
+
+function kimiSessionIdSet() {
+  return new Set(kimiSessionEntries().map((entry) => entry.id));
+}
+
+function findNewKimiSessionId(workspacePath, sessionIdsBefore) {
+  if (!sessionIdsBefore) return null;
+  const resolvedWorkspacePath = realpathOrResolve(workspacePath);
+  const candidates = kimiSessionEntries().filter((entry) =>
+    !sessionIdsBefore.has(entry.id) && realpathOrResolve(entry.workDir) === resolvedWorkspacePath,
+  );
+  return candidates.length === 1 ? candidates[0].id : null;
+}
+
+function kimiSessionEntries() {
+  let raw;
+  try {
+    raw = fs.readFileSync(path.join(kimiHome, "session_index.jsonl"), "utf8");
+  } catch {
+    return [];
+  }
+  const entries = [];
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line);
+      if (!isKimiSessionId(entry?.sessionId)) continue;
+      if (typeof entry.workDir !== "string" || !entry.workDir || /[\0\r\n]/.test(entry.workDir)) continue;
+      entries.push({ id: entry.sessionId, workDir: entry.workDir });
+    } catch {}
+  }
+  return entries;
 }
 
 function findNewWorkspaceSessionId(job, sessionIdsBefore) {

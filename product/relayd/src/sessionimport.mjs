@@ -797,7 +797,7 @@ function importSession({ manifest, sessionBytes, runHome, codexHome, worktreePat
   // file). requestedHarness keeps that degradation observable instead of
   // silent, so callers/logs can tell what was actually asked for.
   const requestedHarness = manifest.harness;
-  const provider = manifest.harness === "codex" || manifest.harness === "cursor" ? manifest.harness : "claude";
+  const provider = ["codex", "cursor", "kimi"].includes(manifest.harness) ? manifest.harness : "claude";
 
   if (sessionBytes && manifest.sessionFormat === "claude-jsonl" && manifest.sessionId) {
     const sessionId = assertSafeSessionId(manifest.sessionId);
