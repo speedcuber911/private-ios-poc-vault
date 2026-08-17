@@ -91,14 +91,14 @@ private struct WebView: UIViewRepresentable {
         webView.navigationDelegate = context.coordinator
         webView.scrollView.delegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = true
-        webView.load(URLRequest(url: url))
+        webView.load(context.coordinator.authenticatedRequest(for: url))
         return webView
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {
         context.coordinator.onScrollActivityChanged = onScrollActivityChanged
         if uiView.url != url {
-            uiView.load(URLRequest(url: url))
+            uiView.load(context.coordinator.authenticatedRequest(for: url))
         }
     }
 
@@ -116,6 +116,18 @@ private struct WebView: UIViewRepresentable {
             self.identityStore = identityStore
             self.initialHost = initialURL.host(percentEncoded: false) ?? initialURL.host
             self.onScrollActivityChanged = onScrollActivityChanged
+        }
+
+        /// Trial nodes authenticate API/WebView requests with a host-scoped bearer token;
+        /// personal installs continue to use the client-certificate challenge below.
+        /// Artifact previews are self-contained, so the authenticated top-level request is
+        /// sufficient and no token is exposed to page JavaScript or another host.
+        func authenticatedRequest(for url: URL) -> URLRequest {
+            var request = URLRequest(url: url)
+            if let host = url.host, let token = identityStore.deviceToken(for: host) {
+                request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            }
+            return request
         }
 
         func webView(

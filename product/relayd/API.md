@@ -20,6 +20,10 @@ credentials and raw tool inputs never leave that computer.
   `decline`, or `cancel`.
 - `POST /v1/codex/terminals` starts a sandboxed PTY in a registered workspace. The
   returned id supports `/stream`, `/input`, `/resize`, and `/close` subroutes.
+- `POST /v1/codex/previews` turns an HTTP localhost URL returned by a specific job
+  into a 30-minute preview URL. The node proxies only that loopback origin on an
+  unprivileged port; preview subresources use an opaque scoped capability and run
+  in a sandboxed iframe without same-origin access to the Relay API.
 
 Approval responses omit provider request ids and raw tool payloads. Terminal sessions
 are restricted to the selected workspace, have no network access, and do not source the

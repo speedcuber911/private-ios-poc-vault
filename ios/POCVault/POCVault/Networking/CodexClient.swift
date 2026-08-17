@@ -609,16 +609,134 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
             return nil
         }
+        let candidate: URL?
         if let absolute = URL(string: value), absolute.scheme != nil {
-            return absolute
+            candidate = absolute
+        } else if var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) {
+            components.path = value.hasPrefix("/") ? value : "/\(value)"
+            components.query = nil
+            components.fragment = nil
+            candidate = components.url
+        } else {
+            candidate = URL(string: value, relativeTo: baseURL)?.absoluteURL
         }
-        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
-            return URL(string: value, relativeTo: baseURL)?.absoluteURL
+
+        guard let candidate, isTrustedArtifactURL(candidate, baseURL: baseURL) else {
+            return nil
         }
-        components.path = value.hasPrefix("/") ? value : "/\(value)"
-        components.query = nil
-        components.fragment = nil
-        return components.url
+        return candidate
+    }
+
+    /// Job artifact URLs are server-authored capabilities. Keep them on the configured
+    /// Relay origin and on the exact artifact route so a compromised/malformed job cannot
+    /// turn the authenticated client or WebView into a fetcher for another host.
+    static func isTrustedArtifactURL(_ url: URL, baseURL: URL) -> Bool {
+        guard
+            url.scheme?.lowercased() == baseURL.scheme?.lowercased(),
+            url.host?.lowercased() == baseURL.host?.lowercased(),
+            effectivePort(for: url) == effectivePort(for: baseURL),
+            url.user == nil,
+            url.password == nil,
+            url.query == nil,
+            url.fragment == nil
+        else {
+            return false
+        }
+
+        let parts = url.pathComponents.filter { $0 != "/" }
+        return parts.count == 7
+            && parts[0] == "v1"
+            && parts[1] == "codex"
+            && parts[2] == "jobs"
+            && !parts[3].isEmpty
+            && parts[4] == "artifacts"
+            && !parts[5].isEmpty
+            && (parts[6] == "raw" || parts[6] == "preview")
+    }
+
+    private static func effectivePort(for url: URL) -> Int? {
+        if let port = url.port { return port }
+        switch url.scheme?.lowercased() {
+        case "https": return 443
+        case "http": return 80
+        default: return nil
+        }
+    }
+
+    /// Fetches artifact bytes through the same pinned/mTLS or device-token session as the
+    /// rest of Relay. The URL must first pass `isTrustedArtifactURL` above.
+    func fetchArtifact(_ value: String?) async throws -> (data: Data, contentType: String?) {
+        guard let url = resolvedArtifactURL(value) else {
+            throw CodexClientError.invalidEndpoint(baseURL)
+        }
+        let (data, response) = try await performWithResponse(
+            path: url.path,
+            accept: "*/*"
+        )
+        return (
+            data,
+            response.value(forHTTPHeaderField: "Content-Type")?.trimmedNonEmpty
+        )
+    }
+
+    /// Turns a localhost URL returned by one job into a short-lived preview URL on
+    /// the linked machine. The returned URL stays on the configured Relay origin;
+    /// relayd owns the loopback hop and never asks the phone to resolve localhost.
+    func createPreview(jobID: String, sourceURL: URL) async throws -> (lease: CodexPreviewLease, url: URL) {
+        let body = try encoder.encode(CodexCreatePreviewRequest(
+            jobId: jobID,
+            url: sourceURL.absoluteString
+        ))
+        let data = try await perform(path: "/v1/codex/previews", method: "POST", body: body)
+        guard !data.isEmpty else {
+            throw CodexClientError.emptyResponse
+        }
+        let lease = try decoder.decode(CodexPreviewLease.self, from: data)
+        guard let url = resolvedPreviewURL(lease.url) else {
+            throw CodexClientError.invalidEndpoint(baseURL)
+        }
+        return (lease, url)
+    }
+
+    func resolvedPreviewURL(_ value: String?) -> URL? {
+        Self.resolvedPreviewURL(value, baseURL: baseURL)
+    }
+
+    static func resolvedPreviewURL(_ value: String?, baseURL: URL) -> URL? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return nil
+        }
+        let candidate: URL?
+        if let absolute = URL(string: value), absolute.scheme != nil {
+            candidate = absolute
+        } else if var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) {
+            components.path = value.hasPrefix("/") ? value : "/\(value)"
+            components.query = nil
+            components.fragment = nil
+            candidate = components.url
+        } else {
+            candidate = URL(string: value, relativeTo: baseURL)?.absoluteURL
+        }
+
+        guard let candidate,
+              candidate.scheme?.lowercased() == baseURL.scheme?.lowercased(),
+              candidate.host?.lowercased() == baseURL.host?.lowercased(),
+              Self.effectivePort(for: candidate) == Self.effectivePort(for: baseURL),
+              candidate.user == nil,
+              candidate.password == nil,
+              candidate.query == nil,
+              candidate.fragment == nil else {
+            return nil
+        }
+        let parts = candidate.pathComponents.filter { $0 != "/" }
+        guard parts.count == 4,
+              parts[0] == "v1",
+              parts[1] == "codex",
+              parts[2] == "previews",
+              parts[3].range(of: "^[A-Za-z0-9_-]{43}$", options: .regularExpression) != nil else {
+            return nil
+        }
+        return candidate
     }
 
     @discardableResult

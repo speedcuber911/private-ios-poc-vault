@@ -19,6 +19,13 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_SIM_PREVIEW_TOKEN = "s" * 43
+_SIM_LIVE_PREVIEW = b"""<!doctype html>
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+html,body{margin:0;min-height:100%;background:#101412;color:#f4f3ed;font:16px -apple-system,BlinkMacSystemFont,sans-serif}
+main{padding:76px 24px 32px}small{color:#83d9c8;text-transform:uppercase;letter-spacing:.12em}h1{font-size:32px;margin:14px 0 8px}p{color:#b8beb9;line-height:1.5}.card{margin-top:24px;padding:18px;border:1px solid #2e3934;border-radius:16px;background:#171c19}
+</style></head><body><main><small>Live from linked computer</small><h1>Local preview is connected</h1><p>Relay opened localhost:4317 through the machine that ran the task.</p><div class="card">Root-relative assets and app routes stay inside this preview lease.</div></main></body></html>"""
 
 
 class SimulatorVaultServer(ThreadingHTTPServer):
@@ -127,6 +134,20 @@ class Handler(BaseHTTPRequestHandler):
                 "id": "sim-job-running",
                 "job": self.active_job_fixture(status="running", result=None),
             })
+            return
+        if path == "/v1/codex/previews":
+            body = self.read_json_body()
+            if body.get("jobId") not in {"sim-job-linear", "sim-job-running", "sim-job-handoff"}:
+                self.send_json_error(404, "job not found")
+                return
+            if not str(body.get("url") or "").startswith(("http://localhost:4317", "http://127.0.0.1:4317")):
+                self.send_json_error(400, "preview URL was not returned by this job")
+                return
+            self.send_json({
+                "id": _SIM_PREVIEW_TOKEN,
+                "url": f"/v1/codex/previews/{_SIM_PREVIEW_TOKEN}/",
+                "expiresAt": "2026-08-18T01:00:00Z",
+            }, status=201)
             return
         if path == "/v1/codex/jobs/sim-job-running/cancel":
             self.send_json(self.active_job_fixture(status="canceled", result="Simulator job canceled."))
@@ -242,6 +263,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/codex/models":
             self.send_json({"models": codex_fixture_models()})
             return
+        if path == f"/v1/codex/previews/{_SIM_PREVIEW_TOKEN}/":
+            self.send_bytes(_SIM_LIVE_PREVIEW, "text/html; charset=utf-8")
+            return
         if path == "/v1/codex/skills":
             provider = parse_qs(query).get("provider", ["codex"])[0]
             if provider not in {"codex", "claude", "cursor", "kimi"}:
@@ -309,6 +333,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/v1/codex/jobs/sim-job-approval":
             self.send_json(codex_fixture_approval_job(self.server))
+            return
+        artifact_match = re.fullmatch(
+            r"/v1/codex/jobs/(sim-job-linear|sim-job-running|sim-job-handoff)/artifacts/(artifact-001|artifact-002)/(raw|preview)",
+            path,
+        )
+        if artifact_match:
+            artifact_id = artifact_match.group(2)
+            mode = artifact_match.group(3)
+            if artifact_id == "artifact-001" and mode == "raw":
+                self.send_file(_SIM_ARTIFACT_SCREENSHOT, "image/png")
+                return
+            if artifact_id == "artifact-002" and mode in {"raw", "preview"}:
+                self.send_bytes(_SIM_ARTIFACT_PREVIEW, "text/html; charset=utf-8")
+                return
+            self.send_error(404)
             return
         terminal_stream_match = re.fullmatch(r"/v1/codex/terminals/([^/]+)/stream", path)
         if terminal_stream_match:
@@ -576,16 +615,16 @@ class Handler(BaseHTTPRequestHandler):
         guessed = content_type or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         self.send_bytes(path.read_bytes(), guessed)
 
-    def send_bytes(self, payload: bytes, content_type: str) -> None:
-        self.send_response(200)
+    def send_bytes(self, payload: bytes, content_type: str, status: int = 200) -> None:
+        self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(payload)
 
-    def send_json(self, payload: dict) -> None:
-        self.send_bytes(json.dumps(payload).encode("utf-8"), "application/json")
+    def send_json(self, payload: dict, status: int = 200) -> None:
+        self.send_bytes(json.dumps(payload).encode("utf-8"), "application/json", status=status)
 
     def log_message(self, format: str, *args: object) -> None:
         sys.stderr.write("sim-vault: " + format % args + "\n")
@@ -800,6 +839,13 @@ _SIM_FS_MAX_READ_BYTES = 1024 * 1024
 _SIM_FS_PNG = __import__("base64").b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
 )
+
+# Real-size image and static browser-result fixtures for the typed job-output cards.
+_SIM_ARTIFACT_SCREENSHOT = ROOT / "pocs" / "relay" / "public" / "og.png"
+_SIM_ARTIFACT_PREVIEW = b"""<!doctype html>
+<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>html,body{height:100%;margin:0}body{display:grid;place-items:center;background:#101113;color:#f5f5f0;font:16px -apple-system,sans-serif}.card{padding:28px;border:1px solid #3f978d;border-radius:18px;background:#181a1d;max-width:280px}small{color:#8faaa6}</style>
+</head><body><div class="card"><small>AUTHENTICATED PREVIEW</small><h1>Browser output</h1><p>This HTML is rendered by Relay's sandboxed WebView.</p></div></body></html>"""
 
 
 def _sim_big_log() -> bytes:
@@ -1222,6 +1268,8 @@ def codex_fixture_answer() -> str:
         "- ENGG-543: Keep the cleanup item closed unless a new regression appears in the mobile console.",
         "",
         "No active Linear ticket needs a fresh reply right now.",
+        "",
+        "Open the live local app: [http://localhost:4317](http://localhost:4317)",
     ])
 
 
@@ -1411,8 +1459,32 @@ def codex_fixture_job(
     prompt: str = "List out all my linear issues for last one week and also carve out my action items from them.",
 ) -> dict:
     result_text = codex_fixture_answer() if result is None and status == "succeeded" else result
+    job_id = id or ("sim-job-linear" if status == "succeeded" else "sim-job-running")
+    artifacts = [] if status != "succeeded" else [
+        {
+            "id": "artifact-001",
+            "kind": "image",
+            "filename": "browser-screenshot.png",
+            "title": "Browser screenshot",
+            "contentType": "image/png",
+            "bytes": _SIM_ARTIFACT_SCREENSHOT.stat().st_size,
+            "rawURL": f"/v1/codex/jobs/{job_id}/artifacts/artifact-001/raw",
+            "previewURL": None,
+        },
+        {
+            "id": "artifact-002",
+            "kind": "staticPreview",
+            "filename": "preview.html",
+            "title": "Interactive browser preview",
+            "language": "html",
+            "contentType": "text/html; charset=utf-8",
+            "bytes": len(_SIM_ARTIFACT_PREVIEW),
+            "rawURL": f"/v1/codex/jobs/{job_id}/artifacts/artifact-002/raw",
+            "previewURL": f"/v1/codex/jobs/{job_id}/artifacts/artifact-002/preview",
+        },
+    ]
     return {
-        "id": id or ("sim-job-linear" if status == "succeeded" else "sim-job-running"),
+        "id": job_id,
         "provider": provider,
         "model": model,
         "status": status,
@@ -1420,6 +1492,7 @@ def codex_fixture_job(
         "workspaceName": "POC Vault",
         "prompt": prompt,
         "result": result_text,
+        "artifacts": artifacts,
         "resultTruncated": False,
         "logsIncluded": "compact",
         "sessionId": f"sim-{provider}-running-thread" if id == "sim-job-running" else "sim-thread-linear",

@@ -10,6 +10,18 @@ import UIKit
 struct RelayMarkdownText: View {
     let text: String
     let userAligned: Bool
+    let onOpenLoopbackURL: ((URL) -> Void)?
+    @State private var blockedLoopbackURL: URL?
+
+    init(
+        text: String,
+        userAligned: Bool,
+        onOpenLoopbackURL: ((URL) -> Void)? = nil
+    ) {
+        self.text = text
+        self.userAligned = userAligned
+        self.onOpenLoopbackURL = onOpenLoopbackURL
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -27,10 +39,58 @@ struct RelayMarkdownText: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .environment(\.openURL, OpenURLAction { url in
+            guard RelayOutputURLPolicy.isLoopbackURL(url) else {
+                return .systemAction
+            }
+            if let onOpenLoopbackURL {
+                onOpenLoopbackURL(url)
+                return .handled
+            }
+            blockedLoopbackURL = url
+            return .handled
+        })
+        .alert(
+            "Local preview is on the linked computer",
+            isPresented: Binding(
+                get: { blockedLoopbackURL != nil },
+                set: { if !$0 { blockedLoopbackURL = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("This localhost URL was not attached to a Relay task, so Relay cannot prove which linked computer should serve it.")
+        }
     }
 
     private var segments: [CodexMarkdownSegment] {
         CodexMarkdownParser.segments(from: text)
+    }
+}
+
+/// Output links are evaluated on the phone. Loopback therefore never reaches a process
+/// running on the linked Mac/EC2 machine and must not silently open as if it did.
+enum RelayOutputURLPolicy {
+    static func isLoopbackURL(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "http" || url.scheme?.lowercased() == "https" else {
+            return false
+        }
+        switch url.host?.lowercased() {
+        case "localhost", "127.0.0.1", "::1":
+            return true
+        default:
+            return false
+        }
+    }
+
+    static func containsLoopbackURL(in text: String) -> Bool {
+        guard let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) else {
+            return false
+        }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return detector.matches(in: text, options: [], range: range).contains { match in
+            match.url.map(isLoopbackURL) == true
+        }
     }
 }
 
@@ -114,18 +174,24 @@ struct RelayMarkdownTable: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if !header.isEmpty {
-                tableRow(header, isHeader: true)
+            if columnCount == 1, let title = header.first?.trimmedNonEmpty {
+                Text(CodexInlineMarkdown.attributed(title))
+                    .font(AppTheme.uiFont(size: 11, weight: .bold))
+                    .foregroundStyle(color.opacity(0.68))
+                    .padding(.horizontal, 10)
+                    .padding(.top, 9)
+                    .padding(.bottom, 7)
             }
 
-            ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
-                if index > 0 || !header.isEmpty {
+            ForEach(Array(displayRows.enumerated()), id: \.offset) { index, row in
+                if index > 0 || (columnCount == 1 && header.first?.trimmedNonEmpty != nil) {
                     Divider()
                         .overlay(borderColor.opacity(0.72))
                 }
-                tableRow(row, isHeader: false)
+                tableRow(row)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(tableFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -135,42 +201,57 @@ struct RelayMarkdownTable: View {
         .textSelection(.enabled)
     }
 
-    private func tableRow(_ row: [String], isHeader: Bool) -> some View {
-        Group {
-            if row.count == 2 {
-                HStack(alignment: .top, spacing: 10) {
-                    tableCell(row[0], isHeader: isHeader)
-                        .frame(maxWidth: 104, alignment: .leading)
-                        .layoutPriority(0.35)
-                    tableCell(row[1], isHeader: isHeader)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .layoutPriority(1)
-                }
-            } else {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(Array(row.enumerated()), id: \.offset) { index, value in
-                        VStack(alignment: .leading, spacing: 3) {
-                            if !isHeader, header.indices.contains(index), !header[index].isEmpty {
-                                Text(CodexInlineMarkdown.attributed(header[index]))
-                                    .font(AppTheme.uiFont(size: 11, weight: .bold))
-                                    .foregroundStyle(color.opacity(0.68))
-                            }
-                            tableCell(value, isHeader: isHeader)
-                        }
+    /// Tables become labeled records on the phone instead of compressed desktop
+    /// grids. This keeps long values readable, survives Dynamic Type, and avoids
+    /// allocating line height to empty columns from imperfect agent Markdown.
+    private func tableRow(_ row: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(Array(nonEmptyCells(in: row).enumerated()), id: \.offset) { _, cell in
+                VStack(alignment: .leading, spacing: 3) {
+                    if columnCount > 1, let label = headerLabel(at: cell.column) {
+                        Text(CodexInlineMarkdown.attributed(label))
+                            .font(AppTheme.uiFont(size: 10.5, weight: .bold))
+                            .foregroundStyle(color.opacity(0.64))
+                            .textCase(.uppercase)
+                            .tracking(0.45)
                     }
+                    tableCell(cell.value)
                 }
             }
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, isHeader ? 8 : 9)
+        .padding(.vertical, 9)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func tableCell(_ value: String, isHeader: Bool) -> some View {
+    private func tableCell(_ value: String) -> some View {
         Text(CodexInlineMarkdown.attributed(value))
-            .font(AppTheme.uiFont(size: isHeader ? 12 : 13.5, weight: isHeader ? .semibold : .regular))
-            .foregroundStyle(isHeader ? color.opacity(0.72) : color)
+            .font(AppTheme.uiFont(size: 13.5))
+            .foregroundStyle(color)
             .lineSpacing(2)
             .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var columnCount: Int {
+        max(header.count, rows.map(\.count).max() ?? 0)
+    }
+
+    private var displayRows: [[String]] {
+        rows.filter { row in
+            row.contains { $0.trimmedNonEmpty != nil }
+        }
+    }
+
+    private func nonEmptyCells(in row: [String]) -> [(column: Int, value: String)] {
+        row.enumerated().compactMap { index, value in
+            guard value.trimmedNonEmpty != nil else { return nil }
+            return (index, value)
+        }
+    }
+
+    private func headerLabel(at index: Int) -> String? {
+        guard header.indices.contains(index) else { return nil }
+        return header[index].trimmedNonEmpty
     }
 
     private var tableFill: Color {

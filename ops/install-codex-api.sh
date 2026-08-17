@@ -84,7 +84,7 @@ fi
 python3 "$ROOT/ops/render-codex-api-config" --config "$CONFIG_FILE" --output-dir "$TMP_RENDER_DIR"
 
 install -m 0644 -o root -g root "$ROOT/relay-server/codex-api-deploy/server.mjs" "$INSTALL_DIR/server.mjs"
-for helper in approval-store.mjs appserver-client.mjs codex-job-runner.mjs claude-permission-mcp.mjs terminals.mjs; do
+for helper in approval-store.mjs appserver-client.mjs codex-job-runner.mjs claude-permission-mcp.mjs previews.mjs terminals.mjs; do
   install -m 0644 -o root -g root "$ROOT/product/relayd/src/$helper" "$INSTALL_DIR/helpers/$helper"
 done
 install -m 0644 -o root -g root "$ROOT/relay-server/codex-api-deploy/codex-api.service" "$SERVICE_PATH"

@@ -248,19 +248,74 @@ enum CodexMarkdownParser {
     }
 
     private static func tableCells(from line: String) -> [String]? {
-        var value = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard value.contains("|") else { return nil }
-        if value.hasPrefix("|") {
-            value.removeFirst()
-        }
-        if value.hasSuffix("|") {
-            value.removeLast()
+
+        // A literal pipe is common in shell commands and code spans inside agent
+        // output. Splitting every `|` invents columns, which then turns a short table
+        // into a very tall stack on iPhone. Only pipes outside escapes/code delimit
+        // cells, while retaining the original inline Markdown for AttributedString.
+        var cells: [String] = []
+        var cell = ""
+        var index = value.startIndex
+        var codeFenceLength: Int?
+        var foundDelimiter = false
+
+        while index < value.endIndex {
+            let character = value[index]
+
+            if character == "\\" {
+                cell.append(character)
+                index = value.index(after: index)
+                if index < value.endIndex {
+                    cell.append(value[index])
+                    index = value.index(after: index)
+                }
+                continue
+            }
+
+            if character == "`" {
+                let runStart = index
+                var runEnd = index
+                var runLength = 0
+                while runEnd < value.endIndex, value[runEnd] == "`" {
+                    runLength += 1
+                    runEnd = value.index(after: runEnd)
+                }
+                cell.append(contentsOf: value[runStart..<runEnd])
+                if codeFenceLength == runLength {
+                    codeFenceLength = nil
+                } else if codeFenceLength == nil {
+                    codeFenceLength = runLength
+                }
+                index = runEnd
+                continue
+            }
+
+            if character == "|", codeFenceLength == nil {
+                foundDelimiter = true
+                cells.append(cell.trimmingCharacters(in: .whitespacesAndNewlines))
+                cell = ""
+            } else {
+                cell.append(character)
+            }
+            index = value.index(after: index)
         }
 
-        let cells = value
-            .split(separator: "|", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-        guard cells.count >= 2,
+        guard foundDelimiter else { return nil }
+        cells.append(cell.trimmingCharacters(in: .whitespacesAndNewlines))
+
+        // Leading/trailing pipes are table decoration rather than empty columns.
+        if cells.first?.isEmpty == true {
+            cells.removeFirst()
+        }
+        if cells.last?.isEmpty == true {
+            cells.removeLast()
+        }
+
+        // One-column pipe tables are emitted by several CLI/reporting tools. They
+        // are valid input for Relay even though most hand-written Markdown uses 2+.
+        guard !cells.isEmpty,
               cells.contains(where: { !$0.isEmpty }) else {
             return nil
         }

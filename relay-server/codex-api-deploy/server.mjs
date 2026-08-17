@@ -17,6 +17,7 @@ const helperDir = process.env.RELAY_HELPER_DIR || (
 const { ApprovalStore, publicApproval, terminalDecisions } = await import(pathToFileURL(path.join(helperDir, "approval-store.mjs")));
 const { createTerminalService } = await import(pathToFileURL(path.join(helperDir, "terminals.mjs")));
 const { AppServerClient } = await import(pathToFileURL(path.join(helperDir, "appserver-client.mjs")));
+const { createPreviewService } = await import(pathToFileURL(path.join(helperDir, "previews.mjs")));
 
 const host = process.env.CODEX_API_HOST || "127.0.0.1";
 const port = parseIntegerEnv("CODEX_API_PORT", 8787, 1, 65535);
@@ -183,6 +184,7 @@ const providerCapabilities = {
 };
 const chatsDir = path.join(dataDir, "chats");
 const jobs = new Map();
+const previewService = createPreviewService({ jobs, relayPort: port, appendAudit });
 const dynamicWorkspaces = new Map();
 const activeChildren = new Map();
 const jobStreamSubscribers = new Map();
@@ -1627,6 +1629,11 @@ async function routeRequest(req, res) {
     return sendJson(res, 200, healthPayload(false));
   }
 
+  if (previewService.isCapabilityPath(url)) {
+    await previewService.routeCapability(req, res, url);
+    return;
+  }
+
   const auth = authorize(req);
   if (!auth.ok) {
     return sendError(res, auth.status, auth.error);
@@ -1635,6 +1642,8 @@ async function routeRequest(req, res) {
   if (req.method === "GET" && url.pathname === "/v1/codex/health") {
     return sendJson(res, 200, healthPayload(true));
   }
+
+  if (await previewService.routeAuthenticated(req, res, url, auth)) return;
 
   if (req.method === "GET" && url.pathname === "/v1/harness") {
     return sendJson(res, 200, { harnesses: listHarnesses() });

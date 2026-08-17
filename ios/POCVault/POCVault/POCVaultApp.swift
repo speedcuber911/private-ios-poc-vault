@@ -211,6 +211,8 @@ struct POCVaultRootView: View {
         .fullScreenCover(item: $chatLaunch) { launch in
             RelayChatView(
                 viewModel: launch.viewModel,
+                client: codexClient,
+                identityStore: identityStore,
                 onDismiss: { chatLaunch = nil },
                 threadsRequest: $opensThreadsForHandoff,
                 onBindChatToFolder: { path, workspaceID, card in

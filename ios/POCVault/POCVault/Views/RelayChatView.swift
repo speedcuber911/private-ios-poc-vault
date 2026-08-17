@@ -4,6 +4,8 @@ import UIKit
 
 struct RelayChatView: View {
     @ObservedObject var viewModel: RelayChatViewModel
+    let client: CodexClient
+    @ObservedObject var identityStore: ClientIdentityStore
     /// Set when the chat is presented as a folder's full-screen cover; shows the
     /// dismiss chevron in the top bar. Dismissing never cancels streams (VM-owned).
     var onDismiss: (() -> Void)? = nil
@@ -20,6 +22,8 @@ struct RelayChatView: View {
     @State private var showingThreads = false
     @State private var threadsPreferLarge = false
     @State private var fullLogRequest: RelayFullLogRequest?
+    @State private var artifactRequest: CodexJobArtifact?
+    @State private var remotePreviewRequest: RelayRemotePreviewRequest?
     @State private var modelPickerRequest = 0
     @State private var didHandleInitialProviderPicker = false
 
@@ -34,12 +38,13 @@ struct RelayChatView: View {
                     threadAccessBar
                         .simultaneousGesture(keyboardDismissTap)
                     messageList
+                        .layoutPriority(1)
                         .contentShape(Rectangle())
                         .simultaneousGesture(keyboardDismissTap)
                 }
             }
             .toolbar(.hidden, for: .navigationBar)
-            .safeAreaInset(edge: .bottom) {
+            .safeAreaInset(edge: .bottom, spacing: 0) {
                 if !showingThreads {
                     RelayComposer(
                         text: $viewModel.prompt,
@@ -76,6 +81,7 @@ struct RelayChatView: View {
                             viewModel.stopStreaming()
                         }
                     )
+                    .fixedSize(horizontal: false, vertical: true)
                 }
             }
             .task {
@@ -106,6 +112,20 @@ struct RelayChatView: View {
                 RelayFullLogSheet(job: request.job) {
                     await viewModel.loadFullLog(for: request.job)
                 }
+            }
+            .fullScreenCover(item: $artifactRequest) { artifact in
+                RelayArtifactViewer(
+                    artifact: artifact,
+                    client: client,
+                    identityStore: identityStore
+                )
+            }
+            .fullScreenCover(item: $remotePreviewRequest) { request in
+                RelayRemotePreviewViewer(
+                    request: request,
+                    client: client,
+                    identityStore: identityStore
+                )
             }
         }
         // The chat opens as its own full-screen presentation; re-pin the app's
@@ -284,6 +304,7 @@ struct RelayChatView: View {
                             if let job = item.job {
                                 RelayJobCard(
                                     job: job,
+                                    client: client,
                                     liveTail: viewModel.liveJobTails[job.id],
                                     isCancelling: viewModel.cancellingJobIDs.contains(job.id),
                                     onCancel: {
@@ -291,6 +312,15 @@ struct RelayChatView: View {
                                     },
                                     onFullLog: {
                                         fullLogRequest = RelayFullLogRequest(job: job)
+                                    },
+                                    onArtifact: { artifact in
+                                        artifactRequest = artifact
+                                    },
+                                    onLoopbackURL: { url in
+                                        remotePreviewRequest = RelayRemotePreviewRequest(
+                                            jobID: job.id,
+                                            sourceURL: url
+                                        )
                                     }
                                 )
                                 .id(item.id)
@@ -313,6 +343,12 @@ struct RelayChatView: View {
             .animation(.spring(response: 0.36, dampingFraction: 0.82), value: viewModel.messages.count)
             .onChange(of: viewModel.messages.count) { _, _ in scrollToBottom(proxy) }
             .onChange(of: streamingTextLength) { _, _ in scrollToBottom(proxy, animated: false) }
+            // Task completion updates an existing message rather than appending one.
+            // Follow that height change so newly-added artifacts do not land beneath
+            // the pinned composer while the scroll position stays on the old log tail.
+            .onChange(of: completedResultContentVersion) { _, _ in
+                scrollToBottom(proxy, animated: false)
+            }
             .overlay(alignment: .bottomTrailing) { scrollToBottomButton(proxy) }
         }
     }
@@ -322,6 +358,14 @@ struct RelayChatView: View {
         guard let id = viewModel.streamingMessageID,
               let item = viewModel.messages.first(where: { $0.id == id }) else { return 0 }
         return item.text.count
+    }
+
+    private var completedResultContentVersion: Int {
+        viewModel.messages.reduce(into: 0) { version, item in
+            guard let job = item.job, !job.status.isActive else { return }
+            version &+= job.displayOutput?.count ?? 0
+            version &+= job.artifacts.count &* 100_000
+        }
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
@@ -656,6 +700,7 @@ private struct RelayComposer: View {
             .padding(.horizontal, 1)
         }
         .frame(height: 36)
+        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
         .accessibilityIdentifier("relay-control-bar")
     }
 
@@ -1377,12 +1422,15 @@ private struct RelayStreamingContent: View {
 
 private struct RelayJobCard: View {
     let job: CodexJob
+    let client: CodexClient
     /// SSE-fed stdout/stderr tail shown while the job is active; polling fills the card
     /// via `job.displayOutput` when the stream is unavailable.
     let liveTail: String?
     let isCancelling: Bool
     let onCancel: () -> Void
     let onFullLog: () -> Void
+    let onArtifact: (CodexJobArtifact) -> Void
+    let onLoopbackURL: (URL) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1418,7 +1466,23 @@ private struct RelayJobCard: View {
                 }
             } else if let text = job.displayOutput?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
                 // Final result: render markdown like chat replies (bold, code, lists).
-                RelayMarkdownText(text: text, userAligned: false)
+                RelayMarkdownText(
+                    text: text,
+                    userAligned: false,
+                    onOpenLoopbackURL: onLoopbackURL
+                )
+
+                if RelayOutputURLPolicy.containsLoopbackURL(in: text) {
+                    RelayRemoteLocalhostNotice()
+                }
+            }
+
+            if !job.artifacts.isEmpty {
+                RelayJobArtifacts(
+                    artifacts: job.artifacts,
+                    client: client,
+                    onOpen: onArtifact
+                )
             }
 
             HStack {
@@ -1482,6 +1546,467 @@ private struct RelayJobCard: View {
     }
 
     private static let tailAnchor = "relay-job-tail-anchor"
+}
+
+/// Typed outputs returned by relayd. These deliberately sit outside the Markdown
+/// renderer: HTML/browser previews stay sandboxed in the authenticated WebView, images
+/// are fetched as bytes through the authenticated API client, and source/documents get
+/// a native readable surface instead of being squeezed into the transcript card.
+private struct RelayJobArtifacts: View {
+    let artifacts: [CodexJobArtifact]
+    let client: CodexClient
+    let onOpen: (CodexJobArtifact) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            RelayCapsLabel(
+                text: artifacts.count == 1 ? "Output" : "\(artifacts.count) outputs",
+                color: AppTheme.textTertiary,
+                size: 9
+            )
+
+            ForEach(artifacts) { artifact in
+                RelayArtifactCard(artifact: artifact, client: client) {
+                    onOpen(artifact)
+                }
+            }
+        }
+        .accessibilityIdentifier("relay-job-artifacts")
+        // A LazyVStack can otherwise satisfy a tight phone-height proposal by
+        // compressing the output stack, which hides rows beneath a large thumbnail.
+        .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+private struct RelayArtifactCard: View {
+    let artifact: CodexJobArtifact
+    let client: CodexClient
+    let onOpen: () -> Void
+
+    @State private var thumbnail: UIImage?
+    @State private var isLoadingThumbnail = false
+    @State private var thumbnailFailed = false
+
+    var body: some View {
+        Button(action: onOpen) {
+            VStack(alignment: .leading, spacing: 0) {
+                if artifact.relayViewerKind == .image {
+                    thumbnailContent
+                }
+
+                HStack(spacing: 10) {
+                    Image(systemName: artifact.relaySymbolName)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(AppTheme.accent)
+                        .frame(width: 24, height: 24)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(artifact.relayDisplayTitle)
+                            .font(AppTheme.uiFont(size: 13, weight: .semibold))
+                            .foregroundStyle(AppTheme.textPrimary)
+                            .lineLimit(1)
+                        Text(artifact.relayMetadataLabel)
+                            .font(AppTheme.monoFont(size: 10))
+                            .foregroundStyle(AppTheme.textTertiary)
+                            .lineLimit(1)
+                    }
+
+                    Spacer(minLength: 8)
+
+                    Text(artifact.relayActionLabel)
+                        .font(AppTheme.uiFont(size: 11, weight: .semibold))
+                        .foregroundStyle(AppTheme.accent)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(AppTheme.textTertiary)
+                }
+                .padding(10)
+            }
+            .background(AppTheme.textPrimary.opacity(0.035), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .stroke(AppTheme.hairline, lineWidth: 0.75)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .fixedSize(horizontal: false, vertical: true)
+        .accessibilityLabel("\(artifact.relayActionLabel) \(artifact.relayDisplayTitle)")
+        .task(id: artifact.rawURL) {
+            await loadThumbnailIfNeeded()
+        }
+    }
+
+    @ViewBuilder
+    private var thumbnailContent: some View {
+        if let thumbnail {
+            Image(uiImage: thumbnail)
+                .resizable()
+                .scaledToFit()
+                .frame(maxWidth: .infinity)
+                .frame(height: 140)
+                .background(Color.black.opacity(0.18))
+        } else if isLoadingThumbnail {
+            ZStack {
+                Color.black.opacity(0.14)
+                ProgressView().controlSize(.small).tint(AppTheme.accent)
+            }
+            .frame(height: 140)
+        } else if thumbnailFailed {
+            ZStack {
+                Color.black.opacity(0.14)
+                Label("Open image", systemImage: "photo")
+                    .font(AppTheme.uiFont(size: 12, weight: .medium))
+                    .foregroundStyle(AppTheme.textSecondary)
+            }
+            .frame(height: 140)
+        }
+    }
+
+    @MainActor
+    private func loadThumbnailIfNeeded() async {
+        guard artifact.relayViewerKind == .image, thumbnail == nil, !isLoadingThumbnail else { return }
+        isLoadingThumbnail = true
+        thumbnailFailed = false
+        defer { isLoadingThumbnail = false }
+        do {
+            let result = try await client.fetchArtifact(artifact.rawURL)
+            thumbnail = UIImage(data: result.data)
+            thumbnailFailed = thumbnail == nil
+        } catch is CancellationError {
+            return
+        } catch {
+            thumbnailFailed = true
+        }
+    }
+}
+
+private struct RelayArtifactViewer: View {
+    let artifact: CodexJobArtifact
+    let client: CodexClient
+    @ObservedObject var identityStore: ClientIdentityStore
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var data = Data()
+    @State private var text = ""
+    @State private var image: UIImage?
+    @State private var isLoading = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        if artifact.relayViewerKind == .web, let url = webURL {
+            AuthenticatedWebView(
+                url: url,
+                title: artifact.relayDisplayTitle,
+                identityStore: identityStore
+            )
+        } else {
+            NavigationStack {
+                ZStack {
+                    AppTheme.canvasGradient.ignoresSafeArea()
+                    fetchedContent
+                }
+                .navigationTitle(artifact.relayDisplayTitle)
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("Done") { dismiss() }
+                            .foregroundStyle(AppTheme.accent)
+                    }
+                }
+                .task(id: artifact.id) {
+                    await load()
+                }
+            }
+            .preferredColorScheme(.dark)
+        }
+    }
+
+    private var webURL: URL? {
+        client.resolvedArtifactURL(artifact.previewURL)
+            ?? client.resolvedArtifactURL(artifact.rawURL)
+    }
+
+    @ViewBuilder
+    private var fetchedContent: some View {
+        if isLoading, data.isEmpty {
+            ProgressView().tint(AppTheme.accent)
+        } else if let errorMessage, data.isEmpty {
+            VStack(spacing: 12) {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: 28, weight: .medium))
+                    .foregroundStyle(AppTheme.statusError)
+                Text("Could not open this output")
+                    .font(AppTheme.uiFont(size: 16, weight: .semibold))
+                    .foregroundStyle(AppTheme.textPrimary)
+                Text(errorMessage)
+                    .font(AppTheme.uiFont(size: 13))
+                    .foregroundStyle(AppTheme.textSecondary)
+                    .multilineTextAlignment(.center)
+                Button("Try again") { Task { await load() } }
+                    .font(AppTheme.uiFont(size: 14, weight: .semibold))
+                    .foregroundStyle(AppTheme.accent)
+            }
+            .padding(.horizontal, 32)
+        } else {
+            switch artifact.relayViewerKind {
+            case .image:
+                imageContent
+            case .markdown:
+                ScrollView {
+                    RelayMarkdownText(text: text, userAligned: false)
+                        .padding(16)
+                }
+            case .text:
+                ScrollView([.horizontal, .vertical]) {
+                    Text(text.isEmpty ? "This output is empty." : text)
+                        .font(AppTheme.monoFont(size: 12))
+                        .foregroundStyle(text.isEmpty ? AppTheme.textTertiary : AppTheme.textPrimary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .padding(16)
+                }
+            case .binary, .web:
+                VStack(spacing: 12) {
+                    Image(systemName: artifact.relaySymbolName)
+                        .font(.system(size: 30, weight: .semibold))
+                        .foregroundStyle(AppTheme.accent)
+                    Text("No inline preview for this output type.")
+                        .font(AppTheme.uiFont(size: 13))
+                        .foregroundStyle(AppTheme.textSecondary)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var imageContent: some View {
+        if let image {
+            GeometryReader { proxy in
+                ScrollView([.horizontal, .vertical]) {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(minWidth: proxy.size.width, minHeight: proxy.size.height)
+                }
+            }
+        } else {
+            VStack(spacing: 12) {
+                Image(systemName: "photo.badge.exclamationmark")
+                    .font(.system(size: 30, weight: .semibold))
+                    .foregroundStyle(AppTheme.statusWarn)
+                Text("Relay received the image bytes but iOS could not decode them.")
+                    .font(AppTheme.uiFont(size: 13))
+                    .foregroundStyle(AppTheme.textSecondary)
+                    .multilineTextAlignment(.center)
+            }
+            .padding(.horizontal, 32)
+        }
+    }
+
+    @MainActor
+    private func load() async {
+        guard artifact.relayViewerKind != .web, !isLoading else { return }
+        isLoading = true
+        errorMessage = nil
+        defer { isLoading = false }
+        do {
+            let result = try await client.fetchArtifact(artifact.rawURL)
+            data = result.data
+            switch artifact.relayViewerKind {
+            case .image:
+                image = UIImage(data: result.data)
+            case .text, .markdown:
+                text = String(decoding: result.data, as: UTF8.self)
+            case .binary, .web:
+                break
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+}
+
+private struct RelayRemoteLocalhostNotice: View {
+    var body: some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: "desktopcomputer.trianglebadge.exclamationmark")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(AppTheme.statusWarn)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Preview is on the linked computer")
+                    .font(AppTheme.uiFont(size: 12, weight: .semibold))
+                    .foregroundStyle(AppTheme.textPrimary)
+                Text("Tap the localhost link above to open that live port from the linked computer in Relay.")
+                    .font(AppTheme.uiFont(size: 11.5))
+                    .foregroundStyle(AppTheme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(10)
+        .background(AppTheme.statusWarn.opacity(0.07), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(AppTheme.statusWarn.opacity(0.24), lineWidth: 0.75)
+        }
+        .accessibilityIdentifier("relay-remote-localhost-notice")
+    }
+}
+
+private struct RelayRemotePreviewRequest: Identifiable {
+    let id = UUID()
+    let jobID: String
+    let sourceURL: URL
+}
+
+private struct RelayRemotePreviewViewer: View {
+    let request: RelayRemotePreviewRequest
+    let client: CodexClient
+    @ObservedObject var identityStore: ClientIdentityStore
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var previewURL: URL?
+    @State private var isLoading = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        Group {
+            if let previewURL {
+                AuthenticatedWebView(
+                    url: previewURL,
+                    title: "Local preview",
+                    identityStore: identityStore
+                )
+            } else {
+                NavigationStack {
+                    ZStack {
+                        AppTheme.canvasGradient.ignoresSafeArea()
+                        statusContent
+                    }
+                    .navigationTitle("Local preview")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button("Done") { dismiss() }
+                                .foregroundStyle(AppTheme.accent)
+                        }
+                    }
+                }
+                .preferredColorScheme(.dark)
+            }
+        }
+        .task(id: request.id) {
+            await openPreview()
+        }
+    }
+
+    @ViewBuilder
+    private var statusContent: some View {
+        if isLoading {
+            VStack(spacing: 12) {
+                ProgressView().tint(AppTheme.accent)
+                Text("Connecting to \(request.sourceURL.host ?? "localhost")…")
+                    .font(AppTheme.uiFont(size: 13, weight: .medium))
+                    .foregroundStyle(AppTheme.textSecondary)
+            }
+        } else {
+            VStack(spacing: 12) {
+                Image(systemName: "desktopcomputer.trianglebadge.exclamationmark")
+                    .font(.system(size: 30, weight: .semibold))
+                    .foregroundStyle(AppTheme.statusWarn)
+                Text("Could not open the local preview")
+                    .font(AppTheme.uiFont(size: 16, weight: .semibold))
+                    .foregroundStyle(AppTheme.textPrimary)
+                Text(errorMessage ?? "The linked computer did not return a preview.")
+                    .font(AppTheme.uiFont(size: 13))
+                    .foregroundStyle(AppTheme.textSecondary)
+                    .multilineTextAlignment(.center)
+                Button("Try again") { Task { await openPreview() } }
+                    .font(AppTheme.uiFont(size: 14, weight: .semibold))
+                    .foregroundStyle(AppTheme.accent)
+            }
+            .padding(.horizontal, 32)
+        }
+    }
+
+    @MainActor
+    private func openPreview() async {
+        guard !isLoading else { return }
+        isLoading = true
+        errorMessage = nil
+        defer { isLoading = false }
+        do {
+            previewURL = try await client.createPreview(
+                jobID: request.jobID,
+                sourceURL: request.sourceURL
+            ).url
+        } catch is CancellationError {
+            return
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+}
+
+private extension CodexJobArtifact {
+    var relayViewerKind: RelayFileViewerKind {
+        if isBitmapImage { return .image }
+        if kind == .document || normalizedContentType == "text/markdown" { return .markdown }
+        if previewURL?.trimmedNonEmpty != nil || normalizedContentType == "application/pdf" { return .web }
+        if kind == .code || normalizedContentType.hasPrefix("text/") { return .text }
+        return .binary
+    }
+
+    var relayDisplayTitle: String {
+        title?.trimmedNonEmpty ?? filename
+    }
+
+    var relayMetadataLabel: String {
+        let type = language?.trimmedNonEmpty?.uppercased()
+            ?? normalizedContentType.split(separator: "/").last.map(String.init)?.uppercased()
+            ?? kind.rawValue
+        guard let bytes else { return type }
+        return "\(type) · \(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file))"
+    }
+
+    var relayActionLabel: String {
+        switch relayViewerKind {
+        case .image: return "View"
+        case .web: return "Preview"
+        case .markdown, .text: return "Open"
+        case .binary: return "Details"
+        }
+    }
+
+    var relaySymbolName: String {
+        switch relayViewerKind {
+        case .image: return "photo"
+        case .web: return "safari"
+        case .markdown: return "doc.richtext"
+        case .text: return "chevron.left.forwardslash.chevron.right"
+        case .binary: return "doc"
+        }
+    }
+
+    private var normalizedContentType: String {
+        contentType?
+            .split(separator: ";", maxSplits: 1)
+            .first
+            .map(String.init)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+    }
+
+    private var isBitmapImage: Bool {
+        if normalizedContentType.hasPrefix("image/") && normalizedContentType != "image/svg+xml" {
+            return true
+        }
+        return ["png", "jpg", "jpeg", "gif", "webp", "heic", "heif"].contains(
+            URL(fileURLWithPath: filename).pathExtension.lowercased()
+        )
+    }
 }
 
 private struct RelayStatusPill: View {

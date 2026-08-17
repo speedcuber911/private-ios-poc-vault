@@ -256,7 +256,10 @@ final class TrialPairingTests: XCTestCase {
         client.retarget(baseURL: trial)
         XCTAssertEqual(client.baseURL, trial)
         XCTAssertEqual(
-            CodexClient.resolvedArtifactURL("/v1/codex/fs/file", baseURL: client.baseURL)?.host,
+            CodexClient.resolvedArtifactURL(
+                "/v1/codex/jobs/job-001/artifacts/artifact-001/raw",
+                baseURL: client.baseURL
+            )?.host,
             "node-0011223344556677.tun.test"
         )
 

@@ -1706,6 +1706,7 @@ enum CodexJobArtifactKind: String, Decodable, Hashable {
     case code
     case staticPreview
     case document
+    case image
     case unknown
 
     init(from decoder: Decoder) throws {
@@ -1750,6 +1751,17 @@ struct CodexJobArtifact: Decodable, Hashable, Identifiable {
         self.rawURL = try container.decodeLooseStringIfPresent(forKey: .rawURL)
         self.previewURL = try container.decodeLooseStringIfPresent(forKey: .previewURL)
     }
+}
+
+struct CodexCreatePreviewRequest: Encodable {
+    let jobId: String
+    let url: String
+}
+
+struct CodexPreviewLease: Decodable, Hashable, Identifiable {
+    let id: String
+    let url: String
+    let expiresAt: Date?
 }
 
 struct CodexJobAttachment: Encodable, Hashable, Identifiable {

@@ -27,6 +27,7 @@ import { ApprovalStore, publicApproval, terminalDecisions } from "./approval-sto
 import { createTerminalService } from "./terminals.mjs";
 import { appendAudit } from "./audit.mjs";
 import { emitEvent } from "./events.mjs";
+import { createPreviewService } from "./previews.mjs";
 
 const approvalStore = new ApprovalStore(approvalsDir);
 const terminalService = createTerminalService({
@@ -39,6 +40,7 @@ const terminalService = createTerminalService({
   sendError,
   appendAudit,
 });
+const previewService = createPreviewService({ jobs, relayPort: port, appendAudit });
 
 // SHA-256 of the device's bearer token, or null when this node authenticates
 // with client certificates instead. Re-read when the file changes, because the
@@ -151,6 +153,15 @@ async function routeRequest(req, res) {
     return sendJson(res, 200, healthPayload(false));
   }
 
+  // Preview subresources use the short-lived, unguessable lease returned by an
+  // authenticated POST below. This is required for token-authenticated trial
+  // nodes because a WKWebView iframe cannot inherit the top-level Authorization
+  // header. The capability is scoped to one loopback origin and expires quickly.
+  if (previewService.isCapabilityPath(url)) {
+    await previewService.routeCapability(req, res, url);
+    return;
+  }
+
   // Explicit invariant (API.md §2.3): pairing is authenticated by a single-use
   // secret and a blob MAC, never by a client certificate. It lives on its own
   // listener (pairing.mjs / RELAYD_PAIRING_*) and is NEVER routable here — not
@@ -167,6 +178,8 @@ async function routeRequest(req, res) {
   if (req.method === "GET" && url.pathname === "/v1/codex/health") {
     return sendJson(res, 200, healthPayload(true));
   }
+
+  if (await previewService.routeAuthenticated(req, res, url, auth)) return;
 
   if (req.method === "GET" && url.pathname === "/v1/codex/ui") {
     return sendHtml(res, 200, codexThreadUiHtml());

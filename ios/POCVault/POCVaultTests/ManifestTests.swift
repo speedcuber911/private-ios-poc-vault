@@ -854,13 +854,21 @@ final class ManifestTests: XCTestCase {
                   "bytes": 42,
                   "rawURL": "/v1/codex/jobs/job-artifacts/artifacts/artifact-001/raw",
                   "previewURL": "/v1/codex/jobs/job-artifacts/artifacts/artifact-001/preview"
+                },
+                {
+                  "id": "artifact-002",
+                  "kind": "image",
+                  "filename": "browser-screenshot.png",
+                  "contentType": "image/png",
+                  "bytes": 128,
+                  "rawURL": "/v1/codex/jobs/job-artifacts/artifacts/artifact-002/raw"
                 }
               ]
             }
             """
         )
 
-        XCTAssertEqual(job.artifacts.count, 1)
+        XCTAssertEqual(job.artifacts.count, 2)
         XCTAssertEqual(job.artifacts[0].id, "artifact-001")
         XCTAssertEqual(job.artifacts[0].kind, .staticPreview)
         XCTAssertEqual(job.artifacts[0].filename, "index.html")
@@ -868,6 +876,8 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(job.artifacts[0].bytes, 42)
         XCTAssertEqual(job.artifacts[0].rawURL, "/v1/codex/jobs/job-artifacts/artifacts/artifact-001/raw")
         XCTAssertEqual(job.artifacts[0].previewURL, "/v1/codex/jobs/job-artifacts/artifacts/artifact-001/preview")
+        XCTAssertEqual(job.artifacts[1].kind, .image)
+        XCTAssertEqual(job.artifacts[1].contentType, "image/png")
     }
 
     func testCodexClientResolvesArtifactURLsAgainstBaseURL() throws {
@@ -881,7 +891,66 @@ final class ManifestTests: XCTestCase {
             CodexClient.resolvedArtifactURL("https://codex.pocs.conformal.live/v1/codex/jobs/job/artifacts/artifact-001/raw", baseURL: baseURL),
             URL(string: "https://codex.pocs.conformal.live/v1/codex/jobs/job/artifacts/artifact-001/raw")
         )
+        XCTAssertNil(CodexClient.resolvedArtifactURL(
+            "https://evil.example/v1/codex/jobs/job/artifacts/artifact-001/raw",
+            baseURL: baseURL
+        ))
+        XCTAssertNil(CodexClient.resolvedArtifactURL(
+            "https://codex.pocs.conformal.live/v1/codex/jobs/job/artifacts/artifact-001/raw?redirect=https://evil.example",
+            baseURL: baseURL
+        ))
+        XCTAssertNil(CodexClient.resolvedArtifactURL(
+            "https://codex.pocs.conformal.live/v1/codex/fs/file",
+            baseURL: baseURL
+        ))
         XCTAssertNil(CodexClient.resolvedArtifactURL(nil, baseURL: baseURL))
+    }
+
+    func testRelayOutputURLPolicyBlocksOnlyPhoneLoopbackLinks() {
+        XCTAssertTrue(RelayOutputURLPolicy.isLoopbackURL(URL(string: "http://localhost:3000/dashboard")!))
+        XCTAssertTrue(RelayOutputURLPolicy.isLoopbackURL(URL(string: "https://127.0.0.1:8443")!))
+        XCTAssertTrue(RelayOutputURLPolicy.isLoopbackURL(URL(string: "http://[::1]:5173")!))
+        XCTAssertFalse(RelayOutputURLPolicy.isLoopbackURL(URL(string: "https://preview.example.com")!))
+        XCTAssertFalse(RelayOutputURLPolicy.isLoopbackURL(URL(string: "file:///tmp/index.html")!))
+
+        XCTAssertTrue(RelayOutputURLPolicy.containsLoopbackURL(in: "Open http://localhost:3000 to inspect it."))
+        XCTAssertFalse(RelayOutputURLPolicy.containsLoopbackURL(in: "Open https://preview.example.com instead."))
+    }
+
+    func testPreviewLeaseDecodingAndURLTrustStayOnTheRelayOrigin() throws {
+        let token = String(repeating: "s", count: 43)
+        let lease = try CodexClient.makeDecoder().decode(
+            CodexPreviewLease.self,
+            from: Data(
+                """
+                {
+                  "id": "\(token)",
+                  "url": "/v1/codex/previews/\(token)/",
+                  "expiresAt": "2026-08-18T01:00:00Z"
+                }
+                """.utf8
+            )
+        )
+        XCTAssertEqual(lease.id, token)
+        XCTAssertNotNil(lease.expiresAt)
+
+        let baseURL = URL(string: "https://node.example.test")!
+        XCTAssertEqual(
+            CodexClient.resolvedPreviewURL(lease.url, baseURL: baseURL),
+            URL(string: "https://node.example.test/v1/codex/previews/\(token)/")
+        )
+        XCTAssertNil(CodexClient.resolvedPreviewURL(
+            "https://evil.example/v1/codex/previews/\(token)/",
+            baseURL: baseURL
+        ))
+        XCTAssertNil(CodexClient.resolvedPreviewURL(
+            "/v1/codex/previews/\(token)/?next=https://evil.example",
+            baseURL: baseURL
+        ))
+        XCTAssertNil(CodexClient.resolvedPreviewURL(
+            "/v1/codex/previews/too-short/",
+            baseURL: baseURL
+        ))
     }
 
     func testCodexJobDisplayOutputHidesRawCodexTranscript() throws {
@@ -1842,6 +1911,48 @@ final class ManifestTests: XCTestCase {
         XCTAssertFalse(preview.contains("|------|"))
     }
 
+    func testCodexMarkdownParserKeepsLiteralPipesInsideTableCells() throws {
+        let blocks = CodexMarkdownParser.proseBlocks(
+            from: """
+            | Check | Command |
+            | --- | --- |
+            | Working tree | `git status --short | head` |
+            | Escaped value | alpha \\| beta |
+            """
+        )
+
+        XCTAssertEqual(blocks.count, 1)
+        guard case .table(let header, let rows) = blocks[0].kind else {
+            return XCTFail("Expected literal pipes to stay inside one table cell")
+        }
+        XCTAssertEqual(header, ["Check", "Command"])
+        XCTAssertEqual(rows, [
+            ["Working tree", "`git status --short | head`"],
+            ["Escaped value", "alpha \\| beta"]
+        ])
+    }
+
+    func testCodexMarkdownParserAcceptsCompactOneColumnTables() throws {
+        let blocks = CodexMarkdownParser.proseBlocks(
+            from: """
+            | Status |
+            | --- |
+            | Clean and synchronized with remote |
+            | Passes |
+            """
+        )
+
+        XCTAssertEqual(blocks.count, 1)
+        guard case .table(let header, let rows) = blocks[0].kind else {
+            return XCTFail("Expected a one-column table block")
+        }
+        XCTAssertEqual(header, ["Status"])
+        XCTAssertEqual(rows, [
+            ["Clean and synchronized with remote"],
+            ["Passes"]
+        ])
+    }
+
     func testRelayChatUsesStructuredMarkdownRendering() throws {
         // The markdown views were promoted out of RelayChatView (revamp I3) into
         // Rendering/RelayMarkdownViews.swift so chat and the file viewer share them.
@@ -1851,6 +1962,9 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(markdownSource.contains("struct RelayMarkdownTable"))
         XCTAssertTrue(markdownSource.contains("struct RelayCodeBlock"))
         XCTAssertTrue(markdownSource.contains("CodexMarkdownParser.segments"))
+        XCTAssertTrue(markdownSource.contains("nonEmptyCells(in: row)"))
+        XCTAssertTrue(markdownSource.contains("headerLabel(at:"))
+        XCTAssertFalse(markdownSource.contains(".frame(maxWidth: 104"))
         XCTAssertFalse(markdownSource.contains("private struct RelayMarkdownText"))
         XCTAssertFalse(markdownSource.contains("RelayTextPart.parse(text)"))
 
@@ -1862,6 +1976,33 @@ final class ManifestTests: XCTestCase {
         // The file viewer's rendered-markdown mode consumes the same shared views.
         let viewerSource = try AppSourceFixture.load("POCVault/Browser/FileViewerView.swift")
         XCTAssertTrue(viewerSource.contains("RelayMarkdownText(text:"))
+    }
+
+    func testRelayJobResultsUseTypedAuthenticatedArtifactRendering() throws {
+        let chatSource = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
+        let clientSource = try AppSourceFixture.load("POCVault/Networking/CodexClient.swift")
+        let rootSource = try AppSourceFixture.load("POCVault/POCVaultApp.swift")
+
+        XCTAssertTrue(chatSource.contains("private struct RelayJobArtifacts"))
+        XCTAssertTrue(chatSource.contains("private struct RelayArtifactViewer"))
+        XCTAssertTrue(chatSource.contains("artifact.relayViewerKind == .image"))
+        XCTAssertTrue(chatSource.contains("AuthenticatedWebView("))
+        XCTAssertTrue(chatSource.contains("RelayRemoteLocalhostNotice"))
+        XCTAssertTrue(chatSource.contains("private struct RelayRemotePreviewViewer"))
+        XCTAssertTrue(chatSource.contains(".fullScreenCover(item: $artifactRequest)"))
+        XCTAssertTrue(chatSource.contains(".fullScreenCover(item: $remotePreviewRequest)"))
+        XCTAssertTrue(chatSource.contains(".onChange(of: completedResultContentVersion)"))
+        XCTAssertTrue(chatSource.contains(".frame(height: 140)"))
+        XCTAssertTrue(clientSource.contains("func fetchArtifact("))
+        XCTAssertTrue(clientSource.contains("func createPreview("))
+        XCTAssertTrue(clientSource.contains("isTrustedArtifactURL"))
+        XCTAssertTrue(rootSource.contains("client: codexClient"))
+        XCTAssertTrue(rootSource.contains("identityStore: identityStore"))
+
+        let webViewSource = try AppSourceFixture.load("POCVault/Web/AuthenticatedWebView.swift")
+        XCTAssertTrue(webViewSource.contains("authenticatedRequest(for: url)"))
+        XCTAssertTrue(webViewSource.contains("deviceToken(for: host)"))
+        XCTAssertTrue(webViewSource.contains("forHTTPHeaderField: \"Authorization\""))
     }
 
     func testRelayComposerDoesNotReserveExtraKeyboardGap() throws {
@@ -1894,9 +2035,23 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(controlBarSource.contains("ScrollView(.horizontal, showsIndicators: false)"))
         XCTAssertTrue(controlBarSource.contains("HStack(spacing: 8)"))
         XCTAssertTrue(controlBarSource.contains(".frame(height: 36)"))
+        XCTAssertTrue(controlBarSource.contains("scrollBounceBehavior(.basedOnSize, axes: .horizontal)"))
         XCTAssertTrue(controlBarSource.contains("relay-control-bar"))
         XCTAssertFalse(controlBarSource.contains("VStack"))
         XCTAssertFalse(source.contains("usesAccessibilityLayout"))
+    }
+
+    func testRelayComposerIsPinnedOutsideTheConversationScrollView() throws {
+        let source = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
+        let chatSource = try sourceSnippet(
+            in: source,
+            from: "struct RelayChatView: View",
+            to: "private struct RelayComposerCommand"
+        )
+
+        XCTAssertTrue(chatSource.contains(".safeAreaInset(edge: .bottom, spacing: 0)"))
+        XCTAssertTrue(chatSource.contains(".fixedSize(horizontal: false, vertical: true)"))
+        XCTAssertTrue(chatSource.contains("messageList\n                        .layoutPriority(1)"))
     }
 
     func testRelayComposerDoesNotOfferCrossProviderSwitchingInsideAThread() throws {

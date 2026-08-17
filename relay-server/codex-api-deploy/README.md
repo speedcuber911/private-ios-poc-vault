@@ -244,6 +244,23 @@ Markdown render inside a sandboxed wrapper. HTML plus CSS/JS blocks are also
 assembled into a job-only `preview.html` artifact. These artifacts are not POC
 Library entries and do not use `ops/deploy-poc`.
 
+## Live Local Previews
+
+When a job result contains an HTTP URL on `localhost`, `127.0.0.1`, or `::1`,
+Relay can open the app running on that same linked computer:
+
+```text
+POST /v1/codex/previews
+GET  /v1/codex/previews/<capability>/
+```
+
+Lease creation requires the protected API credential, an existing job, and an
+exact URL present in that job's output. Only unprivileged loopback ports are
+accepted, the Relay API port is excluded, and leases expire after 30 minutes.
+The returned wrapper runs proxied content in a sandboxed iframe without
+same-origin privileges. Relay credentials and cookies are never forwarded to
+the local development server.
+
 ## Directory Workspaces
 
 Relay can browse safe EC2 workspace directories with:
