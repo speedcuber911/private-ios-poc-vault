@@ -36,4 +36,15 @@ if [ ! -x "$relay_java_home/bin/java" ]; then
   exit 1
 fi
 
-"$relay_java_home/bin/java" -version
+# The later xcodebuild Run Script is a fresh shell. Exporting here is not
+# enough on its own; also pin a user-local JVM so java_home and the Gradle
+# helper can find JDK 17 without sudo or a workflow env var.
+mkdir -p "$HOME/Library/Java/JavaVirtualMachines"
+ln -sfn "$("$relay_brew_bin" --prefix openjdk@17)/libexec/openjdk.jdk" \
+  "$HOME/Library/Java/JavaVirtualMachines/openjdk-17.jdk"
+
+JAVA_HOME="$relay_java_home"
+PATH="$JAVA_HOME/bin:$PATH"
+export JAVA_HOME PATH
+
+"$JAVA_HOME/bin/java" -version

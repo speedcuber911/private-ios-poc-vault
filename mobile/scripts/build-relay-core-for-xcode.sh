@@ -24,13 +24,32 @@ if [ -z "$relay_brew_bin" ]; then
   done
 fi
 
-if [ -n "$relay_brew_bin" ]; then
-  relay_brew_java_home="$("$relay_brew_bin" --prefix openjdk@17 2>/dev/null || true)/libexec/openjdk.jdk/Contents/Home"
-  if [ -x "$relay_brew_java_home/bin/java" ]; then
-    JAVA_HOME="$relay_brew_java_home"
-    PATH="$JAVA_HOME/bin:$PATH"
-    export JAVA_HOME PATH
+if [ -z "${JAVA_HOME:-}" ] || [ ! -x "${JAVA_HOME:-}/bin/java" ]; then
+  if [ -n "$relay_brew_bin" ]; then
+    relay_brew_java_home="$("$relay_brew_bin" --prefix openjdk@17 2>/dev/null || true)/libexec/openjdk.jdk/Contents/Home"
+    if [ -x "$relay_brew_java_home/bin/java" ]; then
+      JAVA_HOME="$relay_brew_java_home"
+    fi
   fi
+fi
+
+if [ -z "${JAVA_HOME:-}" ] || [ ! -x "${JAVA_HOME:-}/bin/java" ]; then
+  for relay_java_home in \
+    "$HOME/Library/Java/JavaVirtualMachines/openjdk-17.jdk/Contents/Home" \
+    /opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home \
+    /usr/local/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home \
+    /Users/local/Homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home
+  do
+    if [ -x "$relay_java_home/bin/java" ]; then
+      JAVA_HOME="$relay_java_home"
+      break
+    fi
+  done
+fi
+
+if [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+  PATH="$JAVA_HOME/bin:$PATH"
+  export JAVA_HOME PATH
 fi
 
 if ! command -v java >/dev/null 2>&1 || ! java -version >/dev/null 2>&1; then
