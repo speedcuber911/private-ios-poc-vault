@@ -17,6 +17,13 @@ release_public_key='-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAZH3GefgaF6Yix3n7RSlaSO/1KjzZxXYfVxto3PViFVE=
 -----END PUBLIC KEY-----'
 
+# Local distribution tests sign fixtures with an ephemeral key. Permit that
+# key only when the caller has already opted into the explicitly unsafe HTTP
+# test transport; production HTTPS installs always use the compiled trust root.
+if [ "${RELAY_INSTALL_ALLOW_HTTP:-0}" = "1" ] && [ -n "${RELAY_RELEASE_PUBLIC_KEY:-}" ]; then
+  release_public_key=$RELAY_RELEASE_PUBLIC_KEY
+fi
+
 say() {
   printf '[relay-install] %s\n' "$*"
 }

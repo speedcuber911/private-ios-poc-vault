@@ -39,7 +39,17 @@ After starting a new agent session, phrases such as “handoff to Relay”, “s
 this to Relay”, or “continue this on my phone” trigger the workflow. The skill
 drives the existing CLI commands; it does not add an MCP server or copy agent
 settings, plugins, skills, or slash commands to the Relay runner. Re-run with
-`--force` only when intentionally replacing a locally modified copy.
+`--force` only when intentionally replacing a locally modified copy. Relay
+records a content digest in copies it installed: `relay update` can refresh an
+unchanged managed copy automatically, but refuses to overwrite a user-edited
+copy.
+
+`relay update` runs the installer bundled with the current CLI, so the update
+keeps using the Ed25519 public key this installation already trusts. It reads
+the hosted `latest.txt`, verifies and activates the newest signed archive, then
+refreshes Relay-managed handoff skills with the newly installed CLI. Use
+`relay update --cli-only` to skip the skill refresh. Installations not managed
+by the curl installer should update through their original package mechanism.
 
 `relay login` signs in and pins the sandbox this machine hands off to. Approve
 the device code by scanning the QR in the iOS app. The production control plane

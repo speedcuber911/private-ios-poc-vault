@@ -13,6 +13,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SKILL_NAME = "relay-handoff";
+const MANAGED_MARKER = ".relay-managed.json";
 const bundledSkill = fileURLToPath(new URL(`../../plugins/relay-handoff/skills/${SKILL_NAME}`, import.meta.url));
 
 function skillTargets({ home = os.homedir(), env = process.env } = {}) {
@@ -30,7 +31,7 @@ function filesBelow(root) {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
       const absolute = path.join(dir, entry.name);
       if (entry.isDirectory()) visit(absolute);
-      else if (entry.isFile()) files.push(path.relative(root, absolute));
+      else if (entry.isFile() && entry.name !== MANAGED_MARKER) files.push(path.relative(root, absolute));
     }
   }
   visit(root);
@@ -49,13 +50,49 @@ function treeDigest(root) {
   return hash.digest("hex");
 }
 
+function readManagedMarker(destination) {
+  try {
+    const marker = JSON.parse(fs.readFileSync(path.join(destination, MANAGED_MARKER), "utf8"));
+    if (marker?.v !== 1 || marker?.manager !== "relay-cli" || marker?.skill !== SKILL_NAME) return null;
+    if (!/^[a-f0-9]{64}$/.test(marker?.sourceDigest || "")) return null;
+    return marker;
+  } catch {
+    return null;
+  }
+}
+
+function writeManagedMarker(destination, sourceDigest) {
+  const markerPath = path.join(destination, MANAGED_MARKER);
+  const temporary = `${markerPath}.new-${process.pid}`;
+  fs.writeFileSync(temporary, `${JSON.stringify({
+    v: 1,
+    manager: "relay-cli",
+    skill: SKILL_NAME,
+    sourceDigest,
+  }, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(temporary, markerPath);
+}
+
+function installationState(sourceDigest, destination) {
+  if (!fs.existsSync(destination)) return "absent";
+  const destinationDigest = treeDigest(destination);
+  if (destinationDigest === sourceDigest) return "current";
+  const marker = readManagedMarker(destination);
+  if (marker && marker.sourceDigest === destinationDigest) return "managed-update";
+  return "conflict";
+}
+
 function installOne(source, destination, { force = false } = {}) {
   const sourceDigest = treeDigest(source);
   if (!sourceDigest) throw new Error("bundled_relay_handoff_skill_missing");
 
-  if (fs.existsSync(destination)) {
-    if (treeDigest(destination) === sourceDigest) return "current";
-    if (!force) throw new Error(`skill_conflict: ${destination} already exists; re-run with --force to replace it`);
+  const priorState = installationState(sourceDigest, destination);
+  if (priorState === "current") {
+    writeManagedMarker(destination, sourceDigest);
+    return "current";
+  }
+  if (priorState === "conflict" && !force) {
+    throw new Error(`skill_conflict: ${destination} was modified or is not Relay-managed; re-run with --force to replace it`);
   }
 
   const parent = path.dirname(destination);
@@ -64,6 +101,7 @@ function installOne(source, destination, { force = false } = {}) {
   const backup = `${destination}.relay-backup-${process.pid}`;
   try {
     fs.cpSync(source, staged, { recursive: true, force: false });
+    writeManagedMarker(staged, sourceDigest);
     if (fs.existsSync(destination)) fs.renameSync(destination, backup);
     fs.renameSync(staged, destination);
     fs.rmSync(backup, { recursive: true, force: true });
@@ -72,7 +110,7 @@ function installOne(source, destination, { force = false } = {}) {
     if (!fs.existsSync(destination) && fs.existsSync(backup)) fs.renameSync(backup, destination);
     throw error;
   }
-  return "installed";
+  return priorState === "absent" ? "installed" : "updated";
 }
 
 function cmdInstallSkill(args = [], deps = {}) {
@@ -92,23 +130,20 @@ function cmdInstallSkill(args = [], deps = {}) {
   const sourceDigest = treeDigest(source);
   if (!sourceDigest) throw new Error("bundled_relay_handoff_skill_missing");
   if (!force) {
-    const conflict = targets.find((target) => {
-      const digest = treeDigest(target.path);
-      return digest && digest !== sourceDigest;
-    });
+    const conflict = targets.find((target) => installationState(sourceDigest, target.path) === "conflict");
     if (conflict) {
-      throw new Error(`skill_conflict: ${conflict.path} already exists; re-run with --force to replace it`);
+      throw new Error(`skill_conflict: ${conflict.path} was modified or is not Relay-managed; re-run with --force to replace it`);
     }
   }
 
   for (const target of targets) {
     const state = installOne(source, target.path, { force });
     results.push({ ...target, state });
-    log(`  ${target.agent.padEnd(11)} ${state === "current" ? "already current" : "installed"}`);
+    log(`  ${target.agent.padEnd(11)} ${state === "current" ? "already current" : state}`);
   }
   log("");
   log("  Start a new agent session, then say: handoff to Relay");
   return results;
 }
 
-export { cmdInstallSkill, installOne, skillTargets, treeDigest };
+export { cmdInstallSkill, installOne, installationState, readManagedMarker, skillTargets, treeDigest };

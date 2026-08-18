@@ -121,6 +121,7 @@ test("curl-style installer verifies the signature and links the current CLI", as
       RELAY_BIN_DIR: binDir,
       RELAY_INSTALL_ALLOW_HTTP: "1",
       RELAY_INSTALL_BASE_URL: `http://127.0.0.1:${address.port}`,
+      RELAY_RELEASE_PUBLIC_KEY: publicPem,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -134,6 +135,27 @@ test("curl-style installer verifies the signature and links the current CLI", as
   const versionResult = spawnSync(relayBin, ["--version"], { encoding: "utf8" });
   assert.equal(versionResult.status, 0, versionResult.stderr);
   assert.equal(versionResult.stdout.trim(), version);
+
+  // The installed CLI must be able to update through the installer carried
+  // inside its own signed archive. Reinstalling the same fixture version is a
+  // real end-to-end exercise of relay update without publishing a second
+  // immutable release just for this test.
+  const updated = await run(relayBin, ["update", "--cli-only"], {
+    cwd: root,
+    env: {
+      ...process.env,
+      HOME: home,
+      RELAY_BIN_DIR: binDir,
+      RELAY_INSTALL_ALLOW_HTTP: "1",
+      RELAY_INSTALL_BASE_URL: `http://127.0.0.1:${address.port}`,
+      RELAY_RELEASE_PUBLIC_KEY: publicPem,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  assert.equal(updated.code, 0, updated.stderr);
+  assert.match(updated.stdout, /Updating Relay CLI from the latest signed release/);
+  assert.match(updated.stdout, /Relay is up to date/);
+  assert.equal(spawnSync(relayBin, ["--version"], { encoding: "utf8" }).stdout.trim(), version);
 
   // A same-origin attacker can replace both the archive and SHA-256 file. The
   // pinned key must still reject the substituted archive before extraction.

@@ -13,6 +13,7 @@ const usage = `usage: relay <command>
   handoff     hand the current session to your sandbox
   sync-auth   copy your GitHub and harness logins to your sandbox
   install-skill install the Relay handoff skill for your local coding agents
+  update      install the latest signed Relay CLI and refresh managed skills
   status      show this repository's handoffs
   version     show the installed Relay CLI version
   help        show this message
@@ -60,6 +61,11 @@ try {
     case "install-skill": {
       const { cmdInstallSkill } = await import("../src/commands/installskill.mjs");
       await cmdInstallSkill(rest);
+      break;
+    }
+    case "update": {
+      const { cmdUpdate } = await import("../src/commands/update.mjs");
+      await cmdUpdate(rest);
       break;
     }
     case "status": {

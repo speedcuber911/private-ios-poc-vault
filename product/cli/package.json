@@ -5,7 +5,7 @@
   "type": "module",
   "engines": { "node": ">=20" },
   "bin": { "relay": "bin/relay" },
-  "files": ["bin", "src", "plugins"],
+  "files": ["bin", "src", "plugins", "dist/install.sh"],
   "scripts": { "test": "node --test test/*.test.mjs" },
   "license": "MIT"
 }

@@ -5,7 +5,9 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { cmdInstallSkill, skillTargets, treeDigest } from "../src/commands/installskill.mjs";
+import {
+  cmdInstallSkill, installOne, readManagedMarker, skillTargets, treeDigest,
+} from "../src/commands/installskill.mjs";
 
 const source = fileURLToPath(new URL("../plugins/relay-handoff/skills/relay-handoff", import.meta.url));
 
@@ -26,6 +28,7 @@ test("installs one canonical handoff skill for every supported local agent", () 
   ]);
   for (const target of skillTargets({ home, env: {} })) {
     assert.equal(treeDigest(target.path), treeDigest(source));
+    assert.equal(readManagedMarker(target.path)?.sourceDigest, treeDigest(source));
   }
   assert.match(lines.join("\n"), /Start a new agent session/);
 });
@@ -51,8 +54,36 @@ test("preflights conflicts before changing any provider and force replaces them"
   assert.equal(fs.readFileSync(path.join(targets[1].path, "SKILL.md"), "utf8"), "user-owned\n");
 
   const results = cmdInstallSkill(["--force"], { home, env: {}, source, log: () => {} });
-  assert.ok(results.every(({ state }) => state === "installed"));
+  assert.deepEqual(results.map(({ state }) => state), ["installed", "updated", "installed", "installed"]);
   assert.equal(treeDigest(targets[1].path), treeDigest(source));
+});
+
+test("updates unchanged Relay-managed copies and preserves user edits", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "relay-managed-skill-"));
+  const first = path.join(root, "first");
+  const second = path.join(root, "second");
+  const destination = path.join(root, "installed");
+  fs.cpSync(source, first, { recursive: true });
+  fs.cpSync(source, second, { recursive: true });
+  fs.appendFileSync(path.join(second, "SKILL.md"), "\nManaged update fixture.\n");
+
+  assert.equal(installOne(first, destination), "installed");
+  assert.equal(installOne(second, destination), "updated");
+  assert.equal(treeDigest(destination), treeDigest(second));
+  assert.equal(readManagedMarker(destination)?.sourceDigest, treeDigest(second));
+
+  fs.appendFileSync(path.join(destination, "SKILL.md"), "\nUser customization.\n");
+  assert.throws(() => installOne(first, destination), /skill_conflict/);
+  assert.match(fs.readFileSync(path.join(destination, "SKILL.md"), "utf8"), /User customization/);
+});
+
+test("adopts an unmarked legacy copy only when its content is exact", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "relay-legacy-skill-"));
+  const destination = path.join(root, "installed");
+  fs.cpSync(source, destination, { recursive: true });
+  assert.equal(readManagedMarker(destination), null);
+  assert.equal(installOne(source, destination), "current");
+  assert.equal(readManagedMarker(destination)?.sourceDigest, treeDigest(source));
 });
 
 test("honors provider-specific home overrides", () => {
