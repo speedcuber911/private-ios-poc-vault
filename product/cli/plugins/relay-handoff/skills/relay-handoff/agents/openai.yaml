@@ -1,0 +1,4 @@
+interface:
+  display_name: "Relay Handoff"
+  short_description: "Hand active agent work off to Relay"
+  default_prompt: "Use $relay-handoff to hand this active coding session off to Relay."

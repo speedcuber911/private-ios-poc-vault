@@ -27,10 +27,19 @@ running:
 ```bash
 relay login
 relay init
+relay install-skill
 relay handoff
 ```
 
 ## Commands
+
+`relay install-skill` installs the shared `relay-handoff` Agent Skill into the
+user-level skill directories for Codex, Claude Code, Cursor, and Kimi Code.
+After starting a new agent session, phrases such as “handoff to Relay”, “send
+this to Relay”, or “continue this on my phone” trigger the workflow. The skill
+drives the existing CLI commands; it does not add an MCP server or copy agent
+settings, plugins, skills, or slash commands to the Relay runner. Re-run with
+`--force` only when intentionally replacing a locally modified copy.
 
 `relay login` signs in and pins the sandbox this machine hands off to. Approve
 the device code by scanning the QR in the iOS app. The production control plane
@@ -154,8 +163,8 @@ key to the AWS infrastructure owner merely because they deploy the bucket.
 Update `package.json`, commit the change, and tag that commit:
 
 ```bash
-git tag relay-cli-v0.1.1
-git push origin relay-cli-v0.1.1
+git tag relay-cli-v0.1.2
+git push origin relay-cli-v0.1.2
 ```
 
 `.github/workflows/release-relay-cli.yml` requires the tag to match the package

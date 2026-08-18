@@ -1,0 +1,22 @@
+{
+  "name": "relay-handoff",
+  "version": "0.1.0",
+  "description": "Hand the active local coding-agent session off to Relay.",
+  "author": {
+    "name": "Relay"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Relay Handoff",
+    "shortDescription": "Send active coding sessions to Relay.",
+    "longDescription": "Recognizes requests to hand active work off to Relay and drives the installed Relay CLI through login, repository registration, credential sync when required, and verified handoff.",
+    "developerName": "Relay",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write"],
+    "defaultPrompt": [
+      "Hand this session off to Relay.",
+      "Continue this work on Relay.",
+      "Send this coding session to my phone."
+    ]
+  }
+}
