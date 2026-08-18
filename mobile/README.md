@@ -71,6 +71,11 @@ xcodebuild \
   build
 ```
 
+Xcode Cloud installs the required JDK 17 from
+`ios/POCVault/ci_scripts/ci_post_clone.sh`. The Xcode build helper resolves the
+Homebrew JDK explicitly because versioned Homebrew JDKs are keg-only and may
+not appear on the build phase's default `PATH`.
+
 ## Android first run
 
 1. Open **Settings** in Relay.

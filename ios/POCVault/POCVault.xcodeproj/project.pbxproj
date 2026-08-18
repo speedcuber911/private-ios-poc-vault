@@ -443,7 +443,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "if [ \"YES\" = \"$OVERRIDE_KOTLIN_BUILD_IDE_SUPPORTED\" ]; then\n  echo \"Skipping Gradle build because the IDE already built RelayCore\"\n  exit 0\nfi\ncd \"$SRCROOT/../../mobile\"\n./gradlew :relay-core:embedAndSignAppleFrameworkForXcode\n";
+			shellScript = "\"$SRCROOT/../../mobile/scripts/build-relay-core-for-xcode.sh\"\n";
 			showEnvVarsInLog = 0;
 		};
 /* End PBXShellScriptBuildPhase section */
