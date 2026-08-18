@@ -29,6 +29,10 @@ import { createNotify, parseNodePubkey } from "./notify.js";
 import { createApnsClient, createNoopTransport } from "./apns.js";
 import { createProvisioner } from "./provisioner.js";
 import { verifyNodeRequest, createReplayGuard } from "./nodeauth.js";
+import {
+  appAccountTokenForAccount,
+  createAppStoreVerifier,
+} from "./app-store.js";
 
 const NODE_KINDS = new Set(["byo", "managed"]);
 const BROWSER_GRANT_TTL_SEC = 900;
@@ -96,6 +100,7 @@ export function createApp({
   apnsTransport = createNoopTransport(),
   now = () => Date.now(),
   provisioner = createProvisioner(config),
+  appStoreVerifier = createAppStoreVerifier(config),
   // Operator warnings from the push pipeline. Injectable so a test can assert
   // that a whole-account APNs refusal actually SAYS so — the fanout summary and
   // the bad-token alert are the only signal an operator gets, and both were
@@ -127,6 +132,117 @@ export function createApp({
       return legacyAuth.authenticate(req) || (await betterAuth.authenticate(req));
     },
   };
+
+  async function activateHostedSubscription(accountId, expiresAt) {
+    const trial = registry.getTrialByAccount(accountId);
+    if (!trial?.nodeId || !trial.sandboxId || trial.state === "destroyed" || trial.state === "failed") {
+      return { ok: true, trial };
+    }
+    if (!provisioner) return { error: "provisioner_unavailable" };
+
+    const sandboxExists = trial.state === "expired"
+      ? await provisioner.resumeSandbox(trial.sandboxId, config.trial.paidSandboxTimeoutSec)
+      : await provisioner.extendSandbox(trial.sandboxId, config.trial.paidSandboxTimeoutSec);
+    if (!sandboxExists) {
+      // The platform no longer has this sandbox. Retire the stale node so the
+      // paid account can use the existing destroyed-row retry path to create a
+      // replacement instead of being stuck on a machine that cannot resume.
+      registry.deleteNode(accountId, trial.nodeId);
+      return {
+        ok: true,
+        trial: registry.updateTrial(trial.id, {
+          state: "destroyed",
+          nodeId: null,
+          sandboxId: null,
+          enrollTokenHash: null,
+        }),
+      };
+    }
+    return registry.activateHostedSubscriptionAccount(accountId, expiresAt);
+  }
+
+  async function expireHostedSubscription(accountId, expiresAt) {
+    const trial = registry.getTrialByAccount(accountId);
+    if (trial?.state === "upgraded" && trial.sandboxId && provisioner) {
+      try { await provisioner.pauseSandbox(trial.sandboxId); } catch {}
+    }
+    return registry.expireHostedSubscriptionAccount(accountId, expiresAt);
+  }
+
+  function computerAccessAllowed(node) {
+    const trial = registry.getTrialByNodeId(node.id);
+    if (!trial) return true;
+    switch (trial.state) {
+    case "creating":
+    case "ready":
+      return trial.expiresAt > now();
+    case "upgraded":
+      return (
+        registry.getEntitlement(node.accountId, ENTITLEMENT_HOSTED_AUTO_UPGRADE) === "1" ||
+        registry.hasActiveAppleSubscription(node.accountId, now())
+      );
+    case "expired":
+    case "destroyed":
+    case "failed":
+    default:
+      return false;
+    }
+  }
+
+  function normalizedSubscription(transaction, { accountId, status } = {}) {
+    const hostedProductIds = new Set([
+      config.appStore.monthlyProductId,
+      config.appStore.yearlyProductId,
+    ]);
+    if (
+      !transaction ||
+      !hostedProductIds.has(transaction.productId) ||
+      typeof transaction.originalTransactionId !== "string" ||
+      typeof transaction.transactionId !== "string" ||
+      typeof transaction.appAccountToken !== "string" ||
+      !Number.isFinite(transaction.expiresDate) ||
+      !Number.isFinite(transaction.signedDate)
+    ) {
+      return null;
+    }
+    const active =
+      status !== "expired" &&
+      !transaction.revocationDate &&
+      transaction.expiresDate > now();
+    return {
+      accountId,
+      productId: transaction.productId,
+      originalTransactionId: transaction.originalTransactionId,
+      transactionId: transaction.transactionId,
+      appAccountToken: transaction.appAccountToken.toLowerCase(),
+      environment: String(transaction.environment || "unknown"),
+      status: active ? "active" : "expired",
+      expiresAt: Number(transaction.expiresDate),
+      signedAt: Number(transaction.signedDate),
+    };
+  }
+
+  async function applyVerifiedSubscription(subscription) {
+    const saved = registry.upsertAppleSubscription(subscription);
+    if (saved.error) return saved;
+    if (saved.subscription.status === "active") {
+      const activated = await activateHostedSubscription(
+        saved.subscription.accountId,
+        saved.subscription.expiresAt,
+      );
+      if (activated.error) return activated;
+    } else {
+      await expireHostedSubscription(
+        saved.subscription.accountId,
+        saved.subscription.expiresAt,
+      );
+    }
+    return {
+      ok: true,
+      subscription: registry.getAppleSubscriptionByAccount(subscription.accountId),
+      trial: registry.getTrialByAccount(subscription.accountId),
+    };
+  }
   const pairing = createPairing({ registry, config, now });
   const apns = createApnsClient({ config, transport: apnsTransport, now });
   const notify = createNotify({ registry, apns, config, now, log });
@@ -376,11 +492,25 @@ export function createApp({
     }
   }
 
+  async function sweepExpiredSubscriptions() {
+    for (const subscription of registry.listExpiredAppleSubscriptions(now())) {
+      try {
+        registry.markAppleSubscriptionExpired(subscription.accountId);
+        await expireHostedSubscription(subscription.accountId, subscription.expiresAt);
+      } catch (error) {
+        console.error(`subscription expire failed for ${subscription.accountId}: ${error?.message}`);
+      }
+    }
+  }
+
   function runSweeps() {
     pairing.sweep();
     notify.sweep();
     registry.sweepDeviceCodes(now());
     registry.sweepSyncNotices(now());
+    sweepExpiredSubscriptions().catch((err) =>
+      console.error(`subscription sweep failed: ${err?.message}`),
+    );
     sweepTrials().catch((err) => console.error(`trial sweep failed: ${err?.message}`));
   }
 
@@ -631,6 +761,55 @@ export function createApp({
       return sendJson(res, result.status, result.body);
     }
 
+    // App Store Server Notifications V2 is public because Apple cannot hold a
+    // Relay session. The signedPayload is the credential: both the outer
+    // notification and nested transaction JWS are verified with Apple's root
+    // chain before any entitlement state changes.
+    if (method === "POST" && path === "/v1/subscriptions/apple/notifications") {
+      const body = await readJson(req, config.jsonBodyMaxBytes);
+      if (typeof body?.signedPayload !== "string") {
+        return sendJson(res, 400, { error: "signed_payload_required" });
+      }
+      let notification;
+      try {
+        notification = await appStoreVerifier.verifyNotification(body.signedPayload);
+      } catch {
+        return sendJson(res, 400, { error: "invalid_signed_payload" });
+      }
+      const signedTransaction = notification?.data?.signedTransactionInfo;
+      if (!signedTransaction) return sendJson(res, 200, { ok: true });
+
+      let transaction;
+      try {
+        transaction = await appStoreVerifier.verifyNotificationTransaction(signedTransaction);
+      } catch {
+        return sendJson(res, 400, { error: "invalid_signed_transaction" });
+      }
+      const existing = transaction.originalTransactionId
+        ? registry.getAppleSubscriptionByOriginalTransactionId(transaction.originalTransactionId)
+        : null;
+      // A first notification can race the app's authenticated verification.
+      // Acknowledge it without inventing ownership; the app then binds the
+      // same original transaction id and future notifications reconcile it.
+      if (!existing) return sendJson(res, 200, { ok: true });
+
+      const appleStatus = Number(notification?.data?.status);
+      const explicitlyInactive = [2, 3, 5].includes(appleStatus) ||
+        ["EXPIRED", "GRACE_PERIOD_EXPIRED", "REFUND", "REVOKE"].includes(
+          String(notification?.notificationType || ""),
+        );
+      const subscription = normalizedSubscription(transaction, {
+        accountId: existing.accountId,
+        status: explicitlyInactive ? "expired" : "active",
+      });
+      if (!subscription) return sendJson(res, 200, { ok: true });
+      const result = await applyVerifiedSubscription(subscription);
+      if (result.error === "provisioner_unavailable") {
+        return sendJson(res, 503, { error: result.error });
+      }
+      return sendJson(res, 200, { ok: true });
+    }
+
     // ── pairing rendezvous (protocol v2) ────────────────────────────────
     //
     // The caller supplies the derived authToken; the cloud never generates a
@@ -695,9 +874,21 @@ export function createApp({
         if (
           slot === "node" &&
           pairingSession &&
-          registry.getEntitlement(pairingSession.accountId, ENTITLEMENT_HOSTED_AUTO_UPGRADE) === "1"
+          (
+            registry.getEntitlement(pairingSession.accountId, ENTITLEMENT_HOSTED_AUTO_UPGRADE) === "1" ||
+            registry.hasActiveAppleSubscription(pairingSession.accountId, now())
+          )
         ) {
-          registry.upgradeTrialAccount(pairingSession.accountId);
+          if (registry.hasActiveAppleSubscription(pairingSession.accountId, now())) {
+            const subscription = registry.getAppleSubscriptionByAccount(pairingSession.accountId);
+            try {
+              await activateHostedSubscription(pairingSession.accountId, subscription.expiresAt);
+            } catch (error) {
+              console.error(`subscription machine activation failed for ${pairingSession.accountId}: ${error?.message}`);
+            }
+          } else {
+            registry.upgradeTrialAccount(pairingSession.accountId);
+          }
         }
         return sendBytes(res, 200, outcome.blob, { "x-pairing-tag": outcome.tag });
       }
@@ -852,7 +1043,9 @@ export function createApp({
           id, pairingId, secret, lease: leaseToken,
         })),
         computerAccess: {
-          allowed: !registry.isCliComputerAccessRevoked(verified.node.accountId),
+          allowed:
+            !registry.isCliComputerAccessRevoked(verified.node.accountId) &&
+            computerAccessAllowed(verified.node),
           leaseSec: config.computerAccessLeaseSec,
         },
       });
@@ -989,6 +1182,44 @@ export function createApp({
 
     function callerIsAdmin() {
       return isRelayAdmin(readBetterAuthUser(db, account.id), account, config);
+    }
+
+    if (path === "/v1/subscriptions/apple/verify" && method === "POST") {
+      const body = await readJson(req, config.jsonBodyMaxBytes);
+      if (typeof body?.signedTransaction !== "string") {
+        return sendJson(res, 400, { error: "signed_transaction_required" });
+      }
+      let transaction;
+      try {
+        transaction = await appStoreVerifier.verifyTransaction(body.signedTransaction);
+      } catch {
+        return sendJson(res, 400, { error: "invalid_signed_transaction" });
+      }
+      const expectedToken = appAccountTokenForAccount(account.id);
+      if (String(transaction?.appAccountToken || "").toLowerCase() !== expectedToken) {
+        return sendJson(res, 403, { error: "subscription_account_mismatch" });
+      }
+      const subscription = normalizedSubscription(transaction, { accountId: account.id });
+      if (!subscription) return sendJson(res, 400, { error: "invalid_subscription" });
+      if (subscription.status !== "active") {
+        return sendJson(res, 402, { error: "subscription_inactive" });
+      }
+      const result = await applyVerifiedSubscription(subscription);
+      if (result.error === "subscription_owned_by_another_account") {
+        return sendJson(res, 409, { error: result.error });
+      }
+      if (result.error) return sendJson(res, 503, { error: result.error });
+      return sendJson(res, 200, {
+        subscription: publicSubscription(result.subscription),
+        trial: result.trial ? publicTrial(result.trial, config, registry) : null,
+      });
+    }
+
+    if (path === "/v1/subscriptions/apple/status" && method === "GET") {
+      const subscription = registry.getAppleSubscriptionByAccount(account.id);
+      return sendJson(res, 200, {
+        subscription: subscription ? publicSubscription(subscription) : null,
+      });
     }
 
     if (path === "/v1/admin/accounts" && method === "GET") {
@@ -1831,6 +2062,14 @@ function publicTrial(trial, config, registry) {
     sni: trial.nodeId && config.tunnel.suffix ? `${trial.nodeId}${config.tunnel.suffix}` : null,
     createdAt: trial.createdAt,
     expiresAt: trial.expiresAt,
+  };
+}
+
+function publicSubscription(subscription) {
+  return {
+    productId: subscription.productId,
+    status: subscription.status,
+    expiresAt: subscription.expiresAt,
   };
 }
 

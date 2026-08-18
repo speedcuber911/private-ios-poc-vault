@@ -79,6 +79,25 @@ function ensureBrowserSessionsSchema(db) {
   `);
 }
 
+function ensureAppleSubscriptionSchema(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS apple_subscriptions (
+      account_id              TEXT PRIMARY KEY,
+      product_id              TEXT NOT NULL,
+      original_transaction_id TEXT NOT NULL UNIQUE,
+      transaction_id          TEXT NOT NULL,
+      app_account_token       TEXT NOT NULL UNIQUE,
+      environment             TEXT NOT NULL,
+      status                  TEXT NOT NULL,
+      expires_at              INTEGER NOT NULL,
+      signed_at               INTEGER NOT NULL,
+      updated_at              INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_apple_subscriptions_expiry
+      ON apple_subscriptions (status, expires_at);
+  `);
+}
+
 // Stores that hang off auth rather than off the core object model. Created
 // here, idempotently, so that opening a database provisioned from an earlier
 // schema turns these protections on rather than failing closed on first use;
@@ -314,6 +333,7 @@ function ensureDeviceApnsEnvironmentColumn(db) {
 export function createRegistry(db, { now = () => Date.now() } = {}) {
   ensureCliComputerSchema(db);
   ensureBrowserSessionsSchema(db);
+  ensureAppleSubscriptionSchema(db);
   ensureAuthSchema(db, now);
   ensureNodeEventSchema(db);
   ensureNodeEncColumn(db);
@@ -375,6 +395,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       db.prepare("DELETE FROM refresh_tokens WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM account_security WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM entitlements WHERE account_id = ?").run(accountId);
+      db.prepare("DELETE FROM apple_subscriptions WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM devices WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM nodes WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM trial_nodes WHERE account_id = ?").run(accountId);
@@ -806,6 +827,127 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       db.exec("ROLLBACK");
       throw err;
     }
+  }
+
+  // ── App Store subscriptions ────────────────────────────────────────────
+
+  function getAppleSubscriptionByAccount(accountId) {
+    return mapAppleSubscription(
+      db.prepare("SELECT * FROM apple_subscriptions WHERE account_id = ?").get(accountId),
+    );
+  }
+
+  function getAppleSubscriptionByOriginalTransactionId(originalTransactionId) {
+    return mapAppleSubscription(
+      db.prepare("SELECT * FROM apple_subscriptions WHERE original_transaction_id = ?")
+        .get(originalTransactionId),
+    );
+  }
+
+  function upsertAppleSubscription(subscription) {
+    const byOriginal = getAppleSubscriptionByOriginalTransactionId(
+      subscription.originalTransactionId,
+    );
+    const byToken = mapAppleSubscription(
+      db.prepare("SELECT * FROM apple_subscriptions WHERE app_account_token = ?")
+        .get(subscription.appAccountToken),
+    );
+    if (
+      (byOriginal && byOriginal.accountId !== subscription.accountId) ||
+      (byToken && byToken.accountId !== subscription.accountId)
+    ) {
+      return { error: "subscription_owned_by_another_account" };
+    }
+
+    db.prepare(
+      `INSERT INTO apple_subscriptions (
+         account_id, product_id, original_transaction_id, transaction_id,
+         app_account_token, environment, status, expires_at, signed_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (account_id) DO UPDATE SET
+         product_id = excluded.product_id,
+         original_transaction_id = excluded.original_transaction_id,
+         transaction_id = excluded.transaction_id,
+         app_account_token = excluded.app_account_token,
+         environment = excluded.environment,
+         status = excluded.status,
+         expires_at = excluded.expires_at,
+         signed_at = excluded.signed_at,
+         updated_at = excluded.updated_at
+       WHERE excluded.signed_at >= apple_subscriptions.signed_at`,
+    ).run(
+      subscription.accountId,
+      subscription.productId,
+      subscription.originalTransactionId,
+      subscription.transactionId,
+      subscription.appAccountToken,
+      subscription.environment,
+      subscription.status,
+      subscription.expiresAt,
+      subscription.signedAt,
+      now(),
+    );
+    return { ok: true, subscription: getAppleSubscriptionByAccount(subscription.accountId) };
+  }
+
+  function hasActiveAppleSubscription(accountId, at = now()) {
+    const subscription = getAppleSubscriptionByAccount(accountId);
+    return Boolean(
+      subscription &&
+      subscription.status === "active" &&
+      subscription.expiresAt > at,
+    );
+  }
+
+  function listExpiredAppleSubscriptions(at = now()) {
+    return db.prepare(
+      "SELECT * FROM apple_subscriptions WHERE status = 'active' AND expires_at <= ? ORDER BY expires_at",
+    ).all(at).map(mapAppleSubscription);
+  }
+
+  function markAppleSubscriptionExpired(accountId) {
+    // This transition comes from Relay's own wall clock, not a newly signed
+    // Apple event. Preserve signed_at so a delayed renewal that Apple signed
+    // after the last stored transaction can still supersede this local sweep.
+    db.prepare(
+      "UPDATE apple_subscriptions SET status = 'expired', updated_at = ? WHERE account_id = ?",
+    ).run(now(), accountId);
+    return getAppleSubscriptionByAccount(accountId);
+  }
+
+  function activateHostedSubscriptionAccount(accountId, expiresAt) {
+    if (!getAccount(accountId)) return { error: "unknown_account" };
+    const trial = getTrialByAccount(accountId);
+    const node = trial?.nodeId ? getNode(trial.nodeId) : null;
+    if (!trial || !node || !["ready", "expired", "upgraded"].includes(trial.state)) {
+      return { error: "nothing_to_activate" };
+    }
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      updateNode(node.id, {
+        ...(node.kind === "trial" ? { kind: "managed" } : {}),
+        ...(node.name === "Trial machine" ? { name: "Machine" } : {}),
+      });
+      updateTrial(trial.id, { state: "upgraded", expiresAt });
+      const currentMax = Number.parseInt(
+        getEntitlement(accountId, ENTITLEMENT_MAX_NODES) ?? "0",
+        10,
+      );
+      if (!Number.isFinite(currentMax) || currentMax < 2) {
+        setEntitlement(accountId, ENTITLEMENT_MAX_NODES, 2);
+      }
+      db.exec("COMMIT");
+      return { ok: true, trial: getTrialByAccount(accountId) };
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  function expireHostedSubscriptionAccount(accountId, expiresAt = now()) {
+    const trial = getTrialByAccount(accountId);
+    if (!trial || trial.state !== "upgraded") return { ok: true, trial };
+    return { ok: true, trial: updateTrial(trial.id, { state: "expired", expiresAt }) };
   }
 
   // ── sandbox orphans ─────────────────────────────────────────────────────
@@ -1864,6 +2006,14 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     listTrialsPastGrace,
     countActiveTrials,
     upgradeTrialAccount,
+    getAppleSubscriptionByAccount,
+    getAppleSubscriptionByOriginalTransactionId,
+    upsertAppleSubscription,
+    hasActiveAppleSubscription,
+    listExpiredAppleSubscriptions,
+    markAppleSubscriptionExpired,
+    activateHostedSubscriptionAccount,
+    expireHostedSubscriptionAccount,
     recordSandboxOrphan,
     listSandboxOrphans,
     clearSandboxOrphan,
@@ -2074,6 +2224,22 @@ function mapTrial(row) {
     state: row.state,
     createdAt: Number(row.created_at),
     expiresAt: Number(row.expires_at),
+    updatedAt: Number(row.updated_at),
+  };
+}
+
+function mapAppleSubscription(row) {
+  if (!row) return null;
+  return {
+    accountId: row.account_id,
+    productId: row.product_id,
+    originalTransactionId: row.original_transaction_id,
+    transactionId: row.transaction_id,
+    appAccountToken: row.app_account_token,
+    environment: row.environment,
+    status: row.status,
+    expiresAt: Number(row.expires_at),
+    signedAt: Number(row.signed_at),
     updatedAt: Number(row.updated_at),
   };
 }

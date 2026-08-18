@@ -117,6 +117,9 @@ export async function startTestApp(overrides = {}) {
     apnsTransport,
     now,
     provisioner: overrides.provisioner,
+    ...(overrides.appStoreVerifier
+      ? { appStoreVerifier: overrides.appStoreVerifier }
+      : {}),
     ...(overrides.log ? { log: overrides.log } : {}),
   });
 

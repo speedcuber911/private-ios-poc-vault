@@ -61,6 +61,23 @@ CREATE TABLE IF NOT EXISTS entitlements (
   PRIMARY KEY (account_id, feature)
 );
 
+-- Latest verified App Store state for Relay Hosted. Apple-signed transaction
+-- ids are retained for entitlement reconciliation, not for analytics.
+CREATE TABLE IF NOT EXISTS apple_subscriptions (
+  account_id              TEXT PRIMARY KEY,
+  product_id              TEXT NOT NULL,
+  original_transaction_id TEXT NOT NULL UNIQUE,
+  transaction_id          TEXT NOT NULL,
+  app_account_token       TEXT NOT NULL UNIQUE,
+  environment             TEXT NOT NULL,
+  status                  TEXT NOT NULL,
+  expires_at              INTEGER NOT NULL,
+  signed_at               INTEGER NOT NULL,
+  updated_at              INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_apple_subscriptions_expiry
+  ON apple_subscriptions (status, expires_at);
+
 CREATE TABLE IF NOT EXISTS waitlist (
   email       TEXT PRIMARY KEY,
   created_at  INTEGER NOT NULL

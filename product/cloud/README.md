@@ -342,6 +342,42 @@ try/catch, so one trial's failure cannot abort the pass and strand every trial
 behind it, and the sweep holds an in-flight flag so a slow pass cannot be
 re-entered by the next 60 s tick.
 
+### Relay Hosted App Store subscriptions
+
+The seven-day hosted-machine trial is controlled by Relay's server clock; it
+is not an App Store introductory offer. After the trial expires, hosted access
+stays paused unless the account has either a current Apple subscription or the
+operator-only `hosted.auto_upgrade=1` entitlement used by App Review. Provider
+accounts and usage (Codex, Claude, Cursor, and similar services) are not part
+of Relay Hosted.
+
+The iOS app sells two auto-renewable products in one subscription group:
+
+- `com.parikshit.pocvault.hosted.monthly` — one month
+- `com.parikshit.pocvault.hosted.yearly` — one year
+
+`POST /v1/subscriptions/apple/verify` accepts an authenticated StoreKit
+transaction JWS. The service validates Apple's certificate chain, bundle id,
+product id, expiration, and a deterministic `appAccountToken` bound to the
+Relay account before activating the machine. `POST
+/v1/subscriptions/apple/notifications` is public for App Store Server
+Notifications V2; the signed outer payload and its transaction JWS are both
+verified before a renewal, expiration, refund, or revocation changes access.
+Configure that App Store Connect notification URL as:
+
+```text
+https://api.pocs.conformal.live/v1/subscriptions/apple/notifications
+```
+
+Apple's public root certificates are checked in as DER `.cer` files under
+`certs/`. Never replace them with a private key or signing credential. Product
+ids and the numeric App Store app id can be overridden with
+`APP_STORE_HOSTED_MONTHLY_PRODUCT_ID`,
+`APP_STORE_HOSTED_YEARLY_PRODUCT_ID`, and `APP_STORE_APP_APPLE_ID`.
+`APP_STORE_ONLINE_CHECKS=0` is for isolated tests only. A paid renewal extends
+Cube's platform timeout using `HOSTED_SANDBOX_TIMEOUT_SEC` (default 370 days),
+while Relay still enforces the signed subscription expiration itself.
+
 **Lifecycle enforcement is not gated on the feature flag.** `E2B_API_URL`
 switches off *creating* trials; the reaper keeps running without it, because a
 kill switch that also froze every existing trial would leave users with

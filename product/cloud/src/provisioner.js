@@ -73,6 +73,32 @@ export function createProvisioner(config) {
       return true;
     },
 
+    async extendSandbox(sandboxId, timeoutSec = config.trial.paidSandboxTimeoutSec) {
+      const res = await call(
+        "POST",
+        `/sandboxes/${encodeURIComponent(sandboxId)}/timeout`,
+        { timeout: timeoutSec },
+      );
+      if (res.status === 404) return false;
+      if (!res.ok && res.status !== 204) throw new Error(`provisioner_http_${res.status}`);
+      return true;
+    },
+
+    // E2B/Cube's connect endpoint resumes a paused sandbox and extends its
+    // timeout in the same authenticated request. That atomic shape is exactly
+    // what a subscription recovery needs: access is not marked active until
+    // the machine is both awake and protected from its old trial timer.
+    async resumeSandbox(sandboxId, timeoutSec = config.trial.paidSandboxTimeoutSec) {
+      const res = await call(
+        "POST",
+        `/sandboxes/${encodeURIComponent(sandboxId)}/connect`,
+        { timeout: timeoutSec },
+      );
+      if (res.status === 404) return false;
+      if (!res.ok) throw new Error(`provisioner_http_${res.status}`);
+      return true;
+    },
+
     // Writes a file into a RUNNING sandbox through envd, the in-container
     // daemon the platform reaches on :49983.
     //

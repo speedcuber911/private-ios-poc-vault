@@ -5,27 +5,14 @@ import SwiftUI
 /// full-width expiry banner once `trial.state == .expired`. Copy always says
 /// "machine", never "sandbox" (product copy rule).
 struct TrialStatusBanner: View {
-    /// Labelled actions must do what they say: this one actually posts to the
-    /// waitlist. Returns false when the join failed so the banner can say so
-    /// instead of silently claiming success.
-    typealias JoinWaitlistAction = () async -> Bool
-
     let trial: RelayTrialNode
     let client: CodexClient
-    let onJoinWaitlist: JoinWaitlistAction
+    @ObservedObject var subscriptionStore: RelaySubscriptionStore
 
     @State private var showingConnectOwnMachine = false
     @State private var exportURL: URL?
     @State private var isExporting = false
     @State private var exportError: String?
-    @State private var waitlistState = WaitlistState.idle
-
-    private enum WaitlistState: Equatable {
-        case idle
-        case joining
-        case joined
-        case failed
-    }
 
     var body: some View {
         Group {
@@ -40,31 +27,6 @@ struct TrialStatusBanner: View {
         }
     }
 
-    /// Status here is a word, never a dot (spec rule 5): once joined, the button
-    /// is replaced by a small-caps confirmation rather than a badge.
-    @ViewBuilder
-    private var waitlistAction: some View {
-        switch waitlistState {
-        case .joined:
-            RelayCapsLabel(text: "On the waitlist", color: AppTheme.textSecondary, size: 10)
-                .accessibilityIdentifier("relay-trial-waitlist-joined")
-        case .idle, .joining, .failed:
-            Button(waitlistState == .joining ? "Joining…" : "Join the paid waitlist") {
-                Task { await joinWaitlist() }
-            }
-            .font(AppTheme.uiFont(size: 13, weight: .semibold))
-            .foregroundStyle(AppTheme.accent)
-            .buttonStyle(.plain)
-            .disabled(waitlistState == .joining)
-            .accessibilityIdentifier("relay-trial-waitlist")
-        }
-    }
-
-    private func joinWaitlist() async {
-        waitlistState = .joining
-        waitlistState = await onJoinWaitlist() ? .joined : .failed
-    }
-
     private func exportFiles() async {
         isExporting = true
         exportError = nil
@@ -77,13 +39,26 @@ struct TrialStatusBanner: View {
     }
 
     private var capsule: some View {
-        RelayCapsLabel(
-            text: "Trial · \(trial.remainingDescription())",
-            color: AppTheme.textSecondary,
-            size: 10
-        )
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
+        HStack(spacing: 12) {
+            RelayCapsLabel(
+                text: "Trial · \(trial.remainingDescription())",
+                color: AppTheme.textSecondary,
+                size: 10
+            )
+
+            Spacer(minLength: 4)
+
+            Button("Keep Relay · \(subscriptionStore.monthlyDisplayPrice)/month") {
+                Task { await subscriptionStore.purchase() }
+            }
+            .font(AppTheme.uiFont(size: 12, weight: .semibold))
+            .foregroundStyle(AppTheme.accent)
+            .buttonStyle(.plain)
+            .disabled(subscriptionStore.isPurchasing)
+            .accessibilityIdentifier("relay-trial-subscribe")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
         .background(AppTheme.textPrimary.opacity(0.06), in: Capsule())
         .accessibilityIdentifier("relay-trial-badge")
     }
@@ -96,16 +71,41 @@ struct TrialStatusBanner: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .accessibilityIdentifier("relay-trial-expired-message")
 
-            HStack(spacing: 18) {
-                Button("Connect your own machine") {
-                    showingConnectOwnMachine = true
+            VStack(spacing: 10) {
+                Button("Subscribe monthly · \(subscriptionStore.monthlyDisplayPrice)") {
+                    Task { await subscriptionStore.purchase() }
                 }
-                .font(AppTheme.uiFont(size: 13, weight: .semibold))
-                .foregroundStyle(AppTheme.textPrimary)
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("relay-trial-connect-own")
+                .buttonStyle(RelayPrimaryButtonStyle())
+                .disabled(subscriptionStore.isPurchasing)
+                .accessibilityIdentifier("relay-trial-subscribe-monthly")
 
-                waitlistAction
+                Button("Subscribe yearly · \(subscriptionStore.yearlyDisplayPrice)") {
+                    Task {
+                        await subscriptionStore.purchase(
+                            productID: RelaySubscriptionStore.hostedYearlyProductID
+                        )
+                    }
+                }
+                .buttonStyle(RelayOutlineButtonStyle())
+                .disabled(subscriptionStore.isPurchasing)
+                .accessibilityIdentifier("relay-trial-subscribe-yearly")
+
+                HStack(spacing: 18) {
+                    Button("Restore Purchases") {
+                        Task { await subscriptionStore.restorePurchases() }
+                    }
+                    .font(AppTheme.uiFont(size: 13, weight: .semibold))
+                    .foregroundStyle(AppTheme.accent)
+                    .buttonStyle(.plain)
+
+                    Button("Connect your own machine") {
+                        showingConnectOwnMachine = true
+                    }
+                    .font(AppTheme.uiFont(size: 13, weight: .semibold))
+                    .foregroundStyle(AppTheme.textPrimary)
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("relay-trial-connect-own")
+                }
             }
 
             // The grace period is the only window in which this data still
@@ -130,12 +130,11 @@ struct TrialStatusBanner: View {
                 .accessibilityIdentifier("relay-trial-export")
             }
 
-            if waitlistState == .failed {
-                Text("Relay couldn't add you to the waitlist. Try again.")
+            if let message = subscriptionStore.errorMessage, !message.isEmpty {
+                Text(message)
                     .font(AppTheme.uiFont(size: 12))
                     .foregroundStyle(AppTheme.statusError)
                     .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("relay-trial-waitlist-error")
             }
 
             if let exportError {
@@ -192,5 +191,156 @@ private struct ConnectOwnMachineInfoView: View {
             }
         }
         .preferredColorScheme(.dark)
+    }
+}
+
+/// The hosted machine is deliberately unreachable after trial expiry. This
+/// screen is the only root surface until StoreKit and the cloud both confirm
+/// an active entitlement; successful purchase/restore updates RelayNodeStore,
+/// which routes the app back to the normal workspace UI.
+struct RelayExpiredTrialView: View {
+    @ObservedObject var accountStore: RelayAccountStore
+    @ObservedObject var subscriptionStore: RelaySubscriptionStore
+
+    @State private var showingDeleteConfirmation = false
+    @State private var deletionPassword = ""
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                AppTheme.canvasGradient.ignoresSafeArea()
+                ScrollView {
+                    VStack(spacing: 22) {
+                        Image(systemName: "bolt.shield")
+                            .font(.system(size: 42, weight: .medium))
+                            .foregroundStyle(AppTheme.accentGradient)
+
+                        VStack(spacing: 10) {
+                            Text("Keep your Relay machine")
+                                .font(AppTheme.serifFont(size: 30))
+                                .foregroundStyle(AppTheme.textPrimary)
+                                .multilineTextAlignment(.center)
+
+                            Text("Your seven-day trial has ended. Hosted access is paused; your machine data is kept for three days.")
+                                .font(AppTheme.uiFont(size: 15))
+                                .foregroundStyle(AppTheme.textSecondary)
+                                .multilineTextAlignment(.center)
+                                .lineSpacing(4)
+                        }
+
+                        VStack(spacing: 12) {
+                            Button {
+                                Task { await subscriptionStore.purchase() }
+                            } label: {
+                                VStack(spacing: 3) {
+                                    Text("Monthly · \(subscriptionStore.monthlyDisplayPrice)")
+                                        .font(AppTheme.uiFont(size: 16, weight: .semibold))
+                                    Text("Billed every month")
+                                        .font(AppTheme.uiFont(size: 11))
+                                }
+                                .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(RelayPrimaryButtonStyle())
+                            .disabled(subscriptionStore.isPurchasing)
+                            .accessibilityIdentifier("relay-expired-subscribe-monthly")
+
+                            Button {
+                                Task {
+                                    await subscriptionStore.purchase(
+                                        productID: RelaySubscriptionStore.hostedYearlyProductID
+                                    )
+                                }
+                            } label: {
+                                VStack(spacing: 3) {
+                                    Text("Yearly · \(subscriptionStore.yearlyDisplayPrice)")
+                                        .font(AppTheme.uiFont(size: 16, weight: .semibold))
+                                    Text("Save about 17% · billed every year")
+                                        .font(AppTheme.uiFont(size: 11))
+                                }
+                                .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(RelayOutlineButtonStyle())
+                            .disabled(subscriptionStore.isPurchasing)
+                            .accessibilityIdentifier("relay-expired-subscribe-yearly")
+                        }
+
+                        if subscriptionStore.isPurchasing {
+                            ProgressView("Confirming with the App Store…")
+                                .tint(AppTheme.accent)
+                                .foregroundStyle(AppTheme.textSecondary)
+                        }
+
+                        if let message = subscriptionStore.errorMessage, !message.isEmpty {
+                            Text(message)
+                                .font(AppTheme.uiFont(size: 13))
+                                .foregroundStyle(AppTheme.statusError)
+                                .multilineTextAlignment(.center)
+                        }
+
+                        Button("Restore Purchases") {
+                            Task { await subscriptionStore.restorePurchases() }
+                        }
+                        .font(AppTheme.uiFont(size: 14, weight: .semibold))
+                        .foregroundStyle(AppTheme.accent)
+                        .buttonStyle(.plain)
+                        .disabled(subscriptionStore.isPurchasing)
+                        .accessibilityIdentifier("relay-expired-restore")
+
+                        Text("Payment is charged to your Apple ID. Subscriptions renew automatically unless canceled at least 24 hours before the current period ends. Manage or cancel in App Store account settings.")
+                            .font(AppTheme.uiFont(size: 11))
+                            .foregroundStyle(AppTheme.textTertiary)
+                            .multilineTextAlignment(.center)
+                            .lineSpacing(3)
+
+                        HStack(spacing: 18) {
+                            Link("Privacy", destination: URL(string: "https://app.openrelay.sh/privacy")!)
+                            Link("Terms", destination: URL(string: "https://app.openrelay.sh/terms")!)
+                            Link("Support", destination: URL(string: "https://app.openrelay.sh/support")!)
+                        }
+                        .font(AppTheme.uiFont(size: 12, weight: .medium))
+                        .foregroundStyle(AppTheme.textSecondary)
+
+                        Button("Sign out") {
+                            Task { await accountStore.signOut() }
+                        }
+                        .font(AppTheme.uiFont(size: 13, weight: .medium))
+                        .foregroundStyle(AppTheme.textTertiary)
+                        .buttonStyle(.plain)
+
+                        Button("Delete account", role: .destructive) {
+                            deletionPassword = ""
+                            showingDeleteConfirmation = true
+                        }
+                        .font(AppTheme.uiFont(size: 13, weight: .medium))
+                        .buttonStyle(.plain)
+                        .disabled(accountStore.isWorking)
+                        .accessibilityIdentifier("relay-expired-delete-account")
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 34)
+                }
+            }
+            .navigationTitle("Relay Hosted")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+        .preferredColorScheme(.dark)
+        .task { await subscriptionStore.prepare() }
+        .alert("Delete your Relay account?", isPresented: $showingDeleteConfirmation) {
+            if accountStore.user?.usesPassword == true {
+                SecureField("Current password", text: $deletionPassword)
+            }
+            Button("Delete account", role: .destructive) {
+                Task {
+                    _ = await accountStore.deleteAccount(
+                        password: accountStore.user?.usesPassword == true
+                            ? deletionPassword
+                            : nil
+                    )
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This permanently deletes your Relay account and hosted machine. Your App Store subscription must be canceled separately in Apple account settings.")
+        }
     }
 }

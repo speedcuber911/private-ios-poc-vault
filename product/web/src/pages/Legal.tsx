@@ -31,6 +31,7 @@ function Privacy() {
         <li><strong>Device information:</strong> app device identifiers, device name and platform, notification token, and signed-in session details.</li>
         <li><strong>Agent content:</strong> prompts, messages, run status, logs, outputs, attachments, workspace and repository metadata, and authenticated previews you choose to create or open.</li>
         <li><strong>Voice prompts:</strong> audio you intentionally record is sent for speech transcription. Relay keeps the resulting text and operational metadata, but does not retain the audio clip after the transcription request completes.</li>
+        <li><strong>Subscription information:</strong> Apple-signed product, transaction, renewal, and expiration details used to confirm Relay Hosted access. Apple processes your payment details; Relay does not receive your card or bank information.</li>
         <li><strong>Service information:</strong> diagnostics, security events, machine state, and usage needed to operate, protect, and troubleshoot Relay.</li>
       </ul>
 
@@ -45,10 +46,11 @@ function Privacy() {
       <h2>Service providers and agent providers</h2>
       <p>
         Relay uses infrastructure and authentication providers to operate the service, Apple for
-        Sign in with Apple and notifications, and Microsoft Azure Speech when you request voice
-        transcription. Prompts and files are also processed by the AI provider you select—such as
-        Codex, Claude Code, Cursor, or Kimi—under the account and terms configured on your Relay
-        machine. Relay does not place provider credentials in its public catalog or app metadata.
+        Sign in with Apple, notifications, and App Store subscription processing, and Microsoft
+        Azure Speech when you request voice transcription. Prompts and files are also processed by
+        the AI provider you select—such as Codex, Claude Code, Cursor, or Kimi—under the account and
+        terms configured on your Relay machine. Relay does not place provider credentials in its
+        public catalog or app metadata.
       </p>
 
       <h2>Retention and deletion</h2>
@@ -90,9 +92,25 @@ function Terms() {
       <h2>Your account and services</h2>
       <p>
         You must provide accurate account information, protect your credentials, and be legally
-        able to use Relay. Relay may provide a hosted sandbox or let you connect a machine you
-        control. Access to a hosted sandbox may be time-limited or separately granted. This version
-        of Relay does not sell an in-app subscription or include third-party AI subscriptions.
+        able to use Relay. Relay may provide a hosted machine or let you connect a machine you
+        control. New eligible accounts receive seven days of Relay Hosted access. After that trial,
+        the hosted machine is paused unless you have an active Relay Hosted subscription. Relay does
+        not include third-party AI-provider subscriptions or their usage charges.
+      </p>
+
+      <h2>Relay Hosted subscriptions</h2>
+      <p>
+        Relay Hosted is available as an auto-renewing monthly subscription for US$9.99 or an
+        auto-renewing yearly subscription for US$99. Prices may vary by country, and the price shown
+        in the App Store purchase sheet controls. Both plans provide the same hosted Relay access.
+      </p>
+      <p>
+        Payment is charged to your Apple Account when you confirm the purchase. Your subscription
+        renews automatically unless you cancel it at least 24 hours before the end of the current
+        billing period. Apple may charge your account for renewal within 24 hours before the period
+        ends. You can manage or cancel the subscription in your Apple Account subscription settings.
+        Deleting Relay does not cancel a subscription. Refund requests are handled under Apple's
+        App Store policies.
       </p>
 
       <h2>AI providers and agent actions</h2>
@@ -151,6 +169,7 @@ function Support() {
         <li>Open Settings and confirm the expected computer or hosted sandbox appears under Signed in.</li>
         <li>If a run is still active, open Threads and refresh before starting a duplicate run.</li>
         <li>Provider sign-in and billing are managed by the provider configured on your Relay machine.</li>
+        <li>For Relay Hosted billing, use Restore Purchases in Relay or manage the subscription in your Apple Account settings.</li>
       </ul>
 
       <h2>Account deletion</h2>

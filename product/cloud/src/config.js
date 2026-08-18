@@ -55,6 +55,22 @@ export function loadConfig(env = process.env) {
     appleClientSecret: env.APPLE_CLIENT_SECRET || "",
     appleJwksUrl: env.APPLE_JWKS_URL || "https://appleid.apple.com/auth/keys",
 
+    // Relay Hosted uses monthly and yearly durations in one auto-renewable
+    // subscription group. The product ids and numeric App Store app id are
+    // public identifiers; keeping them configurable still makes local/test
+    // deployments explicit.
+    appStore: {
+      bundleId: env.APP_STORE_BUNDLE_ID || "com.parikshit.pocvault",
+      appAppleId: intFrom(env.APP_STORE_APP_APPLE_ID, 6800257362),
+      monthlyProductId:
+        env.APP_STORE_HOSTED_MONTHLY_PRODUCT_ID ||
+        "com.parikshit.pocvault.hosted.monthly",
+      yearlyProductId:
+        env.APP_STORE_HOSTED_YEARLY_PRODUCT_ID ||
+        "com.parikshit.pocvault.hosted.yearly",
+      enableOnlineChecks: env.APP_STORE_ONLINE_CHECKS !== "0",
+    },
+
     // Magic link
     magicLinkBaseUrl: env.MAGIC_LINK_BASE_URL || "https://<domain>/auth/confirm",
     magicLinkTtlSec: intFrom(env.MAGIC_LINK_TTL_SEC, 15 * 60),
@@ -159,6 +175,14 @@ export function loadConfig(env = process.env) {
       // POST /v1/trial-nodes pending forever and — worse — stalls the reaper
       // mid-pass, silently stopping all later expiry work.
       provisionerTimeoutMs: intFrom(env.TRIAL_PROVISIONER_TIMEOUT_MS, 30_000),
+
+      // A verified paid renewal extends the platform timer to this backstop.
+      // Relay still pauses access at subscription expiry; this only prevents
+      // Cube's create-time trial timer from deleting a paying user's machine.
+      paidSandboxTimeoutSec: Math.max(
+        31 * 24 * 3600,
+        intFrom(env.HOSTED_SANDBOX_TIMEOUT_SEC, 370 * 24 * 3600),
+      ),
     },
     tunnel: {
       host: env.TUNNEL_HOST || "",

@@ -2,6 +2,13 @@ import XCTest
 @testable import POCVault
 
 final class AccountTests: XCTestCase {
+    func testStoreKitAppAccountTokenMatchesServerDerivation() {
+        XCTAssertEqual(
+            RelaySubscriptionStore.appAccountToken(accountID: "account-a").uuidString.lowercased(),
+            "332798da-332f-436e-a13a-c1d2f176bb7e"
+        )
+    }
+
     func testRelayAccountPrefersDisplayUsernameAndDetectsPasswordAccounts() {
         let user = RelayAccountUser(
             id: "user-1",

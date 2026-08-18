@@ -53,6 +53,7 @@
   ],
   "knownDifferences": [
     {"id": "apple-identity-and-apns", "status": "platform-specific", "reason": "Sign in with Apple and APNs require native Apple implementations; Android equivalents must use Android identity and FCM."},
+    {"id": "apple-app-store-subscriptions", "status": "platform-specific", "reason": "The iOS App Store build purchases Relay Hosted through StoreKit; Android billing requires its own store implementation before Android distribution."},
     {"id": "account-trial-cli-handoff", "status": "android-gap", "reason": "Android 0.1 still uses manual private-operator setup and does not yet expose the iOS account, trial, CLI-link, or handoff flows."},
     {"id": "file-terminal-voice-notifications", "status": "android-gap", "reason": "Android does not yet expose the iOS file viewer, terminal, voice capture, or completion-notification workflows."}
   ]

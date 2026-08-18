@@ -201,3 +201,33 @@ test("pauseSandbox posts pause", async () => {
     await fake.close();
   }
 });
+
+test("paid lifecycle calls extend and resume with the hosted timeout", async () => {
+  const fake = await startFakeCube((req, res) => {
+    if (req.url.endsWith("/connect")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ sandboxID: "sbx_9" }));
+      return;
+    }
+    res.writeHead(204);
+    res.end();
+  });
+  try {
+    const config = loadConfig({
+      E2B_API_URL: fake.url,
+      E2B_API_KEY: "k",
+      TRIAL_TEMPLATE_ID: "tpl",
+      HOSTED_SANDBOX_TIMEOUT_SEC: "2678400",
+    });
+    const provisioner = createProvisioner(config);
+    assert.equal(await provisioner.extendSandbox("sbx_9"), true);
+    assert.equal(fake.calls[0].url, "/sandboxes/sbx_9/timeout");
+    assert.deepEqual(fake.calls[0].body, { timeout: 2678400 });
+
+    assert.equal(await provisioner.resumeSandbox("sbx_9"), true);
+    assert.equal(fake.calls[1].url, "/sandboxes/sbx_9/connect");
+    assert.deepEqual(fake.calls[1].body, { timeout: 2678400 });
+  } finally {
+    await fake.close();
+  }
+});

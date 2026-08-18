@@ -12,6 +12,7 @@ struct POCVaultApp: App {
     @StateObject private var nodeStore: RelayNodeStore
     @StateObject private var computerLinkStore: RelayComputerLinkStore
     @StateObject private var pushService: RelayPushService
+    @StateObject private var subscriptionStore: RelaySubscriptionStore
     private let manifestClient: ManifestClient
     private let codexClient: CodexClient
     private let trialClient: RelayTrialClient
@@ -53,6 +54,11 @@ struct POCVaultApp: App {
             client: RelayAuthClient(baseURL: AppConfiguration.authBaseURL)
         ))
         _pushService = StateObject(wrappedValue: RelayPushService(accountStore: accountStore, codexClient: codexClient))
+        _subscriptionStore = StateObject(wrappedValue: RelaySubscriptionStore(
+            accountStore: accountStore,
+            nodeStore: nodeStore,
+            client: RelaySubscriptionClient(baseURL: AppConfiguration.authBaseURL)
+        ))
         self.manifestClient = manifestClient
         self.codexClient = codexClient
         self.trialClient = RelayTrialClient(baseURL: AppConfiguration.authBaseURL)
@@ -72,6 +78,10 @@ struct POCVaultApp: App {
                 await applyAuthenticationUITestHooks()
                 #endif
             }
+            .task(id: accountStore.user?.id) {
+                guard accountStore.user != nil else { return }
+                await subscriptionStore.prepare()
+            }
         }
     }
 
@@ -88,6 +98,11 @@ struct POCVaultApp: App {
                 nodeStore: nodeStore,
                 identityStore: identityStore,
                 trialClient: trialClient
+            )
+        case .ready where nodeStore.trial?.state == .expired:
+            RelayExpiredTrialView(
+                accountStore: accountStore,
+                subscriptionStore: subscriptionStore
             )
         case .ready where !nodeStore.hasMachine:
             // Signed in, but nothing to talk to: the trial was lost or
@@ -114,6 +129,7 @@ struct POCVaultApp: App {
                 manifestClient: manifestClient,
                 codexClient: codexClient,
                 trialClient: trialClient,
+                subscriptionStore: subscriptionStore,
                 pushService: pushService
             )
             // Adopting (or losing) a machine restarts the browser stack so
@@ -186,6 +202,7 @@ struct POCVaultRootView: View {
     let manifestClient: ManifestClient
     let codexClient: CodexClient
     let trialClient: RelayTrialClient
+    @ObservedObject var subscriptionStore: RelaySubscriptionStore
     @ObservedObject var pushService: RelayPushService
 
     @Environment(\.scenePhase) private var scenePhase
@@ -347,6 +364,7 @@ struct POCVaultRootView: View {
                 identityStore: identityStore,
                 computerLinkStore: computerLinkStore,
                 trialClient: trialClient,
+                subscriptionStore: subscriptionStore,
                 showsDismissButton: false
             )
             .tag(RelayRootTab.settings)
@@ -433,23 +451,11 @@ struct POCVaultRootView: View {
                 TrialStatusBanner(
                     trial: trial,
                     client: codexClient,
-                    onJoinWaitlist: joinPaidWaitlist
+                    subscriptionStore: subscriptionStore
                 )
                 .padding(.horizontal, 16)
                 .padding(.bottom, 8)
             }
-        }
-    }
-
-    /// The expiry banner's "Join the paid waitlist" posts to the public
-    /// `/v1/waitlist` endpoint with the signed-in account's email.
-    private func joinPaidWaitlist() async -> Bool {
-        guard let email = accountStore.user?.email.trimmedNonEmpty else { return false }
-        do {
-            try await trialClient.joinWaitlist(email: email)
-            return true
-        } catch {
-            return false
         }
     }
 

@@ -6,6 +6,7 @@ struct AccountSettingsView: View {
     @ObservedObject var identityStore: ClientIdentityStore
     @ObservedObject var computerLinkStore: RelayComputerLinkStore
     let trialClient: RelayTrialClient
+    @ObservedObject var subscriptionStore: RelaySubscriptionStore
     var showsDismissButton = true
     @Environment(\.dismiss) private var dismiss
 
@@ -135,6 +136,53 @@ struct AccountSettingsView: View {
                             Label(error, systemImage: "exclamationmark.triangle.fill")
                                 .foregroundStyle(AppTheme.statusError)
                         }
+                    }
+                }
+
+                if let trial = nodeStore.trial {
+                    Section {
+                        if subscriptionStore.isActive {
+                            LabeledContent("Status", value: "Active")
+                            Link(
+                                "Manage Subscription",
+                                destination: URL(string: "https://apps.apple.com/account/subscriptions")!
+                            )
+                        } else {
+                            if trial.state == .upgraded {
+                                LabeledContent("Hosted access", value: "Included")
+                            }
+
+                            Button("Monthly · \(subscriptionStore.monthlyDisplayPrice)") {
+                                Task { await subscriptionStore.purchase() }
+                            }
+                            .disabled(subscriptionStore.isPurchasing)
+                            .accessibilityIdentifier("relay-settings-subscribe-monthly")
+
+                            Button("Yearly · \(subscriptionStore.yearlyDisplayPrice) · save ~17%") {
+                                Task {
+                                    await subscriptionStore.purchase(
+                                        productID: RelaySubscriptionStore.hostedYearlyProductID
+                                    )
+                                }
+                            }
+                            .disabled(subscriptionStore.isPurchasing)
+                            .accessibilityIdentifier("relay-settings-subscribe-yearly")
+                        }
+
+                        Button("Restore Purchases") {
+                            Task { await subscriptionStore.restorePurchases() }
+                        }
+                        .disabled(subscriptionStore.isPurchasing)
+                        .accessibilityIdentifier("relay-settings-restore")
+
+                        if let message = subscriptionStore.errorMessage, !message.isEmpty {
+                            Label(message, systemImage: "exclamationmark.triangle.fill")
+                                .foregroundStyle(AppTheme.statusError)
+                        }
+                    } header: {
+                        Text("Relay Hosted")
+                    } footer: {
+                        Text("Monthly and yearly plans unlock the same hosted machine. Payment is charged to your Apple ID and renews automatically unless canceled at least 24 hours before the current period ends. Manage or cancel in App Store account settings.")
                     }
                 }
 
