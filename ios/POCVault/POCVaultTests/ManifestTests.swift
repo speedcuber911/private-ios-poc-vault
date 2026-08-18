@@ -783,6 +783,15 @@ final class ManifestTests: XCTestCase {
         XCTAssertNotNil(approval.createdAt)
     }
 
+    func testOnlyGeneric404IsTreatedAsAnUnsupportedRelayRoute() {
+        XCTAssertTrue(CodexClientError.httpFailure(404, "not found").isGenericRouteNotFound)
+        XCTAssertTrue(CodexClientError.httpFailure(404, "not_found").isGenericRouteNotFound)
+
+        XCTAssertFalse(CodexClientError.httpFailure(404, "job not found").isGenericRouteNotFound)
+        XCTAssertFalse(CodexClientError.httpFailure(404, "preview not found").isGenericRouteNotFound)
+        XCTAssertFalse(CodexClientError.httpFailure(500, "not found").isGenericRouteNotFound)
+    }
+
     func testCodexTerminalDecodesLiveRuntimePayload() throws {
         let data = Data(
             """

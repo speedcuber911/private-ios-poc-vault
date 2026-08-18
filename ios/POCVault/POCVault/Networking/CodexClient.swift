@@ -12,6 +12,18 @@ enum CodexClientError: Error, LocalizedError {
         return statusCode
     }
 
+    /// A plain 404 from the server's route fallback, rather than a resource-specific
+    /// error such as "job not found" or "preview not found". This lets newer apps
+    /// remain usable while a linked computer is still running an older Relay API.
+    var isGenericRouteNotFound: Bool {
+        guard case .httpFailure(404, let message) = self else { return false }
+        let normalized = message?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: " ")
+        return normalized == "not found"
+    }
+
     var errorDescription: String? {
         switch self {
         case .httpFailure(let statusCode, let message):
@@ -513,6 +525,17 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         if pendingOnly { query.append(URLQueryItem(name: "status", value: "pending")) }
         let data = try await perform(path: "/v1/codex/approvals", queryItems: query)
         return try decoder.decode(CodexListEnvelope<CodexApproval>.self, from: data).values
+    }
+
+    /// Approval inboxes were added after the first Relay job API. An older linked
+    /// computer answers its route fallback with a generic 404; that means there is
+    /// no inbox to show, not that loading the otherwise-valid Sessions screen failed.
+    func fetchPendingApprovalsIfSupported() async throws -> [CodexApproval] {
+        do {
+            return try await fetchApprovals(pendingOnly: true)
+        } catch let error as CodexClientError where error.isGenericRouteNotFound {
+            return []
+        }
     }
 
     func decideApproval(id: String, decision: CodexApprovalDecision, message: String? = nil) async throws -> CodexApproval {

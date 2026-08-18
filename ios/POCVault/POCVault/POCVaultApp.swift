@@ -731,7 +731,7 @@ final class StatusFeedViewModel: ObservableObject {
         do {
             async let threadRequest = client.fetchThreads(provider: nil, workspaceID: nil, limit: 80)
             async let jobRequest = client.fetchJobs(provider: nil, workspaceID: nil, limit: 30)
-            async let approvalRequest = client.fetchApprovals(pendingOnly: true)
+            async let approvalRequest = client.fetchPendingApprovalsIfSupported()
             threads = try await threadRequest
             jobs = try await jobRequest
             approvals = try await approvalRequest

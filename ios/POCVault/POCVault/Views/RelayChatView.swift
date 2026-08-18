@@ -1944,6 +1944,8 @@ private struct RelayRemotePreviewViewer: View {
             ).url
         } catch is CancellationError {
             return
+        } catch let error as CodexClientError where error.isGenericRouteNotFound {
+            errorMessage = "This linked computer is running an older Relay service that cannot open localhost previews. Update Relay on that computer, then try again."
         } catch {
             errorMessage = error.localizedDescription
         }
