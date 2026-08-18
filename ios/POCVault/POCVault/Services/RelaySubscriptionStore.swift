@@ -117,7 +117,7 @@ final class RelaySubscriptionStore: ObservableObject {
         }
     }
 
-    static func appAccountToken(accountID: String) -> UUID {
+    nonisolated static func appAccountToken(accountID: String) -> UUID {
         var bytes = Array(
             SHA256.hash(data: Data("relay-app-account-v1\0\(accountID)".utf8)).prefix(16)
         )
