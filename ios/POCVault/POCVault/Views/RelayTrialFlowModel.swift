@@ -116,7 +116,12 @@ final class RelayTrialFlowModel: ObservableObject {
                 host: readyTrial.sni
             )
 
-            nodeStore.adoptTrial(readyTrial)
+            // Fetch once more after credential collection. Operator-entitled
+            // hosted accounts are promoted when the node blob is redeemed, so
+            // the phone should adopt the permanent state immediately and never
+            // flash a trial countdown. Ordinary trials simply return `ready`.
+            let finalTrial = (try? await client.currentTrial(bearer: bearer)) ?? readyTrial
+            nodeStore.adoptTrial(finalTrial)
             step = .done
         } catch {
             step = .failed(Self.message(for: error))

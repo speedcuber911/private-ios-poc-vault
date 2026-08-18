@@ -542,6 +542,87 @@ a {
   margin: 0;
 }
 
+.canvas-legal {
+  align-items: flex-start;
+  padding-bottom: 72px;
+}
+
+.legal-page {
+  width: min(100%, 720px);
+}
+
+.legal-brand {
+  display: inline-block;
+  margin-bottom: 42px;
+  color: var(--ember-bright);
+  font-family: var(--font-serif);
+  font-size: 22px;
+  text-decoration: none;
+}
+
+.legal-page h1 {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-size: clamp(36px, 8vw, 52px);
+  font-weight: 500;
+  letter-spacing: -0.025em;
+  line-height: 1.05;
+}
+
+.legal-page h2 {
+  margin: 36px 0 10px;
+  font-family: var(--font-serif);
+  font-size: 23px;
+  font-weight: 500;
+}
+
+.legal-page p,
+.legal-page li {
+  color: var(--ink-secondary);
+  font-size: 15px;
+  line-height: 1.7;
+}
+
+.legal-page strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.legal-page ul {
+  padding-left: 22px;
+}
+
+.legal-page li + li {
+  margin-top: 8px;
+}
+
+.legal-updated {
+  margin: 12px 0 30px;
+  color: var(--ink-tertiary) !important;
+  font-size: 12px !important;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.legal-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin-top: 52px;
+  padding-top: 22px;
+  border-top: 1px solid var(--hairline);
+}
+
+.legal-nav button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ember);
+  font-size: 13px;
+  font-weight: 600;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .underline,
   .btn-primary {

@@ -5,6 +5,7 @@
 import { randomUUID } from "node:crypto";
 
 export const ENTITLEMENT_MAX_NODES = "nodes.max";
+export const ENTITLEMENT_HOSTED_AUTO_UPGRADE = "hosted.auto_upgrade";
 export const BROWSER_SESSION_MAX = 10;
 
 // THE canonical email rule for the whole control plane. One human must map to

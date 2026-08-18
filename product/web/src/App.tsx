@@ -6,6 +6,7 @@ import { Activity } from "./pages/Activity";
 import { Admin } from "./pages/Admin";
 import { CliLogin } from "./pages/CliLogin";
 import { Login } from "./pages/Login";
+import { LegalPage } from "./pages/Legal";
 import { Machines } from "./pages/Machines";
 import { Provisioning } from "./pages/Provisioning";
 
@@ -44,9 +45,13 @@ export default function App() {
 
   const machineId = machineIdFrom(route);
   const authRoute = route === "/login" || route === "/cli-login";
+  const legalPage = route === "/privacy" || route === "/terms" || route === "/support"
+    ? route.slice(1) as "privacy" | "terms" | "support"
+    : null;
+  const publicRoute = authRoute || legalPage !== null;
 
   useEffect(() => {
-    if (authRoute) {
+    if (publicRoute) {
       setNav({ signedIn: false, showAdmin: false, impersonating: false });
       return;
     }
@@ -69,7 +74,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [authRoute, route, sessionTick]);
+  }, [publicRoute, route, sessionTick]);
 
   async function stopImpersonating() {
     try {
@@ -90,7 +95,9 @@ export default function App() {
       onSignedUp={() => navigate("/provisioning")}
     />
   );
-  if (route === "/cli-login") {
+  if (legalPage) {
+    screen = <LegalPage page={legalPage} onNavigate={navigate} />;
+  } else if (route === "/cli-login") {
     screen = (
       <CliLogin
         onApproved={() => navigate("/machines")}
@@ -128,8 +135,8 @@ export default function App() {
   }
 
   return (
-    <main className={authRoute ? "canvas" : "canvas canvas-page"}>
-      {!authRoute && nav.signedIn ? (
+    <main className={legalPage ? "canvas canvas-legal" : authRoute ? "canvas" : "canvas canvas-page"}>
+      {!publicRoute && nav.signedIn ? (
         <nav className="chrome" aria-label="Console">
           <button type="button" className="btn-text" onClick={() => navigate("/machines")}>
             Machines

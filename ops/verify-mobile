@@ -8,7 +8,11 @@ if [[ -n "${MOBILE_PARITY_BASE:-}" ]]; then
   parity_args+=(--base "$MOBILE_PARITY_BASE")
 fi
 
-python3 "$repo_root/ops/check-mobile-parity.py" "${parity_args[@]}"
+if ((${#parity_args[@]})); then
+  python3 "$repo_root/ops/check-mobile-parity.py" "${parity_args[@]}"
+else
+  python3 "$repo_root/ops/check-mobile-parity.py"
+fi
 
 (
   cd "$repo_root/mobile"

@@ -20,7 +20,7 @@ import { timingSafeEqual, randomBytes, createHash, randomUUID } from "node:crypt
 import { signEd25519 } from "./jwt.js";
 import { serializeSignedCookie } from "better-call";
 import { createDb } from "./db.js";
-import { createRegistry } from "./registry.js";
+import { createRegistry, ENTITLEMENT_HOSTED_AUTO_UPGRADE } from "./registry.js";
 import { createAuth, createAppleJwksFetcher } from "./auth.js";
 import { createRelayBetterAuth, isRelayAdmin, readBetterAuthUser, listBetterAuthUsers } from "./better-auth.js";
 import { webOriginStore } from "./web-origin.js";
@@ -682,10 +682,23 @@ export function createApp({
         return sendJson(res, 401, { error: "unauthorized" });
       }
       if (method === "GET") {
+        // Capture ownership before getBlob potentially closes and scrubs the
+        // rendezvous. Operator-entitled hosted accounts become permanent only
+        // after the phone has actually collected its device credential; doing
+        // this at enroll time races the iOS ready/pairing sequence and strands
+        // the device without an identity.
+        const pairingSession = slot === "node" ? registry.getPairingSession(id) : null;
         const outcome = pairing.getBlob(id, authToken, slot);
         if (outcome === "unauthorized") return sendJson(res, 401, { error: "unauthorized" });
         if (outcome === "bad_slot") return sendJson(res, 400, { error: "invalid_blob" });
         if (outcome === "empty") return sendJson(res, 404, { error: "not_posted_yet" });
+        if (
+          slot === "node" &&
+          pairingSession &&
+          registry.getEntitlement(pairingSession.accountId, ENTITLEMENT_HOSTED_AUTO_UPGRADE) === "1"
+        ) {
+          registry.upgradeTrialAccount(pairingSession.accountId);
+        }
         return sendBytes(res, 200, outcome.blob, { "x-pairing-tag": outcome.tag });
       }
     }

@@ -164,6 +164,9 @@ struct AccountSettingsView: View {
                     LabeledContent("App", value: "Relay")
                     LabeledContent("Version", value: versionText)
                     LabeledContent("Authentication", value: "Better Auth")
+                    Link("Privacy Policy", destination: URL(string: "https://app.openrelay.sh/privacy")!)
+                    Link("Terms of Use", destination: URL(string: "https://app.openrelay.sh/terms")!)
+                    Link("Support", destination: URL(string: "https://app.openrelay.sh/support")!)
                 }
             }
             .scrollContentBackground(.hidden)

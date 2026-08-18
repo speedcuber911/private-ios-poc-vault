@@ -85,6 +85,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -474,6 +475,7 @@ private fun PocLibraryScreen(pocs: List<PocEntry>, onOpen: (PocEntry) -> Unit) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SettingsScreen(state: RelayUiState, viewModel: RelayViewModel) {
+    val uriHandler = LocalUriHandler.current
     var codexUrl by remember(state.configuration.codexBaseUrl) {
         mutableStateOf(state.configuration.codexBaseUrl.takeUnless { it == RelaySettings.UNCONFIGURED_CODEX_URL }.orEmpty())
     }
@@ -574,6 +576,19 @@ private fun SettingsScreen(state: RelayUiState, viewModel: RelayViewModel) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
+        item {
+            SettingsCard("About") {
+                TextButton(onClick = { uriHandler.openUri("https://app.openrelay.sh/privacy") }) {
+                    Text("Privacy Policy")
+                }
+                TextButton(onClick = { uriHandler.openUri("https://app.openrelay.sh/terms") }) {
+                    Text("Terms of Use")
+                }
+                TextButton(onClick = { uriHandler.openUri("https://app.openrelay.sh/support") }) {
+                    Text("Support")
+                }
+            }
         }
     }
 
