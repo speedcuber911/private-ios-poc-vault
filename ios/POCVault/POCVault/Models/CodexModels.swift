@@ -1,7 +1,7 @@
 import Foundation
 import RelayCore
 
-private let relaySharedContract = RelayCoreInfo()
+let relaySharedContract = RelayCoreInfo()
 
 struct CodexWorkspace: Decodable, Hashable, Identifiable {
     let id: String

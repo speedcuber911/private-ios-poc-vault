@@ -27,6 +27,7 @@ import live.relay.core.JobStreamState
 import live.relay.core.ModelDescriptor
 import live.relay.core.PocEntry
 import live.relay.core.RelayProvider
+import live.relay.core.RelayHttpException
 import live.relay.core.RelayRepository
 import live.relay.core.ThreadDetail
 import live.relay.core.ThreadSummary
@@ -48,6 +49,7 @@ data class RelayUiState(
     val streamState: JobStreamState = JobStreamState(),
     val approvals: List<Approval> = emptyList(),
     val pocs: List<PocEntry> = emptyList(),
+    val previewUrl: String? = null,
     val loading: Boolean = false,
     val streaming: Boolean = false,
     val error: String? = null,
@@ -205,7 +207,22 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             runLoading {
                 val detail = repository().threadDetail(thread.resolvedSessionId, thread.workspaceId, thread.provider)
-                _uiState.update { it.copy(selectedThread = detail, selectedJob = null, approvals = emptyList()) }
+                // Relay returns thread jobs newest-first, matching the thread summary.
+                val latestJob = detail.jobs.firstOrNull()
+                _uiState.update {
+                    it.copy(
+                        selectedThread = detail,
+                        selectedJob = latestJob,
+                        streamState = JobStreamState(
+                            job = latestJob,
+                            stdout = latestJob?.stdout.orEmpty(),
+                            stderr = latestJob?.stderr.orEmpty(),
+                        ),
+                        approvals = emptyList(),
+                    )
+                }
+                if (latestJob?.resolvedStatus?.isActive == true) collectJob(latestJob.resolvedId)
+                if (latestJob?.resolvedStatus?.needsAttention == true) loadApprovals(latestJob.resolvedId)
             }
         }
     }
@@ -266,6 +283,22 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                 _uiState.update { it.copy(notice = "Cancel requested.") }
             }
         }
+    }
+
+    fun openRemotePreview(jobId: String, sourceUrl: String) {
+        if (!guardMachineReady()) return
+        viewModelScope.launch {
+            runLoading {
+                val lease = repository().createPreview(jobId, sourceUrl)
+                val previewUrl = trustedPreviewUrl(lease.url, _uiState.value.configuration.codexBaseUrl)
+                    ?: error("Relay returned an invalid localhost preview URL.")
+                _uiState.update { it.copy(previewUrl = previewUrl) }
+            }
+        }
+    }
+
+    fun closeRemotePreview() {
+        _uiState.update { it.copy(previewUrl = null) }
     }
 
     fun decideApproval(approval: Approval, decision: String) {
@@ -330,7 +363,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private suspend fun loadApprovalsNow(jobId: String) {
-        val approvals = repository().listApprovals(jobId, pendingOnly = true)
+        val approvals = repository().listPendingApprovalsIfSupported(jobId)
         _uiState.update { it.copy(approvals = approvals) }
     }
 
@@ -376,6 +409,8 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     private fun friendlyError(error: Throwable): String {
         val message = error.message.orEmpty()
         return when {
+            error is RelayHttpException && error.isGenericRouteNotFound ->
+                "This linked computer is running an older Relay service that cannot open localhost previews. Update Relay on that computer, then try again."
             message.contains("CERTIFICATE_REQUIRED", ignoreCase = true) -> "The Relay server requires a valid client certificate."
             message.contains("PKIX", ignoreCase = true) -> "Relay could not verify the server certificate."
             message.contains("unconfigured.invalid", ignoreCase = true) -> "Configure your Relay machine URL in Settings first."
@@ -383,4 +418,28 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
             else -> "Relay could not complete the request."
         }
     }
+}
+
+private fun trustedPreviewUrl(value: String, baseUrl: String): String? {
+    val base = Uri.parse(baseUrl)
+    val candidate = when {
+        value.startsWith("/") -> base.buildUpon().encodedPath(value).clearQuery().fragment(null).build()
+        else -> Uri.parse(value)
+    }
+    if (!sameOrigin(candidate, base) || candidate.userInfo != null || candidate.query != null || candidate.fragment != null) return null
+    if (!Regex("^/v1/codex/previews/[A-Za-z0-9_-]{43}$").matches(candidate.path.orEmpty())) return null
+    return candidate.toString()
+}
+
+internal fun sameOrigin(candidate: Uri, base: Uri): Boolean {
+    return candidate.scheme.equals(base.scheme, ignoreCase = true) &&
+        candidate.host.equals(base.host, ignoreCase = true) &&
+        effectivePort(candidate) == effectivePort(base)
+}
+
+internal fun effectivePort(uri: Uri): Int = when {
+    uri.port >= 0 -> uri.port
+    uri.scheme.equals("https", ignoreCase = true) -> 443
+    uri.scheme.equals("http", ignoreCase = true) -> 80
+    else -> -1
 }

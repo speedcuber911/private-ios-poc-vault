@@ -79,7 +79,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -96,11 +95,11 @@ import androidx.core.net.toUri
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.parikshit.relay.data.RelaySettings
-import kotlinx.coroutines.launch
 import live.relay.core.Approval
 import live.relay.core.JobArtifact
 import live.relay.core.ModelDescriptor
 import live.relay.core.PocEntry
+import live.relay.core.RelayLocalPreviewUrls
 import live.relay.core.RelayProvider
 import live.relay.core.ThreadSummary
 import live.relay.core.WorkspaceEntry
@@ -129,7 +128,6 @@ fun RelayApp(viewModel: RelayViewModel = viewModel()) {
     val snackbar = remember { SnackbarHostState() }
     var tab by rememberSaveable { mutableStateOf(RootTab.WORKSPACES) }
     var pocUrl by rememberSaveable { mutableStateOf<String?>(null) }
-    val scope = rememberCoroutineScope()
 
     LaunchedEffect(state.error, state.notice) {
         val message = state.error ?: state.notice ?: return@LaunchedEffect
@@ -141,8 +139,17 @@ fun RelayApp(viewModel: RelayViewModel = viewModel()) {
         Surface(modifier = Modifier.fillMaxSize()) {
             Box(Modifier.fillMaxSize()) {
                 when {
+                    state.previewUrl != null -> RelayWebView(
+                        url = state.previewUrl!!,
+                        title = "Local preview",
+                        errorTitle = "Could not open the local preview",
+                        identityStore = viewModel.identityStore,
+                        onBack = viewModel::closeRemotePreview,
+                    )
                     pocUrl != null -> RelayWebView(
                         url = pocUrl!!,
+                        title = "Relay POC",
+                        errorTitle = "Could not open this POC",
                         identityStore = viewModel.identityStore,
                         onBack = { pocUrl = null },
                     )
@@ -155,6 +162,7 @@ fun RelayApp(viewModel: RelayViewModel = viewModel()) {
                         onOpenArtifact = { artifact ->
                             artifactUrl(artifact, state.configuration.codexBaseUrl)?.let { pocUrl = it }
                         },
+                        onOpenPreview = viewModel::openRemotePreview,
                     )
                     state.selectedWorkspace != null -> WorkspaceSessionScreen(
                         state = state,
@@ -166,6 +174,7 @@ fun RelayApp(viewModel: RelayViewModel = viewModel()) {
                         onOpenArtifact = { artifact ->
                             artifactUrl(artifact, state.configuration.codexBaseUrl)?.let { pocUrl = it }
                         },
+                        onOpenPreview = viewModel::openRemotePreview,
                     )
                     state.selectedJob != null -> JobDetailScreen(
                         state = state,
@@ -175,6 +184,7 @@ fun RelayApp(viewModel: RelayViewModel = viewModel()) {
                         onOpenArtifact = { artifact ->
                             artifactUrl(artifact, state.configuration.codexBaseUrl)?.let { pocUrl = it }
                         },
+                        onOpenPreview = viewModel::openRemotePreview,
                     )
                     else -> RootScreen(
                         state = state,
@@ -600,6 +610,7 @@ private fun WorkspaceSessionScreen(
     onCancel: () -> Unit,
     onDecision: (Approval, String) -> Unit,
     onOpenArtifact: (JobArtifact) -> Unit,
+    onOpenPreview: (String, String) -> Unit,
 ) {
     val workspace = requireNotNull(state.selectedWorkspace)
     var showingThreads by rememberSaveable { mutableStateOf(false) }
@@ -657,7 +668,7 @@ private fun WorkspaceSessionScreen(
                     )
                 }
             } else {
-                item { JobPanel(state, onCancel, onOpenArtifact) }
+                item { JobPanel(state, onCancel, onOpenArtifact, onOpenPreview) }
                 items(state.approvals, key = Approval::id) { approval -> ApprovalCard(approval, onDecision) }
             }
         }
@@ -692,6 +703,7 @@ private fun ConversationScreen(
     onCancel: () -> Unit,
     onDecision: (Approval, String) -> Unit,
     onOpenArtifact: (JobArtifact) -> Unit,
+    onOpenPreview: (String, String) -> Unit,
 ) {
     val detail = requireNotNull(state.selectedThread)
     val provider = detail.thread.provider
@@ -740,7 +752,7 @@ private fun ConversationScreen(
                 MessageBubble(message.normalizedRole, message.displayText)
             }
             state.selectedJob?.let {
-                item { JobPanel(state, onCancel, onOpenArtifact) }
+                item { JobPanel(state, onCancel, onOpenArtifact, onOpenPreview) }
                 items(state.approvals, key = Approval::id) { approval -> ApprovalCard(approval, onDecision) }
             }
         }
@@ -755,6 +767,7 @@ private fun JobDetailScreen(
     onCancel: () -> Unit,
     onDecision: (Approval, String) -> Unit,
     onOpenArtifact: (JobArtifact) -> Unit,
+    onOpenPreview: (String, String) -> Unit,
 ) {
     val job = requireNotNull(state.selectedJob)
     BackHandler(onBack = onBack)
@@ -774,7 +787,7 @@ private fun JobDetailScreen(
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            item { JobPanel(state, onCancel, onOpenArtifact) }
+            item { JobPanel(state, onCancel, onOpenArtifact, onOpenPreview) }
             items(state.approvals, key = Approval::id) { approval -> ApprovalCard(approval, onDecision) }
         }
     }
@@ -850,8 +863,17 @@ private fun ThreadRow(thread: ThreadSummary, onOpen: () -> Unit) {
 }
 
 @Composable
-private fun JobPanel(state: RelayUiState, onCancel: () -> Unit, onOpenArtifact: (JobArtifact) -> Unit) {
+private fun JobPanel(
+    state: RelayUiState,
+    onCancel: () -> Unit,
+    onOpenArtifact: (JobArtifact) -> Unit,
+    onOpenPreview: (String, String) -> Unit,
+) {
     val job = requireNotNull(state.selectedJob)
+    val output = job.displayOutput ?: state.streamState.stdout.takeIf(String::isNotBlank)
+    val previewSources = remember(job.resolvedId, output, state.streamState.stdout) {
+        RelayLocalPreviewUrls.extract(listOfNotNull(output, state.streamState.stdout).joinToString("\n")).take(4)
+    }
     Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -862,7 +884,6 @@ private fun JobPanel(state: RelayUiState, onCancel: () -> Unit, onOpenArtifact: 
                 Text(job.provider.displayName, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Text(job.displayPrompt, style = MaterialTheme.typography.titleMedium)
-            val output = job.displayOutput ?: state.streamState.stdout.takeIf(String::isNotBlank)
             if (output != null) {
                 SelectionContainer {
                     Text(output, style = MaterialTheme.typography.bodyMedium)
@@ -889,6 +910,18 @@ private fun JobPanel(state: RelayUiState, onCancel: () -> Unit, onOpenArtifact: 
                     onClick = { onOpenArtifact(artifact) },
                     label = { Text(artifact.title ?: artifact.filename) },
                     leadingIcon = { Icon(Icons.Default.Description, contentDescription = null) },
+                )
+            }
+            previewSources.forEach { sourceUrl ->
+                val source = sourceUrl.toUri()
+                val sourceLabel = buildString {
+                    append(source.host ?: "localhost")
+                    if (source.port >= 0) append(':').append(source.port)
+                }
+                AssistChip(
+                    onClick = { onOpenPreview(job.resolvedId, sourceUrl) },
+                    label = { Text("Open $sourceLabel") },
+                    leadingIcon = { Icon(Icons.Default.Apps, contentDescription = null) },
                 )
             }
             if (job.resolvedStatus.isActive) {
@@ -975,11 +1008,14 @@ private fun EmptyState(title: String, detail: String) {
 @Composable
 private fun RelayWebView(
     url: String,
+    title: String,
+    errorTitle: String,
     identityStore: com.parikshit.relay.security.AndroidClientIdentityStore,
     onBack: () -> Unit,
 ) {
     val context = LocalContext.current
-    val expectedHost = remember(url) { url.toUri().host }
+    val expectedOrigin = remember(url) { url.toUri() }
+    val expectedHost = expectedOrigin.host
     val identity = remember(url) { runCatching { identityStore.loadIdentity() }.getOrNull() }
     var loadError by remember { mutableStateOf<String?>(null) }
     var webView by remember { mutableStateOf<WebView?>(null) }
@@ -990,7 +1026,7 @@ private fun RelayWebView(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(expectedHost ?: "Relay POC", maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 navigationIcon = {
                     IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Close") }
                 },
@@ -1013,7 +1049,11 @@ private fun RelayWebView(
                         settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
                         webViewClient = object : WebViewClient() {
                             override fun onReceivedClientCertRequest(view: WebView, request: ClientCertRequest) {
-                                if (request.host == expectedHost && identity != null) {
+                                if (
+                                    request.host.equals(expectedHost, ignoreCase = true) &&
+                                    request.port == effectivePort(expectedOrigin) &&
+                                    identity != null
+                                ) {
                                     request.proceed(identity.privateKey, identity.certificates.toTypedArray())
                                 } else {
                                     request.cancel()
@@ -1022,7 +1062,7 @@ private fun RelayWebView(
 
                             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                                 val destination = request.url
-                                if (destination.scheme == "https" && destination.host == expectedHost) return false
+                                if (sameOrigin(destination, expectedOrigin)) return false
                                 context.startActivity(Intent(Intent.ACTION_VIEW, destination))
                                 return true
                             }
@@ -1042,7 +1082,7 @@ private fun RelayWebView(
             loadError?.let {
                 Card(Modifier.align(Alignment.Center).padding(24.dp)) {
                     Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("Could not open this POC", fontWeight = FontWeight.Bold)
+                        Text(errorTitle, fontWeight = FontWeight.Bold)
                         Text(it)
                     }
                 }
@@ -1070,5 +1110,12 @@ private fun defaultModel(state: RelayUiState, provider: RelayProvider): String? 
 
 private fun artifactUrl(artifact: JobArtifact, baseUrl: String): String? {
     val value = artifact.previewURL ?: artifact.rawURL ?: return null
-    return if (value.startsWith("https://")) value else "${baseUrl.trimEnd('/')}/${value.trimStart('/')}"
+    val base = baseUrl.toUri()
+    val candidate = when {
+        value.startsWith("/") -> base.buildUpon().encodedPath(value).clearQuery().fragment(null).build()
+        else -> value.toUri()
+    }
+    if (!sameOrigin(candidate, base) || candidate.userInfo != null || candidate.query != null || candidate.fragment != null) return null
+    if (!Regex("^/v1/codex/jobs/[^/]+/artifacts/[^/]+/(?:raw|preview)$").matches(candidate.path.orEmpty())) return null
+    return candidate.toString()
 }

@@ -25,6 +25,12 @@ kotlin {
             isStatic = true
         }
     }
+    iosX64 {
+        binaries.framework {
+            baseName = "RelayCore"
+            isStatic = true
+        }
+    }
     iosSimulatorArm64 {
         binaries.framework {
             baseName = "RelayCore"

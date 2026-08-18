@@ -97,6 +97,10 @@ For a new Relay API capability:
 3. Expose the behavior through native view models on iOS and Android.
 4. Build both targets before handoff.
 
+The enforced workflow and current parity boundary are documented in
+[`docs/MOBILE_PARITY.md`](../docs/MOBILE_PARITY.md). Run `ops/verify-mobile` from
+the repository root; CI runs the same contract check and both platform builds.
+
 Avoid moving UI state, secure-storage implementations, WebViews, or other
 platform APIs into the shared module. That would save little code while making
 both applications harder to evolve naturally.

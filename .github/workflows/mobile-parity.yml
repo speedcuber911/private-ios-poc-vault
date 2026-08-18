@@ -1,0 +1,71 @@
+name: Mobile parity
+
+on:
+  pull_request:
+    paths:
+      - 'ios/POCVault/**'
+      - 'mobile/**'
+      - 'ops/check-mobile-parity.py'
+      - 'ops/verify-mobile'
+      - '.github/workflows/mobile-parity.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'ios/POCVault/**'
+      - 'mobile/**'
+      - 'ops/check-mobile-parity.py'
+      - 'ops/verify-mobile'
+      - '.github/workflows/mobile-parity.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Verify matched mobile behavior
+        env:
+          PARITY_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python3 ops/check-mobile-parity.py --base "$PARITY_BASE"
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 36
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+      - name: Test shared core and build Android
+        working-directory: mobile
+        run: ./gradlew :relay-core:allTests :androidApp:assembleDebug
+
+  ios:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - name: Build iOS Simulator app
+        run: >-
+          xcodebuild
+          -project ios/POCVault/POCVault.xcodeproj
+          -scheme POCVault
+          -destination 'generic/platform=iOS Simulator'
+          CODE_SIGNING_ALLOWED=NO
+          build

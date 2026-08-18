@@ -1,0 +1,59 @@
+{
+  "schemaVersion": 1,
+  "sharedCoreSchemaVersion": 2,
+  "capabilities": [
+    {
+      "id": "provider-and-status-normalization",
+      "surfaces": {
+        "shared": [{"path": "mobile/relay-core/src/commonMain/kotlin/live/relay/core/RelayCoreInfo.kt", "contains": ["normalizedProvider", "normalizedJobStatus"]}],
+        "ios": [{"path": "ios/POCVault/POCVault/Models/CodexModels.swift", "contains": ["relaySharedContract.normalizedProvider", "relaySharedContract.normalizedJobStatus"]}],
+        "android": [{"path": "mobile/androidApp/src/main/kotlin/com/parikshit/relay/ui/RelayViewModel.kt", "contains": ["RelayProvider", "RelayRepository"]}]
+      }
+    },
+    {
+      "id": "workspace-thread-and-job-control",
+      "surfaces": {
+        "shared": [{"path": "mobile/relay-core/src/commonMain/kotlin/live/relay/core/RelayRepository.kt", "contains": ["listWorkspaceDirectories", "listThreads", "createJob", "streamJob"]}],
+        "ios": [{"path": "ios/POCVault/POCVault/Networking/CodexClient.swift", "contains": ["fetchWorkspaceDirectories", "fetchThreads", "createJob", "streamJobEvents"]}],
+        "android": [{"path": "mobile/androidApp/src/main/kotlin/com/parikshit/relay/ui/RelayViewModel.kt", "contains": ["loadWorkspaces", "openThread", "submitTask", "collectJob"]}]
+      }
+    },
+    {
+      "id": "provider-locked-active-thread",
+      "surfaces": {
+        "shared": [{"path": "mobile/relay-core/src/commonMain/kotlin/live/relay/core/RelayModels.kt", "contains": ["resumeSessionId", "RelayProvider"]}],
+        "ios": [{"path": "ios/POCVault/POCVault/Views/RelayChatView.swift", "contains": ["New conversation", "restricted(to:"]}],
+        "android": [{"path": "mobile/androidApp/src/main/kotlin/com/parikshit/relay/ui/RelayApp.kt", "contains": ["providerLocked = true", "Provider is locked for this thread"]}]
+      }
+    },
+    {
+      "id": "older-runner-approval-fallback",
+      "surfaces": {
+        "shared": [{"path": "mobile/relay-core/src/commonMain/kotlin/live/relay/core/RelayRepository.kt", "contains": ["isGenericRouteNotFound", "listPendingApprovalsIfSupported"]}],
+        "ios": [{"path": "ios/POCVault/POCVault/Networking/CodexClient.swift", "contains": ["fetchPendingApprovalsIfSupported", "relaySharedContract.isGenericRouteNotFound"]}],
+        "android": [{"path": "mobile/androidApp/src/main/kotlin/com/parikshit/relay/ui/RelayViewModel.kt", "contains": ["listPendingApprovalsIfSupported", "older Relay service"]}]
+      }
+    },
+    {
+      "id": "trusted-artifacts-and-localhost-previews",
+      "surfaces": {
+        "shared": [{"path": "mobile/relay-core/src/commonMain/kotlin/live/relay/core/RelayRepository.kt", "contains": ["createPreview", "/v1/codex/previews"]}],
+        "ios": [{"path": "ios/POCVault/POCVault/Networking/CodexClient.swift", "contains": ["isTrustedArtifactURL", "createPreview", "resolvedPreviewURL"]}],
+        "android": [{"path": "mobile/androidApp/src/main/kotlin/com/parikshit/relay/ui/RelayApp.kt", "contains": ["artifactUrl", "onOpenPreview", "sameOrigin"]}]
+      }
+    },
+    {
+      "id": "signed-private-poc-viewing",
+      "surfaces": {
+        "shared": [{"path": "mobile/relay-core/src/commonMain/kotlin/live/relay/core/ManifestModels.kt", "contains": ["PocManifest", "ManifestSignature"]}],
+        "ios": [{"path": "ios/POCVault/POCVault/Networking/ManifestClient.swift", "contains": ["verifySignature", "POCManifest"]}],
+        "android": [{"path": "mobile/androidApp/src/main/kotlin/com/parikshit/relay/network/AndroidManifestClient.kt", "contains": ["verify", "PocManifest"]}]
+      }
+    }
+  ],
+  "knownDifferences": [
+    {"id": "apple-identity-and-apns", "status": "platform-specific", "reason": "Sign in with Apple and APNs require native Apple implementations; Android equivalents must use Android identity and FCM."},
+    {"id": "account-trial-cli-handoff", "status": "android-gap", "reason": "Android 0.1 still uses manual private-operator setup and does not yet expose the iOS account, trial, CLI-link, or handoff flows."},
+    {"id": "file-terminal-voice-notifications", "status": "android-gap", "reason": "Android does not yet expose the iOS file viewer, terminal, voice capture, or completion-notification workflows."}
+  ]
+}

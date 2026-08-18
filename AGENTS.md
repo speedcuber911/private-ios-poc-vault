@@ -220,6 +220,23 @@ accessory or floating dismiss control. Keep interactive scroll dismissal,
 keyboard dismissal on `Send`/`Run`, and outside-tap dismissal on non-editor
 content. Taps inside the composer must not resign focus.
 
+## Mobile Parity Contract
+
+Relay has native SwiftUI and Jetpack Compose apps. Shared provider/status rules,
+wire models, request construction, SSE reduction, and compatibility behavior
+belong in `mobile/relay-core`; platform UI and OS integrations stay native.
+
+- For a shared mobile behavior change, update both native surfaces in the same
+  change or record and explain the intentional difference in
+  `mobile/parity-contract.json`.
+- Add shared contract tests for UI-free behavior.
+- Run `ops/verify-mobile` before handoff. It checks the parity ledger, shared
+  tests, the Android APK build, and the iOS Simulator build.
+- Keep `.github/workflows/mobile-parity.yml` required on `main` so one-sided
+  shared-surface changes cannot merge silently.
+- Do not describe the apps as fully feature-identical while an `android-gap`
+  remains in the parity contract.
+
 ## Physical iPhone Provisioning
 
 The app expects a `.p12` at:

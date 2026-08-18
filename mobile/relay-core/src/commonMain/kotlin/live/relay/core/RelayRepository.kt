@@ -2,6 +2,7 @@ package live.relay.core
 
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.decodeFromJsonElement
 
 enum class HttpMethod { GET, POST, DELETE }
@@ -21,7 +22,11 @@ data class RelayResponse(
 )
 
 class RelayHttpException(val status: Int, val responseBody: String) :
-    Exception("Relay request failed with HTTP $status${responseBody.takeIf { it.isNotBlank() }?.let { ": $it" } ?: ""}")
+    Exception("Relay request failed with HTTP $status${relayErrorMessage(responseBody)?.let { ": $it" } ?: ""}") {
+    val responseMessage: String? = relayErrorMessage(responseBody)
+    val isGenericRouteNotFound: Boolean
+        get() = RelayCoreInfo().isGenericRouteNotFound(status, responseMessage)
+}
 
 interface RelayTransport {
     suspend fun execute(request: RelayRequest): RelayResponse
@@ -134,12 +139,30 @@ class RelayRepository(private val transport: RelayTransport) {
         request(RelayRequest(method = HttpMethod.POST, path = "/v1/codex/jobs/${encodePathComponent(id)}/cancel"))
     }
 
+    suspend fun createPreview(jobId: String, sourceUrl: String): PreviewLease {
+        require(RelayLocalPreviewUrls.isSupported(sourceUrl)) { "Relay previews only support localhost HTTP URLs." }
+        val payload = RelayJson.encode(
+            CreatePreviewRequest.serializer(),
+            CreatePreviewRequest(jobId = jobId, url = sourceUrl.trim()),
+        )
+        return decode(
+            PreviewLease.serializer(),
+            request(RelayRequest(method = HttpMethod.POST, path = "/v1/codex/previews", body = payload)),
+        )
+    }
+
     suspend fun listApprovals(jobId: String? = null, pendingOnly: Boolean = false): List<Approval> {
         val query = buildList {
             jobId?.let { add("jobId" to it) }
             if (pendingOnly) add("status" to "pending")
         }
         return RelayJson.decodeList(Approval.serializer(), request(RelayRequest(path = "/v1/codex/approvals", query = query)))
+    }
+
+    suspend fun listPendingApprovalsIfSupported(jobId: String? = null): List<Approval> = try {
+        listApprovals(jobId = jobId, pendingOnly = true)
+    } catch (error: RelayHttpException) {
+        if (error.isGenericRouteNotFound) emptyList() else throw error
     }
 
     suspend fun decideApproval(id: String, decision: String, message: String? = null): Approval {
@@ -189,6 +212,18 @@ class RelayRepository(private val transport: RelayTransport) {
             workspaceId?.takeIf { it.isNotBlank() }?.let { add("workspaceId" to it) }
             provider?.let { add("provider" to it.wireValue) }
         }
+}
+
+private fun relayErrorMessage(body: String): String? {
+    val trimmed = body.trim()
+    if (trimmed.isEmpty()) return null
+    val parsed = runCatching { RelayJson.codec.parseToJsonElement(trimmed) }.getOrNull()
+    val objectValue = parsed as? kotlinx.serialization.json.JsonObject
+    val candidate = listOf("error", "message", "detail")
+        .firstNotNullOfOrNull { key ->
+            (objectValue?.get(key) as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull
+        }
+    return candidate?.trim()?.takeIf { it.isNotEmpty() } ?: trimmed
 }
 
 private fun encodePathComponent(value: String): String = value.encodeToByteArray().joinToString("") { byte ->

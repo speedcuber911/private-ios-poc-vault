@@ -17,11 +17,7 @@ enum CodexClientError: Error, LocalizedError {
     /// remain usable while a linked computer is still running an older Relay API.
     var isGenericRouteNotFound: Bool {
         guard case .httpFailure(404, let message) = self else { return false }
-        let normalized = message?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-            .replacingOccurrences(of: "_", with: " ")
-        return normalized == "not found"
+        return relaySharedContract.isGenericRouteNotFound(statusCode: 404, message: message)
     }
 
     var errorDescription: String? {

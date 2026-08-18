@@ -358,6 +358,19 @@ data class CreateJobRequest(
 
 data class CreateJobResponse(val id: String, val job: Job?)
 
+@Serializable
+data class CreatePreviewRequest(
+    val jobId: String,
+    val url: String,
+)
+
+@Serializable
+data class PreviewLease(
+    val id: String,
+    val url: String,
+    val expiresAt: String? = null,
+)
+
 internal fun firstNonBlank(vararg values: String?): String? =
     values.firstOrNull { !it.isNullOrBlank() }?.trim()
 
@@ -381,5 +394,26 @@ object RelayOutputCleaner {
             text.contains("\nreasoning effort: ") ||
             text.contains("\nexec\n") ||
             text.contains("\nsucceeded in ")
+    }
+}
+
+object RelayLocalPreviewUrls {
+    private val loopbackUrl = Regex(
+        """https?://(?:localhost|127\.0\.0\.1|\[::1])(?::[0-9]{1,5})?(?:/[^\s<>'\"`]*)?""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    fun extract(value: String): List<String> = loopbackUrl
+        .findAll(value)
+        .map { it.value.trimEnd('.', ',', ';', ':', '!', '?', ')') }
+        .filter(::isSupported)
+        .distinct()
+        .toList()
+
+    fun isSupported(value: String): Boolean {
+        val match = loopbackUrl.matchEntire(value.trim()) ?: return false
+        val portText = Regex(""":([0-9]{1,5})(?:/|$)""").find(match.value)?.groupValues?.get(1)
+        val port = portText?.toIntOrNull()
+        return port == null || port in 1..65535
     }
 }

@@ -28,6 +28,30 @@ class RelayCoreTest {
     }
 
     @Test
+    fun onlyGeneric404MeansAnOlderRelayRouteIsMissing() {
+        val contract = RelayCoreInfo()
+        assertTrue(contract.isGenericRouteNotFound(404, "not found"))
+        assertTrue(contract.isGenericRouteNotFound(404, "not_found"))
+        assertFalse(contract.isGenericRouteNotFound(404, "job not found"))
+        assertFalse(contract.isGenericRouteNotFound(404, "preview not found"))
+        assertFalse(contract.isGenericRouteNotFound(500, "not found"))
+        assertTrue(RelayHttpException(404, "{\"error\":\"not found\"}").isGenericRouteNotFound)
+    }
+
+    @Test
+    fun localhostPreviewUrlsAreExtractedAndValidated() {
+        assertEquals(
+            listOf("http://localhost:4317/demo", "https://127.0.0.1:8080/health"),
+            RelayLocalPreviewUrls.extract(
+                "Open http://localhost:4317/demo, then https://127.0.0.1:8080/health.",
+            ),
+        )
+        assertTrue(RelayLocalPreviewUrls.isSupported("http://[::1]:3000/"))
+        assertFalse(RelayLocalPreviewUrls.isSupported("https://example.com"))
+        assertFalse(RelayLocalPreviewUrls.isSupported("http://localhost:99999"))
+    }
+
+    @Test
     fun listEnvelopeAcceptsServerKeysAndUnknownFields() {
         val jobs = RelayJson.decodeList(
             Job.serializer(),
@@ -86,5 +110,34 @@ class RelayCoreTest {
         assertEquals(2, events.size)
         assertEquals(JobStreamEvent.Stdout(0, "ok"), events[0])
         assertIs<JobStreamEvent.Done>(events[1])
+    }
+
+    @Test
+    fun approvalFallbackAndPreviewCreationShareTheWireContract() = runTest {
+        val requests = mutableListOf<RelayRequest>()
+        val transport = object : RelayTransport {
+            override suspend fun execute(request: RelayRequest): RelayResponse {
+                requests += request
+                return when (request.path) {
+                    "/v1/codex/approvals" -> RelayResponse(404, "{\"error\":\"not found\"}")
+                    "/v1/codex/previews" -> RelayResponse(
+                        200,
+                        """{"id":"lease_1","url":"/v1/codex/previews/abcdefghijklmnopqrstuvwxyzABCDEFGH123456789","expiresAt":"2026-08-18T10:00:00Z"}""",
+                    )
+                    else -> RelayResponse(500, "unexpected")
+                }
+            }
+
+            override fun stream(request: RelayRequest) = flowOf<String>()
+        }
+        val repository = RelayRepository(transport)
+
+        assertTrue(repository.listPendingApprovalsIfSupported("job-1").isEmpty())
+        val preview = repository.createPreview("job-1", "http://localhost:4317/demo")
+
+        assertEquals("lease_1", preview.id)
+        assertEquals("/v1/codex/previews", requests.last().path)
+        assertTrue(requests.last().body.orEmpty().contains("\"jobId\":\"job-1\""))
+        assertTrue(requests.last().body.orEmpty().contains("\"url\":\"http://localhost:4317/demo\""))
     }
 }
