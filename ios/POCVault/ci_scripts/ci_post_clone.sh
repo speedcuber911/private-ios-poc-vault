@@ -48,3 +48,23 @@ PATH="$JAVA_HOME/bin:$PATH"
 export JAVA_HOME PATH
 
 "$JAVA_HOME/bin/java" -version
+
+# Warm the Gradle wrapper distribution before xcodebuild starts. Xcode Cloud
+# occasionally resets the services.gradle.org connection during the Run Script
+# phase; retrying here keeps that transient download failure from aborting the
+# archive after compilation has already begun.
+relay_mobile_root="$(CDPATH= cd -- "$(dirname -- "$0")/../../../mobile" && pwd)"
+relay_gradle_attempt=1
+relay_gradle_max_attempts=4
+
+while ! (cd "$relay_mobile_root" && ./gradlew --no-daemon --version); do
+  if [ "$relay_gradle_attempt" -ge "$relay_gradle_max_attempts" ]; then
+    echo "error: Unable to prepare the Gradle wrapper after $relay_gradle_max_attempts attempts" >&2
+    exit 1
+  fi
+
+  relay_gradle_delay=$((relay_gradle_attempt * 3))
+  echo "Gradle wrapper download failed; retrying in ${relay_gradle_delay}s" >&2
+  sleep "$relay_gradle_delay"
+  relay_gradle_attempt=$((relay_gradle_attempt + 1))
+done
