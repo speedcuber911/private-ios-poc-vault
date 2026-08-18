@@ -15,6 +15,24 @@ if [ -z "${CODEX_WORKSPACES:-}" ]; then
 fi
 export CODEX_RUN_HOME="${CODEX_RUN_HOME:-/home/relay}"
 export RELAYD_STORE="${RELAYD_STORE:-sqlite}"
+RUN_USER=relay
+
+# Cube's base entrypoint must start envd as root so it can mount and manage the
+# microVM.  relayd and every provider harness must not inherit that uid: Codex
+# enters an unprivileged bubblewrap user namespace, where root no longer has
+# ambient DAC override on the host filesystem.  A root-launched daemon made
+# the intentionally-private 0750 workspace jail and 0700 handoff checkouts
+# unreadable to Codex's own sandbox.  Keep the bootstrap shell privileged only
+# for the few ownership repairs below and run all Relay state writers, the
+# daemon, and therefore its harness children as the dedicated relay user.
+run_as_relay() {
+  if [ "$(id -u)" -eq 0 ]; then
+    HOME="${CODEX_RUN_HOME}" USER="${RUN_USER}" LOGNAME="${RUN_USER}" \
+      runuser --preserve-environment -u "${RUN_USER}" -- "$@"
+  else
+    "$@"
+  fi
+}
 
 # npm's global prefix on this base image is /opt/node, not /usr, so
 # `npm install -g @openai/codex @anthropic-ai/claude-code @moonshot-ai/kimi-code`
@@ -32,13 +50,12 @@ echo "harness binaries: codex=${CODEX_BIN} claude=${CLAUDE_BIN} kimi=${KIMI_BIN}
 # Claude Code refuses `--dangerously-skip-permissions` under root:
 #   "--dangerously-skip-permissions cannot be used with root/sudo privileges
 #    for security reasons"
-# and this container is deliberately root (see the Dockerfile — the base
-# entrypoint has to start envd, which mounts and therefore needs root). relayd
-# passes that flag whenever CODEX_DANGEROUS_MODE is on, which it is by default,
-# so EVERY Claude job on EVERY trial sandbox failed before running a single
-# token. Note `--permission-mode bypassPermissions` is refused by the same
-# guard, so dropping the flag is not a workaround; tested against Claude Code
-# 2.1.227 in this image.
+# The image entrypoint must still begin as root so it can start envd, but Relay
+# itself now drops to the `relay` user below. IS_SANDBOX remains truthful and
+# keeps the intended bypass mode explicit for this disposable microVM. Note
+# `--permission-mode bypassPermissions` is refused by the same guard when a
+# caller accidentally regresses to root; tested against Claude Code 2.1.227 in
+# this image.
 #
 # IS_SANDBOX is Claude Code's own escape for exactly this case, and the claim
 # is true here: a Cube microVM, one per trial user, no persistent state, torn
@@ -60,7 +77,13 @@ PAIR_MARKER="${CODEX_DATA_DIR}/paired"
 # Written into the running sandbox by relay-cloud through envd's file API.
 ENROLL_CONFIG="${CODEX_DATA_DIR}/enroll.json"
 
-mkdir -p "${CODEX_DATA_DIR}"
+mkdir -p "${CODEX_DATA_DIR}" "${CODEX_WORKSPACE_BROWSE_ROOT}" "${CODEX_RUN_HOME}"
+if [ "$(id -u)" -eq 0 ]; then
+  chown "${RUN_USER}:${RUN_USER}" \
+    "${CODEX_DATA_DIR}" "${CODEX_WORKSPACE_BROWSE_ROOT}" "${CODEX_RUN_HOME}"
+fi
+chmod 700 "${CODEX_DATA_DIR}" "${CODEX_RUN_HOME}"
+chmod 750 "${CODEX_WORKSPACE_BROWSE_ROOT}"
 
 # ── enrollment ───────────────────────────────────────────────────────────────
 # Once-only and must succeed. The cloud burns the single-use token and flips
@@ -93,11 +116,38 @@ if [ ! -f "${ENROLL_MARKER}" ]; then
   done
   echo "relay: enrollment config received" >&2
 
+  # envd writes the config as root.  The contents are consumed by relayd and
+  # the runtime-env writer below, both of which deliberately run as `relay`.
+  # Refuse anything other than the regular file we waited for before changing
+  # ownership; this path contains credentials and must remain 0600.
+  if [ -L "${ENROLL_CONFIG}" ] || [ ! -f "${ENROLL_CONFIG}" ]; then
+    echo "relay: enrollment config is not a regular file" >&2
+    exit 1
+  fi
+  if [ "$(id -u)" -eq 0 ]; then
+    chown "${RUN_USER}:${RUN_USER}" "${ENROLL_CONFIG}"
+  fi
+  chmod 600 "${ENROLL_CONFIG}"
+
   # The token and pairing secret are read by relayd straight out of the file
   # and are deliberately NEVER exported, so nothing the daemon later spawns
   # can inherit them.
-  RELAYD_ENROLL_CONFIG="${ENROLL_CONFIG}" node "${RELAYD_BIN}" enroll --no-pair
-  touch "${ENROLL_MARKER}"
+  run_as_relay env RELAYD_ENROLL_CONFIG="${ENROLL_CONFIG}" node "${RELAYD_BIN}" enroll --no-pair
+  run_as_relay touch "${ENROLL_MARKER}"
+fi
+
+# Existing snapshot state may already contain the config while enrollment is
+# complete.  Repair only this fixed credential file so a restarted image can
+# still run the relay-owned pairing and runtime-env steps below.
+if [ -f "${ENROLL_CONFIG}" ]; then
+  if [ -L "${ENROLL_CONFIG}" ]; then
+    echo "relay: enrollment config is not a regular file" >&2
+    exit 1
+  fi
+  if [ "$(id -u)" -eq 0 ]; then
+    chown "${RUN_USER}:${RUN_USER}" "${ENROLL_CONFIG}"
+  fi
+  chmod 600 "${ENROLL_CONFIG}"
 fi
 
 # Tunnel settings AND the control-plane URL are frozen in the snapshot for the
@@ -117,7 +167,7 @@ fi
 # `lastSeen` still null, because the node never polled even once.
 if [ -f "${ENROLL_CONFIG}" ]; then
   BOOT_DIR="$(cd "$(dirname "$0")" && pwd)"
-  node "${BOOT_DIR}/src/write-runtime-env.mjs" \
+  run_as_relay node "${BOOT_DIR}/src/write-runtime-env.mjs" \
     "${ENROLL_CONFIG}" \
     "${CODEX_DATA_DIR}/runtime.env" \
     "${RELAYD_IDENTITY_DIR}/node-id"
@@ -138,8 +188,11 @@ fi
 # either is missing so relayd never starts on half a pair.
 TLS_DIR="${CODEX_DATA_DIR}/tls"
 mkdir -p "${TLS_DIR}"
+if [ "$(id -u)" -eq 0 ]; then
+  chown "${RUN_USER}:${RUN_USER}" "${TLS_DIR}"
+fi
 chmod 700 "${TLS_DIR}"
-if node -e '
+if run_as_relay node -e '
   const fs = require("node:fs");
   const cfg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
   if (!cfg.tlsCert || !cfg.tlsKey) process.exit(1);
@@ -175,8 +228,8 @@ if grep -q '"pairingId"' "${ENROLL_CONFIG}" 2>/dev/null && [ ! -f "${PAIR_MARKER
   (
     # `if` guards the command so `set -e` cannot turn a failed pairing into a
     # failed boot.
-    if RELAYD_ENROLL_CONFIG="${ENROLL_CONFIG}" node "${RELAYD_BIN}" enroll --pair-only; then
-      touch "${PAIR_MARKER}"
+    if run_as_relay env RELAYD_ENROLL_CONFIG="${ENROLL_CONFIG}" node "${RELAYD_BIN}" enroll --pair-only; then
+      run_as_relay touch "${PAIR_MARKER}"
     else
       echo "relay: trial pairing did not complete; the node is up and will retry on next boot (or run: relayd enroll --pair-only)" >&2
     fi
@@ -197,4 +250,8 @@ fi
 # machine, not a live one.
 unset RELAYD_ENROLL_TOKEN RELAYD_ENROLL_PAIRING_ID RELAYD_ENROLL_PAIRING_SECRET
 
+if [ "$(id -u)" -eq 0 ]; then
+  export HOME="${CODEX_RUN_HOME}" USER="${RUN_USER}" LOGNAME="${RUN_USER}"
+  exec runuser --preserve-environment -u "${RUN_USER}" -- node "${RELAYD_BIN}" run --mode tunneled
+fi
 exec node "${RELAYD_BIN}" run --mode tunneled

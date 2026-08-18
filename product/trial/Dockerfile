@@ -15,7 +15,7 @@
 FROM ghcr.io/tencentcloud/cubesandbox-base:2026.16
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    ca-certificates curl git openssl python3 ripgrep unzip xz-utils \
+    ca-certificates curl git openssl python3 ripgrep unzip util-linux xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Node 22 (relayd floor; also used by the harness CLIs).
@@ -64,13 +64,12 @@ COPY start.sh /opt/relayd/start.sh
 COPY src /opt/relayd/src
 RUN chmod 0755 /opt/relayd/start.sh /opt/relayd/app/bin/relayd
 
-# Deliberately NO `USER relay`. The base image's entrypoint has to start envd,
-# which mounts inside the sandbox and therefore needs root; running the
-# entrypoint as an unprivileged user is exactly what produced
-# `Exec mount failed: exec process exit code: 1`. The isolation boundary here
-# is the microVM itself, not the in-guest uid — which is why Cube's own
-# reference templates run as root too. The `relay` user still exists and still
-# owns the workspace jail, and CODEX_RUN_HOME keeps agent state under
-# /home/relay.
+# Deliberately NO image-level `USER relay`. The base entrypoint has to start
+# envd as root because envd mounts inside the sandbox; setting USER here is
+# exactly what produced `Exec mount failed: exec process exit code: 1`.
+# start.sh uses util-linux runuser only after envd is alive, so relayd and every
+# provider harness run as `relay`. This is also required by Codex's bubblewrap
+# user namespace: a root-launched relayd cannot traverse the relay-owned 0750
+# workspace jail after entering that namespace.
 WORKDIR /home/relay
 CMD ["/opt/relayd/start.sh"]

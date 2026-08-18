@@ -45,8 +45,10 @@ independent, because they have very different retry semantics:
    phone typically posts that blob before this sandbox has finished booting, so
    losing that one request is enough to time it out. `${CODEX_DATA_DIR}/paired`
    is written only on success, so a failure simply retries on the next boot.
-3. **`exec relayd run --mode tunneled`** — reached unconditionally. A pairing
-   failure never prevents the daemon from starting.
+3. **`exec runuser ... relayd run --mode tunneled`** — reached unconditionally.
+   Cube's envd stays root-owned for mounts, while relayd and every provider
+   harness run as the non-root `relay` user. A pairing failure never prevents
+   the daemon from starting.
 
 To re-run pairing by hand against an already-enrolled, already-running node:
 

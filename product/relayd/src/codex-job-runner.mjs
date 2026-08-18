@@ -14,6 +14,16 @@ let completed = false;
 let finalAnswer = "";
 let streamedAnswer = "";
 let currentThreadId = process.env.RELAY_RESUME_SESSION_ID || "";
+let sandboxStartupFailure = null;
+
+const SANDBOX_STARTUP_FAILURES = [
+  /bwrap:\s+Can't find source path[^\r\n]*:\s*Permission denied/i,
+  /bwrap:\s+Can't chdir to[^\r\n]*:\s*Permission denied/i,
+  /bwrap:\s+No permissions to create a new namespace/i,
+  /bwrap:\s+Creating new namespace failed/i,
+  /bubblewrap is unavailable/i,
+  /bubblewrap cannot create user namespaces/i,
+];
 
 for (const signal of ["SIGTERM", "SIGINT"]) {
   process.once(signal, () => controller.abort(new Error(`received ${signal}`)));
@@ -145,11 +155,20 @@ function handleNotification(message) {
   if (method === "item/completed") {
     if (item.type === "agentMessage" && typeof item.text === "string") finalAnswer = item.text;
     if (item.type === "exitedReviewMode" && typeof item.review === "string") finalAnswer = item.review;
+    if (item.type === "commandExecution" && item.status === "failed") {
+      const output = typeof item.aggregatedOutput === "string" ? item.aggregatedOutput : "";
+      if (SANDBOX_STARTUP_FAILURES.some((pattern) => pattern.test(output))) {
+        sandboxStartupFailure = new Error(
+          "Codex sandbox could not access the workspace. The Relay runner needs repair before this job can run.",
+        );
+      }
+    }
     return;
   }
   if (method === "turn/completed") {
     const turn = params.turn || {};
-    if (turn.status === "completed") succeed();
+    if (turn.status === "completed" && sandboxStartupFailure) fail(sandboxStartupFailure);
+    else if (turn.status === "completed") succeed();
     else fail(new Error(turn.error?.message || `Codex turn ended with ${turn.status || "unknown status"}`));
   }
 }

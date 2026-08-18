@@ -76,6 +76,53 @@ for await (const line of rl) {
   assert.equal(fs.readFileSync(session, "utf8").trim(), "thread-real-1");
 });
 
+test("Codex app-server reports a bubblewrap workspace startup failure as a failed job", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-codex-bwrap-"));
+  const workspace = path.join(dir, "workspace");
+  const approvals = path.join(dir, "approvals");
+  const result = path.join(dir, "answer.md");
+  fs.mkdirSync(workspace);
+  const fake = path.join(dir, "fake-codex.mjs");
+  fs.writeFileSync(fake, `#!/usr/bin/env node
+import readline from "node:readline";
+const rl = readline.createInterface({input:process.stdin});
+for await (const line of rl) {
+ const m=JSON.parse(line);
+ if(m.method==="initialize") console.log(JSON.stringify({id:m.id,result:{}}));
+ else if(m.method==="thread/start") console.log(JSON.stringify({id:m.id,result:{thread:{id:"thread-bwrap-1"}}}));
+ else if(m.method==="turn/start") {
+  console.log(JSON.stringify({id:m.id,result:{turn:{id:"turn-bwrap-1"}}}));
+  console.log(JSON.stringify({method:"item/completed",params:{item:{type:"commandExecution",status:"failed",aggregatedOutput:"bwrap: Can't find source path /srv/relay-workspaces/example: Permission denied",exitCode:1}}}));
+  console.log(JSON.stringify({method:"item/completed",params:{item:{type:"agentMessage",text:"Please reopen the workspace."}}}));
+  console.log(JSON.stringify({method:"turn/completed",params:{turn:{status:"completed"}}}));
+ }
+}
+`, { mode: 0o755 });
+
+  const child = spawn(process.execPath, [path.join(srcDir, "codex-job-runner.mjs")], {
+    cwd: workspace,
+    env: {
+      ...process.env,
+      RELAY_JOB_ID: "job-bwrap-1",
+      RELAY_WORKSPACE_PATH: workspace,
+      RELAY_RESULT_PATH: result,
+      RELAY_APPROVAL_DIR: approvals,
+      RELAY_CODEX_BIN: fake,
+      RELAY_CODEX_APPROVAL_POLICY: "never",
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.stdin.end("inspect the workspace");
+
+  const exit = await new Promise((resolve) => child.once("exit", resolve));
+  assert.equal(exit, 1);
+  assert.equal(fs.existsSync(result), false);
+  assert.match(stderr, /Codex sandbox could not access the workspace/);
+});
+
 test("Claude permission MCP waits for and returns the exact phone decision", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-claude-approval-"));
   const approvals = path.join(dir, "approvals");
