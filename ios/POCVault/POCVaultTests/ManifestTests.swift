@@ -2042,12 +2042,30 @@ final class ManifestTests: XCTestCase {
         )
 
         XCTAssertTrue(controlBarSource.contains("ScrollView(.horizontal, showsIndicators: false)"))
-        XCTAssertTrue(controlBarSource.contains("HStack(spacing: 8)"))
-        XCTAssertTrue(controlBarSource.contains(".frame(height: 36)"))
+        XCTAssertTrue(controlBarSource.contains("HStack(alignment: .center, spacing: 8)"))
+        XCTAssertTrue(controlBarSource.contains(".frame(height: Layout.controlHeight)"))
         XCTAssertTrue(controlBarSource.contains("scrollBounceBehavior(.basedOnSize, axes: .horizontal)"))
         XCTAssertTrue(controlBarSource.contains("relay-control-bar"))
         XCTAssertFalse(controlBarSource.contains("VStack"))
         XCTAssertFalse(source.contains("usesAccessibilityLayout"))
+    }
+
+    func testRelayComposerUsesSharedDockGeometry() throws {
+        let source = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
+        let composerSource = try sourceSnippet(
+            in: source,
+            from: "private struct RelayComposer",
+            to: "private struct RelayChatBubble"
+        )
+
+        XCTAssertTrue(composerSource.contains("static let horizontalInset: CGFloat = 16"))
+        XCTAssertTrue(composerSource.contains("static let controlHeight: CGFloat = 38"))
+        XCTAssertTrue(composerSource.contains("static let actionSize: CGFloat = 36"))
+        XCTAssertTrue(composerSource.contains("VStack(spacing: Layout.rowSpacing)"))
+        XCTAssertTrue(composerSource.contains("HStack(alignment: .bottom, spacing: 9)"))
+        XCTAssertFalse(composerSource.contains(".padding(.vertical, 6)"))
+        XCTAssertTrue(composerSource.contains(".fill(AppTheme.hairlineStrong)"))
+        XCTAssertFalse(composerSource.contains(".frame(height: 2)"))
     }
 
     func testRelayComposerIsPinnedOutsideTheConversationScrollView() throws {

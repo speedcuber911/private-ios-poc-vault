@@ -417,7 +417,13 @@ private struct RelayComposerCommand: Identifiable {
 }
 
 private struct RelayComposer: View {
-    private static let normalBottomPadding: CGFloat = 8
+    private enum Layout {
+        static let horizontalInset: CGFloat = 16
+        static let controlHeight: CGFloat = 38
+        static let actionSize: CGFloat = 36
+        static let rowSpacing: CGFloat = 12
+        static let bottomPadding: CGFloat = 10
+    }
 
     @Binding var text: String
     let sections: RelayModelPickerSections
@@ -569,12 +575,20 @@ private struct RelayComposer: View {
         }
         .foregroundStyle(AppTheme.textPrimary)
         .padding(.horizontal, 12)
-        .padding(.vertical, 6)
-        .frame(minHeight: 34)
+        .frame(height: Layout.controlHeight)
         .frame(maxWidth: 240, alignment: .leading)
         .fixedSize(horizontal: true, vertical: false)
-        .background(providerMark == nil ? Color.clear : tint.opacity(0.07), in: Capsule())
-        .overlay(Capsule().stroke(providerMark == nil ? AppTheme.hairlineStrong : tint.opacity(0.3), lineWidth: 1))
+        .background(
+            providerMark == nil ? AppTheme.textPrimary.opacity(0.025) : tint.opacity(0.08),
+            in: Capsule()
+        )
+        .overlay {
+            Capsule()
+                .stroke(
+                    providerMark == nil ? AppTheme.hairlineStrong : tint.opacity(0.34),
+                    lineWidth: 1
+                )
+        }
     }
 
     /// Harness-first model picker: each agent harness (Codex, Claude Code, Cursor) is a
@@ -684,7 +698,7 @@ private struct RelayComposer: View {
     /// move sideways inside this rail instead.
     private var controlBar: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
+            HStack(alignment: .center, spacing: 8) {
                 modelPickerMenu
 
                 if !efforts.isEmpty {
@@ -697,15 +711,14 @@ private struct RelayComposer: View {
                     skillChip
                 }
             }
-            .padding(.horizontal, 1)
         }
-        .frame(height: 36)
+        .frame(height: Layout.controlHeight)
         .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
         .accessibilityIdentifier("relay-control-bar")
     }
 
     var body: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: Layout.rowSpacing) {
             if slashContext != nil {
                 slashPalette
                     .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -741,7 +754,7 @@ private struct RelayComposer: View {
                                 .foregroundStyle(recorder.isRecording ? AppTheme.statusWarn : AppTheme.textSecondary)
                         }
                     }
-                    .frame(width: 30, height: 34)
+                    .frame(width: Layout.actionSize, height: Layout.actionSize)
                 }
                 .buttonStyle(.plain)
                 .disabled(isSending || isTranscribing)
@@ -763,12 +776,13 @@ private struct RelayComposer: View {
                     .frame(height: editorHeight)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.vertical, 6)
 
                 if isStreaming {
                     Button(action: onStop) {
                         ZStack {
-                            Circle().fill(AppTheme.accent).frame(width: 34, height: 34)
+                            Circle()
+                                .fill(AppTheme.accent)
+                                .frame(width: Layout.actionSize, height: Layout.actionSize)
                             RoundedRectangle(cornerRadius: 3).fill(.white).frame(width: 12, height: 12)
                         }
                     }
@@ -784,7 +798,7 @@ private struct RelayComposer: View {
                         ZStack {
                             Circle()
                                 .fill(canSend ? AnyShapeStyle(AppTheme.accent) : AnyShapeStyle(AppTheme.textPrimary.opacity(0.08)))
-                                .frame(width: 34, height: 34)
+                                .frame(width: Layout.actionSize, height: Layout.actionSize)
                             Image(systemName: "arrow.up")
                                 .font(.system(size: 15, weight: .bold))
                                 .foregroundStyle(canSend ? .white : AppTheme.textTertiary)
@@ -797,23 +811,25 @@ private struct RelayComposer: View {
                     .transition(.scale.combined(with: .opacity))
                 }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
             .background {
-                Capsule().stroke(AppTheme.hairlineStrong, lineWidth: 1)
+                Capsule()
+                    .fill(AppTheme.textPrimary.opacity(0.018))
+                    .overlay {
+                        Capsule().stroke(AppTheme.hairlineStrong, lineWidth: 1)
+                    }
             }
             .animation(.spring(response: 0.3, dampingFraction: 0.7), value: isStreaming)
         }
-        .padding(.horizontal, 12)
-        .padding(.top, 10)
-        .padding(.bottom, Self.normalBottomPadding)
+        .padding(.horizontal, Layout.horizontalInset)
+        .padding(.top, 12)
+        .padding(.bottom, Layout.bottomPadding)
         .background(AppTheme.canvasBottom)
         .overlay(alignment: .top) {
-            if let selectedChoice {
-                Rectangle()
-                    .fill(selectedChoice.executionProvider.relayPresentation.accent.opacity(0.8))
-                    .frame(height: 2)
-            }
+            Rectangle()
+                .fill(AppTheme.hairlineStrong)
+                .frame(height: 1)
         }
         .animation(.easeOut(duration: 0.18), value: isFocused)
         .animation(.easeOut(duration: 0.16), value: slashContext)
