@@ -27,3 +27,7 @@ ios/POCVault/Package.resolved
 __pycache__/
 *.pyc
 node_modules/
+mobile/.gradle/
+mobile/**/build/
+mobile/local.properties
+mobile/.kotlin/

@@ -325,6 +325,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 800000000000000000000002 /* Build configuration list for PBXNativeTarget "POCVault" */;
 			buildPhases = (
+				6000000000000000000000B0 /* Compile Relay shared core */,
 				600000000000000000000001 /* Sources */,
 				400000000000000000000001 /* Frameworks */,
 				600000000000000000000002 /* Resources */,
@@ -423,6 +424,29 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		6000000000000000000000B0 /* Compile Relay shared core */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Compile Relay shared core";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "if [ \"YES\" = \"$OVERRIDE_KOTLIN_BUILD_IDE_SUPPORTED\" ]; then\n  echo \"Skipping Gradle build because the IDE already built RelayCore\"\n  exit 0\nfi\ncd \"$SRCROOT/../../mobile\"\n./gradlew :relay-core:embedAndSignAppleFrameworkForXcode\n";
+			showEnvVarsInLog = 0;
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		600000000000000000000001 /* Sources */ = {
@@ -609,6 +633,7 @@
 				CODE_SIGN_ENTITLEMENTS = POCVault/POCVault.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = QRXV2V66Y6;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = POCVault/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
@@ -633,6 +658,7 @@
 				CODE_SIGN_ENTITLEMENTS = POCVault/POCVault.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = QRXV2V66Y6;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = POCVault/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;

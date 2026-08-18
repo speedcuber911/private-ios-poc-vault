@@ -1,4 +1,7 @@
 import Foundation
+import RelayCore
+
+private let relaySharedContract = RelayCoreInfo()
 
 struct CodexWorkspace: Decodable, Hashable, Identifiable {
     let id: String
@@ -317,23 +320,19 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
     static let defaultProvider = CodexProvider.codex
 
     init(rawProvider: String?) {
-        let normalized = rawProvider?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
+        let normalized = relaySharedContract.normalizedProvider(value: rawProvider)
 
         switch normalized {
         case "bedrock":
             self = .bedrock
-        case "azure", "azure-openai":
+        case "azure":
             self = .azure
-        case "claude", "anthropic":
+        case "claude":
             self = .claude
-        case "cursor", "cursor-agent":
+        case "cursor":
             self = .cursor
-        case "kimi", "kimi-code", "moonshot":
+        case "kimi":
             self = .kimi
-        case "codex", "openai", .none:
-            self = .codex
         default:
             self = .codex
         }
@@ -680,31 +679,27 @@ enum CodexJobStatus: Hashable, Codable {
     case unknown(String)
 
     init(rawStatus: String?) {
-        let normalized = rawStatus?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
+        let normalized = relaySharedContract.normalizedJobStatus(value: rawStatus)
 
         switch normalized {
-        case "queued", "queue", "pending", "created", "submitted":
+        case "queued":
             self = .queued
-        case "running", "active", "in_progress", "in-progress", "processing":
+        case "running":
             self = .running
-        case "waiting_for_approval", "waiting-for-approval", "needs_input":
+        case "waiting_for_approval":
             self = .waitingForApproval
-        case "succeeded", "success", "completed", "complete", "done", "passed":
+        case "succeeded":
             self = .succeeded
-        case "failed", "failure", "errored", "error":
+        case "failed":
             self = .failed
-        case "canceling", "cancelling":
+        case "canceling":
             self = .canceling
-        case "canceled", "cancelled":
+        case "canceled":
             self = .canceled
-        case "timeout", "timed_out", "timed-out":
+        case "timeout":
             self = .timeout
-        case .some(let value) where !value.isEmpty:
-            self = .unknown(value)
         default:
-            self = .unknown("unknown")
+            self = .unknown(normalized.isEmpty ? "unknown" : normalized)
         }
     }
 
