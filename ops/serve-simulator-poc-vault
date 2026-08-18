@@ -25,7 +25,7 @@ _SIM_LIVE_PREVIEW = b"""<!doctype html>
 <style>
 html,body{margin:0;min-height:100%;background:#101412;color:#f4f3ed;font:16px -apple-system,BlinkMacSystemFont,sans-serif}
 main{padding:76px 24px 32px}small{color:#83d9c8;text-transform:uppercase;letter-spacing:.12em}h1{font-size:32px;margin:14px 0 8px}p{color:#b8beb9;line-height:1.5}.card{margin-top:24px;padding:18px;border:1px solid #2e3934;border-radius:16px;background:#171c19}
-</style></head><body><main><small>Live from linked computer</small><h1>Local preview is connected</h1><p>Relay opened localhost:4317 through the machine that ran the task.</p><div class="card">Root-relative assets and app routes stay inside this preview lease.</div></main></body></html>"""
+</style></head><body><main><small>Live from linked computer</small><h1>App preview is connected</h1><p>Relay opened this through the machine that ran the task.</p><div class="card">Root-relative assets and app routes stay inside this secure preview.</div></main></body></html>"""
 
 
 class SimulatorVaultServer(ThreadingHTTPServer):
@@ -1269,7 +1269,7 @@ def codex_fixture_answer() -> str:
         "",
         "No active Linear ticket needs a fresh reply right now.",
         "",
-        "Open the live local app: [http://localhost:4317](http://localhost:4317)",
+        "Open the live local app: `http://localhost:4317/lab`",
     ])
 
 

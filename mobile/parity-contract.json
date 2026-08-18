@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "sharedCoreSchemaVersion": 2,
+  "sharedCoreSchemaVersion": 3,
   "capabilities": [
     {
       "id": "provider-and-status-normalization",
@@ -40,6 +40,14 @@
         "shared": [{"path": "mobile/relay-core/src/commonMain/kotlin/live/relay/core/RelayRepository.kt", "contains": ["createPreview", "/v1/codex/previews"]}],
         "ios": [{"path": "ios/POCVault/POCVault/Networking/CodexClient.swift", "contains": ["isTrustedArtifactURL", "createPreview", "resolvedPreviewURL"]}],
         "android": [{"path": "mobile/androidApp/src/main/kotlin/com/parikshit/relay/ui/RelayApp.kt", "contains": ["artifactUrl", "onOpenPreview", "sameOrigin"]}]
+      }
+    },
+    {
+      "id": "natural-preview-intent-and-artifact-routing",
+      "surfaces": {
+        "shared": [{"path": "mobile/relay-core/src/commonMain/kotlin/live/relay/core/RelayModels.kt", "contains": ["RelayPresentationIntent", "RelayArtifactPresentation"]}],
+        "ios": [{"path": "ios/POCVault/POCVault/Views/RelayChatView.swift", "contains": ["requestsAutomaticPreview", "artifactPresentationKind"]}],
+        "android": [{"path": "mobile/androidApp/src/main/kotlin/com/parikshit/relay/ui/RelayViewModel.kt", "contains": ["RelayPresentationIntent", "maybeOpenRequestedPreview"]}]
       }
     },
     {

@@ -725,6 +725,12 @@ function jobBinary(provider) {
 
 
 function buildJobEnv(job) {
+  prepareRuntimePackageCaches();
+  const npmAudit = process.env.NPM_CONFIG_AUDIT ?? process.env.npm_config_audit ?? "false";
+  const npmFund = process.env.NPM_CONFIG_FUND ?? process.env.npm_config_fund ?? "false";
+  const npmPreferOffline = process.env.NPM_CONFIG_PREFER_OFFLINE
+    ?? process.env.npm_config_prefer_offline
+    ?? "true";
   const env = {
     ...process.env,
     HOME: runHome,
@@ -738,6 +744,12 @@ function buildJobEnv(job) {
     npm_config_progress: process.env.npm_config_progress || "false",
     NPM_CONFIG_UPDATE_NOTIFIER: process.env.NPM_CONFIG_UPDATE_NOTIFIER || "false",
     npm_config_update_notifier: process.env.npm_config_update_notifier || "false",
+    NPM_CONFIG_AUDIT: npmAudit,
+    npm_config_audit: npmAudit,
+    NPM_CONFIG_FUND: npmFund,
+    npm_config_fund: npmFund,
+    NPM_CONFIG_PREFER_OFFLINE: npmPreferOffline,
+    npm_config_prefer_offline: npmPreferOffline,
     BUN_INSTALL_CACHE_DIR: bunCacheDir,
     PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
     RELAY_JOB_ID: job.id,
@@ -1345,16 +1357,33 @@ function pruneRuntimeCaches() {
 }
 
 
+// Package tarballs are reusable runtime infrastructure on a linked machine,
+// not per-job scratch. In particular, trial sandboxes may have intermittent
+// registry DNS/egress; deleting the cache before every task made a previously
+// installable project impossible to start on the next task. Ensure npm/bun can
+// write their configured caches, then retain package bytes across jobs.
+function prepareRuntimePackageCaches() {
+  for (const [name, target] of [["npm", npmCacheDir], ["bun", bunCacheDir]]) {
+    try {
+      fs.mkdirSync(target, { recursive: true, mode: 0o700 });
+    } catch (error) {
+      appendAudit("runtime_cache_prepare_failed", null, {
+        cache: name,
+        error: error.message || String(error),
+      });
+    }
+  }
+}
+
+
 function runtimeCacheTargets() {
-  return [
-    path.join(runHome, ".npm", "_cacache"),
+  return [...new Set([
     path.join(runHome, ".npm", "_npx"),
     path.join(runHome, ".npm", "_logs"),
-    path.join(runHome, ".bun", "install", "cache"),
-    npmCacheDir,
-    bunCacheDir,
+    path.join(npmCacheDir, "_npx"),
+    path.join(npmCacheDir, "_logs"),
     path.join(codexHome, ".tmp"),
-  ];
+  ])];
 }
 
 

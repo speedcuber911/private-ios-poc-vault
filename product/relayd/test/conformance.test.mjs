@@ -728,12 +728,19 @@ async function makeCacheWritingCodex(tmpDir) {
       "  prev=\"$arg\"",
       "done",
       "prompt=$(cat)",
-      "mkdir -p \"$HOME/.npm/_cacache\" \"$HOME/.npm/_npx/tool\" \"$HOME/.npm/_logs\" \"$HOME/.bun/install/cache\" \"$NPM_CONFIG_CACHE\" \"$BUN_INSTALL_CACHE_DIR\" \"$CODEX_HOME/.tmp/plugin\"",
+      "test -d \"$NPM_CONFIG_CACHE\"",
+      "test -d \"$BUN_INSTALL_CACHE_DIR\"",
+      "test \"$NPM_CONFIG_AUDIT\" = false",
+      "test \"$NPM_CONFIG_FUND\" = false",
+      "test \"$NPM_CONFIG_PREFER_OFFLINE\" = true",
+      "mkdir -p \"$HOME/.npm/_cacache\" \"$HOME/.npm/_npx/tool\" \"$HOME/.npm/_logs\" \"$HOME/.bun/install/cache\" \"$NPM_CONFIG_CACHE/_npx/tool\" \"$NPM_CONFIG_CACHE/_logs\" \"$BUN_INSTALL_CACHE_DIR\" \"$CODEX_HOME/.tmp/plugin\"",
       "printf cache > \"$HOME/.npm/_cacache/blob\"",
       "printf npx > \"$HOME/.npm/_npx/tool/blob\"",
       "printf log > \"$HOME/.npm/_logs/debug.log\"",
       "printf bun > \"$HOME/.bun/install/cache/blob\"",
       "printf cache > \"$NPM_CONFIG_CACHE/blob\"",
+      "printf npx > \"$NPM_CONFIG_CACHE/_npx/tool/blob\"",
+      "printf log > \"$NPM_CONFIG_CACHE/_logs/debug.log\"",
       "printf bun > \"$BUN_INSTALL_CACHE_DIR/blob\"",
       "printf tmp > \"$CODEX_HOME/.tmp/plugin/blob\"",
       "if [ -n \"$out\" ]; then printf 'clean answer: %s\\n' \"$prompt\" > \"$out\"; fi",
@@ -2543,6 +2550,7 @@ localTest("keeps artifact extraction bounded and falls back from unsafe filename
   const server = await startServer({
     CODEX_REQUIRE_MTLS: "false",
     CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_MAX_ARTIFACT_BYTES: String(1024 * 1024),
     CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
     CODEX_BIN: await makeAnswerCodex(tmpDir, answer),
   });
@@ -2561,6 +2569,58 @@ localTest("keeps artifact extraction bounded and falls back from unsafe filename
     assert.equal(job.artifacts[0].filename, "artifact-001.js");
     assert.equal(job.artifacts[0].bytes, "console.log('safe fallback');".length);
     assert.doesNotMatch(job.artifacts[0].rawURL, /\.\./);
+  } finally {
+    await server.stop();
+  }
+});
+
+localTest("publishes referenced document artifacts with table and device-viewer metadata", "runs a job that references files in its workspace", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
+  const workspaceDir = path.join(tmpDir, "scratch");
+  const dataDir = path.join(tmpDir, "data");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  await fs.writeFile(path.join(workspaceDir, "orders.csv"), 'order,total\nA-1,"1,200"\n', "utf8");
+  await fs.writeFile(path.join(workspaceDir, "forecast.xlsx"), Buffer.from("PK\u0003\u0004fixture-xlsx"));
+  const answer = [
+    "The requested files are ready:",
+    "- [Orders table](orders.csv)",
+    "- [Forecast workbook](forecast.xlsx)",
+  ].join("\n");
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: dataDir,
+    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
+    CODEX_BIN: await makeAnswerCodex(tmpDir, answer),
+  });
+  try {
+    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspaceId: "scratch", prompt: "create reports", timeoutMs: 5000 }),
+    });
+    assert.equal(create.status, 202);
+    const created = await create.json();
+    const job = await waitForJob(server, created.id);
+
+    assert.deepEqual(
+      job.artifacts.map((artifact) => [artifact.kind, artifact.filename, artifact.contentType, Boolean(artifact.previewURL)]),
+      [
+        ["document", "orders.csv", "text/csv; charset=utf-8", true],
+        ["document", "forecast.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", false],
+      ],
+    );
+
+    const tablePreview = await fetch(`${server.baseUrl}${job.artifacts[0].previewURL}`);
+    assert.equal(tablePreview.status, 200);
+    const tableHTML = await tablePreview.text();
+    assert.match(tableHTML, /&lt;table&gt;/);
+    assert.match(tableHTML, /&lt;th&gt;order&lt;\/th&gt;/);
+    assert.match(tableHTML, /&lt;td&gt;1,200&lt;\/td&gt;/);
+
+    const workbook = await fetch(`${server.baseUrl}${job.artifacts[1].rawURL}`);
+    assert.equal(workbook.status, 200);
+    assert.equal(workbook.headers.get("content-type"), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    assert.equal(Buffer.from(await workbook.arrayBuffer()).subarray(0, 4).toString("binary"), "PK\u0003\u0004");
   } finally {
     await server.stop();
   }
@@ -2720,7 +2780,7 @@ localTest("saves job attachments and includes their paths in the Codex prompt", 
   }
 });
 
-localTest("prunes runner package caches after jobs finish", "inspects the server's runner HOME on disk after a job", async () => {
+localTest("retains package caches while pruning transient runner state", "inspects the server's runner HOME on disk after a job", async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
   const workspaceDir = path.join(tmpDir, "scratch");
   const runHome = path.join(tmpDir, "run-home");
@@ -2748,12 +2808,14 @@ localTest("prunes runner package caches after jobs finish", "inspects the server
     const job = await waitForJob(server, created.id);
 
     assert.equal(job.status, "succeeded");
-    assert.equal(await pathExists(path.join(runHome, ".npm", "_cacache")), false);
+    assert.equal(await fs.readFile(path.join(runHome, ".npm", "_cacache", "blob"), "utf8"), "cache");
     assert.equal(await pathExists(path.join(runHome, ".npm", "_npx")), false);
     assert.equal(await pathExists(path.join(runHome, ".npm", "_logs")), false);
-    assert.equal(await pathExists(path.join(runHome, ".bun", "install", "cache")), false);
-    assert.equal(await pathExists(path.join(runHome, ".npm-cache")), false);
-    assert.equal(await pathExists(path.join(runHome, ".bun-cache")), false);
+    assert.equal(await fs.readFile(path.join(runHome, ".bun", "install", "cache", "blob"), "utf8"), "bun");
+    assert.equal(await fs.readFile(path.join(runHome, ".npm-cache", "blob"), "utf8"), "cache");
+    assert.equal(await pathExists(path.join(runHome, ".npm-cache", "_npx")), false);
+    assert.equal(await pathExists(path.join(runHome, ".npm-cache", "_logs")), false);
+    assert.equal(await fs.readFile(path.join(runHome, ".bun-cache", "blob"), "utf8"), "bun");
     assert.equal(await pathExists(path.join(codexHome, ".tmp")), false);
   } finally {
     await server.stop();

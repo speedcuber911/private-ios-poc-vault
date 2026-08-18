@@ -132,9 +132,9 @@ const maxOutputBytes = parseIntegerEnv("CODEX_MAX_OUTPUT_BYTES", 5 * 1024 * 1024
 
 const maxJobArtifacts = parseIntegerEnv("CODEX_MAX_JOB_ARTIFACTS", 12, 0, 50);
 
-const maxArtifactBytes = parseIntegerEnv("CODEX_MAX_ARTIFACT_BYTES", 1024 * 1024, 1024, 25 * 1024 * 1024);
+const maxArtifactBytes = parseIntegerEnv("CODEX_MAX_ARTIFACT_BYTES", 10 * 1024 * 1024, 1024, 25 * 1024 * 1024);
 
-const maxArtifactTotalBytes = parseIntegerEnv("CODEX_MAX_ARTIFACT_TOTAL_BYTES", 5 * 1024 * 1024, 1024, 50 * 1024 * 1024);
+const maxArtifactTotalBytes = parseIntegerEnv("CODEX_MAX_ARTIFACT_TOTAL_BYTES", 25 * 1024 * 1024, 1024, 50 * 1024 * 1024);
 
 const maxJobSkills = parseIntegerEnv("CODEX_MAX_JOB_SKILLS", 6, 0, 20);
 

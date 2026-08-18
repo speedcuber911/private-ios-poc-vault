@@ -2,11 +2,23 @@ package live.relay.core
 
 /** A deliberately small, Swift-friendly entry point while iOS migrates feature slices. */
 class RelayCoreInfo {
-    val schemaVersion: Int = 2
+    val schemaVersion: Int = 3
     val supportedProviders: List<String> = RelayProvider.entries.map { it.wireValue }
 
     fun normalizedProvider(value: String?): String = RelayProvider.fromWireValue(value).wireValue
     fun normalizedJobStatus(value: String?): String = JobStatus.fromWireValue(value).wireValue
+    fun requestsAutomaticPreview(prompt: String?): Boolean =
+        RelayPresentationIntent.requestsAutomaticPreview(prompt)
+
+    fun artifactPresentationKind(
+        filename: String,
+        contentType: String?,
+        artifactKind: String?,
+        hasPreview: Boolean,
+    ): String = RelayArtifactPresentation.kind(filename, contentType, artifactKind, hasPreview).wireValue
+
+    fun displayTextHidingLocalPreviewURLs(value: String): String =
+        RelayLocalPreviewUrls.hidingEndpoints(value)
 
     /**
      * Older Relay services answer unknown routes with a bare `not found`. Resource

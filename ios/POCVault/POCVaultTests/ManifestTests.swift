@@ -924,6 +924,25 @@ final class ManifestTests: XCTestCase {
 
         XCTAssertTrue(RelayOutputURLPolicy.containsLoopbackURL(in: "Open http://localhost:3000 to inspect it."))
         XCTAssertFalse(RelayOutputURLPolicy.containsLoopbackURL(in: "Open https://preview.example.com instead."))
+        XCTAssertEqual(
+            RelayOutputURLPolicy.loopbackURLs(
+                in: "Open `http://localhost:3000/lab`, then reuse http://localhost:3000/lab."
+            ),
+            [URL(string: "http://localhost:3000/lab")!]
+        )
+    }
+
+    func testCodexInlineMarkdownMakesBareLocalhostURLTappable() {
+        let bareURL = URL(string: "http://localhost:3000/lab")!
+        let attributed = CodexInlineMarkdown.attributed(
+            "Once dependencies are available, the interactive app is at `http://localhost:3000/lab`."
+        )
+
+        XCTAssertEqual(attributed.runs.compactMap(\.link), [bareURL])
+        XCTAssertEqual(
+            String(attributed.characters),
+            "Once dependencies are available, the interactive app is at http://localhost:3000/lab."
+        )
     }
 
     func testPreviewLeaseDecodingAndURLTrustStayOnTheRelayOrigin() throws {
@@ -1996,8 +2015,14 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(chatSource.contains("private struct RelayArtifactViewer"))
         XCTAssertTrue(chatSource.contains("artifact.relayViewerKind == .image"))
         XCTAssertTrue(chatSource.contains("AuthenticatedWebView("))
-        XCTAssertTrue(chatSource.contains("RelayRemoteLocalhostNotice"))
+        XCTAssertTrue(chatSource.contains("RelayAppPreviewNotice"))
+        XCTAssertTrue(chatSource.contains("relay-show-app"))
         XCTAssertTrue(chatSource.contains("private struct RelayRemotePreviewViewer"))
+        XCTAssertTrue(chatSource.contains("requestsAutomaticPreview"))
+        XCTAssertTrue(chatSource.contains("openRequestedPreviewIfNeeded"))
+        XCTAssertTrue(chatSource.contains("Text(\"Show app\")"))
+        XCTAssertTrue(chatSource.contains("RelayQuickLookPreview"))
+        XCTAssertTrue(chatSource.contains("artifactPresentationKind"))
         XCTAssertTrue(chatSource.contains(".fullScreenCover(item: $artifactRequest)"))
         XCTAssertTrue(chatSource.contains(".fullScreenCover(item: $remotePreviewRequest)"))
         XCTAssertTrue(chatSource.contains(".onChange(of: completedResultContentVersion)"))
@@ -2408,6 +2433,8 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(try kind(name: "server.mjs", mime: "text/javascript"), .text)
         XCTAssertEqual(try kind(name: "notes.txt"), .text)
         XCTAssertEqual(try kind(name: "LICENSE", isText: true), .text)
+        XCTAssertEqual(try kind(name: "orders.csv", mime: "text/csv; charset=utf-8"), .table)
+        XCTAssertEqual(try kind(name: "events.tsv"), .table)
 
         // Markdown renders through the shared Relay markdown views.
         XCTAssertEqual(try kind(name: "README.md"), .markdown)
@@ -2429,6 +2456,23 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(try kind(name: "blob.dat", mime: "application/octet-stream"), .binary)
         XCTAssertEqual(try kind(name: "mystery"), .binary)
         XCTAssertEqual(try kind(name: ".env", isText: true, readDenied: true), .binary)
+    }
+
+    func testDelimitedViewerParsesQuotedCellsAndCapsLargeTables() {
+        let table = RelayDelimitedTable.parse(
+            "order,total,note\nA-1,\"1,200\",\"first\nline\"\n",
+            delimiter: ","
+        )
+
+        XCTAssertEqual(table.rows, [
+            ["order", "total", "note"],
+            ["A-1", "1,200", "first\nline"]
+        ])
+        XCTAssertFalse(table.isTruncated)
+
+        let capped = RelayDelimitedTable.parse("a,b,c\n1,2,3\n4,5,6", delimiter: ",", maximumRows: 2, maximumColumns: 2)
+        XCTAssertEqual(capped.rows, [["a", "b"], ["1", "2"]])
+        XCTAssertTrue(capped.isTruncated)
     }
 
     @MainActor

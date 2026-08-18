@@ -27,6 +27,8 @@ import live.relay.core.JobStreamState
 import live.relay.core.ModelDescriptor
 import live.relay.core.PocEntry
 import live.relay.core.RelayProvider
+import live.relay.core.RelayLocalPreviewUrls
+import live.relay.core.RelayPresentationIntent
 import live.relay.core.RelayHttpException
 import live.relay.core.RelayRepository
 import live.relay.core.ThreadDetail
@@ -70,6 +72,8 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     )
     val uiState: StateFlow<RelayUiState> = _uiState.asStateFlow()
     private var streamCollection: Job? = null
+    private val automaticallyOpenedPreviews = mutableSetOf<String>()
+    private val artifactOpener = AndroidArtifactOpener(application, identityStore)
 
     fun clearMessage() = _uiState.update { it.copy(error = null, notice = null) }
 
@@ -301,6 +305,15 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(previewUrl = null) }
     }
 
+    fun openArtifact(artifact: live.relay.core.JobArtifact) {
+        if (!guardMachineReady()) return
+        viewModelScope.launch {
+            runLoading {
+                artifactOpener.open(artifact, _uiState.value.configuration.codexBaseUrl)
+            }
+        }
+    }
+
     fun decideApproval(approval: Approval, decision: String) {
         viewModelScope.launch {
             runLoading {
@@ -343,6 +356,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                         else -> state.job
                     }
                     _uiState.update { it.copy(selectedJob = job ?: it.selectedJob, streamState = state) }
+                    job?.let { maybeOpenRequestedPreview(it, state.stdout) }
                     if (job?.resolvedStatus == live.relay.core.JobStatus.WAITING_FOR_APPROVAL) {
                         loadApprovalsNow(id)
                     }
@@ -382,6 +396,34 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         return RelayRepository(OkHttpRelayTransport(configuration.codexBaseUrl, client))
     }
 
+    private fun maybeOpenRequestedPreview(job: RelayJob, streamedOutput: String) {
+        if (job.resolvedStatus != live.relay.core.JobStatus.SUCCEEDED) return
+        if (!RelayPresentationIntent.requestsAutomaticPreview(job.prompt)) return
+        val currentSource = RelayLocalPreviewUrls.extract(
+            listOfNotNull(job.displayOutput, streamedOutput.takeIf(String::isNotBlank)).joinToString("\n"),
+        ).firstOrNull()
+        val source = if (currentSource != null) {
+            job to currentSource
+        } else {
+            sequenceOf(
+                _uiState.value.selectedThread?.jobs.orEmpty(),
+                _uiState.value.jobs,
+            )
+                .flatten()
+                .distinctBy(RelayJob::resolvedId)
+                .firstNotNullOfOrNull { sourceJob ->
+                    sourceJob.displayOutput
+                        ?.let(RelayLocalPreviewUrls::extract)
+                        ?.firstOrNull()
+                        ?.let { sourceJob to it }
+                }
+                ?: return
+        }
+        val key = "${job.resolvedId}|${source.first.resolvedId}|${source.second}"
+        if (!automaticallyOpenedPreviews.add(key)) return
+        openRemotePreview(source.first.resolvedId, source.second)
+    }
+
     private fun guardMachineReady(): Boolean {
         val state = _uiState.value
         val message = when {
@@ -410,7 +452,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         val message = error.message.orEmpty()
         return when {
             error is RelayHttpException && error.isGenericRouteNotFound ->
-                "This linked computer is running an older Relay service that cannot open localhost previews. Update Relay on that computer, then try again."
+                "This linked computer is running an older Relay service that cannot open app previews. Update Relay on that computer, then try again."
             message.contains("CERTIFICATE_REQUIRED", ignoreCase = true) -> "The Relay server requires a valid client certificate."
             message.contains("PKIX", ignoreCase = true) -> "Relay could not verify the server certificate."
             message.contains("unconfigured.invalid", ignoreCase = true) -> "Configure your Relay machine URL in Settings first."

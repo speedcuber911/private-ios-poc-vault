@@ -242,6 +242,90 @@ data class JobArtifact(
     val previewURL: String? = null,
 )
 
+/**
+ * Natural-language intent for results that should be presented, rather than merely
+ * described in the transcript. The URL remains server-authored and loopback-only;
+ * this classifier only decides whether Relay should open that safe preview once the
+ * job succeeds.
+ */
+object RelayPresentationIntent {
+    private val presentationPhrases = listOf(
+        "show me",
+        "show it",
+        "open it",
+        "open this",
+        "open the app",
+        "open the site",
+        "launch it",
+        "launch the app",
+        "preview it",
+        "preview the app",
+        "let me see",
+    )
+
+    fun requestsAutomaticPreview(prompt: String?): Boolean {
+        val normalized = prompt
+            ?.lowercase()
+            ?.replace(Regex("[^a-z0-9]+"), " ")
+            ?.trim()
+            ?: return false
+        if (normalized.isEmpty()) return false
+        val padded = " $normalized "
+        return presentationPhrases.any { phrase -> padded.contains(" $phrase ") }
+    }
+}
+
+enum class ArtifactPresentationKind(val wireValue: String) {
+    IMAGE("image"),
+    WEB("web"),
+    MARKDOWN("markdown"),
+    TABLE("table"),
+    TEXT("text"),
+    DOCUMENT("document"),
+    ARCHIVE("archive"),
+    MEDIA("media"),
+    BINARY("binary"),
+}
+
+/** Shared artifact routing so iOS and Android agree about the same file. */
+object RelayArtifactPresentation {
+    private val imageExtensions = setOf("png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tif", "tiff")
+    private val markdownExtensions = setOf("md", "markdown")
+    private val tableExtensions = setOf("csv", "tsv")
+    private val webExtensions = setOf("html", "htm", "svg")
+    private val documentExtensions = setOf("pdf", "xlsx", "xls", "ods", "docx", "doc", "odt", "pptx", "ppt", "rtf", "pages", "numbers", "key")
+    private val archiveExtensions = setOf("zip", "tar", "gz", "tgz", "bz2", "7z", "rar")
+    private val mediaExtensions = setOf("mp3", "wav", "m4a", "aac", "flac", "mp4", "mov", "m4v", "webm")
+
+    fun kind(
+        filename: String,
+        contentType: String? = null,
+        artifactKind: String? = null,
+        hasPreview: Boolean = false,
+    ): ArtifactPresentationKind {
+        val extension = filename.substringAfterLast('.', "").lowercase()
+        val mime = contentType.orEmpty().substringBefore(';').trim().lowercase()
+        val normalizedKind = artifactKind.orEmpty().trim().lowercase()
+
+        if (mime.startsWith("image/") && mime != "image/svg+xml" || extension in imageExtensions) return ArtifactPresentationKind.IMAGE
+        if (mime == "text/markdown" || extension in markdownExtensions) return ArtifactPresentationKind.MARKDOWN
+        if (mime == "text/csv" || mime == "text/tab-separated-values" || extension in tableExtensions) return ArtifactPresentationKind.TABLE
+        if (normalizedKind == "staticpreview" || mime == "text/html" || mime == "application/xhtml+xml" || mime == "image/svg+xml" || extension in webExtensions) {
+            return ArtifactPresentationKind.WEB
+        }
+        if (mime == "application/pdf" || extension in documentExtensions || mime.contains("spreadsheet") || mime.contains("wordprocessing") || mime.contains("presentation")) {
+            return ArtifactPresentationKind.DOCUMENT
+        }
+        if (mime.startsWith("audio/") || mime.startsWith("video/") || extension in mediaExtensions) return ArtifactPresentationKind.MEDIA
+        if (mime.contains("zip") || mime.contains("archive") || mime.contains("compressed") || extension in archiveExtensions) return ArtifactPresentationKind.ARCHIVE
+        if (normalizedKind == "code" || mime.startsWith("text/") || mime in setOf("application/json", "application/xml", "application/javascript")) {
+            return ArtifactPresentationKind.TEXT
+        }
+        if (hasPreview) return ArtifactPresentationKind.WEB
+        return ArtifactPresentationKind.BINARY
+    }
+}
+
 @Serializable
 data class Job(
     val id: String? = null,
@@ -415,5 +499,10 @@ object RelayLocalPreviewUrls {
         val portText = Regex(""":([0-9]{1,5})(?:/|$)""").find(match.value)?.groupValues?.get(1)
         val port = portText?.toIntOrNull()
         return port == null || port in 1..65535
+    }
+
+    /** Keeps the transport endpoint in full logs while chat speaks in product language. */
+    fun hidingEndpoints(value: String): String = extract(value).fold(value) { display, url ->
+        display.replace(url, "the app preview")
     }
 }

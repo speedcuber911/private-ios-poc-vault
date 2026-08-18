@@ -84,12 +84,25 @@ enum RelayOutputURLPolicy {
     }
 
     static func containsLoopbackURL(in text: String) -> Bool {
+        !loopbackURLs(in: text).isEmpty
+    }
+
+    static func loopbackURLs(in text: String) -> [URL] {
         guard let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) else {
-            return false
+            return []
         }
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
-        return detector.matches(in: text, options: [], range: range).contains { match in
-            match.url.map(isLoopbackURL) == true
+        var seen = Set<String>()
+        return detector.matches(in: text, options: [], range: range).compactMap { match in
+            guard
+                let swiftRange = Range(match.range, in: text),
+                let url = URL(string: String(text[swiftRange]).trimmingCharacters(in: CharacterSet(charactersIn: "`"))),
+                isLoopbackURL(url),
+                seen.insert(url.absoluteString).inserted
+            else {
+                return nil
+            }
+            return url
         }
     }
 }

@@ -1,3 +1,4 @@
+import QuickLook
 import SwiftUI
 import UIKit
 
@@ -9,6 +10,8 @@ enum RelayFileViewerKind: String, Hashable {
     case text
     /// Rendered markdown through the shared Relay markdown views, with a raw toggle.
     case markdown
+    /// Row-and-column rendering for CSV and TSV files.
+    case table
     /// Fit-width bitmap preview.
     case image
     /// Authenticated web view pointed at the raw-file endpoint (PDF + HTML).
@@ -25,6 +28,9 @@ extension CodexWorkspaceDirectoryEntry {
         }
         if isHTMLDocument {
             return .web
+        }
+        if isDelimitedDocument {
+            return .table
         }
         switch fileCategory {
         case .code, .text:
@@ -47,6 +53,161 @@ extension CodexWorkspaceDirectoryEntry {
         }
         let fileExtension = URL(fileURLWithPath: displayName).pathExtension.lowercased()
         return fileExtension == "html" || fileExtension == "htm"
+    }
+
+    private var isDelimitedDocument: Bool {
+        let mimeValue = mime?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let fileExtension = URL(fileURLWithPath: displayName).pathExtension.lowercased()
+        return mimeValue.hasPrefix("text/csv")
+            || mimeValue.hasPrefix("text/tab-separated-values")
+            || fileExtension == "csv"
+            || fileExtension == "tsv"
+    }
+}
+
+struct RelayDelimitedTable: Equatable {
+    let rows: [[String]]
+    let isTruncated: Bool
+
+    static func parse(
+        _ text: String,
+        delimiter: Character,
+        maximumRows: Int = 500,
+        maximumColumns: Int = 50
+    ) -> RelayDelimitedTable {
+        var parsed: [[String]] = []
+        var row: [String] = []
+        var field = ""
+        var insideQuotes = false
+        var iterator = text.makeIterator()
+        var pending: Character?
+        var didTruncateRows = false
+        var didTruncateColumns = false
+
+        func finishField() {
+            if row.count < maximumColumns {
+                row.append(field)
+            } else {
+                didTruncateColumns = true
+            }
+            field = ""
+        }
+        func finishRow() {
+            finishField()
+            if parsed.count < maximumRows {
+                parsed.append(row)
+            } else {
+                didTruncateRows = true
+            }
+            row = []
+        }
+
+        while let character = pending ?? iterator.next() {
+            pending = nil
+            if character == "\"" {
+                if insideQuotes {
+                    if let next = iterator.next() {
+                        if next == "\"" {
+                            field.append("\"")
+                        } else {
+                            insideQuotes = false
+                            pending = next
+                        }
+                    } else {
+                        insideQuotes = false
+                    }
+                } else if field.isEmpty {
+                    insideQuotes = true
+                } else {
+                    field.append(character)
+                }
+            } else if character == delimiter, !insideQuotes {
+                finishField()
+            } else if (character == "\n" || character == "\r"), !insideQuotes {
+                if character == "\r", let next = iterator.next(), next != "\n" { pending = next }
+                finishRow()
+            } else {
+                field.append(character)
+            }
+        }
+        if !field.isEmpty || !row.isEmpty { finishRow() }
+
+        return RelayDelimitedTable(
+            rows: parsed,
+            isTruncated: didTruncateRows || didTruncateColumns
+        )
+    }
+}
+
+struct RelayDelimitedTableView: View {
+    let text: String
+    let delimiter: Character
+
+    private var table: RelayDelimitedTable {
+        RelayDelimitedTable.parse(text, delimiter: delimiter)
+    }
+
+    var body: some View {
+        ScrollView([.horizontal, .vertical]) {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(table.rows.enumerated()), id: \.offset) { rowIndex, row in
+                    HStack(spacing: 0) {
+                        ForEach(Array(row.enumerated()), id: \.offset) { _, value in
+                            Text(value.isEmpty ? " " : value)
+                                .font(rowIndex == 0 ? AppTheme.uiFont(size: 12, weight: .semibold) : AppTheme.uiFont(size: 12))
+                                .foregroundStyle(AppTheme.textPrimary)
+                                .lineLimit(4)
+                                .frame(width: 170, alignment: .leading)
+                                .padding(9)
+                                .background(rowIndex == 0 ? AppTheme.accent.opacity(0.12) : Color.clear)
+                                .overlay(alignment: .trailing) {
+                                    Rectangle().fill(AppTheme.hairline).frame(width: 0.5)
+                                }
+                        }
+                    }
+                    .overlay(alignment: .bottom) {
+                        Rectangle().fill(AppTheme.hairline).frame(height: 0.5)
+                    }
+                }
+                if table.isTruncated {
+                    Text("Showing the first 500 rows and 50 columns.")
+                        .font(AppTheme.uiFont(size: 12))
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .padding(12)
+                }
+            }
+            .padding(12)
+        }
+    }
+}
+
+struct RelayQuickLookPreview: UIViewControllerRepresentable {
+    let fileURL: URL
+
+    func makeCoordinator() -> Coordinator { Coordinator(fileURL: fileURL) }
+
+    func makeUIViewController(context: Context) -> QLPreviewController {
+        let controller = QLPreviewController()
+        controller.dataSource = context.coordinator
+        return controller
+    }
+
+    func updateUIViewController(_ controller: QLPreviewController, context: Context) {
+        guard context.coordinator.fileURL != fileURL else { return }
+        context.coordinator.fileURL = fileURL
+        controller.reloadData()
+    }
+
+    final class Coordinator: NSObject, QLPreviewControllerDataSource {
+        var fileURL: URL
+
+        init(fileURL: URL) { self.fileURL = fileURL }
+
+        func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
+
+        func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem {
+            fileURL as NSURL
+        }
     }
 }
 
@@ -122,6 +283,13 @@ final class FileViewerViewModel: ObservableObject {
     func loadIfNeeded() async {
         guard needsByteFetch, !hasLoaded, !isLoading else { return }
         await load()
+        if kind == .binary {
+            while hasMoreBytes, errorMessage == nil {
+                let previousCount = data.count
+                await loadMore()
+                if data.count == previousCount { break }
+            }
+        }
     }
 
     func load() async {
@@ -224,7 +392,7 @@ final class FileViewerViewModel: ObservableObject {
 
     private func applyDerivedContent() {
         switch kind {
-        case .text, .markdown:
+        case .text, .markdown, .table:
             text = String(decoding: data, as: UTF8.self)
             textChunks = Self.chunkedLines(text)
         case .image:
@@ -232,7 +400,9 @@ final class FileViewerViewModel: ObservableObject {
         case .binary, .web:
             break
         }
-        refreshShareFile()
+        if kind != .binary || !hasMoreBytes {
+            refreshShareFile()
+        }
     }
 
     private func refreshShareFile() {
@@ -317,6 +487,11 @@ struct FileViewerView: View {
                 textContent(raw: false)
             case .markdown:
                 markdownContent
+            case .table:
+                RelayDelimitedTableView(
+                    text: viewModel.text,
+                    delimiter: viewModel.entry.displayName.lowercased().hasSuffix(".tsv") ? "\t" : ","
+                )
             case .image:
                 imageContent
             case .binary, .web:
@@ -437,9 +612,13 @@ struct FileViewerView: View {
         return "\(dimensions) · \(size)"
     }
 
-    /// Binary fallback (also used for undecodable images): file icon, identity, share.
-    private var fallbackContent: some View {
-        VStack(spacing: 14) {
+    /// Quick Look covers common documents (Excel, Word, PowerPoint, archives and media).
+    /// If the platform cannot render one, the same staged file remains shareable.
+    @ViewBuilder private var fallbackContent: some View {
+        if let shareURL = viewModel.shareURL {
+            RelayQuickLookPreview(fileURL: shareURL)
+        } else {
+            VStack(spacing: 14) {
             Image(systemName: viewModel.entry.browserGlyph)
                 .font(.system(size: 30, weight: .semibold))
                 .foregroundStyle(AppTheme.accent)
@@ -476,8 +655,9 @@ struct FileViewerView: View {
             if let error = viewModel.errorMessage {
                 FileViewerErrorBanner(text: error)
             }
+            }
+            .padding(.horizontal, 28)
         }
-        .padding(.horizontal, 28)
     }
 
     // MARK: - Shared rows

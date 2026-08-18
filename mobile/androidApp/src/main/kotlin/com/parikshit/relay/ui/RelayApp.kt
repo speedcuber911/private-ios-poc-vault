@@ -102,6 +102,7 @@ import live.relay.core.ModelDescriptor
 import live.relay.core.PocEntry
 import live.relay.core.RelayLocalPreviewUrls
 import live.relay.core.RelayProvider
+import live.relay.core.RelayArtifactPresentation
 import live.relay.core.ThreadSummary
 import live.relay.core.WorkspaceEntry
 import live.relay.core.Job as RelayJob
@@ -142,8 +143,8 @@ fun RelayApp(viewModel: RelayViewModel = viewModel()) {
                 when {
                     state.previewUrl != null -> RelayWebView(
                         url = state.previewUrl!!,
-                        title = "Local preview",
-                        errorTitle = "Could not open the local preview",
+                        title = "App preview",
+                        errorTitle = "Could not open the app preview",
                         identityStore = viewModel.identityStore,
                         onBack = viewModel::closeRemotePreview,
                     )
@@ -161,7 +162,11 @@ fun RelayApp(viewModel: RelayViewModel = viewModel()) {
                         onCancel = viewModel::cancelSelectedJob,
                         onDecision = viewModel::decideApproval,
                         onOpenArtifact = { artifact ->
-                            artifactUrl(artifact, state.configuration.codexBaseUrl)?.let { pocUrl = it }
+                            if (artifact.previewURL != null) {
+                                artifactUrl(artifact, state.configuration.codexBaseUrl)?.let { pocUrl = it }
+                            } else {
+                                viewModel.openArtifact(artifact)
+                            }
                         },
                         onOpenPreview = viewModel::openRemotePreview,
                     )
@@ -173,7 +178,11 @@ fun RelayApp(viewModel: RelayViewModel = viewModel()) {
                         onCancel = viewModel::cancelSelectedJob,
                         onDecision = viewModel::decideApproval,
                         onOpenArtifact = { artifact ->
-                            artifactUrl(artifact, state.configuration.codexBaseUrl)?.let { pocUrl = it }
+                            if (artifact.previewURL != null) {
+                                artifactUrl(artifact, state.configuration.codexBaseUrl)?.let { pocUrl = it }
+                            } else {
+                                viewModel.openArtifact(artifact)
+                            }
                         },
                         onOpenPreview = viewModel::openRemotePreview,
                     )
@@ -183,7 +192,11 @@ fun RelayApp(viewModel: RelayViewModel = viewModel()) {
                         onCancel = viewModel::cancelSelectedJob,
                         onDecision = viewModel::decideApproval,
                         onOpenArtifact = { artifact ->
-                            artifactUrl(artifact, state.configuration.codexBaseUrl)?.let { pocUrl = it }
+                            if (artifact.previewURL != null) {
+                                artifactUrl(artifact, state.configuration.codexBaseUrl)?.let { pocUrl = it }
+                            } else {
+                                viewModel.openArtifact(artifact)
+                            }
                         },
                         onOpenPreview = viewModel::openRemotePreview,
                     )
@@ -901,7 +914,7 @@ private fun JobPanel(
             Text(job.displayPrompt, style = MaterialTheme.typography.titleMedium)
             if (output != null) {
                 SelectionContainer {
-                    Text(output, style = MaterialTheme.typography.bodyMedium)
+                    Text(RelayLocalPreviewUrls.hidingEndpoints(output), style = MaterialTheme.typography.bodyMedium)
                 }
             }
             if (state.streamState.stderr.isNotBlank()) {
@@ -921,21 +934,22 @@ private fun JobPanel(
                 }
             }
             job.artifacts.forEach { artifact ->
+                val viewerKind = RelayArtifactPresentation.kind(
+                    filename = artifact.filename,
+                    contentType = artifact.contentType,
+                    artifactKind = artifact.kind,
+                    hasPreview = artifact.previewURL != null,
+                )
                 AssistChip(
                     onClick = { onOpenArtifact(artifact) },
-                    label = { Text(artifact.title ?: artifact.filename) },
+                    label = { Text("${artifact.title ?: artifact.filename} · ${viewerKind.wireValue}") },
                     leadingIcon = { Icon(Icons.Default.Description, contentDescription = null) },
                 )
             }
             previewSources.forEach { sourceUrl ->
-                val source = sourceUrl.toUri()
-                val sourceLabel = buildString {
-                    append(source.host ?: "localhost")
-                    if (source.port >= 0) append(':').append(source.port)
-                }
                 AssistChip(
                     onClick = { onOpenPreview(job.resolvedId, sourceUrl) },
-                    label = { Text("Open $sourceLabel") },
+                    label = { Text("Show app") },
                     leadingIcon = { Icon(Icons.Default.Apps, contentDescription = null) },
                 )
             }
@@ -1125,12 +1139,5 @@ private fun defaultModel(state: RelayUiState, provider: RelayProvider): String? 
 
 private fun artifactUrl(artifact: JobArtifact, baseUrl: String): String? {
     val value = artifact.previewURL ?: artifact.rawURL ?: return null
-    val base = baseUrl.toUri()
-    val candidate = when {
-        value.startsWith("/") -> base.buildUpon().encodedPath(value).clearQuery().fragment(null).build()
-        else -> value.toUri()
-    }
-    if (!sameOrigin(candidate, base) || candidate.userInfo != null || candidate.query != null || candidate.fragment != null) return null
-    if (!Regex("^/v1/codex/jobs/[^/]+/artifacts/[^/]+/(?:raw|preview)$").matches(candidate.path.orEmpty())) return null
-    return candidate.toString()
+    return resolvedArtifactUrl(value, baseUrl)
 }

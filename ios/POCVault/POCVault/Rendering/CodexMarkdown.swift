@@ -366,10 +366,39 @@ enum CodexMarkdownParser {
 }
 
 enum CodexInlineMarkdown {
+    private static let linkDetector = try? NSDataDetector(
+        types: NSTextCheckingResult.CheckingType.link.rawValue
+    )
+
     static func attributed(_ value: String) -> AttributedString {
         let options = AttributedString.MarkdownParsingOptions(
             interpretedSyntax: .inlineOnlyPreservingWhitespace
         )
-        return (try? AttributedString(markdown: value, options: options)) ?? AttributedString(value)
+        var attributed = (try? AttributedString(markdown: value, options: options))
+            ?? AttributedString(value)
+
+        // Markdown only makes `[label](url)` and `<url>` tappable. Agent results
+        // commonly return bare localhost URLs such as `http://localhost:3000/lab`,
+        // so detect links in the rendered text and attach the missing link attribute.
+        // Applying this after Markdown parsing preserves inline-code styling and
+        // avoids disturbing labels on links that already carry a destination.
+        let plainText = String(attributed.characters)
+        guard let detector = linkDetector else {
+            return attributed
+        }
+        let fullRange = NSRange(plainText.startIndex..<plainText.endIndex, in: plainText)
+        for match in detector.matches(in: plainText, options: [], range: fullRange) {
+            guard let url = match.url,
+                  let stringRange = Range(match.range, in: plainText),
+                  let lowerBound = AttributedString.Index(stringRange.lowerBound, within: attributed),
+                  let upperBound = AttributedString.Index(stringRange.upperBound, within: attributed) else {
+                continue
+            }
+            let range = lowerBound..<upperBound
+            guard attributed[range].runs.allSatisfy({ $0.link == nil }) else { continue }
+            attributed[range].link = url
+        }
+
+        return attributed
     }
 }

@@ -49,6 +49,32 @@ class RelayCoreTest {
         assertTrue(RelayLocalPreviewUrls.isSupported("http://[::1]:3000/"))
         assertFalse(RelayLocalPreviewUrls.isSupported("https://example.com"))
         assertFalse(RelayLocalPreviewUrls.isSupported("http://localhost:99999"))
+        assertEquals(
+            "The app is at the app preview. Open the app preview now.",
+            RelayLocalPreviewUrls.hidingEndpoints(
+                "The app is at http://localhost:4317/lab. Open http://localhost:4317/lab now.",
+            ),
+        )
+    }
+
+    @Test
+    fun naturalPresentationLanguageRequestsAnAutomaticPreview() {
+        assertTrue(RelayPresentationIntent.requestsAutomaticPreview("Build the dashboard and show me"))
+        assertTrue(RelayPresentationIntent.requestsAutomaticPreview("Open it when you are done."))
+        assertTrue(RelayPresentationIntent.requestsAutomaticPreview("Let me see the working app"))
+        assertFalse(RelayPresentationIntent.requestsAutomaticPreview("Build the dashboard and report the test results"))
+        assertFalse(RelayPresentationIntent.requestsAutomaticPreview("Explain how localhost works"))
+    }
+
+    @Test
+    fun artifactsRouteToPortableViewerKinds() {
+        assertEquals(ArtifactPresentationKind.DOCUMENT, RelayArtifactPresentation.kind("report.pdf", "application/pdf"))
+        assertEquals(ArtifactPresentationKind.TABLE, RelayArtifactPresentation.kind("orders.csv", "text/csv"))
+        assertEquals(ArtifactPresentationKind.DOCUMENT, RelayArtifactPresentation.kind("forecast.xlsx"))
+        assertEquals(ArtifactPresentationKind.DOCUMENT, RelayArtifactPresentation.kind("brief.docx"))
+        assertEquals(ArtifactPresentationKind.WEB, RelayArtifactPresentation.kind("preview.html", artifactKind = "staticPreview", hasPreview = true))
+        assertEquals(ArtifactPresentationKind.MARKDOWN, RelayArtifactPresentation.kind("README.md", artifactKind = "document"))
+        assertEquals(ArtifactPresentationKind.BINARY, RelayArtifactPresentation.kind("weights.bin"))
     }
 
     @Test

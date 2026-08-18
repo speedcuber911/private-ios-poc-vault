@@ -24,6 +24,7 @@ struct RelayChatView: View {
     @State private var fullLogRequest: RelayFullLogRequest?
     @State private var artifactRequest: CodexJobArtifact?
     @State private var remotePreviewRequest: RelayRemotePreviewRequest?
+    @State private var automaticallyOpenedPreviews: Set<String> = []
     @State private var modelPickerRequest = 0
     @State private var didHandleInitialProviderPicker = false
 
@@ -94,6 +95,9 @@ struct RelayChatView: View {
             }
             .onChange(of: threadsRequest.wrappedValue) { _, _ in
                 honorThreadsRequest()
+            }
+            .onChange(of: automaticPreviewCandidate?.key) { _, _ in
+                openRequestedPreviewIfNeeded()
             }
             .refreshable {
                 await viewModel.refreshThreads()
@@ -366,6 +370,46 @@ struct RelayChatView: View {
             version &+= job.displayOutput?.count ?? 0
             version &+= job.artifacts.count &* 100_000
         }
+    }
+
+    private var automaticPreviewCandidate: RelayAutomaticPreviewCandidate? {
+        let jobs = viewModel.messages.compactMap(\.job).reversed()
+        guard let triggerJob = jobs.first(where: {
+            $0.status == .succeeded && relaySharedContract.requestsAutomaticPreview(prompt: $0.prompt)
+        }) else { return nil }
+
+        if let output = triggerJob.displayOutput,
+           let sourceURL = RelayOutputURLPolicy.loopbackURLs(in: output).first {
+            return RelayAutomaticPreviewCandidate(
+                triggerJobID: triggerJob.id,
+                previewJobID: triggerJob.id,
+                sourceURL: sourceURL
+            )
+        }
+
+        // A follow-up may be only “show me,” so its answer need not repeat an endpoint
+        // already present in the conversation. The preview lease must still use the job
+        // that originally produced that endpoint.
+        for sourceJob in jobs {
+            if let output = sourceJob.displayOutput,
+               let sourceURL = RelayOutputURLPolicy.loopbackURLs(in: output).first {
+                return RelayAutomaticPreviewCandidate(
+                    triggerJobID: triggerJob.id,
+                    previewJobID: sourceJob.id,
+                    sourceURL: sourceURL
+                )
+            }
+        }
+        return nil
+    }
+
+    private func openRequestedPreviewIfNeeded() {
+        guard let candidate = automaticPreviewCandidate,
+              automaticallyOpenedPreviews.insert(candidate.key).inserted else { return }
+        remotePreviewRequest = RelayRemotePreviewRequest(
+            jobID: candidate.previewJobID,
+            sourceURL: candidate.sourceURL
+        )
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
@@ -1483,13 +1527,15 @@ private struct RelayJobCard: View {
             } else if let text = job.displayOutput?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
                 // Final result: render markdown like chat replies (bold, code, lists).
                 RelayMarkdownText(
-                    text: text,
+                    text: relaySharedContract.displayTextHidingLocalPreviewURLs(value: text),
                     userAligned: false,
                     onOpenLoopbackURL: onLoopbackURL
                 )
 
-                if RelayOutputURLPolicy.containsLoopbackURL(in: text) {
-                    RelayRemoteLocalhostNotice()
+                if let sourceURL = RelayOutputURLPolicy.loopbackURLs(in: text).first {
+                    RelayAppPreviewNotice {
+                        onLoopbackURL(sourceURL)
+                    }
                 }
             }
 
@@ -1706,6 +1752,8 @@ private struct RelayArtifactViewer: View {
     @State private var data = Data()
     @State private var text = ""
     @State private var image: UIImage?
+    @State private var localFileURL: URL?
+    @State private var localFileDirectoryURL: URL?
     @State private var isLoading = false
     @State private var errorMessage: String?
 
@@ -1729,10 +1777,19 @@ private struct RelayArtifactViewer: View {
                         Button("Done") { dismiss() }
                             .foregroundStyle(AppTheme.accent)
                     }
+                    if let localFileURL {
+                        ToolbarItem(placement: .topBarTrailing) {
+                            ShareLink(item: localFileURL) {
+                                Image(systemName: "square.and.arrow.up")
+                            }
+                            .accessibilityLabel("Share output")
+                        }
+                    }
                 }
                 .task(id: artifact.id) {
                     await load()
                 }
+                .onDisappear(perform: removeLocalFile)
             }
             .preferredColorScheme(.dark)
         }
@@ -1782,15 +1839,19 @@ private struct RelayArtifactViewer: View {
                         .fixedSize(horizontal: true, vertical: false)
                         .padding(16)
                 }
-            case .binary, .web:
-                VStack(spacing: 12) {
-                    Image(systemName: artifact.relaySymbolName)
-                        .font(.system(size: 30, weight: .semibold))
-                        .foregroundStyle(AppTheme.accent)
-                    Text("No inline preview for this output type.")
-                        .font(AppTheme.uiFont(size: 13))
-                        .foregroundStyle(AppTheme.textSecondary)
+            case .table:
+                RelayDelimitedTableView(
+                    text: text,
+                    delimiter: artifact.filename.lowercased().hasSuffix(".tsv") ? "\t" : ","
+                )
+            case .quickLook:
+                if let localFileURL {
+                    RelayQuickLookPreview(fileURL: localFileURL)
+                } else {
+                    ProgressView().tint(AppTheme.accent)
                 }
+            case .web:
+                EmptyView()
             }
         }
     }
@@ -1832,9 +1893,11 @@ private struct RelayArtifactViewer: View {
             switch artifact.relayViewerKind {
             case .image:
                 image = UIImage(data: result.data)
-            case .text, .markdown:
+            case .text, .markdown, .table:
                 text = String(decoding: result.data, as: UTF8.self)
-            case .binary, .web:
+            case .quickLook:
+                try stageLocalFile(result.data)
+            case .web:
                 break
             }
         } catch is CancellationError {
@@ -1843,23 +1906,66 @@ private struct RelayArtifactViewer: View {
             errorMessage = error.localizedDescription
         }
     }
+
+    @MainActor
+    private func stageLocalFile(_ data: Data) throws {
+        removeLocalFile()
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("relay-artifact-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let name = URL(fileURLWithPath: artifact.filename).lastPathComponent.trimmedNonEmpty ?? "output"
+        let url = directory.appendingPathComponent(name)
+        try data.write(to: url, options: .atomic)
+        localFileDirectoryURL = directory
+        localFileURL = url
+    }
+
+    @MainActor
+    private func removeLocalFile() {
+        localFileURL = nil
+        if let localFileDirectoryURL {
+            try? FileManager.default.removeItem(at: localFileDirectoryURL)
+        }
+        localFileDirectoryURL = nil
+    }
 }
 
-private struct RelayRemoteLocalhostNotice: View {
+private struct RelayAppPreviewNotice: View {
+    let onOpen: () -> Void
+
     var body: some View {
-        HStack(alignment: .top, spacing: 9) {
-            Image(systemName: "desktopcomputer.trianglebadge.exclamationmark")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(AppTheme.statusWarn)
-            VStack(alignment: .leading, spacing: 3) {
-                Text("Preview is on the linked computer")
-                    .font(AppTheme.uiFont(size: 12, weight: .semibold))
-                    .foregroundStyle(AppTheme.textPrimary)
-                Text("Tap the localhost link above to open that live port from the linked computer in Relay.")
-                    .font(AppTheme.uiFont(size: 11.5))
-                    .foregroundStyle(AppTheme.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(alignment: .top, spacing: 9) {
+                Image(systemName: "desktopcomputer.trianglebadge.exclamationmark")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(AppTheme.statusWarn)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("App preview ready")
+                        .font(AppTheme.uiFont(size: 12, weight: .semibold))
+                        .foregroundStyle(AppTheme.textPrimary)
+                    Text("Relay can show the running app from your linked computer.")
+                        .font(AppTheme.uiFont(size: 11.5))
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
+
+            Button(action: onOpen) {
+                HStack(spacing: 7) {
+                    Image(systemName: "arrow.up.right.square")
+                    Text("Show app")
+                    Spacer(minLength: 0)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .bold))
+                }
+                .font(AppTheme.uiFont(size: 12, weight: .semibold))
+                .foregroundStyle(AppTheme.statusWarn)
+                .padding(.horizontal, 10)
+                .frame(height: 34)
+                .background(AppTheme.statusWarn.opacity(0.09), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("relay-show-app")
         }
         .padding(10)
         .background(AppTheme.statusWarn.opacity(0.07), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
@@ -1867,8 +1973,17 @@ private struct RelayRemoteLocalhostNotice: View {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .stroke(AppTheme.statusWarn.opacity(0.24), lineWidth: 0.75)
         }
-        .accessibilityIdentifier("relay-remote-localhost-notice")
+        .accessibilityIdentifier("relay-app-preview-notice")
     }
+
+}
+
+private struct RelayAutomaticPreviewCandidate {
+    let triggerJobID: String
+    let previewJobID: String
+    let sourceURL: URL
+
+    var key: String { "\(triggerJobID)|\(previewJobID)|\(sourceURL.absoluteString)" }
 }
 
 private struct RelayRemotePreviewRequest: Identifiable {
@@ -1892,7 +2007,7 @@ private struct RelayRemotePreviewViewer: View {
             if let previewURL {
                 AuthenticatedWebView(
                     url: previewURL,
-                    title: "Local preview",
+                    title: "App preview",
                     identityStore: identityStore
                 )
             } else {
@@ -1901,7 +2016,7 @@ private struct RelayRemotePreviewViewer: View {
                         AppTheme.canvasGradient.ignoresSafeArea()
                         statusContent
                     }
-                    .navigationTitle("Local preview")
+                    .navigationTitle("App preview")
                     .navigationBarTitleDisplayMode(.inline)
                     .toolbar {
                         ToolbarItem(placement: .topBarLeading) {
@@ -1923,7 +2038,7 @@ private struct RelayRemotePreviewViewer: View {
         if isLoading {
             VStack(spacing: 12) {
                 ProgressView().tint(AppTheme.accent)
-                Text("Connecting to \(request.sourceURL.host ?? "localhost")…")
+                Text("Connecting to the app…")
                     .font(AppTheme.uiFont(size: 13, weight: .medium))
                     .foregroundStyle(AppTheme.textSecondary)
             }
@@ -1932,7 +2047,7 @@ private struct RelayRemotePreviewViewer: View {
                 Image(systemName: "desktopcomputer.trianglebadge.exclamationmark")
                     .font(.system(size: 30, weight: .semibold))
                     .foregroundStyle(AppTheme.statusWarn)
-                Text("Could not open the local preview")
+                Text("Could not open the app preview")
                     .font(AppTheme.uiFont(size: 16, weight: .semibold))
                     .foregroundStyle(AppTheme.textPrimary)
                 Text(errorMessage ?? "The linked computer did not return a preview.")
@@ -1961,7 +2076,7 @@ private struct RelayRemotePreviewViewer: View {
         } catch is CancellationError {
             return
         } catch let error as CodexClientError where error.isGenericRouteNotFound {
-            errorMessage = "This linked computer is running an older Relay service that cannot open localhost previews. Update Relay on that computer, then try again."
+            errorMessage = "This linked computer is running an older Relay service that cannot open app previews. Update Relay on that computer, then try again."
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -1969,12 +2084,21 @@ private struct RelayRemotePreviewViewer: View {
 }
 
 private extension CodexJobArtifact {
-    var relayViewerKind: RelayFileViewerKind {
-        if isBitmapImage { return .image }
-        if kind == .document || normalizedContentType == "text/markdown" { return .markdown }
-        if previewURL?.trimmedNonEmpty != nil || normalizedContentType == "application/pdf" { return .web }
-        if kind == .code || normalizedContentType.hasPrefix("text/") { return .text }
-        return .binary
+    var relayViewerKind: RelayArtifactViewerKind {
+        let sharedKind = relaySharedContract.artifactPresentationKind(
+            filename: filename,
+            contentType: contentType,
+            artifactKind: kind.rawValue,
+            hasPreview: previewURL?.trimmedNonEmpty != nil
+        )
+        switch sharedKind {
+        case "image": return .image
+        case "web": return .web
+        case "markdown": return .markdown
+        case "table": return .table
+        case "text": return .text
+        default: return .quickLook
+        }
     }
 
     var relayDisplayTitle: String {
@@ -1993,8 +2117,7 @@ private extension CodexJobArtifact {
         switch relayViewerKind {
         case .image: return "View"
         case .web: return "Preview"
-        case .markdown, .text: return "Open"
-        case .binary: return "Details"
+        case .markdown, .table, .text, .quickLook: return "Open"
         }
     }
 
@@ -2003,8 +2126,9 @@ private extension CodexJobArtifact {
         case .image: return "photo"
         case .web: return "safari"
         case .markdown: return "doc.richtext"
+        case .table: return "tablecells"
         case .text: return "chevron.left.forwardslash.chevron.right"
-        case .binary: return "doc"
+        case .quickLook: return "doc.text.magnifyingglass"
         }
     }
 
@@ -2017,14 +2141,15 @@ private extension CodexJobArtifact {
             .lowercased() ?? ""
     }
 
-    private var isBitmapImage: Bool {
-        if normalizedContentType.hasPrefix("image/") && normalizedContentType != "image/svg+xml" {
-            return true
-        }
-        return ["png", "jpg", "jpeg", "gif", "webp", "heic", "heif"].contains(
-            URL(fileURLWithPath: filename).pathExtension.lowercased()
-        )
-    }
+}
+
+private enum RelayArtifactViewerKind {
+    case image
+    case web
+    case markdown
+    case table
+    case text
+    case quickLook
 }
 
 private struct RelayStatusPill: View {

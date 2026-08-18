@@ -19,7 +19,6 @@ function isSafeArtifactId(id) {
 function extractJobArtifacts(job, answerText) {
   if (maxJobArtifacts <= 0 || !answerText) return [];
   const blocks = parseMarkdownCodeBlocks(answerText);
-  if (!blocks.length) return [];
 
   const jobArtifactsDir = path.join(artifactsDir, job.id);
   const saved = [];
@@ -48,7 +47,27 @@ function extractJobArtifacts(job, answerText) {
   }
 
   const assembled = assembleStaticPreviewArtifact(job, saved, totalBytes);
-  if (assembled) saved.push(assembled);
+  if (assembled) {
+    saved.push(assembled);
+    totalBytes += assembled.artifact.bytes;
+  }
+
+  for (const filePath of referencedArtifactPaths(job, answerText)) {
+    if (saved.length >= maxJobArtifacts) break;
+    let stat;
+    try {
+      stat = fs.statSync(filePath);
+    } catch {
+      continue;
+    }
+    if (!stat.isFile() || stat.size <= 0 || stat.size > maxArtifactBytes || totalBytes + stat.size > maxArtifactTotalBytes) continue;
+    const ordinal = saved.length + 1;
+    const filename = safeArtifactFilename(path.basename(filePath), languageForFilename(filePath), ordinal);
+    if (hasBlockedArtifactFilename(filename)) continue;
+    const artifact = copyJobArtifact({ job, ordinal, filename, sourcePath: filePath });
+    saved.push({ artifact, content: null });
+    totalBytes += stat.size;
+  }
 
   if (!saved.length) {
     removeArtifactDirectory(jobArtifactsDir);
@@ -56,6 +75,45 @@ function extractJobArtifacts(job, answerText) {
   }
 
   return saved.map((entry) => entry.artifact);
+}
+
+const referencedArtifactExtensions = new Set([
+  "pdf", "csv", "tsv", "xlsx", "xls", "ods", "docx", "doc", "odt", "pptx", "ppt", "rtf",
+  "png", "jpg", "jpeg", "gif", "webp", "heic", "svg", "html", "htm", "md", "txt", "json",
+  "zip", "tar", "gz", "tgz", "mp3", "wav", "m4a", "mp4", "mov",
+]);
+
+function referencedArtifactPaths(job, answerText) {
+  let root = path.resolve(job.worktree?.path || job.workspacePath || "");
+  try { root = fs.realpathSync(root); } catch { return []; }
+  if (!root || root === path.parse(root).root) return [];
+  const candidates = [];
+  const text = String(answerText || "");
+  for (const pattern of [
+    /\[[^\]]*\]\(([^)]+)\)/g,
+    /`([^`\r\n]+)`/g,
+  ]) {
+    for (const match of text.matchAll(pattern)) candidates.push(match[1]);
+  }
+
+  const resolved = [];
+  const seen = new Set();
+  for (let candidate of candidates) {
+    candidate = String(candidate || "").trim().replace(/^<|>$/g, "").replace(/^file:\/\//i, "");
+    candidate = candidate.replace(/\s+["'][^"']*["']$/, "");
+    try { candidate = decodeURIComponent(candidate); } catch { /* keep the literal path */ }
+    if (!candidate || /^[a-z][a-z0-9+.-]*:/i.test(candidate)) continue;
+    const extension = path.extname(candidate).slice(1).toLowerCase();
+    if (!referencedArtifactExtensions.has(extension)) continue;
+    const absolute = path.isAbsolute(candidate) ? path.resolve(candidate) : path.resolve(root, candidate);
+    let real;
+    try { real = fs.realpathSync(absolute); } catch { continue; }
+    const relative = path.relative(root, real);
+    if (!relative || relative.startsWith("..") || path.isAbsolute(relative) || seen.has(real)) continue;
+    seen.add(real);
+    resolved.push(real);
+  }
+  return resolved;
 }
 
 
@@ -206,6 +264,10 @@ function extensionForLanguage(language) {
     case "text":
     case "txt":
       return ".txt";
+    case "csv":
+      return ".csv";
+    case "tsv":
+      return ".tsv";
     default:
       return ".txt";
   }
@@ -244,6 +306,10 @@ function languageForFilename(filename) {
       return "bash";
     case ".txt":
       return "text";
+    case ".csv":
+      return "csv";
+    case ".tsv":
+      return "tsv";
     default:
       return "";
   }
@@ -252,14 +318,29 @@ function languageForFilename(filename) {
 
 function kindForArtifact(filename, language) {
   const normalized = cleanArtifactLanguage(language || languageForFilename(filename));
+  const extension = path.extname(String(filename || "")).toLowerCase();
+  if ([".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic"].includes(extension)) return "image";
+  if ([".pdf", ".csv", ".tsv", ".xlsx", ".xls", ".ods", ".docx", ".doc", ".odt", ".pptx", ".ppt", ".rtf"].includes(extension)) return "document";
   if (["html", "htm", "svg"].includes(normalized)) return "staticPreview";
-  if (["markdown", "md"].includes(normalized)) return "document";
+  if (["markdown", "md", "csv", "tsv"].includes(normalized)) return "document";
   return "code";
 }
 
 
 function contentTypeForArtifact(filename, language) {
   const normalized = cleanArtifactLanguage(language || languageForFilename(filename));
+  const extension = path.extname(String(filename || "")).toLowerCase();
+  const binaryType = {
+    ".pdf": "application/pdf", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xls": "application/vnd.ms-excel", ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".doc": "application/msword",
+    ".odt": "application/vnd.oasis.opendocument.text", ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".ppt": "application/vnd.ms-powerpoint", ".rtf": "application/rtf", ".png": "image/png", ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".heic": "image/heic",
+    ".zip": "application/zip", ".tar": "application/x-tar", ".gz": "application/gzip", ".tgz": "application/gzip",
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4", ".mp4": "video/mp4", ".mov": "video/quicktime",
+  }[extension];
+  if (binaryType) return binaryType;
   switch (normalized) {
     case "html":
     case "htm":
@@ -277,9 +358,30 @@ function contentTypeForArtifact(filename, language) {
     case "markdown":
     case "md":
       return "text/markdown; charset=utf-8";
+    case "csv":
+      return "text/csv; charset=utf-8";
+    case "tsv":
+      return "text/tab-separated-values; charset=utf-8";
     default:
       return "text/plain; charset=utf-8";
   }
+}
+
+function copyJobArtifact({ job, ordinal, filename, sourcePath }) {
+  const id = `artifact-${String(ordinal).padStart(3, "0")}`;
+  const jobArtifactsDir = path.join(artifactsDir, job.id);
+  fs.mkdirSync(jobArtifactsDir, { recursive: true });
+  const filePath = path.join(jobArtifactsDir, `${id}-${filename}`);
+  fs.copyFileSync(sourcePath, filePath);
+  const bytes = fs.statSync(filePath).size;
+  const language = languageForFilename(filename);
+  const kind = kindForArtifact(filename, language);
+  return {
+    id, kind, filename, title: titleForArtifact(filename), language: language || null,
+    contentType: contentTypeForArtifact(filename, language), bytes, path: filePath,
+    rawURL: artifactRoute(job.id, id, "raw"),
+    previewURL: isPreviewableArtifact(filename, language, kind) ? artifactRoute(job.id, id, "preview") : null,
+  };
 }
 
 
@@ -313,7 +415,9 @@ function titleForArtifact(filename) {
 function isPreviewableArtifact(filename, language, kind) {
   if (kind === "staticPreview") return true;
   const normalized = cleanArtifactLanguage(language || languageForFilename(filename));
-  return ["markdown", "md"].includes(normalized);
+  if (!normalized) return false;
+  return contentTypeForArtifact(filename, normalized).startsWith("text/")
+    || ["json", "javascript", "js", "jsx"].includes(normalized);
 }
 
 
@@ -381,7 +485,7 @@ function sanitizePersistedArtifacts(job) {
       const id = isSafeArtifactId(artifact.id) ? artifact.id : "";
       const filename = safeArtifactFilename(artifact.filename, artifact.language, Number(id.slice(-3)) || 1);
       const language = cleanArtifactLanguage(artifact.language || languageForFilename(filename));
-      const kind = ["code", "staticPreview", "document"].includes(artifact.kind) ? artifact.kind : kindForArtifact(filename, language);
+      const kind = ["code", "staticPreview", "document", "image"].includes(artifact.kind) ? artifact.kind : kindForArtifact(filename, language);
       const filePath = cleanOptionalFilePath(artifact.path);
       if (!id || !filePath || !artifactPathBelongsToJob(job.id, filePath)) return null;
       const bytes = Number.isFinite(artifact.bytes) && artifact.bytes >= 0 ? artifact.bytes : 0;
@@ -486,6 +590,10 @@ function previewSrcdoc(artifact, rawContent) {
   if (language === "markdown" || language === "md") {
     return `<!doctype html><html><head><meta charset="utf-8">${csp}<style>body{font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.5;margin:24px;color:#202124}pre{white-space:pre-wrap;word-break:break-word}</style></head><body><pre>${escapeHtml(rawContent)}</pre></body></html>`;
   }
+  if (language === "csv" || language === "tsv") {
+    const delimiter = language === "tsv" ? "\t" : ",";
+    return delimitedPreviewSrcdoc(rawContent, delimiter);
+  }
   if (language === "svg") {
     return `<!doctype html><html><head><meta charset="utf-8">${csp}<style>body{margin:0;display:grid;place-items:center;min-height:100vh;background:#fff}</style></head><body>${rawContent}</body></html>`;
   }
@@ -493,6 +601,36 @@ function previewSrcdoc(artifact, rawContent) {
     return injectPreviewCsp(rawContent, csp);
   }
   return `<!doctype html><html><head><meta charset="utf-8">${csp}<style>body{font:13px ui-monospace,SFMono-Regular,Menlo,monospace;margin:20px;white-space:pre-wrap;color:#202124}</style></head><body>${escapeHtml(rawContent)}</body></html>`;
+}
+
+function delimitedPreviewSrcdoc(rawContent, delimiter) {
+  const rows = parseDelimitedText(rawContent, delimiter).slice(0, 500);
+  const body = rows.map((row, rowIndex) => `<tr>${row.slice(0, 50).map((cell) =>
+    `<${rowIndex === 0 ? "th" : "td"}>${escapeHtml(cell)}</${rowIndex === 0 ? "th" : "td"}>`
+  ).join("")}</tr>`).join("");
+  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';"><style>body{margin:0;font:13px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#202124}div{overflow:auto;padding:16px}table{border-collapse:collapse;white-space:pre-wrap}th,td{border:1px solid #d8dadd;padding:8px 10px;max-width:260px;vertical-align:top}th{position:sticky;top:0;background:#f1f3f4;text-align:left}</style></head><body><div><table>${body}</table></div></body></html>`;
+}
+
+function parseDelimitedText(value, delimiter) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let quoted = false;
+  const text = String(value || "");
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index];
+    if (character === '"') {
+      if (quoted && text[index + 1] === '"') { field += '"'; index += 1; }
+      else quoted = !quoted;
+    } else if (character === delimiter && !quoted) {
+      row.push(field); field = "";
+    } else if ((character === "\n" || character === "\r") && !quoted) {
+      if (character === "\r" && text[index + 1] === "\n") index += 1;
+      row.push(field); rows.push(row); row = []; field = "";
+    } else field += character;
+  }
+  if (field || row.length) { row.push(field); rows.push(row); }
+  return rows;
 }
 
 
@@ -535,6 +673,7 @@ export {
   looksLikeFilename,
   cleanArtifactLanguage,
   cleanArtifactContent,
+  referencedArtifactPaths,
   safeArtifactFilename,
   hasBlockedArtifactFilename,
   extensionForLanguage,
@@ -542,6 +681,7 @@ export {
   kindForArtifact,
   contentTypeForArtifact,
   writeJobArtifact,
+  copyJobArtifact,
   titleForArtifact,
   isPreviewableArtifact,
   artifactRoute,
@@ -554,6 +694,8 @@ export {
   contentDispositionFilename,
   artifactPreviewWrapper,
   previewSrcdoc,
+  delimitedPreviewSrcdoc,
+  parseDelimitedText,
   injectPreviewCsp,
   escapeHtml,
   escapeHtmlAttribute,
