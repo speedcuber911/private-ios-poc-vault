@@ -366,7 +366,7 @@ verified before a renewal, expiration, refund, or revocation changes access.
 Configure that App Store Connect notification URL as:
 
 ```text
-https://api.pocs.conformal.live/v1/subscriptions/apple/notifications
+https://relay.ai-rocket-experiments.com/v1/subscriptions/apple/notifications
 ```
 
 Apple's public root certificates are checked in as DER `.cer` files under
