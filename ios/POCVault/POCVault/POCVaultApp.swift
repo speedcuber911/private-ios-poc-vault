@@ -328,6 +328,12 @@ struct POCVaultRootView: View {
             guard !foldersAreHiddenAfterComputerDisconnect, shouldStartAgentMonitor else { return }
             await chatSessionStore.monitorActiveWorkWhileAppIsOpen()
         }
+        .task(id: selectedRootTab) {
+            // Sessions is a live view, not a one-time snapshot. Refresh every time the
+            // user returns so work started after the tab's first load appears immediately.
+            guard selectedRootTab == .sessions else { return }
+            await statusFeedViewModel.refresh()
+        }
         #if DEBUG
         .task {
             applyUITestHooks()
@@ -716,19 +722,12 @@ final class StatusFeedViewModel: ObservableObject {
     @Published private(set) var errorMessage: String?
 
     private let client: CodexClient
-    private var hasLoaded = false
-
     init(client: CodexClient) {
         self.client = client
     }
 
     var feedItems: [CodexThreadFeedItem] {
         CodexThreadFeedItem.makeFeed(threads: threads, jobs: jobs)
-    }
-
-    func bootstrapIfNeeded() async {
-        guard !hasLoaded else { return }
-        await refresh()
     }
 
     func refresh() async {
@@ -742,7 +741,6 @@ final class StatusFeedViewModel: ObservableObject {
             jobs = try await jobRequest
             approvals = try await approvalRequest
             errorMessage = nil
-            hasLoaded = true
         } catch {
             guard !isCancellation(error) else { return }
             errorMessage = error.localizedDescription
@@ -890,9 +888,6 @@ private struct CodexStatusView: View {
             .toolbar(.hidden, for: .navigationBar)
             .refreshable {
                 await feedViewModel.refresh()
-            }
-            .task {
-                await feedViewModel.bootstrapIfNeeded()
             }
         }
         .preferredColorScheme(.dark)

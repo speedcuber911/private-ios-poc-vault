@@ -522,6 +522,13 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(source.contains("RelayRootTab"))
         XCTAssertFalse(source.contains("RelayTabBar"))
 
+        // Sessions must not keep the empty snapshot it may have loaded before the user
+        // started work. Returning to the tab always reloads the app-wide thread feed.
+        XCTAssertTrue(source.contains(".task(id: selectedRootTab)"))
+        XCTAssertTrue(source.contains("guard selectedRootTab == .sessions else { return }"))
+        XCTAssertTrue(source.contains("await statusFeedViewModel.refresh()"))
+        XCTAssertFalse(source.contains("bootstrapIfNeeded"))
+
         // Settings and profile are root tabs only; the workspace menu does not
         // duplicate them as separate destinations.
         XCTAssertFalse(browserSource.contains("Label(\"Account & Settings\""))
