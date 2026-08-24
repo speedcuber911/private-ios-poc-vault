@@ -107,6 +107,23 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(CodexProvider.kimi.defaultReasoningEffort, .high)
     }
 
+    func testAIDataSharingDisclosureAndConsentAreProviderSpecific() throws {
+        XCTAssertEqual(CodexProvider.codex.aiDataRecipient, "OpenAI (Codex)")
+        XCTAssertEqual(CodexProvider.claude.aiDataRecipient, "Anthropic (Claude)")
+        XCTAssertTrue(CodexProvider.cursor.aiDataDisclosure.contains("workspace files, attachments, and command output"))
+
+        let suiteName = "relay-ai-consent-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertFalse(RelayAIDataConsentStore.hasConsent(for: .codex, defaults: defaults))
+        RelayAIDataConsentStore.grantConsent(for: .codex, defaults: defaults)
+        XCTAssertTrue(RelayAIDataConsentStore.hasConsent(for: .codex, defaults: defaults))
+        XCTAssertFalse(RelayAIDataConsentStore.hasConsent(for: .claude, defaults: defaults))
+        RelayAIDataConsentStore.reset(defaults: defaults)
+        XCTAssertFalse(RelayAIDataConsentStore.hasConsent(for: .codex, defaults: defaults))
+    }
+
     func testRelayHarnessStatusSeparatesProviderReadinessAndRecovery() throws {
         let signedOut = try JSONDecoder().decode(
             RelayHarnessStatus.self,

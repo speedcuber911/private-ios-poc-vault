@@ -102,6 +102,7 @@ import live.relay.core.ModelDescriptor
 import live.relay.core.PocEntry
 import live.relay.core.RelayLocalPreviewUrls
 import live.relay.core.RelayProvider
+import live.relay.core.RelayAIDataSharing
 import live.relay.core.RelayArtifactPresentation
 import live.relay.core.ThreadSummary
 import live.relay.core.WorkspaceEntry
@@ -159,6 +160,7 @@ fun RelayApp(viewModel: RelayViewModel = viewModel()) {
                         state = state,
                         onBack = viewModel::closeThread,
                         onSubmit = viewModel::submitTask,
+                        onGrantAIDataConsent = viewModel::grantAIDataConsent,
                         onCancel = viewModel::cancelSelectedJob,
                         onDecision = viewModel::decideApproval,
                         onOpenArtifact = { artifact ->
@@ -175,6 +177,7 @@ fun RelayApp(viewModel: RelayViewModel = viewModel()) {
                         onBack = viewModel::closeWorkspace,
                         onOpenThread = viewModel::openThread,
                         onSubmit = viewModel::submitTask,
+                        onGrantAIDataConsent = viewModel::grantAIDataConsent,
                         onCancel = viewModel::cancelSelectedJob,
                         onDecision = viewModel::decideApproval,
                         onOpenArtifact = { artifact ->
@@ -635,6 +638,7 @@ private fun WorkspaceSessionScreen(
     onBack: () -> Unit,
     onOpenThread: (ThreadSummary) -> Unit,
     onSubmit: (String, RelayProvider, String?) -> Unit,
+    onGrantAIDataConsent: (RelayProvider) -> Unit,
     onCancel: () -> Unit,
     onDecision: (Approval, String) -> Unit,
     onOpenArtifact: (JobArtifact) -> Unit,
@@ -644,6 +648,7 @@ private fun WorkspaceSessionScreen(
     var showingThreads by rememberSaveable { mutableStateOf(false) }
     var prompt by rememberSaveable { mutableStateOf("") }
     var provider by rememberSaveable { mutableStateOf(RelayProvider.CODEX) }
+    var pendingConsentPrompt by rememberSaveable { mutableStateOf<String?>(null) }
     BackHandler(onBack = onBack)
 
     Scaffold(
@@ -677,8 +682,12 @@ private fun WorkspaceSessionScreen(
                 providerLocked = false,
                 onProvider = { provider = it },
                 onSend = {
-                    onSubmit(prompt, provider, defaultModel(state, provider))
-                    prompt = ""
+                    if (provider in state.aiDataConsentProviders) {
+                        onSubmit(prompt, provider, defaultModel(state, provider))
+                        prompt = ""
+                    } else {
+                        pendingConsentPrompt = prompt
+                    }
                 },
             )
         },
@@ -720,6 +729,20 @@ private fun WorkspaceSessionScreen(
             }
         }
     }
+
+
+    pendingConsentPrompt?.let { pendingPrompt ->
+        AIDataConsentDialog(
+            provider = provider,
+            onAllow = {
+                onGrantAIDataConsent(provider)
+                onSubmit(pendingPrompt, provider, defaultModel(state, provider))
+                prompt = ""
+                pendingConsentPrompt = null
+            },
+            onCancel = { pendingConsentPrompt = null },
+        )
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -728,6 +751,7 @@ private fun ConversationScreen(
     state: RelayUiState,
     onBack: () -> Unit,
     onSubmit: (String, RelayProvider, String?) -> Unit,
+    onGrantAIDataConsent: (RelayProvider) -> Unit,
     onCancel: () -> Unit,
     onDecision: (Approval, String) -> Unit,
     onOpenArtifact: (JobArtifact) -> Unit,
@@ -736,6 +760,7 @@ private fun ConversationScreen(
     val detail = requireNotNull(state.selectedThread)
     val provider = detail.thread.provider
     var prompt by rememberSaveable(detail.thread.resolvedId) { mutableStateOf("") }
+    var pendingConsentPrompt by rememberSaveable(detail.thread.resolvedId) { mutableStateOf<String?>(null) }
     BackHandler(onBack = onBack)
     Scaffold(
         topBar = {
@@ -765,8 +790,12 @@ private fun ConversationScreen(
                 providerLocked = true,
                 onProvider = {},
                 onSend = {
-                    onSubmit(prompt, provider, defaultModel(state, provider))
-                    prompt = ""
+                    if (provider in state.aiDataConsentProviders) {
+                        onSubmit(prompt, provider, defaultModel(state, provider))
+                        prompt = ""
+                    } else {
+                        pendingConsentPrompt = prompt
+                    }
                 },
             )
         },
@@ -785,6 +814,47 @@ private fun ConversationScreen(
             }
         }
     }
+
+
+    pendingConsentPrompt?.let { pendingPrompt ->
+        AIDataConsentDialog(
+            provider = provider,
+            onAllow = {
+                onGrantAIDataConsent(provider)
+                onSubmit(pendingPrompt, provider, defaultModel(state, provider))
+                prompt = ""
+                pendingConsentPrompt = null
+            },
+            onCancel = { pendingConsentPrompt = null },
+        )
+    }
+}
+
+@Composable
+private fun AIDataConsentDialog(
+    provider: RelayProvider,
+    onAllow: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    val uriHandler = LocalUriHandler.current
+    AlertDialog(
+        onDismissRequest = onCancel,
+        title = { Text("Share work content with ${RelayAIDataSharing.recipient(provider)}?") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(RelayAIDataSharing.disclosure(provider))
+                Text(
+                    "Relay does not share your Relay name, email, password, device identifiers, or payment and subscription details with this AI provider. You can decline and nothing will be sent.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                TextButton(onClick = { uriHandler.openUri("https://app.openrelay.sh/privacy") }) {
+                    Text("Read Privacy Policy")
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onAllow) { Text("Allow & Send") } },
+        dismissButton = { TextButton(onClick = onCancel) { Text("Not Now") } },
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

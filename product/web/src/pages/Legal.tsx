@@ -19,7 +19,7 @@ function Privacy() {
   return (
     <>
       <h1>Privacy Policy</h1>
-      <p className="legal-updated">Effective August 18, 2026</p>
+      <p className="legal-updated">Effective August 24, 2026</p>
       <p>
         Relay is a private control surface for AI agent work. This policy explains what Relay
         processes when you use the iPhone app, web console, hosted sandbox, or a Relay runner.
@@ -47,10 +47,26 @@ function Privacy() {
       <p>
         Relay uses infrastructure and authentication providers to operate the service, Apple for
         Sign in with Apple, notifications, and App Store subscription processing, and Microsoft
-        Azure Speech when you request voice transcription. Prompts and files are also processed by
-        the AI provider you select—such as Codex, Claude Code, Cursor, or Kimi—under the account and
-        terms configured on your Relay machine. Relay does not place provider credentials in its
-        public catalog or app metadata.
+        Azure Speech when you request voice transcription. When you choose an agent, Relay identifies
+        its third-party AI provider before sending data: OpenAI for Codex, Anthropic for Claude,
+        Cursor for Cursor Agent, Moonshot AI for Kimi, Microsoft for Azure OpenAI, or Amazon Web
+        Services for Amazon Bedrock. Your selected provider processes agent content under the account,
+        privacy terms, and controls configured on your Relay machine. Relay does not place provider
+        credentials in its public catalog or app metadata.
+      </p>
+      <p>
+        Before the app sends agent content to a selected AI provider for the first time, Relay shows
+        a provider-specific disclosure and asks for your permission. The disclosure covers your prompt,
+        conversation history, and any workspace files, attachments, or command output the agent needs
+        to fulfill your request. If you decline, Relay does not send that request. Relay shares this
+        content only to generate responses and perform the agent work you request; it does not include
+        your Relay name, email, password, device identifiers, or Apple payment and subscription details.
+      </p>
+      <p>
+        Relay enables supported AI providers only when their published data-handling commitments and
+        security controls provide protection equivalent to the safeguards described in this policy.
+        Content remains subject to the selected provider's privacy terms and any retention or training
+        controls on the provider account you or the Relay machine operator configured.
       </p>
 
       <h2>Retention and deletion</h2>

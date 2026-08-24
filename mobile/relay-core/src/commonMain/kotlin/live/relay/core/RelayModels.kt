@@ -30,6 +30,22 @@ enum class RelayProvider(val wireValue: String, val displayName: String) {
     }
 }
 
+object RelayAIDataSharing {
+    fun recipient(provider: RelayProvider): String = when (provider) {
+        RelayProvider.CODEX -> "OpenAI (Codex)"
+        RelayProvider.CLAUDE -> "Anthropic (Claude)"
+        RelayProvider.CURSOR -> "Cursor"
+        RelayProvider.KIMI -> "Moonshot AI (Kimi)"
+        RelayProvider.BEDROCK -> "Amazon Web Services (Amazon Bedrock)"
+        RelayProvider.AZURE -> "Microsoft (Azure OpenAI)"
+    }
+
+    fun disclosure(provider: RelayProvider): String =
+        "Relay will send your prompt and conversation history to ${recipient(provider)}. " +
+            "The agent may also send workspace files, attachments, and command output it needs to complete your request. " +
+            "The provider processes this data to generate responses and run the work you request."
+}
+
 object RelayProviderSerializer : KSerializer<RelayProvider> {
     override val descriptor: SerialDescriptor =
         PrimitiveSerialDescriptor("RelayProvider", PrimitiveKind.STRING)

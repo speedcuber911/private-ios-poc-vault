@@ -56,6 +56,7 @@ data class RelayUiState(
     val streaming: Boolean = false,
     val error: String? = null,
     val notice: String? = null,
+    val aiDataConsentProviders: Set<RelayProvider> = emptySet(),
 ) {
     val isReadyForMachineRequests: Boolean
         get() = configuration.hasConfiguredMachine && certificateSubject != null
@@ -68,6 +69,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         RelayUiState(
             configuration = settings.load(),
             certificateSubject = identityStore.subjectOrNull(),
+            aiDataConsentProviders = settings.loadAIDataConsents(),
         ),
     )
     val uiState: StateFlow<RelayUiState> = _uiState.asStateFlow()
@@ -76,6 +78,11 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     private val artifactOpener = AndroidArtifactOpener(application, identityStore)
 
     fun clearMessage() = _uiState.update { it.copy(error = null, notice = null) }
+
+    fun grantAIDataConsent(provider: RelayProvider) {
+        settings.grantAIDataConsent(provider)
+        _uiState.update { it.copy(aiDataConsentProviders = it.aiDataConsentProviders + provider) }
+    }
 
     fun saveConfiguration(codexBaseUrl: String, manifestUrl: String, signatureUrl: String) {
         val requested = RelayConfiguration(codexBaseUrl, manifestUrl, signatureUrl)

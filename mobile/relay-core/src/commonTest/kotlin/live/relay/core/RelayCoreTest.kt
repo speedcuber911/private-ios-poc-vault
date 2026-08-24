@@ -19,6 +19,16 @@ class RelayCoreTest {
     }
 
     @Test
+    fun aiDataDisclosureNamesTheRecipientAndDataBeforeSharing() {
+        val contract = RelayCoreInfo()
+        assertEquals("OpenAI (Codex)", contract.aiDataRecipient("codex"))
+        assertEquals("Anthropic (Claude)", contract.aiDataRecipient("anthropic"))
+        assertTrue(contract.aiDataDisclosure("cursor").contains("prompt and conversation history"))
+        assertTrue(contract.aiDataDisclosure("cursor").contains("workspace files, attachments, and command output"))
+        assertTrue(contract.aiDataDisclosure("cursor").contains("Cursor"))
+    }
+
+    @Test
     fun jobStatusAliasesPreserveAttentionAndActivityRules() {
         assertEquals(JobStatus.RUNNING, JobStatus.fromWireValue("in_progress"))
         assertEquals(JobStatus.WAITING_FOR_APPROVAL, JobStatus.fromWireValue("needs_input"))

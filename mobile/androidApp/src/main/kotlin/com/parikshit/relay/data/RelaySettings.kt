@@ -2,6 +2,7 @@ package com.parikshit.relay.data
 
 import android.content.Context
 import androidx.core.content.edit
+import live.relay.core.RelayProvider
 
 data class RelayConfiguration(
     val codexBaseUrl: String,
@@ -29,6 +30,19 @@ class RelaySettings(context: Context) {
         }
     }
 
+    fun loadAIDataConsents(): Set<RelayProvider> =
+        preferences.getStringSet(KEY_AI_DATA_CONSENTS, emptySet()).orEmpty()
+            .mapTo(mutableSetOf()) { RelayProvider.fromWireValue(it) }
+
+    fun grantAIDataConsent(provider: RelayProvider) {
+        preferences.edit {
+            putStringSet(
+                KEY_AI_DATA_CONSENTS,
+                preferences.getStringSet(KEY_AI_DATA_CONSENTS, emptySet()).orEmpty() + provider.wireValue,
+            )
+        }
+    }
+
     private fun normalizeUrl(value: String, fallback: String): String =
         value.trim().trimEnd('/').takeIf { it.startsWith("https://") } ?: fallback
 
@@ -40,5 +54,6 @@ class RelaySettings(context: Context) {
         private const val KEY_CODEX_BASE_URL = "codex_base_url"
         private const val KEY_MANIFEST_URL = "manifest_url"
         private const val KEY_SIGNATURE_URL = "signature_url"
+        private const val KEY_AI_DATA_CONSENTS = "ai_data_sharing_consents_v1"
     }
 }

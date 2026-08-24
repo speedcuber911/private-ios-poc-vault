@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "sharedCoreSchemaVersion": 3,
+  "sharedCoreSchemaVersion": 4,
   "capabilities": [
     {
       "id": "provider-and-status-normalization",
@@ -8,6 +8,14 @@
         "shared": [{"path": "mobile/relay-core/src/commonMain/kotlin/live/relay/core/RelayCoreInfo.kt", "contains": ["normalizedProvider", "normalizedJobStatus"]}],
         "ios": [{"path": "ios/POCVault/POCVault/Models/CodexModels.swift", "contains": ["relaySharedContract.normalizedProvider", "relaySharedContract.normalizedJobStatus"]}],
         "android": [{"path": "mobile/androidApp/src/main/kotlin/com/parikshit/relay/ui/RelayViewModel.kt", "contains": ["RelayProvider", "RelayRepository"]}]
+      }
+    },
+    {
+      "id": "provider-specific-ai-data-consent",
+      "surfaces": {
+        "shared": [{"path": "mobile/relay-core/src/commonMain/kotlin/live/relay/core/RelayModels.kt", "contains": ["RelayAIDataSharing", "recipient", "disclosure"]}],
+        "ios": [{"path": "ios/POCVault/POCVault/Views/RelayChatView.swift", "contains": ["RelayAIDataConsentSheet", "Allow & Send", "Not Now"]}],
+        "android": [{"path": "mobile/androidApp/src/main/kotlin/com/parikshit/relay/ui/RelayApp.kt", "contains": ["AIDataConsentDialog", "Allow & Send", "Not Now"]}]
       }
     },
     {

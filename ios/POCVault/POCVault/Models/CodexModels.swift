@@ -365,6 +365,14 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
         }
     }
 
+    var aiDataRecipient: String {
+        relaySharedContract.aiDataRecipient(value: rawValue)
+    }
+
+    var aiDataDisclosure: String {
+        relaySharedContract.aiDataDisclosure(value: rawValue)
+    }
+
     var defaultModel: String {
         ""
     }
@@ -384,6 +392,26 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
 
     var reasoningEffortOptions: [CodexReasoningEffort] {
         CodexReasoningEffort.allCases
+    }
+}
+
+struct RelayAIDataConsentStore {
+    private static let keyPrefix = "relay.ai-data-sharing-consent.v1"
+
+    static func hasConsent(for provider: CodexProvider, defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: key(for: provider))
+    }
+
+    static func grantConsent(for provider: CodexProvider, defaults: UserDefaults = .standard) {
+        defaults.set(true, forKey: key(for: provider))
+    }
+
+    static func reset(defaults: UserDefaults = .standard) {
+        CodexProvider.allCases.forEach { defaults.removeObject(forKey: key(for: $0)) }
+    }
+
+    private static func key(for provider: CodexProvider) -> String {
+        "\(keyPrefix).\(provider.rawValue)"
     }
 }
 

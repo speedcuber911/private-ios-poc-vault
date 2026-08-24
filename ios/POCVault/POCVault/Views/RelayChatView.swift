@@ -27,6 +27,7 @@ struct RelayChatView: View {
     @State private var automaticallyOpenedPreviews: Set<String> = []
     @State private var modelPickerRequest = 0
     @State private var didHandleInitialProviderPicker = false
+    @State private var aiDataConsentRequest: RelayAIDataConsentRequest?
 
     var body: some View {
         NavigationStack {
@@ -75,7 +76,7 @@ struct RelayChatView: View {
                         },
                         onSend: {
                             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                            Task { await viewModel.sendCurrentPrompt() }
+                            requestPromptSend()
                         },
                         onStop: {
                             UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
@@ -116,6 +117,20 @@ struct RelayChatView: View {
                 RelayFullLogSheet(job: request.job) {
                     await viewModel.loadFullLog(for: request.job)
                 }
+            }
+            .sheet(item: $aiDataConsentRequest) { request in
+                RelayAIDataConsentSheet(
+                    provider: request.provider,
+                    onAllow: {
+                        RelayAIDataConsentStore.grantConsent(for: request.provider)
+                        aiDataConsentRequest = nil
+                        Task { await viewModel.sendCurrentPrompt() }
+                    },
+                    onCancel: {
+                        aiDataConsentRequest = nil
+                    }
+                )
+                .interactiveDismissDisabled()
             }
             .fullScreenCover(item: $artifactRequest) { artifact in
                 RelayArtifactViewer(
@@ -264,6 +279,19 @@ struct RelayChatView: View {
     private func startNewConversation() {
         viewModel.startNewConversation()
         modelPickerRequest += 1
+    }
+
+    private func requestPromptSend() {
+        guard let provider = viewModel.selectedChoice?.model.provider else {
+            Task { await viewModel.sendCurrentPrompt() }
+            return
+        }
+        guard RelayAIDataConsentStore.hasConsent(for: provider) else {
+            dismissKeyboard()
+            aiDataConsentRequest = RelayAIDataConsentRequest(provider: provider)
+            return
+        }
+        Task { await viewModel.sendCurrentPrompt() }
     }
 
     private func continueHandoff(_ card: RelayHandoffCard) async {
@@ -2446,6 +2474,81 @@ private struct RelayEmptyConversation: View {
 private struct RelayFullLogRequest: Identifiable {
     var id: String { job.id }
     let job: CodexJob
+}
+
+private struct RelayAIDataConsentRequest: Identifiable {
+    let provider: CodexProvider
+    var id: CodexProvider { provider }
+}
+
+private struct RelayAIDataConsentSheet: View {
+    let provider: CodexProvider
+    let onAllow: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    RelayProviderMark(provider: provider, size: 32)
+                        .frame(width: 58, height: 58)
+                        .background(provider.relayPresentation.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 16))
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Share work content with \(provider.aiDataRecipient)?")
+                            .font(AppTheme.serifFont(size: 28))
+                            .foregroundStyle(AppTheme.textPrimary)
+
+                        Text(provider.aiDataDisclosure)
+                            .font(AppTheme.uiFont(size: 15))
+                            .foregroundStyle(AppTheme.textSecondary)
+                            .lineSpacing(4)
+                    }
+
+                    VStack(alignment: .leading, spacing: 12) {
+                        disclosureRow("01", "Your prompt and conversation history")
+                        disclosureRow("02", "Workspace files, attachments, and command output the agent needs")
+                        disclosureRow("03", "Used by \(provider.aiDataRecipient) to provide the requested AI service")
+                    }
+
+                    Text("Relay does not share your Relay name, email, password, device identifiers, or Apple payment and subscription details with this AI provider. You can decline and nothing will be sent.")
+                        .font(AppTheme.uiFont(size: 13))
+                        .foregroundStyle(AppTheme.textTertiary)
+                        .lineSpacing(3)
+
+                    Link("Read Privacy Policy", destination: URL(string: "https://app.openrelay.sh/privacy")!)
+                        .font(AppTheme.uiFont(size: 14, weight: .medium))
+                        .foregroundStyle(AppTheme.accent)
+
+                    VStack(spacing: 12) {
+                        Button("Allow & Send", action: onAllow)
+                            .buttonStyle(RelayPrimaryButtonStyle())
+                            .accessibilityIdentifier("relay-ai-data-consent-allow")
+
+                        Button("Not Now", action: onCancel)
+                            .buttonStyle(RelayOutlineButtonStyle())
+                            .accessibilityIdentifier("relay-ai-data-consent-cancel")
+                    }
+                    .padding(.top, 4)
+                }
+                .padding(24)
+            }
+            .background(AppTheme.bgCanvas)
+            .navigationTitle("AI Data Sharing")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+        .preferredColorScheme(.dark)
+        .presentationDetents([.large])
+    }
+
+    private func disclosureRow(_ index: String, _ text: String) -> some View {
+        HStack(alignment: .top, spacing: 11) {
+            RelayCapsLabel(text: index, color: provider.relayPresentation.accent, size: 9)
+            Text(text)
+                .font(AppTheme.uiFont(size: 14))
+                .foregroundStyle(AppTheme.textPrimary)
+        }
+    }
 }
 
 private struct RelayFullLogSheet: View {
