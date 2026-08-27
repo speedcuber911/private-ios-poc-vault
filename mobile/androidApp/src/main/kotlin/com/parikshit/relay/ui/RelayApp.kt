@@ -649,7 +649,16 @@ private fun WorkspaceSessionScreen(
     var prompt by rememberSaveable { mutableStateOf("") }
     var provider by rememberSaveable { mutableStateOf(RelayProvider.CODEX) }
     var pendingConsentPrompt by rememberSaveable { mutableStateOf<String?>(null) }
+    var showingConsentReview by rememberSaveable { mutableStateOf(false) }
+    var automaticallyPresentedConsentProviders by remember { mutableStateOf(emptySet<RelayProvider>()) }
     BackHandler(onBack = onBack)
+
+    LaunchedEffect(provider, state.aiDataConsentProviders) {
+        if (provider !in state.aiDataConsentProviders && provider !in automaticallyPresentedConsentProviders) {
+            automaticallyPresentedConsentProviders = automaticallyPresentedConsentProviders + provider
+            showingConsentReview = true
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -681,6 +690,8 @@ private fun WorkspaceSessionScreen(
                 availableProviders = availableProviders(state),
                 providerLocked = false,
                 onProvider = { provider = it },
+                aiDataConsentGranted = provider in state.aiDataConsentProviders,
+                onReviewAIDataSharing = { showingConsentReview = true },
                 onSend = {
                     if (provider in state.aiDataConsentProviders) {
                         onSubmit(prompt, provider, defaultModel(state, provider))
@@ -731,16 +742,25 @@ private fun WorkspaceSessionScreen(
     }
 
 
-    pendingConsentPrompt?.let { pendingPrompt ->
+    val pendingPrompt = pendingConsentPrompt
+    if (pendingPrompt != null || showingConsentReview) {
         AIDataConsentDialog(
             provider = provider,
+            isConsentGranted = provider in state.aiDataConsentProviders,
+            sendsPromptAfterConsent = pendingPrompt != null,
             onAllow = {
-                onGrantAIDataConsent(provider)
-                onSubmit(pendingPrompt, provider, defaultModel(state, provider))
-                prompt = ""
+                if (provider !in state.aiDataConsentProviders) onGrantAIDataConsent(provider)
+                if (pendingPrompt != null) {
+                    onSubmit(pendingPrompt, provider, defaultModel(state, provider))
+                    prompt = ""
+                }
                 pendingConsentPrompt = null
+                showingConsentReview = false
             },
-            onCancel = { pendingConsentPrompt = null },
+            onCancel = {
+                pendingConsentPrompt = null
+                showingConsentReview = false
+            },
         )
     }
 }
@@ -761,7 +781,16 @@ private fun ConversationScreen(
     val provider = detail.thread.provider
     var prompt by rememberSaveable(detail.thread.resolvedId) { mutableStateOf("") }
     var pendingConsentPrompt by rememberSaveable(detail.thread.resolvedId) { mutableStateOf<String?>(null) }
+    var showingConsentReview by rememberSaveable(detail.thread.resolvedId) { mutableStateOf(false) }
+    var automaticallyPresentedConsent by remember(detail.thread.resolvedId) { mutableStateOf(false) }
     BackHandler(onBack = onBack)
+
+    LaunchedEffect(provider, state.aiDataConsentProviders) {
+        if (provider !in state.aiDataConsentProviders && !automaticallyPresentedConsent) {
+            automaticallyPresentedConsent = true
+            showingConsentReview = true
+        }
+    }
     Scaffold(
         topBar = {
             TopAppBar(
@@ -789,6 +818,8 @@ private fun ConversationScreen(
                 availableProviders = listOf(provider),
                 providerLocked = true,
                 onProvider = {},
+                aiDataConsentGranted = provider in state.aiDataConsentProviders,
+                onReviewAIDataSharing = { showingConsentReview = true },
                 onSend = {
                     if (provider in state.aiDataConsentProviders) {
                         onSubmit(prompt, provider, defaultModel(state, provider))
@@ -816,16 +847,25 @@ private fun ConversationScreen(
     }
 
 
-    pendingConsentPrompt?.let { pendingPrompt ->
+    val pendingPrompt = pendingConsentPrompt
+    if (pendingPrompt != null || showingConsentReview) {
         AIDataConsentDialog(
             provider = provider,
+            isConsentGranted = provider in state.aiDataConsentProviders,
+            sendsPromptAfterConsent = pendingPrompt != null,
             onAllow = {
-                onGrantAIDataConsent(provider)
-                onSubmit(pendingPrompt, provider, defaultModel(state, provider))
-                prompt = ""
+                if (provider !in state.aiDataConsentProviders) onGrantAIDataConsent(provider)
+                if (pendingPrompt != null) {
+                    onSubmit(pendingPrompt, provider, defaultModel(state, provider))
+                    prompt = ""
+                }
                 pendingConsentPrompt = null
+                showingConsentReview = false
             },
-            onCancel = { pendingConsentPrompt = null },
+            onCancel = {
+                pendingConsentPrompt = null
+                showingConsentReview = false
+            },
         )
     }
 }
@@ -833,6 +873,8 @@ private fun ConversationScreen(
 @Composable
 private fun AIDataConsentDialog(
     provider: RelayProvider,
+    isConsentGranted: Boolean,
+    sendsPromptAfterConsent: Boolean,
     onAllow: () -> Unit,
     onCancel: () -> Unit,
 ) {
@@ -847,13 +889,31 @@ private fun AIDataConsentDialog(
                     "Relay does not share your Relay name, email, password, device identifiers, or payment and subscription details with this AI provider. You can decline and nothing will be sent.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                if (isConsentGranted) {
+                    Text(
+                        "Permission is currently allowed for this provider.",
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
                 TextButton(onClick = { uriHandler.openUri("https://app.openrelay.sh/privacy") }) {
                     Text("Read Privacy Policy")
                 }
             }
         },
-        confirmButton = { TextButton(onClick = onAllow) { Text("Allow & Send") } },
-        dismissButton = { TextButton(onClick = onCancel) { Text("Not Now") } },
+        confirmButton = {
+            TextButton(onClick = onAllow) {
+                Text(
+                    when {
+                        isConsentGranted -> "Done"
+                        sendsPromptAfterConsent -> "Allow & Send"
+                        else -> "Allow"
+                    },
+                )
+            }
+        },
+        dismissButton = {
+            if (!isConsentGranted) TextButton(onClick = onCancel) { Text("Not Now") }
+        },
     )
 }
 
@@ -899,6 +959,8 @@ private fun Composer(
     availableProviders: List<RelayProvider>,
     providerLocked: Boolean,
     onProvider: (RelayProvider) -> Unit,
+    aiDataConsentGranted: Boolean,
+    onReviewAIDataSharing: () -> Unit,
     onSend: () -> Unit,
 ) {
     Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 4.dp) {
@@ -919,6 +981,26 @@ private fun Composer(
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+            }
+            TextButton(
+                onClick = onReviewAIDataSharing,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("AI data sharing", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "Work content to ${RelayAIDataSharing.recipient(provider)}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    Text(if (aiDataConsentGranted) "Allowed" else "Review")
+                    Spacer(Modifier.width(4.dp))
+                    Icon(Icons.Default.ChevronRight, contentDescription = null)
+                }
             }
             Row(verticalAlignment = Alignment.Bottom) {
                 OutlinedTextField(

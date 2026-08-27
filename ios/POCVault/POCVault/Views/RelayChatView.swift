@@ -28,6 +28,7 @@ struct RelayChatView: View {
     @State private var modelPickerRequest = 0
     @State private var didHandleInitialProviderPicker = false
     @State private var aiDataConsentRequest: RelayAIDataConsentRequest?
+    @State private var automaticallyPresentedConsentProviders: Set<CodexProvider> = []
 
     var body: some View {
         NavigationStack {
@@ -57,6 +58,10 @@ struct RelayChatView: View {
                         efforts: viewModel.availableEfforts,
                         selectedEffort: viewModel.effectiveEffort,
                         provider: viewModel.selectedTaskProvider,
+                        aiDataProvider: viewModel.selectedChoice?.model.provider,
+                        aiDataConsentGranted: viewModel.selectedChoice.map {
+                            RelayAIDataConsentStore.hasConsent(for: $0.model.provider)
+                        } ?? false,
                         harnessStatus: viewModel.selectedHarnessStatus,
                         skills: viewModel.availableSkills,
                         selectedSkillIDs: viewModel.selectedSkillIDs,
@@ -74,6 +79,9 @@ struct RelayChatView: View {
                         onVoice: { fileURL in
                             Task { await viewModel.transcribePromptAudio(fileURL: fileURL) }
                         },
+                        onReviewAIDataSharing: {
+                            presentAIDataConsent(purpose: .review)
+                        },
                         onSend: {
                             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                             requestPromptSend()
@@ -89,6 +97,7 @@ struct RelayChatView: View {
             .task {
                 honorThreadsRequest()
                 await viewModel.bootstrap()
+                presentAIDataConsentIfNeeded()
                 if presentsProviderPickerOnAppear, !didHandleInitialProviderPicker {
                     didHandleInitialProviderPicker = true
                     modelPickerRequest += 1
@@ -96,6 +105,9 @@ struct RelayChatView: View {
             }
             .onChange(of: threadsRequest.wrappedValue) { _, _ in
                 honorThreadsRequest()
+            }
+            .onChange(of: viewModel.selectedChoice?.id) { _, _ in
+                presentAIDataConsentIfNeeded()
             }
             .onChange(of: automaticPreviewCandidate?.key) { _, _ in
                 openRequestedPreviewIfNeeded()
@@ -121,10 +133,14 @@ struct RelayChatView: View {
             .sheet(item: $aiDataConsentRequest) { request in
                 RelayAIDataConsentSheet(
                     provider: request.provider,
+                    purpose: request.purpose,
+                    isConsentGranted: RelayAIDataConsentStore.hasConsent(for: request.provider),
                     onAllow: {
                         RelayAIDataConsentStore.grantConsent(for: request.provider)
                         aiDataConsentRequest = nil
-                        Task { await viewModel.sendCurrentPrompt() }
+                        if request.purpose == .sendPrompt {
+                            Task { await viewModel.sendCurrentPrompt() }
+                        }
                     },
                     onCancel: {
                         aiDataConsentRequest = nil
@@ -287,11 +303,28 @@ struct RelayChatView: View {
             return
         }
         guard RelayAIDataConsentStore.hasConsent(for: provider) else {
-            dismissKeyboard()
-            aiDataConsentRequest = RelayAIDataConsentRequest(provider: provider)
+            presentAIDataConsent(for: provider, purpose: .sendPrompt)
             return
         }
         Task { await viewModel.sendCurrentPrompt() }
+    }
+
+    private func presentAIDataConsentIfNeeded() {
+        guard let provider = viewModel.selectedChoice?.model.provider,
+              !RelayAIDataConsentStore.hasConsent(for: provider),
+              !automaticallyPresentedConsentProviders.contains(provider),
+              aiDataConsentRequest == nil else { return }
+        automaticallyPresentedConsentProviders.insert(provider)
+        presentAIDataConsent(for: provider, purpose: .review)
+    }
+
+    private func presentAIDataConsent(
+        for provider: CodexProvider? = nil,
+        purpose: RelayAIDataConsentPurpose
+    ) {
+        guard let provider = provider ?? viewModel.selectedChoice?.model.provider else { return }
+        dismissKeyboard()
+        aiDataConsentRequest = RelayAIDataConsentRequest(provider: provider, purpose: purpose)
     }
 
     private func continueHandoff(_ card: RelayHandoffCard) async {
@@ -505,6 +538,8 @@ private struct RelayComposer: View {
     let efforts: [CodexReasoningEffort]
     let selectedEffort: CodexReasoningEffort?
     let provider: CodexProvider?
+    let aiDataProvider: CodexProvider?
+    let aiDataConsentGranted: Bool
     let harnessStatus: RelayHarnessStatus?
     let skills: [CodexSkillDescriptor]
     let selectedSkillIDs: Set<String>
@@ -520,6 +555,7 @@ private struct RelayComposer: View {
     let onPickCodexApproval: (RelayCodexApprovalPolicy) -> Void
     let onNewConversation: () -> Void
     let onVoice: (URL) -> Void
+    let onReviewAIDataSharing: () -> Void
     let onSend: () -> Void
     let onStop: () -> Void
     @State private var isFocused = false
@@ -797,6 +833,46 @@ private struct RelayComposer: View {
             }
 
             controlBar
+
+            if let aiDataProvider {
+                Button(action: onReviewAIDataSharing) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "hand.raised.fill")
+                            .font(AppTheme.uiFont(size: 13, weight: .semibold))
+                            .foregroundStyle(aiDataProvider.relayPresentation.accent)
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("AI data sharing")
+                                .font(AppTheme.uiFont(size: 12, weight: .semibold))
+                                .foregroundStyle(AppTheme.textPrimary)
+                            Text("Work content to \(aiDataProvider.aiDataRecipient)")
+                                .font(AppTheme.uiFont(size: 10))
+                                .foregroundStyle(AppTheme.textTertiary)
+                                .lineLimit(1)
+                        }
+
+                        Spacer()
+
+                        RelayCapsLabel(
+                            text: aiDataConsentGranted ? "Allowed" : "Review",
+                            color: aiDataConsentGranted ? aiDataProvider.relayPresentation.accent : AppTheme.statusWarn,
+                            size: 8
+                        )
+
+                        Image(systemName: "chevron.right")
+                            .font(AppTheme.uiFont(size: 9, weight: .semibold))
+                            .foregroundStyle(AppTheme.textFaint)
+                    }
+                    .padding(.horizontal, 4)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("relay-ai-data-sharing")
+                .accessibilityLabel(
+                    "AI data sharing with \(aiDataProvider.aiDataRecipient), "
+                        + (aiDataConsentGranted ? "permission allowed" : "review permission")
+                )
+            }
 
             if let harnessStatus, harnessStatus.isConfirmedUnavailable {
                 HStack(alignment: .top, spacing: 8) {
@@ -2476,13 +2552,21 @@ private struct RelayFullLogRequest: Identifiable {
     let job: CodexJob
 }
 
+private enum RelayAIDataConsentPurpose: Equatable {
+    case review
+    case sendPrompt
+}
+
 private struct RelayAIDataConsentRequest: Identifiable {
+    let id = UUID()
     let provider: CodexProvider
-    var id: CodexProvider { provider }
+    let purpose: RelayAIDataConsentPurpose
 }
 
 private struct RelayAIDataConsentSheet: View {
     let provider: CodexProvider
+    let purpose: RelayAIDataConsentPurpose
+    let isConsentGranted: Bool
     let onAllow: () -> Void
     let onCancel: () -> Void
 
@@ -2521,13 +2605,15 @@ private struct RelayAIDataConsentSheet: View {
                         .foregroundStyle(AppTheme.accent)
 
                     VStack(spacing: 12) {
-                        Button("Allow & Send", action: onAllow)
+                        Button(primaryActionTitle, action: onAllow)
                             .buttonStyle(RelayPrimaryButtonStyle())
                             .accessibilityIdentifier("relay-ai-data-consent-allow")
 
-                        Button("Not Now", action: onCancel)
-                            .buttonStyle(RelayOutlineButtonStyle())
-                            .accessibilityIdentifier("relay-ai-data-consent-cancel")
+                        if !isConsentGranted {
+                            Button("Not Now", action: onCancel)
+                                .buttonStyle(RelayOutlineButtonStyle())
+                                .accessibilityIdentifier("relay-ai-data-consent-cancel")
+                        }
                     }
                     .padding(.top, 4)
                 }
@@ -2539,6 +2625,11 @@ private struct RelayAIDataConsentSheet: View {
         }
         .preferredColorScheme(.dark)
         .presentationDetents([.large])
+    }
+
+    private var primaryActionTitle: String {
+        if isConsentGranted { return "Done" }
+        return purpose == .sendPrompt ? "Allow & Send" : "Allow"
     }
 
     private func disclosureRow(_ index: String, _ text: String) -> some View {

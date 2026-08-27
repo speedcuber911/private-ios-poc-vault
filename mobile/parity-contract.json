@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "sharedCoreSchemaVersion": 4,
+  "sharedCoreSchemaVersion": 5,
   "capabilities": [
     {
       "id": "provider-and-status-normalization",
@@ -14,8 +14,8 @@
       "id": "provider-specific-ai-data-consent",
       "surfaces": {
         "shared": [{"path": "mobile/relay-core/src/commonMain/kotlin/live/relay/core/RelayModels.kt", "contains": ["RelayAIDataSharing", "recipient", "disclosure"]}],
-        "ios": [{"path": "ios/POCVault/POCVault/Views/RelayChatView.swift", "contains": ["RelayAIDataConsentSheet", "Allow & Send", "Not Now"]}],
-        "android": [{"path": "mobile/androidApp/src/main/kotlin/com/parikshit/relay/ui/RelayApp.kt", "contains": ["AIDataConsentDialog", "Allow & Send", "Not Now"]}]
+        "ios": [{"path": "ios/POCVault/POCVault/Views/RelayChatView.swift", "contains": ["RelayAIDataConsentSheet", "AI data sharing", "Work content to", "Allow & Send", "Not Now"]}],
+        "android": [{"path": "mobile/androidApp/src/main/kotlin/com/parikshit/relay/ui/RelayApp.kt", "contains": ["AIDataConsentDialog", "AI data sharing", "Work content to", "Allow & Send", "Not Now"]}]
       }
     },
     {

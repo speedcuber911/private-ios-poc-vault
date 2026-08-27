@@ -25,6 +25,7 @@ class RelayCoreTest {
         assertEquals("Anthropic (Claude)", contract.aiDataRecipient("anthropic"))
         assertTrue(contract.aiDataDisclosure("cursor").contains("prompt and conversation history"))
         assertTrue(contract.aiDataDisclosure("cursor").contains("workspace files, attachments, and command output"))
+        assertTrue(contract.aiDataDisclosure("cursor").contains("can include personal data"))
         assertTrue(contract.aiDataDisclosure("cursor").contains("Cursor"))
     }
 

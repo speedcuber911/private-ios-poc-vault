@@ -43,6 +43,7 @@ object RelayAIDataSharing {
     fun disclosure(provider: RelayProvider): String =
         "Relay will send your prompt and conversation history to ${recipient(provider)}. " +
             "The agent may also send workspace files, attachments, and command output it needs to complete your request. " +
+            "This work content can include personal data if it appears in what you provide. " +
             "The provider processes this data to generate responses and run the work you request."
 }
 

@@ -111,6 +111,7 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(CodexProvider.codex.aiDataRecipient, "OpenAI (Codex)")
         XCTAssertEqual(CodexProvider.claude.aiDataRecipient, "Anthropic (Claude)")
         XCTAssertTrue(CodexProvider.cursor.aiDataDisclosure.contains("workspace files, attachments, and command output"))
+        XCTAssertTrue(CodexProvider.cursor.aiDataDisclosure.contains("can include personal data"))
 
         let suiteName = "relay-ai-consent-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -122,6 +123,18 @@ final class ManifestTests: XCTestCase {
         XCTAssertFalse(RelayAIDataConsentStore.hasConsent(for: .claude, defaults: defaults))
         RelayAIDataConsentStore.reset(defaults: defaults)
         XCTAssertFalse(RelayAIDataConsentStore.hasConsent(for: .codex, defaults: defaults))
+    }
+
+    func testAIDataConsentIsReachableBeforeProviderConnectionOrSend() throws {
+        let source = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
+
+        XCTAssertTrue(source.contains("presentAIDataConsentIfNeeded()"))
+        XCTAssertTrue(source.contains("purpose: .review"))
+        XCTAssertTrue(source.contains("relay-ai-data-sharing"))
+        XCTAssertTrue(source.contains("Work content to"))
+        XCTAssertTrue(source.contains("permission allowed"))
+        XCTAssertTrue(source.contains("purpose == .sendPrompt"))
+        XCTAssertTrue(source.contains("harnessStatus?.isConfirmedUnavailable != true"))
     }
 
     func testRelayHarnessStatusSeparatesProviderReadinessAndRecovery() throws {
