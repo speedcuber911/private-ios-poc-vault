@@ -832,6 +832,11 @@ private struct RelayComposer: View {
                     skillChip
                 }
             }
+            // Pinned to the rail height: the moment the content renders even a
+            // point taller than the viewport (a tall chip, large text), the
+            // horizontal scroll view gains a vertical axis and the whole rail
+            // becomes draggable up and down.
+            .frame(height: Layout.controlHeight)
         }
         .frame(height: Layout.controlHeight)
         .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
