@@ -250,6 +250,35 @@ final class ProviderLoginTests: XCTestCase {
     }
 
     @MainActor
+    func testTerminalLoginUsesResolvedAbsoluteBinaryPath() async throws {
+        let stub = StubHarnessLoginClient()
+        stub.startError = CodexClientError.httpFailure(404, "not found")
+        stub.workspaces = try Self.workspaces()
+        // The machine resolves the CLI to its npm-global location.
+        stub.execResults = [(contains: "command -v claude", result: CodexExecResult(exitCode: 0, stdout: "/opt/node/bin/claude\n"))]
+        let flow = Self.makeFastFlow(client: stub, provider: .claude)
+
+        await flow.start()
+        XCTAssertEqual(stub.terminalInputs.first?.text, "/opt/node/bin/claude setup-token\n",
+                       "the typed command must survive a PATH that misses the CLI")
+    }
+
+    @MainActor
+    func testTerminalErrorLineFailsFastWithTheMachinesWords() async throws {
+        let stub = StubHarnessLoginClient()
+        stub.startError = CodexClientError.httpFailure(404, "not found")
+        stub.workspaces = try Self.workspaces()
+        let flow = Self.makeFastFlow(client: stub, provider: .codex)
+
+        await flow.start()
+        stub.pushTerminalOutput("sh: 1: codex: command not found\r\n")
+        try await Self.waitUntil {
+            if case .failed(let message) = flow.step { return message.contains("command not found") }
+            return false
+        }
+    }
+
+    @MainActor
     func testOpThatDiesWithoutALinkRetriesThroughTerminal() async throws {
         let stub = StubHarnessLoginClient()
         // The op starts but the CLI dies instantly (the no-TTY shape).
@@ -352,6 +381,9 @@ private final class StubHarnessLoginClient: HarnessLoginClient {
     var listedOps: [RelayHarnessOp] = []
     var harnesses: [RelayHarnessStatus] = []
     var workspaces: [CodexWorkspace] = []
+    /// First entry whose key is contained in the exec command wins; other
+    /// commands get an empty success.
+    var execResults: [(contains: String, result: CodexExecResult)] = []
     private(set) var sentInputs: [SentInput] = []
     private(set) var forwardedCallbacks: [ForwardedCallback] = []
     private(set) var cancelledOpIDs: [String] = []
@@ -451,6 +483,9 @@ private final class StubHarnessLoginClient: HarnessLoginClient {
 
     func execCommand(_ command: String, timeoutMs: Int?) async throws -> CodexExecResult {
         execCommands.append(command)
+        if let match = execResults.first(where: { command.contains($0.contains) }) {
+            return match.result
+        }
         return CodexExecResult(exitCode: 0)
     }
 }

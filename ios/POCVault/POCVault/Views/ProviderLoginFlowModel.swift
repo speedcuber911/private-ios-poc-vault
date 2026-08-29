@@ -123,19 +123,30 @@ final class ProviderLoginFlowModel: ObservableObject {
         provider == .codex
     }
 
-    /// The command the terminal fallback runs — each provider's own login
-    /// entry point, on the machine's PATH.
-    var terminalLoginCommand: String {
+    /// Each provider's CLI binary and login entry point. The command is the
+    /// logical form ("codex login"); the fallback types an absolute path when
+    /// it can resolve one, because the terminal shell's PATH on a headless
+    /// machine often misses the npm-global bin dir (the exact incident
+    /// STATUS.md records for /opt/node/bin).
+    var loginBinaryName: String {
         switch provider {
         case .claude:
-            return "claude setup-token"
+            return "claude"
         case .cursor:
-            return "cursor-agent login"
+            return "cursor-agent"
         case .kimi:
-            return "kimi login"
+            return "kimi"
         case .codex, .bedrock, .azure:
-            return "codex login"
+            return "codex"
         }
+    }
+
+    private var loginArgument: String {
+        provider == .claude ? "setup-token" : "login"
+    }
+
+    var terminalLoginCommand: String {
+        "\(loginBinaryName) \(loginArgument)"
     }
 
     func start() async {
@@ -337,6 +348,15 @@ final class ProviderLoginFlowModel: ObservableObject {
             timeoutMs: 8000
         )
 
+        // The terminal shell's PATH may not carry the CLI even though relayd
+        // itself found it (headless installs put npm-global bins in places a
+        // login shell never sources). Resolve an absolute path up front so
+        // the typed command cannot die as "command not found".
+        var launchCommand = terminalLoginCommand
+        if let binaryPath = await resolveLoginBinaryPath() {
+            launchCommand = "\(binaryPath) \(loginArgument)"
+        }
+
         let workspaceID: String
         do {
             guard let workspace = try await client.fetchCodexWorkspaces().first else {
@@ -370,7 +390,7 @@ final class ProviderLoginFlowModel: ObservableObject {
         // in the stream's opening snapshot, so the reader must both attach
         // after the command exists and ingest that snapshot.
         do {
-            try await client.sendTerminalInput(id: terminal.id, text: "\(terminalLoginCommand)\n")
+            try await client.sendTerminalInput(id: terminal.id, text: "\(launchCommand)\n")
         } catch {
             stopEverythingKeepingStep()
             step = .failed(Self.startFailedMessage)
@@ -378,6 +398,24 @@ final class ProviderLoginFlowModel: ObservableObject {
         }
         startTerminalReader(terminalID: terminal.id)
         startConnectedWatcher()
+    }
+
+    /// Resolve the provider CLI's absolute path on the machine, via one
+    /// bounded exec: PATH lookup first, then the conventional headless
+    /// locations (node's own bin dir is where npm-global CLIs live).
+    private func resolveLoginBinaryPath() async -> String? {
+        let name = loginBinaryName
+        let probe = "command -v \(name) 2>/dev/null || "
+            + "for d in \"$(dirname \"$(command -v node 2>/dev/null || echo /nonexistent)\")\" "
+            + "/opt/node/bin /opt/node22/bin /usr/local/bin /usr/bin; do "
+            + "[ -x \"$d/\(name)\" ] && { echo \"$d/\(name)\"; break; }; done"
+        guard let result = try? await client.execCommand(probe, timeoutMs: 8000) else { return nil }
+        let line = result.stdout
+            .split(whereSeparator: \.isNewline)
+            .first
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        guard let line, line.hasPrefix("/"), !line.contains(" "), !line.contains("'") else { return nil }
+        return line
     }
 
     private func startTerminalReader(terminalID: String) {
@@ -413,7 +451,18 @@ final class ProviderLoginFlowModel: ObservableObject {
     private func ingestTerminalOutput(_ chunk: String, terminalID: String) {
         guard terminalCommandSent else { return }
         terminalOutput = String((terminalOutput + chunk).suffix(64 * 1024))
-        let artifacts = Self.scanSignInArtifacts(in: Self.strippedTerminalText(terminalOutput))
+        let stripped = Self.strippedTerminalText(terminalOutput)
+
+        // A login that errored will never produce a link — surface the
+        // machine's own words now instead of spinning until the deadline.
+        if !sawSignInArtifacts, step != .completing, step != .succeeded,
+           let errorLine = Self.firstMachineError(in: stripped) {
+            stopEverythingKeepingStep()
+            step = .failed("The sign-in failed on the machine: \(errorLine)")
+            return
+        }
+
+        let artifacts = Self.scanSignInArtifacts(in: stripped)
         guard artifacts.url != nil || artifacts.code != nil else { return }
         sawSignInArtifacts = true
         progressDetail = nil
@@ -531,6 +580,27 @@ final class ProviderLoginFlowModel: ObservableObject {
             output = output.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
         }
         return output
+    }
+
+    /// The failure shapes a login command prints instead of a link. Bounded
+    /// to one trimmed line so the sheet can quote the machine verbatim.
+    nonisolated static func firstMachineError(in text: String) -> String? {
+        let markers = [
+            "command not found",
+            "No such file or directory",
+            "Permission denied",
+            "address already in use",
+            "EADDRINUSE",
+            "[Terminal failed",
+            "[Relay terminal disconnected",
+        ]
+        for rawLine in text.split(whereSeparator: \.isNewline) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if markers.contains(where: { line.localizedCaseInsensitiveContains($0) }) {
+                return String(line.prefix(160))
+            }
+        }
+        return nil
     }
 
     /// Mirror of relayd's login-output scrape: first https URL, first
