@@ -360,8 +360,10 @@ private final class StubHarnessLoginClient: HarnessLoginClient {
     private(set) var closedTerminalIDs: [String] = []
     private(set) var execCommands: [String] = []
     private var terminalContinuations: [AsyncThrowingStream<CodexTerminalStreamEvent, Error>.Continuation] = []
+    private var bufferedTerminalOutput = ""
 
     func pushTerminalOutput(_ text: String) {
+        bufferedTerminalOutput += text
         for continuation in terminalContinuations {
             continuation.yield(.output(text))
         }
@@ -437,6 +439,11 @@ private final class StubHarnessLoginClient: HarnessLoginClient {
     nonisolated func terminalEvents(id: String) -> AsyncThrowingStream<CodexTerminalStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             Task { @MainActor in
+                // Mirror the real server: the opening snapshot carries every
+                // byte that landed in the buffer before the stream attached.
+                if let terminal = self.createdTerminals.last {
+                    continuation.yield(.snapshot(terminal: terminal, output: self.bufferedTerminalOutput))
+                }
                 self.terminalContinuations.append(continuation)
             }
         }

@@ -139,7 +139,7 @@ struct ProviderLoginView: View {
                 VStack(spacing: 12) {
                     HStack(spacing: 10) {
                         ProgressView().tint(AppTheme.accent)
-                        Text("Waiting for the sign-in link from your machine…")
+                        Text(flow.progressDetail ?? "Waiting for the sign-in link from your machine…")
                             .font(AppTheme.uiFont(size: 13))
                             .foregroundStyle(AppTheme.textSecondary)
                     }

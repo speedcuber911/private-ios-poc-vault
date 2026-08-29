@@ -77,6 +77,10 @@ final class ProviderLoginFlowModel: ObservableObject {
     let provider: CodexProvider
     @Published private(set) var step: Step = .idle
     @Published var pastedCode: String = ""
+    /// What the flow is doing while there is nothing to show yet — surfaced
+    /// under the waiting spinner so a stall names its stage instead of
+    /// looking like a generic hang.
+    @Published private(set) var progressDetail: String?
 
     /// Poll cadences and patience windows; tests shrink them.
     var pollInterval: Duration = .seconds(1)
@@ -139,6 +143,7 @@ final class ProviderLoginFlowModel: ObservableObject {
         engine = nil
         sawSignInArtifacts = false
         usedTerminalFallback = false
+        progressDetail = nil
         step = .starting
         do {
             adoptOp(try await client.startHarnessLogin(provider: provider))
@@ -322,6 +327,7 @@ final class ProviderLoginFlowModel: ObservableObject {
         cancelBackgroundWork()
         engine = nil
         step = .starting
+        progressDetail = "Preparing a terminal on your machine…"
 
         // Clear any stray login process from earlier attempts — a silent
         // `codex login` still holds its localhost port. Best effort: machines
@@ -345,8 +351,9 @@ final class ProviderLoginFlowModel: ObservableObject {
 
         let terminal: CodexTerminal
         do {
-            // Wide columns so the CLI never wraps its (long) sign-in URL.
-            terminal = try await client.createTerminal(workspaceID: workspaceID, cols: 320, rows: 40)
+            // Widest columns the machine accepts, so the CLI never wraps its
+            // (long) sign-in URL.
+            terminal = try await client.createTerminal(workspaceID: workspaceID, cols: 300, rows: 40)
         } catch {
             step = .failed(Self.startFailedMessage)
             return
@@ -354,11 +361,14 @@ final class ProviderLoginFlowModel: ObservableObject {
 
         engine = .terminal(id: terminal.id)
         terminalOutput = ""
-        terminalCommandSent = false
-        step = .waitingForSignIn(RelayHarnessOp(id: "terminal:\(terminal.id)", provider: provider))
-        startTerminalReader(terminalID: terminal.id)
-
         terminalCommandSent = true
+        step = .waitingForSignIn(RelayHarnessOp(id: "terminal:\(terminal.id)", provider: provider))
+        progressDetail = "Running `\(terminalLoginCommand)` on your machine…"
+
+        // Type the command BEFORE attaching the stream: output that lands in
+        // the terminal's buffer before the stream connects is only delivered
+        // in the stream's opening snapshot, so the reader must both attach
+        // after the command exists and ingest that snapshot.
         do {
             try await client.sendTerminalInput(id: terminal.id, text: "\(terminalLoginCommand)\n")
         } catch {
@@ -366,6 +376,7 @@ final class ProviderLoginFlowModel: ObservableObject {
             step = .failed(Self.startFailedMessage)
             return
         }
+        startTerminalReader(terminalID: terminal.id)
         startConnectedWatcher()
     }
 
@@ -377,8 +388,19 @@ final class ProviderLoginFlowModel: ObservableObject {
                 for try await event in self.client.terminalEvents(id: terminalID) {
                     if Task.isCancelled { return }
                     guard case .terminal(id: terminalID) = self.engine else { return }
-                    if case .output(let text) = event {
+                    switch event {
+                    case .snapshot(_, let output):
+                        self.ingestTerminalOutput(output, terminalID: terminalID)
+                    case .output(let text):
                         self.ingestTerminalOutput(text, terminalID: terminalID)
+                    case .done:
+                        // The shell ended. If the sign-in never even produced
+                        // a link, that is a failure now, not a quiet hang.
+                        if !self.sawSignInArtifacts, self.step != .completing, self.step != .succeeded {
+                            self.stopEverythingKeepingStep()
+                            self.step = .failed(Self.failedMessage)
+                        }
+                        return
                     }
                 }
             } catch {
@@ -394,6 +416,7 @@ final class ProviderLoginFlowModel: ObservableObject {
         let artifacts = Self.scanSignInArtifacts(in: Self.strippedTerminalText(terminalOutput))
         guard artifacts.url != nil || artifacts.code != nil else { return }
         sawSignInArtifacts = true
+        progressDetail = nil
         guard step != .completing, step != .succeeded else { return }
         let synthesized = RelayHarnessOp(
             id: "terminal:\(terminalID)",
@@ -469,6 +492,7 @@ final class ProviderLoginFlowModel: ObservableObject {
         if case .terminal(let id) = current {
             Task { [client] in try? await client.closeTerminal(id: id) }
         }
+        progressDetail = nil
         step = .succeeded
     }
 
