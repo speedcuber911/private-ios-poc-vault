@@ -3,8 +3,10 @@ import Foundation
 /// The node-side surface the direct-login flow needs. `CodexClient` conforms;
 /// tests substitute a stub. The first block is the modern path (harness login
 /// ops with input/callback/cancel). The second block is what the fallback
-/// rides on machines that predate those routes: a terminal (a real PTY),
-/// bounded exec, and the harness status list.
+/// rides on any other machine: the harness status list and bounded exec —
+/// deliberately nothing else, because everything richer (terminals, jobs)
+/// runs through the Codex app-server, which itself needs an authenticated
+/// codex — exactly what a fresh machine doesn't have yet.
 protocol HarnessLoginClient: AnyObject {
     func startHarnessLogin(provider: CodexProvider) async throws -> RelayHarnessOp
     func fetchHarnessOp(id: String) async throws -> RelayHarnessOp
@@ -14,11 +16,6 @@ protocol HarnessLoginClient: AnyObject {
     func cancelHarnessOp(id: String) async throws -> RelayHarnessOp
 
     func fetchHarnesses() async throws -> [RelayHarnessStatus]
-    func fetchCodexWorkspaces() async throws -> [CodexWorkspace]
-    func createTerminal(workspaceID: String, cols: Int, rows: Int) async throws -> CodexTerminal
-    func sendTerminalInput(id: String, text: String) async throws
-    func closeTerminal(id: String) async throws
-    func terminalEvents(id: String) -> AsyncThrowingStream<CodexTerminalStreamEvent, Error>
     func execCommand(_ command: String, timeoutMs: Int?) async throws -> CodexExecResult
 }
 
@@ -36,14 +33,18 @@ extension CodexClient: HarnessLoginClient {}
 /// Two engines, chosen automatically:
 /// - **Op mode** (modern relayd): `POST /v1/harness/:provider/login` plus the
 ///   op-scoped input/callback/cancel routes.
-/// - **Terminal fallback** (any machine): run the CLI's login inside a
-///   machine terminal — a real PTY, so CLIs that stay silent without one
-///   print their link — scrape the URL/code from the output here, type the
-///   pasted code back into that terminal, replay a captured localhost
-///   callback via `POST /v1/exec`, and treat the harness list's
-///   `loggedIn: true` as the machine's confirmation. The fallback engages
-///   when the modern routes are missing (404), when the op dies before
-///   producing a link, or when no link appears within `opLinkPatience`.
+/// - **Exec fallback** (any machine): launch the CLI's login on the node via
+///   `POST /v1/exec` under util-linux `script` — a real PTY, detached with
+///   setsid, output flushed to a log file, stdin fed from a FIFO — then poll
+///   that log through exec, scrape the URL/user code here, type the pasted
+///   code into the FIFO, replay a captured localhost callback against the
+///   node's loopback, and treat the harness list's `loggedIn: true` as the
+///   machine's confirmation. Exec is the one primitive with no dependency on
+///   an authenticated provider (Relay's terminals ride the Codex app-server,
+///   which is the very thing a fresh machine can't run yet). The fallback
+///   engages when the modern routes are missing (404), when the op dies
+///   before producing a link, or when no link appears within
+///   `opLinkPatience`.
 ///
 /// Status is always explicit text (Editorial Ember) — never a colored dot.
 @MainActor
@@ -71,8 +72,6 @@ final class ProviderLoginFlowModel: ObservableObject {
         "The sign-in didn't complete. Try again."
     static let completionFailedMessage =
         "Relay couldn't hand the sign-in result to your machine. Try again."
-    static let noWorkspaceMessage =
-        "Your machine reported no folders to host the sign-in. Open a folder once, then try again."
 
     let provider: CodexProvider
     @Published private(set) var step: Step = .idle
@@ -81,15 +80,15 @@ final class ProviderLoginFlowModel: ObservableObject {
     /// under the waiting spinner so a stall names its stage instead of
     /// looking like a generic hang.
     @Published private(set) var progressDetail: String?
-    /// Tail of the machine terminal's (ANSI-stripped) output while the
-    /// fallback login runs. Shown on the sheet whenever there is no link
-    /// yet, so a stalled sign-in displays exactly what the machine said
-    /// instead of a spinner with a secret.
+    /// Tail of the machine login's (ANSI-stripped) output while the fallback
+    /// runs. Shown on the sheet whenever there is no link yet, so a stalled
+    /// sign-in displays exactly what the machine said instead of a spinner
+    /// with a secret.
     @Published private(set) var terminalTail: String?
 
-    /// True while the legacy-machine terminal engine is driving the login.
+    /// True while the exec fallback engine is driving the login.
     var isUsingTerminalEngine: Bool {
-        if case .terminal = engine { return true }
+        if case .exec = engine { return true }
         return false
     }
 
@@ -101,19 +100,16 @@ final class ProviderLoginFlowModel: ObservableObject {
 
     private enum Engine: Equatable {
         case op(id: String)
-        case terminal(id: String)
+        case exec(logPath: String, inputPath: String, launchCommand: String)
     }
 
     private let client: HarnessLoginClient
     private var engine: Engine?
     private var pollTask: Task<Void, Never>?
-    private var terminalTask: Task<Void, Never>?
     private var connectedWatchTask: Task<Void, Never>?
     private var fallbackTimerTask: Task<Void, Never>?
-    private var terminalOutput = ""
-    private var terminalCommandSent = false
     private var sawSignInArtifacts = false
-    private var usedTerminalFallback = false
+    private var usedExecFallback = false
 
     init(client: HarnessLoginClient, provider: CodexProvider) {
         self.client = client
@@ -122,7 +118,6 @@ final class ProviderLoginFlowModel: ObservableObject {
 
     deinit {
         pollTask?.cancel()
-        terminalTask?.cancel()
         connectedWatchTask?.cancel()
         fallbackTimerTask?.cancel()
     }
@@ -135,10 +130,10 @@ final class ProviderLoginFlowModel: ObservableObject {
     }
 
     /// Each provider's CLI binary and login entry point. The command is the
-    /// logical form ("codex login"); the fallback types an absolute path when
-    /// it can resolve one, because the terminal shell's PATH on a headless
-    /// machine often misses the npm-global bin dir (the exact incident
-    /// STATUS.md records for /opt/node/bin).
+    /// logical form ("codex login"); the fallback launches an absolute path
+    /// when it can resolve one, because a headless machine's PATH often
+    /// misses the npm-global bin dir (the exact incident STATUS.md records
+    /// for /opt/node/bin).
     var loginBinaryName: String {
         switch provider {
         case .claude:
@@ -164,7 +159,7 @@ final class ProviderLoginFlowModel: ObservableObject {
         cancelBackgroundWork()
         engine = nil
         sawSignInArtifacts = false
-        usedTerminalFallback = false
+        usedExecFallback = false
         progressDetail = nil
         terminalTail = nil
         step = .starting
@@ -178,11 +173,11 @@ final class ProviderLoginFlowModel: ObservableObject {
                 .first(where: { $0.provider == provider && $0.action == "login" && $0.isActive }) {
                 adoptOp(existing)
             } else {
-                await startTerminalFallback()
+                await startExecFallback()
             }
         } catch let error as CodexClientError where error.statusCode == 404 {
-            // No harness login op route at all — drive it through a terminal.
-            await startTerminalFallback()
+            // No harness login op route at all — drive it through exec.
+            await startExecFallback()
         } catch {
             step = .failed(Self.notReachableMessage)
         }
@@ -190,7 +185,7 @@ final class ProviderLoginFlowModel: ObservableObject {
 
     /// Send the code the user pasted from the provider's sign-in page. Op
     /// mode types it into the login CLI's stdin via the machine API; the
-    /// fallback types it straight into the terminal running the login.
+    /// fallback writes it into the FIFO feeding the login's PTY.
     func submitPastedCode() async {
         let text = pastedCode.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
@@ -202,17 +197,26 @@ final class ProviderLoginFlowModel: ObservableObject {
                 startConnectedWatcher()
             } catch let error as CodexClientError where error.statusCode == 404 {
                 // This machine can't reach that stdin (route predates the
-                // feature). Rerun the login in a terminal, where typing works.
-                await startTerminalFallback()
+                // feature). Rerun the login through exec, where typing works.
+                await startExecFallback()
             } catch {
                 stopEverythingKeepingStep()
                 step = .failed(Self.completionFailedMessage)
             }
-        case .terminal(let id):
+        case .exec(_, let inputPath, _):
+            guard let quoted = Self.shellSingleQuoted(text) else {
+                step = .failed(Self.completionFailedMessage)
+                return
+            }
             step = .completing
             do {
-                try await client.sendTerminalInput(id: id, text: "\(text)\n")
-                startConnectedWatcher()
+                let result = try await client.execCommand("printf '%s\\n' \(quoted) > \(inputPath)", timeoutMs: 8000)
+                if result.exitCode == 0 {
+                    startConnectedWatcher()
+                } else {
+                    stopEverythingKeepingStep()
+                    step = .failed(Self.completionFailedMessage)
+                }
             } catch {
                 stopEverythingKeepingStep()
                 step = .failed(Self.completionFailedMessage)
@@ -238,7 +242,7 @@ final class ProviderLoginFlowModel: ObservableObject {
                 stopEverythingKeepingStep()
                 step = .failed(Self.completionFailedMessage)
             }
-        case .terminal:
+        case .exec:
             step = .completing
             await replayCallbackViaExec(url)
         case nil:
@@ -261,8 +265,8 @@ final class ProviderLoginFlowModel: ObservableObject {
         switch current {
         case .op(let id):
             _ = try? await client.cancelHarnessOp(id: id)
-        case .terminal(let id):
-            try? await client.closeTerminal(id: id)
+        case .exec:
+            await cleanUpExecLogin()
         case nil:
             break
         }
@@ -291,10 +295,10 @@ final class ProviderLoginFlowModel: ObservableObject {
             finishConnected()
         case .expired, .failed, .cancelled, .unknown:
             // A login that died before it ever produced a link is the shape of
-            // a CLI that won't talk without a TTY — the terminal fallback IS a
-            // TTY, so try it once before reporting failure.
-            if !sawSignInArtifacts && !usedTerminalFallback {
-                Task { await startTerminalFallback() }
+            // a CLI that won't talk without a TTY — the exec fallback gives it
+            // one, so try that once before reporting failure.
+            if !sawSignInArtifacts && !usedExecFallback {
+                Task { await startExecFallback() }
                 return
             }
             stopEverythingKeepingStep()
@@ -326,90 +330,122 @@ final class ProviderLoginFlowModel: ObservableObject {
 
     /// A live op that produces no link within the patience window is the
     /// stalled shape (old machine build, or a login variant that needs a
-    /// TTY): switch to the terminal fallback instead of waiting forever.
+    /// TTY): switch to the exec fallback instead of waiting forever.
     private func armOpLinkPatience() {
         fallbackTimerTask?.cancel()
         fallbackTimerTask = Task { [weak self] in
             guard let self else { return }
             try? await Task.sleep(for: self.opLinkPatience)
             if Task.isCancelled { return }
-            guard case .op = self.engine, !self.sawSignInArtifacts, !self.usedTerminalFallback else { return }
+            guard case .op = self.engine, !self.sawSignInArtifacts, !self.usedExecFallback else { return }
             if case .waitingForSignIn = self.step {
-                await self.startTerminalFallback()
+                await self.startExecFallback()
             } else if self.step == .starting {
-                await self.startTerminalFallback()
+                await self.startExecFallback()
             }
         }
     }
 
-    // MARK: - Terminal fallback engine
+    // MARK: - Exec fallback engine
 
-    private func startTerminalFallback() async {
-        guard !usedTerminalFallback else { return }
-        usedTerminalFallback = true
+    private var execLogPath: String { "/tmp/relay-phone-login-\(provider.rawValue).log" }
+    private var execInputPath: String { "/tmp/relay-phone-login-\(provider.rawValue).in" }
+
+    private func startExecFallback() async {
+        guard !usedExecFallback else { return }
+        usedExecFallback = true
         cancelBackgroundWork()
         engine = nil
         step = .starting
-        progressDetail = "Preparing a terminal on your machine…"
+        progressDetail = "Preparing the sign-in on your machine…"
 
-        // Clear any stray login process from earlier attempts — a silent
-        // `codex login` still holds its localhost port. Best effort: machines
-        // without pkill just skip this.
+        // Clear any stray login from earlier attempts — a silent
+        // `codex login` still holds its localhost port. Best effort.
         _ = try? await client.execCommand(
-            "pkill -f '\(terminalLoginCommand)' >/dev/null 2>&1; true",
+            "pkill -f '\(loginBinaryName) \(loginArgument)' >/dev/null 2>&1; true",
             timeoutMs: 8000
         )
 
-        // The terminal shell's PATH may not carry the CLI even though relayd
-        // itself found it (headless installs put npm-global bins in places a
-        // login shell never sources). Resolve an absolute path up front so
-        // the typed command cannot die as "command not found".
-        var launchCommand = terminalLoginCommand
-        if let binaryPath = await resolveLoginBinaryPath() {
-            launchCommand = "\(binaryPath) \(loginArgument)"
+        // A headless machine's PATH often misses the npm-global bin dir;
+        // resolve an absolute path so the launch can't die as "command not
+        // found".
+        var binary = loginBinaryName
+        if let resolved = await resolveLoginBinaryPath() {
+            binary = resolved
         }
 
-        let workspaceID: String
+        let launch = Self.execLaunchCommand(
+            binary: binary,
+            argument: loginArgument,
+            logPath: execLogPath,
+            inputPath: execInputPath
+        )
         do {
-            guard let workspace = try await client.fetchCodexWorkspaces().first else {
-                step = .failed(Self.noWorkspaceMessage)
+            let result = try await client.execCommand(launch, timeoutMs: 15000)
+            guard result.exitCode == 0 else {
+                step = .failed(Self.startFailedMessage)
                 return
             }
-            workspaceID = workspace.id
         } catch {
             step = .failed(Self.notReachableMessage)
             return
         }
 
-        let terminal: CodexTerminal
-        do {
-            // Widest columns the machine accepts, so the CLI never wraps its
-            // (long) sign-in URL.
-            terminal = try await client.createTerminal(workspaceID: workspaceID, cols: 300, rows: 40)
-        } catch {
-            step = .failed(Self.startFailedMessage)
-            return
-        }
-
-        engine = .terminal(id: terminal.id)
-        terminalOutput = ""
-        terminalCommandSent = true
-        step = .waitingForSignIn(RelayHarnessOp(id: "terminal:\(terminal.id)", provider: provider))
+        engine = .exec(logPath: execLogPath, inputPath: execInputPath, launchCommand: launch)
+        step = .waitingForSignIn(RelayHarnessOp(id: "exec:\(provider.rawValue)", provider: provider))
         progressDetail = "Running `\(terminalLoginCommand)` on your machine…"
+        startLogPolling(logPath: execLogPath)
+        startConnectedWatcher()
+    }
 
-        // Type the command BEFORE attaching the stream: output that lands in
-        // the terminal's buffer before the stream connects is only delivered
-        // in the stream's opening snapshot, so the reader must both attach
-        // after the command exists and ingest that snapshot.
-        do {
-            try await client.sendTerminalInput(id: terminal.id, text: "\(launchCommand)\n")
-        } catch {
+    private func startLogPolling(logPath: String) {
+        pollTask?.cancel()
+        pollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                try? await Task.sleep(for: self.pollInterval)
+                if Task.isCancelled { return }
+                guard case .exec(let currentLog, _, _) = self.engine, currentLog == logPath else { return }
+                guard let result = try? await self.client.execCommand(
+                    "tail -c 4000 \(logPath) 2>/dev/null; true",
+                    timeoutMs: 8000
+                ) else { continue }
+                self.ingestLoginOutput(result.stdout)
+            }
+        }
+    }
+
+    private func ingestLoginOutput(_ text: String) {
+        let stripped = Self.strippedTerminalText(text)
+        let tail = String(stripped.suffix(360)).trimmingCharacters(in: .whitespacesAndNewlines)
+        terminalTail = tail.isEmpty ? nil : tail
+
+        // A login that errored will never produce a link — surface the
+        // machine's own words now instead of spinning until the deadline.
+        if !sawSignInArtifacts, step != .completing, step != .succeeded,
+           let errorLine = Self.firstMachineError(in: stripped) {
             stopEverythingKeepingStep()
-            step = .failed(Self.startFailedMessage)
+            step = .failed("The sign-in failed on the machine: \(errorLine)")
             return
         }
-        startTerminalReader(terminalID: terminal.id)
-        startConnectedWatcher()
+
+        let artifacts = Self.scanSignInArtifacts(in: stripped)
+        guard artifacts.url != nil || artifacts.code != nil else { return }
+        sawSignInArtifacts = true
+        progressDetail = nil
+        guard step != .completing, step != .succeeded else { return }
+        let synthesized = RelayHarnessOp(
+            id: "exec:\(provider.rawValue)",
+            provider: provider,
+            verificationURL: artifacts.url,
+            userCode: artifacts.code
+        )
+        if case .waitingForSignIn(let current) = step,
+           current.verificationURL == synthesized.verificationURL,
+           current.userCode == synthesized.userCode {
+            return
+        }
+        step = .waitingForSignIn(synthesized)
     }
 
     /// Resolve the provider CLI's absolute path on the machine, via one
@@ -430,69 +466,11 @@ final class ProviderLoginFlowModel: ObservableObject {
         return line
     }
 
-    private func startTerminalReader(terminalID: String) {
-        terminalTask?.cancel()
-        terminalTask = Task { [weak self] in
-            guard let self else { return }
-            do {
-                for try await event in self.client.terminalEvents(id: terminalID) {
-                    if Task.isCancelled { return }
-                    guard case .terminal(id: terminalID) = self.engine else { return }
-                    switch event {
-                    case .snapshot(_, let output):
-                        self.ingestTerminalOutput(output, terminalID: terminalID)
-                    case .output(let text):
-                        self.ingestTerminalOutput(text, terminalID: terminalID)
-                    case .done:
-                        // The shell ended. If the sign-in never even produced
-                        // a link, that is a failure now, not a quiet hang.
-                        if !self.sawSignInArtifacts, self.step != .completing, self.step != .succeeded {
-                            self.stopEverythingKeepingStep()
-                            self.step = .failed(Self.failedMessage)
-                        }
-                        return
-                    }
-                }
-            } catch {
-                // Stream drop is not fatal: the connected watcher still
-                // resolves the outcome from the machine's own status.
-            }
-        }
-    }
-
-    private func ingestTerminalOutput(_ chunk: String, terminalID: String) {
-        guard terminalCommandSent else { return }
-        terminalOutput = String((terminalOutput + chunk).suffix(64 * 1024))
-        let stripped = Self.strippedTerminalText(terminalOutput)
-        let tail = String(stripped.suffix(360)).trimmingCharacters(in: .whitespacesAndNewlines)
-        terminalTail = tail.isEmpty ? nil : tail
-
-        // A login that errored will never produce a link — surface the
-        // machine's own words now instead of spinning until the deadline.
-        if !sawSignInArtifacts, step != .completing, step != .succeeded,
-           let errorLine = Self.firstMachineError(in: stripped) {
-            stopEverythingKeepingStep()
-            step = .failed("The sign-in failed on the machine: \(errorLine)")
-            return
-        }
-
-        let artifacts = Self.scanSignInArtifacts(in: stripped)
-        guard artifacts.url != nil || artifacts.code != nil else { return }
-        sawSignInArtifacts = true
-        progressDetail = nil
-        guard step != .completing, step != .succeeded else { return }
-        let synthesized = RelayHarnessOp(
-            id: "terminal:\(terminalID)",
-            provider: provider,
-            verificationURL: artifacts.url,
-            userCode: artifacts.code
+    private func cleanUpExecLogin() async {
+        _ = try? await client.execCommand(
+            "pkill -f '\(loginBinaryName) \(loginArgument)' >/dev/null 2>&1; rm -f \(execLogPath) \(execInputPath); true",
+            timeoutMs: 8000
         )
-        if case .waitingForSignIn(let current) = step,
-           current.verificationURL == synthesized.verificationURL,
-           current.userCode == synthesized.userCode {
-            return
-        }
-        step = .waitingForSignIn(synthesized)
     }
 
     // MARK: - Shared completion
@@ -552,8 +530,8 @@ final class ProviderLoginFlowModel: ObservableObject {
         let current = engine
         cancelBackgroundWork()
         engine = nil
-        if case .terminal(let id) = current {
-            Task { [client] in try? await client.closeTerminal(id: id) }
+        if case .exec = current {
+            Task { await self.cleanUpExecLogin() }
         }
         progressDetail = nil
         step = .succeeded
@@ -563,16 +541,14 @@ final class ProviderLoginFlowModel: ObservableObject {
         let current = engine
         cancelBackgroundWork()
         engine = nil
-        if case .terminal(let id) = current {
-            Task { [client] in try? await client.closeTerminal(id: id) }
+        if case .exec = current {
+            Task { await self.cleanUpExecLogin() }
         }
     }
 
     private func cancelBackgroundWork() {
         pollTask?.cancel()
         pollTask = nil
-        terminalTask?.cancel()
-        terminalTask = nil
         connectedWatchTask?.cancel()
         connectedWatchTask = nil
         fallbackTimerTask?.cancel()
@@ -580,6 +556,29 @@ final class ProviderLoginFlowModel: ObservableObject {
     }
 
     // MARK: - Pure helpers (testable)
+
+    /// The one-shot launcher the fallback runs through `POST /v1/exec`:
+    /// - a FIFO feeds the login's stdin so paste-back codes can be typed later
+    ///   (a persistent writer fd keeps it open so the CLI never sees EOF);
+    /// - util-linux `script` gives the CLI a real PTY and flushes every write
+    ///   to the log (`-f`), which is what the phone polls; a machine without
+    ///   `script` falls back to plain redirection;
+    /// - `setsid` detaches the whole thing from exec's process group so the
+    ///   endpoint's timeout kill can't take the login with it.
+    nonisolated static func execLaunchCommand(
+        binary: String,
+        argument: String,
+        logPath: String,
+        inputPath: String
+    ) -> String {
+        let command = "\(binary) \(argument)"
+        return "rm -f \(logPath) \(inputPath) && mkfifo \(inputPath) && "
+            + "if command -v script >/dev/null 2>&1; then "
+            + "setsid bash -c 'exec 3>\(inputPath); exec script -qefc \"\(command)\" \(logPath) < \(inputPath)' >/dev/null 2>&1 & "
+            + "else "
+            + "setsid bash -c 'exec 3>\(inputPath); exec \(command) < \(inputPath) >> \(logPath) 2>&1' >/dev/null 2>&1 & "
+            + "fi; echo launched"
+    }
 
     /// Remove ANSI control sequences (CSI, OSC, and lone escapes) plus
     /// carriage returns, so URL/code scanning sees plain text.
@@ -605,8 +604,6 @@ final class ProviderLoginFlowModel: ObservableObject {
             "Permission denied",
             "address already in use",
             "EADDRINUSE",
-            "[Terminal failed",
-            "[Relay terminal disconnected",
         ]
         for rawLine in text.split(whereSeparator: \.isNewline) {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
@@ -648,5 +645,13 @@ final class ProviderLoginFlowModel: ObservableObject {
         let script = "fetch(process.argv[1],{signal:AbortSignal.timeout(8000)})"
             + ".then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
         return "node -e '\(script)' '\(replay)'"
+    }
+
+    /// Single-quote text for a bash command line; nil when it cannot be
+    /// quoted safely (the pasted code is user input).
+    nonisolated static func shellSingleQuoted(_ text: String) -> String? {
+        guard !text.contains("'"), !text.contains("\\"), !text.contains("\u{0}"),
+              text.rangeOfCharacter(from: .newlines) == nil else { return nil }
+        return "'\(text)'"
     }
 }

@@ -1,10 +1,10 @@
 import XCTest
 @testable import POCVault
 
-/// Direct provider login from the phone: op decoding, the pure terminal
-/// scrapers, and the `ProviderLoginFlowModel` state machine — both the modern
-/// op engine and the legacy-machine terminal fallback — against a stubbed
-/// node client.
+/// Direct provider login from the phone: op decoding, the pure scrapers and
+/// command builders, and the `ProviderLoginFlowModel` state machine — both
+/// the modern op engine and the legacy-machine exec fallback — against a
+/// stubbed node client.
 final class ProviderLoginTests: XCTestCase {
     // MARK: - RelayHarnessOp decoding
 
@@ -89,6 +89,27 @@ final class ProviderLoginTests: XCTestCase {
 
         XCTAssertNil(ProviderLoginFlowModel.execReplayCommand(for: URL(string: "https://evil.example/auth/callback")!))
         XCTAssertNil(ProviderLoginFlowModel.execReplayCommand(for: URL(string: "http://localhost:1455/auth/callback?code=a'b")!))
+    }
+
+    func testExecLaunchCommandShape() {
+        let command = ProviderLoginFlowModel.execLaunchCommand(
+            binary: "/opt/node/bin/codex",
+            argument: "login",
+            logPath: "/tmp/relay-phone-login-codex.log",
+            inputPath: "/tmp/relay-phone-login-codex.in"
+        )
+        XCTAssertTrue(command.contains("mkfifo /tmp/relay-phone-login-codex.in"))
+        XCTAssertTrue(command.contains("script -qefc \"/opt/node/bin/codex login\" /tmp/relay-phone-login-codex.log"),
+                      "the PTY path must run through util-linux script")
+        XCTAssertTrue(command.contains("setsid"), "the login must escape exec's process-group kill")
+        XCTAssertTrue(command.contains("else"), "a machine without script still launches with plain redirection")
+    }
+
+    func testShellSingleQuotedRejectsUnsafeText() {
+        XCTAssertEqual(ProviderLoginFlowModel.shellSingleQuoted("abc-123#st"), "'abc-123#st'")
+        XCTAssertNil(ProviderLoginFlowModel.shellSingleQuoted("a'b"))
+        XCTAssertNil(ProviderLoginFlowModel.shellSingleQuoted("a\\b"))
+        XCTAssertNil(ProviderLoginFlowModel.shellSingleQuoted("a\nb"))
     }
 
     // MARK: - Op engine
@@ -191,42 +212,6 @@ final class ProviderLoginTests: XCTestCase {
         XCTAssertEqual(flow.step, .idle)
     }
 
-    // MARK: - Terminal fallback engine (legacy machines)
-
-    @MainActor
-    func testMissingOpRoutesFallBackToTerminalLoginEndToEnd() async throws {
-        let stub = StubHarnessLoginClient()
-        stub.startError = CodexClientError.httpFailure(404, "not found")
-        stub.workspaces = try Self.workspaces()
-        let flow = Self.makeFastFlow(client: stub, provider: .claude)
-
-        await flow.start()
-        XCTAssertEqual(stub.createdTerminals.count, 1, "a legacy machine gets a terminal-driven login")
-        XCTAssertEqual(stub.terminalInputs.first?.text, "claude setup-token\n")
-        XCTAssertTrue(stub.execCommands.first?.contains("pkill") == true, "stray logins are cleared first")
-
-        // The CLI prints its link (with ANSI noise) into the terminal.
-        stub.pushTerminalOutput("\u{1B}[1mVisit\u{1B}[0m https://provider.example/authorize?flow=paste and paste the code\r\n")
-        try await Self.waitUntil {
-            if case .waitingForSignIn(let op) = flow.step { return op.verificationURL != nil }
-            return false
-        }
-        XCTAssertTrue(flow.terminalTail?.contains("Visit") == true,
-                      "the sheet surfaces the machine's own output while a link is pending")
-
-        // Pasting types the code into the same terminal.
-        flow.pastedCode = " paste-code-123 "
-        await flow.submitPastedCode()
-        XCTAssertEqual(stub.terminalInputs.last?.text, "paste-code-123\n")
-        XCTAssertEqual(flow.step, .completing)
-
-        // The machine's own status is the confirmation.
-        stub.harnesses = [try Self.harness(provider: "claude", loggedIn: true)]
-        try await Self.waitUntil { flow.step == .succeeded }
-        // Terminal cleanup is fire-and-forget; wait for it rather than racing it.
-        try await Self.waitUntil { stub.closedTerminalIDs == [stub.createdTerminals[0].id] }
-    }
-
     @MainActor
     func testOpCallback404FallsBackToExecReplay() async throws {
         let stub = StubHarnessLoginClient()
@@ -251,29 +236,52 @@ final class ProviderLoginTests: XCTestCase {
         try await Self.waitUntil { flow.step == .succeeded }
     }
 
+    // MARK: - Exec fallback engine (any machine)
+
     @MainActor
-    func testTerminalLoginUsesResolvedAbsoluteBinaryPath() async throws {
+    func testMissingOpRoutesFallBackToExecLoginEndToEnd() async throws {
         let stub = StubHarnessLoginClient()
         stub.startError = CodexClientError.httpFailure(404, "not found")
-        stub.workspaces = try Self.workspaces()
-        // The machine resolves the CLI to its npm-global location.
         stub.execResults = [(contains: "command -v claude", result: CodexExecResult(exitCode: 0, stdout: "/opt/node/bin/claude\n"))]
         let flow = Self.makeFastFlow(client: stub, provider: .claude)
 
         await flow.start()
-        XCTAssertEqual(stub.terminalInputs.first?.text, "/opt/node/bin/claude setup-token\n",
-                       "the typed command must survive a PATH that misses the CLI")
+        XCTAssertTrue(stub.execCommands.first?.contains("pkill") == true, "stray logins are cleared first")
+        let launch = stub.execCommands.first(where: { $0.contains("mkfifo") })
+        XCTAssertTrue(launch?.contains("/opt/node/bin/claude setup-token") == true,
+                      "the resolved absolute path must be launched: \(launch ?? "<none>")")
+
+        // The CLI writes its link (with ANSI noise) into the polled log.
+        stub.loginLog = "\u{1B}[1mVisit\u{1B}[0m https://provider.example/authorize?flow=paste and paste the code\r\n"
+        try await Self.waitUntil {
+            if case .waitingForSignIn(let op) = flow.step { return op.verificationURL != nil }
+            return false
+        }
+        XCTAssertTrue(flow.terminalTail?.contains("Visit") == true,
+                      "the sheet surfaces the machine's own output while a link is pending")
+
+        // Pasting writes the code into the FIFO feeding the login's stdin.
+        flow.pastedCode = " paste-code-123 "
+        await flow.submitPastedCode()
+        let paste = stub.execCommands.last
+        XCTAssertTrue(paste?.contains("'paste-code-123'") == true && paste?.contains(".in") == true,
+                      "expected a FIFO write, got: \(paste ?? "<none>")")
+        XCTAssertEqual(flow.step, .completing)
+
+        // The machine's own status is the confirmation.
+        stub.harnesses = [try Self.harness(provider: "claude", loggedIn: true)]
+        try await Self.waitUntil { flow.step == .succeeded }
+        try await Self.waitUntil { stub.execCommands.last?.contains("rm -f") == true }
     }
 
     @MainActor
-    func testTerminalErrorLineFailsFastWithTheMachinesWords() async throws {
+    func testExecLoginErrorLineFailsFastWithTheMachinesWords() async throws {
         let stub = StubHarnessLoginClient()
         stub.startError = CodexClientError.httpFailure(404, "not found")
-        stub.workspaces = try Self.workspaces()
         let flow = Self.makeFastFlow(client: stub, provider: .codex)
 
         await flow.start()
-        stub.pushTerminalOutput("sh: 1: codex: command not found\r\n")
+        stub.loginLog = "sh: 1: codex: command not found\r\n"
         try await Self.waitUntil {
             if case .failed(let message) = flow.step { return message.contains("command not found") }
             return false
@@ -281,17 +289,16 @@ final class ProviderLoginTests: XCTestCase {
     }
 
     @MainActor
-    func testOpThatDiesWithoutALinkRetriesThroughTerminal() async throws {
+    func testOpThatDiesWithoutALinkRetriesThroughExec() async throws {
         let stub = StubHarnessLoginClient()
         // The op starts but the CLI dies instantly (the no-TTY shape).
         stub.startResult = try Self.op(id: "op-1", provider: "codex", status: "running")
         stub.currentOp = try Self.op(id: "op-1", provider: "codex", status: "failed", error: "login exited with code 1")
-        stub.workspaces = try Self.workspaces()
         let flow = Self.makeFastFlow(client: stub, provider: .codex)
 
         await flow.start()
-        try await Self.waitUntil { stub.createdTerminals.count == 1 }
-        XCTAssertEqual(stub.terminalInputs.first?.text, "codex login\n")
+        try await Self.waitUntil { stub.execCommands.contains(where: { $0.contains("mkfifo") }) }
+        XCTAssertTrue(stub.execCommands.contains(where: { $0.contains("codex login") }))
     }
 
     // MARK: - Helpers
@@ -334,13 +341,6 @@ final class ProviderLoginTests: XCTestCase {
         )
     }
 
-    private static func workspaces() throws -> [CodexWorkspace] {
-        try CodexClient.makeDecoder().decode(
-            [CodexWorkspace].self,
-            from: Data(#"[{"id": "scratch", "name": "Scratch"}]"#.utf8)
-        )
-    }
-
     /// Wait for a condition the flow's poll loop will land; the deadline is a
     /// hang detector, not a synchronization primitive.
     @MainActor
@@ -371,37 +371,21 @@ private final class StubHarnessLoginClient: HarnessLoginClient {
         let url: URL
     }
 
-    struct TerminalInput: Equatable {
-        let terminalID: String
-        let text: String
-    }
-
     var startResult: RelayHarnessOp?
     var startError: Error?
     var forwardError: Error?
     var currentOp: RelayHarnessOp?
     var listedOps: [RelayHarnessOp] = []
     var harnesses: [RelayHarnessStatus] = []
-    var workspaces: [CodexWorkspace] = []
+    /// Content the fallback's `tail -c` polls read back.
+    var loginLog = ""
     /// First entry whose key is contained in the exec command wins; other
-    /// commands get an empty success.
+    /// commands get an empty success (log polls serve `loginLog`).
     var execResults: [(contains: String, result: CodexExecResult)] = []
     private(set) var sentInputs: [SentInput] = []
     private(set) var forwardedCallbacks: [ForwardedCallback] = []
     private(set) var cancelledOpIDs: [String] = []
-    private(set) var createdTerminals: [CodexTerminal] = []
-    private(set) var terminalInputs: [TerminalInput] = []
-    private(set) var closedTerminalIDs: [String] = []
     private(set) var execCommands: [String] = []
-    private var terminalContinuations: [AsyncThrowingStream<CodexTerminalStreamEvent, Error>.Continuation] = []
-    private var bufferedTerminalOutput = ""
-
-    func pushTerminalOutput(_ text: String) {
-        bufferedTerminalOutput += text
-        for continuation in terminalContinuations {
-            continuation.yield(.output(text))
-        }
-    }
 
     func startHarnessLogin(provider: CodexProvider) async throws -> RelayHarnessOp {
         if let startError { throw startError }
@@ -441,50 +425,11 @@ private final class StubHarnessLoginClient: HarnessLoginClient {
         harnesses
     }
 
-    func fetchCodexWorkspaces() async throws -> [CodexWorkspace] {
-        workspaces
-    }
-
-    func createTerminal(workspaceID: String, cols: Int, rows: Int) async throws -> CodexTerminal {
-        let terminal = CodexTerminal(
-            id: "term-\(createdTerminals.count + 1)",
-            workspaceId: workspaceID,
-            workspaceName: workspaceID,
-            status: "running",
-            createdAt: nil,
-            updatedAt: nil,
-            finishedAt: nil,
-            exitCode: nil,
-            cols: cols,
-            rows: rows
-        )
-        createdTerminals.append(terminal)
-        return terminal
-    }
-
-    func sendTerminalInput(id: String, text: String) async throws {
-        terminalInputs.append(TerminalInput(terminalID: id, text: text))
-    }
-
-    func closeTerminal(id: String) async throws {
-        closedTerminalIDs.append(id)
-    }
-
-    nonisolated func terminalEvents(id: String) -> AsyncThrowingStream<CodexTerminalStreamEvent, Error> {
-        AsyncThrowingStream { continuation in
-            Task { @MainActor in
-                // Mirror the real server: the opening snapshot carries every
-                // byte that landed in the buffer before the stream attached.
-                if let terminal = self.createdTerminals.last {
-                    continuation.yield(.snapshot(terminal: terminal, output: self.bufferedTerminalOutput))
-                }
-                self.terminalContinuations.append(continuation)
-            }
-        }
-    }
-
     func execCommand(_ command: String, timeoutMs: Int?) async throws -> CodexExecResult {
         execCommands.append(command)
+        if command.contains("tail -c") {
+            return CodexExecResult(exitCode: 0, stdout: loginLog)
+        }
         if let match = execResults.first(where: { command.contains($0.contains) }) {
             return match.result
         }

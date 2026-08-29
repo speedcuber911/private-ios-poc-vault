@@ -92,19 +92,28 @@ poll shows succeeded ◀──────── op → succeeded, harness.chang
   waitingForSignIn(op) → completing → succeeded | failed(reason)`;
   adopts an already-running login on 409; 1 s op polling; cancel frees
   the machine's slot.
-- **Legacy-machine fallback** (added same day, after field testing against
-  a machine still running the pre-change relayd): the flow model carries a
-  second engine that needs only W2-era routes — terminals, `POST /v1/exec`,
-  and `GET /v1/harness`. It runs the provider's own login inside a machine
-  terminal (a real PTY, which also cures CLIs that stay silent without
-  one), scrapes the sign-in URL/user code from the terminal stream on the
-  phone (ANSI-stripped, relayd-pattern parity), types the pasted code back
-  into that terminal, replays a captured localhost callback with one
-  bounded `node -e 'fetch(…)'` exec against `127.0.0.1`, and takes the
-  harness list's `loggedIn: true` as the machine's confirmation. It engages
-  automatically: op routes 404, the op dies before producing a link, no
-  link within 8 s, or input/callback answer 404 at completion time. The
-  modern op engine remains the path on updated machines.
+- **Legacy-machine fallback** (added same day, then rebuilt once more after
+  field testing): the flow model carries a second engine that needs only
+  `POST /v1/exec` and `GET /v1/harness`. The first fallback rode Relay's
+  terminals — and field testing exposed why it can't: terminals run through
+  the Codex app-server, i.e. through the codex CLI itself, which hangs on a
+  machine where codex has never signed in. The exact chicken-and-egg this
+  feature exists to break. The exec engine has no such dependency: it
+  launches the CLI's login via one bounded exec under util-linux `script`
+  (a real PTY, which also cures CLIs that stay silent without one; plain
+  redirection when `script` is absent), detached with `setsid`, output
+  flushed to a log file, stdin fed from a FIFO held open by a writer fd.
+  The phone resolves the CLI's absolute path first (headless PATH misses
+  npm-global bins — the /opt/node/bin incident), polls the log through
+  exec, scrapes the URL/user code (ANSI-stripped, relayd-pattern parity),
+  quotes the machine's own error line on failure and shows the live output
+  tail on the sheet, writes the pasted code into the FIFO, replays a
+  captured localhost callback with one bounded `node -e 'fetch(…)'` exec
+  against `127.0.0.1`, and takes the harness list's `loggedIn: true` as the
+  machine's confirmation. It engages automatically: op routes 404, the op
+  dies before producing a link, no link within 8 s, or input/callback
+  answer 404 at completion time. The modern op engine remains the path on
+  updated machines.
 - `Views/ProviderLoginView.swift`: the sheet (Editorial Ember: explicit
   status copy, never a dot), Safari and intercepting-WKWebView browsers,
   code display with tap-to-copy, paste field.
