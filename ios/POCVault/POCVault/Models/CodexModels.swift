@@ -508,6 +508,26 @@ struct RelayHarnessOp: Decodable, Hashable, Identifiable {
         case error
     }
 
+    /// Direct construction for the legacy-machine fallback, which discovers the
+    /// sign-in artifacts itself (from terminal output) instead of decoding an op.
+    init(
+        id: String,
+        provider: CodexProvider,
+        action: String = "login",
+        status: Status = .waitingForUser,
+        verificationURL: URL? = nil,
+        userCode: String? = nil,
+        error: String? = nil
+    ) {
+        self.id = id
+        self.provider = provider
+        self.action = action
+        self.status = status
+        self.verificationURL = verificationURL
+        self.userCode = userCode
+        self.error = error
+    }
+
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(String.self, forKey: .id)
@@ -534,6 +554,36 @@ struct RelayHarnessOp: Decodable, Hashable, Identifiable {
 
 struct CodexHarnessOpEnvelope: Decodable {
     let op: RelayHarnessOp
+}
+
+/// Result of one bounded command run on the machine (`POST /v1/exec`).
+struct CodexExecResult: Decodable, Hashable {
+    let exitCode: Int?
+    let stdout: String
+    let stderr: String
+    let timedOut: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case exitCode
+        case stdout
+        case stderr
+        case timedOut
+    }
+
+    init(exitCode: Int?, stdout: String = "", stderr: String = "", timedOut: Bool = false) {
+        self.exitCode = exitCode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.timedOut = timedOut
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        exitCode = try container.decodeIfPresent(Int.self, forKey: .exitCode)
+        stdout = (try container.decodeIfPresent(String.self, forKey: .stdout)) ?? ""
+        stderr = (try container.decodeIfPresent(String.self, forKey: .stderr)) ?? ""
+        timedOut = (try container.decodeIfPresent(Bool.self, forKey: .timedOut)) ?? false
+    }
 }
 
 struct RelayHarnessTaskControls: Decodable, Hashable {

@@ -92,6 +92,19 @@ poll shows succeeded ◀──────── op → succeeded, harness.chang
   waitingForSignIn(op) → completing → succeeded | failed(reason)`;
   adopts an already-running login on 409; 1 s op polling; cancel frees
   the machine's slot.
+- **Legacy-machine fallback** (added same day, after field testing against
+  a machine still running the pre-change relayd): the flow model carries a
+  second engine that needs only W2-era routes — terminals, `POST /v1/exec`,
+  and `GET /v1/harness`. It runs the provider's own login inside a machine
+  terminal (a real PTY, which also cures CLIs that stay silent without
+  one), scrapes the sign-in URL/user code from the terminal stream on the
+  phone (ANSI-stripped, relayd-pattern parity), types the pasted code back
+  into that terminal, replays a captured localhost callback with one
+  bounded `node -e 'fetch(…)'` exec against `127.0.0.1`, and takes the
+  harness list's `loggedIn: true` as the machine's confirmation. It engages
+  automatically: op routes 404, the op dies before producing a link, no
+  link within 8 s, or input/callback answer 404 at completion time. The
+  modern op engine remains the path on updated machines.
 - `Views/ProviderLoginView.swift`: the sheet (Editorial Ember: explicit
   status copy, never a dot), Safari and intercepting-WKWebView browsers,
   code display with tap-to-copy, paste field.

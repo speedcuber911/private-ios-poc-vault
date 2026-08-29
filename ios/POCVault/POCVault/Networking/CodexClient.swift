@@ -397,6 +397,25 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         return try decoder.decode(CodexHarnessOpEnvelope.self, from: data).op
     }
 
+    /// Registered workspaces on the machine. The direct-login fallback needs one
+    /// only as the mount point for a terminal session; any registered id works.
+    func fetchCodexWorkspaces() async throws -> [CodexWorkspace] {
+        let data = try await perform(path: "/v1/codex/workspaces")
+        return try decoder.decode(CodexListEnvelope<CodexWorkspace>.self, from: data).values
+    }
+
+    /// One bounded command on the machine (`POST /v1/exec`). Used by the
+    /// direct-login fallback to replay a captured localhost OAuth callback and
+    /// to clear stale login processes on machines that predate the harness
+    /// login-op input/callback routes.
+    func execCommand(_ command: String, timeoutMs: Int? = nil) async throws -> CodexExecResult {
+        var payload: [String: Any] = ["command": command]
+        if let timeoutMs { payload["timeoutMs"] = timeoutMs }
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        let data = try await perform(path: "/v1/exec", method: "POST", body: body)
+        return try decoder.decode(CodexExecResult.self, from: data)
+    }
+
     /// Discover the skills actually installed for one harness on the linked computer.
     /// The endpoint is provider-scoped so a Claude skill can never leak into a Codex run
     /// (or vice versa), and the returned descriptor contains no runner-local paths.
