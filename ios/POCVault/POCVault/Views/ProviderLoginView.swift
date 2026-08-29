@@ -19,6 +19,7 @@ struct ProviderLoginView: View {
     @State private var safariTarget: ProviderLoginBrowserTarget?
     @State private var callbackBrowserTarget: ProviderLoginBrowserTarget?
     @State private var didCopyCode = false
+    @State private var showsNoLinkHint = false
 
     init(client: CodexClient, provider: CodexProvider) {
         _flow = StateObject(wrappedValue: ProviderLoginFlowModel(client: client, provider: provider))
@@ -135,11 +136,29 @@ struct ProviderLoginView: View {
             }
 
             if op.verificationURL == nil {
-                HStack(spacing: 10) {
-                    ProgressView().tint(AppTheme.accent)
-                    Text("Waiting for the sign-in link from your machine…")
-                        .font(AppTheme.uiFont(size: 13))
-                        .foregroundStyle(AppTheme.textSecondary)
+                VStack(spacing: 12) {
+                    HStack(spacing: 10) {
+                        ProgressView().tint(AppTheme.accent)
+                        Text("Waiting for the sign-in link from your machine…")
+                            .font(AppTheme.uiFont(size: 13))
+                            .foregroundStyle(AppTheme.textSecondary)
+                    }
+
+                    if showsNoLinkHint {
+                        // The CLI started but never printed a link relayd could
+                        // scrape — usually an outdated Relay build on the
+                        // machine, or a login command that needs configuring
+                        // there. The Terminal path works regardless.
+                        Text("Still nothing? The machine may be running an older Relay build. You can also open this folder's Terminal and run \(flow.provider.displayName)'s own login command — the link and code appear right there.")
+                            .font(AppTheme.uiFont(size: 12))
+                            .foregroundStyle(AppTheme.statusWarn)
+                            .multilineTextAlignment(.center)
+                            .accessibilityIdentifier("relay-provider-login-stall-hint")
+                    }
+                }
+                .task {
+                    try? await Task.sleep(for: .seconds(20))
+                    if !Task.isCancelled { showsNoLinkHint = true }
                 }
             } else {
                 Button("Open sign-in page") {
