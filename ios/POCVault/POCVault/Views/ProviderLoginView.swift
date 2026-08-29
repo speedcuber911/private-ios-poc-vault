@@ -144,12 +144,40 @@ struct ProviderLoginView: View {
                             .foregroundStyle(AppTheme.textSecondary)
                     }
 
+                    if let tail = flow.terminalTail {
+                        // The machine's own words beat any guess: whatever the
+                        // login command printed instead of a link is the
+                        // diagnosis, so put it on the sheet.
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("From your machine:")
+                                .font(AppTheme.uiFont(size: 10, weight: .semibold))
+                                .foregroundStyle(AppTheme.textTertiary)
+                            Text(tail)
+                                .font(AppTheme.monoFont(size: 11))
+                                .foregroundStyle(AppTheme.textSecondary)
+                                .lineLimit(8)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .padding(10)
+                        .background {
+                            RoundedRectangle(cornerRadius: 10)
+                                .stroke(AppTheme.hairlineStrong, lineWidth: 1)
+                        }
+                        .accessibilityIdentifier("relay-provider-login-terminal-tail")
+                    } else if showsNoLinkHint, flow.isUsingTerminalEngine {
+                        Text("The machine's terminal hasn't produced any output yet.")
+                            .font(AppTheme.uiFont(size: 12))
+                            .foregroundStyle(AppTheme.statusWarn)
+                            .multilineTextAlignment(.center)
+                            .accessibilityIdentifier("relay-provider-login-no-output")
+                    }
+
                     if showsNoLinkHint {
                         // The CLI started but never printed a link relayd could
                         // scrape — usually an outdated Relay build on the
                         // machine, or a login command that needs configuring
                         // there. The Terminal path works regardless.
-                        Text("Still nothing? The machine may be running an older Relay build. You can also open this folder's Terminal and run \(flow.provider.displayName)'s own login command — the link and code appear right there.")
+                        Text("Still nothing? You can also open this folder's Terminal and run \(flow.provider.displayName)'s own login command — the link and code appear right there.")
                             .font(AppTheme.uiFont(size: 12))
                             .foregroundStyle(AppTheme.statusWarn)
                             .multilineTextAlignment(.center)

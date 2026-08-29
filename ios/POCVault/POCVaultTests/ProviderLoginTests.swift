@@ -211,6 +211,8 @@ final class ProviderLoginTests: XCTestCase {
             if case .waitingForSignIn(let op) = flow.step { return op.verificationURL != nil }
             return false
         }
+        XCTAssertTrue(flow.terminalTail?.contains("Visit") == true,
+                      "the sheet surfaces the machine's own output while a link is pending")
 
         // Pasting types the code into the same terminal.
         flow.pastedCode = " paste-code-123 "

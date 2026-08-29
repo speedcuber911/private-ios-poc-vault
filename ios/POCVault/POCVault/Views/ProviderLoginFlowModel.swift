@@ -81,6 +81,17 @@ final class ProviderLoginFlowModel: ObservableObject {
     /// under the waiting spinner so a stall names its stage instead of
     /// looking like a generic hang.
     @Published private(set) var progressDetail: String?
+    /// Tail of the machine terminal's (ANSI-stripped) output while the
+    /// fallback login runs. Shown on the sheet whenever there is no link
+    /// yet, so a stalled sign-in displays exactly what the machine said
+    /// instead of a spinner with a secret.
+    @Published private(set) var terminalTail: String?
+
+    /// True while the legacy-machine terminal engine is driving the login.
+    var isUsingTerminalEngine: Bool {
+        if case .terminal = engine { return true }
+        return false
+    }
 
     /// Poll cadences and patience windows; tests shrink them.
     var pollInterval: Duration = .seconds(1)
@@ -155,6 +166,7 @@ final class ProviderLoginFlowModel: ObservableObject {
         sawSignInArtifacts = false
         usedTerminalFallback = false
         progressDetail = nil
+        terminalTail = nil
         step = .starting
         do {
             adoptOp(try await client.startHarnessLogin(provider: provider))
@@ -452,6 +464,8 @@ final class ProviderLoginFlowModel: ObservableObject {
         guard terminalCommandSent else { return }
         terminalOutput = String((terminalOutput + chunk).suffix(64 * 1024))
         let stripped = Self.strippedTerminalText(terminalOutput)
+        let tail = String(stripped.suffix(360)).trimmingCharacters(in: .whitespacesAndNewlines)
+        terminalTail = tail.isEmpty ? nil : tail
 
         // A login that errored will never produce a link — surface the
         // machine's own words now instead of spinning until the deadline.
