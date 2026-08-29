@@ -1130,6 +1130,37 @@ Long-running harness actions are modeled as **operations**, not jobs
 - **`GET /v1/harness/ops/:id`** → 200 `{op}`; **`GET /v1/harness/ops`**
   → recent ops, bounded (`limit` clamp 1–200).
 
+Direct login from the phone — three op-scoped actions let the app finish
+a login with no laptop in the loop. Login children are spawned with stdin
+piped (not ignored) so paste-back prompts can be answered remotely:
+
+- **`POST /v1/harness/ops/:id/input`** `{text}` → 200 `{op}` — writes one
+  line to an ACTIVE login op's stdin: the code the provider's sign-in
+  page shows after browser auth (Claude-style paste-back). `text` is
+  trimmed, single-line, ≤ 4 KiB, no control characters (400 otherwise).
+  It is a credential: relayd writes it to the child and nowhere else —
+  never `op.log`, never the audit record (which carries op id + provider
+  only).
+- **`POST /v1/harness/ops/:id/callback`** `{url}` → 200
+  `{op, upstreamStatus}` — replays the provider's localhost OAuth
+  callback on the node. `codex login` binds a login server on
+  `localhost:1455` and the browser is redirected there with the
+  authorization code; on the phone nothing listens, so the app's in-app
+  browser captures that redirect and hands the URL here. relayd
+  validates it hard — active login op only; `http:` on
+  `localhost`/`127.0.0.1`; the port configured for the op's provider
+  (default `{"codex": 1455}`, override
+  `RELAYD_HARNESS_CALLBACK_PORTS='{"codex":1455,…}'`; providers without
+  an entry → 400); path exactly `/auth/callback` — then GETs it against
+  `127.0.0.1:<port>`, following ≤ 3 same-origin redirects so the CLI's
+  callback → success chain runs exactly as in a local browser. The query
+  string carries the authorization code: forwarded to loopback and never
+  logged/audited. Unreachable login server → 502.
+- **`POST /v1/harness/ops/:id/cancel`** → 200 `{op}` — SIGTERMs an
+  active op's child and finishes it as `cancelled`; frees the
+  provider's one-active-op slot immediately. Finished op → 409.
+
+
 Operation shape:
 
 ```json

@@ -370,6 +370,7 @@ struct POCVaultRootView: View {
                 identityStore: identityStore,
                 computerLinkStore: computerLinkStore,
                 trialClient: trialClient,
+                codexClient: codexClient,
                 subscriptionStore: subscriptionStore,
                 showsDismissButton: false
             )

@@ -177,7 +177,8 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(signedOut.provider, .codex)
         XCTAssertTrue(signedOut.isConfirmedUnavailable)
         XCTAssertEqual(signedOut.shortStatus, "Needs connection")
-        XCTAssertEqual(signedOut.actionMessage, "Run relay sync-auth on your Mac to connect Codex, then try again.")
+        XCTAssertEqual(signedOut.actionMessage, "Codex is not connected. Sign in from this iPhone, or run relay sync-auth on your Mac.")
+        XCTAssertTrue(signedOut.supportsDirectLogin)
         XCTAssertEqual(signedOut.taskControls?.model, true)
         XCTAssertEqual(signedOut.taskControls?.reasoningEffort, true)
         XCTAssertEqual(signedOut.taskControls?.approvalPolicies, ["untrusted", "on-request", "never"])
@@ -187,7 +188,16 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(connected.shortStatus, "Connected")
         XCTAssertNil(connected.actionMessage)
         XCTAssertEqual(kimiSignedOut.provider, .kimi)
-        XCTAssertEqual(kimiSignedOut.actionMessage, "Run relay sync-auth on your Mac to connect Kimi K3, then try again.")
+        XCTAssertEqual(kimiSignedOut.actionMessage, "Kimi K3 is not connected. Sign in from this iPhone, or run relay sync-auth on your Mac.")
+
+        let notInstalled = try JSONDecoder().decode(
+            RelayHarnessStatus.self,
+            from: Data("""
+            { "provider": "cursor", "installed": false, "authKind": "unknown" }
+            """.utf8)
+        )
+        XCTAssertEqual(notInstalled.actionMessage, "Cursor is not installed on this computer.")
+        XCTAssertFalse(notInstalled.supportsDirectLogin, "an uninstalled CLI has nothing to sign in to")
     }
 
     func testCodexModelDescriptorAllowsOptionalEffortLevels() throws {

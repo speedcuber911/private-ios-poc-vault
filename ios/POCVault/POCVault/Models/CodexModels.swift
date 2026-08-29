@@ -463,11 +463,77 @@ struct RelayHarnessStatus: Decodable, Hashable, Identifiable {
             return "\(provider.displayName) is not installed on this computer."
         }
         guard loggedIn == false else { return nil }
-        if provider == .cursor {
-            return "Run cursor-agent login on the computer, then try again."
-        }
-        return "Run relay sync-auth on your Mac to connect \(provider.displayName), then try again."
+        return "\(provider.displayName) is not connected. Sign in from this iPhone, or run relay sync-auth on your Mac."
     }
+
+    /// Whether the phone can drive this provider's own CLI login on the machine
+    /// (`POST /v1/harness/:provider/login`). True for every agent harness relayd
+    /// manages; an uninstalled CLI has nothing to sign in to.
+    var supportsDirectLogin: Bool {
+        installed
+    }
+}
+
+/// One long-running harness operation on the machine (`login` or `smoke`),
+/// as reported by `GET /v1/harness/ops/:id`. Login ops surface the provider's
+/// own public sign-in artifacts (verification URL, user code); credentials
+/// themselves never transit the API in either direction.
+struct RelayHarnessOp: Decodable, Hashable, Identifiable {
+    enum Status: String {
+        case queued
+        case running
+        case waitingForUser = "waiting_for_user"
+        case succeeded
+        case failed
+        case expired
+        case cancelled
+        case unknown
+    }
+
+    let id: String
+    let provider: CodexProvider
+    let action: String
+    let status: Status
+    let verificationURL: URL?
+    let userCode: String?
+    let error: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case provider
+        case action
+        case status
+        case verificationUrl
+        case userCode
+        case error
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        provider = try container.decode(CodexProvider.self, forKey: .provider)
+        action = (try container.decodeIfPresent(String.self, forKey: .action))?.trimmedNonEmpty ?? "login"
+        let rawStatus = (try container.decodeIfPresent(String.self, forKey: .status)) ?? ""
+        status = Status(rawValue: rawStatus) ?? .unknown
+        verificationURL = (try container.decodeIfPresent(String.self, forKey: .verificationUrl))?
+            .trimmedNonEmpty
+            .flatMap { URL(string: $0) }
+        userCode = try container.decodeIfPresent(String.self, forKey: .userCode)?.trimmedNonEmpty
+        error = try container.decodeIfPresent(String.self, forKey: .error)?.trimmedNonEmpty
+    }
+
+    var isActive: Bool {
+        switch status {
+        case .queued, .running, .waitingForUser:
+            return true
+        case .succeeded, .failed, .expired, .cancelled, .unknown:
+            return false
+        }
+    }
+}
+
+struct CodexHarnessOpEnvelope: Decodable {
+    let op: RelayHarnessOp
 }
 
 struct RelayHarnessTaskControls: Decodable, Hashable {

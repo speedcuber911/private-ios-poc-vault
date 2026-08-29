@@ -29,6 +29,7 @@ struct RelayChatView: View {
     @State private var didHandleInitialProviderPicker = false
     @State private var aiDataConsentRequest: RelayAIDataConsentRequest?
     @State private var automaticallyPresentedConsentProviders: Set<CodexProvider> = []
+    @State private var providerLoginRequest: CodexProvider?
 
     var body: some View {
         NavigationStack {
@@ -89,6 +90,9 @@ struct RelayChatView: View {
                         onStop: {
                             UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
                             viewModel.stopStreaming()
+                        },
+                        onConnectProvider: { provider in
+                            providerLoginRequest = provider
                         }
                     )
                     .fixedSize(horizontal: false, vertical: true)
@@ -114,6 +118,13 @@ struct RelayChatView: View {
             }
             .refreshable {
                 await viewModel.refreshThreads()
+            }
+            .sheet(item: $providerLoginRequest, onDismiss: {
+                // The machine's login state changed (or the user backed out);
+                // either way the composer notice must reflect reality.
+                Task { await viewModel.refreshHarnesses() }
+            }) { provider in
+                ProviderLoginView(client: client, provider: provider)
             }
             .sheet(isPresented: $showingThreads) {
                 RelayThreadDrawer(
@@ -558,6 +569,8 @@ private struct RelayComposer: View {
     let onReviewAIDataSharing: () -> Void
     let onSend: () -> Void
     let onStop: () -> Void
+    /// Direct provider sign-in from this iPhone; nil hides the affordance.
+    var onConnectProvider: ((CodexProvider) -> Void)? = nil
     @State private var isFocused = false
     @State private var editorSelection = NSRange(location: 0, length: 0)
     @State private var editorHeight: CGFloat = 36
@@ -881,6 +894,16 @@ private struct RelayComposer: View {
                         .font(AppTheme.uiFont(size: 11, weight: .medium))
                         .foregroundStyle(AppTheme.statusWarn)
                         .frame(maxWidth: .infinity, alignment: .leading)
+
+                    if let onConnectProvider, harnessStatus.supportsDirectLogin, harnessStatus.loggedIn == false {
+                        Button("Connect") {
+                            onConnectProvider(harnessStatus.provider)
+                        }
+                        .font(AppTheme.uiFont(size: 11, weight: .semibold))
+                        .foregroundStyle(AppTheme.accent)
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("relay-provider-connect")
+                    }
                 }
                 .padding(.horizontal, 4)
                 .accessibilityElement(children: .combine)

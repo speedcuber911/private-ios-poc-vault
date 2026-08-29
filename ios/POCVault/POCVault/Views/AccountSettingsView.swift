@@ -6,6 +6,7 @@ struct AccountSettingsView: View {
     @ObservedObject var identityStore: ClientIdentityStore
     @ObservedObject var computerLinkStore: RelayComputerLinkStore
     let trialClient: RelayTrialClient
+    let codexClient: CodexClient
     @ObservedObject var subscriptionStore: RelaySubscriptionStore
     var showsDismissButton = true
     @Environment(\.dismiss) private var dismiss
@@ -20,6 +21,10 @@ struct AccountSettingsView: View {
     @State private var signedInPlacesError: String?
     @State private var showingDisconnectConfirmation = false
     @State private var browserToRemove: RelayBrowserSession?
+    @State private var harnesses: [RelayHarnessStatus] = []
+    @State private var isLoadingHarnesses = false
+    @State private var harnessError: String?
+    @State private var providerLoginRequest: CodexProvider?
 
     var body: some View {
         NavigationStack {
@@ -208,6 +213,48 @@ struct AccountSettingsView: View {
                     }
                 }
 
+                if nodeStore.hasMachine {
+                    Section {
+                        if isLoadingHarnesses && harnesses.isEmpty {
+                            HStack(spacing: 10) {
+                                ProgressView()
+                                Text("Checking agents on your machine…")
+                                    .foregroundStyle(AppTheme.textSecondary)
+                            }
+                        }
+
+                        ForEach(harnesses.filter(\.installed)) { harness in
+                            HStack(spacing: 10) {
+                                RelayProviderMark(provider: harness.provider, size: 16)
+                                Text(harness.provider.displayName)
+                                Spacer()
+                                if harness.loggedIn == true {
+                                    Text("Connected")
+                                        .foregroundStyle(AppTheme.textSecondary)
+                                } else {
+                                    Button(harness.loggedIn == false ? "Sign in" : "Check sign-in") {
+                                        providerLoginRequest = harness.provider
+                                    }
+                                    .accessibilityIdentifier("relay-agent-sign-in-\(harness.provider.rawValue)")
+                                }
+                            }
+                        }
+
+                        if let harnessError {
+                            Label(harnessError, systemImage: "exclamationmark.triangle.fill")
+                                .foregroundStyle(AppTheme.statusError)
+
+                            Button("Try again") {
+                                Task { await loadHarnesses() }
+                            }
+                        }
+                    } header: {
+                        Text("Coding agents")
+                    } footer: {
+                        Text("Sign in to each agent right from this iPhone — no laptop needed. The session is stored on your machine, and `relay sync-auth` from a Mac still works too.")
+                    }
+                }
+
                 Section("About") {
                     LabeledContent("App", value: "Relay")
                     LabeledContent("Version", value: versionText)
@@ -292,6 +339,11 @@ struct AccountSettingsView: View {
                     }
                 }
             }
+            .sheet(item: $providerLoginRequest, onDismiss: {
+                Task { await loadHarnesses() }
+            }) { provider in
+                ProviderLoginView(client: codexClient, provider: provider)
+            }
             .sheet(isPresented: $showingCLILink, onDismiss: {
                 Task { await loadLinkedComputer() }
             }) {
@@ -304,6 +356,10 @@ struct AccountSettingsView: View {
             }
             .task {
                 await loadLinkedComputer()
+            }
+            .task(id: nodeStore.hasMachine) {
+                guard nodeStore.hasMachine else { return }
+                await loadHarnesses()
             }
             .task(id: computerLinkStore.computer?.id) {
                 guard computerLinkStore.computer?.status == .connecting else { return }
@@ -349,6 +405,18 @@ struct AccountSettingsView: View {
             identityStore.discardTrialMaterial()
         } catch {
             trialDeleteError = "Relay couldn't delete the trial machine. Try again."
+        }
+    }
+
+    private func loadHarnesses() async {
+        guard nodeStore.hasMachine else { return }
+        isLoadingHarnesses = true
+        harnessError = nil
+        defer { isLoadingHarnesses = false }
+        do {
+            harnesses = try await codexClient.fetchHarnesses()
+        } catch {
+            harnessError = "Relay couldn't check the agents on your machine."
         }
     }
 

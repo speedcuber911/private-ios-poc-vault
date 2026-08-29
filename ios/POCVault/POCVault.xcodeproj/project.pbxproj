@@ -64,6 +64,9 @@
 		200000000000000000000067 /* CLILinkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000067 /* CLILinkTests.swift */; };
 		200000000000000000000068 /* SignedInPlacesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000068 /* SignedInPlacesTests.swift */; };
 		200000000000000000000071 /* RelaySubscriptionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000071 /* RelaySubscriptionStore.swift */; };
+		200000000000000000000072 /* ProviderLoginFlowModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000072 /* ProviderLoginFlowModel.swift */; };
+		200000000000000000000073 /* ProviderLoginView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000073 /* ProviderLoginView.swift */; };
+		200000000000000000000074 /* ProviderLoginTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000074 /* ProviderLoginTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -139,6 +142,9 @@
 		100000000000000000000067 /* CLILinkTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CLILinkTests.swift; sourceTree = "<group>"; };
 		100000000000000000000068 /* SignedInPlacesTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignedInPlacesTests.swift; sourceTree = "<group>"; };
 		100000000000000000000071 /* RelaySubscriptionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelaySubscriptionStore.swift; sourceTree = "<group>"; };
+		100000000000000000000072 /* ProviderLoginFlowModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProviderLoginFlowModel.swift; sourceTree = "<group>"; };
+		100000000000000000000073 /* ProviderLoginView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProviderLoginView.swift; sourceTree = "<group>"; };
+		100000000000000000000074 /* ProviderLoginTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProviderLoginTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -206,6 +212,7 @@
 				100000000000000000000063 /* HandoffTests.swift */,
 				100000000000000000000067 /* CLILinkTests.swift */,
 				100000000000000000000068 /* SignedInPlacesTests.swift */,
+				100000000000000000000074 /* ProviderLoginTests.swift */,
 			);
 			path = POCVaultTests;
 			sourceTree = "<group>";
@@ -282,6 +289,8 @@
 				100000000000000000000061 /* RelayHandoffCardView.swift */,
 				100000000000000000000065 /* CLILinkFlowModel.swift */,
 				100000000000000000000066 /* CLILinkScannerView.swift */,
+				100000000000000000000072 /* ProviderLoginFlowModel.swift */,
+				100000000000000000000073 /* ProviderLoginView.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -500,6 +509,8 @@
 				200000000000000000000071 /* RelaySubscriptionStore.swift in Sources */,
 				200000000000000000000065 /* CLILinkFlowModel.swift in Sources */,
 				200000000000000000000066 /* CLILinkScannerView.swift in Sources */,
+				200000000000000000000072 /* ProviderLoginFlowModel.swift in Sources */,
+				200000000000000000000073 /* ProviderLoginView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -514,6 +525,7 @@
 				200000000000000000000063 /* HandoffTests.swift in Sources */,
 				200000000000000000000067 /* CLILinkTests.swift in Sources */,
 				200000000000000000000068 /* SignedInPlacesTests.swift in Sources */,
+				200000000000000000000074 /* ProviderLoginTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

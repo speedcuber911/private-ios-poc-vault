@@ -346,6 +346,57 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         return try decoder.decode(CodexListEnvelope<RelayHarnessStatus>.self, from: data).values
     }
 
+    // MARK: Direct provider login (harness login ops)
+
+    /// Start the provider CLI's own login flow on the machine
+    /// (`POST /v1/harness/:provider/login`). The returned op surfaces the
+    /// provider's public sign-in URL (and user code, when the provider uses
+    /// one) as the CLI prints them; poll `fetchHarnessOp` for progress.
+    func startHarnessLogin(provider: CodexProvider) async throws -> RelayHarnessOp {
+        let data = try await perform(
+            path: "/v1/harness/\(Self.pathComponent(provider.rawValue))/login",
+            method: "POST",
+            body: Data("{}".utf8)
+        )
+        return try decoder.decode(CodexHarnessOpEnvelope.self, from: data).op
+    }
+
+    func fetchHarnessOp(id: String) async throws -> RelayHarnessOp {
+        let data = try await perform(path: "/v1/harness/ops/\(Self.pathComponent(id))")
+        return try decoder.decode(CodexHarnessOpEnvelope.self, from: data).op
+    }
+
+    func fetchHarnessOps(limit: Int = 50) async throws -> [RelayHarnessOp] {
+        let data = try await perform(
+            path: "/v1/harness/ops",
+            queryItems: [URLQueryItem(name: "limit", value: String(limit))]
+        )
+        return try decoder.decode(CodexListEnvelope<RelayHarnessOp>.self, from: data).values
+    }
+
+    /// Deliver the code the user pasted from the provider's sign-in page to
+    /// the login CLI's stdin. The text is a credential: relayd writes it to
+    /// the CLI and keeps it out of logs on both sides.
+    func sendHarnessLoginInput(id: String, text: String) async throws -> RelayHarnessOp {
+        let body = try JSONSerialization.data(withJSONObject: ["text": text])
+        let data = try await perform(path: "/v1/harness/ops/\(Self.pathComponent(id))/input", method: "POST", body: body)
+        return try decoder.decode(CodexHarnessOpEnvelope.self, from: data).op
+    }
+
+    /// Replay the provider's localhost OAuth callback — captured by the in-app
+    /// sign-in browser — against the CLI's login server on the machine, where
+    /// that server actually listens.
+    func forwardHarnessLoginCallback(id: String, url: URL) async throws -> RelayHarnessOp {
+        let body = try JSONSerialization.data(withJSONObject: ["url": url.absoluteString])
+        let data = try await perform(path: "/v1/harness/ops/\(Self.pathComponent(id))/callback", method: "POST", body: body)
+        return try decoder.decode(CodexHarnessOpEnvelope.self, from: data).op
+    }
+
+    func cancelHarnessOp(id: String) async throws -> RelayHarnessOp {
+        let data = try await perform(path: "/v1/harness/ops/\(Self.pathComponent(id))/cancel", method: "POST", body: Data("{}".utf8))
+        return try decoder.decode(CodexHarnessOpEnvelope.self, from: data).op
+    }
+
     /// Discover the skills actually installed for one harness on the linked computer.
     /// The endpoint is provider-scoped so a Claude skill can never leak into a Codex run
     /// (or vice versa), and the returned descriptor contains no runner-local paths.

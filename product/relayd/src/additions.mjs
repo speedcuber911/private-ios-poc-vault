@@ -8,7 +8,7 @@
 import { sendJson, sendError, readBody, clampLimit, isSafeJobId } from "./util.mjs";
 import { streamNodeEvents, emitEvent } from "./events.mjs";
 import { listDevices, revokeDevice, publicDevice } from "./identity.mjs";
-import { listHarnesses, getOp, listOps, publicOp, startLoginOp, startSmokeOp } from "./harness.mjs";
+import { listHarnesses, getOp, listOps, publicOp, startLoginOp, sendLoginInput, forwardLoginCallback, cancelOp, startSmokeOp } from "./harness.mjs";
 import { serveExportTar } from "./fsapi.mjs";
 import { serveExec } from "./exec.mjs";
 import { continueHandoff } from "./handoff.mjs";
@@ -89,6 +89,28 @@ async function handleAdditionRoutes(req, res, url, auth) {
       return true;
     }
     sendJson(res, 200, { op: publicOp(op) });
+    return true;
+  }
+
+  // Direct login from the phone: deliver paste-back input to the login CLI's
+  // stdin, replay the provider's localhost OAuth callback on this node, or
+  // cancel an op the user abandoned. Input text and callback URLs carry
+  // authorization codes — harness.mjs forwards them and never logs them.
+  const opActionMatch = url.pathname.match(/^\/v1\/harness\/ops\/([^/]+)\/(input|callback|cancel)$/);
+  if (opActionMatch && req.method === "POST") {
+    const [, opId, opAction] = opActionMatch;
+    if (!isSafeJobId(opId)) {
+      sendError(res, 404, "not found");
+      return true;
+    }
+    const body = await readBody(req);
+    if (opAction === "input") {
+      sendJson(res, 200, { op: sendLoginInput(opId, typeof body?.text === "string" ? body.text : "") });
+    } else if (opAction === "callback") {
+      sendJson(res, 200, await forwardLoginCallback(opId, typeof body?.url === "string" ? body.url : ""));
+    } else {
+      sendJson(res, 200, { op: cancelOp(opId) });
+    }
     return true;
   }
 

@@ -7,6 +7,7 @@
 import { execFile, spawn, execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 
@@ -20,6 +21,22 @@ const opLogTailBytes = 8 * 1024;
 const loginTimeoutMs = 10 * 60 * 1000;
 
 const smokeTimeoutMs = 2 * 60 * 1000;
+
+// Direct login from the phone: bounded paste-back input and a bounded relay
+// of the provider's own localhost OAuth callback. Both carry credentials
+// (an authorization code), so neither the input text nor the callback query
+// may ever reach op.log, the audit trail, or stderr.
+const loginInputMaxBytes = 4 * 1024;
+
+const loginCallbackTimeoutMs = 15 * 1000;
+
+const loginCallbackMaxRedirects = 3;
+
+// The provider CLI's own local OAuth-callback listener. Only providers listed
+// here accept POST /v1/harness/ops/:id/callback; Codex's login server binds
+// 1455 (fixed upstream). Override per install with
+// RELAYD_HARNESS_CALLBACK_PORTS='{"codex":1455,...}'.
+const defaultLoginCallbackPorts = { codex: 1455 };
 
 const providerVersionCache = new Map();
 const providerVersionCacheMs = 5 * 60 * 1000;
@@ -312,7 +329,7 @@ async function assertProviderReady(provider, requirements = {}) {
   if (result.auth.loggedIn === false) {
     const action = cleanProvider === "cursor"
       ? "Run cursor-agent login on the computer, then try again."
-      : `Run relay sync-auth on your Mac to connect ${displayName}, then try again.`;
+      : `Connect ${displayName} from the Relay app (Settings → Coding agents), or run relay sync-auth on your Mac, then try again.`;
     throw Object.assign(new Error(`${displayName} is not connected on this computer. ${action}`), { status: 503 });
   }
   if (cleanProvider === "claude" && requirements.reasoningEffort && !providerTaskControls(cleanProvider).reasoningEffort) {
@@ -491,10 +508,14 @@ function startLoginOp(provider) {
   appendAudit("harness_login_started", null, { opId: op.id, provider: cleanProvider });
   emitEvent("harness.changed", publicOp(op));
 
+  // stdin stays open so a paste-back flow (the CLI prompts for the code the
+  // provider's site displays after sign-in) can be completed remotely via
+  // sendLoginInput. CLIs that never read stdin are unaffected.
   const child = spawn(providerBinary(cleanProvider), loginArgsFor(cleanProvider), {
     env: opEnv(cleanProvider),
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
   });
+  child.stdin?.on("error", () => {});
   attachOpChild(op, child, {
     timeoutMs: loginTimeoutMs,
     onExpire: "expired",
@@ -508,6 +529,155 @@ function startLoginOp(provider) {
       finishOp(op, "failed", `login exited with code ${code}`);
     }
   });
+  return publicOp(op);
+}
+
+function requireActiveLoginOp(opId) {
+  const op = getOp(opId);
+  if (!op) {
+    throw Object.assign(new Error("operation not found"), { status: 404 });
+  }
+  if (op.action !== "login") {
+    throw Object.assign(new Error("operation is not a login"), { status: 409 });
+  }
+  if (!activeOpStatuses.has(op.status)) {
+    throw Object.assign(new Error("login has already finished"), { status: 409 });
+  }
+  return op;
+}
+
+// POST /v1/harness/ops/:id/input — deliver one line the user typed on the
+// phone (typically the authorization code the provider's site shows after
+// sign-in) to the login CLI's stdin. The text is a credential: it is written
+// to the child and NOWHERE else — not op.log, not the audit record.
+function sendLoginInput(opId, text) {
+  const op = requireActiveLoginOp(opId);
+  if (typeof text !== "string" || text.trim().length === 0) {
+    throw Object.assign(new Error("text is required"), { status: 400 });
+  }
+  if (Buffer.byteLength(text, "utf8") > loginInputMaxBytes) {
+    throw Object.assign(new Error(`text must be at most ${loginInputMaxBytes} bytes`), { status: 400 });
+  }
+  const line = text.trim();
+  if (/[\u0000-\u001f\u007f]/.test(line)) {
+    throw Object.assign(new Error("text must be a single line without control characters"), { status: 400 });
+  }
+  const stdin = activeOpChildren.get(op.id)?.child?.stdin;
+  if (!stdin || stdin.destroyed || !stdin.writable) {
+    throw Object.assign(new Error("login is not accepting input"), { status: 409 });
+  }
+  stdin.write(`${line}\n`);
+  appendAudit("harness_login_input", null, { opId: op.id, provider: op.provider });
+  touchOp(op, {});
+  return publicOp(op);
+}
+
+// Optional override: RELAYD_HARNESS_CALLBACK_PORTS='{"codex":1455,...}'
+function loginCallbackPortFor(provider) {
+  const raw = process.env.RELAYD_HARNESS_CALLBACK_PORTS;
+  if (raw) {
+    try {
+      const port = Number(JSON.parse(raw)?.[provider]);
+      if (Number.isInteger(port) && port > 0 && port < 65536) return port;
+    } catch {
+      // Fall through to defaults.
+    }
+  }
+  return defaultLoginCallbackPorts[provider] || null;
+}
+
+// One GET against the provider CLI's local login server, following only
+// same-origin (localhost, same port) redirects so the CLI's own
+// callback → success chain runs exactly as it would in a local browser.
+function relayLocalLoginGet(port, pathWithQuery, redirectsLeft) {
+  return new Promise((resolve, reject) => {
+    const request = http.request(
+      { host: "127.0.0.1", port, path: pathWithQuery, method: "GET", agent: false, headers: { connection: "close" } },
+      (response) => {
+        response.resume();
+        const status = response.statusCode || 0;
+        const location = response.headers.location;
+        if (status >= 300 && status < 400 && location && redirectsLeft > 0) {
+          let next = null;
+          try {
+            next = new URL(location, `http://127.0.0.1:${port}`);
+          } catch {
+            next = null;
+          }
+          if (
+            next &&
+            (next.hostname === "127.0.0.1" || next.hostname === "localhost") &&
+            Number(next.port || 80) === port
+          ) {
+            response.on("end", () => {
+              relayLocalLoginGet(port, `${next.pathname}${next.search}`, redirectsLeft - 1).then(resolve, reject);
+            });
+            return;
+          }
+        }
+        response.on("end", () => resolve(status));
+      },
+    );
+    request.setTimeout(loginCallbackTimeoutMs, () => request.destroy(new Error("login server timed out")));
+    request.on("error", () => {
+      reject(Object.assign(new Error("the provider's login server is not reachable on this machine"), { status: 502 }));
+    });
+    request.end();
+  });
+}
+
+// POST /v1/harness/ops/:id/callback — the phone's in-app browser captured the
+// provider's redirect to its localhost login server (Codex binds 1455) and
+// hands it here to be replayed on the node, where that server actually runs.
+// The query string carries the OAuth authorization code, so it is forwarded
+// to 127.0.0.1 and NOWHERE else — never logged, never audited.
+async function forwardLoginCallback(opId, rawUrl) {
+  const op = requireActiveLoginOp(opId);
+  const port = loginCallbackPortFor(op.provider);
+  if (!port) {
+    throw Object.assign(new Error(`${op.provider} login does not use a local callback`), { status: 400 });
+  }
+  let parsed;
+  try {
+    parsed = new URL(String(rawUrl || ""));
+  } catch {
+    throw Object.assign(new Error("url must be an absolute URL"), { status: 400 });
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  if (parsed.protocol !== "http:" || (hostname !== "localhost" && hostname !== "127.0.0.1")) {
+    throw Object.assign(new Error("url must target the provider's localhost login server"), { status: 400 });
+  }
+  if (Number(parsed.port || 80) !== port) {
+    throw Object.assign(new Error(`url must target localhost port ${port}`), { status: 400 });
+  }
+  if (parsed.pathname !== "/auth/callback") {
+    throw Object.assign(new Error("url path is not a login callback"), { status: 400 });
+  }
+  appendAudit("harness_login_callback", null, { opId: op.id, provider: op.provider, path: parsed.pathname });
+  const upstreamStatus = await relayLocalLoginGet(port, `${parsed.pathname}${parsed.search}`, loginCallbackMaxRedirects);
+  touchOp(op, {});
+  return { op: publicOp(op), upstreamStatus };
+}
+
+// POST /v1/harness/ops/:id/cancel — user dismissed the flow on the phone.
+// Applies to any still-active op with a child (login or smoke).
+function cancelOp(opId) {
+  const op = getOp(opId);
+  if (!op) {
+    throw Object.assign(new Error("operation not found"), { status: 404 });
+  }
+  if (!activeOpStatuses.has(op.status) || op.finishedAt) {
+    throw Object.assign(new Error("operation has already finished"), { status: 409 });
+  }
+  const child = activeOpChildren.get(op.id)?.child;
+  if (child) {
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      // Already gone.
+    }
+  }
+  finishOp(op, "cancelled");
   return publicOp(op);
 }
 
@@ -570,5 +740,8 @@ export {
   getOp,
   listOps,
   startLoginOp,
+  sendLoginInput,
+  forwardLoginCallback,
+  cancelOp,
   startSmokeOp,
 };
