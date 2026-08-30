@@ -71,6 +71,7 @@ struct POCVaultApp: App {
             // per body evaluation leaked a URLSession every time SwiftUI re-ran it.
             .onChange(of: nodeStore.effectiveBaseURL, initial: true) { _, newBaseURL in
                 codexClient.retarget(baseURL: newBaseURL)
+                libraryViewModel.reset()
             }
             .task {
                 await accountStore.restore()
@@ -79,6 +80,7 @@ struct POCVaultApp: App {
                 #endif
             }
             .task(id: accountStore.user?.id) {
+                libraryViewModel.reset()
                 guard accountStore.user != nil else { return }
                 await subscriptionStore.prepare()
             }
@@ -135,7 +137,7 @@ struct POCVaultApp: App {
             // Adopting (or losing) a machine restarts the browser stack so
             // listings refetch; the shared client and the chat/status
             // stores survive it.
-            .id(nodeStore.effectiveBaseURL)
+            .id("\(nodeStore.effectiveBaseURL.absoluteString)|\(accountStore.user?.id ?? "signed-out")")
         }
     }
 
@@ -181,6 +183,7 @@ enum BrowserRoute: Hashable {
 
 private enum RelayRootTab: Hashable {
     case workspaces
+    case previews
     case sessions
     case settings
 }
@@ -213,18 +216,13 @@ struct POCVaultRootView: View {
     /// cards live, so that is where the tap has to land.
     @State private var opensThreadsForHandoff = false
     @State private var selectedRootTab = RelayRootTab.workspaces
-    @State private var showingLibrary = false
     @State private var showingDiagnostics = false
+    @State private var previewIdentityRevision = 0
 
     var body: some View {
         mainTabs
         .tint(AppTheme.accent)
         .preferredColorScheme(.dark)
-        // Library embeds its own NavigationStack, so it must present full screen — never
-        // be pushed into the browser stack (nesting navigation stacks is illegal).
-        .fullScreenCover(isPresented: $showingLibrary) {
-            libraryCover
-        }
         .fullScreenCover(item: $chatLaunch) { launch in
             RelayChatView(
                 viewModel: launch.viewModel,
@@ -238,7 +236,8 @@ struct POCVaultRootView: View {
                     chatLaunch = next
                     Task { await next.viewModel.continueHandoff(card) }
                 },
-                presentsProviderPickerOnAppear: launch.presentsProviderPicker
+                presentsProviderPickerOnAppear: launch.presentsProviderPicker,
+                automaticallyOpensPreviews: launch.automaticallyOpensPreviews
             )
         }
         .fullScreenCover(item: $terminalLaunch) { launch in
@@ -257,6 +256,13 @@ struct POCVaultRootView: View {
         }
         .task {
             identityStore.importIdentityFromSetupEnvironmentIfNeeded()
+        }
+        // The publisher emits on every import, including a replacement with
+        // the same certificate name. Dismiss any old preview or catalog detail
+        // without depending on a display name changing.
+        .onReceive(identityStore.$lastImportedCertificateName.dropFirst().receive(on: RunLoop.main)) { _ in
+            libraryViewModel.reset()
+            previewIdentityRevision &+= 1
         }
         // Push registration waits for a signed-in account: this view only exists
         // in the `.ready` phase, and the cloud device route is session-authed.
@@ -353,6 +359,20 @@ struct POCVaultRootView: View {
             .tag(RelayRootTab.workspaces)
             .tabItem { Label("Workspaces", systemImage: "square.grid.2x2") }
 
+            RelayPreviewsView(
+                libraryViewModel: libraryViewModel,
+                identityStore: identityStore,
+                manifestClient: manifestClient,
+                client: codexClient,
+                workspaceAccessIsAvailable: !foldersAreHiddenAfterComputerDisconnect,
+                onOpenWorkspaces: { selectedRootTab = .workspaces },
+                onOpenJob: openPreviewSourceJob
+            )
+            .id(previewIdentityRevision)
+            .tag(RelayRootTab.previews)
+            .tabItem { Label("Previews", systemImage: "rectangle.on.rectangle") }
+            .accessibilityIdentifier("relay-previews-tab")
+
             CodexStatusView(
                 feedViewModel: statusFeedViewModel,
                 identityStore: identityStore,
@@ -448,7 +468,7 @@ struct POCVaultRootView: View {
             onOpenTerminal: { workspaceID, workspaceName in
                 terminalLaunch = RelayTerminalLaunch(workspaceID: workspaceID, workspaceName: workspaceName)
             },
-            onOpenLibrary: isRoot ? { showingLibrary = true } : nil,
+            onOpenLibrary: isRoot ? { selectedRootTab = .previews } : nil,
             onOpenDiagnostics: isRoot ? { showingDiagnostics = true } : nil
         )
         // Only at the root: the countdown is about the machine as a whole, so
@@ -480,34 +500,15 @@ struct POCVaultRootView: View {
         Task { await launch.viewModel.openHistoryItem(item) }
     }
 
-    private var libraryCover: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Spacer()
-                Button {
-                    showingLibrary = false
-                } label: {
-                    Image(systemName: "chevron.down")
-                        .font(AppTheme.uiFont(size: 16, weight: .semibold))
-                        .foregroundStyle(AppTheme.textSecondary)
-                        .frame(width: 36, height: 36)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Close library")
-            }
-            .padding(.horizontal, 16)
-            .padding(.top, 10)
-
-            LibraryView(
-                viewModel: libraryViewModel,
-                identityStore: identityStore,
-                manifestClient: manifestClient
-            )
-        }
-        .background(AppTheme.bgCanvas.ignoresSafeArea())
-        // Full-screen covers are separate presentations: re-pin the deliberate
-        // dark-only appearance so the cover can never flash light.
-        .preferredColorScheme(.dark)
+    private func openPreviewSourceJob(_ job: CodexJob) {
+        let item = CodexThreadFeedItem(source: .pendingJob(job))
+        let launch = chatSessionStore.launch(
+            folderPath: nil,
+            workspaceID: item.workspaceID,
+            automaticallyOpensPreviews: false
+        )
+        chatLaunch = launch
+        Task { await launch.viewModel.openHistoryItem(item) }
     }
 
     private var shouldStartAgentMonitor: Bool {
@@ -523,7 +524,7 @@ struct POCVaultRootView: View {
     /// - RELAY_UITEST_CHAT=1               open the chat cover (for RELAY_UITEST_PATH's
     ///   folder when set, else the root); the existing RELAY_UITEST_MODEL /
     ///   RELAY_UITEST_PROMPT / RELAY_UITEST_TASK_PROMPT auto-drive then takes over.
-    /// - RELAY_UITEST_OPEN=library|status|account  present that cover/sheet
+    /// - RELAY_UITEST_OPEN=previews|library|status|account select that tab
     private func applyUITestHooks() {
         let env = ProcessInfo.processInfo.environment
         if let folder = env["RELAY_UITEST_PATH"]?.trimmedNonEmpty {
@@ -535,8 +536,8 @@ struct POCVaultRootView: View {
             browserPath.append(.file(entry: entry))
         }
         switch env["RELAY_UITEST_OPEN"] {
-        case "library":
-            showingLibrary = true
+        case "previews", "library":
+            selectedRootTab = .previews
         case "status":
             selectedRootTab = .sessions
         case "account":

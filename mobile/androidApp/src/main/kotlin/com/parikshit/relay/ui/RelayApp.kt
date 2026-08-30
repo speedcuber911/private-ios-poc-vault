@@ -86,6 +86,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -104,8 +105,13 @@ import live.relay.core.RelayLocalPreviewUrls
 import live.relay.core.RelayProvider
 import live.relay.core.RelayAIDataSharing
 import live.relay.core.RelayArtifactPresentation
+import live.relay.core.RelayWorkspacePreviews
 import live.relay.core.ThreadSummary
 import live.relay.core.WorkspaceEntry
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.time.format.FormatStyle
 import live.relay.core.Job as RelayJob
 
 private val RelayRed = Color(0xFFFF5D3A)
@@ -122,7 +128,11 @@ private val RelayColors = darkColorScheme(
 )
 
 private enum class RootTab(val label: String) {
-    WORKSPACES("Workspaces"), ACTIVE("Active"), LIBRARY("POCs"), SETTINGS("Settings")
+    WORKSPACES("Workspaces"), ACTIVE("Active"), LIBRARY("Previews"), SETTINGS("Settings")
+}
+
+private enum class PreviewSource(val label: String) {
+    WORKSPACE_RESULTS("Workspace results"), PUBLISHED_CATALOG("Published catalog")
 }
 
 @Composable
@@ -130,7 +140,10 @@ fun RelayApp(viewModel: RelayViewModel = viewModel()) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
     var tab by rememberSaveable { mutableStateOf(RootTab.WORKSPACES) }
-    var pocUrl by rememberSaveable { mutableStateOf<String?>(null) }
+    var previewSource by rememberSaveable(state.connectionRevision) { mutableStateOf(PreviewSource.WORKSPACE_RESULTS) }
+    var pocUrl by rememberSaveable(state.connectionRevision) { mutableStateOf<String?>(null) }
+    var selectedPocId by rememberSaveable(state.connectionRevision) { mutableStateOf<String?>(null) }
+    val selectedPoc = state.pocs.firstOrNull { it.resolvedId == selectedPocId }
 
     LaunchedEffect(state.error, state.notice) {
         val message = state.error ?: state.notice ?: return@LaunchedEffect
@@ -151,10 +164,16 @@ fun RelayApp(viewModel: RelayViewModel = viewModel()) {
                     )
                     pocUrl != null -> RelayWebView(
                         url = pocUrl!!,
-                        title = "Relay POC",
-                        errorTitle = "Could not open this POC",
+                        title = "Relay preview",
+                        errorTitle = "Could not open this preview",
                         identityStore = viewModel.identityStore,
                         onBack = { pocUrl = null },
+                    )
+                    selectedPoc != null -> PocPreviewDetailsScreen(
+                        poc = selectedPoc,
+                        catalogGeneratedAt = state.pocsCatalogGeneratedAt,
+                        onBack = { selectedPocId = null },
+                        onOpen = { pocUrl = selectedPoc.url },
                     )
                     state.selectedThread != null -> ConversationScreen(
                         state = state,
@@ -206,18 +225,20 @@ fun RelayApp(viewModel: RelayViewModel = viewModel()) {
                     else -> RootScreen(
                         state = state,
                         tab = tab,
+                        previewSource = previewSource,
+                        onPreviewSource = { previewSource = it },
                         snackbar = snackbar,
                         onTab = { selected ->
                             tab = selected
                             when (selected) {
                                 RootTab.WORKSPACES -> viewModel.loadWorkspaces()
                                 RootTab.ACTIVE -> viewModel.loadActiveJobs()
-                                RootTab.LIBRARY -> viewModel.loadPocs()
+                                RootTab.LIBRARY -> Unit
                                 RootTab.SETTINGS -> Unit
                             }
                         },
                         viewModel = viewModel,
-                        onOpenPoc = { pocUrl = it.url },
+                        onOpenPoc = { selectedPocId = it.resolvedId },
                     )
                 }
 
@@ -239,6 +260,8 @@ fun RelayApp(viewModel: RelayViewModel = viewModel()) {
 private fun RootScreen(
     state: RelayUiState,
     tab: RootTab,
+    previewSource: PreviewSource,
+    onPreviewSource: (PreviewSource) -> Unit,
     snackbar: SnackbarHostState,
     onTab: (RootTab) -> Unit,
     viewModel: RelayViewModel,
@@ -262,7 +285,10 @@ private fun RootScreen(
                                 when (tab) {
                                     RootTab.WORKSPACES -> viewModel.loadWorkspaces()
                                     RootTab.ACTIVE -> viewModel.loadActiveJobs()
-                                    RootTab.LIBRARY -> viewModel.loadPocs()
+                                    RootTab.LIBRARY -> when (previewSource) {
+                                        PreviewSource.WORKSPACE_RESULTS -> viewModel.loadPreviewResults()
+                                        PreviewSource.PUBLISHED_CATALOG -> viewModel.loadPocs()
+                                    }
                                     RootTab.SETTINGS -> Unit
                                 }
                             },
@@ -299,7 +325,34 @@ private fun RootScreen(
             when (tab) {
                 RootTab.WORKSPACES -> WorkspacesScreen(state, viewModel)
                 RootTab.ACTIVE -> ActiveJobsScreen(state.jobs, viewModel::openActiveJob)
-                RootTab.LIBRARY -> PocLibraryScreen(state.pocs, onOpenPoc)
+                RootTab.LIBRARY -> Column(Modifier.fillMaxSize().testTag("relay-previews")) {
+                    Row(Modifier.padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        PreviewSource.entries.forEach { source ->
+                            FilterChip(
+                                selected = previewSource == source,
+                                onClick = { onPreviewSource(source) },
+                                label = { Text(source.label) },
+                            )
+                        }
+                    }
+                    when (previewSource) {
+                        PreviewSource.WORKSPACE_RESULTS -> WorkspacePreviewsScreen(
+                            state = state,
+                            onRefresh = viewModel::loadPreviewResults,
+                            onSettings = { onTab(RootTab.SETTINGS) },
+                            onWorkspaces = { onTab(RootTab.WORKSPACES) },
+                            onOpenJob = viewModel::openPreviewSourceJob,
+                            onOpenArtifact = viewModel::openPreviewArtifact,
+                            onOpenPreview = viewModel::openRemotePreview,
+                        )
+                        PreviewSource.PUBLISHED_CATALOG -> PocLibraryScreen(
+                            state = state,
+                            onOpen = onOpenPoc,
+                            onRefresh = viewModel::loadPocs,
+                            onSettings = { onTab(RootTab.SETTINGS) },
+                        )
+                    }
+                }
                 RootTab.SETTINGS -> SettingsScreen(state, viewModel)
             }
         }
@@ -456,14 +509,174 @@ private fun StatusDot(job: RelayJob) {
 }
 
 @Composable
-private fun PocLibraryScreen(pocs: List<PocEntry>, onOpen: (PocEntry) -> Unit) {
-    if (pocs.isEmpty()) {
-        EmptyState("No private POCs loaded", "Refresh after importing the Relay client certificate.")
-        return
+private fun WorkspacePreviewsScreen(
+    state: RelayUiState,
+    onRefresh: () -> Unit,
+    onSettings: () -> Unit,
+    onWorkspaces: () -> Unit,
+    onOpenJob: (RelayJob) -> Unit,
+    onOpenArtifact: (JobArtifact) -> Unit,
+    onOpenPreview: (String, String) -> Unit,
+) {
+    LaunchedEffect(Unit) {
+        if (!state.previewJobsLoaded && !state.previewJobsLoading && state.previewJobsError == null) onRefresh()
     }
-    LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        item { Text("Hosted POCs", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold) }
-        items(pocs, key = PocEntry::resolvedId) { poc ->
+    val previewJobs = remember(state.previewJobs) {
+        state.previewJobs.filter { job ->
+            job.artifacts.isNotEmpty() || RelayWorkspacePreviews.sources(job.displayOutput, job.stdout).isNotEmpty()
+        }
+    }
+    LazyColumn(
+        modifier = Modifier.fillMaxSize().testTag("relay-preview-results"),
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        item {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Previews", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                Text("Open what your workspace produced.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(
+                    "Files and running app previews reported by recent jobs on your linked machine. These results are separate from the published catalog.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        when {
+            !state.isReadyForMachineRequests -> item {
+                PreviewInformationSection("Connect a workspace") {
+                    Text("Configure your linked Relay machine and import its client certificate in Settings. Workspace results do not require access to the separate published catalog.")
+                    OutlinedButton(onClick = onSettings) { Text("Open Settings") }
+                }
+            }
+            state.previewJobsLoading -> item {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+                    Text("Loading workspace results…")
+                }
+            }
+            state.previewJobsError != null -> item {
+                PreviewInformationSection("Could not load workspace results") {
+                    Text(state.previewJobsError, color = MaterialTheme.colorScheme.error)
+                    Text("This is a connection or request failure, not an empty results list.")
+                    OutlinedButton(onClick = onRefresh) { Text("Try again") }
+                }
+            }
+            state.previewJobsLoaded && previewJobs.isEmpty() -> item {
+                PreviewInformationSection("No preview results yet") {
+                    Text("No files or app-preview addresses were reported by the latest 100 jobs. Open a workspace and ask your agent to produce a file or start an app, then return here.")
+                    OutlinedButton(onClick = onWorkspaces) { Text("Open Workspaces") }
+                }
+            }
+        }
+        items(previewJobs, key = RelayJob::resolvedId) { job ->
+            PreviewInformationSection(job.workspaceName ?: job.workspaceId ?: "Workspace result") {
+                Text(job.displayPrompt, style = MaterialTheme.typography.titleSmall, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                Text(
+                    "${job.provider.displayName} · ${job.resolvedStatus.label}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                job.artifacts.forEach { artifact ->
+                    val kind = RelayArtifactPresentation.kind(
+                        filename = artifact.filename,
+                        contentType = artifact.contentType,
+                        artifactKind = artifact.kind,
+                        hasPreview = artifact.previewURL != null,
+                    )
+                    val hasAddress = !artifact.previewURL.isNullOrBlank() || !artifact.rawURL.isNullOrBlank()
+                    OutlinedButton(
+                        onClick = { onOpenArtifact(artifact) },
+                        enabled = hasAddress,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                            Text(artifact.title ?: artifact.filename, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            Text(if (hasAddress) "Open ${kind.wireValue}" else "No file address reported", style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                }
+                val sources = RelayWorkspacePreviews.sources(job.displayOutput, job.stdout).take(4)
+                sources.forEachIndexed { index, source ->
+                    Button(onClick = { onOpenPreview(job.resolvedId, source) }, modifier = Modifier.fillMaxWidth()) {
+                        Text(if (sources.size == 1) "Open running app" else "Open running app ${index + 1}")
+                    }
+                }
+                if (sources.isNotEmpty()) {
+                    Text("Running previews require the app's server to still be running on your linked machine.", style = MaterialTheme.typography.bodySmall)
+                }
+                TextButton(onClick = { onOpenJob(job) }) { Text("View source job") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PocLibraryScreen(
+    state: RelayUiState,
+    onOpen: (PocEntry) -> Unit,
+    onRefresh: () -> Unit,
+    onSettings: () -> Unit,
+) {
+    LaunchedEffect(Unit) {
+        if (!state.pocsCatalogVerified && !state.pocsLoading && state.pocsError == null) onRefresh()
+    }
+    LazyColumn(
+        modifier = Modifier.fillMaxSize().testTag("relay-preview-catalog"),
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        item {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Published catalog", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                Text(
+                    "Published web previews from your signed catalog.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    "Inspect a published preview and its access requirements before opening it. Previews are separate from your linked workspaces.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        when {
+            state.pocsLoading -> item {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+                    Text("Loading and verifying the catalog…", style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+            state.certificateSubject == null -> item {
+                PreviewInformationSection("Connect your preview catalog") {
+                    Text("Import a Relay client certificate in Settings to load your configured catalog. The certificate is separate from the catalog signature.")
+                    OutlinedButton(onClick = onSettings) { Text("Open Settings") }
+                }
+            }
+            state.pocsError != null -> item {
+                PreviewInformationSection("Catalog unavailable") {
+                    Text(state.pocsError, color = MaterialTheme.colorScheme.error)
+                    Text("No previews are shown until Relay can load and verify the catalog. Check the catalog URLs and client certificate in Settings.")
+                    OutlinedButton(onClick = onRefresh) { Text("Try again") }
+                }
+            }
+            state.pocsCatalogVerified -> item {
+                PreviewInformationSection("Catalog integrity") {
+                    Text("Manifest signature verified.", fontWeight = FontWeight.Medium)
+                    Text("This verifies the catalog, not the contents of downloaded web pages.")
+                    state.pocsCatalogGeneratedAt?.let { Text("Catalog generated ${previewDate(it)}", style = MaterialTheme.typography.bodySmall) }
+                }
+            }
+        }
+        if (state.pocsCatalogVerified && state.pocs.isEmpty()) {
+            item {
+                PreviewInformationSection("No published previews yet") {
+                    Text("The verified catalog is empty. Publish a static preview through your Relay deployment workflow, then refresh here. A linked workspace does not automatically create a catalog entry.")
+                    OutlinedButton(onClick = onRefresh) { Text("Refresh catalog") }
+                }
+            }
+        }
+        items(state.pocs, key = PocEntry::resolvedId) { poc ->
             Card(
                 modifier = Modifier.fillMaxWidth().clickable { onOpen(poc) },
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
@@ -480,6 +693,12 @@ private fun PocLibraryScreen(pocs: List<PocEntry>, onOpen: (PocEntry) -> Unit) {
                             maxLines = 2,
                             overflow = TextOverflow.Ellipsis,
                         )
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            if (poc.requiresClientCertificate) "Client certificate required" else "No client certificate required by catalog",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.secondary,
+                        )
                     }
                     Icon(Icons.Default.ChevronRight, contentDescription = null)
                 }
@@ -487,6 +706,94 @@ private fun PocLibraryScreen(pocs: List<PocEntry>, onOpen: (PocEntry) -> Unit) {
         }
     }
 }
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun PocPreviewDetailsScreen(
+    poc: PocEntry,
+    catalogGeneratedAt: String?,
+    onBack: () -> Unit,
+    onOpen: () -> Unit,
+) {
+    BackHandler(onBack = onBack)
+    Scaffold(
+        modifier = Modifier.testTag("relay-previews-details"),
+        topBar = {
+            TopAppBar(
+                title = { Text("Preview details") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back to previews")
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
+            )
+        },
+    ) { padding ->
+        Column(
+            Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState()).padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(18.dp),
+        ) {
+            Text(poc.title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+            Text(poc.detail, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Button(onClick = onOpen, modifier = Modifier.fillMaxWidth().testTag("relay-previews-open")) {
+                Text("Open preview")
+            }
+            PreviewInformationSection("Published preview") {
+                PreviewMetadataRow("Host", poc.url.toUri().host ?: "Not provided")
+                poc.updatedAt?.let { PreviewMetadataRow("Updated", previewDate(it)) }
+                if (poc.tags.isNotEmpty()) PreviewMetadataRow("Tags", poc.tags.joinToString(" · "))
+                PreviewMetadataRow("Address", poc.url)
+            }
+            PreviewInformationSection("Catalog integrity") {
+                Text("Manifest signature verified.", fontWeight = FontWeight.Medium)
+                Text("This verifies the catalog, not the contents of downloaded web pages.")
+                catalogGeneratedAt?.let { PreviewMetadataRow("Catalog generated", previewDate(it)) }
+            }
+            PreviewInformationSection("Access") {
+                Text(
+                    if (poc.requiresClientCertificate) "Client certificate required" else "No client certificate required by catalog",
+                    fontWeight = FontWeight.Medium,
+                )
+                Text(
+                    if (poc.requiresClientCertificate) {
+                        "The catalog marks this preview as requiring a valid client certificate. Relay uses the certificate imported on this device when the configured server requests it."
+                    } else {
+                        "The catalog does not mark this preview as requiring a client certificate. The website may still have its own sign-in or access rules."
+                    },
+                )
+                Text("The catalog's access requirement is separate from its signature. It does not mean the preview is restricted to one device.")
+            }
+        }
+    }
+}
+
+@Composable
+private fun PreviewInformationSection(title: String, content: @Composable ColumnScope.() -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            content()
+        }
+    }
+}
+
+@Composable
+private fun PreviewMetadataRow(label: String, value: String) {
+    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        SelectionContainer { Text(value, style = MaterialTheme.typography.bodyMedium) }
+    }
+}
+
+private fun previewDate(value: String): String = runCatching {
+    DateTimeFormatter.ofLocalizedDateTime(FormatStyle.MEDIUM, FormatStyle.SHORT)
+        .withZone(ZoneId.systemDefault())
+        .format(Instant.parse(value))
+}.getOrDefault(value)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -1221,8 +1528,9 @@ private fun RelayWebView(
                 factory = { appContext ->
                     WebView(appContext).apply {
                         webView = this
-                        // Hosted Relay POCs are signed, trusted app content and commonly
-                        // require JavaScript. File/content access and mixed content remain off.
+                        // Hosted previews commonly require JavaScript. The catalog signature
+                        // does not verify downloaded web content; file/content access and mixed
+                        // content remain off, and client identity stays scoped to the origin.
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
                         settings.allowFileAccess = false
@@ -1253,7 +1561,7 @@ private fun RelayWebView(
                                 request: WebResourceRequest,
                                 error: android.webkit.WebResourceError,
                             ) {
-                                if (request.isForMainFrame) loadError = error.description?.toString() ?: "The POC could not be loaded."
+                                if (request.isForMainFrame) loadError = error.description?.toString() ?: "The preview could not be loaded."
                             }
                         }
                         loadUrl(url)

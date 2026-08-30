@@ -19,6 +19,9 @@ struct RelayChatView: View {
     /// New-session entry points ask for the owning agent/model after the server catalog
     /// has loaded. Existing-thread and push entry points leave the picker closed.
     var presentsProviderPickerOnAppear = false
+    /// Source-job inspection never replays its historical request to show an app.
+    /// The visible Show app and output actions remain available on demand.
+    var automaticallyOpensPreviews = true
     @State private var showingThreads = false
     @State private var threadsPreferLarge = false
     @State private var fullLogRequest: RelayFullLogRequest?
@@ -445,6 +448,7 @@ struct RelayChatView: View {
     }
 
     private var automaticPreviewCandidate: RelayAutomaticPreviewCandidate? {
+        guard automaticallyOpensPreviews else { return nil }
         let jobs = viewModel.messages.compactMap(\.job).reversed()
         guard let triggerJob = jobs.first(where: {
             $0.status == .succeeded && relaySharedContract.requestsAutomaticPreview(prompt: $0.prompt)
@@ -1875,7 +1879,7 @@ private struct RelayArtifactCard: View {
     }
 }
 
-private struct RelayArtifactViewer: View {
+struct RelayArtifactViewer: View {
     let artifact: CodexJobArtifact
     let client: CodexClient
     @ObservedObject var identityStore: ClientIdentityStore
@@ -2118,13 +2122,13 @@ private struct RelayAutomaticPreviewCandidate {
     var key: String { "\(triggerJobID)|\(previewJobID)|\(sourceURL.absoluteString)" }
 }
 
-private struct RelayRemotePreviewRequest: Identifiable {
+struct RelayRemotePreviewRequest: Identifiable {
     let id = UUID()
     let jobID: String
     let sourceURL: URL
 }
 
-private struct RelayRemotePreviewViewer: View {
+struct RelayRemotePreviewViewer: View {
     let request: RelayRemotePreviewRequest
     let client: CodexClient
     @ObservedObject var identityStore: ClientIdentityStore

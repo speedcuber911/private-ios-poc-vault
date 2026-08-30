@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -20,12 +21,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 ROOT = Path(__file__).resolve().parents[1]
 SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _SIM_PREVIEW_TOKEN = "s" * 43
-_SIM_LIVE_PREVIEW = b"""<!doctype html>
-<html><head><meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-html,body{margin:0;min-height:100%;background:#101412;color:#f4f3ed;font:16px -apple-system,BlinkMacSystemFont,sans-serif}
-main{padding:76px 24px 32px}small{color:#83d9c8;text-transform:uppercase;letter-spacing:.12em}h1{font-size:32px;margin:14px 0 8px}p{color:#b8beb9;line-height:1.5}.card{margin-top:24px;padding:18px;border:1px solid #2e3934;border-radius:16px;background:#171c19}
-</style></head><body><main><small>Live from linked computer</small><h1>App preview is connected</h1><p>Relay opened this through the machine that ran the task.</p><div class="card">Root-relative assets and app routes stay inside this secure preview.</div></main></body></html>"""
+_SIM_LIVE_PREVIEW = (ROOT / "ops" / "fixtures" / "launch-checklist.html").read_bytes()
 
 
 class SimulatorVaultServer(ThreadingHTTPServer):
@@ -41,6 +37,7 @@ class SimulatorVaultServer(ThreadingHTTPServer):
         self.active_job_model: str | None = None
         self.active_job_prompt = "Inspect the workspace."
         self.active_job_tick = 0
+        self.handoff_job_id: str | None = None
         self.fixture_lock = threading.Lock()
 
 
@@ -62,10 +59,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"computer": simulator_computer_link()})
             return
         if path == "/v1/handoffs":
-            self.send_json({"handoffs": [simulator_handoff()]})
+            self.send_json({"handoffs": [simulator_handoff(self.server.handoff_job_id)]})
             return
         if path == "/v1/handoffs/sim-handoff-4f89a2c1":
-            handoff = simulator_handoff()
+            handoff = simulator_handoff(self.server.handoff_job_id)
             handoff["manifest"] = simulator_handoff_manifest()
             self.send_json({"handoff": handoff})
             return
@@ -104,10 +101,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"success": True, "message": "Simulator account deleted."})
             return
         if path == "/v1/handoffs/sim-handoff-4f89a2c1/continue":
+            with self.server.fixture_lock:
+                self.server.handoff_job_id = "sim-job-handoff"
             self.send_response(202)
             payload = json.dumps({
                 "id": "sim-job-handoff",
-                "job": codex_fixture_job(id="sim-job-handoff"),
+                "job": codex_fixture_handoff_job(),
             }).encode("utf-8")
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
@@ -140,13 +139,13 @@ class Handler(BaseHTTPRequestHandler):
             if body.get("jobId") not in {"sim-job-linear", "sim-job-running", "sim-job-handoff"}:
                 self.send_json_error(404, "job not found")
                 return
-            if not str(body.get("url") or "").startswith(("http://localhost:4317", "http://127.0.0.1:4317")):
+            if not simulator_preview_source_is_valid(body.get("url")):
                 self.send_json_error(400, "preview URL was not returned by this job")
                 return
             self.send_json({
                 "id": _SIM_PREVIEW_TOKEN,
                 "url": f"/v1/codex/previews/{_SIM_PREVIEW_TOKEN}/",
-                "expiresAt": "2026-08-18T01:00:00Z",
+                "expiresAt": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(timespec="seconds").replace("+00:00", "Z"),
             }, status=201)
             return
         if path == "/v1/codex/jobs/sim-job-running/cancel":
@@ -298,14 +297,22 @@ class Handler(BaseHTTPRequestHandler):
             self.serve_codex_fs_file(parse_qs(query))
             return
         if path == "/v1/codex/jobs":
-            self.send_json({"jobs": [codex_fixture_approval_job(self.server), codex_fixture_job()]})
+            jobs = [codex_fixture_approval_job(self.server), codex_fixture_job()]
+            if self.server.handoff_job_id:
+                jobs.append(codex_fixture_handoff_job())
+            self.send_json({"jobs": jobs})
             return
         if path == "/v1/codex/sessions":
-            self.send_json({"sessions": [codex_fixture_session()]})
+            sessions = [codex_fixture_session()]
+            if self.server.handoff_job_id:
+                sessions.append({**codex_fixture_session(), "id": "sim-claude-handoff-thread", "provider": "claude"})
+            self.send_json({"sessions": sessions})
             return
         if path == "/v1/codex/threads":
             workspace_id = parse_qs(query).get("workspaceId", [""])[0]
             threads = [codex_fixture_thread(), codex_fixture_chat_thread(), codex_fixture_scoped_chat_thread()]
+            if self.server.handoff_job_id:
+                threads.append(codex_fixture_handoff_thread())
             if workspace_id:
                 # Workspace filters merge task and chat threads for that folder;
                 # legacy null-workspace chats stay global-only.
@@ -316,6 +323,17 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/codex/threads/sim-thread-linear":
             self.send_json(codex_fixture_thread_detail())
             return
+        if path == "/v1/codex/threads/sim-claude-handoff-thread":
+            job = codex_fixture_handoff_job()
+            self.send_json({
+                "thread": codex_fixture_handoff_thread(),
+                "messages": [
+                    {"role": "user", "text": job["prompt"], "timestamp": job["createdAt"]},
+                    {"role": "assistant", "text": job["result"], "timestamp": job["completedAt"]},
+                ],
+                "jobs": [job],
+            })
+            return
         if path == "/v1/codex/threads/sim-chat-thread":
             self.send_json(codex_fixture_chat_thread_detail())
             return
@@ -324,6 +342,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/v1/codex/jobs/sim-job-linear":
             self.send_json(codex_fixture_job())
+            return
+        if path == "/v1/codex/jobs/sim-job-handoff":
+            self.send_json(codex_fixture_handoff_job())
             return
         if path == "/v1/codex/jobs/sim-job-running":
             self.send_json(codex_fixture_running_job_tick(self.server))
@@ -633,10 +654,10 @@ class Handler(BaseHTTPRequestHandler):
 def simulator_account_user() -> dict:
     return {
         "id": "relay-simulator-user",
-        "name": "Komal",
-        "email": "komal@relay.local",
-        "username": "komal",
-        "displayUsername": "Komal",
+        "name": "Relay Demo",
+        "email": "demo@relay.local",
+        "username": "relay-demo",
+        "displayUsername": "Relay Demo",
         "image": None,
     }
 
@@ -644,7 +665,7 @@ def simulator_account_user() -> dict:
 def simulator_computer_link() -> dict:
     return {
         "id": "relay-simulator-computer",
-        "machineName": "Komal's MacBook",
+        "machineName": "Demo Mac",
         "platform": "macos",
         "status": "connected",
         "connectedAt": 1786622400000,
@@ -652,43 +673,68 @@ def simulator_computer_link() -> dict:
     }
 
 
-def simulator_handoff() -> dict:
+def simulator_handoff(last_job_id: str | None = None) -> dict:
     return {
         "id": "sim-handoff-4f89a2c1",
         "state": "ready",
-        "repo": "komal/relay-ios",
+        "repo": "demo/launch-checklist",
         "branch": "relay/handoff-4f89a2c1b6e7",
-        "title": "Polish the mobile agent experience",
+        "title": "Finish the launch checklist",
         "provider": "claude",
         "workspaceId": "poc-vault",
         "canResumeNatively": True,
-        "lastJobId": None,
+        "lastJobId": last_job_id,
         "error": None,
         "createdAt": "2026-08-13T12:05:00Z",
-        "updatedAt": "2026-08-13T12:07:00Z",
+        "updatedAt": "2026-08-13T12:08:20Z" if last_job_id else "2026-08-13T12:07:00Z",
     }
 
 
 def simulator_handoff_manifest() -> dict:
     return {
         "harness": "claude",
-        "machine": "Komal's MacBook",
-        "excerpt": "The navigation works; the next pass should make setup and handoff feel self-explanatory.",
+        "machine": "Demo Mac",
+        "excerpt": "The responsive checklist is working. Review the final copy, then finish the handoff.",
         "baseBranch": "main",
         "wip": {"summary": "4 files · +86/-31", "files": 4, "insertions": 86, "deletions": 31},
     }
 
 
+def simulator_preview_source_is_valid(value: object) -> bool:
+    """Only the fixture's reported app address can produce a local preview.
+
+    This server serves fixed sample bytes; it never proxies or fetches this URL.
+    Keep parsing strict anyway so simulator tests do not bless unsafe endpoints.
+    """
+    if not isinstance(value, str) or value != value.strip() or any(ord(character) < 32 for character in value):
+        return False
+    try:
+        parsed = urlparse(value)
+        return (
+            parsed.scheme == "http"
+            and parsed.hostname in {"localhost", "127.0.0.1"}
+            and parsed.port == 4317
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.path == "/lab"
+            and not parsed.params
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except ValueError:
+        return False
+
+
 def simulator_mac_session_index() -> dict:
     return {
-        "machine": "Komal's MacBook",
+        "machine": "Demo Mac",
         "updatedAt": "2026-08-13T12:08:00Z",
         "sessions": [
             {
                 "id": "sim-mac-session",
                 "harness": "codex",
-                "title": "Improve Relay onboarding",
-                "repo": "komal/relay-ios",
+                "title": "Build the launch checklist",
+                "repo": "demo/launch-checklist",
                 "lastActive": "2026-08-13T12:00:00Z",
             }
         ],
@@ -721,7 +767,7 @@ def simulator_harnesses() -> list[dict]:
     ]
 
 
-def codex_fixture_workspace(id: str = "poc-vault", name: str = "POC Vault", path: str = "/srv/codex-workspaces/poc-vault") -> dict:
+def codex_fixture_workspace(id: str = "poc-vault", name: str = "Launch checklist", path: str = "/srv/codex-workspaces/poc-vault") -> dict:
     return {
         "id": id,
         "name": name,
@@ -733,9 +779,9 @@ def codex_fixture_workspace(id: str = "poc-vault", name: str = "POC Vault", path
 
 _SIM_WORKSPACE_ROOT = "/srv/codex-workspaces"
 _SIM_WORKSPACES = [
-    {"id": "scratch", "name": "Scratch", "path": f"{_SIM_WORKSPACE_ROOT}/scratch", "summary": "Throwaway sandbox", "isDefault": False},
-    {"id": "poc-vault", "name": "POC Vault", "path": f"{_SIM_WORKSPACE_ROOT}/poc-vault", "summary": "POC hosting repo", "isDefault": True},
-    {"id": "sigiq", "name": "SigiQ", "path": f"{_SIM_WORKSPACE_ROOT}/sigiq", "summary": "SigiQ monorepo", "isDefault": False},
+    {"id": "scratch", "name": "Scratchpad", "path": f"{_SIM_WORKSPACE_ROOT}/scratch", "summary": "Ideas and experiments", "isDefault": False},
+    {"id": "poc-vault", "name": "Launch checklist", "path": f"{_SIM_WORKSPACE_ROOT}/poc-vault", "summary": "A small product-release prototype", "isDefault": True},
+    {"id": "sigiq", "name": "Sample project", "path": f"{_SIM_WORKSPACE_ROOT}/sigiq", "summary": "Example registered workspace", "isDefault": False},
 ]
 # Child directories surfaced when browsing into a workspace (keyed by workspace path).
 _SIM_WORKSPACE_CHILDREN = {
@@ -806,7 +852,7 @@ def codex_fixture_approval(server: SimulatorVaultServer) -> dict:
         "kind": "tool",
         "title": "Run deployment command",
         "reason": "Claude Code needs permission before it can run this command.",
-        "command": "./ops/deploy-poc --slug relay-demo",
+        "command": "./ops/deploy-poc --slug launch-checklist",
         "cwd": "/srv/codex-workspaces/poc-vault",
         "toolName": "Bash",
         "createdAt": "2026-08-14T11:00:00Z",
@@ -842,10 +888,7 @@ _SIM_FS_PNG = __import__("base64").b64decode(
 
 # Real-size image and static browser-result fixtures for the typed job-output cards.
 _SIM_ARTIFACT_SCREENSHOT = ROOT / "pocs" / "relay" / "public" / "og.png"
-_SIM_ARTIFACT_PREVIEW = b"""<!doctype html>
-<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<style>html,body{height:100%;margin:0}body{display:grid;place-items:center;background:#101113;color:#f5f5f0;font:16px -apple-system,sans-serif}.card{padding:28px;border:1px solid #3f978d;border-radius:18px;background:#181a1d;max-width:280px}small{color:#8faaa6}</style>
-</head><body><div class="card"><small>AUTHENTICATED PREVIEW</small><h1>Browser output</h1><p>This HTML is rendered by Relay's sandboxed WebView.</p></div></body></html>"""
+_SIM_ARTIFACT_PREVIEW = _SIM_LIVE_PREVIEW
 
 
 def _sim_big_log() -> bytes:
@@ -860,8 +903,10 @@ _SIM_FS_TREE = {
         "children": {
             ".env": {"kind": "file", "content": b"SIMULATOR_PLACEHOLDER=1\n", "denied": True,
                      "mime": "text/plain; charset=utf-8", "isText": True},
-            "readme.md": {"kind": "file", "content": b"# POC Vault\n\nSimulator file fixture for the Relay browser.\n",
+            "readme.md": {"kind": "file", "content": b"# Launch checklist\n\nRepresentative local sample project for Relay.\n\nOpen launch-checklist.html to inspect the interactive release checklist.\nThe sample task exposes the same HTML as an artifact and a local app preview.\n",
                           "mime": "text/markdown; charset=utf-8", "isText": True},
+            "launch-checklist.html": {"kind": "file", "content": _SIM_LIVE_PREVIEW,
+                                      "mime": "text/html; charset=utf-8", "isText": True},
             "assets": {"kind": "dir", "children": {
                 "pixel.png": {"kind": "file", "content": _SIM_FS_PNG, "mime": "image/png", "isText": False},
             }},
@@ -1253,7 +1298,7 @@ def codex_fixture_session() -> dict:
         "id": "sim-thread-linear",
         "provider": "codex",
         "workspaceId": "poc-vault",
-        "workspaceName": "POC Vault",
+        "workspaceName": "Launch checklist",
         "cwd": "/srv/codex-workspaces/poc-vault",
         "updatedAt": "2026-05-23T13:35:30Z",
     }
@@ -1261,13 +1306,13 @@ def codex_fixture_session() -> dict:
 
 def codex_fixture_answer() -> str:
     return "\n".join([
-        "I pulled issues assigned to you that were updated in the last 7 days, from May 16 to May 23, 2026. There are 3. None are still open in Linear, so these are the action items I could extract:",
+        "Built the launch checklist in this workspace. The working preview is ready to inspect.",
         "",
-        "- ENGG-541: Confirm the remaining LMS sync follow-up is already captured in the rollout notes.",
-        "- ENGG-542: Check whether the production deploy note needs an owner before the next release.",
-        "- ENGG-543: Keep the cleanup item closed unless a new regression appears in the mobile console.",
+        "- Responsive layout for phone and tablet.",
+        "- Three release checks with an interactive progress count.",
+        "- Labeled controls and a final copy-review step.",
         "",
-        "No active Linear ticket needs a fresh reply right now.",
+        "Two checks are complete. Review the final copy before publishing.",
         "",
         "Open the live local app: `http://localhost:4317/lab`",
     ])
@@ -1280,13 +1325,13 @@ def codex_fixture_thread() -> dict:
         "mode": "task",
         "provider": "codex",
         "workspaceId": "poc-vault",
-        "workspaceName": "POC Vault",
+        "workspaceName": "Launch checklist",
         "updatedAt": "2026-05-23T13:35:30Z",
         "jobCount": 1,
         "activeJobCount": 0,
         "lastJobId": "sim-job-linear",
         "lastJobStatus": "succeeded",
-        "lastPrompt": "List out all my linear issues for last one week and also carve out my action items from them.",
+        "lastPrompt": "Build a launch checklist with three release checks and show me the working preview.",
         "lastResult": codex_fixture_answer()[:220] + "...",
         "hasSessionFile": True,
         "isSmokeTest": False,
@@ -1319,12 +1364,12 @@ def codex_fixture_scoped_chat_thread() -> dict:
         "provider": "codex",
         "model": "codex-gpt-5.6-sol",
         "workspaceId": "poc-vault",
-        "workspaceName": "POC Vault",
+        "workspaceName": "Launch checklist",
         "updatedAt": "2026-08-09T10:00:00Z",
         "jobCount": 0,
         "activeJobCount": 0,
         "lastPrompt": "What does this folder contain?",
-        "lastResult": "This folder hosts the POC Vault static POCs and ops tooling.",
+        "lastResult": "This workspace contains the launch checklist and its preview assets.",
         "hasSessionFile": False,
         "isSmokeTest": False,
     }
@@ -1342,7 +1387,7 @@ def codex_fixture_scoped_chat_thread_detail() -> dict:
             {
                 "role": "assistant",
                 "timestamp": "2026-08-09T10:00:00Z",
-                "text": "This folder hosts the POC Vault static POCs and ops tooling.",
+                "text": "This workspace contains the launch checklist and its preview assets.",
             },
         ],
         "jobs": [],
@@ -1356,12 +1401,12 @@ def codex_fixture_thread_detail() -> dict:
             {
                 "role": "user",
                 "timestamp": "2026-05-23T13:34:00Z",
-                "text": "List out all my linear issues for last one week and also carve out my action items from them.",
+                "text": "Build a launch checklist with three release checks and show me the working preview.",
             },
             {
                 "role": "assistant",
                 "timestamp": "2026-05-23T13:34:20Z",
-                "text": "I am pulling Linear issues.",
+                "text": "I am building a responsive checklist in this workspace.",
             },
             {
                 "role": "assistant",
@@ -1437,8 +1482,8 @@ def codex_fixture_approval_job(server: SimulatorVaultServer) -> dict:
         "provider": "claude",
         "status": "waiting_for_approval" if pending else "succeeded",
         "workspaceId": "poc-vault",
-        "workspaceName": "POC Vault",
-        "prompt": "Deploy the Relay demo after reviewing the generated changes.",
+        "workspaceName": "Launch checklist",
+        "prompt": "Publish the launch checklist after reviewing the generated changes.",
         "result": None if pending else "Approval resolved; the simulator run continued.",
         "resultTruncated": False,
         "logsIncluded": "compact",
@@ -1450,32 +1495,53 @@ def codex_fixture_approval_job(server: SimulatorVaultServer) -> dict:
     }
 
 
+def codex_fixture_handoff_job() -> dict:
+    job = codex_fixture_job(
+        id="sim-job-handoff",
+        provider="claude",
+        prompt="Continue the launch-checklist handoff and prepare the final copy review.",
+        result="Reviewed the handed-off workspace. The launch checklist is ready for final copy review.\n\nOpen the live local app: `http://localhost:4317/lab`",
+    )
+    job.update({
+        "sessionId": "sim-claude-handoff-thread",
+        "createdAt": "2026-08-13T12:08:00Z",
+        "startedAt": "2026-08-13T12:08:02Z",
+        "completedAt": "2026-08-13T12:08:20Z",
+        "updatedAt": "2026-08-13T12:08:20Z",
+    })
+    return job
+
+
+def codex_fixture_handoff_thread() -> dict:
+    job = codex_fixture_handoff_job()
+    return {
+        **codex_fixture_thread(),
+        "id": job["sessionId"],
+        "sessionId": job["sessionId"],
+        "provider": job["provider"],
+        "updatedAt": job["updatedAt"],
+        "lastJobId": job["id"],
+        "lastPrompt": job["prompt"],
+        "lastResult": job["result"],
+    }
+
+
 def codex_fixture_job(
     status: str = "succeeded",
     result: str | None = None,
     id: str | None = None,
     provider: str = "codex",
     model: str | None = None,
-    prompt: str = "List out all my linear issues for last one week and also carve out my action items from them.",
+    prompt: str = "Build a launch checklist with three release checks and show me the working preview.",
 ) -> dict:
     result_text = codex_fixture_answer() if result is None and status == "succeeded" else result
     job_id = id or ("sim-job-linear" if status == "succeeded" else "sim-job-running")
     artifacts = [] if status != "succeeded" else [
         {
-            "id": "artifact-001",
-            "kind": "image",
-            "filename": "browser-screenshot.png",
-            "title": "Browser screenshot",
-            "contentType": "image/png",
-            "bytes": _SIM_ARTIFACT_SCREENSHOT.stat().st_size,
-            "rawURL": f"/v1/codex/jobs/{job_id}/artifacts/artifact-001/raw",
-            "previewURL": None,
-        },
-        {
             "id": "artifact-002",
             "kind": "staticPreview",
-            "filename": "preview.html",
-            "title": "Interactive browser preview",
+            "filename": "launch-checklist.html",
+            "title": "Launch checklist",
             "language": "html",
             "contentType": "text/html; charset=utf-8",
             "bytes": len(_SIM_ARTIFACT_PREVIEW),
@@ -1489,7 +1555,7 @@ def codex_fixture_job(
         "model": model,
         "status": status,
         "workspaceId": "poc-vault",
-        "workspaceName": "POC Vault",
+        "workspaceName": "Launch checklist",
         "prompt": prompt,
         "result": result_text,
         "artifacts": artifacts,

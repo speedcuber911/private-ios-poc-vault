@@ -10,6 +10,9 @@ struct RelayChatLaunch: Identifiable {
     /// immediately asks which runner/model should own it. History and push routes
     /// leave this false because they open a specific existing conversation.
     let presentsProviderPicker: Bool
+    /// Inspecting an output's source job must keep its conversation visible.
+    /// This is presentation intent, not cached conversation state.
+    let automaticallyOpensPreviews: Bool
 }
 
 /// App-wide cache of per-folder chat view models plus the single background job monitor.
@@ -100,11 +103,12 @@ final class RelayChatSessionStore: ObservableObject {
     }
 
     /// Session lookup packaged for `fullScreenCover(item:)`.
-    func launch(folderPath: String?, workspaceID: String? = nil) -> RelayChatLaunch {
+    func launch(folderPath: String?, workspaceID: String? = nil, automaticallyOpensPreviews: Bool = true) -> RelayChatLaunch {
         RelayChatLaunch(
             id: Self.canonicalKey(forFolderPath: folderPath),
             viewModel: session(forFolderPath: folderPath, workspaceID: workspaceID),
-            presentsProviderPicker: false
+            presentsProviderPicker: false,
+            automaticallyOpensPreviews: automaticallyOpensPreviews
         )
     }
 
@@ -117,7 +121,8 @@ final class RelayChatSessionStore: ObservableObject {
         return RelayChatLaunch(
             id: Self.canonicalKey(forFolderPath: folderPath),
             viewModel: viewModel,
-            presentsProviderPicker: true
+            presentsProviderPicker: true,
+            automaticallyOpensPreviews: true
         )
     }
 

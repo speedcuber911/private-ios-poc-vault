@@ -18,7 +18,7 @@ class AndroidArtifactOpener(
     private val application: Application,
     private val identityStore: AndroidClientIdentityStore,
 ) {
-    suspend fun open(artifact: JobArtifact, baseUrl: String) {
+    suspend fun open(artifact: JobArtifact, baseUrl: String, isCurrentConnection: () -> Boolean) {
         val remoteUrl = resolvedArtifactUrl(artifact.rawURL, baseUrl)
             ?: error("Relay returned an invalid output URL.")
         val opened = withContext(Dispatchers.IO) {
@@ -41,6 +41,7 @@ class AndroidArtifactOpener(
             }
         }
 
+        if (!isCurrentConnection()) return
         val contentUri = FileProvider.getUriForFile(
             application,
             "${application.packageName}.files",

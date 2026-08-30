@@ -14,6 +14,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -39,6 +40,7 @@ import live.relay.core.Job as RelayJob
 
 data class RelayUiState(
     val configuration: RelayConfiguration,
+    val connectionRevision: Int = 0,
     val certificateSubject: String? = null,
     val listing: WorkspaceListing? = null,
     val currentPath: String? = null,
@@ -51,6 +53,14 @@ data class RelayUiState(
     val streamState: JobStreamState = JobStreamState(),
     val approvals: List<Approval> = emptyList(),
     val pocs: List<PocEntry> = emptyList(),
+    val pocsCatalogVerified: Boolean = false,
+    val pocsCatalogGeneratedAt: String? = null,
+    val pocsLoading: Boolean = false,
+    val pocsError: String? = null,
+    val previewJobs: List<RelayJob> = emptyList(),
+    val previewJobsLoaded: Boolean = false,
+    val previewJobsLoading: Boolean = false,
+    val previewJobsError: String? = null,
     val previewUrl: String? = null,
     val loading: Boolean = false,
     val streaming: Boolean = false,
@@ -74,6 +84,8 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     )
     val uiState: StateFlow<RelayUiState> = _uiState.asStateFlow()
     private var streamCollection: Job? = null
+    private var pocCollection: Job? = null
+    private var previewJobCollection: Job? = null
     private val automaticallyOpenedPreviews = mutableSetOf<String>()
     private val artifactOpener = AndroidArtifactOpener(application, identityStore)
 
@@ -91,9 +103,15 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         val requestedUrls = listOf(codexBaseUrl, manifestUrl, signatureUrl)
             .map { it.trim().trimEnd('/') }
         val savedUrls = listOf(saved.codexBaseUrl, saved.manifestUrl, saved.signatureUrl)
+        val connectionChanged = saved != _uiState.value.configuration
+        if (connectionChanged) {
+            invalidatePreviewCatalog()
+            invalidatePreviewResults()
+        }
         _uiState.update {
             it.copy(
                 configuration = saved,
+                connectionRevision = it.connectionRevision + if (connectionChanged) 1 else 0,
                 notice = "Relay configuration saved.",
                 error = if (savedUrls != requestedUrls) {
                     "Machine and manifest URLs must use HTTPS."
@@ -106,7 +124,11 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             runLoading {
                 val subject = withContext(Dispatchers.IO) { identityStore.import(uri, password) }
-                _uiState.update { it.copy(certificateSubject = subject, notice = "Client certificate imported securely.") }
+                invalidatePreviewCatalog()
+                invalidatePreviewResults()
+                _uiState.update {
+                    it.copy(certificateSubject = subject, connectionRevision = it.connectionRevision + 1, notice = "Client certificate imported securely.")
+                }
             }
         }
     }
@@ -115,7 +137,11 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             runLoading {
                 withContext(Dispatchers.IO) { identityStore.clear() }
-                _uiState.update { it.copy(certificateSubject = null, notice = "Client certificate removed from this app.") }
+                invalidatePreviewCatalog()
+                invalidatePreviewResults()
+                _uiState.update {
+                    it.copy(certificateSubject = null, connectionRevision = it.connectionRevision + 1, notice = "Client certificate removed from this app.")
+                }
             }
         }
     }
@@ -194,7 +220,14 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun openActiveJob(job: RelayJob) {
+    fun openActiveJob(job: RelayJob) = openJob(job, automaticallyOpensPreviews = true)
+
+    // Reading the source is a separate presentation; a historical "show app"
+    // prompt must not replace it with a viewer when an active job completes.
+    fun openPreviewSourceJob(job: RelayJob) = openJob(job, automaticallyOpensPreviews = false)
+
+    private fun openJob(job: RelayJob, automaticallyOpensPreviews: Boolean) {
+        streamCollection?.cancel()
         _uiState.update {
             it.copy(
                 selectedWorkspace = null,
@@ -202,9 +235,10 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                 selectedJob = job,
                 streamState = JobStreamState(job = job, stdout = job.stdout.orEmpty(), stderr = job.stderr.orEmpty()),
                 approvals = emptyList(),
+                streaming = false,
             )
         }
-        if (job.resolvedStatus.isActive) collectJob(job.resolvedId)
+        if (job.resolvedStatus.isActive) collectJob(job.resolvedId, automaticallyOpensPreviews)
         if (job.resolvedStatus.needsAttention) loadApprovals(job.resolvedId)
     }
 
@@ -298,10 +332,13 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
 
     fun openRemotePreview(jobId: String, sourceUrl: String) {
         if (!guardMachineReady()) return
+        val connection = _uiState.value
+        val repository = repository()
         viewModelScope.launch {
             runLoading {
-                val lease = repository().createPreview(jobId, sourceUrl)
-                val previewUrl = trustedPreviewUrl(lease.url, _uiState.value.configuration.codexBaseUrl)
+                val lease = repository.createPreview(jobId, sourceUrl)
+                if (_uiState.value.connectionRevision != connection.connectionRevision) return@runLoading
+                val previewUrl = trustedPreviewUrl(lease.url, connection.configuration.codexBaseUrl)
                     ?: error("Relay returned an invalid localhost preview URL.")
                 _uiState.update { it.copy(previewUrl = previewUrl) }
             }
@@ -314,9 +351,12 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
 
     fun openArtifact(artifact: live.relay.core.JobArtifact) {
         if (!guardMachineReady()) return
+        val connection = _uiState.value
         viewModelScope.launch {
             runLoading {
-                artifactOpener.open(artifact, _uiState.value.configuration.codexBaseUrl)
+                artifactOpener.open(artifact, connection.configuration.codexBaseUrl) {
+                    _uiState.value.connectionRevision == connection.connectionRevision
+                }
             }
         }
     }
@@ -331,25 +371,100 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun loadPocs() {
+        invalidatePreviewCatalog()
         if (_uiState.value.certificateSubject == null) {
-            _uiState.update { it.copy(error = "Import the Relay client certificate before loading private POCs.") }
+            _uiState.update { it.copy(pocsError = "Import a Relay client certificate in Settings before loading your preview catalog.") }
             return
         }
-        viewModelScope.launch {
-            runLoading {
-                val configuration = _uiState.value.configuration
+        val configuration = _uiState.value.configuration
+        _uiState.update { it.copy(pocsLoading = true) }
+        pocCollection = viewModelScope.launch {
+            try {
                 val client = RelayHttpClientFactory(identityStore).create()
                 val manifest = AndroidManifestClient(
                     client,
                     configuration.manifestUrl,
                     configuration.signatureUrl,
                 ).fetch()
-                _uiState.update { it.copy(pocs = manifest.pocs.sortedByDescending(PocEntry::updatedAt)) }
+                ensureActive()
+                _uiState.update {
+                    it.copy(
+                        pocs = manifest.pocs.sortedByDescending(PocEntry::updatedAt),
+                        pocsCatalogVerified = true,
+                        pocsCatalogGeneratedAt = manifest.generatedAt,
+                        pocsLoading = false,
+                    )
+                }
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                ensureActive()
+                _uiState.update { it.copy(pocsLoading = false, pocsError = friendlyError(error)) }
             }
         }
     }
 
-    private fun collectJob(id: String) {
+    fun loadPreviewResults() {
+        invalidatePreviewResults()
+        if (!_uiState.value.isReadyForMachineRequests) return
+        _uiState.update { it.copy(previewJobsLoading = true) }
+        previewJobCollection = viewModelScope.launch {
+            try {
+                val jobs = repository().listJobs(limit = 100)
+                ensureActive()
+                _uiState.update {
+                    it.copy(previewJobs = jobs, previewJobsLoaded = true, previewJobsLoading = false)
+                }
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                ensureActive()
+                _uiState.update { it.copy(previewJobsLoading = false, previewJobsError = friendlyError(error)) }
+            }
+        }
+    }
+
+    fun openPreviewArtifact(artifact: live.relay.core.JobArtifact) {
+        if (!guardMachineReady()) return
+        if (artifact.previewURL == null) {
+            openArtifact(artifact)
+            return
+        }
+        val url = resolvedArtifactUrl(artifact.previewURL, _uiState.value.configuration.codexBaseUrl)
+        _uiState.update {
+            if (url == null) it.copy(error = "Relay returned an invalid preview URL.") else it.copy(previewUrl = url)
+        }
+    }
+
+    private fun invalidatePreviewResults() {
+        previewJobCollection?.cancel()
+        previewJobCollection = null
+        _uiState.update {
+            it.copy(
+                previewJobs = emptyList(),
+                previewJobsLoaded = false,
+                previewJobsLoading = false,
+                previewJobsError = null,
+                previewUrl = null,
+            )
+        }
+    }
+
+    private fun invalidatePreviewCatalog() {
+        pocCollection?.cancel()
+        pocCollection = null
+        _uiState.update {
+            it.copy(
+                pocs = emptyList(),
+                pocsCatalogVerified = false,
+                pocsCatalogGeneratedAt = null,
+                pocsLoading = false,
+                pocsError = null,
+            )
+        }
+    }
+
+    private fun collectJob(id: String, automaticallyOpensPreviews: Boolean = true) {
         streamCollection?.cancel()
         streamCollection = viewModelScope.launch {
             _uiState.update { it.copy(streaming = true) }
@@ -363,7 +478,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                         else -> state.job
                     }
                     _uiState.update { it.copy(selectedJob = job ?: it.selectedJob, streamState = state) }
-                    job?.let { maybeOpenRequestedPreview(it, state.stdout) }
+                    if (automaticallyOpensPreviews) job?.let { maybeOpenRequestedPreview(it, state.stdout) }
                     if (job?.resolvedStatus == live.relay.core.JobStatus.WAITING_FOR_APPROVAL) {
                         loadApprovalsNow(id)
                     }

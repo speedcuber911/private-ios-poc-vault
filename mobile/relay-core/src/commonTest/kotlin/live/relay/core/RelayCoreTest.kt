@@ -69,6 +69,37 @@ class RelayCoreTest {
     }
 
     @Test
+    fun workspacePreviewSourcesIncludeStdoutWithoutInventingResults() {
+        val contract = RelayCoreInfo()
+        assertEquals(
+            listOf("http://localhost:4317/", "http://127.0.0.1:3000/demo"),
+            contract.previewResultSources(
+                output = "Preview: http://localhost:4317/",
+                stdout = "Ready at http://localhost:4317/ and http://127.0.0.1:3000/demo",
+            ),
+        )
+        assertEquals(
+            listOf("http://localhost:8080/app"),
+            RelayWorkspacePreviews.sources("The build succeeded.", "Listening at http://localhost:8080/app"),
+        )
+        assertTrue(contract.previewResultSources(null, null).isEmpty())
+        assertTrue(contract.previewResultSources("Succeeded without an app address.", null).isEmpty())
+        assertTrue(contract.previewResultSources("Read https://example.com/docs", null).isEmpty())
+    }
+
+    @Test
+    fun manifestAccessMetadataDoesNotDefaultEveryPreviewToCertificateFree() {
+        val manifest = RelayJson.decode(
+            PocManifest.serializer(),
+            """{"schemaVersion":1,"generatedAt":"2026-08-30T10:00:00Z","pocs":[{"slug":"protected","title":"Protected preview","url":"https://preview.example.com","updatedAt":"2026-08-29T10:00:00Z","tags":["demo"]},{"slug":"public","title":"Public preview","url":"https://public.example.com","requiresClientCertificate":false}]}""",
+        )
+        assertTrue(manifest.pocs.first().requiresClientCertificate)
+        assertFalse(manifest.pocs.last().requiresClientCertificate)
+        assertEquals("2026-08-30T10:00:00Z", manifest.generatedAt)
+        assertEquals(listOf("demo"), manifest.pocs.first().tags)
+    }
+
+    @Test
     fun naturalPresentationLanguageRequestsAnAutomaticPreview() {
         assertTrue(RelayPresentationIntent.requestsAutomaticPreview("Build the dashboard and show me"))
         assertTrue(RelayPresentationIntent.requestsAutomaticPreview("Open it when you are done."))

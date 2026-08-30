@@ -6,7 +6,7 @@ import UIKit
 /// Rows are full-width with hairline dividers on the warm flat canvas for a
 /// Files-app feel. Folders drill in, files route to the viewer, the terminal toolbar
 /// icon opens this folder's chat cover, and the root screen additionally exposes
-/// Library / Diagnostics behind the ellipsis menu. Sessions and Settings stay in
+/// Previews / Diagnostics shortcuts behind the ellipsis menu. Sessions and Settings stay in
 /// their dedicated bottom tabs instead of being duplicated here.
 struct FileBrowserView: View {
     @StateObject private var viewModel: FileBrowserViewModel
@@ -292,7 +292,7 @@ struct FileBrowserView: View {
                         Button {
                             onOpenLibrary()
                         } label: {
-                            Label("Library", systemImage: "square.grid.2x2")
+                            Label("Previews", systemImage: "rectangle.on.rectangle")
                         }
                     }
                     if let onOpenDiagnostics {

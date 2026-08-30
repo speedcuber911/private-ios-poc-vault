@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "sharedCoreSchemaVersion": 5,
+  "sharedCoreSchemaVersion": 6,
   "capabilities": [
     {
       "id": "provider-and-status-normalization",
@@ -65,12 +65,29 @@
         "ios": [{"path": "ios/POCVault/POCVault/Networking/ManifestClient.swift", "contains": ["verifySignature", "POCManifest"]}],
         "android": [{"path": "mobile/androidApp/src/main/kotlin/com/parikshit/relay/network/AndroidManifestClient.kt", "contains": ["verify", "PocManifest"]}]
       }
+    },
+    {
+      "id": "first-class-workspace-preview-results",
+      "surfaces": {
+        "shared": [{"path": "mobile/relay-core/src/commonMain/kotlin/live/relay/core/RelayCoreInfo.kt", "contains": ["previewResultSources", "RelayWorkspacePreviews.sources"]}],
+        "ios": [{"path": "ios/POCVault/POCVault/Views/LibraryView.swift", "contains": ["RelayPreviewsView", "Workspace results", "Published catalog", "fetchJobs"]}, {"path": "ios/POCVault/POCVault/POCVaultApp.swift", "contains": ["openPreviewSourceJob", "automaticallyOpensPreviews: false"]}],
+        "android": [{"path": "mobile/androidApp/src/main/kotlin/com/parikshit/relay/ui/RelayApp.kt", "contains": ["WorkspacePreviewsScreen", "Workspace results", "Published catalog", "RelayWorkspacePreviews.sources", "viewModel::openPreviewSourceJob"]}, {"path": "mobile/androidApp/src/main/kotlin/com/parikshit/relay/ui/RelayViewModel.kt", "contains": ["automaticallyOpensPreviews = false", "if (automaticallyOpensPreviews) job?.let"]}]
+      }
+    },
+    {
+      "id": "published-preview-metadata-and-access",
+      "surfaces": {
+        "shared": [{"path": "mobile/relay-core/src/commonMain/kotlin/live/relay/core/ManifestModels.kt", "contains": ["updatedAt", "tags", "requiresClientCertificate"]}],
+        "ios": [{"path": "ios/POCVault/POCVault/Views/LibraryView.swift", "contains": ["PreviewDetailsView", "Preview details", "Open preview", "PreviewTrustCopy"]}],
+        "android": [{"path": "mobile/androidApp/src/main/kotlin/com/parikshit/relay/ui/RelayApp.kt", "contains": ["PocPreviewDetailsScreen", "Preview details", "Open preview", "not the contents of downloaded web pages"]}]
+      }
     }
   ],
   "knownDifferences": [
     {"id": "apple-identity-and-apns", "status": "platform-specific", "reason": "Sign in with Apple and APNs require native Apple implementations; Android equivalents must use Android identity and FCM."},
     {"id": "apple-app-store-subscriptions", "status": "platform-specific", "reason": "The iOS App Store build purchases Relay Hosted through StoreKit; Android billing requires its own store implementation before Android distribution."},
     {"id": "account-trial-cli-handoff", "status": "android-gap", "reason": "Android 0.1 still uses manual private-operator setup and does not yet expose the iOS account, trial, CLI-link, or handoff flows."},
+    {"id": "published-preview-catalog-filters", "status": "android-gap", "reason": "Both apps expose workspace results, the separate signed published catalog, per-preview metadata/access details, and explicit preview opening. iOS additionally has catalog search, the Protected filter, and locally stored recently opened preview history; Android currently lists the verified catalog in update order without those browsing controls."},
     {"id": "direct-provider-login", "status": "android-gap", "reason": "Direct provider sign-in on the machine from the phone ships on iOS only; Android has no machine-management surface yet (see account-trial-cli-handoff). Covers the whole iOS surface as it iterated on 2026-08-29: the harness login-op engine (start/input/callback/cancel), the legacy-machine exec fallback (login under util-linux script for a PTY via /v1/exec, setsid-detached with log-file polling and FIFO stdin, absolute-binary resolution, exec callback replay, loggedIn confirmation; rebuilt off the terminals API, which needs an authenticated codex app-server), and the sheet's diagnostics (stage text, machine-error quoting, terminal-output tail), plus composer entry-point and control-rail layout fixes in RelayChatView."},
     {"id": "file-terminal-voice-notifications", "status": "android-gap", "reason": "Android does not yet expose the iOS file viewer, terminal, voice capture, or completion-notification workflows."}
   ]

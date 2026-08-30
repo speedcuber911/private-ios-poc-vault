@@ -498,6 +498,12 @@ object RelayOutputCleaner {
     }
 }
 
+/** Preview listings combine reported result text and stdout without inferring from job status. */
+object RelayWorkspacePreviews {
+    fun sources(output: String?, stdout: String?): List<String> =
+        RelayLocalPreviewUrls.extract(listOfNotNull(output, stdout).joinToString("\n"))
+}
+
 object RelayLocalPreviewUrls {
     private val loopbackUrl = Regex(
         """https?://(?:localhost|127\.0\.0\.1|\[::1])(?::[0-9]{1,5})?(?:/[^\s<>'\"`]*)?""",
