@@ -170,6 +170,35 @@ exact-block replacement and syntax-checked before being trusted.)
 | cloud | `cd product/cloud && node --test test/*.test.mjs` | **16 pass / 0 fail** |
 | broker | `cd product/broker && go vet ./... && go build ./... && go test -count=1 ./...` | **all packages ok** (e2e, mux, sni, verify; 18 test funcs; Go 1.26.4) |
 
+## product/relayd deploy story (recorded 2026-08-30; closes the "undocumented" item in docs/RUNBOOK_DIRECT_LOGIN_FINISH.md)
+
+Discovered by tracing the live infrastructure end to end, not from docs:
+
+- **The owner's phone "machine" is the account's trial-sandbox node** (kind
+  `trial` in the production registry), not the personal box. The personal box
+  (`pariksj-dev`, `i-0364bb0f31f506e7c`) still runs the **legacy pre-extraction
+  `server.mjs`** under `codex-api.service` — it contains no `/v1/harness` or
+  `/v1/exec` surface at all and is not an enrolled relayd node (W2 item
+  "enroll the personal box as node #1" remains missing). Its gateway is a
+  Docker Caddy owned by an unrelated POC stack on the same shared box, with the
+  relay vhost block inside that stack's Caddyfile; the vhost also still lists a
+  retired sslip.io hostname from before the 2026-08-11 EIP change.
+- **relayd therefore deploys to real users only via the trial template.** The
+  path: copy `product/{trial,relayd}` from the target commit to the Cube host
+  (`rocketizer-cubesandbox`, `i-077519030563ae4a8`, no public IP — reach it via
+  SSM; build contexts live in `/root/relay-build-<sha>/`), run
+  `trial/build.sh` there (docker build → local registry push → `POST
+  /templates` → poll READY; template ids are server-generated `tpl-*`), then
+  set the returned id as `TRIAL_TEMPLATE_ID` in `/etc/relay-cloud/env` on the
+  control-plane box (`i-0ce97c38c7fd74825`) and restart `relay-cloud`.
+- **Existing sandboxes keep the old image forever** — a template update only
+  affects sandboxes created after it. To move a live trial machine to new
+  relayd bits, delete + recreate the trial from the phone (the `destroyed`
+  row is retried in place, so the account is not burned). Until then, phones
+  with app ≥ `58bdb03` can still sign in to providers on an old-image sandbox
+  through the exec fallback (`/v1/exec` + `GET /v1/harness`), which shipped in
+  templates built from ≥ `9b4392d` (2026-08-13).
+
 ## Next actions
 
 ### Remaining for M0 (contract freeze + tunnel spike closure)
