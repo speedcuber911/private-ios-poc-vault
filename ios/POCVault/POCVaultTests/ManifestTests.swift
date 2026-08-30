@@ -128,6 +128,103 @@ final class ManifestTests: XCTestCase {
     }
 
     @MainActor
+    func testPreviewSourceJobIsVisibleBeforeSlowDetailRefreshCompletes() async throws {
+        let snapshot = try decodeCodexJob("""
+        {"id":"source-job","provider":"codex","status":"succeeded","workspaceId":"hosted-project","prompt":"Inspect the project output","result":"Snapshot output"}
+        """)
+        let updated = try decodeCodexJob("""
+        {"id":"source-job","provider":"codex","status":"succeeded","workspaceId":"hosted-project","prompt":"Inspect the project output","result":"Refreshed output"}
+        """)
+        let requested = expectation(description: "read-only job detail requested")
+        var response: CheckedContinuation<CodexJob, Never>?
+        var requestedIDs: [String] = []
+        let model = RelayChatViewModel(
+            client: makeOfflineCodexClient(), workspaceID: "hosted-project", workspacePath: nil,
+            fetchJobDetail: { id in
+                requestedIDs.append(id)
+                return await withCheckedContinuation { continuation in
+                    response = continuation
+                    requested.fulfill()
+                }
+            }
+        )
+        let opening = Task { await model.openHistoryItem(CodexThreadFeedItem(source: .pendingJob(snapshot))) }
+        await fulfillment(of: [requested], timeout: 2)
+
+        XCTAssertEqual(model.messages.first?.text, "Inspect the project output")
+        XCTAssertEqual(model.messages.last?.job?.id, "source-job")
+        XCTAssertEqual(model.messages.last?.text, "Snapshot output")
+        XCTAssertTrue(model.prompt.isEmpty, "Inspecting a source must not queue a prompt to send.")
+        XCTAssertFalse(model.isSending)
+        XCTAssertFalse(model.isStreaming)
+        XCTAssertNil(model.selectedChoice, "Source inspection does not invent provider authorization or a model.")
+        XCTAssertEqual(requestedIDs, ["source-job"])
+
+        response?.resume(returning: updated)
+        await opening.value
+        XCTAssertEqual(model.messages.last?.text, "Refreshed output")
+    }
+
+    @MainActor
+    func testPreviewSourceLateRefreshCannotReplaceNewConversation() async throws {
+        let job = try decodeCodexJob("""
+        {"id":"source-job","status":"succeeded","workspaceId":"hosted-project","prompt":"Old source","result":"Old output"}
+        """)
+        let requested = expectation(description: "detail refresh suspended")
+        var response: CheckedContinuation<CodexJob, Never>?
+        let model = RelayChatViewModel(
+            client: makeOfflineCodexClient(), workspaceID: "hosted-project", workspacePath: nil,
+            fetchJobDetail: { _ in
+                await withCheckedContinuation { continuation in
+                    response = continuation
+                    requested.fulfill()
+                }
+            }
+        )
+        let opening = Task { await model.openHistoryItem(CodexThreadFeedItem(source: .pendingJob(job))) }
+        await fulfillment(of: [requested], timeout: 2)
+        XCTAssertFalse(model.messages.isEmpty)
+        model.startNewConversation()
+        model.prompt = "Keep my new draft"
+        response?.resume(returning: job)
+        await opening.value
+        XCTAssertTrue(model.messages.isEmpty)
+        XCTAssertNil(model.currentSessionProvider)
+        XCTAssertEqual(model.prompt, "Keep my new draft")
+    }
+
+    @MainActor
+    func testPreviewSourceReselectIgnoresEarlierRefreshForSameJob() async throws {
+        let snapshot = try decodeCodexJob("""
+        {"id":"same-source","status":"succeeded","workspaceId":"hosted-project","result":"Original snapshot"}
+        """)
+        let latest = try decodeCodexJob("""
+        {"id":"same-source","status":"succeeded","workspaceId":"hosted-project","result":"Newest detail"}
+        """)
+        let firstRequested = expectation(description: "first detail suspended")
+        let secondRequested = expectation(description: "second detail suspended")
+        var responses: [CheckedContinuation<CodexJob, Never>] = []
+        let model = RelayChatViewModel(
+            client: makeOfflineCodexClient(), workspaceID: "hosted-project", workspacePath: nil,
+            fetchJobDetail: { _ in
+                await withCheckedContinuation { continuation in
+                    responses.append(continuation)
+                    (responses.count == 1 ? firstRequested : secondRequested).fulfill()
+                }
+            }
+        )
+        let first = Task { await model.openHistoryItem(CodexThreadFeedItem(source: .pendingJob(snapshot))) }
+        await fulfillment(of: [firstRequested], timeout: 2)
+        let second = Task { await model.openHistoryItem(CodexThreadFeedItem(source: .pendingJob(snapshot))) }
+        await fulfillment(of: [secondRequested], timeout: 2)
+        responses[1].resume(returning: latest)
+        await second.value
+        responses[0].resume(returning: snapshot)
+        await first.value
+        XCTAssertEqual(model.messages.last?.text, "Newest detail", "Job ID alone cannot identify the current selection.")
+    }
+
+    @MainActor
     func testPreviewSourceJobInspectionDoesNotReplayAutomaticPreview() throws {
         let store = RelayChatSessionStore(client: makeOfflineCodexClient())
         let source = store.launch(folderPath: nil, workspaceID: "scratch", automaticallyOpensPreviews: false)

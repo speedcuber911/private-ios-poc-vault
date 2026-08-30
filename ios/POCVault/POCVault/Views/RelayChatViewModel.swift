@@ -275,6 +275,10 @@ final class RelayChatViewModel: ObservableObject {
     @Published private(set) var streamingMessageID: String?
 
     private let client: CodexClient
+    private let fetchJobDetail: (String) async throws -> CodexJob
+    /// Detail refreshes may finish after the user selects a different source or
+    /// starts a conversation. They must not replace that newer foreground state.
+    private var conversationRevision = UUID()
     private var currentThreadID: String?
     private var currentThreadProvider: CodexProvider?
     /// Workspace the current thread belongs to. Resuming a session in a different
@@ -314,8 +318,16 @@ final class RelayChatViewModel: ObservableObject {
         )
     }
 
-    init(client: CodexClient, workspaceID: String?, workspacePath: String?) {
+    init(
+        client: CodexClient,
+        workspaceID: String?,
+        workspacePath: String?,
+        fetchJobDetail: ((String) async throws -> CodexJob)? = nil
+    ) {
         self.client = client
+        self.fetchJobDetail = fetchJobDetail ?? { id in
+            try await client.fetchJob(id: id, includeFullLogs: false)
+        }
         self.workspaceID = workspaceID?.trimmedNonEmpty
         self.workspacePath = workspacePath?.trimmedNonEmpty
         let savedClaudeMode = UserDefaults.standard.string(forKey: Self.claudePermissionDefaultsKey)
@@ -554,6 +566,7 @@ final class RelayChatViewModel: ObservableObject {
     /// that session: follow-up task messages target the handoff's workspace.
     func continueHandoff(_ card: RelayHandoffCard) async {
         guard card.isActionable, !continuingHandoffIDs.contains(card.id) else { return }
+        conversationRevision = UUID()
         continuingHandoffIDs.insert(card.id)
         defer { continuingHandoffIDs.remove(card.id) }
 
@@ -623,6 +636,7 @@ final class RelayChatViewModel: ObservableObject {
             errorMessage = "No model is available."
             return
         }
+        conversationRevision = UUID()
         switch choice.mode {
         case .chat:
             await sendChat(using: choice)
@@ -959,6 +973,7 @@ final class RelayChatViewModel: ObservableObject {
     // MARK: - Threads
 
     func startNewConversation() {
+        conversationRevision = UUID()
         currentThreadID = nil
         currentThreadProvider = nil
         currentThreadWorkspaceID = nil
@@ -990,12 +1005,15 @@ final class RelayChatViewModel: ObservableObject {
             errorMessage = "This thread belongs to a different folder."
             return
         }
+        let revision = UUID()
+        conversationRevision = revision
         do {
             let detail = try await client.fetchThreadDetail(
                 sessionID: thread.sessionId,
                 workspaceID: workspaceID,
                 provider: thread.provider
             )
+            guard conversationRevision == revision else { return }
             currentThreadID = detail.thread.sessionId
             currentThreadProvider = detail.thread.provider
             currentThreadWorkspaceID = detail.thread.workspaceId
@@ -1028,6 +1046,7 @@ final class RelayChatViewModel: ObservableObject {
             messages = items.sorted { $0.timestamp < $1.timestamp }
             errorMessage = nil
         } catch {
+            guard conversationRevision == revision else { return }
             errorMessage = error.localizedDescription
         }
     }
@@ -1048,7 +1067,19 @@ final class RelayChatViewModel: ObservableObject {
             errorMessage = "This invocation belongs to a different folder."
             return
         }
-        let latest = (try? await client.fetchJob(id: job.id, includeFullLogs: false)) ?? job
+        let revision = UUID()
+        conversationRevision = revision
+        // Previews/history already supplied this real job. Show it before any
+        // network wait: a cold runner's provider probes can otherwise leave an
+        // empty conversation on screen for tens of seconds.
+        presentStandaloneJob(job)
+        guard let latest = try? await fetchJobDetail(job.id),
+              conversationRevision == revision,
+              latest.id == job.id, belongsToHistoryScope(latest.workspaceId) else { return }
+        presentStandaloneJob(latest)
+    }
+
+    private func presentStandaloneJob(_ latest: CodexJob) {
         currentThreadID = latest.threadSessionId
         currentThreadProvider = latest.provider
         currentThreadWorkspaceID = latest.workspaceId
