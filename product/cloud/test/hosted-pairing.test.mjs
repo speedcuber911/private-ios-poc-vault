@@ -3,17 +3,26 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { startTestApp, signIn, api, authed, makeNodeIdentity } from "./helpers.mjs";
 import { nodeRequestSigningInput } from "../src/nodeauth.js";
-import { generateEncKeyPair, sealTo } from "../../relayd/src/seal.mjs";
+
+// The cloud validates framing and relays opaque bytes; it must never decrypt
+// the payload. Real sealing/decryption is covered by product/integration.
+function opaqueSealedEnvelope() {
+  return Buffer.concat([
+    Buffer.from("RLYSEAL1"),
+    crypto.randomBytes(32 + 12 + 48 + 16), // ephemeral key, nonce, ciphertext, tag
+  ]).toString("base64");
+}
 
 async function fixture() {
   const t = await startTestApp();
   const account = await signIn(t);
   const other = await signIn(t, { sub: "other", email: "other@example.com" });
   const identity = makeNodeIdentity();
-  const encryption = generateEncKeyPair();
+  const { publicKey } = crypto.generateKeyPairSync("x25519");
+  const encryptionPublicKey = Buffer.from(publicKey.export({ format: "jwk" }).x, "base64url").toString("base64");
   const nodeId = "node-0123456789abcdef";
   const node = t.app.registry.createNode(account.accountId, {
-    id: nodeId, kind: "managed", pubkey: identity.pubkeyPem, encPubkey: encryption.publicKeyB64,
+    id: nodeId, kind: "managed", pubkey: identity.pubkeyPem, encPubkey: encryptionPublicKey,
   });
   const trial = t.app.registry.createTrialNode({ accountId: account.accountId, enrollTokenHash: "spent", expiresAt: t.clock.t + 86_400_000 });
   t.app.registry.updateTrial(trial.id, { nodeId, sandboxId: "abc123", state: "upgraded" });
@@ -32,9 +41,7 @@ async function fixture() {
     const session = t.app.pairing.createSession({ accountId: owner, authToken, kind });
     assert.equal(typeof session, "object");
     const secret = crypto.randomBytes(24).toString("base64url");
-    const sealedSecret = sealTo(encryption.publicKeyB64, Buffer.from(JSON.stringify({
-      v: 1, nodeId, pairingId: session.pairingId, secret, expiresAt: session.expiresAt,
-    }))).toString("base64");
+    const sealedSecret = opaqueSealedEnvelope();
     return { ...session, authToken, secret, sealedSecret, body: { pairingId: session.pairingId, sealedSecret } };
   }
   const submit = (r, owner = account) => api(t.baseUrl, "POST", `/v1/nodes/${nodeId}/device-pairings`, {
@@ -43,7 +50,7 @@ async function fixture() {
   return { t, account, other, node, nodeId, trial, signed, poll, request, submit };
 }
 
-test("hosted recovery is ownership-bound, capability-gated, encrypted, idempotent and node-ready-gated", async () => {
+test("hosted recovery is ownership-bound, capability-gated, opaque, idempotent and node-ready-gated", async () => {
   const f = await fixture();
   const { t } = f;
   try {
@@ -54,7 +61,7 @@ test("hosted recovery is ownership-bound, capability-gated, encrypted, idempoten
     await f.poll();
     assert.equal((await f.submit(r)).status, 202);
     assert.equal((await f.submit(r)).status, 202);
-    assert.equal((await f.submit({ body: { ...r.body, sealedSecret: sealTo(generateEncKeyPair().publicKeyB64, Buffer.from("changed")).toString("base64") } })).json.error, "pairing_conflict");
+    assert.equal((await f.submit({ body: { ...r.body, sealedSecret: opaqueSealedEnvelope() } })).json.error, "pairing_conflict");
     const oldPoll = await f.poll(false);
     assert.equal(oldPoll.json.devicePairings, undefined, "old workers never consume requests");
     const delivered = await f.poll();
@@ -88,6 +95,10 @@ test("recovery rejects wrong session ownership/kind, raw secrets, expired access
     assert.equal((await f.submit(f.request(f.account.accountId, "pair"))).json.error, "pairing_unavailable");
     const r = f.request();
     assert.equal((await f.submit({ body: { ...r.body, secret: r.secret } })).status, 400);
+    for (const sealedSecret of ["not base64", Buffer.from("RLYSEAL1").toString("base64"),
+      Buffer.concat([Buffer.from("BADSEAL1"), crypto.randomBytes(108)]).toString("base64")]) {
+      assert.equal((await f.submit({ body: { ...r.body, sealedSecret } })).json.error, "invalid_device_pairing");
+    }
     f.t.app.registry.updateTrial(f.trial.id, { state: "expired" });
     assert.equal((await f.submit(r)).status, 403);
     f.t.app.registry.updateTrial(f.trial.id, { state: "upgraded" });
