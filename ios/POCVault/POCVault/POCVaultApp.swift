@@ -35,10 +35,13 @@ struct POCVaultApp: App {
             baseURL: nodeStore.effectiveBaseURL,
             identityStore: identityStore
         )
+        let trialClient = RelayTrialClient(baseURL: AppConfiguration.authBaseURL)
         let accountStore = RelayAccountStore(
             client: RelayAuthClient(baseURL: AppConfiguration.authBaseURL),
             identityStore: identityStore,
-            nodeStore: nodeStore
+            nodeStore: nodeStore,
+            trialClient: trialClient,
+            recoveryDeviceName: UIDevice.current.name
         )
 
         _identityStore = StateObject(wrappedValue: identityStore)
@@ -61,7 +64,7 @@ struct POCVaultApp: App {
         ))
         self.manifestClient = manifestClient
         self.codexClient = codexClient
-        self.trialClient = RelayTrialClient(baseURL: AppConfiguration.authBaseURL)
+        self.trialClient = trialClient
     }
 
     var body: some Scene {
@@ -94,6 +97,8 @@ struct POCVaultApp: App {
             RelayRestoringView()
         case .signedOut:
             AuthenticationView(accountStore: accountStore)
+        case .recoveringMachine:
+            RelayHostedRecoveryView(accountStore: accountStore)
         case .onboarding:
             RelayOnboardingView(
                 accountStore: accountStore,
@@ -172,6 +177,46 @@ private struct RelayRestoringView: View {
             }
         }
         .preferredColorScheme(.dark)
+    }
+}
+
+private struct RelayHostedRecoveryView: View {
+    @ObservedObject var accountStore: RelayAccountStore
+
+    var body: some View {
+        ZStack {
+            AppTheme.canvasGradient.ignoresSafeArea()
+            VStack(spacing: 20) {
+                Image(systemName: "desktopcomputer")
+                    .font(.system(size: 36, weight: .medium))
+                    .foregroundStyle(AppTheme.accent)
+                Text(accountStore.machineRecoveryError == nil ? "Restoring your machine" : "Reconnect your hosted machine")
+                    .font(AppTheme.serifFont(size: 28))
+                    .foregroundStyle(AppTheme.textPrimary)
+                    .multilineTextAlignment(.center)
+                Text(accountStore.machineRecoveryError ?? "Checking your account and securely connecting this device to your existing hosted machine. No replacement machine is created.")
+                    .font(AppTheme.uiFont(size: 14))
+                    .foregroundStyle(AppTheme.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                if accountStore.machineRecoveryError != nil {
+                    Button("Retry connection") {
+                        Task { await accountStore.retryHostedMachineRecovery() }
+                    }
+                    .buttonStyle(RelayPrimaryButtonStyle())
+                    .accessibilityIdentifier("relay-hosted-recovery-retry")
+                } else {
+                    ProgressView().tint(AppTheme.accent)
+                }
+                Button("Sign out") { Task { await accountStore.signOut() } }
+                    .font(AppTheme.uiFont(size: 14))
+                    .foregroundStyle(AppTheme.textSecondary)
+            }
+            .frame(maxWidth: 460)
+            .padding(28)
+        }
+        .preferredColorScheme(.dark)
+        .accessibilityIdentifier("relay-hosted-recovery")
     }
 }
 

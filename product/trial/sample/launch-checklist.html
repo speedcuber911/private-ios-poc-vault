@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Launch checklist</title>
+  <style>
+    :root { color-scheme: light; font: 16px -apple-system, BlinkMacSystemFont, sans-serif; color: #252a26; background: #f4f2e9; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { max-width: 720px; margin: auto; padding: 64px 24px 40px; }
+    .eyebrow { color: #58735e; font-size: 11px; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; }
+    h1 { font: 44px/1.02 Georgia, serif; letter-spacing: -.04em; margin: 18px 0 14px; max-width: 440px; }
+    .intro { color: #62685f; line-height: 1.5; margin: 0 0 28px; max-width: 440px; }
+    .progress { display: flex; justify-content: space-between; align-items: baseline; padding-bottom: 12px; font-size: 13px; }
+    .progress strong { font-size: 20px; font-weight: 600; }
+    progress { display: block; width: 100%; height: 6px; appearance: none; border: none; border-radius: 4px; overflow: hidden; background: #dbdfd4; }
+    progress::-webkit-progress-bar { background: #dbdfd4; }
+    progress::-webkit-progress-value { background: #50745a; transition: width .2s; }
+    .tasks { margin: 28px 0; border-top: 1px solid #d6d8cd; }
+    label { display: flex; align-items: flex-start; gap: 14px; padding: 22px 0; border-bottom: 1px solid #d6d8cd; cursor: pointer; }
+    input { accent-color: #50745a; width: 22px; height: 22px; flex-shrink: 0; margin: 1px 0 0; }
+    .task-title { display: block; font-weight: 600; line-height: 1.4; }
+    .task-detail { display: block; color: #73796e; font-size: 13px; line-height: 1.5; margin-top: 5px; }
+    .next { border-left: 3px solid #50745a; padding-left: 16px; margin-top: 30px; }
+    .next p { font-size: 14px; line-height: 1.5; margin: 8px 0 0; }
+    footer { margin-top: 36px; color: #7a8176; font-size: 11px; }
+    @media (min-width: 650px) { main { padding: 88px 40px 48px; } h1 { font-size: 64px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="eyebrow">Release plan · sample project</div>
+    <h1>A calmer path<br>to launch.</h1>
+    <p class="intro">The working checklist for a small product release. Review the last detail, then hand it over.</p>
+    <div class="progress"><span>Ready for handoff</span><strong id="count" aria-live="polite">2 of 3</strong></div>
+    <progress id="progress" value="2" max="3" aria-label="Release checks complete"></progress>
+    <section class="tasks" aria-label="Release checklist">
+      <label><input type="checkbox" checked><span><span class="task-title">Review the mobile layout</span><span class="task-detail">Small screens, readable type, no horizontal scrolling.</span></span></label>
+      <label><input type="checkbox" checked><span><span class="task-title">Check the keyboard flow</span><span class="task-detail">Every control has a label and a visible focus state.</span></span></label>
+      <label><input type="checkbox"><span><span class="task-title">Approve the final copy</span><span class="task-detail">Read the page once more before publishing.</span></span></label>
+    </section>
+    <aside class="next"><div class="eyebrow">Next step</div><p>Finish the copy review. The same task can continue from the phone.</p></aside>
+    <footer>Interactive sample output · changes stay in this preview</footer>
+  </main>
+  <script>
+    const checks = Array.from(document.querySelectorAll('input[type="checkbox"]'));
+    function updateProgress() {
+      const completed = checks.filter(check => check.checked).length;
+      document.getElementById('count').textContent = `${completed} of ${checks.length}`;
+      document.getElementById('progress').value = completed;
+    }
+    checks.forEach(check => check.addEventListener('change', updateProgress));
+  </script>
+</body>
+</html>

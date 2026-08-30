@@ -62,6 +62,7 @@ COPY relayd/bin /opt/relayd/app/bin
 COPY relayd/package.json /opt/relayd/app/package.json
 COPY start.sh /opt/relayd/start.sh
 COPY src /opt/relayd/src
+COPY sample /opt/relayd/sample
 RUN chmod 0755 /opt/relayd/start.sh /opt/relayd/app/bin/relayd
 
 # Deliberately NO image-level `USER relay`. The base entrypoint has to start

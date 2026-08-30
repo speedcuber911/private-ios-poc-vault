@@ -54,7 +54,7 @@ const SLOTS = new Set(["node", "device"]);
 //                   sync-auth, different payload.
 // Slot names stay exactly "node" / "device" for all three kinds — sync-auth
 // and session-index simply never write "node".
-const KINDS = new Set(["pair", "sync-auth", "session-index"]);
+const KINDS = new Set(["pair", "hosted-device", "sync-auth", "session-index"]);
 
 // `sync-auth` and `session-index` are one-directional: only the "device"
 // slot is ever written (by the CLI) or read (by the node) — nothing ever
@@ -146,6 +146,11 @@ export function createPairing({ registry, config, now = () => Date.now() }) {
     if (typeof tag !== "string" || !TAG_RE.test(tag)) return "bad_slot";
     const session = authorize(id, authToken);
     if (!session) return "unauthorized";
+    // A node may retry the SAME encrypted response after a crash or a
+    // lost HTTP acknowledgement. Never permit replacement or extend its TTL.
+    if (["pair", "hosted-device"].includes(session.kind) && slot === "node" && session.nodeBlob !== null) {
+      return session.nodeBlob === blob.toString("base64") && session.nodeTag === tag ? "ok" : "conflict";
+    }
     // PUT-ONCE: a filled slot is a conflict, never an overwrite. This is what
     // denies the control plane a quiet substitution even before the peer's MAC
     // check catches it.
@@ -187,5 +192,5 @@ export function createPairing({ registry, config, now = () => Date.now() }) {
     registry.sweepPairingSessions(now());
   }
 
-  return { createSession, putBlob, getBlob, sweep, maxPerAccount };
+  return { createSession, putBlob, getBlob, sweep, maxPerAccount, isAuthorized: (id, authToken) => Boolean(authorize(id, authToken)) };
 }

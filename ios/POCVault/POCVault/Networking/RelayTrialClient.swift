@@ -10,6 +10,10 @@ enum RelayTrialClientError: Error, Equatable {
     case blobPending        // 404 not_posted_yet
     case tooManyAttempts    // 429 too_many_pairing_sessions
     case tagMismatch
+    case reconnectUnavailable
+    case machineNotReady
+    case hostedAccessUnavailable
+    case hostedUpgradeRequired
     case server(status: Int)
 }
 
@@ -54,6 +58,52 @@ final class RelayTrialClient {
         )
         try Self.throwIfError(response: response, data: data)
         return try Self.decodeTrialEnvelope(data)
+    }
+
+    struct HostedPairingSession: Decodable {
+        let pairingId: String
+        let expiresAt: Int64
+    }
+
+    func createHostedPairingSession(authToken: String, bearer: String) async throws -> HostedPairingSession {
+        let (data, response) = try await send(
+            method: "POST",
+            path: "/v1/pairing/sessions",
+            body: ["authToken": authToken, "kind": "hosted-device"],
+            bearer: bearer
+        )
+        try Self.throwIfError(response: response, data: data)
+        return try JSONDecoder().decode(HostedPairingSession.self, from: data)
+    }
+
+    func hostedNodeEncryptionKey(nodeID: String, bearer: String) async throws -> String {
+        struct Node: Decodable { let id: String; let encPubkey: String }
+        struct Envelope: Decodable { let node: Node }
+        let (data, response) = try await send(
+            method: "GET", path: "/v1/nodes/\(try Self.pathComponent(nodeID))", body: nil, bearer: bearer
+        )
+        try Self.throwIfError(response: response, data: data)
+        let node = try JSONDecoder().decode(Envelope.self, from: data).node
+        guard node.id == nodeID else { throw RelayTrialFlowError.malformedResponse }
+        return node.encPubkey
+    }
+
+    /// Only ciphertext crosses the account API. The pairing secret remains on
+    /// this device and is opened by the account-owned node's X25519 key.
+    func requestHostedDevicePairing(nodeID: String, pairingID: String, sealedSecret: Data, bearer: String) async throws {
+        struct Accepted: Decodable { let ok: Bool; let pairingId: String; let expiresAt: Int64 }
+        let (data, response) = try await send(
+            method: "POST",
+            path: "/v1/nodes/\(try Self.pathComponent(nodeID))/device-pairings",
+            body: ["pairingId": pairingID, "sealedSecret": sealedSecret.base64EncodedString()],
+            bearer: bearer
+        )
+        try Self.throwIfError(response: response, data: data)
+        let accepted = try JSONDecoder().decode(Accepted.self, from: data)
+        guard accepted.ok, accepted.pairingId == pairingID,
+              accepted.expiresAt > Int64(Date().timeIntervalSince1970 * 1_000) else {
+            throw RelayTrialFlowError.reconnectExpired
+        }
     }
 
     func deleteTrial(bearer: String) async throws {
@@ -121,6 +171,10 @@ final class RelayTrialClient {
     /// reported to the user as a spent trial.
     static func mapError(status: Int, code: String?) -> RelayTrialClientError {
         switch (status, code) {
+        case (404, "device_pairing_unavailable"), (404, "node_not_found"), (404, "not_found"): return .reconnectUnavailable
+        case (403, "hosted_access_unavailable"): return .hostedAccessUnavailable
+        case (409, "hosted_pairing_upgrade_required"): return .hostedUpgradeRequired
+        case (409, "node_not_ready"): return .machineNotReady
         case (409, "trial_already_used"): return .alreadyUsed
         case (409, _): return .pairingConflict
         case (429, _): return .tooManyAttempts
@@ -200,6 +254,14 @@ final class RelayTrialClient {
         components.query = nil
         components.fragment = nil
         return components.url!
+    }
+
+    private static func pathComponent(_ value: String) throws -> String {
+        let safe = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_.~"))
+        guard !value.isEmpty, value.unicodeScalars.allSatisfy(safe.contains) else {
+            throw RelayTrialFlowError.malformedResponse
+        }
+        return value
     }
 
     private var origin: String {

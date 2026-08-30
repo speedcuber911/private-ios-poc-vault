@@ -785,6 +785,18 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       .map(mapTrial);
   }
 
+  function listUpgradedTrials() {
+    return db.prepare("SELECT * FROM trial_nodes WHERE state = 'upgraded' ORDER BY id").all().map(mapTrial);
+  }
+
+  function listPendingHostedActivations() {
+    return db.prepare(
+      `SELECT t.* FROM trial_nodes t JOIN entitlements e ON e.account_id = t.account_id
+       WHERE e.feature = 'hosted.activation_pending_trial' AND e.value = t.id || ':' || t.sandbox_id
+         AND t.state IN ('creating', 'ready', 'expired') ORDER BY t.id`,
+    ).all().map(mapTrial);
+  }
+
   function countActiveTrials() {
     return Number(db.prepare("SELECT COUNT(*) AS c FROM trial_nodes WHERE state IN ('creating','ready')").get().c);
   }
@@ -808,7 +820,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       const maxVal = Number.isFinite(currentMax) ? currentMax : 0;
       if (
         !trial ||
-        (trial.state !== "creating" && trial.state !== "ready") ||
+        !["creating", "ready", "expired"].includes(trial.state) ||
         !trial.nodeId ||
         !node
       ) {
@@ -2004,6 +2016,8 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     updateTrial,
     listTrialsDue,
     listTrialsPastGrace,
+    listUpgradedTrials,
+    listPendingHostedActivations,
     countActiveTrials,
     upgradeTrialAccount,
     getAppleSubscriptionByAccount,

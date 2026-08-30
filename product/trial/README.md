@@ -10,6 +10,15 @@ A Cube/E2B template for running the Relay agent in a sandboxed, tunneled environ
 - **Workspaces**: Jail at `/srv/relay-workspaces` with a seeded welcome workspace
 - **Init**: `start.sh` (no systemd; runs as PID 1)
 
+New hosted machines also include a **Launch checklist** starter workspace,
+an HTML artifact and a local preview at `http://localhost:4317/lab`. The
+sample task and README explicitly label this as preloaded fictional content,
+not a provider-generated run. No AI request or provider authentication occurs
+during seeding. The sample server listens only on loopback and cannot list
+directories or execute commands; Relay's normal task-linked preview path
+provides remote access. Existing user folders and sample edits are never
+overwritten. Real agent tasks still require the user's own provider access.
+
 ## Environment Contract
 
 The sandbox receives the following environment variables, injected by relay-cloud:

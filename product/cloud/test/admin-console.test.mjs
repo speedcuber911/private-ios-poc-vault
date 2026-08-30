@@ -22,6 +22,10 @@ function makeFakeProvisioner() {
     created,
     writes: [],
     killed: [],
+    extended: [],
+    resumed: [],
+    async extendSandbox(id, timeout) { this.extended.push({ id, timeout }); return true; },
+    async resumeSandbox(id, timeout) { this.resumed.push({ id, timeout }); return true; },
     async createSandbox(opts) {
       created.push(opts);
       return { sandboxId: `sbx_${created.length}` };
@@ -259,6 +263,8 @@ test("POST /v1/admin/accounts/:id/upgrade converts a live trial and is idempoten
     assert.equal(stored.sandboxId, seeded.sandboxId);
     assert.equal(stored.nodeId, seeded.nodeId);
     assert.equal(t.app.registry.getNode(seeded.nodeId).kind, "byo");
+    assert.deepEqual(provisioner.extended, [{ id: seeded.sandboxId, timeout: t.config.trial.paidSandboxTimeoutSec }]);
+    assert.equal(t.app.registry.getEntitlement(customer.user.id, "hosted.auto_upgrade"), "1");
 
     const again = await api(
       t.baseUrl,

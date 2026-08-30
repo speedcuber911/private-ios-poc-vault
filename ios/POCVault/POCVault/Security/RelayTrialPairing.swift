@@ -3,6 +3,7 @@ import Foundation
 import Security
 
 enum RelayTrialPairing {
+    enum HostedSealError: Error { case invalidPublicKey, invalidEnvelope }
     static let deviceSlot = "device-blob"
     static let nodeSlot = "node-blob"
     private static let authLabel = "relay-pair-auth-v1"
@@ -79,6 +80,49 @@ enum RelayTrialPairing {
             using: SymmetricKey(data: Data(secret.utf8))
         )
         return Data(mac).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Byte-compatible with relayd's canonical RLYSEAL1 seal.mjs. This is the
+    /// existing X25519 + HKDF-SHA256 + AES-256-GCM format, with empty AAD.
+    /// Optional entropy inputs are exclusively for cross-language test vectors.
+    static func sealHostedPairingSecret(
+        nodeID: String,
+        pairingID: String,
+        secret: String,
+        expiresAt: Int64,
+        recipientPublicKey: String,
+        ephemeralPrivateKeyRaw: Data? = nil,
+        nonceData: Data? = nil
+    ) throws -> Data {
+        guard let recipientRaw = Data(base64Encoded: recipientPublicKey),
+              recipientRaw.count == 32,
+              recipientRaw.base64EncodedString() == recipientPublicKey else {
+            throw HostedSealError.invalidPublicKey
+        }
+        guard !nodeID.isEmpty, !pairingID.isEmpty, !secret.isEmpty, expiresAt > 0 else {
+            throw HostedSealError.invalidEnvelope
+        }
+        let recipient = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: recipientRaw)
+        let ephemeral = try ephemeralPrivateKeyRaw.map { try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: $0) }
+            ?? Curve25519.KeyAgreement.PrivateKey()
+        let ephemeralRaw = ephemeral.publicKey.rawRepresentation
+        let magic = Data("RLYSEAL1".utf8)
+        var info = Data("relay-seal-v1".utf8)
+        info.append(ephemeralRaw)
+        info.append(recipientRaw)
+        let sharedSecret = try ephemeral.sharedSecretFromKeyAgreement(with: recipient)
+        let key = sharedSecret.hkdfDerivedSymmetricKey(using: SHA256.self, salt: magic, sharedInfo: info, outputByteCount: 32)
+        let nonce = try nonceData.map { try AES.GCM.Nonce(data: $0) } ?? AES.GCM.Nonce()
+        let payload = try JSONSerialization.data(withJSONObject: [
+            "v": 1, "nodeId": nodeID, "pairingId": pairingID, "secret": secret, "expiresAt": expiresAt
+        ], options: [.sortedKeys])
+        let sealed = try AES.GCM.seal(payload, using: key, nonce: nonce)
+        var result = magic
+        result.append(ephemeralRaw)
+        nonce.withUnsafeBytes { result.append(contentsOf: $0) }
+        result.append(sealed.ciphertext)
+        result.append(sealed.tag)
+        return result
     }
 }
 

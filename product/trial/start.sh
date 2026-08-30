@@ -250,6 +250,14 @@ fi
 # machine, not a live one.
 unset RELAYD_ENROLL_TOKEN RELAYD_ENROLL_PAIRING_ID RELAYD_ENROLL_PAIRING_SECRET
 
+# New hosted machines include an explicitly preloaded sample, never a claimed
+# provider run. Seed before relayd reads its store; existing user files win.
+BOOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if ! run_as_relay node "${BOOT_DIR}/src/seed-sample-workspace.mjs"; then
+  echo "relay: starter sample unavailable; continuing normal startup" >&2
+fi
+run_as_relay node "${BOOT_DIR}/src/sample-preview-server.mjs" &
+
 if [ "$(id -u)" -eq 0 ]; then
   export HOME="${CODEX_RUN_HOME}" USER="${RUN_USER}" LOGNAME="${RUN_USER}"
   exec runuser --preserve-environment -u "${RUN_USER}" -- node "${RELAYD_BIN}" run --mode tunneled

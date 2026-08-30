@@ -162,11 +162,14 @@ async function startHandoffPickup() {
     const { startHandoffLoop, completeHandoffJob } = await import("./handoff.mjs");
     const { setHandoffCompletionHook, setJobNotificationHook } = await import("./jobs.mjs");
     const { installFromNotice } = await import("./syncauth.mjs");
+    const { createHostedPairingWorker } = await import("./hosted-pairing.mjs");
+    const recoverHostedDevice = createHostedPairingWorker({ cloudUrl });
     setHandoffCompletionHook(completeHandoffJob);
     // `cloud` is referenced inside the handler, which only ever runs after
     // createCloudClient has returned and this binding is initialized.
     const cloud = createCloudClient({
       cloudUrl,
+      onDevicePairing: recoverHostedDevice,
       onComputerAccess: (lease) => computerAccessGate.applyLease(lease),
       onNotice: (notice) =>
         installFromNotice(notice, {

@@ -120,7 +120,7 @@ struct TrialProvisioningView: View {
         switch flow.step {
         case .failed, .done:
             return false
-        case .idle, .creating, .waitingForMachine, .pairing, .importingIdentity:
+        case .idle, .discovering, .reconnecting, .creating, .waitingForMachine, .pairing, .importingIdentity:
             return true
         }
     }
@@ -146,11 +146,11 @@ struct TrialProvisioningView: View {
         switch step {
         case .idle, .failed:
             return nil
-        case .creating:
+        case .creating, .discovering:
             return 0
         case .waitingForMachine:
             return 1
-        case .pairing, .importingIdentity:
+        case .reconnecting, .pairing, .importingIdentity:
             return 2
         case .done:
             return 3

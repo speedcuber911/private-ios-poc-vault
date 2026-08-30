@@ -39,7 +39,8 @@ async function handleAdditionRoutes(req, res, url, auth) {
   }
 
   if (req.method === "GET" && url.pathname === "/v1/devices") {
-    sendJson(res, 200, { devices: listDevices({ callerSubject: auth.subject }) });
+    sendJson(res, 200, { devices: listDevices({ callerSubject: auth.subject }).map((device) =>
+      auth.deviceId ? { ...device, isCaller: device.id === auth.deviceId } : device) });
     return true;
   }
 

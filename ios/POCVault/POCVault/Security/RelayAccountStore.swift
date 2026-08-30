@@ -8,12 +8,14 @@ final class RelayAccountStore: ObservableObject {
         case signedOut
         case onboarding
         case ready
+        case recoveringMachine
     }
 
     @Published private(set) var phase: Phase = .restoring
     @Published private(set) var user: RelayAccountUser?
     @Published private(set) var isWorking = false
     @Published var errorMessage: String?
+    @Published private(set) var machineRecoveryError: String?
 
     private let client: RelayAuthClient
     private let identityStore: ClientIdentityStore
@@ -25,19 +27,33 @@ final class RelayAccountStore: ObservableObject {
     private let nodeStore: RelayNodeStore?
     private var sessionToken: String?
     private var hasRestored = false
+    private let hostedRecovery: RelayTrialFlowModel?
+    private let hasConfiguredPersonalInstall: Bool
+    private let recoveryDeviceName: String
+    private var accountGeneration = UUID()
 
     init(
         client: RelayAuthClient,
         identityStore: ClientIdentityStore,
         defaults: UserDefaults = .standard,
         tokenStore: RelaySessionTokenStore = RelaySessionTokenStore(),
-        nodeStore: RelayNodeStore? = nil
+        nodeStore: RelayNodeStore? = nil,
+        trialClient: RelayTrialClient? = nil,
+        recoveryDeviceName: String = "Relay iOS",
+        hasConfiguredPersonalInstall: Bool = AppConfiguration.hasConfiguredPersonalInstall
     ) {
         self.client = client
         self.identityStore = identityStore
         self.defaults = defaults
         self.tokenStore = tokenStore
         self.nodeStore = nodeStore
+        self.recoveryDeviceName = recoveryDeviceName
+        self.hasConfiguredPersonalInstall = hasConfiguredPersonalInstall
+        self.hostedRecovery = if let trialClient, let nodeStore {
+            RelayTrialFlowModel(client: trialClient, identityStore: identityStore, nodeStore: nodeStore)
+        } else {
+            nil
+        }
     }
 
     func restore() async {
@@ -53,7 +69,7 @@ final class RelayAccountStore: ObservableObject {
                 clearLocalSession()
                 return
             }
-            accept(user: restoredUser, token: token)
+            await accept(user: restoredUser, token: token)
         } catch {
             clearLocalSession()
         }
@@ -103,9 +119,12 @@ final class RelayAccountStore: ObservableObject {
     }
 
     func signOut() async {
+        // Stop any in-flight recovery before waiting for the remote sign-out.
+        // No late node blob may install access after the user leaves the account.
+        accountGeneration = UUID()
         // Deliberately NOT purging: see `accept(user:token:)`. The machine
-        // outlives the session and its pairing cannot be repeated, so the
-        // credentials are kept until a different account signs in here.
+        // outlives the session. Reusing valid access avoids an unnecessary new
+        // device credential when the same account signs back in.
         guard let token = sessionToken else {
             clearLocalSession()
             return
@@ -151,6 +170,10 @@ final class RelayAccountStore: ObservableObject {
 
     var currentSessionToken: String? { sessionToken }
 
+    func retryHostedMachineRecovery() async {
+        await recoverHostedMachineIfNeeded()
+    }
+
     private func runAuthentication(
         operation: () async throws -> (RelayAccountUser, String)
     ) async {
@@ -160,19 +183,16 @@ final class RelayAccountStore: ObservableObject {
         do {
             let (user, token) = try await operation()
             try tokenStore.save(token)
-            accept(user: user, token: token)
+            await accept(user: user, token: token)
         } catch {
             errorMessage = error.localizedDescription
         }
     }
 
-    private func accept(user: RelayAccountUser, token: String) {
+    private func accept(user: RelayAccountUser, token: String) async {
         // Machine access is purged when the account CHANGES, not when a session
-        // ends. Signing out used to purge, which is safe but permanent: a
-        // trial's pairing slots are put-once, so the moment this device drops
-        // the identity, a still-running machine can never be reached from here
-        // again. Signing back in cannot undo that. A destroyed or failed trial
-        // can be retried as a new machine; a live one cannot.
+        // ends. The same account can reuse valid host-scoped credentials; a
+        // fresh device instead obtains its own through authenticated recovery.
         //
         // Doing it here keeps the property that mattered: a DIFFERENT account
         // signing in on this phone still inherits nothing.
@@ -182,26 +202,70 @@ final class RelayAccountStore: ObservableObject {
         }
         defaults.set(user.id, forKey: Self.trialOwnerKey)
 
+        accountGeneration = UUID()
         self.user = user
         sessionToken = token
-        phase = defaults.bool(forKey: onboardingKey(for: user.id)) ? .ready : .onboarding
+        await recoverHostedMachineIfNeeded()
+    }
+
+    /// Discover hosted access from the authenticated account, not from a local
+    /// trial pointer that a fresh device cannot have. A configured personal
+    /// installation remains its own path and is never replaced by discovery.
+    private func recoverHostedMachineIfNeeded() async {
+        guard let user, let bearer = sessionToken else { return }
+        guard let hostedRecovery,
+              !hasConfiguredPersonalInstall || nodeStore?.trial != nil else {
+            phase = defaults.bool(forKey: onboardingKey(for: user.id)) ? .ready : .onboarding
+            return
+        }
+        let userID = user.id
+        let generation = accountGeneration
+        phase = .recoveringMachine
+        machineRecoveryError = nil
+        let isAuthorized = { [weak self] in
+            guard let self else { return false }
+            return self.accountGeneration == generation && self.user?.id == userID && self.sessionToken == bearer
+        }
+        do {
+            let outcome = try await hostedRecovery.restoreExisting(
+                bearer: bearer, deviceName: recoveryDeviceName, isAuthorized: isAuthorized
+            )
+            guard isAuthorized() else { return }
+            switch outcome {
+            case .restored:
+                completeOnboarding()
+            case .noMachine:
+                phase = defaults.bool(forKey: onboardingKey(for: userID)) ? .ready : .onboarding
+            case .setupRequired(.expired):
+                // The existing expired-machine surface offers the subscription
+                // path. A spent trial is not silently replaced by recovery.
+                phase = .ready
+            case .setupRequired(.creating):
+                machineRecoveryError = "Your hosted machine is still starting. Wait a moment, then retry."
+            case .setupRequired:
+                phase = .onboarding
+            }
+        } catch {
+            guard isAuthorized() else { return }
+            machineRecoveryError = RelayTrialFlowModel.message(for: error)
+        }
     }
 
     /// The account whose trial machine this device currently holds credentials
     /// for. Compared on sign-in to decide whether they must be dropped.
     private static let trialOwnerKey = "com.parikshit.pocvault.trial.owner"
 
-    /// `purgingDeviceAccess` is set only when the user deliberately leaves the
-    /// account (sign out, delete account). Then this device's access to that
+    /// `purgingDeviceAccess` is set when the account is deleted. This device's
+    /// retained access to that
     /// account's machine goes with it: the trial pointer and the trial-issued
     /// client identity plus its pinned CA are removed, so a second account
     /// signing in here inherits neither. A BYO identity the user imported for
     /// their own install is theirs, not the account's, and is left alone.
     ///
-    /// A dropped session (expired token, auth server unreachable) must NOT purge:
-    /// the same user signs back in and their machine — whose pairing can never be
-    /// repeated — has to still be there.
+    /// A dropped session or ordinary sign-out does not purge: the same account
+    /// may reuse its valid credentials. Account changes purge in `accept`.
     private func clearLocalSession(purgingDeviceAccess: Bool = false) {
+        accountGeneration = UUID()
         try? tokenStore.delete()
         if purgingDeviceAccess {
             nodeStore?.clear()
@@ -210,6 +274,7 @@ final class RelayAccountStore: ObservableObject {
         sessionToken = nil
         user = nil
         errorMessage = nil
+        machineRecoveryError = nil
         phase = .signedOut
     }
 

@@ -1024,6 +1024,39 @@ cloud rendezvous is told only `authToken` and has no path to the raw secret
 at all — which is why this lives in a module separate from `pairing.mjs` and
 is reachable only through `relayd enroll`.
 
+#### Hosted fresh-device reconnection
+
+An updated hosted daemon advertises `hostedPairing=1` in its signed cloud
+poll and handles `hosted-device` requests through a dedicated encrypted queue.
+The full account-side contract is in `product/cloud/README.md`, "Reconnect
+another device to an existing hosted machine". This is restricted to a live
+hosted trial/machine owned by the authenticated account; BYO pairing is not
+enabled through cloud sync notices.
+
+The node opens the existing `RLYSEAL1` envelope and verifies exact node id,
+pairing id, expiry and secret shape before using the secret to authenticate
+the device blob. Independent bearers are stored as SHA-256 hashes in a private
+SQLite database beside `RELAYD_DEVICE_TOKEN_HASH_FILE`; no plaintext bearer
+or pairing secret is persisted there. Each hash is bound to the same issued
+device id and certificate serial shown by `GET /v1/devices`. Revoking that
+device or expiring its certificate rejects its bearer without affecting other
+devices. The active/reserved device limit is 32; revoked/expired devices free
+slots on the next recovery attempt.
+
+Prepared responses are immutable and durable. A failed or interrupted upload
+retries the same encrypted PKCS#12 and leaf identity, never a replacement
+certificate associated with the previous bearer. Exact same node-slot bytes
+and tag may be retried; changed bytes remain a conflict. For recovery, the
+phone cannot collect the response until the node has activated the new bearer
+and sent its signed ready acknowledgement. A failure never rotates or deletes
+an existing credential.
+
+Initial provisioning also retains its prepared response for safe retries.
+Already-completed initial setup is a no-op, including after revocation. Existing
+pre-migration single-file bearer hashes remain accepted; once an initial bearer
+has a registered leaf identity, a durable denial marker prevents its later
+revocation/expiry from falling back to legacy authentication after cleanup.
+
 #### CLI contract
 
 `relayd pair` prints, on stdout:

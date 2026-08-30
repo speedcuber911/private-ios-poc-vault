@@ -13,6 +13,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { pairingKeys, blobTag, verifyBlobTag, DEVICE_SLOT, NODE_SLOT } from "./pairing.mjs";
 import { identityPaths, issueDeviceCert, getCaPem } from "./identity.mjs";
+import { hostedDeviceStore } from "./hosted-device-store.mjs";
 
 const execFileAsync = promisify(execFile);
 const P12_LABEL = "relay-trial-p12-v1";
@@ -48,7 +49,7 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export async function runTrialPairing({
+export async function prepareTrialPairing({
   cloudUrl,
   pairingId,
   secret,
@@ -67,7 +68,9 @@ export async function runTrialPairing({
   let blob = null;
   let tag = "";
   for (;;) {
-    const res = await fetchImpl(`${base}/device-blob`, { headers: { "x-pairing-auth": keys.authToken } });
+    const res = await fetchImpl(`${base}/device-blob`, {
+      headers: { "x-pairing-auth": keys.authToken }, signal: AbortSignal.timeout(10_000),
+    });
     if (res.status === 200) {
       blob = Buffer.from(await res.arrayBuffer());
       tag = res.headers.get("x-pairing-tag") || "";
@@ -126,20 +129,12 @@ export async function runTrialPairing({
     );
     const p12 = fs.readFileSync(p12Path);
 
-    writeDeviceTokenHash(secret);
-
-    // 3. Post the node blob.
-    const res = await fetchImpl(`${base}/node-blob`, {
-      method: "POST",
-      headers: {
-        "x-pairing-auth": keys.authToken,
-        "x-pairing-tag": blobTag(keys.macKey, NODE_SLOT, p12),
-        "content-type": "application/octet-stream",
-      },
-      body: p12,
-    });
-    if (res.status !== 204) throw new Error(`trial_pair_post_${res.status}`);
-    return { deviceId: issued.deviceId, certSerial: issued.certSerial };
+    return {
+      deviceId: issued.deviceId, certSerial: issued.certSerial,
+      notAfter: Date.parse(issued.notAfter),
+      tokenHash: crypto.createHash("sha256").update(deviceToken(secret), "utf8").digest("hex"),
+      p12: p12.toString("base64"), tag: blobTag(keys.macKey, NODE_SLOT, p12),
+    };
   } finally {
     for (const f of [keyPath, csrPath, certPath, caPath, p12Path]) {
       try {
@@ -147,4 +142,41 @@ export async function runTrialPairing({
       } catch {}
     }
   }
+}
+
+export async function postPreparedTrialPairing({ cloudUrl, pairingId, secret, prepared, fetchImpl = fetch }) {
+  const keys = pairingKeys(secret);
+  const res = await fetchImpl(`${cloudUrl.replace(/\/+$/, "")}/v1/pairing/sessions/${encodeURIComponent(pairingId)}/node-blob`, {
+    method: "POST", signal: AbortSignal.timeout(10_000),
+    headers: {
+      "x-pairing-auth": keys.authToken, "x-pairing-tag": prepared.tag,
+      "content-type": "application/octet-stream",
+    },
+    body: Buffer.from(prepared.p12, "base64"),
+  });
+  if (res.status !== 204) throw new Error(`trial_pair_post_${res.status}`);
+}
+
+export async function runTrialPairing(options) {
+  const deviceStore = hostedDeviceStore();
+  const fingerprint = crypto.createHash("sha256").update(`${options.pairingId}\n${options.secret}`).digest("hex");
+  let saved = deviceStore?.initial(options.pairingId, fingerprint);
+  if (saved?.completed) return { deviceId: saved.prepared.deviceId, certSerial: saved.prepared.certSerial };
+  let prepared = saved?.prepared;
+  if (!prepared) {
+    prepared = await prepareTrialPairing(options);
+    if (deviceStore) {
+      saved = deviceStore.saveInitial(options.pairingId, fingerprint, prepared);
+      prepared = saved.prepared;
+      if (saved.completed) return { deviceId: prepared.deviceId, certSerial: prepared.certSerial };
+    }
+  }
+  // Initial provisioning keeps its existing bearer contract. Recording the
+  // issued leaf identity additionally makes its bearer individually revocable
+  // on new nodes; legacy nodes without this record still work unchanged.
+  deviceStore?.addInitial(options.pairingId, prepared);
+  writeDeviceTokenHash(options.secret);
+  await postPreparedTrialPairing({ ...options, prepared });
+  deviceStore?.finishInitial(options.pairingId);
+  return { deviceId: prepared.deviceId, certSerial: prepared.certSerial };
 }

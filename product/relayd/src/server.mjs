@@ -28,6 +28,8 @@ import { createTerminalService } from "./terminals.mjs";
 import { appendAudit } from "./audit.mjs";
 import { emitEvent } from "./events.mjs";
 import { createPreviewService } from "./previews.mjs";
+import { hostedDeviceStore } from "./hosted-device-store.mjs";
+import { isRevokedSerial } from "./identity.mjs";
 
 const approvalStore = new ApprovalStore(approvalsDir);
 const terminalService = createTerminalService({
@@ -103,7 +105,7 @@ function authorize(req, { pathname } = {}) {
   // 4. Else: existing mTLS path.
   // Never hash a JWT and compare it to deviceTokenHash.
   const expected = deviceTokenHash();
-  if (expected) {
+  if (process.env.RELAYD_DEVICE_TOKEN_HASH_FILE) {
     const provided = bearerToken(req.headers.authorization);
     if (!provided) {
       return { ok: false, status: 401, error: "device token is required" };
@@ -120,8 +122,26 @@ function authorize(req, { pathname } = {}) {
       return { ok: false, status: 401, error: "device token is not valid" };
     }
     const actual = crypto.createHash("sha256").update(provided, "utf8").digest("hex");
+    let device, registeredLegacy;
+    try {
+      const deviceStore = hostedDeviceStore();
+      device = deviceStore?.find(actual);
+      registeredLegacy = deviceStore?.wasRegisteredLegacy(actual);
+    }
+    catch { return { ok: false, status: 401, error: "device token is not valid" }; }
+    if (device) {
+      if (device.disabled || device.notAfter <= Date.now() || isRevokedSerial(device.certSerial)) {
+        return { ok: false, status: 401, error: "device token is not valid" };
+      }
+      const computerAccess = computerAccessGate.authorize();
+      if (!computerAccess.ok) return computerAccess;
+      return { ok: true, subject: `hosted-device:${device.deviceId}`, deviceId: device.deviceId };
+    }
+    if (registeredLegacy) {
+      return { ok: false, status: 401, error: "device token is not valid" };
+    }
     const a = Buffer.from(actual, "utf8");
-    const b = Buffer.from(expected, "utf8");
+    const b = Buffer.from(expected || "", "utf8");
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
       return { ok: false, status: 401, error: "device token is not valid" };
     }

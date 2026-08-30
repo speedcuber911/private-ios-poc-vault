@@ -84,7 +84,7 @@ ExperimentalWarning on Node 22 is expected.
 | `GET /v1/tunnel/nodes/:nodeId` | `Bearer $BROKER_TOKEN` | broker authorization hook, see contract |
 | `GET /v1/admin/nodes` | `Bearer $ADMIN_TOKEN` | ops-only; response omits pubkeys |
 | `GET /v1/admin/accounts` | Better Auth admin session | paginated `{ accounts }` with trial, nodes, entitlements; newest first; `limit` default 50 max 100 |
-| `POST /v1/admin/accounts/:id/upgrade` | Better Auth admin session | keep the hosted sandbox, set trial `upgraded`, raise `nodes.max` to at least 2 |
+| `POST /v1/admin/accounts/:id/upgrade` | Better Auth admin session | extend/resume the hosted sandbox, then grant operator hosted access, set trial `upgraded`, and raise `nodes.max` to at least 2 |
 | `DELETE /v1/admin/accounts/:id/machine` | Better Auth admin session | kill the hosted sandbox, delete the node, set trial `destroyed`; 409 `nothing_to_unlink` if none |
 
 All responses carry `cache-control: no-store` and
@@ -256,6 +256,45 @@ legitimate `x-www-form-urlencoded` POST. Regression: `test/csrf.test.mjs`,
 which replays a cross-site approve of an attacker's `client=web` device
 code and asserts no session is ever minted.
 
+### Reconnect another device to an existing hosted machine
+
+This is ordinary hosted-account functionality, not an App Review exception.
+BYO pairing and the generic credential-sync notice allowlist are unchanged.
+
+1. An authenticated owner discovers the current `ready`/`upgraded` machine
+   through `GET /v1/trial-nodes/current` and its X25519 `encPubkey` through
+   `GET /v1/nodes/:id`.
+2. The device generates a fresh secret and creates a rendezvous using
+   `POST /v1/pairing/sessions` with `{authToken, kind: "hosted-device"}`.
+   It posts the normal MAC-tagged device blob first.
+3. It seals `{v:1,nodeId,pairingId,secret,expiresAt}` to the node key using
+   `RLYSEAL1` (`product/relayd/src/seal.mjs`, AES-256-GCM with no extra AAD).
+   `expiresAt` is the returned session expiry in epoch milliseconds.
+4. `POST /v1/nodes/:id/device-pairings` accepts only
+   `{pairingId,sealedSecret}` (canonical base64 ciphertext), checks account,
+   hosted-machine ownership, access entitlement, session kind/ownership/TTL,
+   and current worker capability. It returns `202 {ok,pairingId,expiresAt}`.
+   Retrying identical ciphertext is idempotent; changing it is a conflict.
+5. The node requests `hostedPairing=1` on its signed handoff poll, receives the
+   dedicated `devicePairings` array, decrypts and verifies all bindings, then
+   completes the ordinary MAC-tagged encrypted PKCS#12 response. This queue
+   never contains raw pairing secrets and is not a generic BYO pairing route.
+6. The node activates an independent bearer and signs
+   `POST /v1/node/device-pairings/:pairingId/ready`. Until then, the phone's
+   node-blob read returns `404 not_posted_yet`. The phone verifies the blob MAC,
+   pins the node CA to the expected host and stores its own bearer.
+
+Bounds: 15-minute maximum rendezvous TTL, five pending requests per node,
+twenty requests per account per hour, 4 KiB base64 envelope. Old daemons never
+consume the new queue. No capability/key returns `409
+hosted_pairing_upgrade_required`; a stale capability returns `503
+hosted_pairing_unavailable`. Cross-account/non-hosted nodes return the same
+404. Inactive hosted access is 403. Ciphertext is scrubbed on completion/expiry;
+fingerprints remain at most an hour for the rate limit. Account/node deletion
+cascades immediately. The cloud is still the hosted account authority: this
+does not promise security against a compromised operator substituting the
+node key or impersonating the owner.
+
 ### Browser activity grants
 
 The cloud signs short-lived Ed25519 JWTs (`alg: EdDSA`) that authorize
@@ -377,6 +416,33 @@ ids and the numeric App Store app id can be overridden with
 `APP_STORE_ONLINE_CHECKS=0` is for isolated tests only. A paid renewal extends
 Cube's platform timeout using `HOSTED_SANDBOX_TIMEOUT_SEC` (default 370 days),
 while Relay still enforces the signed subscription expiration itself.
+
+Operator/App Review upgrades also extend the platform timeout **before**
+committing `upgraded`. An expired machine is resumed first; an unavailable or
+missing sandbox returns a retryable failure or conflict instead of claiming
+success. A successful admin upgrade grants the independent
+`hosted.auto_upgrade=1` entitlement. Repeating an upgrade preserves existing
+node names and reduced `nodes.max` values. That operator grant is not revoked
+when a separate sandbox StoreKit transaction expires.
+
+The platform timeout is finite, even for an upgraded account. The existing
+60-second lifecycle sweep renews eligible upgraded machines at most once per
+day, using the same `HOSTED_SANDBOX_TIMEOUT_SEC` backstop; failures retry after
+five minutes and do not downgrade or delete an active record. On a control-plane
+restart the first sweep renews eligible machines again. Renewal requires an
+active Apple subscription or operator grant and a current `upgraded` node;
+expired, failed, destroyed, and unentitled rows are not revived. Background
+renewal only extends a running sandbox: explicit recovery/upgrade owns resume.
+The service must remain operational within the platform backstop; no infinite
+platform lifetime is claimed.
+
+If the platform is unavailable when the phone collects its pairing credential,
+Relay still delivers the opaque credential blob and records a
+`hosted.activation_pending_trial` marker tied to that exact trial. A later sweep
+retries the operator activation, including after a control-plane restart. It
+does not promote a newly enrolled node before credential collection. Lifecycle
+operations are serialized per account so an old expiry pass cannot pause a
+machine after its upgrade has completed; shutdown stops further maintenance.
 
 **Lifecycle enforcement is not gated on the feature flag.** `E2B_API_URL`
 switches off *creating* trials; the reaper keeps running without it, because a

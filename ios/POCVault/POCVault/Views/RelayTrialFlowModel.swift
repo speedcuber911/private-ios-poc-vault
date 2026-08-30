@@ -8,6 +8,7 @@ enum RelayTrialFlowError: Error, Equatable {
     case machineTimedOut
     case pairingTimedOut
     case malformedResponse
+    case reconnectExpired
 }
 
 /// Drives the "Try instantly" fork end to end: mints a pairing secret, asks the
@@ -23,6 +24,8 @@ enum RelayTrialFlowError: Error, Equatable {
 final class RelayTrialFlowModel: ObservableObject {
     enum Step: Equatable {
         case idle
+        case discovering
+        case reconnecting
         case creating
         case waitingForMachine
         case pairing
@@ -32,6 +35,12 @@ final class RelayTrialFlowModel: ObservableObject {
     }
 
     @Published private(set) var step: Step = .idle
+
+    enum RestoreOutcome: Equatable {
+        case noMachine
+        case restored
+        case setupRequired(RelayTrialNode.State)
+    }
 
     private let client: RelayTrialClient
     private let identityStore: ClientIdentityStore
@@ -77,7 +86,11 @@ final class RelayTrialFlowModel: ObservableObject {
                 // and wrong whenever the machine is still running and this
                 // device can still reach it. Ask what the account actually has
                 // before deciding there is nothing to do.
-                await adoptExistingTrial(bearer: bearer)
+                let outcome = try await restoreExisting(bearer: bearer, deviceName: deviceName)
+                if case .setupRequired(let state) = outcome {
+                    throw RelayTrialFlowError.machineUnavailable(state)
+                }
+                if outcome == .noMachine { throw RelayTrialClientError.noTrial }
                 return
             }
 
@@ -87,6 +100,9 @@ final class RelayTrialFlowModel: ObservableObject {
 
             step = .waitingForMachine
             let readyTrial = try await waitForReady(trial: created, bearer: bearer)
+            guard Self.hostedNodeURL(for: readyTrial) != nil else {
+                throw RelayTrialFlowError.malformedResponse
+            }
 
             step = .pairing
             let (nodeBlob, nodeTag) = try await waitForNodeBlob(pairingId: pairingId, authToken: authToken)
@@ -128,79 +144,138 @@ final class RelayTrialFlowModel: ObservableObject {
         }
     }
 
-    /// Recovers from `trial_already_used`, which is not one situation but three.
-    ///
-    /// Re-entering this flow only means THIS DEVICE has no pointer to a
-    /// machine, which happens on a reinstall, a second device, or after the
-    /// node store is cleared. The machine itself may still be alive.
-    ///
-    /// `failed` and `destroyed` are retried by `POST /v1/trial-nodes` in
-    /// place, so this path should not see them after the cloud is current.
-    /// `expired` is spent. A live machine this device has no credential for
-    /// cannot be re-paired: the rendezvous is put-once and `runTrialPairing`
-    /// only runs at boot. Say that plainly instead of implying the user did
-    /// something wrong.
-    private func adoptExistingTrial(bearer: String) async {
+    /// Account-authenticated discovery works before this device has a persisted
+    /// node pointer. Ready trials and upgraded hosted machines use the same
+    /// per-device recovery path; it never provisions or replaces a machine.
+    func restoreExisting(
+        bearer: String,
+        deviceName: String,
+        isAuthorized: @escaping @MainActor () -> Bool = { true }
+    ) async throws -> RestoreOutcome {
+        func requireAuthorization() throws {
+            try Task.checkCancellation()
+            guard isAuthorized() else { throw CancellationError() }
+        }
+        try requireAuthorization()
+        step = .discovering
         let current: RelayTrialNode
         do {
             current = try await client.currentTrial(bearer: bearer)
-        } catch {
-            step = .failed(Self.message(for: error))
-            return
+        } catch RelayTrialClientError.noTrial {
+            try requireAuthorization()
+            nodeStore.applyRefresh(.failure(RelayTrialClientError.noTrial))
+            step = .idle
+            return .noMachine
+        }
+        try requireAuthorization()
+        guard Self.isReconnectable(current.state) else {
+            nodeStore.updateTrial(current)
+            step = .idle
+            return .setupRequired(current.state)
+        }
+        guard let host = current.sni, let nodeID = current.nodeId,
+              let nodeURL = Self.hostedNodeURL(for: current) else {
+            throw RelayTrialFlowError.malformedResponse
         }
 
-        guard current.state == .ready, let host = current.sni else {
-            let message: String
-            switch current.state {
-            case .destroyed:
-                message =
-                    "The previous trial machine was deleted. Try instantly again to start a replacement."
-            case .failed:
-                message =
-                    "The previous trial machine failed to start. Try instantly again to start a replacement."
-            case .expired:
-                message =
-                    "This account's trial has expired, so a replacement can't be started here."
-            case .creating:
-                message =
-                    "This account's trial machine is still starting. Wait for it to finish, then come back."
-            case .ready:
-                message =
-                    "This account's trial machine is \(current.state.rawValue) and can't be adopted from here."
-            case .upgraded:
-                message =
-                    "This account's hosted machine is already set up and is no longer a trial."
+        if Self.canReuseHostedCredential(
+            host: host,
+            pinnedHost: identityStore.pinnedHost,
+            hasPinnedCA: identityStore.pinnedCACertificate != nil,
+            hasIdentity: identityStore.hasStoredIdentity,
+            isTrialIdentity: identityStore.hasTrialIssuedIdentity,
+            hasHostToken: identityStore.deviceToken(for: host) != nil
+        ) {
+            do {
+                // A read-only authenticated request confirms that retained
+                // credentials still work. An outage does not revoke or replace
+                // them; only an explicit authentication rejection re-pairs.
+                _ = try await CodexClient(baseURL: nodeURL, identityStore: identityStore).fetchCodexWorkspaces()
+                try requireAuthorization()
+                nodeStore.adoptTrial(current)
+                step = .done
+                return .restored
+            } catch let error as CodexClientError where error.statusCode == 401 || error.statusCode == 403 {
+                try requireAuthorization()
             }
-            step = .failed(message)
-            return
         }
 
-        // The common recoverable case: the machine is up and this device still
-        // holds the identity and bearer it was issued during pairing.
-        guard identityStore.hasTrialIssuedIdentity, identityStore.deviceToken(for: host) != nil else {
-            step = .failed(
-                "Your trial machine is still running, but this device no longer has the credential for it. "
-                + "That credential is issued once, during setup, and can't be reissued — so it can only be "
-                + "reached from a device that still has it."
-            )
-            return
+        step = .reconnecting
+        let nodeKey = try await client.hostedNodeEncryptionKey(nodeID: nodeID, bearer: bearer)
+        try requireAuthorization()
+        let secret = RelayTrialPairing.generateSecret()
+        let authToken = RelayTrialPairing.authToken(secret: secret)
+        let macKey = RelayTrialPairing.macKey(secret: secret)
+        let session = try await client.createHostedPairingSession(authToken: authToken, bearer: bearer)
+        try requireAuthorization()
+        let now = Int64(Date().timeIntervalSince1970 * 1_000)
+        guard session.expiresAt > now, session.expiresAt <= now + 960_000 else {
+            throw RelayTrialFlowError.reconnectExpired
         }
-
-        nodeStore.adoptTrial(current)
+        let deviceBlob = try Self.encodeDeviceBlob(deviceName: deviceName)
+        try await client.postDeviceBlob(
+            pairingId: session.pairingId,
+            authToken: authToken,
+            blob: deviceBlob,
+            tag: RelayTrialPairing.blobTag(macKey: macKey, slot: RelayTrialPairing.deviceSlot, blob: deviceBlob)
+        )
+        try requireAuthorization()
+        let sealed = try RelayTrialPairing.sealHostedPairingSecret(
+            nodeID: nodeID, pairingID: session.pairingId, secret: secret,
+            expiresAt: session.expiresAt, recipientPublicKey: nodeKey
+        )
+        try await client.requestHostedDevicePairing(nodeID: nodeID, pairingID: session.pairingId, sealedSecret: sealed, bearer: bearer)
+        try requireAuthorization()
+        step = .pairing
+        let (nodeBlob, nodeTag) = try await waitForNodeBlob(pairingId: session.pairingId, authToken: authToken, isAuthorized: isAuthorized)
+        try requireAuthorization()
+        guard RelayTrialPairing.verifyTag(macKey: macKey, slot: RelayTrialPairing.nodeSlot, blob: nodeBlob, tag: nodeTag) else {
+            throw RelayTrialFlowError.tagMismatch
+        }
+        let latest = try await client.currentTrial(bearer: bearer)
+        try requireAuthorization()
+        guard Self.isReconnectable(latest.state), latest.nodeId == nodeID,
+              latest.sni?.lowercased() == host.lowercased() else {
+            throw RelayTrialFlowError.machineUnavailable(latest.state)
+        }
+        let p12URL = try Self.writeTemporaryP12(nodeBlob)
+        defer { try? FileManager.default.removeItem(at: p12URL) }
+        step = .importingIdentity
+        _ = try identityStore.importIdentity(from: p12URL, passphrase: RelayTrialPairing.p12Passphrase(secret: secret), trialHost: host)
+        identityStore.storeDeviceToken(RelayTrialPairing.deviceToken(secret: secret), host: host)
+        nodeStore.adoptTrial(latest)
         step = .done
+        return .restored
     }
 
-    /// Polls `currentTrial` until it reaches `.ready`. Any other terminal state
-    /// (expired/destroyed/failed) throws immediately rather than looping; only
-    /// `.creating` keeps polling, bounded by `maxReadyPollAttempts`.
+    static func isReconnectable(_ state: RelayTrialNode.State) -> Bool {
+        state == .ready || state == .upgraded
+    }
+
+    private static func hostedNodeURL(for trial: RelayTrialNode) -> URL? {
+        guard let host = trial.sni, let nodeID = trial.nodeId, !nodeID.isEmpty,
+              let nodeURL = trial.nodeURL, nodeURL.scheme == "https",
+              nodeURL.host?.lowercased() == host.lowercased(), nodeURL.user == nil,
+              nodeURL.password == nil, nodeURL.port == nil, nodeURL.path.isEmpty,
+              nodeURL.query == nil, nodeURL.fragment == nil else { return nil }
+        return nodeURL
+    }
+
+    static func canReuseHostedCredential(host: String, pinnedHost: String?, hasPinnedCA: Bool, hasIdentity: Bool, isTrialIdentity: Bool, hasHostToken: Bool) -> Bool {
+        isTrialIdentity && hasIdentity && hasPinnedCA && hasHostToken && pinnedHost?.lowercased() == host.lowercased()
+    }
+
+    /// Another device can finish pairing and promote the same machine while
+    /// this device is waiting. Both ready and upgraded can finish its original
+    /// pairing; expired/destroyed/failed cannot. Only creating keeps polling.
     private func waitForReady(trial: RelayTrialNode, bearer: String) async throws -> RelayTrialNode {
         var current = trial
         var attempts = 0
-        while current.state != .ready {
+        while !Self.isReconnectable(current.state) {
             switch current.state {
-            case .expired, .destroyed, .failed, .upgraded:
+            case .expired, .destroyed, .failed:
                 throw RelayTrialFlowError.machineUnavailable(current.state)
-            case .creating, .ready:
+            case .creating, .ready, .upgraded:
                 break
             }
             attempts += 1
@@ -209,6 +284,7 @@ final class RelayTrialFlowModel: ObservableObject {
             }
             try await Task.sleep(nanoseconds: pollIntervalNs)
             current = try await client.currentTrial(bearer: bearer)
+            guard current.id == trial.id else { throw RelayTrialFlowError.malformedResponse }
         }
         return current
     }
@@ -216,9 +292,11 @@ final class RelayTrialFlowModel: ObservableObject {
     /// Polls `fetchNodeBlob`, swallowing `.blobPending` (the node hasn't posted
     /// its half of the pairing yet) up to `maxBlobPollAttempts`; any other
     /// thrown error propagates immediately.
-    private func waitForNodeBlob(pairingId: String, authToken: String) async throws -> (blob: Data, tag: String) {
+    private func waitForNodeBlob(pairingId: String, authToken: String, isAuthorized: @MainActor () -> Bool = { true }) async throws -> (blob: Data, tag: String) {
         var attempts = 0
         while true {
+            try Task.checkCancellation()
+            guard isAuthorized() else { throw CancellationError() }
             do {
                 return try await client.fetchNodeBlob(pairingId: pairingId, authToken: authToken)
             } catch RelayTrialClientError.blobPending {
@@ -242,11 +320,12 @@ final class RelayTrialFlowModel: ObservableObject {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("relay-trial-\(UUID().uuidString)", isDirectory: false)
             .appendingPathExtension("p12")
-        try data.write(to: url, options: .atomic)
+        try data.write(to: url, options: [.atomic, .completeFileProtection])
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         return url
     }
 
-    private static func message(for error: Error) -> String {
+    static func message(for error: Error) -> String {
         if let clientError = error as? RelayTrialClientError {
             return message(for: clientError)
         }
@@ -282,6 +361,14 @@ final class RelayTrialFlowModel: ObservableObject {
             return "Still waiting on the trial machine to finish pairing."
         case .tagMismatch:
             return "The trial machine's credential could not be verified."
+        case .reconnectUnavailable:
+            return "This hosted machine cannot reconnect a new device right now. Check its connection and try again."
+        case .machineNotReady:
+            return "The hosted machine is not ready to reconnect. Wait a moment and try again."
+        case .hostedAccessUnavailable:
+            return "This account does not currently have active hosted-machine access. Check your subscription or contact Relay support."
+        case .hostedUpgradeRequired:
+            return "This hosted machine needs a Relay service update before a new device can connect. Contact Relay support; your existing machine was not replaced."
         case .server(let status):
             return "Relay returned an unexpected error (\(status))."
         }
@@ -296,7 +383,7 @@ final class RelayTrialFlowModel: ObservableObject {
             case .expired:
                 return "The trial machine expired before it finished starting."
             case .destroyed:
-                return "The trial machine was destroyed before it finished starting."
+                return "The previous trial machine was deleted. Try instantly again to start a replacement."
             case .failed:
                 return "The trial machine failed to start."
             case .creating, .ready, .upgraded:
@@ -308,6 +395,8 @@ final class RelayTrialFlowModel: ObservableObject {
             return "Pairing with the trial machine took too long. Try again."
         case .malformedResponse:
             return "Relay sent back a response the app couldn't understand."
+        case .reconnectExpired:
+            return "This device's reconnect request expired. Try again to request a new one."
         }
     }
 }

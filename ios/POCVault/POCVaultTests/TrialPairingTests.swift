@@ -2,6 +2,12 @@ import XCTest
 @testable import POCVault
 
 final class TrialPairingTests: XCTestCase {
+    override func tearDown() {
+        StubTrialURLProtocol.handler = nil
+        StubTrialURLProtocol.recordedRequests = []
+        StubTrialURLProtocol.routes = [:]
+        super.tearDown()
+    }
     // Fixtures generated from product/relayd/src/pairing.mjs (Step 1) — the
     // two implementations must agree byte-for-byte.
     private let secret = "fixture-secret-0123456789"
@@ -474,16 +480,20 @@ final class TrialPairingTests: XCTestCase {
 final class StubTrialURLProtocol: URLProtocol {
     /// path -> (status, json). Set per test; read on the URLSession's queue.
     nonisolated(unsafe) static var routes: [String: (Int, String)] = [:]
+    nonisolated(unsafe) static var recordedRequests: [URLRequest] = []
+    nonisolated(unsafe) static var handler: ((URLRequest) -> (Int, String, [String: String]))?
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
         let path = request.url?.path ?? ""
-        let (status, body) = Self.routes[path] ?? (404, "{\"error\":\"not_found\"}")
+        Self.recordedRequests.append(request)
+        let responseParts = Self.handler?(request)
+        let (status, body) = responseParts.map { ($0.0, $0.1) } ?? Self.routes[path] ?? (404, "{\"error\":\"not_found\"}")
         let response = HTTPURLResponse(
             url: request.url!, statusCode: status, httpVersion: "HTTP/1.1",
-            headerFields: ["Content-Type": "application/json"]
+            headerFields: responseParts?.2 ?? ["Content-Type": "application/json"]
         )!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data(body.utf8))
@@ -528,7 +538,44 @@ func makeFlow(_ suite: String) -> (RelayTrialFlowModel, RelayNodeStore) {
 
 extension TrialPairingTests {
     @MainActor
-    func testAlreadyUsedWithALiveMachineExplainsTheMissingCredential() async {
+    func testInitialPairingContinuesWhenAnotherDeviceUpgradesMachine() async {
+        StubTrialURLProtocol.handler = { request in
+            switch request.url?.path {
+            case "/v1/pairing/sessions": return (201, "{\"pairingId\":\"p-initial\",\"expiresAt\":9999999999999}", [:])
+            case "/v1/trial-nodes": return (201, trialJSON(state: "creating", sni: nil), [:])
+            case "/v1/pairing/sessions/p-initial/device-blob": return (204, "", [:])
+            case "/v1/trial-nodes/current": return (200, trialJSON(state: "upgraded", sni: "node-1.tun.test"), [:])
+            case "/v1/pairing/sessions/p-initial/node-blob": return (200, "unverified-fixture", ["x-pairing-tag": "bad-tag"])
+            default: return (404, "{\"error\":\"not_found\"}", [:])
+            }
+        }
+        let (flow, store) = makeFlow("initial-pairing-upgraded-race")
+        await flow.start(bearer: "test-account", deviceName: "Test")
+        XCTAssertTrue(StubTrialURLProtocol.recordedRequests.contains { $0.url?.path == "/v1/pairing/sessions/p-initial/node-blob" })
+        XCTAssertEqual(flow.step, .failed("The trial machine's credential could not be verified."), "Upgraded must reach the original credential verification, not reject a running machine.")
+        XCTAssertNil(store.activeNodeURL, "The race fix must not bypass credential verification.")
+    }
+
+    @MainActor
+    func testInitialPairingRejectsUpgradedMachineWithoutValidDestination() async {
+        for sni in [nil, "node-1.tun.test/path", "node-1.tun.test:443"] as [String?] {
+            StubTrialURLProtocol.recordedRequests = []
+            StubTrialURLProtocol.routes = [
+                "/v1/pairing/sessions": (201, "{\"pairingId\":\"p-initial\",\"expiresAt\":9999999999999}"),
+                "/v1/trial-nodes": (201, trialJSON(state: "creating", sni: nil)),
+                "/v1/pairing/sessions/p-initial/device-blob": (204, ""),
+                "/v1/trial-nodes/current": (200, trialJSON(state: "upgraded", sni: sni))
+            ]
+            let (flow, store) = makeFlow("initial-pairing-upgraded-invalid-destination")
+            await flow.start(bearer: "test-account", deviceName: "Test")
+            guard case .failed = flow.step else { return XCTFail("Invalid destination must fail.") }
+            XCTAssertFalse(StubTrialURLProtocol.recordedRequests.contains { $0.url?.path.contains("node-blob") == true })
+            XCTAssertNil(store.activeNodeURL)
+        }
+    }
+
+    @MainActor
+    func testAlreadyUsedWithALiveMachineRequestsSecureDeviceRecovery() async {
         StubTrialURLProtocol.routes = [
             "/v1/pairing/sessions": (201, "{\"pairingId\":\"p1\",\"expiresAt\":9999999999999}"),
             "/v1/trial-nodes": (409, "{\"error\":\"trial_already_used\"}"),
@@ -541,10 +588,8 @@ extension TrialPairingTests {
         guard case .failed(let message) = flow.step else {
             return XCTFail("expected .failed, got \(flow.step)")
         }
-        // The machine is up, so the message must be about THIS DEVICE's
-        // credential, not about the trial being spent.
-        XCTAssertTrue(message.contains("still running"), "got: \(message)")
-        XCTAssertTrue(message.contains("credential"), "got: \(message)")
+        XCTAssertTrue(message.contains("reconnect"), "got: \(message)")
+        XCTAssertTrue(StubTrialURLProtocol.recordedRequests.contains { $0.url?.path == "/v1/nodes/node-1" })
         XCTAssertNil(nodeStore.trial, "a machine this device cannot authenticate to must not be adopted")
     }
 
@@ -568,7 +613,8 @@ extension TrialPairingTests {
             message.contains("can only be created once"),
             "a deleted machine must not be described as a lifetime cap: \(message)"
         )
-        XCTAssertNil(nodeStore.trial)
+        XCTAssertEqual(nodeStore.trial?.state, .destroyed)
+        XCTAssertNil(nodeStore.activeNodeURL)
     }
 
     @MainActor
@@ -586,6 +632,146 @@ extension TrialPairingTests {
             return XCTFail("expected .failed, got \(flow.step)")
         }
         XCTAssertTrue(message.contains("expired"), "got: \(message)")
-        XCTAssertNil(nodeStore.trial)
+        XCTAssertEqual(nodeStore.trial?.state, .expired)
+        XCTAssertNil(nodeStore.activeNodeURL)
+    }
+
+    func testHostedSealMatchesCanonicalNodeVector() throws {
+        let sealed = try RelayTrialPairing.sealHostedPairingSecret(
+            nodeID: "node-0011223344556677",
+            pairingID: "11111111-2222-4333-8444-555555555555",
+            secret: "fixture-pairing-secret-for-tests-only",
+            expiresAt: 1_800_000_600_000,
+            recipientPublicKey: "WGmv9FBUlzLLqu1eXfmzCm2jHLDldCutWtShp2jxpns=",
+            ephemeralPrivateKeyRaw: Data(1...32),
+            nonceData: Data(0...11)
+        )
+        XCTAssertEqual(sealed.base64EncodedString(), "UkxZU0VBTDEHo3y8FCCTyLdV3BsQ6Gy0JjdK0WqoU+0L38CyuG0cfAABAgMEBQYHCAkKCxpdYsB4dLOJLbhLUQGaY3AmdlumTXbcZ84c3Ym3HoTqOX5INfHzO1ilw871ixDwH/Dq0H/g+xV78I9PTEOSQSSoNFyKRHHPk2jHjKXvV52Za065oDmLIvA6tofJOXn237sIDVbzHgH97+BgHLPXFTbs7mlCkAsFUm3Rqn5FcdTjWl2PMmd83WaPxzh9a4ht/Z4sIWj+7AvPqoTo2qkk+66UmwoqRyfe2jik1OwzS3Iz4pVQ7/Xx")
+        XCTAssertThrowsError(try RelayTrialPairing.sealHostedPairingSecret(nodeID: "node", pairingID: "pair", secret: "test", expiresAt: 1, recipientPublicKey: "not-a-key"))
+    }
+
+    @MainActor
+    func testHostedRecoveryAcceptsReadyAndUpgradedWithoutCreatingMachine() async {
+        for state in ["ready", "upgraded"] {
+            StubTrialURLProtocol.recordedRequests = []
+            StubTrialURLProtocol.routes = [
+                "/v1/trial-nodes/current": (200, trialJSON(state: state, sni: "node-1.tun.test")),
+                "/v1/nodes/node-1": (409, "{\"error\":\"hosted_pairing_upgrade_required\"}")
+            ]
+            let (flow, store) = makeFlow("hosted-recovery-\(state)")
+            do {
+                _ = try await flow.restoreExisting(bearer: "test-bearer", deviceName: "Test")
+                XCTFail("expected unavailable node recovery")
+            } catch {
+                XCTAssertEqual(error as? RelayTrialClientError, .hostedUpgradeRequired)
+            }
+            XCTAssertNil(store.activeNodeURL)
+            XCTAssertTrue(StubTrialURLProtocol.recordedRequests.contains { $0.url?.path == "/v1/nodes/node-1" })
+            XCTAssertFalse(StubTrialURLProtocol.recordedRequests.contains { $0.url?.path == "/v1/trial-nodes" })
+            XCTAssertTrue(StubTrialURLProtocol.recordedRequests.allSatisfy { $0.value(forHTTPHeaderField: "Authorization") == "Bearer test-bearer" })
+        }
+    }
+
+    @MainActor
+    func testHostedRecoveryDoesNotAdoptAfterAccountAuthorizationChanges() async {
+        StubTrialURLProtocol.routes = ["/v1/trial-nodes/current": (200, trialJSON(state: "upgraded", sni: "node-1.tun.test"))]
+        let (flow, store) = makeFlow("hosted-recovery-account-change")
+        var checks = 0
+        do {
+            _ = try await flow.restoreExisting(bearer: "old-account", deviceName: "Test") {
+                checks += 1
+                return checks == 1
+            }
+            XCTFail("expected cancellation")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertNil(store.activeNodeURL)
+        XCTAssertEqual(StubTrialURLProtocol.recordedRequests.map { $0.url?.path }, ["/v1/trial-nodes/current"])
+    }
+
+    @MainActor
+    func testHostedRecoveryRejectsExpiredPairingBeforeSendingDeviceBlob() async {
+        StubTrialURLProtocol.routes = [
+            "/v1/trial-nodes/current": (200, trialJSON(state: "upgraded", sni: "node-1.tun.test")),
+            "/v1/nodes/node-1": (200, "{\"node\":{\"id\":\"node-1\",\"encPubkey\":\"WGmv9FBUlzLLqu1eXfmzCm2jHLDldCutWtShp2jxpns=\"}}"),
+            "/v1/pairing/sessions": (201, "{\"pairingId\":\"expired\",\"expiresAt\":1}")
+        ]
+        let (flow, store) = makeFlow("hosted-recovery-expired")
+        do {
+            _ = try await flow.restoreExisting(bearer: "test", deviceName: "Test")
+            XCTFail("expected expired request")
+        } catch {
+            XCTAssertEqual(error as? RelayTrialFlowError, .reconnectExpired)
+        }
+        XCTAssertNil(store.activeNodeURL)
+        XCTAssertFalse(StubTrialURLProtocol.recordedRequests.contains { $0.url?.path.contains("device-blob") == true })
+    }
+
+    @MainActor
+    func testHostedRecoveryRejectsUnverifiedCredentialBeforeImport() async {
+        let expiry = Int64(Date().timeIntervalSince1970 * 1_000) + 300_000
+        StubTrialURLProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            switch path {
+            case "/v1/trial-nodes/current": return (200, trialJSON(state: "upgraded", sni: "node-1.tun.test"), [:])
+            case "/v1/nodes/node-1": return (200, "{\"node\":{\"id\":\"node-1\",\"encPubkey\":\"WGmv9FBUlzLLqu1eXfmzCm2jHLDldCutWtShp2jxpns=\"}}", [:])
+            case "/v1/pairing/sessions": return (201, "{\"pairingId\":\"p-hosted\",\"expiresAt\":\(expiry)}", [:])
+            case "/v1/pairing/sessions/p-hosted/device-blob": return (200, "{}", [:])
+            case "/v1/nodes/node-1/device-pairings": return (202, "{\"ok\":true,\"pairingId\":\"p-hosted\",\"expiresAt\":\(expiry)}", [:])
+            case "/v1/pairing/sessions/p-hosted/node-blob": return (200, "not-a-credential", ["x-pairing-tag": "bad-tag"])
+            default: return (404, "{\"error\":\"not_found\"}", [:])
+            }
+        }
+        let (flow, store) = makeFlow("hosted-recovery-bad-tag")
+        do {
+            _ = try await flow.restoreExisting(bearer: "test", deviceName: "Test")
+            XCTFail("expected tag mismatch")
+        } catch {
+            XCTAssertEqual(error as? RelayTrialFlowError, .tagMismatch)
+        }
+        XCTAssertNil(store.activeNodeURL)
+        XCTAssertEqual(flow.step, .pairing)
+        XCTAssertTrue(StubTrialURLProtocol.recordedRequests.contains { $0.url?.path == "/v1/nodes/node-1/device-pairings" })
+    }
+
+    @MainActor
+    func testHostedCredentialReuseRequiresCompleteHostScopedMaterial() {
+        XCTAssertTrue(RelayTrialFlowModel.canReuseHostedCredential(host: "node.test", pinnedHost: "NODE.TEST", hasPinnedCA: true, hasIdentity: true, isTrialIdentity: true, hasHostToken: true))
+        XCTAssertFalse(RelayTrialFlowModel.canReuseHostedCredential(host: "node.test", pinnedHost: "other.test", hasPinnedCA: true, hasIdentity: true, isTrialIdentity: true, hasHostToken: true))
+        XCTAssertFalse(RelayTrialFlowModel.canReuseHostedCredential(host: "node.test", pinnedHost: "node.test", hasPinnedCA: true, hasIdentity: true, isTrialIdentity: false, hasHostToken: true))
+        XCTAssertFalse(RelayTrialFlowModel.canReuseHostedCredential(host: "node.test", pinnedHost: "node.test", hasPinnedCA: true, hasIdentity: false, isTrialIdentity: true, hasHostToken: true))
+        XCTAssertFalse(RelayTrialFlowModel.canReuseHostedCredential(host: "node.test", pinnedHost: "node.test", hasPinnedCA: false, hasIdentity: true, isTrialIdentity: true, hasHostToken: true))
+        XCTAssertFalse(RelayTrialFlowModel.canReuseHostedCredential(host: "node.test", pinnedHost: "node.test", hasPinnedCA: true, hasIdentity: true, isTrialIdentity: true, hasHostToken: false))
+    }
+
+    @MainActor
+    func testFreshSignInDiscoversHostedMachineAndPreservesOwnMachinePath() async throws {
+        for personalInstall in [false, true] {
+            let suite = "hosted-account-discovery-\(personalInstall)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defaults.removePersistentDomain(forName: suite)
+            defer { defaults.removePersistentDomain(forName: suite) }
+            StubTrialURLProtocol.recordedRequests = []
+            StubTrialURLProtocol.routes = [
+                "/api/auth/sign-in/username": (200, "{\"token\":\"test-account-token\",\"user\":{\"id\":\"hosted-test-user\",\"name\":\"Test\",\"email\":\"test@example.test\",\"username\":\"test\"}}"),
+                "/v1/trial-nodes/current": (200, trialJSON(state: "upgraded", sni: "node-1.tun.test")),
+                "/v1/nodes/node-1": (409, "{\"error\":\"hosted_pairing_upgrade_required\"}")
+            ]
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [StubTrialURLProtocol.self]
+            let account = RelayAccountStore(
+                client: RelayAuthClient(baseURL: URL(string: "https://cloud.test")!, session: URLSession(configuration: configuration)),
+                identityStore: ClientIdentityStore(defaults: defaults), defaults: defaults,
+                nodeStore: RelayNodeStore(defaults: defaults), trialClient: stubbedTrialClient(),
+                hasConfiguredPersonalInstall: personalInstall
+            )
+            await account.signIn(username: "test", password: "test-password-only")
+            XCTAssertEqual(account.user?.id, "hosted-test-user")
+            XCTAssertEqual(account.phase, personalInstall ? .onboarding : .recoveringMachine)
+            XCTAssertEqual(StubTrialURLProtocol.recordedRequests.contains { $0.url?.path == "/v1/trial-nodes/current" }, !personalInstall)
+            if !personalInstall { XCTAssertTrue(account.machineRecoveryError?.contains("service update") == true) }
+            try RelaySessionTokenStore().delete()
+        }
     }
 }

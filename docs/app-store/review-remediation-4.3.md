@@ -4,6 +4,50 @@ Prepared 2026-08-30 for App Store Connect app `6800257362`, bundle `com.parikshi
 
 The rejected build 38 and generic 4.3(a) feedback were supplied by the release owner. This document's implementation findings were checked against the local source tree. It does not claim live review-account, deployed-service, screenshot, or replacement-binary verification.
 
+## Release checkpoint — 2026-08-31
+
+The implementation is pushed as `85f1eceaf7258280f18847d0c06612e2ecf8602e`.
+Xcode Cloud build **47** (`7187b650-e0ff-49f0-8a27-efc4695d54ab`) has
+live-verified **Succeeded** results for Test — iOS, Archive — iOS, and TestFlight
+Internal Testing. This is not evidence of an attached App Store build or a
+resubmitted review. No Apple listing, screenshot, review reply, or submission
+was changed at this checkpoint.
+
+The five native screenshot candidates under `artifacts/app-store-4.3/iphone/`
+use the local, explicitly fictional fixture. See that artifact directory's
+README for provenance. The equivalent prepared task has **not** been verified
+on the live review account, so the reviewer reply must not claim it exists.
+
+### Live reviewer-access blocker
+
+Saved review credentials authenticated successfully against the production
+account service. Account, node-list, current-trial, and device-link reads all
+returned HTTP 200. The trial is marked `upgraded` and points to an owned node,
+but the exact sandbox lookup returned HTTP 404 with `sandbox ... not found`;
+the HTTP-200 sandbox list also omitted that sandbox. Both node health paths
+reset their connections. Do not represent this as a temporary login failure.
+
+The trial was created on 2026-08-19 at 08:39 UTC; its node's last heartbeat was
+2026-08-29 at 09:39 UTC. This matches the default seven-day trial plus three-day
+grace plus one-hour platform timeout. Source inspection found that App Review
+auto-upgrade changes only registry state/entitlements, while paid subscription
+activation extends or resumes the platform sandbox. The timing and source are
+strong evidence of an unchanged platform-expiry timer, not a recovered machine.
+
+Separately, a fresh installation cannot recover credentials for the existing
+upgraded node: `RelayTrialFlowModel.adoptExistingTrial` accepts only ready trials
+and requires locally retained identity/token material. Accepting `upgraded`
+alone is insufficient. Rerunning the current pair-only operation is not a safe
+multi-device fix: it replaces the single device-token hash before delivery and
+can invalidate an existing phone.
+
+Next recovery must be explicitly scoped: determine whether any sandbox data
+can be recovered, authorize replacement if needed, correct hosted lifetime
+handling, and use a securely ownership-bound fresh-device pairing flow. Do not
+delete the stale registry row, revoke devices, copy operator credentials, or
+promise a ready workspace merely to unblock review. No sandbox, registry,
+account, password, or production service was mutated during these diagnostics.
+
 ## Positioning
 
 Lead with the linked sequence: **workspace → run → Previews → inspect output or working app → follow up**. Handoff is a supporting workflow. The implementation combines these actions in one native client; the claim is a specific workflow, not that no other app has any individual feature.
@@ -63,12 +107,15 @@ Capture real app UI on a supported device/simulator in the replacement build. Us
 6. **Control what is shared:** the actual provider-specific AI Data Sharing sheet, with content categories and Not Now/Allow visible.
 7. **Choose a machine:** actual Settings/onboarding screen explaining own hardware and Relay Hosted. Subscription/paywall, if included, goes last and must not obscure that provider access is separate. Published catalog details may be an additional screenshot only if the shown catalog and its entries are safely authorized and reviewer-accessible.
 
-Capture both iPhone and iPad if layouts differ. Check the requested App Store Connect display classes rather than assuming that the older 1284×2778 files cover every requirement. Keep existing untracked `artifacts/app-store-1.0/` untouched unless separately authorized.
+The release owner's final configuration/runtime check found `TARGETED_DEVICE_FAMILY=1` in Debug and Release and `UIDeviceFamily=[1]` in the built app. Relay currently targets **iPhone**, not native iPad. On iPad it runs in iPhone compatibility mode, including the observed black side margins; passing tests on an iPad simulator does not establish native iPad support. The listing therefore says iPhone only. Do not change the device family as part of this metadata fix.
+
+Capture and upload the required iPhone screenshot sets. Skip iPad uploads unless App Store Connect explicitly requires a compatibility screenshot; any such image must show the actual compatibility-mode app, not imply a native iPad layout. Check the requested App Store Connect display classes rather than assuming that the older 1284×2778 files cover every requirement. Keep existing untracked `artifacts/app-store-1.0/` untouched unless separately authorized.
 
 ## Before posting or submitting
 
 - Resolve the attached replacement build and source commit; verify it processed successfully and was not built with an ineligible beta toolchain.
 - Confirm the new navigation/copy exists in the actual Release binary and shared-mobile changes meet the parity contract.
+- Keep platform claims aligned with the binary's iPhone-only device family. Do not describe the compatibility-mode iPad test run as native iPad validation.
 - Log in through the exact existing review route. Confirm the prepared workspace and its files, handoff (if claimed), task, live local preview and supported approval state are accessible. Record their non-secret names in review notes.
 - Keep review data on the existing isolated review machine. Do not mount the operator's private signed catalog or copy provider credentials to satisfy review.
 - Verify the advertised local preview does not expire or disappear before review; its source development service must be deliberately maintained as part of the prepared review fixture.
