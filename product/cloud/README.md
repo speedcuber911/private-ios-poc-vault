@@ -40,6 +40,11 @@ test/
 Run tests: `npm test` (or `node --test 'test/*.test.mjs'`). The SQLite
 ExperimentalWarning on Node 22 is expected.
 
+In the complete Relay checkout, also run `npm test --prefix product/integration`
+from the repository root before release. That suite exercises encrypted hosted
+device pairing across the actual cloud and daemon implementations; it lives
+outside this standalone cloud package because it requires both source trees.
+
 ## HTTP surface
 
 | Method/Path | Auth | Notes |

@@ -13,7 +13,7 @@ process.env.CODEX_WORKSPACES = JSON.stringify([{ id: "test", name: "Test", path:
 process.env.CODEX_REQUIRE_MTLS = "true";
 process.env.RELAYD_DEVICE_TOKEN_HASH_FILE = path.join(root, "device-token.hash");
 
-const { startTestApp, signIn, api, authed } = await import("./helpers.mjs");
+const { startTestApp, signIn, api, authed } = await import("../../cloud/test/helpers.mjs");
 const { initIdentity, identityPaths, readEncPublicKeyB64, revokeDevice } = await import("../../relayd/src/identity.mjs");
 const { createHostedPairingWorker } = await import("../../relayd/src/hosted-pairing.mjs");
 const { createCloudClient } = await import("../../relayd/src/cloudclient.mjs");
