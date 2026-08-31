@@ -1,0 +1,101 @@
+name: Machine doctor
+
+# Operator tooling: diagnose (and later repair) the Relay node from CI,
+# using the same OIDC role the CLI release pipeline already assumes. All
+# diagnose commands are read-only. Triggered manually only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "diagnose | restart-relayd"
+        required: true
+        default: diagnose
+      instance:
+        description: "EC2 instance id (i-…) or Name tag; blank = first SSM-managed instance"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  doctor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Assume the AWS role
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.RELAY_CLI_PUBLISH_ROLE_ARN }}
+          aws-region: ${{ vars.RELAY_CLI_AWS_REGION }}
+
+      - name: Identity and inventory
+        run: |
+          aws sts get-caller-identity || true
+          echo "== EC2 instances =="
+          aws ec2 describe-instances \
+            --query 'Reservations[].Instances[].{Id:InstanceId,State:State.Name,Name:Tags[?Key==`Name`]|[0].Value,PublicIp:PublicIpAddress}' \
+            --output table || echo "EC2 describe: DENIED for this role"
+          echo "== SSM-managed instances =="
+          aws ssm describe-instance-information \
+            --query 'InstanceInformationList[].{Id:InstanceId,Ping:PingStatus,Platform:PlatformName,Agent:AgentVersion}' \
+            --output table || echo "SSM describe: DENIED for this role"
+
+      - name: Resolve target instance
+        id: target
+        run: |
+          set -uo pipefail
+          RAW="${{ inputs.instance }}"
+          IID=""
+          if [ -n "$RAW" ]; then
+            case "$RAW" in
+              i-*) IID="$RAW" ;;
+              *)
+                IID=$(aws ec2 describe-instances \
+                  --filters "Name=tag:Name,Values=$RAW" "Name=instance-state-name,Values=running" \
+                  --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null || true)
+                ;;
+            esac
+          else
+            IID=$(aws ssm describe-instance-information \
+              --query 'InstanceInformationList[0].InstanceId' --output text 2>/dev/null || true)
+          fi
+          if [ -z "$IID" ] || [ "$IID" = "None" ]; then
+            echo "No target instance resolvable — see inventory above."
+            exit 1
+          fi
+          echo "iid=$IID" >> "$GITHUB_OUTPUT"
+          echo "Target: $IID"
+
+      - name: Run on the node via SSM
+        run: |
+          set -uo pipefail
+          IID="${{ steps.target.outputs.iid }}"
+          MODE="${{ inputs.mode }}"
+          if [ "$MODE" = "restart-relayd" ]; then
+            COMMANDS='["sudo systemctl restart relayd 2>&1 || sudo systemctl restart codex-api 2>&1 || true","sleep 3","systemctl is-active relayd codex-api 2>&1 || true","journalctl -u relayd -n 20 --no-pager 2>&1 || true"]'
+          else
+            COMMANDS='["hostname; uptime","echo == services ==","systemctl list-units --type=service --no-pager 2>/dev/null | grep -Ei \"relay|codex|nginx\" || true","echo == relayd status ==","systemctl status relayd --no-pager 2>&1 || true","echo == codex-api status ==","systemctl status codex-api --no-pager 2>&1 || true","echo == relayd journal ==","journalctl -u relayd -n 60 --no-pager 2>&1 || true","echo == codex-api journal ==","journalctl -u codex-api -n 40 --no-pager 2>&1 || true","echo == listeners ==","ss -ltnp 2>/dev/null | head -25 || true","echo == processes ==","ps aux | grep -Ei \"relayd|codex|node\" | grep -v grep || true","echo == local health ==","for p in 8787 8790 3000 8080 443 80; do printf \"%s: \" $p; curl -s -m 3 -o /dev/null -w \"%{http_code}\\n\" http://127.0.0.1:$p/healthz || true; done"]'
+          fi
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$IID" \
+            --document-name AWS-RunShellScript \
+            --comment "relay machine doctor ($MODE)" \
+            --parameters commands="$COMMANDS" \
+            --query 'Command.CommandId' --output text)
+          echo "Command: $CMD_ID"
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$IID" \
+              --query 'Status' --output text 2>/dev/null || echo Pending)
+            [ "$STATUS" = "Success" ] || [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ] && break
+            sleep 4
+          done
+          echo "== SSM status: $STATUS =="
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$IID" \
+            --query 'StandardOutputContent' --output text
+          echo "== stderr =="
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$IID" \
+            --query 'StandardErrorContent' --output text
