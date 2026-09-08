@@ -477,6 +477,7 @@ test("server on RELAYD_STORE=sqlite persists jobs across restarts", async () => 
   const env = {
     ...process.env,
     CODEX_API_HOST: "127.0.0.1",
+    RELAYD_DIRECT_TLS: "false",  // plain HTTP: these assertions are about the router, not TLS
     CODEX_REQUIRE_MTLS: "false",
     CODEX_DATA_DIR: path.join(dir, "data"),
     CODEX_WORKSPACE_BROWSE_ROOT: dir,

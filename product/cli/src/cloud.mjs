@@ -121,7 +121,7 @@ function createCloudApi({
     baseUrl: base,
     startDeviceLogin: (payload = {}) => request("POST", "/v1/auth/device/start", { body: payload }),
     pollDeviceToken: (deviceCode) => request("POST", "/v1/auth/device/token", { body: { deviceCode } }),
-    currentTrial: () => request("GET", "/v1/trial-nodes/current"),
+    listNodes: () => request("GET", "/v1/nodes"),
     registerRepo: (fullName) => request("POST", "/v1/repos", { body: { fullName } }),
     listRepos: () => request("GET", "/v1/repos"),
     createHandoff: (payload) => request("POST", "/v1/handoffs", { body: payload }),

@@ -17,11 +17,19 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { dataDir } from "./config.mjs";
+import {
+  dataDir,
+  publicHost,
+  serverCertNames,
+  externalTlsConfigured,
+  tlsCertFile,
+  tlsKeyFile,
+} from "./config.mjs";
 import { appendAudit } from "./audit.mjs";
 import { nowIso } from "./util.mjs";
 import { store } from "./store.mjs";
 import { generateEncKeyPair } from "./seal.mjs";
+import net from "node:net";
 
 const identityDir = process.env.RELAYD_IDENTITY_DIR || path.join(dataDir, "identity");
 
@@ -593,17 +601,125 @@ function revokeDevice(deviceId, { force = false, baseDir = identityDir } = {}) {
 
 // Node-CA-issued TLS server certificate for the tunnel listener (SAN-pinned
 // by clients). Idempotent per SAN.
-function ensureServerCert({ san, baseDir = identityDir }) {
+// One SubjectAltName entry. A BYO VM is very often reached by a bare IP, so
+// IP literals become IP: SANs — a DNS: SAN holding an address is not matched
+// by any TLS client.
+function sanEntry(value) {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text) return null;
+  if (net.isIP(text)) return `IP:${text}`;
+  if (/^[a-z0-9.-]{1,253}$/i.test(text)) return `DNS:${text}`;
+  return null;
+}
+
+// Server-cert file basename. IPv6 literals contain ':' and cannot be one, so
+// they are folded; DNS names keep their historical filename exactly, which is
+// what makes an already-issued tunnel cert reusable across this change.
+function serverCertFileKey(san) {
+  return net.isIP(san) && san.includes(":") ? `ip-${san.replace(/:/g, "-")}` : san;
+}
+
+// base64url( sha256( SubjectPublicKeyInfo DER ) ) of an X.509 certificate.
+// This is the value the pairing QR carries as `f=`.
+function spkiFingerprint(certPem) {
+  const spki = new crypto.X509Certificate(certPem).publicKey.export({ type: "spki", format: "der" });
+  return crypto.createHash("sha256").update(spki).digest("base64url");
+}
+
+// The pin the phone is handed out of band. It is taken over the node CA's
+// public key, NOT over a leaf: ensureServerCert may reissue the server
+// certificate at any time (a changed RELAYD_PUBLIC_HOST does exactly that),
+// and a printed pairing code must not stop working when it does. Returns null
+// before `relayd pair`/`initIdentity` has created the CA.
+function caSpkiFingerprint(baseDir = identityDir) {
+  const paths = identityPaths(baseDir);
+  try {
+    return spkiFingerprint(fs.readFileSync(paths.caCertPath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+// Mints a complete device credential on the node: EC P-256 key, a certificate
+// issued by this node's CA, and a passphrase-protected PKCS#12 carrying both
+// plus the CA. This is the "mint" pairing variant — for a phone that has no
+// CSR stack of its own. The private key exists only inside the identity tmp
+// dir (0700) and is removed before this returns, success or not; the only copy
+// that leaves is inside the encrypted PKCS#12.
+function mintDeviceP12({ deviceName = null, platform = null, passphrase, baseDir = identityDir }) {
   requireOpenssl();
-  if (typeof san !== "string" || !/^[a-z0-9.-]{1,253}$/i.test(san)) {
+  if (typeof passphrase !== "string" || passphrase.length < 16) {
+    throw new Error("p12 passphrase is required");
+  }
+  const paths = identityPaths(baseDir);
+  fs.mkdirSync(paths.tmpDir, { recursive: true, mode: 0o700 });
+  const stamp = crypto.randomBytes(6).toString("hex");
+  const keyPath = path.join(paths.tmpDir, `mint-device-${stamp}.key.pem`);
+  const csrPath = path.join(paths.tmpDir, `mint-device-${stamp}.csr.pem`);
+  const certPath = path.join(paths.tmpDir, `mint-device-${stamp}.cert.pem`);
+  const caPath = path.join(paths.tmpDir, `mint-device-${stamp}.ca.pem`);
+  const p12Path = path.join(paths.tmpDir, `mint-device-${stamp}.p12`);
+  try {
+    runOpenssl(["ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", keyPath]);
+    fs.chmodSync(keyPath, 0o600);
+    runOpenssl(["req", "-new", "-key", keyPath, "-subj", "/CN=relay-device", "-out", csrPath]);
+    const issued = issueDeviceCert({
+      csrPem: fs.readFileSync(csrPath, "utf8"),
+      deviceName,
+      platform,
+      baseDir,
+    });
+    fs.writeFileSync(certPath, issued.certificatePem, { mode: 0o600 });
+    fs.writeFileSync(caPath, issued.caPem, { mode: 0o600 });
+    execFileSync(
+      "openssl",
+      [
+        "pkcs12", "-export",
+        "-inkey", keyPath,
+        "-in", certPath,
+        "-certfile", caPath,
+        "-name", "relay-device",
+        "-passout", "env:RELAY_P12_PASS",
+        "-out", p12Path,
+      ],
+      { timeout: 30000, env: { ...process.env, RELAY_P12_PASS: passphrase } },
+    );
+    return { ...issued, p12: fs.readFileSync(p12Path) };
+  } finally {
+    for (const file of [keyPath, csrPath, certPath, caPath, p12Path]) {
+      try {
+        fs.rmSync(file, { force: true });
+      } catch {
+        /* best effort — the tmp dir is 0700 and per-node */
+      }
+    }
+  }
+}
+
+// Idempotent per primary SAN, but NOT per name set: the recorded SAN list is
+// compared and the certificate reissued when it changed. Without that, moving
+// RELAYD_PUBLIC_HOST would leave the node serving a certificate that does not
+// cover the URL its own QR advertises, and every phone would fail the pin.
+function ensureServerCert({ san, altNames = [], baseDir = identityDir }) {
+  requireOpenssl();
+  const primary = typeof san === "string" ? san.trim() : "";
+  if (!sanEntry(primary)) {
     throw new Error("server cert SAN is invalid");
+  }
+  const entries = [];
+  for (const value of [primary, ...(Array.isArray(altNames) ? altNames : [])]) {
+    const entry = sanEntry(value);
+    if (entry && !entries.includes(entry)) entries.push(entry);
   }
   const paths = identityPaths(baseDir);
   if (!fs.existsSync(paths.caKeyPath)) initIdentity({ baseDir });
-  const keyPath = path.join(paths.serverDir, `${san}.key.pem`);
-  const certPath = path.join(paths.serverDir, `${san}.cert.pem`);
-  if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
-    return { keyPath, certPath };
+  const fileKey = serverCertFileKey(primary);
+  const keyPath = path.join(paths.serverDir, `${fileKey}.key.pem`);
+  const certPath = path.join(paths.serverDir, `${fileKey}.cert.pem`);
+  const sansPath = path.join(paths.serverDir, `${fileKey}.sans`);
+  const wanted = entries.join(",");
+  if (fs.existsSync(keyPath) && fs.existsSync(certPath) && readFileOrNull(sansPath)?.trim() === wanted) {
+    return { keyPath, certPath, sans: entries };
   }
 
   const workDir = fs.mkdtempSync(path.join(paths.tmpDir, "server-"));
@@ -611,7 +727,7 @@ function ensureServerCert({ san, baseDir = identityDir }) {
     runOpenssl(["ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", keyPath]);
     fs.chmodSync(keyPath, 0o600);
     const csrPath = path.join(workDir, "server.csr.pem");
-    runOpenssl(["req", "-new", "-key", keyPath, "-subj", `/CN=${san}`, "-out", csrPath]);
+    runOpenssl(["req", "-new", "-key", keyPath, "-subj", `/CN=${primary}`, "-out", csrPath]);
     const extPath = path.join(workDir, "ext.cnf");
     writePrivate(
       extPath,
@@ -619,7 +735,7 @@ function ensureServerCert({ san, baseDir = identityDir }) {
         "basicConstraints=critical,CA:FALSE",
         "keyUsage=critical,digitalSignature,keyEncipherment",
         "extendedKeyUsage=serverAuth",
-        `subjectAltName=DNS:${san}`,
+        `subjectAltName=${wanted}`,
         "",
       ].join("\n"),
     );
@@ -635,10 +751,33 @@ function ensureServerCert({ san, baseDir = identityDir }) {
       "-out", certPath,
     ]);
     fs.chmodSync(certPath, 0o600);
-    return { keyPath, certPath };
+    writePrivate(sansPath, `${wanted}\n`);
+    return { keyPath, certPath, sans: entries };
   } finally {
     fs.rmSync(workDir, { recursive: true, force: true });
   }
+}
+
+// TLS material for a listener this node terminates itself: the operator's own
+// certificate when they supplied one, otherwise a leaf signed by the node CA
+// covering every name the node advertises. Both listeners (data and pairing)
+// use this, so the CA pin in the QR is valid for both.
+function nodeServerTlsOptions({ baseDir = identityDir } = {}) {
+  if (externalTlsConfigured) {
+    return {
+      cert: fs.readFileSync(tlsCertFile),
+      key: fs.readFileSync(tlsKeyFile),
+      selfSigned: false,
+      sans: null,
+    };
+  }
+  const issued = ensureServerCert({ san: publicHost, altNames: serverCertNames(), baseDir });
+  return {
+    cert: fs.readFileSync(issued.certPath),
+    key: fs.readFileSync(issued.keyPath),
+    selfSigned: true,
+    sans: issued.sans,
+  };
 }
 
 export {
@@ -659,5 +798,10 @@ export {
   revokeDevice,
   isRevokedSerial,
   ensureServerCert,
+  nodeServerTlsOptions,
+  sanEntry,
+  spkiFingerprint,
+  caSpkiFingerprint,
+  mintDeviceP12,
   csrKeyIsSupported,
 };

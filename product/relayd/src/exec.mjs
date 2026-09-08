@@ -8,8 +8,9 @@
 // helpers. A shell does not. Once a process exists it can `cd /` and read
 // anything the runtime user can read, and no amount of checking the STARTING
 // directory changes that. The only real confinements are OS-level — mount
-// namespaces, bubblewrap, a container per command — and the trial image ships
-// none of them (see product/trial/Dockerfile).
+// namespaces, bubblewrap, a container per command — and relayd ships none of
+// them. On a machine the user owns and operates, that is their call to make;
+// relayd should not imply a confinement it does not provide.
 //
 // So the honest security model here is:
 //

@@ -34,6 +34,7 @@ async function startServer(extraEnv = {}) {
     env: {
       ...process.env,
       CODEX_API_HOST: "127.0.0.1",
+      RELAYD_DIRECT_TLS: "false",  // plain HTTP: these assertions are about the router, not TLS
       CODEX_API_PORT: String(port),
       RELAYD_CODEX_TRANSPORT: "exec",
       CODEX_REQUIRE_MTLS: "false",

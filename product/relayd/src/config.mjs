@@ -5,6 +5,8 @@ import { execFile, spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
+import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 
 
@@ -32,13 +34,17 @@ const auditPath = path.join(dataDir, "audit.jsonl");
 // Where a harness CLI actually lives.
 //
 // `/usr/bin/<name>` was hardcoded as the default, and that is only true when
-// npm's global prefix is /usr. On the trial image it is not: node is unpacked
-// under /opt/node, so `npm install -g @openai/codex @anthropic-ai/claude-code`
-// puts them at /opt/node/bin/codex and /opt/node/bin/claude. Every trial
-// sandbox therefore answered every prompt with
-// `spawn /usr/bin/codex ENOENT` — both harnesses unrunnable, on every trial
-// machine, from the first one ever provisioned. Cursor was unaffected only
-// because its default is derived from CODEX_RUN_HOME rather than guessed.
+// npm's global prefix is /usr. Under dist/install.sh it is not: node is
+// unpacked under /opt/relayd/node, so
+// `npm install -g @openai/codex @anthropic-ai/claude-code` puts them at
+// /opt/relayd/node/bin/codex and .../claude. A machine installed that way
+// answered every prompt with `spawn /usr/bin/codex ENOENT` — both harnesses
+// unrunnable, from the first install. Cursor was unaffected only because its
+// default is derived from CODEX_RUN_HOME rather than guessed.
+//
+// This is why the resolution order below searches rather than assumes: a BYO
+// machine can have node from a distro package, a tarball, nvm or a version
+// manager, and each puts global bins somewhere different.
 //
 // Resolution order:
 //   1. the explicit env var, honoured even if it points at nothing — an
@@ -281,14 +287,24 @@ const tunnelBackoffMaxMs = Math.max(
   tunnelBackoffBaseMs,
 );
 
-// Control-plane base URL for handoff pickup and event push. Trial sandboxes
-// already receive RELAYD_ENROLL_URL, so that is the fallback; empty disables
-// every cloud-facing loop.
-const cloudUrl = cleanOptionalUrlBase(process.env.RELAYD_CLOUD_URL || process.env.RELAYD_ENROLL_URL || "", "RELAYD_CLOUD_URL");
+// Control-plane base URL for handoff pickup and event push. Empty disables
+// every cloud-facing loop, which is a supported configuration: a machine that
+// is paired but not registered to an account serves files and agent runs
+// perfectly well and simply never calls out.
+//
+// The RELAYD_ENROLL_URL fallback that used to live here is gone with the
+// enrolment route that set it. Nothing writes that variable any more, so
+// honouring it would only mean a stale value silently redirecting a node's
+// cloud traffic somewhere its operator no longer expects.
+const cloudUrl = cleanOptionalUrlBase(process.env.RELAYD_CLOUD_URL || "", "RELAYD_CLOUD_URL");
 
-// Enroll-delivered Ed25519 public key (raw 32-byte base64url). Empty means
-// this node cannot accept browser grants; the phone device-token path is
-// unchanged. Never a signing key — HMAC grant secrets are a spec violation.
+// Ed25519 public key for browser grants (raw 32 bytes, base64url), taken from
+// this node's own environment. It used to arrive in the provisioner's
+// enroll.json; a BYO node has no provisioner, so the operator sets
+// RELAYD_GRANT_PUBLIC_KEY themselves. Unset cleanly DISABLES browser grants —
+// authorize() only enters the grant branch when this is present — rather than
+// half-enabling a path that would then fail verification. Never a signing key:
+// HMAC grant secrets are a spec violation.
 const grantPublicKey = (process.env.RELAYD_GRANT_PUBLIC_KEY || "").trim() || null;
 
 const nodeId = (process.env.RELAYD_NODE_ID || "").trim() || null;
@@ -566,6 +582,110 @@ function readPairingListener() {
   return { host: typeof parsed.host === "string" && parsed.host ? parsed.host : pairingHost, port: parsed.port };
 }
 
+// --- BYO advertisement + self-signed TLS -----------------------------------
+//
+// A node the user owns has to be reachable by a phone with nothing but a QR
+// code. That rules out "assume a reverse proxy terminates TLS": standing up
+// Caddy + DNS + a publicly-trusted certificate is precisely the cost this flow
+// exists to remove. So the node terminates TLS itself with a leaf signed by
+// its own CA, and the QR carries the pin for that CA (identity.caSpkiFingerprint).
+//
+// The old objection — iOS will not do client-certificate auth on a connection
+// whose server trust the app overrode — no longer applies, because a paired
+// phone authenticates with a bearer token, not a client certificate.
+//
+// RELAYD_DIRECT_TLS=false restores plain HTTP for an operator who really does
+// run a terminating proxy. A proxy in front of an HTTPS origin keeps working
+// either way: the X-SSL-Client-* path in server.mjs is untouched.
+const directTls = parseBooleanEnv("RELAYD_DIRECT_TLS", true);
+
+// Externally supplied server material (a publicly-trusted certificate, when
+// the operator has one) takes precedence over the self-signed leaf.
+const tlsCertFile = cleanOptionalFilePath(process.env.RELAYD_TLS_CERT_FILE, "RELAYD_TLS_CERT_FILE");
+const tlsKeyFile = cleanOptionalFilePath(process.env.RELAYD_TLS_KEY_FILE, "RELAYD_TLS_KEY_FILE");
+const externalTlsConfigured = Boolean(tlsCertFile && tlsKeyFile);
+
+// True when this process serves TLS on its own listeners.
+const servesTls = directTls || externalTlsConfigured;
+
+function isWildcardHost(value) {
+  return value === "0.0.0.0" || value === "::" || value === "";
+}
+
+// A DNS name or an IP literal. A BYO VM is very often reached by raw IP, so
+// this deliberately accepts both — the SAN builder in identity.mjs turns an IP
+// into an IP: SAN rather than a (never-matched) DNS: one.
+function cleanPublicHost(value, name) {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text) return null;
+  if (net.isIP(text)) return text;
+  if (!/^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/.test(text)) {
+    throw new Error(`${name} must be a DNS hostname or an IP address`);
+  }
+  return text.toLowerCase();
+}
+
+// Best guess at the address a phone on the same network would dial. IPv4 is
+// preferred over IPv6 because that is what a home or office network hands out, and
+// internal/loopback interfaces are skipped.
+function primaryNonLoopbackAddress() {
+  let sixth = null;
+  let interfaces;
+  try {
+    interfaces = os.networkInterfaces();
+  } catch {
+    return null;
+  }
+  for (const entries of Object.values(interfaces || {})) {
+    for (const entry of entries || []) {
+      if (!entry || entry.internal) continue;
+      const family = typeof entry.family === "number" ? entry.family : Number(String(entry.family).replace("IPv", ""));
+      if (family === 4) return entry.address;
+      if (family === 6 && !sixth && !/^fe80:/i.test(entry.address)) sixth = entry.address;
+    }
+  }
+  return sixth;
+}
+
+// The single host identity: what the QR advertises, what the self-signed
+// certificate covers, and what `relayd doctor` reports.
+const publicHost =
+  cleanPublicHost(process.env.RELAYD_PUBLIC_HOST, "RELAYD_PUBLIC_HOST") ||
+  primaryNonLoopbackAddress() ||
+  (isWildcardHost(host) ? "127.0.0.1" : host);
+
+function bracketHost(value) {
+  return net.isIP(value) === 6 ? `[${value}]` : value;
+}
+
+// Names the self-signed data/pairing certificate must cover. Loopback is
+// always included so a local `curl --cacert` (and every test in this repo)
+// keeps working regardless of what the node advertises.
+function serverCertNames() {
+  const names = [publicHost];
+  if (!isWildcardHost(host)) names.push(host);
+  if (!isWildcardHost(pairingHost)) names.push(pairingHost);
+  names.push("127.0.0.1", "::1", "localhost");
+  return names.filter((value, index) => value && names.indexOf(value) === index);
+}
+
+// Data URL the phone uses after pairing — the `a=` field of the QR. It must be
+// exactly the URL the served certificate is valid for, which is why it is
+// derived from publicHost rather than from the bind address.
+const apiAdvertiseBase = cleanOptionalUrlBase(process.env.RELAYD_PAIR_API_ADVERTISE, "RELAYD_PAIR_API_ADVERTISE");
+
+function apiBaseUrl() {
+  if (apiAdvertiseBase) return apiAdvertiseBase;
+  if (!listensDirect && listensTunneled && tunnelSni) return `https://${tunnelSni}`;
+  return `${servesTls ? "https" : "http"}://${bracketHost(publicHost)}:${port}`;
+}
+
+// Origin of the universal link the QR encodes. The credential rides in the
+// fragment, so this origin never sees it.
+const pairLinkBase =
+  cleanOptionalUrlBase(process.env.RELAYD_PAIR_LINK_BASE, "RELAYD_PAIR_LINK_BASE") ||
+  "https://get.openrelay.sh/pair";
+
 // Base URL the phone should reach for POST /v1/pair (printed by `relayd
 // pair`). Unset => derived from the pairing listener bind address.
 const pairingAdvertiseBase = cleanOptionalUrlBase(process.env.RELAYD_PAIRING_ADVERTISE, "RELAYD_PAIRING_ADVERTISE");
@@ -575,11 +695,14 @@ function pairingEndpointUrl() {
   const live = pairingPort === 0 ? readPairingListener() : null;
   const effectiveHost = live ? live.host : pairingHost;
   const effectivePort = pairingPort !== 0 ? pairingPort : live ? live.port : null;
-  const displayHost = effectiveHost === "0.0.0.0" || effectiveHost === "::" ? "<node-address>" : effectiveHost;
-  const bracketed = displayHost.includes(":") && !displayHost.startsWith("<") ? `[${displayHost}]` : displayHost;
+  // A wildcard bind is resolved to the advertised public host rather than
+  // printed as a placeholder: this string goes into the QR, where a
+  // placeholder is simply an unusable pairing code.
+  const displayHost = isWildcardHost(effectiveHost) ? publicHost : effectiveHost;
+  const bracketed = bracketHost(displayHost);
   // No configured port and no live daemon: say so rather than invent one.
   const displayPort = effectivePort === null ? "<pairing-port>" : effectivePort;
-  return `http://${bracketed}:${displayPort}/v1/pair`;
+  return `${servesTls ? "https" : "http"}://${bracketed}:${displayPort}/v1/pair`;
 }
 
 // True when the pairing listener only accepts loopback connections, i.e. the
@@ -882,6 +1005,18 @@ export {
   pairingAdvertiseBase,
   pairingEndpointUrl,
   pairingIsLoopbackOnly,
+  directTls,
+  servesTls,
+  tlsCertFile,
+  tlsKeyFile,
+  externalTlsConfigured,
+  publicHost,
+  serverCertNames,
+  isWildcardHost,
+  bracketHost,
+  apiAdvertiseBase,
+  apiBaseUrl,
+  pairLinkBase,
   pairingListenerStatePath,
   recordPairingListener,
   readPairingListener,

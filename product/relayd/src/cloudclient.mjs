@@ -100,11 +100,6 @@ function createCloudClient({
   // acknowledges notices and does nothing with them, which is what an older
   // daemon build would do anyway.
   onNotice = null,
-  // Explicit capability: old workers never receive or consume these requests.
-  onDevicePairing = null,
-  // Managed nodes renew their account-level data-path authorization on this
-  // same signed long-poll. Optional for direct/BYO nodes.
-  onComputerAccess = null,
 } = {}) {
   const paths = baseDir ? identityPaths(baseDir) : identityPaths();
   const nodeId = readNodeId(paths);
@@ -353,7 +348,7 @@ function createCloudClient({
   }
 
   async function pollHandoffs(waitSec) {
-    const pathWithQuery = `/v1/node/handoffs?wait=${Number(waitSec) || 0}${onDevicePairing ? "&hostedPairing=1" : ""}`;
+    const pathWithQuery = `/v1/node/handoffs?wait=${Number(waitSec) || 0}`;
     const res = await fetchImpl(`${base}${pathWithQuery}`, {
       method: "GET",
       headers: signedHeaders("GET", pathWithQuery),
@@ -362,31 +357,11 @@ function createCloudClient({
     const json = await res.json();
     const handoffs = Array.isArray(json?.handoffs) ? json.handoffs : [];
     const notices = actionableNotices(json?.notices);
-    if (onComputerAccess) {
-      // The callback owns strict shape/range validation. If it refuses the
-      // lease, this poll is not accepted and the prior lease naturally expires.
-      await onComputerAccess(json?.computerAccess);
-    }
     // res.json() resolving is itself the evidence that matters — proof the
     // bytes crossed a live connection — so ack right here, before returning
     // descriptors to the caller, and before anything is done with them.
     await ackDelivery({ acks: ackableFrom(handoffs), noticeAcks: ackableFrom(notices) });
     await dispatchNotices(notices);
-    if (onDevicePairing) {
-      for (const request of (Array.isArray(json?.devicePairings) ? json.devicePairings : []).slice(0, 5)) {
-        try {
-          if (await onDevicePairing(request)) {
-            const readyPath = `/v1/node/device-pairings/${encodeURIComponent(request.pairingId)}/ready`;
-            await fetchImpl(`${base}${readyPath}`, {
-              method: "POST", headers: signedHeaders("POST", readyPath), signal: AbortSignal.timeout(10_000),
-            });
-          }
-        } catch {
-          // Durable prepared response + cloud TTL queue retry the next poll.
-          // Never log the request, its decrypted secret or encrypted p12.
-        }
-      }
-    }
     // Unchanged on purpose: handoff.mjs's import loop consumes this return
     // value and knows nothing about notices.
     return handoffs;

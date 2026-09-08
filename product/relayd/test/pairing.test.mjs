@@ -25,6 +25,10 @@ process.env.CODEX_WORKSPACES = JSON.stringify([
   { id: "scratch", name: "Scratch", path: path.join(tmpRoot, "ws", "scratch") },
 ]);
 process.env.CODEX_REQUIRE_MTLS = "false";
+// Plain HTTP for the listeners started in this file: everything here is about
+// the pairing PROTOCOL (sessions, tags, single use, rate limiting). The TLS
+// wrapper and the CA pin have their own file, pairing-tls.test.mjs.
+process.env.RELAYD_DIRECT_TLS = "false";
 // Every listener in this file is started explicitly on an ephemeral port; the
 // daemon's configured pairing port is never bound here.
 
@@ -63,7 +67,10 @@ function pairBody(session, blob, { tamperTag = false, blobOverride = null } = {}
   }
   return {
     v: 2,
-    code: session.code,
+    // The wire field is still named `code`, but ONLY the token redeems: every
+    // key in the protocol is derived from it, so the short confirmation code
+    // could never produce an acceptable tag anyway.
+    code: session.token,
     blob: (blobOverride ?? blob).toString("base64"),
     tag,
   };
@@ -107,8 +114,11 @@ test("pairing session: code shape, TTL, presentation without secrets leakage", (
   assert.equal(presentation.code, session.code);
   assert.ok(presentation.url.includes(session.token));
   assert.ok(presentation.otpauthUrl.startsWith("otpauth://relay-pair/"));
-  // Placeholder domain only — no live endpoint baked in.
-  assert.ok(presentation.url.includes("<domain>"));
+  // The credential rides in the FRAGMENT, which no HTTP client sends to a
+  // server — that is the whole reason the link can name a real origin.
+  const [origin, fragment] = presentation.url.split("#");
+  assert.ok(!origin.includes(session.token), "the token must never be in the query or path");
+  assert.ok(fragment.includes(`t=${session.token}`));
   // The address the phone should reach is part of the CLI contract.
   assert.match(presentation.pairUrl, /\/v1\/pair$/);
 });
@@ -181,24 +191,37 @@ test("tag verification is constant-time and rejects a one-byte-flipped tag", () 
   assert.equal(calls[0][0].length, 32);
 });
 
-test("pairing codes are single-use and expired codes are indistinguishable", () => {
+test("pairing tokens are single-use and expired tokens are indistinguishable", () => {
   pairing.resetPairingState();
   const session = pairing.createPairingSession();
-  const redeemed = pairing.consumePairingSecret(session.code);
+  const redeemed = pairing.consumePairingSecret(session.token);
   assert.equal(redeemed.id, session.id);
   // Second use → 403 with the generic message.
   assert.throws(
-    () => pairing.consumePairingSecret(session.code),
-    (error) => error.status === 403 && /pairing code is invalid or expired/.test(error.message),
+    () => pairing.consumePairingSecret(session.token),
+    (error) => error.status === 403 && /pairing token is invalid or expired/.test(error.message),
   );
-  // Unknown code → same 403.
+  // Unknown token → same 403.
   assert.throws(
-    () => pairing.consumePairingSecret("ZZZZ-9999"),
-    (error) => error.status === 403 && /pairing code is invalid or expired/.test(error.message),
+    () => pairing.consumePairingSecret("Zm9vYmFyLXVua25vd24tdG9rZW4"),
+    (error) => error.status === 403 && /pairing token is invalid or expired/.test(error.message),
   );
-  // The long token also redeems.
-  const tokenSession = pairing.createPairingSession();
-  assert.equal(pairing.consumePairingSecret(tokenSession.token).id, tokenSession.id);
+});
+
+// The short code is a CONFIRMATION string, not a credential. Accepting it here
+// would mean deriving macKey from ~40 bits, and one captured blob+tag pair
+// would then be brute-forcible offline — the whole integrity argument for the
+// rendezvous. It is refused even for its own live session.
+test("the short confirmation code never redeems a session", () => {
+  pairing.resetPairingState();
+  const session = pairing.createPairingSession();
+  assert.ok(pairing.looksLikeVerificationCode(session.code));
+  assert.throws(
+    () => pairing.consumePairingSecret(session.code),
+    (error) => error.status === 400 && /confirmation code, not the pairing token/.test(error.message),
+  );
+  // …and the session it names is untouched, so the real token still works.
+  assert.equal(pairing.consumePairingSecret(session.token).id, session.id);
 });
 
 test("pairing sessions are persisted, so a separate process can redeem them", () => {
@@ -224,7 +247,7 @@ test("pairing sessions are persisted, so a separate process can redeem them", ()
 
   // This process — the "daemon" — sees it and can redeem it.
   assert.ok(store.listPairingSessions().some((entry) => entry.id === minted.id));
-  const redeemed = pairing.consumePairingSecret(minted.code);
+  const redeemed = pairing.consumePairingSecret(minted.token);
   assert.equal(redeemed.id, minted.id);
   assert.equal(redeemed.token, minted.token);
   // Consumed => gone from the store, so a restarted daemon cannot replay it.
@@ -244,7 +267,7 @@ test("expired persisted sessions are pruned and never redeemable", () => {
   };
   store.savePairingSession(expired);
   assert.throws(
-    () => pairing.consumePairingSecret(expired.code),
+    () => pairing.consumePairingSecret(expired.token),
     (error) => error.status === 403,
   );
   assert.equal(pairing.prunePairingSessions(Date.now()) >= 0, true);
@@ -328,9 +351,9 @@ test("POST /v1/pair on the pairing listener issues a cert chained to the node CA
     const session3 = pairing.createPairingSession();
     const noCode = await postPair(port, { v: 2, blob: blob.toString("base64"), tag: "AAAA" });
     assert.equal(noCode.status, 400);
-    const noTag = await postPair(port, { v: 2, code: session3.code, blob: blob.toString("base64") });
+    const noTag = await postPair(port, { v: 2, code: session3.token, blob: blob.toString("base64") });
     assert.equal(noTag.status, 400);
-    const badBlob = await postPair(port, { v: 2, code: session3.code, blob: "!!!not base64!!!", tag: "AAAA" });
+    const badBlob = await postPair(port, { v: 2, code: session3.token, blob: "!!!not base64!!!", tag: "AAAA" });
     assert.equal(badBlob.status, 400);
 
     // Only POST /v1/pair exists on this listener.
@@ -386,7 +409,7 @@ test("substitution attack: a cloud-swapped device blob is refused and no cert is
     const relayed = getBlob(session.id, pairing.DEVICE_SLOT);
     const response = await postPair(port, {
       v: 2,
-      code: session.code,
+      code: session.token,
       blob: relayed.blob.toString("base64"),
       tag: relayed.tag,
     });
@@ -568,6 +591,7 @@ test("integration: `relayd pair` prints a code the running daemon redeems", asyn
   const env = {
     ...process.env,
     CODEX_API_HOST: "127.0.0.1",
+    RELAYD_DIRECT_TLS: "false",  // plain HTTP: these assertions are about the router, not TLS
     CODEX_API_PORT: String(apiPort),
     CODEX_REQUIRE_MTLS: "false",
     CODEX_DATA_DIR: path.join(dir, "data"),
@@ -595,7 +619,7 @@ test("integration: `relayd pair` prints a code the running daemon redeems", asyn
     });
     const code = /^\s+([A-Z2-9]{4}-[A-Z2-9]{4})\s*$/m.exec(printed)?.[1];
     assert.ok(code, `no pairing code in output:\n${printed}`);
-    const token = /token=([A-Za-z0-9_-]+)/.exec(printed)?.[1];
+    const token = /[#&]t=([A-Za-z0-9_-]+)/.exec(printed)?.[1];
     assert.ok(token, "the link must carry the long token");
     assert.ok(printed.includes(`http://127.0.0.1:${pairPort}/v1/pair`), "must print where the phone should connect");
     assert.ok(!printed.includes("PRIVATE KEY"), "the CLI must never print key material");
@@ -605,9 +629,20 @@ test("integration: `relayd pair` prints a code the running daemon redeems", asyn
     // The CLI process has exited. Redeem against the daemon's listener.
     const { macKey } = pairing.pairingKeys(token);
     const blob = deviceBlobFor({ csrPem: makeCsr("cli-paired"), deviceName: "CLI Paired", platform: "ios" });
-    const response = await postPair(pairPort, {
+
+    // The printed confirmation code is not a credential — sending it must not
+    // redeem, and must not burn the session either.
+    const typedCode = await postPair(pairPort, {
       v: 2,
       code,
+      blob: blob.toString("base64"),
+      tag: pairing.blobTag(macKey, pairing.DEVICE_SLOT, blob),
+    });
+    assert.equal(typedCode.status, 400, `the confirmation code must not redeem: ${JSON.stringify(typedCode.json)}`);
+
+    const response = await postPair(pairPort, {
+      v: 2,
+      code: token,
       blob: blob.toString("base64"),
       tag: pairing.blobTag(macKey, pairing.DEVICE_SLOT, blob),
     });
@@ -710,6 +745,7 @@ test("two relayd daemons sharing one data dir: one code mints exactly one certif
   const baseEnv = {
     ...process.env,
     CODEX_API_HOST: "127.0.0.1",
+    RELAYD_DIRECT_TLS: "false",  // plain HTTP: these assertions are about the router, not TLS
     CODEX_REQUIRE_MTLS: "false",
     // ONE data dir and ONE identity for both daemons: the co-located
     // deployment, and the only way two processes can race the same session.
@@ -771,7 +807,7 @@ test("two relayd daemons sharing one data dir: one code mints exactly one certif
       const { macKey } = pairing.pairingKeys(session.token);
       const body = {
         v: 2,
-        code: session.code,
+        code: session.token,
         blob: blob.toString("base64"),
         tag: pairing.blobTag(macKey, pairing.DEVICE_SLOT, blob),
       };
@@ -802,7 +838,7 @@ test("two relayd daemons sharing one data dir: one code mints exactly one certif
       // describing the host. Which of the two depends on where it lost: a
       // request that read the session and then lost the claim answers 403; one
       // that arrived after the winner had already removed it never matched at
-      // all, and a used code is by design indistinguishable from a guess, so it
+      // all, and a used token is by design indistinguishable from a guess, so it
       // also spends that source's guessing budget and eventually answers 429.
       const losers = results.filter((result) => result.status !== 201);
       loserStatuses.push(losers.map((loser) => loser.status));
@@ -812,7 +848,7 @@ test("two relayd daemons sharing one data dir: one code mints exactly one certif
           `round ${round}: loser returned ${loser.status} ${JSON.stringify(loser.json)}`,
         );
         assert.ok(
-          loser.json?.error === "pairing code is invalid or expired" ||
+          loser.json?.error === "pairing token is invalid or expired" ||
             loser.json?.error === "too many pairing attempts",
           `round ${round}: unexpected loser message ${JSON.stringify(loser.json)}`,
         );
@@ -906,12 +942,12 @@ test("errors we raised deliberately still reach the client with their own messag
     assert.match((await postPair(port, {})).json.error, /code is required/);
     const unknown = await postPair(port, {
       v: 2,
-      code: "ZZZZ-ZZZZ",
+      code: "dW5rbm93bi10b2tlbi12YWx1ZS0wMDE",
       blob: Buffer.from("{}").toString("base64"),
       tag: "AAAA",
     });
     assert.equal(unknown.status, 403);
-    assert.equal(unknown.json.error, "pairing code is invalid or expired");
+    assert.equal(unknown.json.error, "pairing token is invalid or expired");
 
     const session = pairing.createPairingSession();
     const blob = deviceBlobFor({ csrPem: makeCsr("kept"), deviceName: "Kept", platform: "ios" });
@@ -1000,16 +1036,16 @@ test("unauthenticated junk attempts cannot lock the owner out of pairing", () =>
   const session = pairing.createPairingSession();
   for (let i = 0; i < 25; i += 1) {
     assert.throws(
-      () => pairing.consumePairingSecret("ZZZZ-ZZZZ", { source: "203.0.113.9" }),
+      () => pairing.consumePairingSecret(`junk-token-${i}-aaaaaaaaaaaaaaaa`, { source: "203.0.113.9" }),
       (error) => error.status === 403 || error.status === 429,
     );
   }
-  // Same source, same window, real code: succeeds.
-  assert.equal(pairing.consumePairingSecret(session.code, { source: "203.0.113.9" }).id, session.id);
+  // Same source, same window, real token: succeeds.
+  assert.equal(pairing.consumePairingSecret(session.token, { source: "203.0.113.9" }).id, session.id);
   // …and it consumed none of anyone's budget, so an unrelated source is still
   // only at its own count.
   assert.throws(
-    () => pairing.consumePairingSecret("ZZZZ-ZZZZ", { source: "192.0.2.5" }),
+    () => pairing.consumePairingSecret("junk-token-x-aaaaaaaaaaaaaaaa", { source: "192.0.2.5" }),
     (error) => error.status === 403,
   );
 });
@@ -1022,7 +1058,7 @@ test("HTTP: junk POSTs to /v1/pair do not deny a legitimate pairing", async () =
   const port = server.address().port;
   try {
     const session = pairing.createPairingSession();
-    const junk = { v: 2, code: "ZZZZ-ZZZZ", blob: Buffer.from("{}").toString("base64"), tag: "AAAA" };
+    const junk = { v: 2, code: "anVuay10b2tlbi1ub3QtYS1jb2Rl", blob: Buffer.from("{}").toString("base64"), tag: "AAAA" };
     for (let i = 0; i < 10; i += 1) {
       const response = await postPair(port, junk);
       assert.ok(
@@ -1071,6 +1107,8 @@ function readConfigIn(env) {
       RELAYD_PAIRING_HOST: "",
       RELAYD_PAIRING_PORT: "",
       RELAYD_PAIRING_ADVERTISE: "",
+      RELAYD_PUBLIC_HOST: "203.0.113.9",
+      RELAYD_DIRECT_TLS: "false",
       ...env,
     },
   });
@@ -1094,6 +1132,12 @@ test("the pairing listener never inherits CODEX_API_HOST or CODEX_API_PORT", () 
   assert.notEqual(gateway.pairingPort, 8788);
   assert.match(gateway.endpoint, /^http:\/\/127\.0\.0\.1:(<pairing-port>|\d+)\/v1\/pair$/);
 
+  // With the node terminating its own TLS (the default), the SAME listener is
+  // advertised as https — the phone must not be sent to a plaintext port that
+  // would carry the pairing token in the clear.
+  const secure = readConfigIn({ CODEX_API_HOST: "0.0.0.0", CODEX_API_PORT: "8787", RELAYD_DIRECT_TLS: "true" });
+  assert.match(secure.endpoint, /^https:\/\/127\.0\.0\.1:(<pairing-port>|\d+)\/v1\/pair$/);
+
   // Explicit opt-ins are still honored exactly as configured.
   const explicit = readConfigIn({
     CODEX_API_HOST: "127.0.0.1",
@@ -1104,7 +1148,9 @@ test("the pairing listener never inherits CODEX_API_HOST or CODEX_API_PORT", () 
   assert.equal(explicit.pairingHost, "0.0.0.0");
   assert.equal(explicit.pairingPort, 9999);
   assert.equal(explicit.loopbackOnly, false);
-  assert.equal(explicit.endpoint, "http://<node-address>:9999/v1/pair");
+  // A wildcard bind resolves to the advertised public host. This string is
+  // what goes into the QR, and a placeholder there is an unusable pairing code.
+  assert.equal(explicit.endpoint, "http://203.0.113.9:9999/v1/pair");
 });
 
 test("two relayd daemons on adjacent ports coexist", async () => {
@@ -1144,6 +1190,7 @@ test("two relayd daemons on adjacent ports coexist", async () => {
     const env = {
       ...process.env,
       CODEX_API_HOST: "127.0.0.1",
+      RELAYD_DIRECT_TLS: "false",  // plain HTTP: these assertions are about the router, not TLS
       CODEX_API_PORT: String(port),
       CODEX_REQUIRE_MTLS: "false",
       CODEX_DATA_DIR: path.join(dir, "data"),
@@ -1239,6 +1286,7 @@ test("a data-listener port clash is a clean, actionable exit — not a stack tra
       env: {
         ...process.env,
         CODEX_API_HOST: "127.0.0.1",
+        RELAYD_DIRECT_TLS: "false",  // plain HTTP: these assertions are about the router, not TLS
         CODEX_API_PORT: String(port),
         CODEX_REQUIRE_MTLS: "false",
         CODEX_DATA_DIR: path.join(dir, "data"),
@@ -1279,8 +1327,22 @@ test("dist/install.sh: valid bash, writes the pairing keys, cleans up, tells the
   // The second listener is written into the generated env file, so it is never
   // invisible to the operator who edits CODEX_API_HOST.
   assert.match(text, /env_kv RELAYD_PAIRING_ENABLED true/);
-  assert.match(text, /env_kv RELAYD_PAIRING_HOST 127\.0\.0\.1/);
   assert.match(text, /env_kv RELAYD_PAIRING_PORT "\$PAIRING_PORT"/);
+  // Both listeners must be REACHABLE. A default of 127.0.0.1 is what made
+  // "bring your own machine" undeliverable: the phone is not on this box, so a
+  // loopback-only install pairs with nothing. What makes exposure acceptable
+  // is asserted below — relayd terminates its own TLS, and the pairing
+  // endpoint only ever answers a single-use token minted on this machine.
+  assert.match(text, /env_kv CODEX_API_HOST 0\.0\.0\.0/);
+  assert.match(text, /env_kv RELAYD_PAIRING_HOST 0\.0\.0\.0/);
+  assert.match(text, /env_kv RELAYD_DIRECT_TLS true/);
+  // The advertised address goes into both the QR and the certificate SANs, so
+  // it must be written explicitly rather than left to a runtime guess.
+  assert.match(text, /env_kv RELAYD_PUBLIC_HOST "\$PUBLIC_HOST"/);
+  assert.match(text, /detect_public_host\(\)/);
+  // An operator-supplied value must win: the installer's guess is the private
+  // address on any NATed cloud VM, which is exactly where it is wrong.
+  assert.match(text, /if \[ -n "\$\{RELAYD_PUBLIC_HOST:-\}" \]/);
   // A refused value no longer strands a temp config in /etc/relayd.
   assert.match(text, /trap 'rm -f "\$ENV_TMP"' EXIT/);
   const tmpIndex = text.indexOf('ENV_TMP="$(mktemp');
@@ -1289,7 +1351,42 @@ test("dist/install.sh: valid bash, writes the pairing keys, cleans up, tells the
   // The verdict folds in reachability instead of claiming READY regardless.
   assert.match(text, /pairing_reachability\(\)/);
   assert.match(text, /ONE STEP LEFT before the phone can pair/);
-  assert.match(text, /RELAYD_PAIRING_ADVERTISE/);
+  // Telling the truth now includes naming the advertised address, because a
+  // wrong one fails at the last step with a certificate error the operator has
+  // no other way to diagnose.
+  assert.match(text, /IF PAIRING FAILS WITH A CERTIFICATE OR HOSTNAME ERROR/);
+  assert.match(text, /This machine advertises itself as \$PUBLIC_HOST/);
+});
+
+// The detection is the part that decides whether a real install works, and it
+// runs on hosts this suite cannot emulate. So exercise the function itself.
+test("dist/install.sh: detect_public_host prefers an explicit value and never returns empty", () => {
+  const text = fs.readFileSync(path.join(repoRelaydDir, "dist", "install.sh"), "utf8");
+  const start = text.indexOf("detect_public_host() {");
+  const end = text.indexOf("PUBLIC_HOST=\"$(detect_public_host)\"");
+  assert.ok(start > 0 && end > start, "detect_public_host must be defined before it is called");
+  const fn = text.slice(start, end);
+
+  // An operator override wins outright — no probing, no second-guessing.
+  const overridden = spawnSync("bash", ["-c", `${fn}\ndetect_public_host`], {
+    encoding: "utf8",
+    timeout: 120000,
+    env: { ...process.env, RELAYD_PUBLIC_HOST: "relay.example.net" },
+  });
+  assert.equal(overridden.status, 0, overridden.stderr);
+  assert.equal(overridden.stdout, "relay.example.net");
+
+  // With no override and no usable probe it must still yield SOMETHING: an
+  // empty RELAYD_PUBLIC_HOST would produce a certificate with no SAN and a QR
+  // advertising nothing, which fails much later and much more confusingly than
+  // a loopback default the summary already explains how to correct.
+  const guessed = spawnSync("bash", ["-c", `PATH=/nonexistent\n${fn}\ndetect_public_host`], {
+    encoding: "utf8",
+    timeout: 120000,
+    env: { ...process.env, RELAYD_PUBLIC_HOST: "" },
+  });
+  assert.equal(guessed.status, 0, guessed.stderr);
+  assert.match(guessed.stdout, /^\S+$/, `expected a non-empty host, got ${JSON.stringify(guessed.stdout)}`);
 });
 
 // The installer used to print "Comma-separated allowed client-cert subject DNs"

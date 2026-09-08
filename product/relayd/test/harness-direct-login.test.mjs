@@ -126,6 +126,7 @@ async function startServer({ claudeScript = PARKED_LOGIN_CLAUDE, withLoginServer
     env: {
       ...process.env,
       CODEX_API_HOST: "127.0.0.1",
+      RELAYD_DIRECT_TLS: "false",  // plain HTTP: these assertions are about the router, not TLS
       CODEX_API_PORT: String(port),
       CODEX_REQUIRE_MTLS: "false",
       RELAYD_PAIRING_ENABLED: "false",

@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 // relayd CLI — W2-MODULES. Subcommands:
 //   run [--mode <mode>]       start the node daemon (direct|tunneled|both)
-//   pair                      print a single-use pairing code + URLs
-//   enroll                    enroll with the control plane (env-driven)
+//   pair [--no-qr]            print a single-use pairing QR + code + URLs
 //   doctor                    config / jail / identity / provider checks
 //   status                    query the running daemon's /healthz
 //   devices list              list enrolled devices
@@ -13,6 +12,7 @@
 // user must transfer to the phone, single-use, 15-minute TTL).
 
 import http from "node:http";
+import net from "node:net";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -54,30 +54,64 @@ async function cmdRun(args) {
 }
 
 // Mints a pairing session INTO THE SHARED STORE, so the already-running
-// daemon (a different process) can redeem the printed code. Prints the code,
-// the link the phone opens, and the address the phone POSTs /v1/pair to.
+// daemon (a different process) can redeem the printed code. Prints the QR the
+// phone scans, the typed fallback code, the address the phone POSTs /v1/pair
+// to, and the CA pin the phone will check that connection against.
 // The pairing code/token is the one deliberate secret this CLI prints — it IS
 // the credential the user carries to the phone. No key material is ever shown.
-async function cmdPair() {
+async function cmdPair(args = []) {
   const config = await import("../src/config.mjs");
   const identity = await import("../src/identity.mjs");
   const pairing = await import("../src/pairing.mjs");
+  const { renderQrAnsi, qrAnsiWidth } = await import("../src/qr.mjs");
   identity.initIdentity();
   const session = pairing.createPairingSession();
   const presented = pairing.pairingPresentation(session);
-  console.log("Pairing code (single use, expires in 15 minutes):");
+  const noQr = args.includes("--no-qr");
+
+  // QR above the human code, exactly as `relay login` does it. Skipped when
+  // asked, when stdout is not a TTY (a piped symbol is noise), or when the
+  // terminal is narrower than the symbol — wrapping breaks the finder patterns
+  // and no camera can lock onto it. Terminal.app can leave seams between the
+  // Unicode half-block glyphs, so it gets the wider font-independent renderer
+  // when that one fits.
+  console.log("");
+  if (!noQr && process.stdout.isTTY) {
+    const columns = process.stdout.columns;
+    const preferred = process.env.TERM_PROGRAM === "Apple_Terminal" ? "square" : "compact";
+    const fits = (mode) => columns == null || columns >= qrAnsiWidth(presented.url, { mode });
+    const mode = fits(preferred) ? preferred : fits("compact") ? "compact" : null;
+    if (mode) {
+      console.log(renderQrAnsi(presented.url, { mode }));
+      console.log("");
+      console.log("  Scan this with the Relay app.");
+      console.log("");
+    }
+  }
+
+  // What actually pairs is the QR (or the token pasted from the Link below).
+  // The short code is NOT a credential and cannot redeem this session: every
+  // key in the protocol is derived from the token, so a caller holding only the
+  // code cannot produce a blob the node will accept. It exists to be COMPARED —
+  // the app shows the same eight characters once the exchange completes.
+  console.log("Scan the QR above with the Relay app, or paste the Link below.");
+  console.log("");
+  console.log("Confirmation code — check the app shows exactly this:");
   console.log("");
   console.log(`    ${presented.code}`);
   console.log("");
+  console.log("This code is not typed in anywhere. It is single use and expires in 15 minutes.");
+  console.log("");
   console.log(`  Pair at: ${presented.pairUrl}`);
+  console.log(`  Machine: ${presented.apiBaseUrl}`);
   console.log(`  Link:    ${presented.url}`);
   console.log(`  otpauth: ${presented.otpauthUrl}`);
+  if (presented.caFingerprint) {
+    // The phone shows this before it sends anything. Two screens, one human,
+    // one comparison — that is what makes a self-signed node safe to trust.
+    console.log(`  CA pin:  ${presented.caFingerprint}`);
+  }
   console.log(`  Expires: ${presented.expiresAt}`);
-  console.log("");
-  // TODO(W2-followup): ASCII QR of the link. A correct pure-JS QR encoder
-  // (Reed-Solomon ECC + masking) exceeds the budget for this pass; the code
-  // and link above carry the identical payload.
-  console.log("  (QR rendering not yet implemented — enter the code or open the link.)");
   console.log("");
   if (!presented.pairListenerEnabled) {
     console.log("WARNING: RELAYD_PAIRING_ENABLED=false — the daemon serves no");
@@ -91,105 +125,6 @@ async function cmdPair() {
   console.log("");
   console.log("The session is persisted, so the running daemon redeems it — you do");
   console.log("not need to keep this command open.");
-}
-
-// Non-interactive bootstrap for cloud-provisioned (trial) nodes. Two steps
-// that deliberately do NOT share a failure fate:
-//
-//   enrollment — registers the node identity with the control plane using a
-//                single-use token. Succeeds exactly ONCE: the cloud burns the
-//                token and flips the trial row to `ready`, so a second attempt
-//                can only ever 401. The caller must persist that it happened
-//                and never retry it.
-//   pairing    — hands the phone its device credential through the cloud
-//                rendezvous. Talks only to the cloud (never to the local
-//                daemon), so it is independent of `relayd run`, is retryable,
-//                and is allowed to fail without taking the node down.
-//
-// `--no-pair` runs enrollment alone; `--pair-only` runs pairing alone. The
-// trial bootstrap uses both, because running them in one all-or-nothing
-// process is what let a single dropped pairing poll brick a sandbox: under
-// `set -e` the pairing timeout aborted the boot before `relayd run`, and the
-// next boot re-ran the already-burned enroll token, 401'd, and exited — with
-// the cloud row stuck at `ready` so no new trial could be provisioned either.
-//
-// Everything sensitive (RELAYD_ENROLL_TOKEN, RELAYD_ENROLL_PAIRING_SECRET)
-// arrives via env, never argv, and is never printed — only the resulting node
-// id / sni / device id are logged.
-// Enrollment inputs come from the environment for a directly-launched node,
-// or from a JSON file named by RELAYD_ENROLL_CONFIG.
-//
-// The file exists because of how Cube (and E2B) actually start a machine: a
-// sandbox is RESTORED FROM A TEMPLATE SNAPSHOT rather than booted from the
-// image, so this process is already running — captured mid-boot in the
-// snapshot — before the control plane knows which trial it belongs to.
-// Environment variables supplied at sandbox-create time therefore never reach
-// it; they only apply to processes started afterwards. The control plane
-// writes this file into the running sandbox instead, and the values are read
-// straight out of it rather than being spliced into process.env, so they
-// cannot be inherited by anything the daemon later spawns.
-function enrollInputs() {
-  const str = (value) => (typeof value === "string" ? value.trim() : "");
-  const configPath = str(process.env.RELAYD_ENROLL_CONFIG);
-  if (!configPath) {
-    return {
-      cloudUrl: str(process.env.RELAYD_ENROLL_URL),
-      token: str(process.env.RELAYD_ENROLL_TOKEN),
-      pairingId: str(process.env.RELAYD_ENROLL_PAIRING_ID),
-      pairingSecret: str(process.env.RELAYD_ENROLL_PAIRING_SECRET),
-    };
-  }
-
-  let parsed;
-  try {
-    parsed = JSON.parse(fs.readFileSync(configPath, "utf8"));
-  } catch (error) {
-    // Deliberately reports only the path and the failure kind: the file's
-    // contents are the enroll token and pairing secret.
-    fail(`cannot read enroll config ${configPath}: ${error.code || error.name}`);
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    fail(`enroll config ${configPath} is not a JSON object`);
-  }
-  return {
-    cloudUrl: str(parsed.cloudUrl),
-    token: str(parsed.token),
-    pairingId: str(parsed.pairingId),
-    pairingSecret: str(parsed.pairingSecret),
-  };
-}
-
-async function cmdEnroll(args) {
-  const noPair = args.includes("--no-pair");
-  const pairOnly = args.includes("--pair-only");
-  if (noPair && pairOnly) fail("--no-pair and --pair-only are mutually exclusive");
-
-  const { cloudUrl, token, pairingId, pairingSecret } = enrollInputs();
-
-  if (!cloudUrl || (!pairOnly && !token)) {
-    fail("enroll requires RELAYD_ENROLL_URL and RELAYD_ENROLL_TOKEN");
-  }
-  if (Boolean(pairingId) !== Boolean(pairingSecret)) {
-    fail("RELAYD_ENROLL_PAIRING_ID and RELAYD_ENROLL_PAIRING_SECRET must be set together");
-  }
-  if (pairOnly && !pairingId) {
-    fail("--pair-only requires RELAYD_ENROLL_PAIRING_ID and RELAYD_ENROLL_PAIRING_SECRET");
-  }
-
-  try {
-    if (!pairOnly) {
-      const { enrollWithCloud } = await import("../src/enroll.mjs");
-      const { nodeId, sni } = await enrollWithCloud({ cloudUrl, token, version: "0.1.0" });
-      console.log(`enrolled ${nodeId} sni=${sni}`);
-    }
-    if (!noPair && pairingId) {
-      const { runTrialPairing } = await import("../src/trialpair.mjs");
-      const { deviceId } = await runTrialPairing({ cloudUrl, pairingId, secret: pairingSecret });
-      console.log(`trial device paired: ${deviceId}`);
-    }
-  } catch (error) {
-    fail(error.message);
-  }
 }
 
 async function cmdDoctor() {
@@ -218,7 +153,9 @@ async function cmdDoctor() {
     // Listen mode. Tunneled mode needs a broker endpoint and an initialized
     // identity; direct mode needs neither.
     ok("listen mode", config.listenMode);
-    if (config.listensDirect) ok("direct listener", `http://${config.host}:${config.port}`);
+    if (config.listensDirect) {
+      ok("direct listener", `${config.servesTls ? "https" : "http"}://${config.host}:${config.port}`);
+    }
     if (config.listensTunneled) {
       if (config.tunnelHost) {
         const identityModule = await import("../src/identity.mjs");
@@ -246,6 +183,79 @@ async function cmdDoctor() {
       bad("pairing listener", "RELAYD_PAIRING_ENABLED=false — `relayd pair` codes cannot be redeemed");
       failures += 1;
     }
+
+    // Direct TLS. A BYO node is expected to serve its own certificate; the
+    // phone validates it against the CA pin carried in the QR, so the two must
+    // agree — a certificate that does not cover the advertised host makes every
+    // pairing fail with an error the user cannot act on.
+    if (config.listensDirect) {
+      const advertised = config.apiBaseUrl();
+      if (!config.servesTls) {
+        warn(
+          "direct TLS",
+          "RELAYD_DIRECT_TLS=false — the data listener is plain HTTP and only works behind a TLS-terminating proxy",
+        );
+      } else if (config.externalTlsConfigured) {
+        ok("direct TLS", `operator certificate from ${config.tlsCertFile}`);
+      } else {
+        try {
+          const identityModule = await import("../src/identity.mjs");
+          const issued = identityModule.nodeServerTlsOptions();
+          const wanted = identityModule.sanEntry(new URL(advertised).hostname);
+          if (issued.sans && wanted && !issued.sans.includes(wanted)) {
+            bad(
+              "direct TLS",
+              `server certificate covers ${issued.sans.join(", ")} but the QR advertises ${wanted} — set RELAYD_PUBLIC_HOST`,
+            );
+            failures += 1;
+          } else {
+            ok("direct TLS", `node-signed, SAN ${(issued.sans || []).join(", ")}`);
+          }
+          const pin = identityModule.caSpkiFingerprint();
+          if (pin) ok("CA pin", `${pin} (compare with the app during pairing)`);
+          else {
+            bad("CA pin", "node CA is missing — run `relayd pair` once");
+            failures += 1;
+          }
+        } catch (error) {
+          bad("direct TLS", error.message);
+          failures += 1;
+        }
+      }
+      ok("advertised URL", advertised);
+
+      // Reachability. This can only ever be answered for the hop this machine
+      // can make itself; a firewall between the phone and this VM is invisible
+      // from here, so say that rather than implying a clean bill of health.
+      const target = new URL(advertised);
+      const probeHost = target.hostname.replace(/^\[|\]$/g, "");
+      const probePort = Number(target.port) || (target.protocol === "https:" ? 443 : 80);
+      const reachable = await new Promise((resolve) => {
+        const socket = net.connect({ host: probeHost, port: probePort, timeout: 1500 });
+        const done = (value) => {
+          socket.destroy();
+          resolve(value);
+        };
+        socket.once("connect", () => done(true));
+        socket.once("timeout", () => done(false));
+        socket.once("error", () => done(false));
+      });
+      if (reachable) {
+        warn(
+          "advertised port reachable",
+          `${probeHost}:${probePort} accepted a connection from this machine — this cannot tell you whether a firewall blocks the phone`,
+        );
+      } else {
+        warn(
+          "advertised port reachable",
+          `nothing is listening on ${probeHost}:${probePort} from this machine (relayd may simply not be running yet)`,
+        );
+      }
+    }
+
+    // Browser grants. Optional; the web activity page is the only consumer.
+    if (config.grantPublicKey) ok("browser grants", "RELAYD_GRANT_PUBLIC_KEY is set");
+    else warn("browser grants", "RELAYD_GRANT_PUBLIC_KEY unset — the web activity page is unavailable (pairing is unaffected)");
 
     // Client-cert allowlist. Empty + auto-allow off + mTLS on = every device
     // 403s forever, which is the other half of the onboarding dead end.
@@ -308,6 +318,11 @@ async function cmdDoctor() {
       } else {
         warn("identity", "not initialized yet (run `relayd pair` once to create it)");
       }
+      // The X25519 key `relay handoff` seals to. Pairing is now the only way a
+      // phone learns it, and a node without one silently cannot be handed off
+      // to — so it is called out rather than left to be discovered.
+      if (status.hasEncKey) ok("handoff key", "X25519 keypair present");
+      else warn("handoff key", "no X25519 keypair — this node cannot receive `relay handoff` sessions");
     } catch (error) {
       bad("identity", error.message);
       failures += 1;
@@ -397,13 +412,7 @@ const usage = `usage: relayd <command>
   run [--mode direct|tunneled|both]
                                start the node daemon (default: direct, or
                                RELAYD_LISTEN_MODE)
-  pair                         print a pairing code + link (single use, 15 min)
-  enroll [--no-pair|--pair-only]
-                               enroll with the control plane (env: RELAYD_ENROLL_URL,
-                               RELAYD_ENROLL_TOKEN[, RELAYD_ENROLL_PAIRING_ID,
-                               RELAYD_ENROLL_PAIRING_SECRET]). --no-pair enrolls
-                               without pairing a device; --pair-only pairs against
-                               an already-enrolled node (retryable)
+  pair [--no-qr]               print a pairing QR + code (single use, 15 min)
   doctor                       run config/jail/identity/provider checks
   status                       query the running daemon
   devices list                 list enrolled devices
@@ -415,10 +424,7 @@ switch (command) {
     await cmdRun(rest);
     break;
   case "pair":
-    await cmdPair();
-    break;
-  case "enroll":
-    await cmdEnroll(rest);
+    await cmdPair(rest);
     break;
   case "doctor":
     await cmdDoctor();

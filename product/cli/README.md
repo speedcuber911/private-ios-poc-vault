@@ -1,8 +1,13 @@
 # Relay CLI
 
-The Relay CLI hands a local Claude Code or Codex session to the Relay sandbox
-connected to the iOS app. It requires macOS or Linux, Node.js 20 or newer, Git,
-and a GitHub remote for repository handoffs.
+The Relay CLI hands a local Claude Code or Codex session to the machine you
+run Relay on, and copies your provider credentials onto it. Relay does not
+supply that machine: you install `relayd` on your own VM or box and pair it
+with the phone by scanning the QR code `relayd pair` prints. Moving credentials
+to that machine is the reason this CLI exists.
+
+It requires macOS or Linux, Node.js 20 or newer, Git, and a GitHub remote for
+repository handoffs.
 
 ## Install
 
@@ -51,7 +56,8 @@ refreshes Relay-managed handoff skills with the newly installed CLI. Use
 `relay update --cli-only` to skip the skill refresh. Installations not managed
 by the curl installer should update through their original package mechanism.
 
-`relay login` signs in and pins the sandbox this machine hands off to. Approve
+`relay login` signs in and pins the machine this laptop hands off to, chosen
+from the nodes registered to the account. Approve
 the device code by scanning the QR in the iOS app. The production control plane
 is compiled in, so no environment variable is needed; `RELAY_CLOUD_URL`
 overrides it for development.
@@ -69,8 +75,8 @@ name matches the terminal you are sitting at.
 was never registered is rejected by `relay handoff` up front, before anything
 is pushed.
 
-`relay sync-auth` copies this machine's GitHub and harness logins to the
-sandbox, sealed to the node's key. Credentials ride the pairing rendezvous as
+`relay sync-auth` copies this laptop's GitHub and harness logins to your
+machine, sealed to the node's key. Credentials ride the pairing rendezvous as
 opaque bytes; the control plane relays them without being able to read them,
 and they never touch GitHub. What it looks for:
 
@@ -79,27 +85,27 @@ and they never touch GitHub. What it looks for:
 | GitHub | `gh auth token` |
 | Claude Code | `~/.claude/.credentials.json`, or — on macOS — the login Keychain item `Claude Code-credentials` |
 | Codex | `~/.codex/auth.json` |
-| Cursor | no portable login exists; sign in on the sandbox itself |
+| Cursor | no portable login exists; sign in on the machine itself |
 | Kimi Code | `$KIMI_CODE_HOME` or `~/.kimi-code` OAuth credentials plus the generated provider/model config |
 
 The Keychain lookup matters on macOS: Claude Code stores its login there and
 **not** in `~/.claude/.credentials.json`, which is the Linux location. Reading
 only the file meant a signed-in Mac reported "No Claude Code login found" and
-the sandbox came up with no Anthropic credential. Anything not found is named
+the machine came up with no Anthropic credential. Anything not found is named
 in the output rather than silently omitted — this command never reports a
 credential it did not actually send.
 
 `relay handoff` seals the current session, pushes it to a `relay/handoff-*`
-branch, tells the cloud, then **waits for the sandbox to finish importing it**
+branch, tells the cloud, then **waits for the machine to finish importing it**
 before exiting. It reports the terminal state rather than assuming success:
 
 | result | exit code | meaning |
 | --- | --- | --- |
-| `ready` | 0 | the sandbox cloned, decrypted and imported the session |
-| `failed` | 1 | the sandbox could not open it; the reason is printed |
+| `ready` | 0 | the machine cloned, decrypted and imported the session |
+| `failed` | 1 | the machine could not open it; the reason is printed |
 | still pending after 120s | 0 | recorded but not yet collected — check `relay status` |
 
-`delivered` is deliberately not treated as success: the sandbox acks the row
+`delivered` is deliberately not treated as success: the machine acks the row
 before the import runs, so it means only "it was collected". Use `--no-push` to
 prepare the branch locally without contacting the cloud, and `--session <id>`
 to hand off a session other than the most recent.
