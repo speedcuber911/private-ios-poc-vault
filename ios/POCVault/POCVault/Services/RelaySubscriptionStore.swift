@@ -2,6 +2,14 @@ import CryptoKit
 import Foundation
 import StoreKit
 
+/// StoreKit plumbing for the App Store subscription items.
+///
+/// Deliberately unreferenced by the UI. Relay no longer allocates machines, so
+/// there is nothing to sell yet — but the App Store Connect products, the
+/// receipt-verification route and this client stay valid and compiled, so the
+/// items do not have to be recreated. What was removed is the coupling to a
+/// sandbox lifetime: verifying a receipt no longer moves the app's machine
+/// pointer, because a machine is now the user's own hardware.
 @MainActor
 final class RelaySubscriptionStore: ObservableObject {
     static let hostedMonthlyProductID = "com.parikshit.pocvault.hosted.monthly"
@@ -15,17 +23,14 @@ final class RelaySubscriptionStore: ObservableObject {
     @Published var errorMessage: String?
 
     private let accountStore: RelayAccountStore
-    private let nodeStore: RelayNodeStore
     private let client: RelaySubscriptionClient
     private var updatesTask: Task<Void, Never>?
 
     init(
         accountStore: RelayAccountStore,
-        nodeStore: RelayNodeStore,
         client: RelaySubscriptionClient
     ) {
         self.accountStore = accountStore
-        self.nodeStore = nodeStore
         self.client = client
         updatesTask = Task { [weak self] in
             for await verification in Transaction.updates {
@@ -173,9 +178,6 @@ final class RelaySubscriptionStore: ObservableObject {
             signedTransaction: verification.jwsRepresentation,
             bearer: bearer
         )
-        if let trial = response.trial {
-            nodeStore.updateTrial(trial)
-        }
         isActive = response.subscription.status == "active"
         await transaction.finish()
     }
@@ -200,7 +202,6 @@ struct RelaySubscriptionResponse: Decodable {
         let expiresAt: Int64
     }
     let subscription: Subscription
-    let trial: RelayTrialNode?
 }
 
 enum RelaySubscriptionError: LocalizedError {

@@ -227,6 +227,35 @@ final class RelayAuthClient {
         guard response.ok else { throw RelayAuthClientError.invalidResponse }
     }
 
+    /// Publishes a paired BYO machine to the account.
+    ///
+    /// `encPubkey` is the point of the call: `relay handoff` seals to that
+    /// X25519 key, and since trial enrolment was removed nothing else writes
+    /// `nodes.enc_pubkey`. Re-registering the same id is expected (a second
+    /// phone, a re-pair) and the control plane treats it as an upsert.
+    func registerNode(
+        id: String,
+        name: String,
+        pubkeyPEM: String,
+        encPubkey: String,
+        bearerToken: String
+    ) async throws {
+        struct Payload: Decodable { let id: String? }
+        _ = try await request(
+            method: "POST",
+            path: "/v1/nodes",
+            body: [
+                "id": id,
+                "kind": "byo",
+                "name": name,
+                "pubkey": pubkeyPEM,
+                "encPubkey": encPubkey
+            ],
+            bearerToken: bearerToken,
+            allowsEmptyResponse: true
+        ) as Payload?
+    }
+
     private func sessionToken(_ bodyToken: String?) throws -> String {
         guard let token = lastResponseToken ?? bodyToken, !token.isEmpty else {
             throw RelayAuthClientError.missingSessionToken

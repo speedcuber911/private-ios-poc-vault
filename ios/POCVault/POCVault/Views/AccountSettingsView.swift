@@ -5,17 +5,19 @@ struct AccountSettingsView: View {
     @ObservedObject var nodeStore: RelayNodeStore
     @ObservedObject var identityStore: ClientIdentityStore
     @ObservedObject var computerLinkStore: RelayComputerLinkStore
-    let trialClient: RelayTrialClient
     let codexClient: CodexClient
-    @ObservedObject var subscriptionStore: RelaySubscriptionStore
+    let authClient: RelayAuthClient
     var showsDismissButton = true
     @Environment(\.dismiss) private var dismiss
 
     @State private var showingDeleteConfirmation = false
     @State private var deletionPassword = ""
-    @State private var isDeletingTrial = false
-    @State private var trialDeleteError: String?
     @State private var showingCLILink = false
+    @State private var showingSignIn = false
+    @State private var showingPairing = false
+    @State private var showingUnpairConfirmation = false
+    @State private var isRegisteringMachine = false
+    @State private var machineNotice: String?
     @State private var browsers: [RelayBrowserSession] = []
     @State private var isRemovingBrowser = false
     @State private var signedInPlacesError: String?
@@ -29,6 +31,19 @@ struct AccountSettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                machineSection
+
+                if accountStore.user == nil {
+                    Section {
+                        Button("Sign in to Relay") { showingSignIn = true }
+                            .accessibilityIdentifier("relay-settings-sign-in")
+                    } header: {
+                        Text("Account")
+                    } footer: {
+                        Text("Optional. An account adds handoff from a laptop, push notifications, and approving `relay login` on a computer. Files, agents and terminals work without one.")
+                    }
+                }
+
                 if let user = accountStore.user {
                     Section("Account") {
                         LabeledContent("Name", value: user.preferredName)
@@ -141,75 +156,6 @@ struct AccountSettingsView: View {
                             Label(error, systemImage: "exclamationmark.triangle.fill")
                                 .foregroundStyle(AppTheme.statusError)
                         }
-                    }
-                }
-
-                if let trial = nodeStore.trial {
-                    Section {
-                        if subscriptionStore.isActive {
-                            LabeledContent("Status", value: "Active")
-                            Link(
-                                "Manage Subscription",
-                                destination: URL(string: "https://apps.apple.com/account/subscriptions")!
-                            )
-                        } else {
-                            if trial.state == .upgraded {
-                                LabeledContent("Hosted access", value: "Included")
-                            }
-
-                            Button("Monthly · \(subscriptionStore.monthlyDisplayPrice)") {
-                                Task { await subscriptionStore.purchase() }
-                            }
-                            .disabled(subscriptionStore.isPurchasing)
-                            .accessibilityIdentifier("relay-settings-subscribe-monthly")
-
-                            Button("Yearly · \(subscriptionStore.yearlyDisplayPrice) · save ~17%") {
-                                Task {
-                                    await subscriptionStore.purchase(
-                                        productID: RelaySubscriptionStore.hostedYearlyProductID
-                                    )
-                                }
-                            }
-                            .disabled(subscriptionStore.isPurchasing)
-                            .accessibilityIdentifier("relay-settings-subscribe-yearly")
-                        }
-
-                        Button("Restore Purchases") {
-                            Task { await subscriptionStore.restorePurchases() }
-                        }
-                        .disabled(subscriptionStore.isPurchasing)
-                        .accessibilityIdentifier("relay-settings-restore")
-
-                        if let message = subscriptionStore.errorMessage, !message.isEmpty {
-                            Label(message, systemImage: "exclamationmark.triangle.fill")
-                                .foregroundStyle(AppTheme.statusError)
-                        }
-                    } header: {
-                        Text("Relay Hosted")
-                    } footer: {
-                        Text("Monthly and yearly plans unlock the same hosted machine. Payment is charged to your Apple ID and renews automatically unless canceled at least 24 hours before the current period ends. Manage or cancel in App Store account settings.")
-                    }
-                }
-
-                if let trial = nodeStore.trial, trial.showsTrialMachineSection {
-                    Section {
-                        LabeledContent("Status", value: Self.stateLabel(for: trial.state))
-                        LabeledContent("Expires", value: Self.expiryFormatter.string(from: trial.expiresDate))
-
-                        Button("Delete trial machine", role: .destructive) {
-                            Task { await deleteTrialMachine() }
-                        }
-                        .disabled(isDeletingTrial)
-                        .accessibilityIdentifier("relay-delete-trial-machine")
-
-                        if let trialDeleteError {
-                            Label(trialDeleteError, systemImage: "exclamationmark.triangle.fill")
-                                .foregroundStyle(AppTheme.statusError)
-                        }
-                    } header: {
-                        Text("Trial machine")
-                    } footer: {
-                        Text("Deleting removes the trial machine and its data immediately. You can start a new trial afterwards, or connect your own machine to keep working.")
                     }
                 }
 
@@ -344,6 +290,40 @@ struct AccountSettingsView: View {
             }) { provider in
                 ProviderLoginView(client: codexClient, provider: provider)
             }
+            .sheet(isPresented: $showingSignIn) {
+                NavigationStack {
+                    AuthenticationView(accountStore: accountStore)
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("Cancel") { showingSignIn = false }
+                            }
+                        }
+                }
+                .preferredColorScheme(.dark)
+            }
+            .onChange(of: accountStore.user?.id) { _, id in
+                if id != nil { showingSignIn = false }
+                Task { await loadLinkedComputer() }
+            }
+            .sheet(isPresented: $showingPairing) {
+                NodePairingView(
+                    identityStore: identityStore,
+                    nodeStore: nodeStore,
+                    accountStore: accountStore,
+                    authClient: authClient,
+                    onDismiss: { showingPairing = false }
+                )
+            }
+            .confirmationDialog(
+                "Unpair \(nodeStore.pairedNode?.nodeName ?? "this machine")?",
+                isPresented: $showingUnpairConfirmation,
+                titleVisibility: .visible
+            ) {
+                Button("Unpair", role: .destructive) { unpairMachine() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This phone forgets the machine and deletes the credential it was issued. To retire that credential on the machine too, run `relayd devices revoke` there. Nothing else on the machine is deleted; run `relayd pair` again to reconnect.")
+            }
             .sheet(isPresented: $showingCLILink, onDismiss: {
                 Task { await loadLinkedComputer() }
             }) {
@@ -392,20 +372,88 @@ struct AccountSettingsView: View {
         return "\(version) (\(build))"
     }
 
-    private func deleteTrialMachine() async {
-        guard let bearer = accountStore.currentSessionToken else { return }
-        isDeletingTrial = true
-        trialDeleteError = nil
-        defer { isDeletingTrial = false }
-        do {
-            try await trialClient.deleteTrial(bearer: bearer)
-            nodeStore.clear()
-            // The machine is gone, so its client certificate and pinned CA are
-            // dead weight on this phone — and must not outlive it.
-            identityStore.discardTrialMaterial()
-        } catch {
-            trialDeleteError = "Relay couldn't delete the trial machine. Try again."
+    /// Paired, and — separately — whether that machine is published to an
+    /// account. Unregistered is a normal state, not a fault, so it is stated
+    /// plainly and costs nothing else in the app.
+    @ViewBuilder
+    private var machineSection: some View {
+        Section {
+            if let node = nodeStore.pairedNode {
+                LabeledContent("Machine", value: node.nodeName)
+                LabeledContent("Address", value: node.apiBaseURL.absoluteString)
+                LabeledContent(
+                    "Account",
+                    value: node.registeredAccountID == nil ? "Not connected" : "Connected"
+                )
+
+                if node.registeredAccountID == nil {
+                    Button(accountStore.user == nil
+                           ? "Sign in to connect this machine"
+                           : "Connect this machine to your account") {
+                        if accountStore.user == nil {
+                            showingSignIn = true
+                        } else {
+                            Task { await registerMachine() }
+                        }
+                    }
+                    .disabled(isRegisteringMachine)
+                    .accessibilityIdentifier("relay-settings-register-machine")
+                }
+
+                if let machineNotice {
+                    Label(machineNotice, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(AppTheme.statusError)
+                }
+
+                Button("Unpair machine", role: .destructive) {
+                    showingUnpairConfirmation = true
+                }
+                .accessibilityIdentifier("relay-settings-unpair")
+            } else if AppConfiguration.hasConfiguredPersonalInstall {
+                LabeledContent("Machine", value: AppConfiguration.codexBaseURL.absoluteString)
+                LabeledContent("Configured by", value: "support/vault-config.json")
+                Button("Pair a machine") { showingPairing = true }
+                    .accessibilityIdentifier("relay-settings-pair")
+            } else {
+                Button("Pair a machine") { showingPairing = true }
+                    .accessibilityIdentifier("relay-settings-pair")
+            }
+        } header: {
+            Text("Machine")
+        } footer: {
+            Text(machineFooter)
         }
+    }
+
+    private var machineFooter: String {
+        guard let node = nodeStore.pairedNode else {
+            return "Run `relayd pair` on a computer or server you own and scan the code it prints."
+        }
+        if node.registeredAccountID == nil {
+            return "This machine is paired directly to this phone and fully usable. It is not connected to a Relay account, so there is no handoff from a laptop and no push notifications — add those whenever you want them."
+        }
+        return "Connected to your Relay account, so `relay handoff` from a laptop and push notifications reach this phone."
+    }
+
+    private func registerMachine() async {
+        guard let node = nodeStore.pairedNode else { return }
+        isRegisteringMachine = true
+        machineNotice = nil
+        defer { isRegisteringMachine = false }
+        machineNotice = await RelayNodeRegistration.register(
+            node: node,
+            accountStore: accountStore,
+            nodeStore: nodeStore,
+            client: authClient
+        )
+    }
+
+    private func unpairMachine() {
+        nodeStore.clear()
+        // The machine is no longer this phone's, so its client certificate,
+        // pinned CA and bearer token are dead weight — and must not outlive it.
+        identityStore.discardPairedMaterial()
+        machineNotice = nil
     }
 
     private func loadHarnesses() async {
@@ -502,24 +550,6 @@ struct AccountSettingsView: View {
         default: return platform
         }
     }
-
-    private static func stateLabel(for state: RelayTrialNode.State) -> String {
-        switch state {
-        case .creating: return "Creating"
-        case .ready: return "Active"
-        case .expired: return "Expired"
-        case .destroyed: return "Destroyed"
-        case .failed: return "Failed"
-        case .upgraded: return "Upgraded"
-        }
-    }
-
-    private static let expiryFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.dateStyle = .medium
-        formatter.timeStyle = .short
-        return formatter
-    }()
 
     private static let computerDateFormatter: DateFormatter = {
         let formatter = DateFormatter()

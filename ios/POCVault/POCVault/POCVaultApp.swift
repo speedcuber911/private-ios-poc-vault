@@ -12,10 +12,9 @@ struct POCVaultApp: App {
     @StateObject private var nodeStore: RelayNodeStore
     @StateObject private var computerLinkStore: RelayComputerLinkStore
     @StateObject private var pushService: RelayPushService
-    @StateObject private var subscriptionStore: RelaySubscriptionStore
     private let manifestClient: ManifestClient
     private let codexClient: CodexClient
-    private let trialClient: RelayTrialClient
+    private let authClient: RelayAuthClient
 
     init() {
         let identityStore = ClientIdentityStore()
@@ -27,7 +26,7 @@ struct POCVaultApp: App {
             trustedPublicKeyRawRepresentation: AppConfiguration.trustedManifestPublicKey
         )
         // One client for the whole app, built at the node the store already
-        // restored (a trial adopted on a previous launch, else the personal
+        // restored (a machine paired on a previous launch, else the personal
         // install). Chat, status and the browser all share it, so `retarget`
         // moves every surface at once instead of only the browser's copy.
         let nodeStore = RelayNodeStore()
@@ -35,13 +34,11 @@ struct POCVaultApp: App {
             baseURL: nodeStore.effectiveBaseURL,
             identityStore: identityStore
         )
-        let trialClient = RelayTrialClient(baseURL: AppConfiguration.authBaseURL)
+        let authClient = RelayAuthClient(baseURL: AppConfiguration.authBaseURL)
         let accountStore = RelayAccountStore(
-            client: RelayAuthClient(baseURL: AppConfiguration.authBaseURL),
+            client: authClient,
             identityStore: identityStore,
-            nodeStore: nodeStore,
-            trialClient: trialClient,
-            recoveryDeviceName: UIDevice.current.name
+            nodeStore: nodeStore
         )
 
         _identityStore = StateObject(wrappedValue: identityStore)
@@ -57,14 +54,9 @@ struct POCVaultApp: App {
             client: RelayAuthClient(baseURL: AppConfiguration.authBaseURL)
         ))
         _pushService = StateObject(wrappedValue: RelayPushService(accountStore: accountStore, codexClient: codexClient))
-        _subscriptionStore = StateObject(wrappedValue: RelaySubscriptionStore(
-            accountStore: accountStore,
-            nodeStore: nodeStore,
-            client: RelaySubscriptionClient(baseURL: AppConfiguration.authBaseURL)
-        ))
         self.manifestClient = manifestClient
         self.codexClient = codexClient
-        self.trialClient = trialClient
+        self.authClient = authClient
     }
 
     var body: some Scene {
@@ -84,47 +76,31 @@ struct POCVaultApp: App {
             }
             .task(id: accountStore.user?.id) {
                 libraryViewModel.reset()
-                guard accountStore.user != nil else { return }
-                await subscriptionStore.prepare()
             }
         }
     }
 
+    /// What the app shows is decided by whether there is a MACHINE, not by
+    /// whether there is an account.
+    ///
+    /// Relay hands out no machines, so an account buys handoff, push and
+    /// `relay login` approval and nothing else — and gating the product behind
+    /// a sign-up for a machine the user brought themselves is asking them to
+    /// register with a middleman they do not need. Signed out with a paired
+    /// machine is a first-class state; the account screen now lives inside
+    /// Settings.
     @ViewBuilder
     private var phaseContent: some View {
-        switch accountStore.phase {
-        case .restoring:
+        if accountStore.phase == .restoring {
             RelayRestoringView()
-        case .signedOut:
-            AuthenticationView(accountStore: accountStore)
-        case .recoveringMachine:
-            RelayHostedRecoveryView(accountStore: accountStore)
-        case .onboarding:
+        } else if !nodeStore.hasMachine {
             RelayOnboardingView(
                 accountStore: accountStore,
                 nodeStore: nodeStore,
                 identityStore: identityStore,
-                trialClient: trialClient
+                authClient: authClient
             )
-        case .ready where nodeStore.trial?.state == .expired:
-            RelayExpiredTrialView(
-                accountStore: accountStore,
-                subscriptionStore: subscriptionStore
-            )
-        case .ready where !nodeStore.hasMachine:
-            // Signed in, but nothing to talk to: the trial was lost or
-            // never adopted and no personal install was configured.
-            // Falling through to the browser here is what made a
-            // machine-less account look broken rather than empty — it
-            // fired requests at the baked-in default host and reported
-            // that host's TLS failure. Offer the machine instead.
-            RelayOnboardingView(
-                accountStore: accountStore,
-                nodeStore: nodeStore,
-                identityStore: identityStore,
-                trialClient: trialClient
-            )
-        case .ready:
+        } else {
             POCVaultRootView(
                 libraryViewModel: libraryViewModel,
                 statusFeedViewModel: statusFeedViewModel,
@@ -135,14 +111,34 @@ struct POCVaultApp: App {
                 computerLinkStore: computerLinkStore,
                 manifestClient: manifestClient,
                 codexClient: codexClient,
-                trialClient: trialClient,
-                subscriptionStore: subscriptionStore,
+                authClient: authClient,
                 pushService: pushService
             )
-            // Adopting (or losing) a machine restarts the browser stack so
+            // Pairing (or unpairing) a machine restarts the browser stack so
             // listings refetch; the shared client and the chat/status
             // stores survive it.
             .id("\(nodeStore.effectiveBaseURL.absoluteString)|\(accountStore.user?.id ?? "signed-out")")
+            // Comparing the confirmation code is presented HERE, not from the
+            // pairing screen, because that screen does not outlive its own
+            // success: adopting the node flips `hasMachine` and this router
+            // replaces the onboarding stack the sheet was attached to. Driving
+            // it from the store also means backgrounding the app mid-comparison
+            // resumes the check instead of silently skipping it.
+            .sheet(isPresented: Binding(
+                get: { nodeStore.pendingVerificationCode != nil },
+                set: { if !$0 { nodeStore.confirmVerification() } }
+            )) {
+                if let code = nodeStore.pendingVerificationCode {
+                    NodeVerificationView(
+                        nodeStore: nodeStore,
+                        code: code,
+                        onUnpair: {
+                            nodeStore.clear()
+                            identityStore.discardPairedMaterial()
+                        }
+                    )
+                }
+            }
         }
     }
 
@@ -154,10 +150,6 @@ struct POCVaultApp: App {
            let email = env["RELAY_UITEST_CREATE_EMAIL"]?.trimmedNonEmpty,
            let password = env["RELAY_UITEST_CREATE_PASSWORD"]?.trimmedNonEmpty {
             await accountStore.signUp(username: username, email: email, password: password)
-        }
-        if accountStore.phase == .onboarding,
-           env["RELAY_UITEST_SKIP_ONBOARDING"] == "1" {
-            accountStore.completeOnboarding()
         }
     }
     #endif
@@ -177,46 +169,6 @@ private struct RelayRestoringView: View {
             }
         }
         .preferredColorScheme(.dark)
-    }
-}
-
-private struct RelayHostedRecoveryView: View {
-    @ObservedObject var accountStore: RelayAccountStore
-
-    var body: some View {
-        ZStack {
-            AppTheme.canvasGradient.ignoresSafeArea()
-            VStack(spacing: 20) {
-                Image(systemName: "desktopcomputer")
-                    .font(.system(size: 36, weight: .medium))
-                    .foregroundStyle(AppTheme.accent)
-                Text(accountStore.machineRecoveryError == nil ? "Restoring your machine" : "Reconnect your hosted machine")
-                    .font(AppTheme.serifFont(size: 28))
-                    .foregroundStyle(AppTheme.textPrimary)
-                    .multilineTextAlignment(.center)
-                Text(accountStore.machineRecoveryError ?? "Checking your account and securely connecting this device to your existing hosted machine. No replacement machine is created.")
-                    .font(AppTheme.uiFont(size: 14))
-                    .foregroundStyle(AppTheme.textSecondary)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-                if accountStore.machineRecoveryError != nil {
-                    Button("Retry connection") {
-                        Task { await accountStore.retryHostedMachineRecovery() }
-                    }
-                    .buttonStyle(RelayPrimaryButtonStyle())
-                    .accessibilityIdentifier("relay-hosted-recovery-retry")
-                } else {
-                    ProgressView().tint(AppTheme.accent)
-                }
-                Button("Sign out") { Task { await accountStore.signOut() } }
-                    .font(AppTheme.uiFont(size: 14))
-                    .foregroundStyle(AppTheme.textSecondary)
-            }
-            .frame(maxWidth: 460)
-            .padding(28)
-        }
-        .preferredColorScheme(.dark)
-        .accessibilityIdentifier("relay-hosted-recovery")
     }
 }
 
@@ -249,8 +201,7 @@ struct POCVaultRootView: View {
     @ObservedObject var computerLinkStore: RelayComputerLinkStore
     let manifestClient: ManifestClient
     let codexClient: CodexClient
-    let trialClient: RelayTrialClient
-    @ObservedObject var subscriptionStore: RelaySubscriptionStore
+    let authClient: RelayAuthClient
     @ObservedObject var pushService: RelayPushService
 
     @Environment(\.scenePhase) private var scenePhase
@@ -309,14 +260,16 @@ struct POCVaultRootView: View {
             libraryViewModel.reset()
             previewIdentityRevision &+= 1
         }
-        // Push registration waits for a signed-in account: this view only exists
-        // in the `.ready` phase, and the cloud device route is session-authed.
-        .task {
+        // Push registration needs a session: the cloud device route is
+        // session-authed. This view now exists while signed out too, so it is
+        // keyed on the account and simply does nothing until there is one.
+        .task(id: accountStore.user?.id) {
 #if targetEnvironment(simulator)
             // Simulator previews use local fixtures and should not interrupt UI
             // review with a notification permission prompt.
             return
 #else
+            guard accountStore.currentSessionToken != nil else { return }
             RelayAppDelegate.pushService = pushService
             pushService.registerForPushNotifications()
             await pushService.registerPendingDeviceTokenIfNeeded()
@@ -353,8 +306,9 @@ struct POCVaultRootView: View {
             browserPath.removeAll()
             chatLaunch = nil
         }
-        // A trial machine expires on the server's clock, so the countdown and
-        // the expiry banner are only honest if we re-read state on foreground.
+        // Signed-in places are account state, so this refresh is skipped
+        // entirely when there is no session rather than spinning against a
+        // bearer-authenticated route with no bearer.
         .task(id: scenePhase) {
             guard scenePhase == .active,
                   let bearer = accountStore.currentSessionToken,
@@ -364,15 +318,6 @@ struct POCVaultRootView: View {
                 accountID: accountID,
                 showProgress: !computerLinkStore.hasLoaded
             )
-            guard nodeStore.trial != nil else { return }
-            // Only an authoritative "no trial" may forget the machine — see
-            // RelayNodeStore.applyRefresh. A `try?` here once turned every
-            // offline foreground into permanent, unrecoverable loss.
-            do {
-                nodeStore.applyRefresh(.success(try await trialClient.currentTrial(bearer: bearer)))
-            } catch {
-                nodeStore.applyRefresh(.failure(error))
-            }
         }
         .task(id: foldersAreHiddenAfterComputerDisconnect) {
             // App-wide job monitor + completion notifications, owned by the session store.
@@ -434,9 +379,8 @@ struct POCVaultRootView: View {
                 nodeStore: nodeStore,
                 identityStore: identityStore,
                 computerLinkStore: computerLinkStore,
-                trialClient: trialClient,
                 codexClient: codexClient,
-                subscriptionStore: subscriptionStore,
+                authClient: authClient,
                 showsDismissButton: false
             )
             .tag(RelayRootTab.settings)
@@ -516,19 +460,6 @@ struct POCVaultRootView: View {
             onOpenLibrary: isRoot ? { selectedRootTab = .previews } : nil,
             onOpenDiagnostics: isRoot ? { showingDiagnostics = true } : nil
         )
-        // Only at the root: the countdown is about the machine as a whole, so
-        // repeating it on every drilled-in folder would be noise.
-        .safeAreaInset(edge: .top) {
-            if isRoot, let trial = nodeStore.trial, trial.showsStatusBanner {
-                TrialStatusBanner(
-                    trial: trial,
-                    client: codexClient,
-                    subscriptionStore: subscriptionStore
-                )
-                .padding(.horizontal, 16)
-                .padding(.bottom, 8)
-            }
-        }
     }
 
     private func openChat(folderPath: String?, workspaceID: String?) {
@@ -1322,7 +1253,7 @@ enum AppConfiguration {
         infoKey: "POCVaultSignatureURL",
         fallback: "https://vault.pocs.conformal.live/manifest.sig.json"
     )
-    /// A node URL is per-user — the owner's own machine or an adopted trial —
+    /// A node URL is per-user — the owner's own machine, paired to this phone —
     /// so there is no correct global default and this fallback deliberately
     /// resolves to nothing. `.invalid` is reserved by RFC 2606 and is
     /// guaranteed never to resolve, so an unconfigured build fails at DNS,
@@ -1341,10 +1272,9 @@ enum AppConfiguration {
         infoKey: "POCVaultCodexBaseURL",
         fallback: "https://unconfigured.invalid"
     )
-    // The control plane that owns accounts AND trials. It must be the box the
-    // trial routes are deployed to — pointing this at a relay-cloud without
-    // trial config does not degrade to "no trial", it 403s from the mTLS-gated
-    // codex-api that answers /v1/* for unknown paths on that host.
+    // The control plane that owns accounts, node records, handoff and push.
+    // Nothing on the critical path goes through it: a paired machine serves
+    // files, chat and terminals whether or not this host is reachable.
     static let authBaseURL = configuredURL(
         supportValue: supportConfig?.authBaseURL,
         infoKey: "RelayAuthBaseURL",
@@ -1358,12 +1288,11 @@ enum AppConfiguration {
     ///
     /// `codexBaseURL` always resolves to something, because the build setting
     /// is its last resort — so "we have a base URL" has never meant "we have a
-    /// machine". A trial user who signs out reverts to that build default and
-    /// the app then talks to whatever host happens to be baked in, reporting
-    /// its failures as if the user's own machine were broken. It surfaced as
+    /// machine". A phone that unpairs reverts to that build default and the app
+    /// then talks to whatever host happens to be baked in, reporting its
+    /// failures as if the user's own machine were broken. It surfaced as
     /// `The server "codex.pocs.conformal.live" did not accept the certificate`
-    /// on an account whose only machine was a trial, against a host that had
-    /// been decommissioned.
+    /// against a host that had been decommissioned.
     ///
     /// Declared OUTSIDE the build branches, not inside `#else`: it reads only
     /// `supportConfig`, which both branches share, and `RelayNodeStore.hasMachine`
@@ -1388,8 +1317,8 @@ enum AppConfiguration {
     /// these — sees the truth. The previous blanket
     /// `#if targetEnvironment(simulator) → true` made `hasMachine`
     /// unconditionally true wherever the tests run, so
-    /// `testTrialRefreshClearsTheNodeURLOnceTheTrialIsNoLongerUsable` asserted
-    /// something that could not hold and failed the build on Apple's side.
+    /// every machine-routing assertion asserted something that could not hold,
+    /// and the build failed on Apple's side.
     ///
     /// Deliberately NOT derived from the Info.plist base URL. That value comes
     /// from a build setting, and a build setting always has *some* value, so
