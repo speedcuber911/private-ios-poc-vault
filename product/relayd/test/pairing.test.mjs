@@ -1355,7 +1355,21 @@ test("dist/install.sh: valid bash, writes the pairing keys, cleans up, tells the
   // wrong one fails at the last step with a certificate error the operator has
   // no other way to diagnose.
   assert.match(text, /IF PAIRING FAILS WITH A CERTIFICATE OR HOSTNAME ERROR/);
-  assert.match(text, /This machine advertises itself as \$PUBLIC_HOST/);
+  // The summary must report the EFFECTIVE config, not this script's guesses.
+  // When /etc/relayd/relayd.env already exists the installer leaves it alone,
+  // so $PUBLIC_HOST and $PAIRING_PORT are what a fresh install WOULD have
+  // used. Printing those named an address the node never advertises and told
+  // the operator to open ports nothing was listening on — wrong at precisely
+  // the moment someone is debugging why pairing failed.
+  assert.match(text, /advertises itself as \$\{reach_host:-\$PUBLIC_HOST\}/);
+  assert.match(text, /Open port \$\{reach_pair_port:-\$PAIRING_PORT\} \(pairing\) and \$\{reach_port:-8787\} \(data\)/);
+  // Those three values have to actually come out of config.mjs.
+  for (const field of ["publicHost", "port", "pairingPort"]) {
+    assert.ok(
+      new RegExp(`c\\.${field}`).test(text),
+      `pairing_reachability must read ${field} from the effective config`,
+    );
+  }
 });
 
 // The detection is the part that decides whether a real install works, and it

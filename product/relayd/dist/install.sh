@@ -388,14 +388,31 @@ pairing_reachability() {
       "$NODE_DIR/bin/node" --input-type=module -e \
       'const c = await import(process.env.RELAYD_CONFIG_URL);
        console.log(c.pairingEnabled && c.pairingIsLoopbackOnly() ? "loopback" : "reachable");
-       console.log(c.pairingEndpointUrl());'
+       console.log(c.pairingEndpointUrl());
+       console.log(c.publicHost || "");
+       console.log(String(c.port || ""));
+       console.log(String(c.pairingPort || ""));'
   ) 2>/dev/null
 }
 
+# These come from the EFFECTIVE config, never from this script's own guesses.
+# When /etc/relayd/relayd.env already exists the installer leaves it untouched,
+# so $PUBLIC_HOST and $PAIRING_PORT here are what a fresh install WOULD have
+# used — not what the daemon is actually running with. Printing those in the
+# summary tells the operator to open the wrong ports and names an address the
+# node never advertises, which is worse than saying nothing, because it is
+# wrong exactly when someone is trying to work out why pairing failed.
 reach_state=""
 reach_url=""
+reach_host=""
+reach_port=""
+reach_pair_port=""
 if reach_out="$(pairing_reachability)"; then
-  { IFS= read -r reach_state || true; IFS= read -r reach_url || true; } <<REACH
+  { IFS= read -r reach_state || true
+    IFS= read -r reach_url || true
+    IFS= read -r reach_host || true
+    IFS= read -r reach_port || true
+    IFS= read -r reach_pair_port || true; } <<REACH
 $reach_out
 REACH
 fi
@@ -415,14 +432,14 @@ if [ "$pair_ok" -eq 1 ] && [ "$svc_ok" -eq 1 ]; then
     log " INSTALLED AND READY — scan the QR code above with the Relay app."
     log " Pair at: ${reach_url:-see \`relayd pair\` output}"
     log ""
-    log " This machine advertises itself as $PUBLIC_HOST."
+    log " This machine advertises itself as ${reach_host:-$PUBLIC_HOST}."
     log " IF PAIRING FAILS WITH A CERTIFICATE OR HOSTNAME ERROR, that is why:"
     log " on a cloud VM the address the machine sees is the private one, and"
     log " your phone arrives on the public address. Set RELAYD_PUBLIC_HOST in"
     log " $ENV_FILE to the address you actually reach, restart"
     log " relayd, and run \`relayd pair\` again for a fresh QR."
     log ""
-    log " Open port $PAIRING_PORT (pairing) and 8787 (data) to your phone."
+    log " Open port ${reach_pair_port:-$PAIRING_PORT} (pairing) and ${reach_port:-8787} (data) to your phone."
     log " Check what is advertised and whether it matches: relayd doctor"
   fi
   log " status: systemctl status relayd"
