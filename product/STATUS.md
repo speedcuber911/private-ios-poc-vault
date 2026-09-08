@@ -7,7 +7,33 @@
 
 Legend: **done** — implemented and tested; **partial** — exists but a named
 piece of the checklist item is absent; **missing** — no implementation in
-`product/` (docs may exist).
+`product/` (docs may exist); **removed** — was implemented, then deleted on
+purpose.
+
+## 2026-09-08 — the trial and provisioning work packages were deleted
+
+Relay no longer allocates machines. A user installs `relayd` on hardware they
+already own, runs `relayd pair`, and scans the QR code. See
+[`docs/superpowers/specs/2026-09-08-byo-vm-simplification.md`](../docs/superpowers/specs/2026-09-08-byo-vm-simplification.md).
+
+This is a **scope deletion, not a completion**. The trial-sandbox rows below
+were genuinely built and genuinely worked; they were then removed because the
+feature they served was removed. Nothing about them shipped to a wider
+audience, and nothing in this section should be read as progress. What is gone:
+
+- `cloud/src/provisioner.js`, `hosted-pairing.js`, the `trial_nodes` and
+  `sandbox_orphans` tables, `/v1/trial-nodes*`, the admin upgrade and
+  unlink-machine routes, the lifecycle sweeps.
+- `relayd/src/trialpair.mjs`, `hosted-pairing.mjs`, `enroll.mjs`,
+  `computeraccess.mjs`, and the `relayd enroll` subcommand.
+- The iOS trial flow, provisioning sheet and expiry banner; the web
+  `Provisioning` and `Machines` pages and `api/trial.js`.
+- `product/trial/` — the whole directory, deleted. Nothing built the image
+  any more and nothing referenced it.
+
+What replaced it: QR pairing direct to the node, `relayd` terminating its own
+TLS, and a device bearer token derived from the pairing secret. The Apple
+subscription code is retained and unwired.
 
 ---
 
@@ -58,37 +84,40 @@ piece of the checklist item is absent; **missing** — no implementation in
 | Registry: accounts, devices (APNs token, platform, cert serials), nodes (kind, pubkey, last_seen, version), entitlements, waitlist | done | `cloud/src/registry.js`, `cloud/test/registry.test.mjs` | Cross-account isolation tested; node create is entitlement-gated (`nodes.max`) and validates ed25519 pubkeys |
 | Broker from W1 productionized: registry-backed routes, node-connect auth, metrics, connection draining | partial | cloud side: `GET /v1/tunnel/nodes/:nodeId` hook (`cloud/src/server.js`, README §Broker contract); broker side: `broker/internal/registry`, `-registry-url`/`-registry-token-file` in `broker/cmd/broker/main.go` | The registry hook now has a caller — `broker/internal/registry.Resolver` (60 s positive / 10 s negative TTL cache), wired in via `Broker.SetFallbackLookup`, opt-in with `-registry-url -registry-token-file`. Still no metrics, no connection draining, and the static `-node` flag map remains the broker's primary/default registry — dynamic lookup only fires on a miss |
 | Pairing rendezvous: short-lived sessions relaying opaque CSR/cert blobs | done | `cloud/src/pairing.js`, `cloud/test/pairing.test.mjs` | Hashed secrets, both blob directions, 64 KiB bounds, 15-min TTL + sweep; cloud never parses blobs. Client sides (relayd + iOS) not yet consuming it |
-| Linked-computer data-path revocation | done (deployment pending) | `cloud/src/{db,registry,server}.js`, `relayd/src/{computeraccess,cloudclient,server}.mjs`, iOS `CLILinkFlowModel.swift` | Disconnect writes an account revocation tombstone, wakes every account node, and renews a bounded access lease on the signed node poll. Trial relayd rejects its otherwise-valid device token while revoked or after the lease expires; re-approval restores access. The app mirrors `foldersAvailable` but is not the enforcement boundary. |
+| Linked-computer data-path revocation | **removed** 2026-09-08 | was `relayd/src/computeraccess.mjs` + the cloud lease on the signed node poll | The node-side gate is deleted. It existed so the control plane could switch off a machine the operator ran; a machine the user owns does not ask a control plane for permission to serve its owner. The cloud still records the account's linked computer for `relay login`; it no longer gates the data path. |
 | Notify: signed node-event ingest (no content), APNs fanout (silent/mutable/Live Activity), 7-day retention | partial | `cloud/src/{notify,apns}.js`, `cloud/test/notify.test.mjs`, `cloud/test/apns-unconfigured.test.mjs` | ed25519 raw-body verify, tamper/wrong-key rejection, silent-vs-mutable classification per event type, ES256 provider JWT, 7-day sweep — tested against a mock transport. `410`/`Unregistered` token cleanup IS implemented (`notify.js` → `registry.clearApnsToken`); an earlier revision of this row claiming otherwise was stale. Unconfigured (or partially configured) APNs now short-circuits to the `skipped` outcome **before** minting a provider JWT — until 2026-08-13 the JWT was built while assembling request headers, outside the transport's try/catch, so an unset signing key threw `DECODER routines::unsupported` out of a `send()` documented never to throw, and the noop transport was never consulted. Live APNs HTTP/2 now reaches Apple: the `.p8` was minted and configured in production on 2026-08-13 and a real send returned **200 delivered**. Banner text is built by `bannerFor` — see the dedicated row in the CLI + handoff section for what that discloses. Still open: the Live Activity channel is not implemented, and `APNS_HOST` is a single global with no per-token environment column on `devices` (mixed dev/prod tokens on one account will `BadDeviceToken`). Device-token registration IS confirmed working end-to-end against production |
 | Live control-plane deployment + CI/CD | done | `cloud/deploy/{relay-cloud-cicd.yml,buildspec.deploy.yml,cicd-deploy.sh,install.sh,relay-cloud.service}`, `../docs/RELAY_POC_EC2_DEPLOYMENT.md` | Public HTTPS control plane on shared `poc-ec2`; loopback-only 8790, immutable SHA releases, CodeCommit/EventBridge/CodePipeline/CodeBuild/SSM delivery, public health gate, and rollback. The successful 2026-08-11 pipeline deployed the exact tested SHA |
 | Domains + DNS: product domain, `api.`, `get.`, `*.tun.`, `www.` | partial | `relay.ai-rocket-experiments.com`, `cloud/deploy/relay-cloud.nginx.conf.template`, `../docs/RELAY_POC_EC2_DEPLOYMENT.md` | Control-plane Route 53 record, nginx TLS vhost, Let's Encrypt certificate, and public health are live. Product `get`, `www`, and tunnel wildcard/broker ingress are not deployed |
 | Relay CLI distribution | deployment-ready (not deployed) | `cli/dist/{install.sh,release-public-key.pem}`, `cli/scripts/{build-release.sh,sign-release.mjs}`, `cli/deploy/{distribution.yml,bootstrap.sh,publish.sh}`, `../.github/workflows/release-relay-cli.yml` | Account-parameterized Route 53 + CloudFront + private versioned S3; installer pins an Ed25519 release key and verifies detached signatures before extraction; tag publisher cannot overwrite the installer trust root. No AWS distribution is claimed live |
-| Web v0: landing, docs, account page (login, node list, waitlist) | partial | `web/` (login, `/cli-login`, provisioning, machines, activity, waitlist) | Authenticated console exists in `product/web`. Live app origin, `DEVICE_LOGIN_URL`, grant keys, and gateway ingress are still operator work. Do not deploy via CodeCommit `relay-cloud` or `ops/deploy-poc` |
+| Web v0: landing, docs, account page | partial | `web/` (login, `/cli-login`, admin, activity, legal) | Authenticated console exists in `product/web`. The provisioning and machines pages were deleted on 2026-09-08 — the cloud cannot create a machine, and pairing happens on the phone. Live app origin, `DEVICE_LOGIN_URL`, grant keys, and gateway ingress are still operator work. Do not deploy via CodeCommit `relay-cloud` or `ops/deploy-poc` |
 | Ops: database backups, release automation, external uptime checks, Sentry, structured logs | partial | `cloud/deploy/{backup-sqlite.sh,verify-backup.sh,relay-cloud-backup.service,relay-cloud-backup.timer,relay-cloud-cicd.yml}`, `../docs/RELAY_POC_EC2_DEPLOYMENT.md` | Nightly integrity-checked SQLite backup to private versioned/encrypted S3 and AWS-native CI/CD are live. The database remains SQLite by design; external uptime alerting, Sentry, and structured logging are still open |
 
 ---
 
-## Trial sandbox — revamp/07-trial-sandbox-plan.md
+## Trial sandbox — REMOVED 2026-09-08
 
-> Added 2026-08-11. Land-status of the instant-trial-machine feature
-> described in [`revamp/07-trial-sandbox-plan.md`](../revamp/07-trial-sandbox-plan.md),
-> audited the same way as W0–W3 above; extends (does not replace) the W1/W3
-> rows for the broker and control plane.
+> Added 2026-08-11, deleted 2026-09-08. This section is kept as a record of
+> what was built and then taken out, not as a status board. Every row below
+> reads **removed**: the code existed, was tested, and is gone. The plan it
+> tracked (`revamp/07-trial-sandbox-plan.md`) has been deleted too, so its
+> links no longer resolve.
+>
+> Do not treat any row here as a shipped capability.
 
 | Item | Status | Evidence | Note |
 |---|---|---|---|
-| relay-cloud provisioner (E2B/Cube-protocol client): `createSandbox`/`killSandbox`/`pauseSandbox` | done | `cloud/src/provisioner.js`, `cloud/test/provisioner.test.mjs` | Backend-agnostic — only `E2B_API_URL`/`E2B_API_KEY` change to point at hosted e2b later. `createProvisioner` returns `null` when `E2B_API_URL` is unset, which is how the whole trial surface feature-flags off (`POST /v1/trial-nodes` then 404s `trial_unavailable`) |
-| Trial config (`e2b`, `trial`, `tunnel` groups) | done | `cloud/src/config.js` | `E2B_API_URL/KEY`, `TRIAL_TEMPLATE_ID`, `TRIAL_TTL_SEC` (default 7d), `TRIAL_GRACE_SEC` (default 3d), `TRIAL_MAX_ACTIVE` (default 20), `TRIAL_SANDBOX_TIMEOUT_MS` (default 1h), `TUNNEL_HOST/PORT/SUFFIX`, `ENROLL_BASE_URL` |
-| `trial_nodes` table + registry API | done | `cloud/src/db.js`, `cloud/src/registry.js`, `cloud/test/trial-registry.test.mjs` | One row per account (`UNIQUE account_id`); states `creating\|ready\|expired\|destroyed\|failed`; 8 functions (`createTrialNode`, `getTrialById`, `getTrialByAccount`, `getTrialByTokenHash`, `updateTrial`, `listTrialsDue`, `listTrialsPastGrace`, `countActiveTrials`); `createNode` now takes an optional explicit `id` (used so the trial node's id matches what the sandbox minted) |
-| Cloud HTTP routes: `POST /v1/trial-nodes`, `GET/DELETE /v1/trial-nodes/current`, `POST /v1/trial-nodes/enroll` | done | `cloud/src/server.js`, `cloud/test/trial-api.test.mjs`, `cloud/test/trial-enroll.test.mjs` | Create is session-authed, entitlement/cap-gated (409 `trial_already_used`, 503 `trial_capacity`), mints a single-use enroll token and calls the provisioner; enroll is token-authed (401 `invalid_enroll_token`), burns the token, and registers the node under a new `trial` node kind. A trial in state `failed` or `destroyed` is retried in place — same row, reset to `creating` with a fresh token — instead of permanently burning the account; `creating`/`ready`/`expired` still 409s |
-| `GET /v1/export.tar` — whole-jail workspace export | done | `relayd/src/fsapi.mjs:392` (`serveExportTar`), routed in `relayd/src/additions.mjs`, covered in `relayd/test/conformance.test.mjs` | mTLS-authed (same `authorize()` gate as the data path), jail-contained (reuses the `fs/list` walk, denylisted files excluded before `tar` sees them), 512 MiB cap checked before any header is written → 413 `export_too_large`. Entry list is passed to `tar` NUL-separated (`--null`) over stdin, not argv — required, not stylistic: a newline-joined list lets an attacker-controlled filename inject a `-C` directory-change directive and escape the jail. Consumed by iOS `CodexClient.downloadExport()` and the export/share action in `TrialStatusBanner` |
-| Reaper (pause at TTL expiry, destroy after grace) | done | `cloud/src/server.js` (`sweepTrials`), `cloud/test/trial-reaper.test.mjs` | Wired into the existing 60 s `runSweeps()` timer alongside the pairing/notify sweeps; state-driven off `expires_at`, so a crash mid-pass is safe to re-run |
-| Broker dynamic node registry (control-plane-backed fallback lookup) | done | `broker/internal/registry`, `broker/cmd/broker/main.go` (`-registry-url`, `-registry-token-file`), `broker/internal/broker/broker.go` (`SetFallbackLookup`) | HTTP resolver against the cloud's `GET /v1/tunnel/nodes/:id` hook; 60 s positive / 10 s negative TTL cache; consulted only when a node id misses the static `-node` flag registry, which remains primary. Closes the long-standing "the Go broker does NOT call the registry hook" gap **for nodes opted into it** — the broker still needs `-registry-url` passed at deploy time |
-| relayd `enroll` (identity bootstrap + single-use token registration with the control plane) | done | `relayd/src/enroll.mjs`, `relayd/bin/relayd` (`enroll` subcommand), `relayd/test/enroll.test.mjs` | Idempotent — a second call with a fresh token reuses the same node identity/id. Wired into the CLI, env-driven (`RELAYD_ENROLL_URL`, `RELAYD_ENROLL_TOKEN`), no secrets on argv or in output |
-| Trial pairing (server-mediated; node mints the device cert) | done | `relayd/src/trialpair.mjs`, invoked from `relayd enroll` when `RELAYD_ENROLL_PAIRING_ID`/`_SECRET` are set, `relayd/test/trialpair.test.mjs` | Documented protocol delta from the BYO zero-knowledge CSR flow (`relayd/API.md` §2.3) — see `revamp/07-trial-sandbox-plan.md` "Implementation status" for the rationale |
-| Trial sandbox template (Cube/E2B) | done (never booted against a live Cube host in this audit) | `product/trial/{Dockerfile,start.sh,e2b.toml,build.sh,README.md}` | No systemd — `start.sh` runs `relayd enroll` once (marker file gates re-runs), scrubs the enroll/pairing env vars, then execs `relayd run --mode tunneled`. Template build/boot/egress-preset verification against a real Cube host is still open (plan §Testing) |
-| iOS: fork-screen "Try instantly", provisioning progress states, trial badge/countdown, expiry/export | done | `ios/POCVault/POCVault/Models/{RelayTrialNode,RelayNodeStore}.swift`, `Security/RelayTrialPairing.swift`, `Networking/RelayTrialClient.swift`, `Views/{RelayTrialFlowModel,TrialProvisioningView,TrialStatusBanner}.swift`, `Views/AccountSettingsView.swift`, `POCVaultTests/TrialPairingTests.swift` | Full flow wired: `RelayTrialFlowModel` drives create → device-blob → poll-ready → poll-node-blob → tag-verify → PKCS#12 import → `RelayNodeStore.adoptTrial` (repoints the app at the new node without relaunch); `TrialProvisioningView` renders it as a Creating/Booting/Pairing/Ready checklist with retry; `TrialStatusBanner` shows the "Trial · N days left" badge and, once expired, an expiry banner with "Connect your own machine", "Join the paid waitlist", and an export action (`CodexClient.downloadExport()` → `ShareLink`); `AccountSettingsView` adds a "Trial machine" status/delete section. `RelayTrialPairing` derivations (authToken/macKey/blobTag/p12Passphrase) remain bit-for-bit matched to `relayd/src/trialpair.mjs`, cross-checked by fixtures in `TrialPairingTests.swift`. 96/96 iOS tests pass (`xcodebuild test`, verified against iPhone 17 simulator on this audit date — iPhone 16 unavailable on this machine) |
-| iOS: direct provider login from the phone (no laptop): connect Claude Code/Codex/Cursor/Kimi on the machine from the app | done (code); iOS build/tests not yet run on this Linux workspace — verify via `xcodebuild test` or `ops/verify-mobile` before release | `ios/.../Views/{ProviderLoginFlowModel,ProviderLoginView}.swift`, `Networking/CodexClient.swift` (harness login-op endpoints), `Models/CodexModels.swift` (`RelayHarnessOp`), entry points in `Views/AccountSettingsView.swift` ("Coding agents" section) and the composer readiness notice (`Views/RelayChatView.swift`), `POCVaultTests/ProviderLoginTests.swift` | Drives relayd's harness login op end to end: start → open the provider's sign-in URL (SFSafariViewController for paste-back flows; an intercepting WKWebView for Codex, whose OAuth redirect targets the CLI's localhost login server and is replayed on the node via `POST /v1/harness/ops/:id/callback`) → paste-back codes go to CLI stdin via `.../input` → op polled to `succeeded`. Design: `docs/superpowers/specs/2026-08-29-ios-direct-provider-login-design.md`. Includes a legacy-machine fallback that needs only `/v1/exec` + `GET /v1/harness` (login launched under util-linux `script` for a PTY, setsid-detached, log-file polling, FIFO stdin, exec callback replay) — deliberately NOT the terminals API, which rides the Codex app-server and hangs on a machine whose codex has never signed in — so machines running an older relayd still sign in from the phone. Android: recorded as `direct-provider-login` android-gap in `mobile/parity-contract.json` |
+| relay-cloud provisioner (E2B/Cube-protocol client): `createSandbox`/`killSandbox`/`pauseSandbox` | **removed** | `cloud/src/provisioner.js`, `cloud/test/provisioner.test.mjs` | Backend-agnostic — only `E2B_API_URL`/`E2B_API_KEY` change to point at hosted e2b later. `createProvisioner` returns `null` when `E2B_API_URL` is unset, which is how the whole trial surface feature-flags off (`POST /v1/trial-nodes` then 404s `trial_unavailable`) |
+| Trial config (`e2b`, `trial`, `tunnel` groups) | **removed** | `cloud/src/config.js` | `E2B_API_URL/KEY`, `TRIAL_TEMPLATE_ID`, `TRIAL_TTL_SEC` (default 7d), `TRIAL_GRACE_SEC` (default 3d), `TRIAL_MAX_ACTIVE` (default 20), `TRIAL_SANDBOX_TIMEOUT_MS` (default 1h), `TUNNEL_HOST/PORT/SUFFIX`, `ENROLL_BASE_URL` |
+| `trial_nodes` table + registry API | **removed** | `cloud/src/db.js`, `cloud/src/registry.js`, `cloud/test/trial-registry.test.mjs` | One row per account (`UNIQUE account_id`); states `creating\|ready\|expired\|destroyed\|failed`; 8 functions (`createTrialNode`, `getTrialById`, `getTrialByAccount`, `getTrialByTokenHash`, `updateTrial`, `listTrialsDue`, `listTrialsPastGrace`, `countActiveTrials`); `createNode` now takes an optional explicit `id` (used so the trial node's id matches what the sandbox minted) |
+| Cloud HTTP routes: `POST /v1/trial-nodes`, `GET/DELETE /v1/trial-nodes/current`, `POST /v1/trial-nodes/enroll` | **removed** | `cloud/src/server.js`, `cloud/test/trial-api.test.mjs`, `cloud/test/trial-enroll.test.mjs` | Create is session-authed, entitlement/cap-gated (409 `trial_already_used`, 503 `trial_capacity`), mints a single-use enroll token and calls the provisioner; enroll is token-authed (401 `invalid_enroll_token`), burns the token, and registers the node under a new `trial` node kind. A trial in state `failed` or `destroyed` is retried in place — same row, reset to `creating` with a fresh token — instead of permanently burning the account; `creating`/`ready`/`expired` still 409s |
+| `GET /v1/export.tar` — whole-jail workspace export | done (kept) | `relayd/src/fsapi.mjs:392` (`serveExportTar`), routed in `relayd/src/additions.mjs`, covered in `relayd/test/conformance.test.mjs` | mTLS-authed (same `authorize()` gate as the data path), jail-contained (reuses the `fs/list` walk, denylisted files excluded before `tar` sees them), 512 MiB cap checked before any header is written → 413 `export_too_large`. Entry list is passed to `tar` NUL-separated (`--null`) over stdin, not argv — required, not stylistic: a newline-joined list lets an attacker-controlled filename inject a `-C` directory-change directive and escape the jail. Consumed by iOS `CodexClient.downloadExport()`; the trial expiry banner that used to invoke it is gone, the route is not |
+| Reaper (pause at TTL expiry, destroy after grace) | **removed** | `cloud/src/server.js` (`sweepTrials`), `cloud/test/trial-reaper.test.mjs` | Wired into the existing 60 s `runSweeps()` timer alongside the pairing/notify sweeps; state-driven off `expires_at`, so a crash mid-pass is safe to re-run |
+| Broker dynamic node registry (control-plane-backed fallback lookup) | done (kept) | `broker/internal/registry`, `broker/cmd/broker/main.go` (`-registry-url`, `-registry-token-file`), `broker/internal/broker/broker.go` (`SetFallbackLookup`) | HTTP resolver against the cloud's `GET /v1/tunnel/nodes/:id` hook; 60 s positive / 10 s negative TTL cache; consulted only when a node id misses the static `-node` flag registry, which remains primary. Closes the long-standing "the Go broker does NOT call the registry hook" gap **for nodes opted into it** — the broker still needs `-registry-url` passed at deploy time |
+| relayd `enroll` (identity bootstrap + single-use token registration with the control plane) | **removed** | `relayd/src/enroll.mjs`, `relayd/bin/relayd` (`enroll` subcommand), `relayd/test/enroll.test.mjs` | Idempotent — a second call with a fresh token reuses the same node identity/id. Wired into the CLI, env-driven (`RELAYD_ENROLL_URL`, `RELAYD_ENROLL_TOKEN`), no secrets on argv or in output |
+| Trial pairing (server-mediated; node mints the device cert) | **removed** | `relayd/src/trialpair.mjs`, invoked from `relayd enroll` when `RELAYD_ENROLL_PAIRING_ID`/`_SECRET` are set, `relayd/test/trialpair.test.mjs` | Documented protocol delta from the BYO zero-knowledge CSR flow (`relayd/API.md` §2.3) — see `revamp/07-trial-sandbox-plan.md` "Implementation status" for the rationale |
+| Trial sandbox template (Cube/E2B) | **removed** | was `product/trial/` (deleted 2026-09-08) | Was a Debian image with node, the Codex/Claude/Cursor CLIs and relayd; `start.sh` ran `relayd enroll` once, scrubbed the enroll/pairing env vars, then exec'd `relayd run --mode tunneled`. It was never verified against a live Cube host. The directory is gone; the Cube template it produced is unused |
+| iOS: fork-screen "Try instantly", provisioning progress states, trial badge/countdown, expiry/export | **removed** | `ios/POCVault/POCVault/Models/{RelayTrialNode,RelayNodeStore}.swift`, `Security/RelayTrialPairing.swift`, `Networking/RelayTrialClient.swift`, `Views/{RelayTrialFlowModel,TrialProvisioningView,TrialStatusBanner}.swift`, `Views/AccountSettingsView.swift`, `POCVaultTests/TrialPairingTests.swift` | Full flow wired: `RelayTrialFlowModel` drives create → device-blob → poll-ready → poll-node-blob → tag-verify → PKCS#12 import → `RelayNodeStore.adoptTrial` (repoints the app at the new node without relaunch); `TrialProvisioningView` renders it as a Creating/Booting/Pairing/Ready checklist with retry; `TrialStatusBanner` shows the "Trial · N days left" badge and, once expired, an expiry banner with "Connect your own machine", "Join the paid waitlist", and an export action (`CodexClient.downloadExport()` → `ShareLink`); `AccountSettingsView` adds a "Trial machine" status/delete section. `RelayTrialPairing` derivations (authToken/macKey/blobTag/p12Passphrase) remain bit-for-bit matched to `relayd/src/trialpair.mjs`, cross-checked by fixtures in `TrialPairingTests.swift`. 96/96 iOS tests pass (`xcodebuild test`, verified against iPhone 17 simulator on this audit date — iPhone 16 unavailable on this machine) |
+| iOS: direct provider login from the phone (no laptop): connect Claude Code/Codex/Cursor/Kimi on the machine from the app | done (kept) | `ios/.../Views/{ProviderLoginFlowModel,ProviderLoginView}.swift`, `Networking/CodexClient.swift` (harness login-op endpoints), `Models/CodexModels.swift` (`RelayHarnessOp`), entry points in `Views/AccountSettingsView.swift` ("Coding agents" section) and the composer readiness notice (`Views/RelayChatView.swift`), `POCVaultTests/ProviderLoginTests.swift` | Drives relayd's harness login op end to end: start → open the provider's sign-in URL (SFSafariViewController for paste-back flows; an intercepting WKWebView for Codex, whose OAuth redirect targets the CLI's localhost login server and is replayed on the node via `POST /v1/harness/ops/:id/callback`) → paste-back codes go to CLI stdin via `.../input` → op polled to `succeeded`. Design: `docs/superpowers/specs/2026-08-29-ios-direct-provider-login-design.md`. Includes a legacy-machine fallback that needs only `/v1/exec` + `GET /v1/harness` (login launched under util-linux `script` for a PTY, setsid-detached, log-file polling, FIFO stdin, exec callback replay) — deliberately NOT the terminals API, which rides the Codex app-server and hangs on a machine whose codex has never signed in — so machines running an older relayd still sign in from the phone. Android: recorded as `direct-provider-login` android-gap in `mobile/parity-contract.json` |
 
 ---
 
@@ -108,13 +137,17 @@ piece of the checklist item is absent; **missing** — no implementation in
 | End-to-end proof against production | done | wave 20/22 ledger, `.superpowers/sdd/handoff/progress.md` | `relay status` reached **`ready` in ~9 s** with the card served by the node (`provider: claude`, `canResumeNatively: true`); the failure path was forced and surfaced `clone_failed` on both sides |
 | Push notification on handoff ready | done (delivery to a real device not yet re-observed) | `relayd` → `RELAY_HANDOFF_READY` → cloud fanout | Whole chain verified link by link: the app registers and uploads tokens (28 device rows, all holding APNs tokens), relayd emits the event, the cloud fans out, and the account's `.p8` returns **200 delivered** from Apple. `APNS_KEY_ID`/`APNS_SIGNING_KEY_P8` were set in `/etc/relay-cloud/env` on 2026-08-13 (rollback `env.bak-pre-apns-working-20260813T111043Z`); the prior "blocked" state is resolved. Not yet closed out: one `pending stream has been canceled` transport error was seen on the 11:24 fanout, and no fanout has run since the summary instrumentation was deployed |
 | Notification banner says which session | done | `cloud/src/notify.js` (`bannerFor`), `cloud/src/apns.js` (`apsAlert`), `cloud/src/registry.js` (`latestHandoffForNode`), `cloud/test/push-banner.test.mjs` | Every mutable push used to carry `alert: {"loc-key":"RELAY_EVENT"}` as a placeholder for a Notification Service Extension. **No such extension exists in the app**, and iOS renders an unresolvable `loc-key` verbatim — so every notification a user ever received read literally `RELAY_EVENT`. The banner is now built cloud-side: `handoff.ready` → *"Session ready" / "acme/widgets · relay/handoff-da52e722"*, `handoff.failed` adds the reason from the five-code closed vocabulary, everything else is a fixed per-type string. Text comes from this server's own `handoffs` table, never from the event, so a node cannot influence it. **Deliberate disclosure:** repo and branch names now reach Apple; nothing else does. The row is matched by newest-in-terminal-state for that node within 5 minutes, so a report that never landed degrades to generic wording instead of naming a stale handoff. Verified by mutation: dropping the recency window fails the stale-handoff test, neutering the state filter fails the in-flight test |
-| Re-pair path for an existing trial node | missing | — | The pairing rendezvous is put-once and `runTrialPairing` only runs at boot from `relayd enroll`, so a device that loses its credential to a still-running machine cannot be re-issued one. iOS states this honestly rather than implying user error (`RelayTrialFlowModel.adoptExistingTrial`) |
+| Re-pair path for an existing node | resolved by scope change 2026-09-08 | `relayd pair` | The old gap was that a hosted node could not re-issue a credential to a device that lost one, because the rendezvous is put-once and pairing ran only at boot. On a machine the user owns, they run `relayd pair` again and scan the new code. No code fixed this; ownership did. |
 
-## First real trial run — what it broke, 2026-08-13
+## First real trial run — what it broke, 2026-08-13 (historical)
 
-The first end-to-end use of a trial sandbox by its owner. Everything below was
-found by using the product, not by review, and every one of them affected
-**every** trial user rather than just this account.
+The first and only end-to-end use of a trial sandbox by its owner. Everything
+below was found by using the product, not by review, and every one of them
+affected **every** trial user rather than just this account.
+
+Kept because the lessons outlived the feature — the APNs environment bug, the
+keychain-vs-`UserDefaults` credential loss, and the `PATH` assumption are all
+still live concerns on a user-owned machine. The trial itself is gone.
 
 | Fault as the user saw it | Root cause | Fix |
 |---|---|---|
@@ -137,7 +170,7 @@ found by using the product, not by review, and every one of them affected
 | relayd (full suite) | `cd product/relayd && node --test test/*.test.mjs` | **466 pass / 0 fail** |
 | cli (full suite) | `cd product/cli && node --test test/*.test.mjs` | **187 pass / 0 fail** |
 | iOS | `xcodebuild test -scheme POCVault` | **143 pass / 0 fail** |
-| trial build-script parser | `bash product/trial/test-status-parse.sh` | **8 pass / 0 fail** |
+| trial build-script parser | `bash product/trial/test-status-parse.sh` | **8 pass / 0 fail** — the script and its suite were deleted on 2026-09-08; the row records what ran on the day |
 
 Note `node --test test/` (a bare directory) is wrong on Node 22 — it resolves
 the directory as a module path and emits a single synthetic failing test. Use
@@ -151,7 +184,12 @@ passes. (A first mutation attempt cut inside the return statement's object
 literal and produced a syntax error, which proves nothing; it was redone as an
 exact-block replacement and syntax-checked before being trusted.)
 
-### Test evidence (trial sandbox, 2026-08-11)
+### Test evidence (trial sandbox, 2026-08-11) — historical
+
+These runs included test files that have since been deleted
+(`cloud/test/trial-*.test.mjs`, `relayd/test/{enroll,trialpair}.test.mjs`,
+`POCVaultTests/TrialPairingTests.swift`, `product/trial/test-status-parse.sh`).
+The numbers record what passed on that date; do not expect to reproduce them.
 
 | Suite | Command | Result |
 |---|---|---|
@@ -174,8 +212,9 @@ exact-block replacement and syntax-checked before being trusted.)
 
 Discovered by tracing the live infrastructure end to end, not from docs:
 
-- **The owner's phone "machine" is the account's trial-sandbox node** (kind
-  `trial` in the production registry), not the personal box. The personal box
+- **The owner's phone "machine" was the account's trial-sandbox node** (kind
+  `trial` in the production registry), not the personal box. That node no
+  longer has a way to exist. The personal box
   (`pariksj-dev`, `i-0364bb0f31f506e7c`) still runs the **legacy pre-extraction
   `server.mjs`** under `codex-api.service` — it contains no `/v1/harness` or
   `/v1/exec` surface at all and is not an enrolled relayd node (W2 item
@@ -183,21 +222,19 @@ Discovered by tracing the live infrastructure end to end, not from docs:
   Docker Caddy owned by an unrelated POC stack on the same shared box, with the
   relay vhost block inside that stack's Caddyfile; the vhost also still lists a
   retired sslip.io hostname from before the 2026-08-11 EIP change.
-- **relayd therefore deploys to real users only via the trial template.** The
-  path: copy `product/{trial,relayd}` from the target commit to the Cube host
-  (`rocketizer-cubesandbox`, `i-077519030563ae4a8`, no public IP — reach it via
-  SSM; build contexts live in `/root/relay-build-<sha>/`), run
-  `trial/build.sh` there (docker build → local registry push → `POST
-  /templates` → poll READY; template ids are server-generated `tpl-*`), then
-  set the returned id as `TRIAL_TEMPLATE_ID` in `/etc/relay-cloud/env` on the
-  control-plane box (`i-0ce97c38c7fd74825`) and restart `relay-cloud`.
-- **Existing sandboxes keep the old image forever** — a template update only
-  affects sandboxes created after it. To move a live trial machine to new
-  relayd bits, delete + recreate the trial from the phone (the `destroyed`
-  row is retried in place, so the account is not burned). Until then, phones
-  with app ≥ `58bdb03` can still sign in to providers on an old-image sandbox
-  through the exec fallback (`/v1/exec` + `GET /v1/harness`), which shipped in
-  templates built from ≥ `9b4392d` (2026-08-13).
+- **That path is gone as of 2026-09-08.** relayd used to reach real users only
+  through the trial template: copy `product/{trial,relayd}` to the Cube host,
+  run `trial/build.sh` (docker build → local registry → `POST /templates` →
+  poll READY), then set the returned id as `TRIAL_TEMPLATE_ID` on the
+  control-plane box. `product/trial/` has been deleted and there is no
+  `TRIAL_TEMPLATE_ID`.
+- **relayd now has no deploy story at all.** No installer, no package, no
+  release artifact, no systemd unit shipped. A user copies the source to their
+  own machine and runs it. Writing that installer is the largest single gap
+  between this repository and a product someone else can use.
+- **`rocketizer-cubesandbox` is idle infrastructure.** The Cube host is still
+  running an m6i.2xlarge and still billing; nothing calls it. Terminating it is
+  the owner's decision.
 
 ## Next actions
 
@@ -211,10 +248,10 @@ Discovered by tracing the live infrastructure end to end, not from docs:
 5. TOML config + one-shot `/etc/codex-api.env` migration in `config.mjs`.
 6. relayd→cloud signed event client (`POST /v1/node-events` with the node identity key) — cloud ingest is ready and tested.
 7. Harness `install` action (`POST /v1/harness/:provider/install` per API.md §2.5).
-8. Cloud-rendezvous pairing path from relayd for **BYO** installs (headless enroll-code flow for `install.sh`, per cloud README "stubbed" list) — defines the pairing-session creation auth for installers. *(Partially addressed for the trial tier only: `relayd/src/trialpair.mjs` now consumes the same cloud rendezvous endpoints, but via a node-mints-the-certificate PKCS#12 delta that is deliberately trial-only — see `revamp/07-trial-sandbox-plan.md` "Implementation status". The general BYO headless enroll-code flow for `install.sh` is still not built.)*
+8. Package `relayd` so a user can install it in one command, and write the "connect your own machine" quickstart against a real installer rather than "copy the source". This is now the top item: QR pairing is only as good as the thing the user has to run first. *(The cloud-rendezvous headless enroll-code flow that used to sit here is moot — direct pairing does not need the cloud.)*
 9. Flip the store default to SQLite after a soak (JSON remains the migration source), or make `install.sh` set `RELAYD_STORE=sqlite` for fresh installs.
-10. Execute `install.sh` on a fresh VM end-to-end; then enroll the personal box as node #1 (direct mode) — dogfood gate. *(live deploy; intentionally out of scope this run)*
-11. **iOS W4** (intentionally out of scope this run): NodeStore, Secure-Enclave identity + CSR + pairing client + per-node CA pinning (U2 prototype in week 1), multi-node plumbing, onboarding screens, push/NSE/Live Activity, Sign in with Apple, on-device transcription, settings, keep 79 XCTests green.
+10. Dogfood the BYO path end to end on a fresh VM: install `relayd`, run `relayd pair`, scan from a real phone over a real network, and run a job. Nothing in this repository has done this yet. *(live deploy; out of scope this run)*
+11. **iOS W4** (intentionally out of scope this run): NodeStore, per-node CA pinning, multi-node plumbing, onboarding screens, push/NSE/Live Activity, Sign in with Apple, on-device transcription, settings, keep the XCTest suite green. The pairing client is now the QR scanner plus the mint-variant exchange (`NodePairingView`); the Secure-Enclave CSR path remains unimplemented on iOS, which is why the mint variant exists.
 
 ### Remaining for M2 (hardening; noted for continuity)
 12. Broker production deltas: `wss://` tunnel transport, flow control, per-node/per-IP limits, metrics, connection draining. *(Registry-hook integration with the cloud landed — `broker/internal/registry` + `-registry-url`/`-registry-token-file`, opt-in via flag as a fallback behind the still-default `-node` static registry.)*
