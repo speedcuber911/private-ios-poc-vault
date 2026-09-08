@@ -40,6 +40,33 @@ PAIRING_PORT="8788"
 log() { printf '[relayd-install] %s\n' "$*"; }
 die() { printf '[relayd-install] ERROR: %s\n' "$*" >&2; exit 1; }
 
+# The address this machine believes it is reachable on, used for the QR and
+# the TLS SAN list. RELAYD_PUBLIC_HOST in the environment wins, because the
+# installer's guess cannot be right on a NATed cloud VM — there the phone
+# arrives on a public address this machine never sees on any interface.
+#
+# `ip route get` asks the kernel which source address it would use to reach the
+# internet, which beats `hostname -I` (returns every address, docker0 included,
+# in no useful order) and beats `hostname -f` (frequently an unresolvable name).
+# Falls back to loopback, which is honest: it pairs over an SSH tunnel and the
+# post-install summary says so.
+detect_public_host() {
+  if [ -n "${RELAYD_PUBLIC_HOST:-}" ]; then
+    printf '%s' "$RELAYD_PUBLIC_HOST"
+    return
+  fi
+  local addr=""
+  if command -v ip >/dev/null 2>&1; then
+    addr="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.*[[:space:]]src[[:space:]]\([0-9.]*\).*/\1/p' | head -n1)"
+  fi
+  if [ -z "$addr" ] && command -v hostname >/dev/null 2>&1; then
+    addr="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -v '^127\.' | head -n1)"
+  fi
+  printf '%s' "${addr:-127.0.0.1}"
+}
+
+PUBLIC_HOST="$(detect_public_host)"
+
 # --- env-file helpers -------------------------------------------------------
 #
 # /etc/relayd/relayd.env has two consumers with different parsers:
@@ -220,9 +247,34 @@ if [ ! -f "$ENV_FILE" ]; then
       "# systemd's EnvironmentFile= parser and for \`. $ENV_FILE\` in a shell." \
       '# Keep it that way when you edit: unquoted values with spaces, quotes or' \
       '# JSON get mangled the moment anything sources this file.'
-    env_kv CODEX_API_HOST 127.0.0.1
+    printf '%s\n' \
+      '# The data listener. It is reachable on every interface because the' \
+      '# phone is not on this machine — that is the entire point of the' \
+      '# product. It is not unauthenticated: relayd terminates TLS itself with' \
+      '# a certificate signed by its own CA, and every request needs either a' \
+      '# paired device bearer token or a client certificate this node issued.' \
+      '# An unauthenticated request gets 401 before it reaches any handler.' \
+      '#' \
+      '# Set RELAYD_DIRECT_TLS=false only if you are putting your own proxy in' \
+      '# front; relayd then serves plain HTTP and trusts the X-SSL-Client-*' \
+      '# headers your proxy sets, which is safe ONLY when nothing else can' \
+      '# reach the port.'
+    env_kv CODEX_API_HOST 0.0.0.0
     env_kv CODEX_API_PORT 8787
     env_kv CODEX_REQUIRE_MTLS true
+    env_kv RELAYD_DIRECT_TLS true
+    printf '%s\n' \
+      '# The address the phone reaches this machine on. It goes into the QR' \
+      '# code and into the TLS certificate SAN list, so the two always agree.' \
+      '#' \
+      '# THE DETECTED VALUE IS OFTEN WRONG ON A CLOUD VM: this is the address' \
+      '# the machine sees on itself, which on EC2/GCE/Hetzner is the private' \
+      '# one, while the phone arrives on the public address. If pairing fails' \
+      '# with a certificate or hostname error, this is why. Set it to the' \
+      '# address or hostname you actually reach, then restart relayd — the' \
+      '# certificate is reissued automatically when this value changes.' \
+      '# Bare IPv4 and IPv6 literals are fine; they become IP SANs.'
+    env_kv RELAYD_PUBLIC_HOST "$PUBLIC_HOST"
     printf '%s\n' \
       '# Allowed client-cert subject DNs (filled by pairing/gateway setup —' \
       '# placeholders only, never commit real subjects).' \
@@ -247,15 +299,23 @@ if [ ! -f "$ENV_FILE" ]; then
     env_kv CODEX_RUN_HOME "/home/$RUN_USER"
     env_kv RELAYD_WORKTREE_MODE false
     printf '%s\n' \
-      '# Pairing listener. It is a SECOND listener, separate from the data port,' \
-      '# it speaks plain HTTP and it MINTS device certificates — so it is bound' \
-      '# to loopback and these keys are written explicitly: relayd binds no' \
-      '# address you did not name here. To let the phone reach it, front it with' \
-      '# your TLS gateway (and set RELAYD_PAIRING_ADVERTISE to the public URL) or' \
-      '# use an SSH tunnel. Only move RELAYD_PAIRING_HOST off 127.0.0.1 if you' \
-      '# accept an unauthenticated cert-minting endpoint on that interface.'
+      '# Pairing listener. Still a SECOND listener, separate from the data' \
+      '# port, and it still mints device credentials — but it is now reachable,' \
+      '# because a phone that cannot reach it cannot pair.' \
+      '#' \
+      '# What makes that acceptable, and what changed: it speaks TLS from the' \
+      '# node CA rather than plain HTTP, it only ever answers a single-use' \
+      '# token that `relayd pair` printed on this machine less than 15 minutes' \
+      '# ago, blind guesses are rate-limited per source address, and the QR' \
+      '# carries a fingerprint of the CA so the phone refuses to talk to' \
+      '# anything else. An attacker who cannot see your terminal has nothing to' \
+      '# present.' \
+      '#' \
+      '# It is idle between pairings: with no live session, every request is' \
+      '# refused. Set RELAYD_PAIRING_HOST=127.0.0.1 to close it off entirely' \
+      '# and pair over an SSH tunnel instead.'
     env_kv RELAYD_PAIRING_ENABLED true
-    env_kv RELAYD_PAIRING_HOST 127.0.0.1
+    env_kv RELAYD_PAIRING_HOST 0.0.0.0
     env_kv RELAYD_PAIRING_PORT "$PAIRING_PORT"
   } > "$ENV_TMP"
   chown "root:$RUN_USER" "$ENV_TMP"
@@ -344,17 +404,26 @@ if [ "$pair_ok" -eq 1 ] && [ "$svc_ok" -eq 1 ]; then
   log "==========================================================="
   if [ "$reach_state" = "loopback" ]; then
     log " INSTALLED — ONE STEP LEFT before the phone can pair."
-    log " The pairing listener is on loopback (${reach_url:-http://127.0.0.1:$PAIRING_PORT/v1/pair}),"
-    log " so the phone cannot reach it yet. It mints device certificates over"
-    log " plain HTTP — do NOT simply expose it. Pick one:"
-    log "   * front it with your TLS gateway, then set RELAYD_PAIRING_ADVERTISE"
-    log "     to the public URL in $ENV_FILE and restart relayd"
-    log "   * ssh -L $PAIRING_PORT:127.0.0.1:$PAIRING_PORT <this-host>  (tunnel, then pair)"
-    log " Then pair the phone with the code above (re-run pairing if it expires):"
+    log " The pairing listener came up on loopback, so the phone cannot reach"
+    log " it. That is not the default; something in $ENV_FILE"
+    log " set RELAYD_PAIRING_HOST back to 127.0.0.1. Either set it to 0.0.0.0"
+    log " and restart, or pair over a tunnel:"
+    log "   ssh -L $PAIRING_PORT:127.0.0.1:$PAIRING_PORT <this-host>"
+    log " Then re-run pairing (codes expire after 15 minutes):"
     log "   $PAIR_CMD"
   else
-    log " INSTALLED AND READY — pair the phone with the code above."
+    log " INSTALLED AND READY — scan the QR code above with the Relay app."
     log " Pair at: ${reach_url:-see \`relayd pair\` output}"
+    log ""
+    log " This machine advertises itself as $PUBLIC_HOST."
+    log " IF PAIRING FAILS WITH A CERTIFICATE OR HOSTNAME ERROR, that is why:"
+    log " on a cloud VM the address the machine sees is the private one, and"
+    log " your phone arrives on the public address. Set RELAYD_PUBLIC_HOST in"
+    log " $ENV_FILE to the address you actually reach, restart"
+    log " relayd, and run \`relayd pair\` again for a fresh QR."
+    log ""
+    log " Open port $PAIRING_PORT (pairing) and 8787 (data) to your phone."
+    log " Check what is advertised and whether it matches: relayd doctor"
   fi
   log " status: systemctl status relayd"
   log "==========================================================="

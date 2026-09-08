@@ -1,6 +1,7 @@
 // relayd index.mjs — entry point, extracted from relay-server/codex-api-deploy/server.mjs (W2-CORE, behavior-preserving).
 import fs from "node:fs";
 import http from "node:http";
+import https from "node:https";
 
 // Evaluation-order guards: config first (env validation throws at startup),
 // then catalog (CODEX_MODEL_CATALOG validation), then workspaces (CODEX_WORKSPACES).
@@ -18,6 +19,9 @@ import {
   pairingHost,
   pairingPort,
   recordPairingListener,
+  servesTls,
+  externalTlsConfigured,
+  apiBaseUrl,
   tunnelHost,
   tunnelPort,
   tunnelSuffix,
@@ -37,10 +41,9 @@ import { loadPersistedJobs, processQueue } from "./jobs.mjs";
 import { routeRequest } from "./server.mjs";
 import { sendError } from "./util.mjs";
 import { appendAudit } from "./audit.mjs";
-import { identityPaths, readNodeId, getCaPem, ensureServerCert, isRevokedSerial } from "./identity.mjs";
-import { startTunnelService } from "./tunnel.mjs";
+import { identityPaths, readNodeId, getCaPem, ensureServerCert, nodeServerTlsOptions, caSpkiFingerprint, isRevokedSerial } from "./identity.mjs";
+import { startTunnelService, wrapTunneledHandler } from "./tunnel.mjs";
 import { startPairingListener, prunePairingSessions } from "./pairing.mjs";
-import { computerAccessGate } from "./computeraccess.mjs";
 
 loadPersistedJobs();
 processQueue();
@@ -52,9 +55,78 @@ function handleRequest(req, res) {
   });
 }
 
-// --- direct listen mode (default; unchanged behavior) ----------------------
+// --- direct listen mode ----------------------------------------------------
+//
+// The node terminates TLS itself with a leaf signed by its own CA (or with the
+// operator's certificate when RELAYD_TLS_CERT_FILE/KEY_FILE are set). That is
+// the whole point of the BYO flow: a phone must be able to reach a machine the
+// user owns with nothing but a QR code, and requiring Caddy + DNS + a
+// publicly-trusted certificate first is exactly the cost being removed. The
+// phone trusts the connection because the QR carried the CA pin (`f=`).
+//
+// RELAYD_DIRECT_TLS=false restores the historical plain-HTTP listener for an
+// operator who really does terminate TLS in a proxy. Either way the
+// x-ssl-client-* path in server.mjs is untouched, so a proxy in front of an
+// HTTPS origin keeps working.
+function directListenerTls() {
+  if (!listensDirect || !servesTls) return null;
+  try {
+    return nodeServerTlsOptions();
+  } catch (error) {
+    console.error(
+      `relayd: cannot serve TLS on the data listener — ${error?.message || String(error)}. ` +
+        "Install openssl, or set RELAYD_DIRECT_TLS=false to serve plain HTTP behind a TLS-terminating proxy.",
+    );
+    appendAudit("data_listener_tls_failed", null, { error: error?.message || String(error) });
+    process.exit(1);
+    return null;
+  }
+}
 
-const server = listensDirect ? http.createServer(handleRequest) : null;
+const directTlsOptions = directListenerTls();
+const scheme = directTlsOptions ? "https" : "http";
+
+// The device CA used to verify client certificates on the direct listener.
+// Absent only when the operator supplied their own server certificate and this
+// node has never initialized an identity; the listener then simply accepts no
+// client certificates, and bearer auth carries the node.
+function deviceCaOrNull() {
+  try {
+    return getCaPem();
+  } catch {
+    return null;
+  }
+}
+
+// When THIS process terminates TLS, the x-ssl-client-* headers must come from
+// the handshake and nothing else. Without the same wrapper the tunnel uses, a
+// listener that is now reachable off-box would let any caller send
+// `X-SSL-Client-Verify: SUCCESS` plus an allowed subject and walk straight in —
+// those headers were only ever trustworthy because a proxy set them. The
+// wrapper deletes every inbound x-ssl-client-* header and re-derives the pair
+// from the verified peer certificate, so no peer certificate means no headers
+// and authorize() falls through to the bearer/mTLS decision as designed.
+//
+// requestCert asks for a client certificate without requiring one:
+// rejectUnauthorized stays false because iOS declines to send one and must
+// still be able to pair and use its bearer token.
+const server = listensDirect
+  ? (directTlsOptions
+      ? https.createServer(
+          { ...directTlsOptions, ca: deviceCaOrNull() ?? undefined, requestCert: true, rejectUnauthorized: false },
+          wrapTunneledHandler(handleRequest),
+        )
+      : http.createServer(handleRequest))
+  : null;
+
+// A revoked device certificate dies right after the handshake, exactly as it
+// does on the tunnel. The CRL is owned by identity.mjs.
+if (server && directTlsOptions) {
+  server.on("secureConnection", (socket) => {
+    const serial = (socket.getPeerCertificate?.()?.serialNumber || "").toUpperCase();
+    if (serial && isRevokedSerial(serial)) socket.destroy();
+  });
+}
 
 if (server) {
   // A bind failure on the DATA listener is fatal — but it must be a clean,
@@ -74,7 +146,14 @@ if (server) {
     process.exit(1);
   });
   server.listen(port, host, () => {
-    console.log(`codex-api listening on http://${host}:${port}`);
+    console.log(`codex-api listening on ${scheme}://${host}:${port}`);
+    if (directTlsOptions) {
+      const fingerprint = caSpkiFingerprint();
+      console.log(
+        `relayd: advertising ${apiBaseUrl()} (${externalTlsConfigured ? "operator certificate" : "node-signed certificate"})` +
+          `${fingerprint ? `, CA pin ${fingerprint}` : ""}`,
+      );
+    }
   });
 }
 
@@ -116,7 +195,7 @@ function startPairing() {
       // `relayd pair` runs in a different process and cannot see an ephemeral
       // port otherwise, so the bound address is persisted for it to read back.
       recordPairingListener({ host: pairingHost, port: boundPort });
-      console.log(`relayd pairing listener on http://${pairingHost}:${boundPort}/v1/pair`);
+      console.log(`relayd pairing listener on ${servesTls ? "https" : "http"}://${pairingHost}:${boundPort}/v1/pair`);
       appendAudit("pairing_listener_started", null, { host: pairingHost, port: boundPort });
     })
     .catch((error) => {
@@ -162,15 +241,11 @@ async function startHandoffPickup() {
     const { startHandoffLoop, completeHandoffJob } = await import("./handoff.mjs");
     const { setHandoffCompletionHook, setJobNotificationHook } = await import("./jobs.mjs");
     const { installFromNotice } = await import("./syncauth.mjs");
-    const { createHostedPairingWorker } = await import("./hosted-pairing.mjs");
-    const recoverHostedDevice = createHostedPairingWorker({ cloudUrl });
     setHandoffCompletionHook(completeHandoffJob);
     // `cloud` is referenced inside the handler, which only ever runs after
     // createCloudClient has returned and this binding is initialized.
     const cloud = createCloudClient({
       cloudUrl,
-      onDevicePairing: recoverHostedDevice,
-      onComputerAccess: (lease) => computerAccessGate.applyLease(lease),
       onNotice: (notice) =>
         installFromNotice(notice, {
           cloudUrl,

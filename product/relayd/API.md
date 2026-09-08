@@ -46,8 +46,11 @@ runner's login profile.
 ### 1.1 Transport, encoding, general conventions
 
 - HTTP/1.1 JSON API plus Server-Sent Events (SSE) for chat and job streams.
-  Server bootstrap: `http.createServer` at 6633–6642; single async router
-  `routeRequest` at 1394–1578.
+- Transport depends on the listen mode. **Direct** mode terminates TLS in the
+  daemon with a server certificate signed by the node's own CA, covering the
+  names and IPs in `RELAYD_PUBLIC_HOST` (`RELAYD_DIRECT_TLS=0` reverts to plain
+  HTTP behind your own proxy). **Tunneled** mode dials the broker, which routes
+  on SNI and passes TLS through. Either way the daemon owns the certificate.
 - All JSON responses are sent with `content-type: application/json`,
   `cache-control: no-store`, and explicit `content-length` (`sendJson`,
   1263–1271). HTML responses (`sendHtml`, 1273–1280) and raw bytes
@@ -70,35 +73,55 @@ runner's login profile.
   `/^artifact-[0-9]{3}$/` (`isSafeArtifactId`, 1602–1604). Non-matching ids
   return 404 before any lookup.
 
-### 1.2 Auth model (mTLS or trial device token, with local re-check)
+### 1.2 Auth model (device bearer token or mTLS, with local re-check)
 
-`authorize` (1370–1387), applied to every route except `GET /healthz`
-(gate at 1401–1404):
+`authorize`, applied to every route except `GET /healthz`. It tries four
+things, in this order, and stops at the first that applies:
 
-- The node sits behind a TLS-terminating gateway (Caddy in the personal
-  install) that REQUIRES a client certificate and forwards two headers:
-  - `X-SSL-Client-Verify` — must be exactly `SUCCESS`
-  - `X-SSL-Client-S-DN` — the client-cert subject DN
-- The server **re-checks** the forwarded subject against the allowlist
-  (`RELAYD_ALLOWED_CERT_SUBJECTS`, falling back to
-  `CODEX_ALLOWED_CERT_SUBJECTS` — see the format below).
-  - Missing/failed verify → **401** `client certificate is required`
-  - Verified but unlisted subject → **403**
-    `client certificate subject is not allowed`
-- `CODEX_REQUIRE_MTLS=false` (default `true`, line 11) disables the check
-  entirely; the subject header, if present, is still propagated.
-- The authorized subject is threaded through as `certSubject` into job
-  records, chat threads, audit log lines, and echoed in job responses.
-- Personal/BYO nodes use mTLS. Trial nodes whose
-  `RELAYD_DEVICE_TOKEN_HASH_FILE` is configured use a host-scoped bearer token
-  derived during pairing; only its SHA-256 is stored by the node.
-- A token-authenticated node enrolled with relay-cloud also requires a current
-  account-access lease received on its signed handoff long-poll. Missing or
-  expired lease → **503**; an owner-disconnected computer → **403**. The cloud
-  never receives the file/job request itself.
-- `POST /v1/pair` is **never routable on this listener** — it is refused with
-  a 404 before `authorize` runs, so the data port does not even reveal that it
-  exists. Pairing has its own listener (§2.3).
+1. **Browser grant.** A bearer that is JWT-shaped, when a grant public key is
+   configured, is verified as a short-lived read-only activity grant signed by
+   the control plane (§ `product/cloud/README.md`, "Browser activity grants").
+2. **Paired device.** A bearer whose SHA-256 matches a row in
+   `device-tokens.mjs` authorizes as that device. This is what a
+   QR-paired phone uses.
+3. **Legacy single hash.** If `RELAYD_DEVICE_TOKEN_HASH_FILE` is set, the
+   bearer is compared against that one hash. Kept so an existing install does
+   not break.
+4. **mTLS.** Otherwise the client-certificate path below.
+
+The two modes coexist deliberately: adding QR pairing must not invalidate a
+working certificate-based install.
+
+**mTLS path.** The node either terminates TLS itself and reads the peer
+certificate directly, or sits behind a TLS-terminating gateway that REQUIRES a
+client certificate and forwards two headers:
+
+- `X-SSL-Client-Verify` — must be exactly `SUCCESS`
+- `X-SSL-Client-S-DN` — the client-cert subject DN
+
+Forwarded `x-ssl-client-*` headers from the network are stripped and
+re-derived from the actual TLS peer before anything reads them. The server
+**re-checks** the subject against the allowlist
+(`RELAYD_ALLOWED_CERT_SUBJECTS`, falling back to
+`CODEX_ALLOWED_CERT_SUBJECTS` — see the format below).
+
+- Missing/failed verify → **401** `client certificate is required`
+- Verified but unlisted subject → **403**
+  `client certificate subject is not allowed`
+
+`CODEX_REQUIRE_MTLS=false` (default `true`) disables the check entirely; the
+subject header, if present, is still propagated. The authorized subject is
+threaded through as `certSubject` into job records, chat threads, audit log
+lines, and echoed in job responses.
+
+There is **no control-plane authorization gate.** A node the user owns does
+not ask a control plane for permission to serve its owner, so the former
+account-access lease check (`computeraccess.mjs`) is gone along with the
+managed-node concept it enforced.
+
+`POST /v1/pair` is **never routable on this listener** — it is refused with a
+404 before `authorize` runs, so the data port does not even reveal that it
+exists. Pairing has its own listener (§2.3).
 
 #### Allowlist format (multi-RDN safe)
 
@@ -161,9 +184,15 @@ All from env, parsed at 9–124. Contract-relevant defaults:
 | `CODEX_ALLOWED_CERT_SUBJECTS` | (empty) | same, legacy name; used when the above is empty |
 | `RELAYD_PAIRING_AUTOALLOW` | `true` | allowlist the subject of a freshly paired device (§1.2) |
 | `RELAYD_PAIRING_ENABLED` | `true` | daemon serves the pairing listener (§2.3) |
-| `RELAYD_PAIRING_HOST` | `CODEX_API_HOST` | pairing listener bind address |
-| `RELAYD_PAIRING_PORT` | `CODEX_API_PORT + 1` | pairing listener port; must differ from the data port |
+| `RELAYD_PAIRING_HOST` | `127.0.0.1` | pairing listener bind address; deliberately NOT inherited from `CODEX_API_HOST` |
+| `RELAYD_PAIRING_PORT` | `0` (kernel-chosen, persisted for `relayd pair` to read back) | pairing listener port; must differ from the data port |
 | `RELAYD_PAIRING_ADVERTISE` | unset | public base URL `relayd pair` prints for the phone |
+| `RELAYD_PUBLIC_HOST` | unset | hostname or IP the phone reaches this node on; goes into the server certificate's SANs, IP SANs included |
+| `RELAYD_DIRECT_TLS` | `1` | in direct listen mode, terminate TLS here with a certificate signed by this node's own CA. Set `0` to serve plain HTTP behind your own proxy |
+| `RELAYD_PAIR_LINK_BASE` | `https://get.openrelay.sh/pair` | origin of the universal link the QR encodes |
+| `RELAYD_PAIR_API_ADVERTISE` | unset | overrides the `a=` data URL advertised in the QR, when the address the node sees is not the address the phone reaches |
+| `RELAYD_GRANT_PUBLIC_KEY` | unset | Ed25519 public key (raw 32 bytes, base64url) for browser activity grants. Unset disables that path entirely — it used to arrive in the provisioner's `enroll.json`, which no longer exists |
+| `RELAYD_TLS_CERT_FILE` / `RELAYD_TLS_KEY_FILE` | unset | an operator-supplied server certificate, used in preference to the node-signed one on both listeners |
 | `CODEX_MAX_BODY_BYTES` | 30 MiB | JSON body cap (413) |
 | `CODEX_MAX_CONCURRENT` | 1 | job slots; excess jobs queue FIFO |
 | `CODEX_MAX_JOB_STREAMS` | 8 | concurrent job SSE cap (503) |
@@ -843,17 +872,80 @@ with job streams.
 
 ### 2.3 Pairing — protocol v2
 
-Trust model per product plan §4.3: the node owns a CA; the phone mints a
-Secure Enclave P-256 key and sends a CSR through the pairing channel; the
-node issues the device cert; **no private key ever transits any channel**.
+Trust model per product plan §4.3: the node owns a CA and issues the device
+certificate. Two blob variants exist — a CSR the caller generated, and a
+"mint" request for callers with no CSR stack — and in neither does a private
+key cross a channel in the clear.
+
+This is the primary way a phone gets access to a machine. Everything else in
+this document assumes it already happened.
 
 #### Roles
 
-The **node** originates the pairing secret — `relayd pair` prints a short
-code and a long token, both of which redeem the same session. The **phone**
-receives that secret out of band (QR scan or typed code). The **cloud**, when
-the phone cannot reach the node directly, relays two opaque blobs and is told
-only a derived `authToken` — never the secret.
+The **node** originates the pairing secret — a 24-byte token, rendered as a QR
+code and printed as a link by `relayd pair`. The **phone** receives that token
+out of band (QR scan, or pasted from the link) and POSTs straight to the node.
+The **cloud** is not involved at all in the direct path; when the phone cannot
+reach the node, it relays two opaque blobs and is told only a derived
+`authToken` — never the secret.
+
+`relayd pair` also prints a short eight-character code, but **it is not a
+credential and cannot redeem a session**. Every key in this protocol — `macKey`,
+`p12pass`, `deviceTok` — is derived from the token, so a caller holding only the
+code cannot produce a device-blob tag the node will accept. Making the code
+redeemable would mean deriving `macKey` from roughly 40 bits, and a single
+captured `{blob, tag}` pair would then be brute-forcible offline, which is the
+entire integrity argument below. The code is a **numeric-comparison
+confirmation** in the Bluetooth sense: the node returns it in the node blob as
+`verificationCode`, the app displays it, and the human checks it against the
+terminal. Posting it as `code` returns **400** with a message saying so.
+
+#### The QR payload
+
+`relayd pair` renders exactly this URL as an ANSI QR block:
+
+```
+https://get.openrelay.sh/pair#v=1&n=<nodeId>&m=<nodeName>&t=<token>
+                              &p=<base64url(pairEndpointUrl)>
+                              &a=<base64url(apiBaseUrl)>
+                              &f=<base64url(sha256(node CA SubjectPublicKeyInfo))>
+```
+
+| Field | Meaning |
+|---|---|
+| `v` | payload version, `1` |
+| `n` | node id |
+| `m` | node name, for the confirmation screen |
+| `t` | the long pairing token — the credential |
+| `p` | where to POST `/v1/pair`, base64url of the full URL |
+| `a` | the data base URL to use after pairing, base64url |
+| `f` | SHA-256 of the node CA's SubjectPublicKeyInfo, base64url |
+
+Everything after `#` is a fragment: a browser never puts it in a request line,
+so it cannot reach a server log. A generic camera app offers a tappable
+universal link; the in-app scanner parses the same string directly and never
+opens a browser.
+
+`a` is required. Without it the phone knows how to pair but not where to work
+afterwards. `RELAYD_PAIR_LINK_BASE` overrides the origin,
+`RELAYD_PAIR_API_ADVERTISE` overrides `a`.
+
+#### Why `f` is in the payload
+
+A node signs its own server certificate, so the phone's first request — the
+pairing POST, which carries the token — arrives at a certificate it has no
+prior reason to trust. Serving that endpoint over plain HTTP loses the token
+to any listener on the path, who can then redeem it first; single-use makes
+replay useless but does not win a race. Disabling TLS validation for the first
+call ships an app that will talk to anything.
+
+The QR came off the user's own terminal, so it is already an authenticated
+out-of-band channel, and it carries the pin. The phone requires the pairing
+connection's chain to terminate in a CA whose SPKI SHA-256 equals `f`, and
+after pairing it checks the delivered `caPem` against the same value. The CA is
+pinned rather than the leaf, so the node can rotate its server certificate
+without invalidating a code that is already printed. This is the SSH
+host-key-in-the-QR pattern.
 
 #### Key derivation (both peers; the cloud cannot perform it)
 
@@ -861,7 +953,13 @@ only a derived `authToken` — never the secret.
 secret     = the long pairing token (>= 24 random bytes, base64url)
 authToken  = base64url( sha256( "relay-pair-auth-v1" || 0x00 || secret ) )
 macKey     =           hmac-sha256( key = secret, msg = "relay-pair-mac-v1" )
+p12pass    = hex( hmac-sha256( key = secret, msg = "relay-trial-p12-v1" ) )
+deviceTok  = hex( hmac-sha256( key = secret, msg = "relay-device-token-v1" ) )
 ```
+
+The label strings are wire values shared with the Swift implementation. Do not
+rename them, including `relay-trial-p12-v1`, whose name outlived the feature it
+was written for.
 
 The cloud is given only `authToken` and stores only `sha256(authToken)` at
 rest, so it possesses neither `secret` nor `macKey`.
@@ -912,38 +1010,88 @@ routable on the mTLS data listener — the data router refuses `/v1/pair` with a
 plus the blob tag.
 
 ```json
-// request
+// request — envelope is identical for both blob variants
 {"v": 2,
- "code": "WXYZ-1234",          // the short code, or the long token from the QR/link
+ "code": "<token>",            // the long token from the QR/link — ONLY the token redeems
  "blob": "<base64 device blob>",
  "tag":  "<base64 tag over "device-blob">"}
+```
 
+**CSR variant** — the caller generated a keypair and wants it signed. Used by
+CLI and desktop callers.
+
+```json
 // device blob bytes = UTF-8 JSON
 {"csrPem": "-----BEGIN CERTIFICATE REQUEST-----…",
  "deviceName": "<device-name>",
  "platform": "ios"}            // ios|macos|cli|other
-
-// 201 response
-{"v": 2,
- "blob": "<base64 node blob>",
- "tag":  "<base64 tag over "node-blob">"}
 
 // node blob bytes = UTF-8 JSON (byte-for-byte the v1 201 body)
 {"deviceId": "<uuid>",
  "certificatePem": "-----BEGIN CERTIFICATE-----…",
  "caPem": "-----BEGIN CERTIFICATE-----…",   // the node CA to pin
  "nodeId": "<node-id>", "nodeName": "<node-name>",
- "certSerial": "…", "notAfter": "…Z"}
+ "certSerial": "…", "notAfter": "…Z",
+ "apiBaseUrl": "https://…",
+ "verificationCode": "WXYZ-1234",           // show it; the terminal shows the same
+ "pubkey": "-----BEGIN PUBLIC KEY-----…",   // node ed25519 identity, SPKI PEM
+ "encPubkey": "<base64 32 bytes>"}          // node X25519 key, for sealed handoff
+```
+
+**Mint variant** — the caller has no CSR stack, so the node generates the
+keypair. This is what the iOS scanner sends.
+
+```json
+// device blob bytes = UTF-8 JSON
+{"mint": "p12",
+ "deviceName": "<device-name>",
+ "platform": "ios"}
+
+// node blob bytes = UTF-8 JSON
+{"deviceId": "<uuid>",
+ "p12": "<base64 PKCS#12, encrypted with p12pass>",
+ "caPem": "-----BEGIN CERTIFICATE-----…",   // must hash to the QR's `f`
+ "nodeId": "<node-id>", "nodeName": "<node-name>",
+ "certSerial": "…", "notAfter": "…Z",
+ "apiBaseUrl": "https://…",
+ "verificationCode": "WXYZ-1234",
+ "pubkey": "-----BEGIN PUBLIC KEY-----…",
+ "encPubkey": "<base64 32 bytes>"}
+```
+
+The p12 passphrase is `hex(hmac-sha256(key = secret, msg =
+"relay-trial-p12-v1"))` — derived from the same pairing secret, so it never
+crosses the wire and both sides can compute it. The label string is retained
+verbatim from the earlier implementation because it is a cross-language wire
+value; it no longer has anything to do with trials.
+
+The device bearer token the phone then uses is
+`hex(hmac-sha256(key = secret, msg = "relay-device-token-v1"))`. The node
+stores only its SHA-256 in `device-tokens.mjs`, so a copy of the node's
+database yields no usable credential.
+
+A blob with neither `csrPem` nor `mint` is **400**.
+
+```json
+// 201 response — same shape for both variants
+{"v": 2,
+ "blob": "<base64 node blob>",
+ "tag":  "<base64 tag over "node-blob">"}
 ```
 
 The phone MUST verify the node-blob tag before parsing or trusting the
 contents. The response carries no private key material of any kind — the
 device private key never leaves the device.
 
-Rules: the code is single-use and expiring, with a 15-minute TTL (403
-`pairing code is invalid or expired`; **a used code is indistinguishable from
+`pubkey` and `encPubkey` are carried by **both** variants. Deleting trial
+enrolment removed the only publisher of the node's X25519 key, and `relay
+handoff` seals a session to it, so pairing is now the only way a phone learns
+it — a signed-in user later registers the machine with `POST /v1/nodes`.
+
+Rules: the token is single-use and expiring, with a 15-minute TTL (403
+`pairing token is invalid or expired`; **a used token is indistinguishable from
 an expired one**); redemption is **atomic**, so two concurrent attempts on one
-code cannot both succeed — exactly one gets 201, the other 403; CSR key type
+token cannot both succeed — exactly one gets 201, the other 403; CSR key type
 must be P-256/Ed25519 (400 `csr is unsupported`); malformed input is 400
 (`code is required`, `blob is required`, `tag is required`, `blob is
 invalid`); issuance is rate-limited (429 `too many pairing attempts`, 10
@@ -962,7 +1110,7 @@ atomic single-winner claim:
 - `sqlite` — a `pairing_sessions` row; the claim is a single-row `DELETE`, and
   the loser sees `changes === 0`
 
-Consumption deletes the record, so a used code cannot be replayed after a
+Consumption deletes the record, so a used token cannot be replayed after a
 daemon restart. Expired sessions are pruned at daemon start and on every
 `createPairingSession`.
 
@@ -978,139 +1126,47 @@ slots have been read the session is closed and the blobs are deleted rather
 than lingering for the rest of the TTL; blobs are capped at 64 KiB (413) and a
 per-account cap bounds live sessions (429 `too_many_pairing_sessions`).
 
-#### Trial pairing (trial tier only — the node mints the certificate)
-
-`relayd/src/trialpair.mjs` (`runTrialPairing`) is a **documented delta** from
-the CSR flow above, used only for cloud-provisioned trial sandboxes (see
-`revamp/07-trial-sandbox-plan.md` "Implementation status" for the full
-rationale). iOS has no CSR stack yet, so instead of the phone generating a
-keypair and sending a CSR:
-
-1. The phone posts a small JSON device-blob — `{"deviceName", "platform"}`,
-   **no CSR** — to `POST /v1/pairing/sessions/:id/device-blob`, MAC-tagged
-   exactly as in the BYO flow above.
-2. The node (inside `relayd enroll`, below) polls
-   `GET /v1/pairing/sessions/:id/device-blob` until it appears, verifies the
-   tag, then **mints the EC keypair itself**, issues the certificate against
-   its own CA (`identity.mjs`'s `issueDeviceCert`), and packages
-   key+cert+CA-pem into a **passphrase-protected PKCS#12** via `openssl
-   pkcs12 -export`.
-3. The passphrase is `hex(hmac-sha256(key = secret, msg =
-   "relay-trial-p12-v1"))` — derived from the same pairing `secret` that
-   derives `authToken`/`macKey` above. **Unlike BYO, the cloud on the trial
-   tier is not blind to this secret.** The pairing-*session* endpoint
-   (`POST /v1/pairing/sessions`) is told only `authToken`, exactly as in the
-   BYO flow above — but the separate, trial-only `POST /v1/trial-nodes` call
-   takes the raw `secret` directly in its body as `pairingSecret`
-   (`product/cloud/src/server.js`), because the cloud needs it to hand to the
-   sandbox in step 4 below. The cloud can therefore compute both `macKey` and
-   this passphrase for a trial node; nothing in this delta is
-   zero-knowledge.
-4. The p12 bytes are posted as the node-blob (`POST .../node-blob`,
-   MAC-tagged with the same `blobTag`/`NODE_SLOT` scheme as BYO), and the
-   temporary key/CSR/cert/CA/p12 files are removed from `tmp/` whether
-   pairing succeeds or fails.
-
-The device private key still never transits any channel except embedded
-inside the passphrase-protected p12 — but on this tier it is the **node**,
-not the phone, that generated it, and the cloud transported the pairing
-secret into the sandbox as part of provisioning
-(`RELAYD_ENROLL_PAIRING_ID`/`RELAYD_ENROLL_PAIRING_SECRET` env vars, cleared
-before the daemon starts — see `product/trial/start.sh`). This is acceptable
-only because trial sandboxes already run on operator infrastructure and the
-operator is already inside the trust boundary for trial nodes; **BYO
-installs must never receive a secret from the cloud this way** — the BYO
-cloud rendezvous is told only `authToken` and has no path to the raw secret
-at all — which is why this lives in a module separate from `pairing.mjs` and
-is reachable only through `relayd enroll`.
-
-#### Hosted fresh-device reconnection
-
-An updated hosted daemon advertises `hostedPairing=1` in its signed cloud
-poll and handles `hosted-device` requests through a dedicated encrypted queue.
-The full account-side contract is in `product/cloud/README.md`, "Reconnect
-another device to an existing hosted machine". This is restricted to a live
-hosted trial/machine owned by the authenticated account; BYO pairing is not
-enabled through cloud sync notices.
-
-The node opens the existing `RLYSEAL1` envelope and verifies exact node id,
-pairing id, expiry and secret shape before using the secret to authenticate
-the device blob. Independent bearers are stored as SHA-256 hashes in a private
-SQLite database beside `RELAYD_DEVICE_TOKEN_HASH_FILE`; no plaintext bearer
-or pairing secret is persisted there. Each hash is bound to the same issued
-device id and certificate serial shown by `GET /v1/devices`. Revoking that
-device or expiring its certificate rejects its bearer without affecting other
-devices. The active/reserved device limit is 32; revoked/expired devices free
-slots on the next recovery attempt.
-
-Prepared responses are immutable and durable. A failed or interrupted upload
-retries the same encrypted PKCS#12 and leaf identity, never a replacement
-certificate associated with the previous bearer. Exact same node-slot bytes
-and tag may be retried; changed bytes remain a conflict. For recovery, the
-phone cannot collect the response until the node has activated the new bearer
-and sent its signed ready acknowledgement. A failure never rotates or deletes
-an existing credential.
-
-Initial provisioning also retains its prepared response for safe retries.
-Already-completed initial setup is a no-op, including after revocation. Existing
-pre-migration single-file bearer hashes remain accepted; once an initial bearer
-has a registered leaf identity, a durable denial marker prevents its later
-revocation/expiry from falling back to legacy authentication after cleanup.
-
 #### CLI contract
 
 `relayd pair` prints, on stdout:
 
 ```
-Pairing code (single use, expires in 15 minutes):
+  <ANSI QR block encoding the link below>
+
+Scan the QR above with the Relay app, or paste the Link below.
+
+Confirmation code — check the app shows exactly this:
 
     WXYZ-1234
 
-  Pair at: http://<node-address>:8788/v1/pair
-  Link:    https://get.<domain>/pair#node=<node-id>&token=<token>
+This code is not typed in anywhere. It is single use and expires in 15 minutes.
+
+  Pair at: https://<node-address>:8788/v1/pair
+  Machine: https://<node-address>:8787
+  Link:    https://get.openrelay.sh/pair#v=1&n=<node-id>&m=<node-name>&t=<token>
+                                        &p=<b64url>&a=<b64url>&f=<b64url>
   otpauth: otpauth://relay-pair/<node-name>?secret=<token>&issuer=relayd&node=<node-id>
+  CA pin:  <base64url sha256 of the CA SPKI>
   Expires: <iso8601>
 ```
 
-The code/token pair is the one deliberate secret the CLI prints — it *is* the
-credential the user carries to the phone, single-use with a 15-minute TTL. No
-key material is ever printed. The session is redeemable by the already-running
-daemon, so the command does not need to stay open.
+The QR is the intended path; pasting the Link (or the `t=` token out of it) is
+the fallback for a phone that cannot scan. The eight-character code is for
+comparison only — see Roles above.
 
-#### `relayd enroll` — trial node bootstrap
+`--no-qr` suppresses the symbol; so does a non-TTY stdout, and a terminal
+narrower than the rendered block (a wrapped QR has broken finder patterns and
+no camera can lock onto it).
 
-Non-interactive, env-driven (never argv, never printed): initializes the node
-identity if missing (idempotent — repeat calls reuse the same node id), then
-registers its public key with the control plane using a single-use enroll
-token.
-
-```
-RELAYD_ENROLL_URL              required — cloud base URL
-RELAYD_ENROLL_TOKEN            required — single-use token minted by
-                                POST /v1/trial-nodes
-RELAYD_ENROLL_PAIRING_ID       optional — triggers trial pairing (above)
-                                after enrollment succeeds; must be set
-                                together with RELAYD_ENROLL_PAIRING_SECRET
-RELAYD_ENROLL_PAIRING_SECRET   optional — the pairing secret; both this and
-                                the id are wiped from the environment by
-                                product/trial/start.sh before the daemon
-                                (`relayd run --mode tunneled`) execs
-```
-
-`relayd enroll` calls `POST /v1/trial-nodes/enroll` with
-`{token, nodeId, pubkey, version}`; a 200 response carries `{ok, sni}`. The
-cloud verifies the token against `trial_nodes.enroll_token_hash` (401
-`invalid_enroll_token` if it does not match or the trial is not in the
-`creating` state), validates the node id shape and pubkey (400), rejects a
-duplicate node id (409 `node_exists`), then registers the node under the
-`trial` kind and burns the token. The CLI prints only `enrolled <nodeId>
-sni=<sni>` (and, if pairing ran, `trial device paired: <deviceId>`) — no
-secret material is ever logged.
+The token is the one deliberate secret the CLI prints — it *is* the credential
+the user carries to the phone, single-use with a 15-minute TTL. No key material
+is ever printed. The session is redeemable by the already-running daemon, so the
+command does not need to stay open.
 
 ### 2.4 Device list / revoke
 
-Data-path routes (mTLS, any enrolled device may manage devices — the
-"handled from another enrolled device" recovery path).
+Data-path routes. Any paired device may manage devices — the "handled from
+another paired device" recovery path.
 
 **`GET /v1/devices`** → 200
 
@@ -1310,11 +1366,10 @@ endpoint. Additive field; frozen clients ignore it.
 
 Implemented (`relayd/src/fsapi.mjs:392`, `serveExportTar`; routed in
 `src/additions.mjs`). Streams every readable file under
-`workspaceBrowseRoot` as a single tar archive — the mechanism behind the
-trial-sandbox "export my files" flow (`revamp/07-trial-sandbox-plan.md`),
-though the route itself is not trial-specific: any node exposes it.
+`workspaceBrowseRoot` as a single tar archive. Any node exposes it; it is the
+mechanism behind "export my files".
 
-Auth: same mTLS `authorize()` gate as the rest of the data path (applied
+Auth: the same `authorize()` gate as the rest of the data path (applied
 before `handleAdditionRoutes` dispatches to this route, `server.mjs:60`,
 `:240`) — no separate credential.
 
@@ -1390,7 +1445,7 @@ reaches the filesystem through those helpers. A shell does not. Once the
 process exists it can `cd /` and read anything the runtime user can read,
 and validating the **starting** directory changes nothing about that. Real
 confinement is OS-level — mount namespaces, bubblewrap, a container per
-command — and the trial image ships none of them.
+command — and nothing here ships them.
 
 So the boundary here is **authentication**, not the jail:
 

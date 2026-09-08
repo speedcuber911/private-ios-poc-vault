@@ -219,6 +219,7 @@ test("integration: RELAYD_WORKTREE_MODE=true runs the job in a worktree and push
     env: {
       ...process.env,
       CODEX_API_HOST: "127.0.0.1",
+      RELAYD_DIRECT_TLS: "false",  // plain HTTP: these assertions are about the router, not TLS
       CODEX_API_PORT: String(port),
       CODEX_REQUIRE_MTLS: "false",
       CODEX_RUN_HOME: homeDir,

@@ -62,7 +62,7 @@ test("trial node: grant JWT on jobs list is authorized; device token still works
 
   const device = authorize(bearer(deviceToken));
   assert.equal(device.ok, true);
-  assert.equal(device.subject, "trial-device");
+  assert.equal(device.subject, "legacy-device");
 });
 
 test("trial node: grant for another node is 401 with the device-token error string", async () => {

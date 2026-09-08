@@ -22,13 +22,12 @@ import { transcribeAudio, cleanAudioContentType, cleanAudioFilename } from "./tr
 import { jobsState, jobs, activeChildren, responseShape, wantsFullLogs, enqueueJob, cleanJobProviderFilter, normalizeJobProvider, cancelJob, streamJobEvents, toJobResponse } from "./jobs.mjs";
 import { codexThreadUiHtml } from "./ui.mjs";
 import { handleAdditionRoutes } from "./additions.mjs";
-import { computerAccessGate } from "./computeraccess.mjs";
 import { ApprovalStore, publicApproval, terminalDecisions } from "./approval-store.mjs";
 import { createTerminalService } from "./terminals.mjs";
 import { appendAudit } from "./audit.mjs";
 import { emitEvent } from "./events.mjs";
 import { createPreviewService } from "./previews.mjs";
-import { hostedDeviceStore } from "./hosted-device-store.mjs";
+import { deviceTokenStore } from "./device-tokens.mjs";
 import { isRevokedSerial } from "./identity.mjs";
 
 const approvalStore = new ApprovalStore(approvalsDir);
@@ -44,9 +43,10 @@ const terminalService = createTerminalService({
 });
 const previewService = createPreviewService({ jobs, relayPort: port, appendAudit });
 
-// SHA-256 of the device's bearer token, or null when this node authenticates
-// with client certificates instead. Re-read when the file changes, because the
-// daemon starts before pairing has written it.
+// SHA-256 of the LEGACY single device bearer token, when this node was
+// provisioned with one. Re-read when the file changes, because the daemon
+// starts before pairing has written it. A QR-paired node has no such file: its
+// devices live in device-tokens.mjs, one row each.
 let deviceTokenHashCache = { mtimeMs: -1, value: null };
 function deviceTokenHash() {
   const file = process.env.RELAYD_DEVICE_TOKEN_HASH_FILE;
@@ -75,81 +75,92 @@ function bearerToken(header) {
   return match ? match[1].trim() : null;
 }
 
+// One public error for every bearer rejection. Which of the three bearer paths
+// refused, and whether a token is merely unknown or has been revoked, are not
+// the caller's business.
+const badToken = { ok: false, status: 401, error: "device token is not valid" };
+
+// Node-side authorization (spec "Node-side auth after pairing").
+//
+//   1. bearer, JWT-shaped, grant key configured  -> browser grant
+//   2. bearer matching a row in device-tokens    -> that paired device
+//   3. RELAYD_DEVICE_TOKEN_HASH_FILE set         -> legacy single-hash compare
+//   4. otherwise                                 -> mTLS
+//
+// The two modes COEXIST deliberately. Token mode used to be switched on by the
+// mere presence of the legacy hash file, which meant adopting QR pairing would
+// have turned off certificate auth for an existing cert-based install (and
+// vice versa). Ordering by what the request actually carries keeps both alive
+// on one node: a phone paired by QR sends a bearer, a desktop with a client
+// certificate sends none, and each takes its own branch.
+//
+// Why a bearer at all: iOS will not send a client certificate on a connection
+// it did not itself anchor, and declines SILENTLY — the handshake completes
+// with nothing sent and the server sees no failed handshake to report. Proven
+// against a live machine: a certificate minted from the node's own CA
+// authenticated and returned 200, while the phone's — same CA, byte-identical,
+// with a usable key — was never sent at all.
 function authorize(req, { pathname } = {}) {
   const verify = headerValue(req.headers["x-ssl-client-verify"]);
   const subject = headerValue(req.headers["x-ssl-client-s-dn"]);
+  const provided = bearerToken(req.headers.authorization);
+  const legacyHashConfigured = Boolean(process.env.RELAYD_DEVICE_TOKEN_HASH_FILE);
 
-  // Token authentication, when this node was paired with a device token.
-  //
-  // A trial machine cannot use client certificates: iOS will not send one on
-  // a connection it did not itself anchor, and on a machine whose certificate
-  // is publicly trusted it declines silently — the handshake dies with the
-  // client having sent nothing, and the machine sees no failed handshake to
-  // report. Proven against a live machine: a certificate minted from the
-  // node's own CA authenticated and returned 200, while the phone's — the
-  // same CA, byte-identical, with a usable key — was never sent at all.
-  //
-  // The token is derived from the same single-use pairing secret that already
-  // authenticates pairing, so no new secret crosses the wire and the pairing
-  // protocol is unchanged. Only its SHA-256 is stored here, and it is compared
-  // in constant time.
-  //
-  // Browser grants are also Authorization: Bearer. Precedence lives inside
-  // this first branch so trial traffic actually reaches it (spec §3.3):
-  // 1. Read bearer.
-  // 2. If JWT-shaped (exactly 3 base64url segments) AND grant public key
-  //    configured: verify grant; payload.node === thisNodeId; exp valid; if
-  //    pathname is an activity read, require matching scope. Fail → 401
-  //    { error: "device token is not valid" } (identical public error).
-  // 3. Else if deviceTokenHash() set: existing hash compare.
-  // 4. Else: existing mTLS path.
-  // Never hash a JWT and compare it to deviceTokenHash.
-  const expected = deviceTokenHash();
-  if (process.env.RELAYD_DEVICE_TOKEN_HASH_FILE) {
-    const provided = bearerToken(req.headers.authorization);
-    if (!provided) {
-      return { ok: false, status: 401, error: "device token is required" };
-    }
+  if (provided) {
+    // 1. Browser grant. Only ever entered when an operator configured
+    //    RELAYD_GRANT_PUBLIC_KEY; without it browser grants are simply off and
+    //    a JWT-shaped bearer is treated as any other opaque token.
     if (isJwtShaped(provided) && grantPublicKey) {
-      const grant = verifyBrowserGrant(provided, {
-        publicKey: grantPublicKey,
-        nodeId,
-      });
+      const grant = verifyBrowserGrant(provided, { publicKey: grantPublicKey, nodeId });
       const needed = activityScope(req.method, pathname);
       if (grant.ok && scopeCovers(grant.payload.scope, needed)) {
         return { ok: true, subject: "browser-grant" };
       }
-      return { ok: false, status: 401, error: "device token is not valid" };
+      return badToken;
     }
+
     const actual = crypto.createHash("sha256").update(provided, "utf8").digest("hex");
-    let device, registeredLegacy;
+
+    // 2. A device paired with this node. Never hash a JWT into this lookup —
+    //    the branch above has already returned for anything grant-shaped.
+    let device;
+    let registeredLegacy;
     try {
-      const deviceStore = hostedDeviceStore();
-      device = deviceStore?.find(actual);
-      registeredLegacy = deviceStore?.wasRegisteredLegacy(actual);
+      const tokens = deviceTokenStore();
+      device = tokens?.find(actual);
+      registeredLegacy = tokens?.wasRegisteredLegacy(actual);
+    } catch {
+      return badToken;
     }
-    catch { return { ok: false, status: 401, error: "device token is not valid" }; }
     if (device) {
       if (device.disabled || device.notAfter <= Date.now() || isRevokedSerial(device.certSerial)) {
-        return { ok: false, status: 401, error: "device token is not valid" };
+        return badToken;
       }
-      const computerAccess = computerAccessGate.authorize();
-      if (!computerAccess.ok) return computerAccess;
-      return { ok: true, subject: `hosted-device:${device.deviceId}`, deviceId: device.deviceId };
+      return { ok: true, subject: `device:${device.deviceId}`, deviceId: device.deviceId };
     }
-    if (registeredLegacy) {
-      return { ok: false, status: 401, error: "device token is not valid" };
+
+    // 3. Legacy single-hash install. `registeredLegacy` is a permanent denial
+    //    tombstone: a token that was ever a per-device credential must not fall
+    //    back to the shared hash after its row expires or is revoked.
+    if (legacyHashConfigured && !registeredLegacy) {
+      const a = Buffer.from(actual, "utf8");
+      const b = Buffer.from(deviceTokenHash() || "", "utf8");
+      if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
+        return { ok: true, subject: "legacy-device" };
+      }
     }
-    const a = Buffer.from(actual, "utf8");
-    const b = Buffer.from(expected || "", "utf8");
-    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-      return { ok: false, status: 401, error: "device token is not valid" };
-    }
-    const computerAccess = computerAccessGate.authorize();
-    if (!computerAccess.ok) return computerAccess;
-    return { ok: true, subject: "trial-device" };
+    return badToken;
   }
 
+  // No bearer. A legacy token-mode node has no other credential to offer, so
+  // it keeps its historical error rather than falling through to a client
+  // certificate it was never configured for.
+  if (legacyHashConfigured) {
+    return { ok: false, status: 401, error: "device token is required" };
+  }
+
+  // 4. mTLS, terminated either by this process (tunnel / direct TLS) or by a
+  //    reverse proxy that forwards x-ssl-client-*.
   if (!requireMtls) {
     return { ok: true, subject: subject || null };
   }

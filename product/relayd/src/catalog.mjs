@@ -137,9 +137,9 @@ function defaultModelCatalog() {
     });
   }
   // Bedrock is opt-in, exactly like Azure below it. It was unconditional, so
-  // every node — including every trial sandbox — advertised a "Claude Sonnet
-  // (Bedrock)" chat model that could not work: Bedrock needs AWS credentials
-  // and a region that a trial sandbox has never had. The old default id was a
+  // every node advertised a "Claude Sonnet (Bedrock)" chat model that could
+  // not work: Bedrock needs AWS credentials and a region that a machine set up
+  // for direct subscriptions does not have. The old default id was a
   // hard-coded model arn, and `bedrockRegion` cannot serve as the gate because
   // it falls back to "us-east-1" whether or not anyone configured Bedrock.
   // Setting BEDROCK_CHAT_MODEL is the deliberate act that turns it on.

@@ -24,11 +24,27 @@ function fakeCloud(script) {
   };
 }
 
-const TRIAL = {
-  trial: { id: "t1", state: "ready", nodeId: "node-00112233445566aa", nodeEncPubkey: "a".repeat(43) + "=", sni: "x.tun.test", createdAt: 1, expiresAt: 2 },
+// Several tests below drive a login for an account with no registered machine
+// — they are asserting on the QR/prompt prologue, not on the pin. That login
+// now ends with a non-zero exit (a thrown no_machine), which is the behavior
+// its own test asserts; here it is expected and swallowed so the assertions
+// that follow still run.
+async function loginIgnoringNoMachine(args, deps) {
+  try {
+    await cmdLogin(args, deps);
+  } catch (error) {
+    if (!/no_machine/.test(error?.message || "")) throw error;
+  }
+}
+
+const NODE_ENC_PUBKEY = "a".repeat(43) + "=";
+const NODES = {
+  nodes: [
+    { id: "node-00112233445566aa", kind: "byo", name: "workshop", encPubkey: NODE_ENC_PUBKEY, lastSeen: 100, createdAt: 1 },
+  ],
 };
 
-test("login polls until approval, then pins the sandbox identity", async () => {
+test("login polls until approval, then pins the machine identity", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-login-"));
   let tokenCalls = 0;
   const cloud = fakeCloud({
@@ -39,7 +55,7 @@ test("login polls until approval, then pins the sandbox identity", async () => {
         ? { status: 400, json: { error: "authorization_pending" } }
         : { status: 200, json: { sessionToken: "sess", refreshToken: "ref", accountId: "acct", expiresIn: 900 } };
     },
-    "/v1/trial-nodes/current": { status: 200, json: TRIAL },
+    "/v1/nodes": { status: 200, json: NODES },
   });
   const lines = [];
 
@@ -57,7 +73,7 @@ test("login polls until approval, then pins the sandbox identity", async () => {
   const stored = readCredentials({ home });
   assert.equal(stored.sessionToken, "sess");
   assert.equal(stored.nodeId, "node-00112233445566aa");
-  assert.equal(stored.nodeEncPubkey, TRIAL.trial.nodeEncPubkey);
+  assert.equal(stored.nodeEncPubkey, NODE_ENC_PUBKEY);
   assert.ok(!lines.join("\n").includes("sess"), "the session token is never printed");
   assert.ok(!lines.join("\n").includes("dc"), "the device code is never printed");
 });
@@ -67,11 +83,11 @@ test("login sends machineName and normalized platform, and --no-qr skips the QR"
   const cloud = fakeCloud({
     "/v1/auth/device/start": { status: 201, json: { deviceCode: "dc", userCode: "ABCD-EFGH", verificationUri: "https://relay.test/cli-login", verificationUriComplete: "https://relay.test/cli-login#code=ABCD-EFGH", interval: 1, expiresIn: 900 } },
     "/v1/auth/device/token": { status: 200, json: { sessionToken: "sess", refreshToken: "ref", accountId: "acct" } },
-    "/v1/trial-nodes/current": { status: 404, json: { error: "no_trial" } },
+    "/v1/nodes": { status: 200, json: { nodes: [] } },
   });
   const lines = [];
 
-  await cmdLogin(["--no-qr"], {
+  await loginIgnoringNoMachine(["--no-qr"], {
     home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl,
     log: (line) => lines.push(line), sleep: async () => {},
     hostname: () => "dev-box.local",
@@ -92,11 +108,11 @@ test("Terminal.app uses the glyph-free square QR renderer while iTerm stays comp
   const cloud = fakeCloud({
     "/v1/auth/device/start": { status: 201, json: { deviceCode: "dc", userCode: "ABCD-EFGH", verificationUri: "https://relay.test/cli-login", verificationUriComplete: "https://relay.test/cli-login#code=ABCD-EFGH", interval: 1, expiresIn: 900 } },
     "/v1/auth/device/token": { status: 200, json: { sessionToken: "sess", refreshToken: "ref", accountId: "acct" } },
-    "/v1/trial-nodes/current": { status: 404, json: { error: "no_trial" } },
+    "/v1/nodes": { status: 200, json: { nodes: [] } },
   });
   const lines = [];
 
-  await cmdLogin([], {
+  await loginIgnoringNoMachine([], {
     home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl,
     log: (line) => lines.push(line), sleep: async () => {},
     env: { TERM_PROGRAM: "Apple_Terminal" },
@@ -114,11 +130,11 @@ test("Terminal.app skips a square QR that would wrap in a narrow window", async 
   const cloud = fakeCloud({
     "/v1/auth/device/start": { status: 201, json: { deviceCode: "dc", userCode: "ABCD-EFGH", verificationUri: "https://relay.test/cli-login", verificationUriComplete: "https://relay.test/cli-login#code=ABCD-EFGH", interval: 1, expiresIn: 900 } },
     "/v1/auth/device/token": { status: 200, json: { sessionToken: "sess", refreshToken: "ref", accountId: "acct" } },
-    "/v1/trial-nodes/current": { status: 404, json: { error: "no_trial" } },
+    "/v1/nodes": { status: 200, json: { nodes: [] } },
   });
   const lines = [];
 
-  await cmdLogin([], {
+  await loginIgnoringNoMachine([], {
     home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl,
     log: (line) => lines.push(line), sleep: async () => {},
     env: { TERM_PROGRAM: "Apple_Terminal" },
@@ -131,21 +147,52 @@ test("Terminal.app skips a square QR that would wrap in a narrow window", async 
   assert.match(output, /Approve at:\s+https:\/\/relay\.test\/cli-login/);
 });
 
-test("login reports plainly when the account has no sandbox yet", async () => {
+test("login exits non-zero, but keeps the session, when the account has no machine", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-login-nonode-"));
   const cloud = fakeCloud({
     "/v1/auth/device/start": { status: 201, json: { deviceCode: "dc", userCode: "ABCD-EFGH", verificationUri: "https://relay.test/cli-login", interval: 1, expiresIn: 900 } },
     "/v1/auth/device/token": { status: 200, json: { sessionToken: "sess", refreshToken: "ref", accountId: "acct" } },
-    "/v1/trial-nodes/current": { status: 404, json: { error: "no_trial" } },
+    "/v1/nodes": { status: 200, json: { nodes: [] } },
+  });
+  const lines = [];
+
+  // bin/relay turns a throw into process.exit(1). Signing in succeeded, so the
+  // session must survive; only the PIN is missing, and the user is told exactly
+  // what to do about it.
+  await assert.rejects(
+    () => cmdLogin([], { home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl,
+      log: (line) => lines.push(line), sleep: async () => {} }),
+    /no_machine/,
+  );
+
+  assert.equal(readCredentials({ home }).sessionToken, "sess", "the session is still saved");
+  assert.equal(readCredentials({ home }).nodeId, null);
+  assert.match(lines.join("\n"), /No machine is registered/i);
+  assert.match(lines.join("\n"), /relayd pair/);
+  assert.ok(cloud.calls.some((call) => call.pathname === "/v1/nodes"), "the pin comes from GET /v1/nodes");
+});
+
+test("with several machines, login pins the most recently seen and names it", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-login-multi-"));
+  const cloud = fakeCloud({
+    "/v1/auth/device/start": { status: 201, json: { deviceCode: "dc", userCode: "ABCD-EFGH", verificationUri: "u", interval: 1, expiresIn: 900 } },
+    "/v1/auth/device/token": { status: 200, json: { sessionToken: "sess", refreshToken: "ref", accountId: "acct" } },
+    "/v1/nodes": { status: 200, json: { nodes: [
+      { id: "node-old", kind: "byo", name: "attic", encPubkey: null, lastSeen: 10, createdAt: 1 },
+      { id: "node-new", kind: "byo", name: "workshop", encPubkey: NODE_ENC_PUBKEY, lastSeen: 900, createdAt: 2 },
+      { id: "node-never", kind: "byo", name: "spare", encPubkey: null, lastSeen: null, createdAt: 3 },
+    ] } },
   });
   const lines = [];
 
   await cmdLogin([], { home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl,
     log: (line) => lines.push(line), sleep: async () => {} });
 
-  assert.equal(readCredentials({ home }).sessionToken, "sess", "the session is still saved");
-  assert.equal(readCredentials({ home }).nodeId, null);
-  assert.match(lines.join("\n"), /no machine yet/i);
+  assert.equal(readCredentials({ home }).nodeId, "node-new");
+  assert.equal(readCredentials({ home }).nodeEncPubkey, NODE_ENC_PUBKEY);
+  const output = lines.join("\n");
+  assert.match(output, /3 machines on this account/);
+  assert.match(output, /workshop \(node-new\)/, "the chosen machine is named, not silently picked");
 });
 
 test("an expired device code aborts with a clear message", async () => {
@@ -168,11 +215,11 @@ test("a hostile negative poll interval from the server is clamped, never passed 
   const cloud = fakeCloud({
     "/v1/auth/device/start": { status: 201, json: { deviceCode: "dc", userCode: "ABCD-EFGH", verificationUri: "u", interval: -1, expiresIn: 900 } },
     "/v1/auth/device/token": { status: 200, json: { sessionToken: "sess", refreshToken: "ref", accountId: "acct" } },
-    "/v1/trial-nodes/current": { status: 404, json: { error: "no_trial" } },
+    "/v1/nodes": { status: 200, json: { nodes: [] } },
   });
   const sleeps = [];
 
-  await cmdLogin([], { home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl,
+  await loginIgnoringNoMachine([], { home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl,
     log: () => {}, sleep: async (ms) => { sleeps.push(ms); } });
 
   assert.ok(sleeps.length > 0, "the loop must have slept at least once");
@@ -191,11 +238,11 @@ test("a huge or Infinity poll interval from the server is capped, never overflow
     const cloud = fakeCloud({
       "/v1/auth/device/start": { status: 201, json: { deviceCode: "dc", userCode: "ABCD-EFGH", verificationUri: "u", interval: hostileInterval, expiresIn: 900 } },
       "/v1/auth/device/token": { status: 200, json: { sessionToken: "sess", refreshToken: "ref", accountId: "acct" } },
-      "/v1/trial-nodes/current": { status: 404, json: { error: "no_trial" } },
+      "/v1/nodes": { status: 200, json: { nodes: [] } },
     });
     const sleeps = [];
 
-    await cmdLogin([], { home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl,
+    await loginIgnoringNoMachine([], { home, baseUrl: "https://cloud.test", fetchImpl: cloud.fetchImpl,
       log: () => {}, sleep: async (ms) => { sleeps.push(ms); } });
 
     assert.ok(sleeps.length > 0, "the loop must have slept at least once");

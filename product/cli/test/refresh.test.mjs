@@ -61,7 +61,7 @@ test("proactive refresh fires when session exp is within 60 seconds", async () =
       status: 200,
       json: { sessionToken: mintJwt({ exp: Math.floor(nowMs / 1000) + 900 }), refreshToken: "refresh-new", accountId: "acct" },
     },
-    "/v1/trial-nodes/current": { status: 200, json: { trial: { nodeId: "node-1" } } },
+    "/v1/nodes": { status: 200, json: { nodes: [{ id: "node-1" }] } },
   });
 
   const api = createCloudApi({
@@ -72,11 +72,11 @@ test("proactive refresh fires when session exp is within 60 seconds", async () =
     fetchImpl: cloud.fetchImpl,
     now: () => nowMs,
   });
-  const res = await api.currentTrial();
+  const res = await api.listNodes();
   assert.equal(res.status, 200);
   assert.equal(cloud.calls[0].pathname, "/v1/auth/refresh");
   assert.equal(cloud.calls[0].body.refreshToken, "refresh-old");
-  assert.equal(cloud.calls[1].pathname, "/v1/trial-nodes/current");
+  assert.equal(cloud.calls[1].pathname, "/v1/nodes");
   assert.match(cloud.calls[1].authorization, /^Bearer /);
   assert.notEqual(cloud.calls[1].authorization, `Bearer ${sessionToken}`);
 
@@ -92,17 +92,17 @@ test("a 401 triggers refresh once and retries the original request exactly once"
   const sessionToken = mintJwt({ exp: Math.floor(nowMs / 1000) + 900 });
   writeCredentials({ sessionToken, refreshToken: "refresh-old", accountId: "acct" }, { home });
 
-  let trialHits = 0;
+  let nodeHits = 0;
   const freshSession = mintJwt({ exp: Math.floor(nowMs / 1000) + 1800 });
   const cloud = fakeFetch({
     "/v1/auth/refresh": {
       status: 200,
       json: { sessionToken: freshSession, refreshToken: "refresh-new", accountId: "acct" },
     },
-    "/v1/trial-nodes/current": () => {
-      trialHits += 1;
-      if (trialHits === 1) return { status: 401, json: { error: "unauthorized" } };
-      return { status: 200, json: { trial: { nodeId: "node-1" } } };
+    "/v1/nodes": () => {
+      nodeHits += 1;
+      if (nodeHits === 1) return { status: 401, json: { error: "unauthorized" } };
+      return { status: 200, json: { nodes: [{ id: "node-1" }] } };
     },
   });
 
@@ -114,11 +114,11 @@ test("a 401 triggers refresh once and retries the original request exactly once"
     fetchImpl: cloud.fetchImpl,
     now: () => nowMs,
   });
-  const res = await api.currentTrial();
+  const res = await api.listNodes();
   assert.equal(res.status, 200);
   assert.deepEqual(
     cloud.calls.map((c) => c.pathname),
-    ["/v1/trial-nodes/current", "/v1/auth/refresh", "/v1/trial-nodes/current"],
+    ["/v1/nodes", "/v1/auth/refresh", "/v1/nodes"],
   );
   assert.equal(cloud.calls[2].authorization, `Bearer ${freshSession}`);
   assert.equal(readCredentials({ home }).refreshToken, "refresh-new");
@@ -147,7 +147,7 @@ test("refresh failure prints a friendly hint, exits non-zero, and leaves creds i
     exit: (code) => { exitCode = code; throw new Error(`exit_${code}`); },
   });
 
-  await assert.rejects(() => api.currentTrial(), /exit_1|session_expired/);
+  await assert.rejects(() => api.listNodes(), /exit_1|session_expired/);
   assert.equal(exitCode, 1);
   assert.equal(logs.join("\n"), "Session expired — run `relay login`");
   assert.equal(readCredentials({ home }).refreshToken, "refresh-old", "creds must remain on disk");

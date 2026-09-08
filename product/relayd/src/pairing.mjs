@@ -1,11 +1,22 @@
 // relayd pairing.mjs — pairing protocol v2 (API.md §2.3).
 //
 // WHO HOLDS WHAT
-//   The NODE originates the pairing secret (`relayd pair` prints a short code
-//   and a long token). The PHONE receives it out of band — QR scan or typed
-//   code. The CLOUD, when it is used at all, relays opaque bytes and is told
-//   ONLY a derived authToken; it never possesses the secret and therefore can
-//   never derive the MAC key that authenticates the relayed blobs.
+//   The NODE originates the pairing secret — a 24-byte token. The PHONE
+//   receives it out of band: scanned from the QR, or pasted. The CLOUD, when it
+//   is used at all, relays opaque bytes and is told ONLY a derived authToken;
+//   it never possesses the secret and therefore can never derive the MAC key
+//   that authenticates the relayed blobs.
+//
+//   THE SHORT CODE IS NOT A CREDENTIAL. `relayd pair` also prints an
+//   eight-character code, but redeeming on it is impossible by construction:
+//   every key in this protocol — macKey, p12pass, the device token — is derived
+//   from the TOKEN, so a caller holding only the code cannot produce a device
+//   blob tag the node will accept. Making the code redeemable would mean
+//   deriving macKey from ~40 bits of entropy, and one captured blob+tag pair
+//   would then be brute-forcible offline, which is the entire integrity
+//   argument for the rendezvous. The code is instead a NUMERIC-COMPARISON
+//   confirmation, in the Bluetooth sense: the node returns it in the node blob,
+//   the app shows it, and the human checks it against the terminal.
 //
 // DERIVATION (both peers, never the cloud)
 //   secret    = the long pairing token (>= 24 random bytes, base64url)
@@ -41,13 +52,25 @@
 // and no private key material of any kind.
 
 import crypto from "node:crypto";
+import fs from "node:fs";
 import http from "node:http";
+import https from "node:https";
 
 import { sendJson, sendError, readBody, nowIso } from "./util.mjs";
 import { appendAudit } from "./audit.mjs";
-import { issueDeviceCert, initIdentity, publicDevice } from "./identity.mjs";
+import {
+  issueDeviceCert,
+  initIdentity,
+  publicDevice,
+  mintDeviceP12,
+  caSpkiFingerprint,
+  nodeServerTlsOptions,
+  identityPaths,
+  readEncPublicKeyB64,
+} from "./identity.mjs";
 import { emitEvent } from "./events.mjs";
 import { store } from "./store.mjs";
+import { deviceTokenStore } from "./device-tokens.mjs";
 import {
   pairingEnabled,
   pairingHost,
@@ -56,6 +79,9 @@ import {
   pairingEndpointUrl,
   pairingIsLoopbackOnly,
   allowCertSubject,
+  apiBaseUrl,
+  pairLinkBase,
+  servesTls,
 } from "./config.mjs";
 
 const pairingTtlMs = 15 * 60 * 1000;
@@ -68,6 +94,14 @@ const NODE_SLOT = "node-blob";
 
 const AUTH_LABEL = "relay-pair-auth-v1";
 const MAC_LABEL = "relay-pair-mac-v1";
+
+// Two more derivations from the same single-use secret, for the MINT variant
+// (a phone with no CSR stack). Deriving rather than transmitting means the
+// envelope is unchanged: no new field, no second blob, nothing extra to
+// intercept. The labels are wire values shared with the Swift implementation
+// in ios/.../RelayPairing.swift — never rename them.
+const P12_LABEL = "relay-trial-p12-v1";
+const DEVICE_TOKEN_LABEL = "relay-device-token-v1";
 
 // Bound on a relayed blob; matches the cloud's PAIRING_BLOB_MAX_BYTES default.
 const maxBlobBytes = 64 * 1024;
@@ -125,8 +159,11 @@ function randomCode() {
   return chars.join("");
 }
 
-function normalizeCode(value) {
-  return String(value || "").trim().toUpperCase().replace(/[^A-Z0-9-]/g, "");
+// Shape of the printed confirmation code (see randomCode). Used only to give a
+// caller who typed it a straight answer; it is never matched against a session.
+function looksLikeVerificationCode(value) {
+  return /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{4}-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{4}$/
+    .test(String(value || "").trim().toUpperCase());
 }
 
 function prunePairingSessions(nowMs = Date.now()) {
@@ -197,9 +234,9 @@ function verifyBlobTag(macKey, slotName, blob, tag) {
 // ---------------------------------------------------------------------------
 
 // Creates a single-use pairing session and PERSISTS it, so the running daemon
-// (a different process from `relayd pair`) can redeem it. `code` is the short
-// human code; `token` is the long secret for QR/universal-link payloads.
-// Either redeems the session.
+// (a different process from `relayd pair`) can redeem it. `token` is the secret
+// and the only thing that redeems the session; `code` is the confirmation
+// string the human compares between the terminal and the phone.
 function createPairingSession() {
   prunePairingSessions();
   const identity = initIdentity();
@@ -217,18 +254,49 @@ function createPairingSession() {
   return session;
 }
 
-// otpauth-style + link forms for the CLI printout (05-onboarding §4.2).
-// Domains are placeholders — no live endpoints belong here. `pairUrl` is the
-// address the phone POSTs /v1/pair to.
-function pairingPresentation(session, { linkBase = process.env.RELAYD_PAIR_LINK_BASE || "https://get.<domain>/pair" } = {}) {
-  const url = `${linkBase}#node=${encodeURIComponent(session.nodeId)}&token=${session.token}`;
+// The QR / universal-link payload (spec "QR payload"):
+//
+//   https://get.openrelay.sh/pair#v=1&n=<nodeId>&m=<nodeName>&t=<token>
+//                                &p=<base64url(pairEndpointUrl)>
+//                                &a=<base64url(apiBaseUrl)>
+//                                &f=<base64url(sha256(node CA SPKI))>
+//
+// Everything rides in the FRAGMENT, which no HTTP client ever sends to a
+// server: the origin is a universal-link target, so a generic camera app shows
+// something tappable, but it never learns the pairing token. The in-app scanner
+// parses the same string directly and never opens a browser at all.
+//
+// `f` is the bootstrap pin. The node signs its own TLS certificate, so the
+// phone's very first request has nothing to trust; plain HTTP is not an option
+// because the token travels in that request. The QR came off the user's own
+// terminal, so it is itself an authenticated out-of-band channel and carries
+// the pin. It is taken over the node CA's SubjectPublicKeyInfo rather than a
+// leaf, so `ensureServerCert` can rotate the server certificate without
+// invalidating already-printed codes.
+function pairingPresentation(session, { linkBase = pairLinkBase } = {}) {
+  const b64 = (value) => Buffer.from(String(value), "utf8").toString("base64url");
+  const pairUrl = pairingEndpointUrl();
+  const apiUrl = apiBaseUrl();
+  const caFingerprint = caSpkiFingerprint();
+  const fragment = [
+    "v=1",
+    `n=${encodeURIComponent(session.nodeId)}`,
+    `m=${encodeURIComponent(session.nodeName || session.nodeId)}`,
+    `t=${session.token}`,
+    `p=${b64(pairUrl)}`,
+    `a=${b64(apiUrl)}`,
+    ...(caFingerprint ? [`f=${caFingerprint}`] : []),
+  ].join("&");
+  const url = `${linkBase}#${fragment}`;
   const otpauthUrl = `otpauth://relay-pair/${encodeURIComponent(session.nodeName || session.nodeId)}?secret=${session.token}&issuer=relayd&node=${encodeURIComponent(session.nodeId)}`;
   return {
     code: session.code,
     url,
     otpauthUrl,
     expiresAt: session.expiresAt,
-    pairUrl: pairingEndpointUrl(),
+    pairUrl,
+    apiBaseUrl: apiUrl,
+    caFingerprint,
     pairListenerEnabled: pairingEnabled,
     pairListenerLoopbackOnly: pairingIsLoopbackOnly(),
     // The cloud rendezvous is told this and only this.
@@ -243,24 +311,34 @@ function timingSafeEqualString(left, right) {
   return crypto.timingSafeEqual(a, b);
 }
 
-// A used code is indistinguishable from an expired one (403 either way).
+// A used token is indistinguishable from an expired one (403 either way).
 // The claim is atomic across processes (store.consumePairingSession — O_EXCL
 // create on json, exclusive write transaction on sqlite), so two concurrent
-// redemptions of the same code cannot both succeed even when they are served
+// redemptions of the same token cannot both succeed even when they are served
 // by two different daemons sharing one data dir.
+//
+// ONLY the token matches. See the header: the short code is a confirmation
+// string, and accepting it here would make it the MAC key.
 function consumePairingSecret(rawValue, { source = null } = {}) {
   const now = Date.now();
+  const rawToken = String(rawValue || "").trim();
+
+  // Someone typed the confirmation code into the token field. This is a pure
+  // shape test against no session at all, so it discloses nothing and costs
+  // nobody's rate budget — it just replaces a baffling 403 with the truth.
+  if (looksLikeVerificationCode(rawToken)) {
+    throw Object.assign(
+      new Error("that is the confirmation code, not the pairing token — scan the QR or paste the token"),
+      { status: 400 },
+    );
+  }
 
   // Match FIRST. A caller holding the real secret is never gated on a counter
   // that unauthenticated traffic can move.
-  const normalized = normalizeCode(rawValue);
-  const rawToken = String(rawValue || "").trim();
   let matched = null;
   for (const session of store.listPairingSessions()) {
     if (Date.parse(session.expiresAt) <= now) continue;
-    const codeMatch = normalized.length > 0 && timingSafeEqualString(session.code, normalized);
-    const tokenMatch = rawToken.length > 0 && timingSafeEqualString(session.token, rawToken);
-    if (codeMatch || tokenMatch) {
+    if (rawToken.length > 0 && timingSafeEqualString(session.token, rawToken)) {
       matched = session;
       break;
     }
@@ -270,14 +348,14 @@ function consumePairingSecret(rawValue, { source = null } = {}) {
     // Exactly one caller wins this claim; the loser falls through to 403 and,
     // having matched a real session, still spends nobody's budget.
     if (store.consumePairingSession(matched.id)) return matched;
-    throw Object.assign(new Error("pairing code is invalid or expired"), { status: 403 });
+    throw Object.assign(new Error("pairing token is invalid or expired"), { status: 403 });
   }
 
   pruneAttempts(now);
   if (!recordFailedAttempt(normalizeSource(source), now)) {
     throw Object.assign(new Error("too many pairing attempts"), { status: 429 });
   }
-  throw Object.assign(new Error("pairing code is invalid or expired"), { status: 403 });
+  throw Object.assign(new Error("pairing token is invalid or expired"), { status: 403 });
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +366,54 @@ function consumePairingSecret(rawValue, { source = null } = {}) {
 // the CSR is parsed or anything is issued, which is precisely what makes a
 // control-plane blob substitution fail closed.
 // ---------------------------------------------------------------------------
+
+// hex( hmac-sha256(secret, "relay-trial-p12-v1") ) — the PKCS#12 passphrase
+// for the mint variant. Both peers derive it; it is never transmitted.
+function p12Passphrase(secret) {
+  return crypto.createHmac("sha256", Buffer.from(String(secret), "utf8")).update(P12_LABEL).digest("hex");
+}
+
+// hex( hmac-sha256(secret, "relay-device-token-v1") ) — the paired device's
+// bearer token. Also derived on both sides; the node keeps only its sha256.
+function deviceToken(secret) {
+  return crypto.createHmac("sha256", Buffer.from(String(secret), "utf8")).update(DEVICE_TOKEN_LABEL).digest("hex");
+}
+
+function deviceTokenHashOf(secret) {
+  return crypto.createHash("sha256").update(deviceToken(secret), "utf8").digest("hex");
+}
+
+// Public key material every paired device is handed, whatever the variant.
+//
+// `encPubkey` is load-bearing beyond pairing: `relay handoff` seals a session
+// to this X25519 key, and since trial enrolment (the only other publisher of
+// it) is gone, pairing is now the ONLY way a phone can learn it. A signed-in
+// user later registers the machine with POST /v1/nodes carrying both.
+function nodePublicKeys() {
+  const paths = identityPaths();
+  let pubkey = null;
+  try {
+    pubkey = fs.readFileSync(paths.identityPubPath, "utf8");
+  } catch {
+    pubkey = null;
+  }
+  return { pubkey, encPubkey: readEncPublicKeyB64(paths) };
+}
+
+// Allowlists the subject THIS node just minted — the whole point of pairing is
+// that this device is now trusted. Never widens to anything the node did not
+// itself issue in this exchange.
+function autoAllowIssuedSubject(issued) {
+  if (!pairingAutoAllow || !issued.device?.certSubject) return;
+  if (allowCertSubject(issued.device.certSubject, { reason: "paired", deviceId: issued.deviceId })) {
+    appendAudit("cert_subject_allowlisted", null, {
+      deviceId: issued.deviceId,
+      certSerial: issued.certSerial,
+      certSubject: issued.device.certSubject,
+      reason: "paired",
+    });
+  }
+}
 
 function redeemPairing({ secret, deviceBlob, deviceTag, source = null }) {
   const blob = Buffer.isBuffer(deviceBlob) ? deviceBlob : Buffer.from(String(deviceBlob ?? ""), "utf8");
@@ -315,40 +441,61 @@ function redeemPairing({ secret, deviceBlob, deviceTag, source = null }) {
   if (!request || typeof request !== "object" || Array.isArray(request)) {
     throw Object.assign(new Error("pairing blob is invalid"), { status: 400 });
   }
-  if (typeof request.csrPem !== "string" || !request.csrPem.trim()) {
-    throw Object.assign(new Error("csrPem is required"), { status: 400 });
+
+  const deviceName = typeof request.deviceName === "string" ? request.deviceName : null;
+  const platform = typeof request.platform === "string" ? request.platform : null;
+  const wantsMint = request.mint === "p12";
+  const hasCsr = typeof request.csrPem === "string" && request.csrPem.trim().length > 0;
+  if (!wantsMint && !hasCsr) {
+    // Neither variant. The message names both so a caller that sent an empty
+    // or misspelled field can tell which half of the contract it missed.
+    throw Object.assign(new Error("csrPem or mint is required"), { status: 400 });
+  }
+  if (wantsMint && request.mint !== "p12") {
+    throw Object.assign(new Error("mint must be p12"), { status: 400 });
   }
 
-  const issued = issueDeviceCert({
-    csrPem: request.csrPem,
-    deviceName: typeof request.deviceName === "string" ? request.deviceName : null,
-    platform: typeof request.platform === "string" ? request.platform : null,
-  });
+  const keys = nodePublicKeys();
+  let issued;
+  let body;
 
-  // Explicit, audited allowlisting of the subject THIS node just minted — the
-  // whole point of pairing is that this device is now trusted. Never widens to
-  // anything the node did not itself issue in this exchange.
-  if (pairingAutoAllow && issued.device?.certSubject) {
-    if (allowCertSubject(issued.device.certSubject, { reason: "paired", deviceId: issued.deviceId })) {
-      appendAudit("cert_subject_allowlisted", null, {
-        deviceId: issued.deviceId,
-        certSerial: issued.certSerial,
-        certSubject: issued.device.certSubject,
-        reason: "paired",
-      });
-    }
-  }
-
-  appendAudit("device_paired", null, {
-    sessionId: session.id,
-    deviceId: issued.deviceId,
-    certSerial: issued.certSerial,
-  });
-  emitEvent("device.paired", publicDevice(issued.device));
-
-  // Exactly the historical v1 201 body — now carried as an authenticated blob.
-  const nodeBlob = Buffer.from(
-    JSON.stringify({
+  if (wantsMint) {
+    // MINT VARIANT — the phone has no CSR stack, so the node generates the
+    // keypair, issues the certificate against its own CA, and returns both in
+    // a PKCS#12 encrypted under a passphrase derived from the pairing secret.
+    // No private key crosses in cleartext, and no secret crosses that both
+    // sides cannot already derive.
+    issued = mintDeviceP12({ deviceName, platform, passphrase: p12Passphrase(session.token) });
+    autoAllowIssuedSubject(issued);
+    // The bearer credential this device will present on the data listener.
+    // Recorded BEFORE the node blob is handed back: the phone can present the
+    // token the moment it has the secret, and a node that rejected it in the
+    // interval would look exactly like a failed pairing.
+    deviceTokenStore().registerDevice({
+      pairingId: session.id,
+      deviceId: issued.deviceId,
+      tokenHash: deviceTokenHashOf(session.token),
+      certSerial: issued.certSerial,
+      notAfter: Date.parse(issued.notAfter),
+    });
+    body = {
+      deviceId: issued.deviceId,
+      p12: issued.p12.toString("base64"),
+      caPem: issued.caPem,
+      nodeId: issued.nodeId,
+      nodeName: issued.nodeName,
+      certSerial: issued.certSerial,
+      notAfter: issued.notAfter,
+      apiBaseUrl: apiBaseUrl(),
+      verificationCode: session.code,
+      ...keys,
+    };
+  } else {
+    // CSR VARIANT — unchanged: the caller made its own keypair and the private
+    // key never existed on this machine.
+    issued = issueDeviceCert({ csrPem: request.csrPem, deviceName, platform });
+    autoAllowIssuedSubject(issued);
+    body = {
       deviceId: issued.deviceId,
       certificatePem: issued.certificatePem,
       caPem: issued.caPem,
@@ -356,9 +503,21 @@ function redeemPairing({ secret, deviceBlob, deviceTag, source = null }) {
       nodeName: issued.nodeName,
       certSerial: issued.certSerial,
       notAfter: issued.notAfter,
-    }),
-    "utf8",
-  );
+      apiBaseUrl: apiBaseUrl(),
+      verificationCode: session.code,
+      ...keys,
+    };
+  }
+
+  appendAudit("device_paired", null, {
+    sessionId: session.id,
+    deviceId: issued.deviceId,
+    certSerial: issued.certSerial,
+    variant: wantsMint ? "p12" : "csr",
+  });
+  emitEvent("device.paired", publicDevice(issued.device));
+
+  const nodeBlob = Buffer.from(JSON.stringify(body), "utf8");
 
   return { session, issued, nodeBlob, nodeTag: blobTag(macKey, NODE_SLOT, nodeBlob) };
 }
@@ -438,14 +597,20 @@ function sendPairError(res, error) {
 // Dedicated pairing listener. Serves ONLY POST /v1/pair; the data listener
 // never routes it, so a client cert is never required here — the single-use
 // secret plus the blob tag are the authentication.
-function startPairingListener({ host = pairingHost, port = pairingPort } = {}) {
-  const server = http.createServer((req, res) => {
+function startPairingListener({ host = pairingHost, port = pairingPort, tls = servesTls } = {}) {
+  const handler = (req, res) => {
     if (req.method === "POST" && (req.url || "").split("?")[0] === "/v1/pair") {
       handlePairRequest(req, res).catch((error) => sendPairError(res, error));
       return;
     }
     sendError(res, 404, "not found");
-  });
+  };
+  // TLS here is not optional politeness: the pairing token travels INSIDE this
+  // request, so a plaintext pairing listener hands it to any passive listener
+  // on the path. The phone cannot pre-trust a self-signed node, which is why
+  // the QR carries the CA pin (`f=`) — the certificate served here chains to
+  // exactly that CA.
+  const server = tls ? https.createServer(nodeServerTlsOptions(), handler) : http.createServer(handler);
   return new Promise((resolve, reject) => {
     server.on("error", reject);
     server.listen(port, host, () => resolve(server));
@@ -468,10 +633,14 @@ export {
   pairingAuthToken,
   pairingMacKey,
   pairingKeys,
+  p12Passphrase,
+  deviceToken,
+  deviceTokenHashOf,
   blobTag,
   verifyBlobTag,
   createPairingSession,
   pairingPresentation,
+  looksLikeVerificationCode,
   consumePairingSecret,
   prunePairingSessions,
   redeemPairing,

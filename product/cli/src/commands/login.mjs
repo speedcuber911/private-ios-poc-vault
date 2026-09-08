@@ -1,7 +1,7 @@
 // relay login — device-code sign-in via QR (or typed code), then pin the
-// sandbox this machine hands off to. The session token and device code are
-// never printed; only the user code (which is meant to be read aloud) and the
-// key fingerprint are.
+// machine this desk hands off to. The session token and device code are never
+// printed; only the user code (which is meant to be read aloud) and the key
+// fingerprint are.
 import crypto from "node:crypto";
 import os from "node:os";
 
@@ -139,20 +139,20 @@ async function cmdLogin(args = [], deps = {}) {
   //
   // Without this, approving a code with a DIFFERENT account left that account's
   // session sitting next to the previous account's `nodeId`/`nodeEncPubkey`,
-  // because the only thing that overwrote the pin was the trial lookup below —
-  // and that returns early when the new account has no machine. Two accounts,
+  // because the only thing that overwrote the pin was the machine lookup below
+  // — and that returns early when the new account has no machine. Two accounts,
   // one credentials file. Concretely, that mismatch meant:
   //
   //   - `relay handoff` sealed the session blob to the OTHER account's node
   //     public key and pushed it to GitHub before the cloud rejected the row
   //     as `unknown_node`. Content encrypted to someone else's key, published.
   //   - `relay sync-auth` sent THIS machine's GitHub and harness logins to
-  //     whatever sandbox was pinned — the wrong account's sandbox.
+  //     whatever machine was pinned — the wrong account's machine.
   //
   // Clearing unconditionally (not just when the account changes) is deliberate:
-  // the pin is derived from the account's current trial, so a stale pin is
-  // wrong even on a repeat login to the same account whose machine has since
-  // been destroyed.
+  // the pin is derived from the account's registered machines, so a stale pin
+  // is wrong even on a repeat login to the same account whose machine has
+  // since been removed.
   const previous = readCredentials({ home });
   const switchedAccount = Boolean(previous?.accountId)
     && previous.accountId !== session.accountId;
@@ -169,12 +169,12 @@ async function cmdLogin(args = [], deps = {}) {
     // Loud, because this is the shape of an accidental account takeover: the
     // QR is on screen, someone else scans it, and this machine is now theirs.
     // The unpin above already stops a handoff or a credential sync going to
-    // the wrong sandbox, but the operator still needs to know it happened.
+    // the wrong machine, but the operator still needs to know it happened.
     log("  Signed in — but as a DIFFERENT account than this machine used before.");
     log("  The previously pinned machine has been unpinned.");
     log("  If you did not intend this, run relay login again and approve it yourself:");
     log("  `relay sync-auth` would send this machine's GitHub and harness logins");
-    log("  to the newly signed-in account's sandbox.");
+    log("  to the newly signed-in account's machine.");
   } else {
     log("  Signed in.");
   }
@@ -186,17 +186,37 @@ async function cmdLogin(args = [], deps = {}) {
     home,
     fetchImpl,
   });
-  const trial = await authed.currentTrial();
-  if (trial.status !== 200 || !trial.json?.trial?.nodeId) {
-    log("  You have no machine yet — create one in the Relay app, then run relay login again.");
-    return;
+  // The machine this desk hands off to. Relay no longer hands out machines, so
+  // a node exists only because someone ran `relayd pair` on hardware they own
+  // and registered it from the app. An account with none is a user who has not
+  // done that yet — say so and exit non-zero, rather than leaving a signed-in
+  // shell whose next `relay handoff` fails with no recipient.
+  const nodes = await authed.listNodes();
+  const list = nodes.status === 200 && Array.isArray(nodes.json?.nodes) ? nodes.json.nodes : [];
+  if (list.length === 0) {
+    log("  No machine is registered on this account.");
+    log("  Run `relayd pair` on the machine you want to use, scan the QR with the");
+    log("  Relay app, connect it to your account, then run `relay login` again.");
+    throw new Error("no_machine: pair a machine first");
   }
 
-  const { nodeId, nodeEncPubkey } = trial.json.trial;
+  // More than one is legitimate (a laptop and a VM). Pick the one the control
+  // plane heard from most recently and NAME it, because the choice decides
+  // where `relay handoff` sends a sealed session — silence there would be a
+  // wrong-machine bug nobody could see.
+  const chosen = [...list].sort(
+    (a, b) => (Number(b.lastSeen) || 0) - (Number(a.lastSeen) || 0)
+      || (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0),
+  )[0];
+  const nodeId = chosen.id;
+  const nodeEncPubkey = chosen.encPubkey ?? null;
   writeCredentials({ nodeId, nodeEncPubkey }, { home });
-  log(`  Machine:    ${nodeId}`);
+  if (list.length > 1) {
+    log(`  ${list.length} machines on this account — pinning the most recently seen.`);
+  }
+  log(`  Machine:    ${chosen.name ? `${chosen.name} (${nodeId})` : nodeId}`);
   if (nodeEncPubkey) log(`  Key:        ${fingerprint(nodeEncPubkey)}  (compare with the app)`);
-  else log("  Machine has no encryption key yet — update it before handing off.");
+  else log("  Machine has no encryption key yet — re-pair it in the app before handing off.");
 }
 
 export { cmdLogin, fingerprint, normalizePlatform, qrRenderMode };

@@ -1,14 +1,14 @@
 // `relay login` when the machine is already signed in as someone else.
 //
 // Reported from real use: a CLI was signed in and pinned to its owner's
-// sandbox, `relay login` was run again, and a SECOND PERSON scanned the QR and
+// machine, `relay login` was run again, and a SECOND PERSON scanned the QR and
 // approved it with THEIR account.
 //
 // The server side is sound — approval is a one-shot atomic bind, so a code
 // already bound to any account is refused. The defect was entirely in the CLI:
 // writeCredentials merges by design, login wrote only session/refresh/accountId,
-// and the only thing that overwrote the machine pin was the trial lookup — which
-// returns early when the new account has no machine. The result was one
+// and the only thing that overwrote the machine pin was the machine lookup —
+// which bails early when the new account has no machine. The result was one
 // credentials file holding account B's session next to account A's `nodeId` and
 // `nodeEncPubkey`.
 //
@@ -17,7 +17,7 @@
 //     pushes it to GitHub BEFORE the cloud rejects the row as `unknown_node` —
 //     content encrypted to another account's key, published to a remote.
 //   - `relay sync-auth` sends this machine's GitHub and harness logins to
-//     whichever sandbox is pinned.
+//     whichever machine is pinned.
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -32,7 +32,7 @@ const OTHER_KEY = `${"a".repeat(43)}=`;
 const KOMAL_NODE = "node-99887766554433bb";
 const KOMAL_KEY = `${"b".repeat(43)}=`;
 
-function fakeCloud({ accountId, trial }) {
+function fakeCloud({ accountId, node }) {
   return async (url, options = {}) => {
     const { pathname } = new URL(url);
     if (pathname === "/v1/auth/device/start") {
@@ -52,10 +52,8 @@ function fakeCloud({ accountId, trial }) {
         json: async () => ({ sessionToken: "sess2", refreshToken: "ref2", accountId, expiresIn: 900 }),
       };
     }
-    if (pathname === "/v1/trial-nodes/current") {
-      return trial
-        ? { status: 200, json: async () => ({ trial }) }
-        : { status: 404, json: async () => ({ error: "no_trial" }) };
+    if (pathname === "/v1/nodes") {
+      return { status: 200, json: async () => ({ nodes: node ? [node] : [] }) };
     }
     return { status: 500, json: async () => ({ error: "not_part_of_this_test" }) };
   };
@@ -71,19 +69,29 @@ function homeSignedInAsOwner() {
   return home;
 }
 
-const run = (home, fetchImpl, lines) => cmdLogin([], {
-  home, baseUrl: "https://cloud.test", fetchImpl,
-  log: (line) => lines.push(line), sleep: async () => {},
-  stdout: { isTTY: false, columns: 80 },
-});
+// An account with no registered machine now ends the command non-zero (the
+// login itself still succeeds and is saved). Every assertion in this file is
+// about the account-switch bookkeeping that happens BEFORE the pin, so the
+// expected no_machine throw is absorbed here.
+const run = async (home, fetchImpl, lines) => {
+  try {
+    await cmdLogin([], {
+      home, baseUrl: "https://cloud.test", fetchImpl,
+      log: (line) => lines.push(line), sleep: async () => {},
+      stdout: { isTTY: false, columns: 80 },
+    });
+  } catch (error) {
+    if (!/no_machine/.test(error?.message || "")) throw error;
+  }
+};
 
-// THE BUG. Komal approves; Komal has no machine, so the trial lookup returns
+// THE BUG. Komal approves; Komal has no machine, so the machine lookup bails
 // early — and before the fix, the owner's pin was still sitting there.
 test("a different account approving must not inherit the previous machine pin", async () => {
   const home = homeSignedInAsOwner();
   const lines = [];
 
-  await run(home, fakeCloud({ accountId: "komal", trial: null }), lines);
+  await run(home, fakeCloud({ accountId: "komal", node: null }), lines);
 
   const stored = readCredentials({ home });
   assert.equal(stored.accountId, "komal", "the new account's session is stored");
@@ -95,7 +103,7 @@ test("the account switch is stated, not silent", async () => {
   const home = homeSignedInAsOwner();
   const lines = [];
 
-  await run(home, fakeCloud({ accountId: "komal", trial: null }), lines);
+  await run(home, fakeCloud({ accountId: "komal", node: null }), lines);
 
   const output = lines.join("\n");
   assert.match(output, /DIFFERENT account/, "the operator must be told the account changed");
@@ -111,7 +119,7 @@ test("switching to an account that has its own machine still warns, and repins",
 
   await run(home, fakeCloud({
     accountId: "komal",
-    trial: { id: "t2", state: "ready", nodeId: KOMAL_NODE, nodeEncPubkey: KOMAL_KEY, sni: "k.tun.test", createdAt: 1, expiresAt: 2 },
+    node: { id: KOMAL_NODE, kind: "byo", name: "komal-box", encPubkey: KOMAL_KEY, lastSeen: 5, createdAt: 1 },
   }), lines);
 
   const stored = readCredentials({ home });
@@ -127,7 +135,7 @@ test("logging in again as the same account does not warn", async () => {
 
   await run(home, fakeCloud({
     accountId: "owner",
-    trial: { id: "t1", state: "ready", nodeId: OTHER_NODE, nodeEncPubkey: OTHER_KEY, sni: "o.tun.test", createdAt: 1, expiresAt: 2 },
+    node: { id: OTHER_NODE, kind: "byo", name: "owner-box", encPubkey: OTHER_KEY, lastSeen: 5, createdAt: 1 },
   }), lines);
 
   const output = lines.join("\n");
@@ -141,7 +149,7 @@ test("same account whose machine has since gone away is unpinned, not left stale
   const home = homeSignedInAsOwner();
   const lines = [];
 
-  await run(home, fakeCloud({ accountId: "owner", trial: null }), lines);
+  await run(home, fakeCloud({ accountId: "owner", node: null }), lines);
 
   const stored = readCredentials({ home });
   assert.equal(stored.accountId, "owner");
@@ -154,7 +162,7 @@ test("a first login on a clean machine does not warn", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-fresh-"));
   const lines = [];
 
-  await run(home, fakeCloud({ accountId: "owner", trial: null }), lines);
+  await run(home, fakeCloud({ accountId: "owner", node: null }), lines);
 
   assert.doesNotMatch(lines.join("\n"), /DIFFERENT account/);
   assert.equal(readCredentials({ home }).accountId, "owner");
@@ -164,7 +172,7 @@ test("no secret from either account is ever printed", async () => {
   const home = homeSignedInAsOwner();
   const lines = [];
 
-  await run(home, fakeCloud({ accountId: "komal", trial: null }), lines);
+  await run(home, fakeCloud({ accountId: "komal", node: null }), lines);
 
   const output = lines.join("\n");
   for (const secret of ["sess1", "sess2", "ref1", "ref2", "dc"]) {
