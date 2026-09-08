@@ -7,8 +7,6 @@ import { Admin } from "./pages/Admin";
 import { CliLogin } from "./pages/CliLogin";
 import { Login } from "./pages/Login";
 import { LegalPage } from "./pages/Legal";
-import { Machines } from "./pages/Machines";
-import { Provisioning } from "./pages/Provisioning";
 
 function currentPath() {
   return window.location.pathname.replace(/\/$/, "") || "/";
@@ -18,8 +16,8 @@ function go(to: string) {
   window.history.pushState({}, "", to + window.location.hash);
 }
 
-function machineIdFrom(route: string) {
-  const match = /^\/machines\/([^/]+)$/.exec(route);
+function nodeIdFrom(route: string) {
+  const match = /^\/activity\/([^/]+)$/.exec(route);
   return match ? decodeURIComponent(match[1]) : null;
 }
 
@@ -43,7 +41,7 @@ export default function App() {
     setRoute(currentPath());
   }
 
-  const machineId = machineIdFrom(route);
+  const nodeId = nodeIdFrom(route);
   const authRoute = route === "/login" || route === "/cli-login";
   const legalPage = route === "/privacy" || route === "/terms" || route === "/support"
     ? route.slice(1) as "privacy" | "terms" | "support"
@@ -90,9 +88,9 @@ export default function App() {
     <Login
       onSignedIn={() => {
         if (parseUserCodeFromHash(window.location.hash)) navigate("/cli-login");
-        else navigate("/machines");
+        else navigate("/activity");
       }}
-      onSignedUp={() => navigate("/provisioning")}
+      onSignedUp={() => navigate("/activity")}
     />
   );
   if (legalPage) {
@@ -100,46 +98,31 @@ export default function App() {
   } else if (route === "/cli-login") {
     screen = (
       <CliLogin
-        onApproved={() => navigate("/machines")}
-        onSignedUp={() => navigate("/provisioning")}
+        onApproved={() => navigate("/activity")}
+        onSignedUp={() => navigate("/activity")}
       />
     );
-  } else if (route === "/provisioning") {
-    screen = (
-      <Provisioning
-        onReady={(nodeId) => navigate(nodeId ? `/machines/${nodeId}` : "/machines")}
-        onNeedLogin={() => navigate("/login")}
-      />
-    );
-  } else if (machineId) {
-    screen = <Activity nodeId={machineId} onBack={() => navigate("/machines")} />;
   } else if (route === "/admin") {
     screen = (
       <Admin
         onNeedLogin={() => navigate("/login")}
-        onForbidden={() => navigate("/machines")}
+        onForbidden={() => navigate("/activity")}
         onImpersonated={() => {
           setSessionTick((tick) => tick + 1);
-          navigate("/machines");
+          navigate("/activity");
         }}
       />
     );
-  } else if (route === "/machines") {
-    screen = (
-      <Machines
-        onOpen={(id) => navigate(`/machines/${id}`)}
-        onProvision={() => navigate("/provisioning")}
-        onNeedLogin={() => navigate("/login")}
-      />
-    );
+  } else if (route === "/activity" || nodeId) {
+    screen = <Activity nodeId={nodeId} />;
   }
 
   return (
     <main className={legalPage ? "canvas canvas-legal" : authRoute ? "canvas" : "canvas canvas-page"}>
       {!publicRoute && nav.signedIn ? (
         <nav className="chrome" aria-label="Console">
-          <button type="button" className="btn-text" onClick={() => navigate("/machines")}>
-            Machines
+          <button type="button" className="btn-text" onClick={() => navigate("/activity")}>
+            Activity
           </button>
           {nav.showAdmin || nav.impersonating ? (
             <div className="chrome-end">

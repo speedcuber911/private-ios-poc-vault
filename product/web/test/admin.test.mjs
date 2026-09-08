@@ -1,27 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createCloud } from "../src/api/cloud.js";
-import { kindWord, machineStatusWord } from "../src/api/trial.js";
 import {
-  REMOVE_CONFIRM_COPY,
-  UNLINK_CONFIRM_COPY,
-  UPGRADE_CONFIRM_COPY,
   adminRouteFor,
   canImpersonate,
-  canUnlink,
-  canUpgrade,
-  confirmAndUnlink,
-  confirmAndUpgrade,
   createAdmin,
-  hostedMachineId,
   isAdminRole,
   isImpersonating,
   nodesMax,
   roleActionLabel,
   shouldShowAdminNav,
-  trialStateWord,
-  upgradeErrorWord,
 } from "../src/api/admin.js";
+import * as adminApi from "../src/api/admin.js";
 
 function mockFetch(handler) {
   return async (url, init) => {
@@ -58,9 +48,9 @@ function adminWith(handler) {
   return { cloud, api: createAdmin({ cloud }) };
 }
 
-test("adminRouteFor sends signed-out users to login and non-admins to machines", () => {
+test("adminRouteFor sends signed-out users to login and non-admins to activity", () => {
   assert.equal(adminRouteFor({ signedIn: false }), "/login");
-  assert.equal(adminRouteFor({ signedIn: true, role: "user" }), "/machines");
+  assert.equal(adminRouteFor({ signedIn: true, role: "user" }), "/activity");
   assert.equal(adminRouteFor({ signedIn: true, role: "admin" }), "/admin");
   assert.equal(adminRouteFor({ signedIn: true, role: "admin,user" }), "/admin");
 });
@@ -86,41 +76,6 @@ test("isImpersonating follows Better Auth session.impersonatedBy", () => {
   assert.equal(isImpersonating({}), false);
 });
 
-test("trialStateWord is a small-caps state or NONE", () => {
-  assert.equal(trialStateWord({ state: "creating" }), "CREATING");
-  assert.equal(trialStateWord({ state: "ready" }), "READY");
-  assert.equal(trialStateWord({ state: "upgraded" }), "UPGRADED");
-  assert.equal(trialStateWord({ state: "expired" }), "EXPIRED");
-  assert.equal(trialStateWord({ state: "destroyed" }), "DESTROYED");
-  assert.equal(trialStateWord({ state: "failed" }), "FAILED");
-  assert.equal(trialStateWord(null), "NONE");
-  assert.equal(trialStateWord({}), "NONE");
-});
-
-test("canUnlink is true when the account has a hosted machine", () => {
-  assert.equal(canUnlink({ trial: { nodeId: "node-1" } }), true);
-  assert.equal(canUnlink({ trial: null, nodes: [{ id: "byo-1" }] }), false);
-  assert.equal(canUnlink({ trial: { nodeId: null }, nodes: [] }), false);
-  assert.equal(canUnlink({ trial: null, nodes: [] }), false);
-  assert.equal(
-    canUnlink({
-      trial: { state: "upgraded", nodeId: "hosted-1" },
-      nodes: [{ id: "hosted-1", kind: "byo" }, { id: "byo-2" }],
-    }),
-    true,
-  );
-});
-
-test("canUpgrade requires creating or ready plus a hosted nodeId", () => {
-  assert.equal(canUpgrade({ trial: { state: "ready", nodeId: "node-1" } }), true);
-  assert.equal(canUpgrade({ trial: { state: "creating", nodeId: "node-1" } }), true);
-  assert.equal(canUpgrade({ trial: { state: "ready", nodeId: null } }), false);
-  assert.equal(canUpgrade({ trial: { state: "upgraded", nodeId: "node-1" } }), false);
-  assert.equal(canUpgrade({ trial: { state: "expired", nodeId: "node-1" } }), false);
-  assert.equal(canUpgrade({ trial: { state: "failed", nodeId: "node-1" } }), false);
-  assert.equal(canUpgrade({ trial: null }), false);
-});
-
 test("canImpersonate is hidden for admin targets", () => {
   assert.equal(canImpersonate({ role: "user" }), true);
   assert.equal(canImpersonate({ role: "admin" }), false);
@@ -132,43 +87,9 @@ test("roleActionLabel toggles Make admin and Make user", () => {
   assert.equal(roleActionLabel("admin"), "Make user");
 });
 
-test("hostedMachineId and nodes.max come from the account row", () => {
-  assert.equal(
-    hostedMachineId({ trial: { nodeId: "node-9" }, nodes: [{ id: "other" }] }),
-    "node-9",
-  );
-  assert.equal(hostedMachineId({ trial: null, nodes: [{ id: "byo-1" }] }), null);
-  assert.equal(hostedMachineId({ trial: null, nodes: [] }), null);
-  assert.equal(
-    hostedMachineId({
-      trial: { state: "upgraded", nodeId: "hosted-1" },
-      nodes: [{ id: "hosted-1", kind: "byo" }, { id: "byo-2" }],
-    }),
-    "hosted-1",
-  );
+test("nodes.max comes from the account entitlements", () => {
   assert.equal(nodesMax([{ feature: "nodes.max", value: "2" }]), "2");
   assert.equal(nodesMax([]), "0");
-});
-
-test("unlink confirm copy is the operator warning", () => {
-  assert.equal(
-    UNLINK_CONFIRM_COPY,
-    "Unlink deletes this hosted machine and its files.",
-  );
-});
-
-test("remove confirm copy warns that the computer and files stay", () => {
-  assert.equal(
-    REMOVE_CONFIRM_COPY,
-    "Remove this machine from your account. Your computer and its files are untouched.",
-  );
-});
-
-test("upgrade confirm copy is the operator warning", () => {
-  assert.equal(
-    UPGRADE_CONFIRM_COPY,
-    "Keep this hosted machine, drop the trial limit, allow their own computer.",
-  );
 });
 
 test("listAccounts GETs /v1/admin/accounts with credentials include", async () => {
@@ -186,119 +107,25 @@ test("listAccounts GETs /v1/admin/accounts with credentials include", async () =
   });
 });
 
-test("upgrade confirm posts /v1/admin/accounts/:id/upgrade", async () => {
-  const calls = [];
-  const { api } = adminWith(({ path, method, credentials, body }) => {
-    calls.push({ path, method, credentials, body });
-    return { status: 200, json: { ok: true, account: { id: "acc-1" } } };
-  });
-  const result = await confirmAndUpgrade("acc-1", {
-    confirm: () => true,
-    upgrade: (id) => api.upgradeAccount(id),
-  });
-  assert.equal(result.status, 200);
-  assert.deepEqual(calls[0], {
-    path: "/v1/admin/accounts/acc-1/upgrade",
-    method: "POST",
-    credentials: "include",
-    body: null,
-  });
-});
-
-test("unlink confirm deletes /v1/admin/accounts/:id/machine", async () => {
-  const calls = [];
-  const { api } = adminWith(({ path, method, credentials }) => {
-    calls.push({ path, method, credentials });
-    return { status: 200, json: { ok: true } };
-  });
-  const result = await confirmAndUnlink("acc-1", {
-    confirm: () => true,
-    unlink: (id) => api.unlinkMachine(id),
-  });
-  assert.equal(result.status, 200);
-  assert.deepEqual(calls[0], {
-    path: "/v1/admin/accounts/acc-1/machine",
-    method: "DELETE",
-    credentials: "include",
-  });
-});
-
-test("upgrade confirm does not post when the operator cancels", async () => {
-  let posted = false;
-  const result = await confirmAndUpgrade("acc-1", {
-    confirm: (copy) => {
-      assert.equal(copy, UPGRADE_CONFIRM_COPY);
-      return false;
-    },
-    upgrade: async () => {
-      posted = true;
-      return { ok: true, status: 200, json: {} };
-    },
-  });
-  assert.equal(result.cancelled, true);
-  assert.equal(posted, false);
-});
-
-test("unlink confirm does not delete when the operator cancels", async () => {
-  let deleted = false;
-  const result = await confirmAndUnlink("acc-1", {
-    confirm: (copy) => {
-      assert.equal(copy, UNLINK_CONFIRM_COPY);
-      return false;
-    },
-    unlink: async () => {
-      deleted = true;
-      return { ok: true, status: 200, json: {} };
-    },
-  });
-  assert.equal(result.cancelled, true);
-  assert.equal(deleted, false);
-});
-
-test("confirmAndUnlink passes an optional message to confirm and defaults to UNLINK_CONFIRM_COPY", async () => {
-  const seen = [];
-  await confirmAndUnlink("acc-1", {
-    confirm: (copy) => {
-      seen.push(copy);
-      return false;
-    },
-    unlink: async () => ({ ok: true, status: 200, json: {} }),
-  });
-  await confirmAndUnlink("acc-1", {
-    message: REMOVE_CONFIRM_COPY,
-    confirm: (copy) => {
-      seen.push(copy);
-      return false;
-    },
-    unlink: async () => ({ ok: true, status: 200, json: {} }),
-  });
-  assert.deepEqual(seen, [UNLINK_CONFIRM_COPY, REMOVE_CONFIRM_COPY]);
-});
-
-test("409 nothing_to_upgrade is a short error word and does not throw", () => {
-  assert.equal(
-    upgradeErrorWord({
-      ok: false,
-      status: 409,
-      json: { error: "nothing_to_upgrade" },
-    }),
-    "NOTHING TO UPGRADE",
-  );
-  assert.equal(upgradeErrorWord({ ok: true, status: 200, json: { ok: true } }), null);
-});
-
-test("kindWord and machineStatusWord stay YOUR MACHINE / READY after kind byo", () => {
-  const now = 1_700_000_000_000;
-  assert.equal(kindWord("byo"), "YOUR MACHINE");
-  assert.equal(
-    machineStatusWord({
-      node: { kind: "byo", lastSeen: now },
-      trial: { state: "upgraded", expiresAt: now + 6 * 86_400_000 },
-      now,
-    }),
-    "READY",
-  );
-  assert.notEqual(kindWord("byo"), "TRIAL");
+test("the admin API offers no machine lifecycle actions", () => {
+  const { api } = adminWith(() => ({ status: 200, json: {} }));
+  assert.deepEqual(Object.keys(api), ["listAccounts"]);
+  for (const name of [
+    "upgradeAccount",
+    "unlinkMachine",
+    "confirmAndUpgrade",
+    "confirmAndUnlink",
+    "canUpgrade",
+    "canUnlink",
+    "hostedMachineId",
+    "trialStateWord",
+    "upgradeErrorWord",
+    "UPGRADE_CONFIRM_COPY",
+    "UNLINK_CONFIRM_COPY",
+    "REMOVE_CONFIRM_COPY",
+  ]) {
+    assert.equal(adminApi[name], undefined, `${name} should be gone`);
+  }
 });
 
 test("authClient.admin.stopImpersonating posts Better Auth stop-impersonating", async () => {

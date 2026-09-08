@@ -41,18 +41,21 @@ function lastEvent(item: { lastEvent?: string; updatedAt?: string; lastResult?: 
   return item.lastEvent || item.lastResult || item.updatedAt || null;
 }
 
-export function Activity({
-  nodeId,
-  onBack,
-}: {
-  nodeId: string;
-  onBack: () => void;
-}) {
+const NO_MACHINE = "No machine selected. Pair a machine from the Relay app to watch its runs here.";
+
+export function Activity({ nodeId }: { nodeId: string | null }) {
   const [copy, setCopy] = useState<string | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
 
   useEffect(() => {
+    setJobs([]);
+    setThreads([]);
+    if (!nodeId) {
+      setCopy(NO_MACHINE);
+      return;
+    }
+    setCopy(null);
     let cancelled = false;
     (async () => {
       try {
@@ -82,10 +85,6 @@ export function Activity({
           <h1 className="page-title">Activity</h1>
         </div>
       </div>
-      <button type="button" className="btn-text back" onClick={onBack}>
-        Machines
-      </button>
-
       {copy ? (
         <p className={copy === "Can't reach this machine." ? "error" : "muted"} role={copy.startsWith("Can't") ? "alert" : undefined}>
           {copy}
