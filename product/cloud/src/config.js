@@ -3,16 +3,7 @@
 
 import { normalizeEmail } from "./registry.js";
 
-// Margin between Relay's own destroy point (ttl + grace) and the sandbox-level
-// auto-kill we hand the platform. The reaper runs every 60 s, so an hour is
-// ample for it to act first; in the normal case Relay destroys the sandbox and
-// the platform timer never fires at all.
-const SANDBOX_TIMEOUT_MARGIN_SEC = 3600;
-
 export function loadConfig(env = process.env) {
-  const trialTtlSec = intFrom(env.TRIAL_TTL_SEC, 7 * 24 * 3600);
-  const trialGraceSec = intFrom(env.TRIAL_GRACE_SEC, 3 * 24 * 3600);
-
   return {
     port: intFrom(env.PORT, 8790),
     host: env.HOST || "127.0.0.1",
@@ -133,82 +124,16 @@ export function loadConfig(env = process.env) {
     // Entitlement defaults granted to every new account.
     defaultMaxNodes: intFrom(env.DEFAULT_MAX_NODES, 1),
 
-    // Trial sandboxes (Cube / E2B protocol). An empty apiUrl disables the
-    // whole trial feature — routes 404 and the fork screen hides the option.
-    e2b: {
-      apiUrl: (env.E2B_API_URL || "").replace(/\/+$/, ""),
-      apiKey: env.E2B_API_KEY || "",
-      templateId: env.TRIAL_TEMPLATE_ID || "",
-    },
-    trial: {
-      ttlSec: trialTtlSec,
-      graceSec: trialGraceSec,
-      maxActive: intFrom(env.TRIAL_MAX_ACTIVE, 20),
-
-      // Sandbox-level auto-kill handed to the platform at create time, in
-      // SECONDS — the unit of the E2B/Cube `timeout` field (verified against
-      // the Cube source: CubeAPI forwards the field unconverted and CubeMaster
-      // builds `context.WithTimeout(ctx, timeout * time.Second)`).
-      //
-      // DERIVED from the trial lifecycle on purpose. It used to be an
-      // independent 1-hour constant, which is wrong by 168x against a 7-day
-      // trial: this value is the backstop that destroys a machine whose row
-      // lost track of its sandbox id, so it has to OUTLIVE Relay's own destroy
-      // point (ttl + grace) rather than race it. Too short and it kills live
-      // trials an hour after signup; too long and it stops being a backstop at
-      // all.
-      //
-      // The `_SEC` suffix is load-bearing — the previous `_MS` name is what
-      // let a millisecond value reach a seconds field and ask for ~41 days.
-      // Clamped to a positive floor because Cube treats 0/absent as its own
-      // 60-second default, which would silently cap every trial at one minute.
-      sandboxTimeoutSec: Math.max(
-        60,
-        intFrom(
-          env.TRIAL_SANDBOX_TIMEOUT_SEC,
-          trialTtlSec + trialGraceSec + SANDBOX_TIMEOUT_MARGIN_SEC,
-        ),
-      ),
-
-      // Wall-clock bound on every provisioner HTTP call. Node's fetch has no
-      // default timeout, so without this a hung Cube host leaves
-      // POST /v1/trial-nodes pending forever and — worse — stalls the reaper
-      // mid-pass, silently stopping all later expiry work.
-      provisionerTimeoutMs: intFrom(env.TRIAL_PROVISIONER_TIMEOUT_MS, 30_000),
-
-      // A verified paid renewal extends the platform timer to this backstop.
-      // Relay still pauses access at subscription expiry; this only prevents
-      // Cube's create-time trial timer from deleting a paying user's machine.
-      paidSandboxTimeoutSec: Math.max(
-        31 * 24 * 3600,
-        intFrom(env.HOSTED_SANDBOX_TIMEOUT_SEC, 370 * 24 * 3600),
-      ),
-    },
     tunnel: {
       host: env.TUNNEL_HOST || "",
       port: intFrom(env.TUNNEL_PORT, 80),
       suffix: env.TUNNEL_SUFFIX || "",
     },
 
-    // Wildcard certificate covering every trial node's hostname, handed to
-    // each node at provision time. Unset means nodes sign their own — which
-    // works, but forces the phone to override server trust, and iOS then
-    // performs no client-certificate authentication on that connection, so
-    // mTLS to the node cannot complete.
-    nodeTls: {
-      certFile: env.NODE_TLS_CERT_FILE || "",
-      keyFile: env.NODE_TLS_KEY_FILE || "",
-    },
-
-    // Public cloud URL the trial sandbox reaches to enroll. Empty in tests,
-    // where the fallback (host:port) is used instead.
-    enrollBaseUrl: env.ENROLL_BASE_URL || "",
-
     // Browser activity grants. Ed25519 only — there is no HMAC
-    // BROWSER_GRANT_SECRET. Private key stays on the control-plane host;
-    // the 32-byte public half is what enroll.json delivers to the node.
-    // Unset means POST /v1/nodes/:id/browser-grants returns 503 and
-    // enroll.json omits grantPublicKey so existing phones keep working.
+    // BROWSER_GRANT_SECRET. Private key stays on the control-plane host; the
+    // 32-byte public half is what a node is configured with so it can verify
+    // a grant. Unset means POST /v1/nodes/:id/browser-grants returns 503.
     browserGrantPrivateKey: env.BROWSER_GRANT_PRIVATE_KEY || "",
     browserGrantPublicKey: env.BROWSER_GRANT_PUBLIC_KEY || "",
     grantGatewayUrl: env.GRANT_GATEWAY_URL || "",

@@ -116,7 +116,7 @@ test("a credential collected by relay sync-auth on the laptop ends up installed 
     // ── the account, and the machine the cloud tells the laptop about ──────
     const session = await signIn(t);
     t.app.registry.createNode(session.accountId, {
-      id: NODE_ID, kind: "trial", name: "Trial machine",
+      id: NODE_ID, kind: "byo", name: "Machine",
       pubkey: identity.pubkeyPem, encPubkey: identity.encPubkeyB64,
     });
 
@@ -274,7 +274,7 @@ test("a sync the sandbox slept through ends in a visible failure, not a silent o
   try {
     const session = await signIn(t);
     t.app.registry.createNode(session.accountId, {
-      id: NODE_ID, kind: "trial", name: "Trial machine",
+      id: NODE_ID, kind: "byo", name: "Machine",
       pubkey: identity.pubkeyPem, encPubkey: identity.encPubkeyB64,
     });
     writeCredentials({
@@ -344,7 +344,7 @@ test("the real cloud sees (and accepts) a base64url-safe authToken, not just a h
       const identity = sandboxIdentity();
       const session = await signIn(t);
       t.app.registry.createNode(session.accountId, {
-        id: NODE_ID, kind: "trial", name: "Trial machine",
+        id: NODE_ID, kind: "byo", name: "Machine",
         pubkey: identity.pubkeyPem, encPubkey: identity.encPubkeyB64,
       });
       const laptopHome = fs.mkdtempSync(path.join(os.tmpdir(), "relay-e2e-alphabet-laptop-"));

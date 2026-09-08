@@ -5,7 +5,6 @@
 import { randomUUID } from "node:crypto";
 
 export const ENTITLEMENT_MAX_NODES = "nodes.max";
-export const ENTITLEMENT_HOSTED_AUTO_UPGRADE = "hosted.auto_upgrade";
 export const BROWSER_SESSION_MAX = 10;
 
 // THE canonical email rule for the whole control plane. One human must map to
@@ -370,13 +369,6 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
   // Hard-delete every control-plane row associated with an account. Better
   // Auth separately removes credentials, provider accounts, and sessions.
   // The transaction prevents a half-deleted account from remaining usable.
-  //
-  // Dropping the trial_nodes row is the point of no return for that account's
-  // sandbox: nothing afterwards can map the account back to a live microVM.
-  // The caller must therefore have destroyed it (or recorded it via
-  // recordSandboxOrphan) BEFORE calling this — see the deleteUser hook in
-  // better-auth.js. sandbox_orphans is deliberately NOT cleared here: those
-  // rows exist precisely to outlive the account they came from.
   function deleteAccount(accountId) {
     const account = getAccount(accountId);
     if (!account) return false;
@@ -398,7 +390,6 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       db.prepare("DELETE FROM apple_subscriptions WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM devices WHERE account_id = ?").run(accountId);
       db.prepare("DELETE FROM nodes WHERE account_id = ?").run(accountId);
-      db.prepare("DELETE FROM trial_nodes WHERE account_id = ?").run(accountId);
       if (account.email) {
         db.prepare("DELETE FROM magic_links WHERE email = ?").run(account.email);
       }
@@ -640,23 +631,10 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       .map(mapNode);
   }
 
-  // `includeTrial: false` counts only the nodes that consume the account's
-  // `nodes.max` entitlement. A trial node is granted by the cloud (the trial
-  // enroll route creates it bypassing the gate entirely), not registered by
-  // the user, so counting it would make `POST /v1/nodes` 403
-  // `entitlement_limit` against the default limit of 1 for the whole 7+3 day
-  // trial — closing off the "Upgrade to BYO" path the trial exists to funnel
-  // people into, at exactly the moment they want to take it.
-  function countNodes(accountId, { includeTrial = true } = {}) {
-    const row = includeTrial
-      ? db
-          .prepare("SELECT COUNT(*) AS n FROM nodes WHERE account_id = ?")
-          .get(accountId)
-      : db
-          .prepare(
-            "SELECT COUNT(*) AS n FROM nodes WHERE account_id = ? AND kind != 'trial'",
-          )
-          .get(accountId);
+  function countNodes(accountId) {
+    const row = db
+      .prepare("SELECT COUNT(*) AS n FROM nodes WHERE account_id = ?")
+      .get(accountId);
     return Number(row.n);
   }
 
@@ -672,7 +650,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       // A handoff row whose node no longer exists can never be delivered —
       // nothing will ever poll for it again. deleteAccount already clears
       // every handoff for an account in one transaction, but a single-node
-      // delete (BYO/managed removal, or the trial reaper's past-grace path)
+      // delete (BYO/managed removal)
       // previously left these rows behind forever; no sweep touches the
       // handoffs table at all. See Task 8 review, M-5.
       db.prepare("DELETE FROM handoffs WHERE node_id = ?").run(id);
@@ -717,128 +695,6 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       .prepare("SELECT * FROM nodes ORDER BY created_at")
       .all()
       .map(mapNode);
-  }
-
-  // ── trial nodes ─────────────────────────────────────────────────────────
-  const TRIAL_PATCH_COLUMNS = {
-    state: "state",
-    nodeId: "node_id",
-    sandboxId: "sandbox_id",
-    enrollTokenHash: "enroll_token_hash",
-    expiresAt: "expires_at",
-  };
-
-  function createTrialNode({ accountId, enrollTokenHash, expiresAt }) {
-    const id = randomUUID();
-    db.prepare(
-      "INSERT INTO trial_nodes (id, account_id, node_id, sandbox_id, enroll_token_hash, state, created_at, expires_at, updated_at) VALUES (?, ?, NULL, NULL, ?, 'creating', ?, ?, ?)",
-    ).run(id, accountId, enrollTokenHash, now(), expiresAt, now());
-    return getTrialById(id);
-  }
-
-  function getTrialById(id) {
-    return mapTrial(db.prepare("SELECT * FROM trial_nodes WHERE id = ?").get(id));
-  }
-
-  function getTrialByAccount(accountId) {
-    return mapTrial(db.prepare("SELECT * FROM trial_nodes WHERE account_id = ?").get(accountId));
-  }
-
-  function getTrialByTokenHash(hash) {
-    if (!hash) return null;
-    return mapTrial(db.prepare("SELECT * FROM trial_nodes WHERE enroll_token_hash = ?").get(hash));
-  }
-
-  function getTrialByNodeId(nodeId) {
-    if (!nodeId) return null;
-    return mapTrial(db.prepare("SELECT * FROM trial_nodes WHERE node_id = ?").get(nodeId));
-  }
-
-  function updateTrial(id, patch) {
-    const sets = [];
-    const values = [];
-    for (const [key, column] of Object.entries(TRIAL_PATCH_COLUMNS)) {
-      if (patch[key] !== undefined) {
-        sets.push(`${column} = ?`);
-        values.push(patch[key]);
-      }
-    }
-    if (sets.length > 0) {
-      sets.push("updated_at = ?");
-      values.push(now(), id);
-      db.prepare(`UPDATE trial_nodes SET ${sets.join(", ")} WHERE id = ?`).run(...values);
-    }
-    return getTrialById(id);
-  }
-
-  function listTrialsDue(nowMs) {
-    return db
-      .prepare("SELECT * FROM trial_nodes WHERE state IN ('creating','ready') AND expires_at <= ? ORDER BY expires_at")
-      .all(nowMs)
-      .map(mapTrial);
-  }
-
-  function listTrialsPastGrace(nowMs, graceMs) {
-    return db
-      .prepare("SELECT * FROM trial_nodes WHERE state = 'expired' AND expires_at + ? <= ? ORDER BY expires_at")
-      .all(graceMs, nowMs)
-      .map(mapTrial);
-  }
-
-  function listUpgradedTrials() {
-    return db.prepare("SELECT * FROM trial_nodes WHERE state = 'upgraded' ORDER BY id").all().map(mapTrial);
-  }
-
-  function listPendingHostedActivations() {
-    return db.prepare(
-      `SELECT t.* FROM trial_nodes t JOIN entitlements e ON e.account_id = t.account_id
-       WHERE e.feature = 'hosted.activation_pending_trial' AND e.value = t.id || ':' || t.sandbox_id
-         AND t.state IN ('creating', 'ready', 'expired') ORDER BY t.id`,
-    ).all().map(mapTrial);
-  }
-
-  function countActiveTrials() {
-    return Number(db.prepare("SELECT COUNT(*) AS c FROM trial_nodes WHERE state IN ('creating','ready')").get().c);
-  }
-
-  function upgradeTrialAccount(accountId) {
-    if (!getAccount(accountId)) return { error: "unknown_account" };
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      const trial = getTrialByAccount(accountId);
-      // Already upgraded: true no-op. Do not re-raise entitlements or touch the
-      // node — admin may have lowered max_nodes or renamed/deleted the node.
-      if (trial?.state === "upgraded") {
-        db.exec("COMMIT");
-        return { ok: true };
-      }
-      const node = trial?.nodeId ? getNode(trial.nodeId) : null;
-      const currentMax = Number.parseInt(
-        getEntitlement(accountId, ENTITLEMENT_MAX_NODES) ?? "0",
-        10,
-      );
-      const maxVal = Number.isFinite(currentMax) ? currentMax : 0;
-      if (
-        !trial ||
-        !["creating", "ready", "expired"].includes(trial.state) ||
-        !trial.nodeId ||
-        !node
-      ) {
-        db.exec("ROLLBACK");
-        return { error: "nothing_to_upgrade" };
-      }
-      const nodePatch = {};
-      if (node.kind === "trial") nodePatch.kind = "byo";
-      if (node.name === "Trial machine") nodePatch.name = "Machine";
-      if (Object.keys(nodePatch).length > 0) updateNode(node.id, nodePatch);
-      updateTrial(trial.id, { state: "upgraded" });
-      if (maxVal < 2) setEntitlement(accountId, ENTITLEMENT_MAX_NODES, 2);
-      db.exec("COMMIT");
-      return { ok: true };
-    } catch (err) {
-      db.exec("ROLLBACK");
-      throw err;
-    }
   }
 
   // ── App Store subscriptions ────────────────────────────────────────────
@@ -925,80 +781,6 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       "UPDATE apple_subscriptions SET status = 'expired', updated_at = ? WHERE account_id = ?",
     ).run(now(), accountId);
     return getAppleSubscriptionByAccount(accountId);
-  }
-
-  function activateHostedSubscriptionAccount(accountId, expiresAt) {
-    if (!getAccount(accountId)) return { error: "unknown_account" };
-    const trial = getTrialByAccount(accountId);
-    const node = trial?.nodeId ? getNode(trial.nodeId) : null;
-    if (!trial || !node || !["ready", "expired", "upgraded"].includes(trial.state)) {
-      return { error: "nothing_to_activate" };
-    }
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      updateNode(node.id, {
-        ...(node.kind === "trial" ? { kind: "managed" } : {}),
-        ...(node.name === "Trial machine" ? { name: "Machine" } : {}),
-      });
-      updateTrial(trial.id, { state: "upgraded", expiresAt });
-      const currentMax = Number.parseInt(
-        getEntitlement(accountId, ENTITLEMENT_MAX_NODES) ?? "0",
-        10,
-      );
-      if (!Number.isFinite(currentMax) || currentMax < 2) {
-        setEntitlement(accountId, ENTITLEMENT_MAX_NODES, 2);
-      }
-      db.exec("COMMIT");
-      return { ok: true, trial: getTrialByAccount(accountId) };
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
-    }
-  }
-
-  function expireHostedSubscriptionAccount(accountId, expiresAt = now()) {
-    const trial = getTrialByAccount(accountId);
-    if (!trial || trial.state !== "upgraded") return { ok: true, trial };
-    return { ok: true, trial: updateTrial(trial.id, { state: "expired", expiresAt }) };
-  }
-
-  // ── sandbox orphans ─────────────────────────────────────────────────────
-  //
-  // A sandbox we still believe is running but can no longer destroy right now.
-  // Recorded instead of being forgotten, so an unreachable Cube host degrades
-  // into "we owe this a destroy" rather than "a microVM holds this user's
-  // files forever". Keyed on sandbox id so repeated failures collapse to one
-  // row and the first-seen reason/timestamp survives.
-  function recordSandboxOrphan({ sandboxId, trialId = null, accountId = null, reason }) {
-    if (!sandboxId) return false;
-    const result = db
-      .prepare(
-        `INSERT OR IGNORE INTO sandbox_orphans (sandbox_id, trial_id, account_id, reason, created_at)
-         VALUES (?, ?, ?, ?, ?)`,
-      )
-      .run(sandboxId, trialId, accountId, String(reason || "unknown"), now());
-    return Number(result.changes) > 0;
-  }
-
-  function listSandboxOrphans(limit = 100) {
-    return db
-      .prepare("SELECT * FROM sandbox_orphans ORDER BY created_at LIMIT ?")
-      .all(limit)
-      .map((row) => ({
-        sandboxId: row.sandbox_id,
-        trialId: row.trial_id,
-        accountId: row.account_id,
-        reason: row.reason,
-        createdAt: Number(row.created_at),
-      }));
-  }
-
-  function clearSandboxOrphan(sandboxId) {
-    if (!sandboxId) return false;
-    const result = db
-      .prepare("DELETE FROM sandbox_orphans WHERE sandbox_id = ?")
-      .run(sandboxId);
-    return Number(result.changes) > 0;
   }
 
   // ── repos ───────────────────────────────────────────────────────────────
@@ -2008,29 +1790,12 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     updateNode,
     touchNode,
     adminListNodes,
-    createTrialNode,
-    getTrialById,
-    getTrialByAccount,
-    getTrialByTokenHash,
-    getTrialByNodeId,
-    updateTrial,
-    listTrialsDue,
-    listTrialsPastGrace,
-    listUpgradedTrials,
-    listPendingHostedActivations,
-    countActiveTrials,
-    upgradeTrialAccount,
     getAppleSubscriptionByAccount,
     getAppleSubscriptionByOriginalTransactionId,
     upsertAppleSubscription,
     hasActiveAppleSubscription,
     listExpiredAppleSubscriptions,
     markAppleSubscriptionExpired,
-    activateHostedSubscriptionAccount,
-    expireHostedSubscriptionAccount,
-    recordSandboxOrphan,
-    listSandboxOrphans,
-    clearSandboxOrphan,
     upsertRepo,
     getRepo,
     listRepos,
@@ -2135,13 +1900,11 @@ function mapNode(row) {
     name: row.name,
     pubkey: row.pubkey,
     // See the two-key note on the `nodes` table in db.js: this is the
-    // X25519 sealed-handoff key, never the ed25519 `pubkey` above. Included
-    // on every node returned from here (including /v1/nodes, which cannot
-    // set it) deliberately: it is public-key material — safe to expose,
-    // same as pubkey — and keeping one node shape everywhere a node is
-    // returned means routes never need an allow-list kept in sync by hand
-    // as fields are added. It is simply always null for nodes registered
-    // through /v1/nodes today, since only trial enroll sets it (MINOR 5).
+    // X25519 sealed-handoff key, never the ed25519 `pubkey` above. Returned
+    // on every node shape deliberately: it is public-key material — safe to
+    // expose, same as pubkey — and the CLI needs it to seal a handoff to this
+    // node. Null for a node registered without one, which is a supported
+    // state: everything but handoff works.
     encPubkey: row.enc_pubkey ?? null,
     version: row.version,
     lastSeen: row.last_seen == null ? null : Number(row.last_seen),
@@ -2224,21 +1987,6 @@ function mapHandoff(row) {
     // session-authed clients via POST/GET /v1/handoffs).
     leaseToken: row.lease_token ?? null,
     leaseExpiresAt: row.lease_expires_at ?? null,
-  };
-}
-
-function mapTrial(row) {
-  if (!row) return null;
-  return {
-    id: row.id,
-    accountId: row.account_id,
-    nodeId: row.node_id,
-    sandboxId: row.sandbox_id,
-    enrollTokenHash: row.enroll_token_hash,
-    state: row.state,
-    createdAt: Number(row.created_at),
-    expiresAt: Number(row.expires_at),
-    updatedAt: Number(row.updated_at),
   };
 }
 

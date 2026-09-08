@@ -23,53 +23,37 @@ if (config.adminEmails.length === 0) {
 }
 if (!config.brokerToken) console.warn("BROKER_TOKEN unset — /v1/tunnel/* disabled.");
 
-// A half-configured trial feature fails silently and plausibly instead of
-// loudly, which is the worst of both worlds:
-//   - without ENROLL_BASE_URL the sandbox is handed `http://127.0.0.1:<port>`
-//     and tries to enrol against ITSELF;
-//   - without TUNNEL_SUFFIX every trial's `sni` is null, so the phone gets no
-//     node URL and quietly falls back to whatever personal install it already
-//     had, talking to the wrong machine entirely.
-// Both look configured and produce a broken trial. Refuse to start instead.
-// Only checked when E2B_API_URL is set, so the deliberate dark launch (every
-// trial variable unset) still boots cleanly. Names only — never values.
-if (config.e2b.apiUrl) {
-  const missing = [
-    ["E2B_API_KEY", config.e2b.apiKey],
-    ["TRIAL_TEMPLATE_ID", config.e2b.templateId],
-    ["ENROLL_BASE_URL", config.enrollBaseUrl],
-    ["TUNNEL_HOST", config.tunnel.host],
-    ["TUNNEL_SUFFIX", config.tunnel.suffix],
-  ]
-    .filter(([, value]) => !value)
-    .map(([name]) => name);
-  if (missing.length > 0) {
-    console.error(
-      `E2B_API_URL is set but ${missing.join(", ")} ${missing.length === 1 ? "is" : "are"} missing; ` +
-        "refusing to start with a half-configured trial feature. " +
-        "Unset E2B_API_URL to disable trials entirely.",
-    );
-    process.exit(1);
-  }
-}
-
-// Browser grants are the same shape of trap: GRANT_GATEWAY_URL in a response
-// with no private key to sign, or a public key enrolled onto nodes with no
-// way to mint, both look configured and fail at request time. Names only.
+// Browser grants are a half-configuration trap: GRANT_GATEWAY_URL in a
+// response with no private key to sign it looks configured and fails at
+// request time. These two are the whole of the cloud's half — they are exactly
+// what POST /v1/nodes/:id/browser-grants needs — so the guard covers exactly
+// them. Names only, never values.
 const grantMissing = [
   ["BROWSER_GRANT_PRIVATE_KEY", config.browserGrantPrivateKey],
-  ["BROWSER_GRANT_PUBLIC_KEY", config.browserGrantPublicKey],
   ["GRANT_GATEWAY_URL", config.grantGatewayUrl],
 ]
   .filter(([, value]) => !value)
   .map(([name]) => name);
-if (grantMissing.length > 0 && grantMissing.length < 3) {
+if (grantMissing.length === 1) {
   console.error(
-    `browser grants are half-configured; missing ${grantMissing.join(", ")}. ` +
-      "Set BROWSER_GRANT_PRIVATE_KEY, BROWSER_GRANT_PUBLIC_KEY, and GRANT_GATEWAY_URL together, " +
-      "or unset all three to disable grants.",
+    `browser grants are half-configured; missing ${grantMissing[0]}. ` +
+      "Set BROWSER_GRANT_PRIVATE_KEY and GRANT_GATEWAY_URL together, " +
+      "or unset both to disable grants.",
   );
   process.exit(1);
+}
+
+// The verifying half is NOT the control plane's to hold. enroll.json — written
+// by the provisioner, which no longer exists — was the only thing that ever
+// delivered it, so a BYO node now reads the public key from its own
+// RELAYD_GRANT_PUBLIC_KEY. Set here it is inert, so say so rather than ignore
+// it silently: the operator who set it believes grants are wired up.
+if (config.browserGrantPublicKey) {
+  console.warn(
+    "BROWSER_GRANT_PUBLIC_KEY is set but the control plane never uses it — " +
+      "nothing delivers it to a node any more. Set RELAYD_GRANT_PUBLIC_KEY in " +
+      "the node's own environment instead, and unset this.",
+  );
 }
 
 if (webOriginsRequireHttps(config)) {

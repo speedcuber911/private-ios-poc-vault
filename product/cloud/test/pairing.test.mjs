@@ -8,7 +8,6 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { startTestApp, api, authed, signIn } from "./helpers.mjs";
-import { ENTITLEMENT_HOSTED_AUTO_UPGRADE } from "../src/registry.js";
 
 // ── the peer-side derivation, implemented here from the spec ──────────────
 // Deliberately a second, independent implementation: if relayd's derivation
@@ -46,98 +45,6 @@ async function createSession(t, sessionToken, authToken) {
     ...authed(sessionToken),
   });
 }
-
-test("credential collection upgrades only operator-entitled hosted accounts", async () => {
-  for (const entitled of [false, true]) {
-    const extended = [];
-    const t = await startTestApp({ provisioner: {
-      async extendSandbox(id, timeout) { extended.push({ id, timeout }); return true; },
-      async resumeSandbox() { return true; },
-    } });
-    try {
-      const session = await signIn(t);
-      const secret = pairingSecret();
-      const authToken = authTokenFor(secret);
-      const macKey = macKeyFor(secret);
-      const created = await createSession(t, session.sessionToken, authToken);
-      const { pairingId } = created.json;
-      const trial = t.app.registry.createTrialNode({
-        accountId: session.accountId,
-        enrollTokenHash: "enroll-hash",
-        expiresAt: Date.now() + 86_400_000,
-      });
-      const nodeId = entitled ? "node-aaaaaaaaaaaaaaaa" : "node-bbbbbbbbbbbbbbbb";
-      t.app.registry.createNode(session.accountId, {
-        id: nodeId,
-        kind: "trial",
-        name: "Trial machine",
-        pubkey: "pk",
-        version: null,
-      });
-      t.app.registry.updateTrial(trial.id, { state: "ready", nodeId, sandboxId: "sbx_pairing" });
-      if (entitled) {
-        t.app.registry.setEntitlement(session.accountId, ENTITLEMENT_HOSTED_AUTO_UPGRADE, "1");
-      }
-
-      const nodeBlob = randomBytes(128);
-      let res = await api(t.baseUrl, "POST", `/v1/pairing/sessions/${pairingId}/node-blob`, {
-        raw: nodeBlob,
-        headers: {
-          "x-pairing-auth": authToken,
-          "x-pairing-tag": tagFor(macKey, "node-blob", nodeBlob),
-        },
-      });
-      assert.equal(res.status, 204);
-      res = await api(t.baseUrl, "GET", `/v1/pairing/sessions/${pairingId}/node-blob`, {
-        headers: { "x-pairing-auth": authToken },
-      });
-      assert.equal(res.status, 200);
-
-      const current = t.app.registry.getTrialByAccount(session.accountId);
-      const node = t.app.registry.getNode(nodeId);
-      assert.equal(current.state, entitled ? "upgraded" : "ready");
-      assert.equal(node.kind, entitled ? "byo" : "trial");
-      assert.equal(node.name, entitled ? "Machine" : "Trial machine");
-      assert.equal(extended.length, entitled ? 1 : 0);
-      if (entitled) assert.equal(extended[0].timeout, t.config.trial.paidSandboxTimeoutSec);
-    } finally {
-      await t.close();
-    }
-  }
-});
-
-test("a failed auto-upgrade still delivers credentials and retries durable activation", async () => {
-  let unavailable = true;
-  const t = await startTestApp({ provisioner: {
-    async extendSandbox() { if (unavailable) throw new Error("platform_unavailable"); return true; },
-    async resumeSandbox() { return true; },
-  }, log: () => {} });
-  try {
-    const session = await signIn(t);
-    const secret = pairingSecret();
-    const authToken = authTokenFor(secret);
-    const created = await createSession(t, session.sessionToken, authToken);
-    const trial = t.app.registry.createTrialNode({ accountId: session.accountId, enrollTokenHash: "test-enroll", expiresAt: t.clock.t + 86_400_000 });
-    const nodeId = "node-cccccccccccccccc";
-    t.app.registry.createNode(session.accountId, { id: nodeId, kind: "trial", name: "Trial machine", pubkey: "pk" });
-    t.app.registry.updateTrial(trial.id, { state: "ready", nodeId, sandboxId: "sbx_deferred" });
-    t.app.registry.setEntitlement(session.accountId, ENTITLEMENT_HOSTED_AUTO_UPGRADE, "1");
-    const blob = randomBytes(128);
-    const endpoint = `/v1/pairing/sessions/${created.json.pairingId}/node-blob`;
-    assert.equal((await api(t.baseUrl, "POST", endpoint, {
-      raw: blob, headers: { "x-pairing-auth": authToken, "x-pairing-tag": tagFor(macKeyFor(secret), "node-blob", blob) },
-    })).status, 204);
-    const response = await api(t.baseUrl, "GET", endpoint, { headers: { "x-pairing-auth": authToken } });
-    assert.equal(response.status, 200);
-    assert.ok(response.buf.equals(blob));
-    assert.equal(t.app.registry.getTrialById(trial.id).state, "ready");
-    assert.equal(t.app.registry.getEntitlement(session.accountId, "hosted.activation_pending_trial"), `${trial.id}:sbx_deferred`);
-    unavailable = false;
-    await t.app.sweepHostedSandboxes();
-    assert.equal(t.app.registry.getTrialById(trial.id).state, "upgraded");
-    assert.equal(t.app.registry.getEntitlement(session.accountId, "hosted.activation_pending_trial"), "");
-  } finally { await t.close(); }
-});
 
 test("rendezvous: relays opaque blobs with their tags in both directions", async () => {
   const t = await startTestApp();

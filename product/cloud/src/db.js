@@ -35,9 +35,9 @@ CREATE TABLE IF NOT EXISTS devices (
 --   enc_pubkey - base64 of 32 raw X25519 bytes. The recipient key relayd's
 --                seal.mjs (sealTo) encrypts handoff manifests/transcripts
 --                to, so only the node's matching private key can open them.
---                Currently set only by trial enroll (POST
---                /v1/trial-nodes/enroll); BYO/managed nodes registered via
---                POST /v1/nodes always read back null here today.
+--                Optional at registration (POST /v1/nodes), and null when
+--                the caller offered none — such a node works for everything
+--                except handoff, which has no recipient without it.
 -- Using one where the other is expected is silent at write time and fails
 -- much later — a signature check passing/failing for the wrong reason, or a
 -- sealed handoff nobody can open — so name every local var and column that
@@ -135,35 +135,6 @@ CREATE TABLE IF NOT EXISTS node_events (
   created_at  INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS trial_nodes (
-  id TEXT PRIMARY KEY,
-  account_id TEXT NOT NULL UNIQUE,
-  node_id TEXT,
-  sandbox_id TEXT,
-  enroll_token_hash TEXT,
-  state TEXT NOT NULL,
-  created_at INTEGER NOT NULL,
-  expires_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_trial_state_expires ON trial_nodes (state, expires_at);
-
--- Sandboxes Relay believes are still alive but can no longer reach through
--- trial_nodes. Two ways in: account deletion drops the trial row while the
--- provisioner is unreachable, and the reaper hits its destroy point with the
--- trial feature's kill switch (E2B_API_URL) unset. Without this table both
--- cases lose the sandbox id forever, leaving a microVM holding the user's
--- files with nothing left that could ever name it. Rows carry no user data —
--- just the ids needed to finish the job later — and are cleared as soon as
--- the destroy succeeds.
-CREATE TABLE IF NOT EXISTS sandbox_orphans (
-  sandbox_id  TEXT PRIMARY KEY,
-  trial_id    TEXT,
-  account_id  TEXT,
-  reason      TEXT NOT NULL,
-  created_at  INTEGER NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS device_codes (
   id TEXT PRIMARY KEY,
   device_code_hash TEXT NOT NULL,
@@ -239,8 +210,7 @@ CREATE INDEX IF NOT EXISTS idx_browser_sessions_account
   ON browser_sessions (account_id);
 
 -- A row is a durable owner-triggered revocation of the node data path. It is
--- deliberately separate from cli_computer_links: a brand-new account may use
--- its instant trial before linking a laptop, while an account that explicitly
+-- deliberately separate from cli_computer_links: an account that explicitly
 -- disconnects a computer must stay revoked across app reinstalls and service
 -- restarts until a replacement computer is approved.
 CREATE TABLE IF NOT EXISTS cli_computer_access_revocations (

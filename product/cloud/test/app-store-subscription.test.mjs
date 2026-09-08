@@ -6,44 +6,6 @@ import { startTestApp, api, signIn, authed } from "./helpers.mjs";
 
 const PRODUCT_ID = "com.parikshit.pocvault.hosted.monthly";
 const YEARLY_PRODUCT_ID = "com.parikshit.pocvault.hosted.yearly";
-const TRIAL_ENV = {
-  E2B_API_URL: "http://cube.invalid",
-  E2B_API_KEY: "k",
-  TRIAL_TEMPLATE_ID: "relay-trial",
-  TUNNEL_SUFFIX: ".tun.test",
-};
-
-function makeProvisioner() {
-  return {
-    extended: [],
-    resumed: [],
-    paused: [],
-    async extendSandbox(id, timeout) { this.extended.push({ id, timeout }); return true; },
-    async resumeSandbox(id, timeout) { this.resumed.push({ id, timeout }); return true; },
-    async pauseSandbox(id) { this.paused.push(id); return true; },
-    async killSandbox() { return true; },
-  };
-}
-
-function installReadyTrial(t, accountId) {
-  const trial = t.app.registry.createTrialNode({
-    accountId,
-    enrollTokenHash: "enroll",
-    expiresAt: t.clock.t + 7 * 24 * 3600 * 1000,
-  });
-  t.app.registry.createNode(accountId, {
-    id: "node-0011223344556677",
-    kind: "trial",
-    name: "Trial machine",
-    pubkey: "pk",
-  });
-  t.app.registry.updateTrial(trial.id, {
-    state: "ready",
-    nodeId: "node-0011223344556677",
-    sandboxId: "sbx_paid",
-  });
-}
-
 test("app account tokens are stable UUIDs and account-specific", () => {
   assert.equal(
     appAccountTokenForAccount("account-a"),
@@ -97,51 +59,7 @@ test("a verified yearly purchase activates the same hosted entitlement", async (
     assert.equal(response.status, 200);
     assert.equal(response.json.subscription.productId, YEARLY_PRODUCT_ID);
     assert.equal(response.json.subscription.status, "active");
-    assert.equal(response.json.trial, null);
-  } finally {
-    await t.close();
-  }
-});
-
-test("a verified monthly purchase upgrades the machine and extends its platform timer", async () => {
-  const provisioner = makeProvisioner();
-  let transaction;
-  const appStoreVerifier = {
-    async verifyTransaction() { return transaction; },
-    async verifyNotification() { throw new Error("unused"); },
-    async verifyNotificationTransaction() { throw new Error("unused"); },
-  };
-  const t = await startTestApp({ env: TRIAL_ENV, provisioner, appStoreVerifier });
-  try {
-    const session = await signIn(t);
-    installReadyTrial(t, session.accountId);
-    transaction = {
-      productId: PRODUCT_ID,
-      originalTransactionId: "original-1",
-      transactionId: "transaction-1",
-      appAccountToken: appAccountTokenForAccount(session.accountId),
-      environment: "Sandbox",
-      expiresDate: t.clock.t + 30 * 24 * 3600 * 1000,
-      signedDate: t.clock.t,
-    };
-
-    const response = await api(t.baseUrl, "POST", "/v1/subscriptions/apple/verify", {
-      body: { signedTransaction: "apple-jws" },
-      ...authed(session.sessionToken),
-    });
-    assert.equal(response.status, 200);
-    assert.deepEqual(response.json.subscription, {
-      productId: PRODUCT_ID,
-      status: "active",
-      expiresAt: transaction.expiresDate,
-    });
-    assert.equal(response.json.trial.state, "upgraded");
-    assert.equal(t.app.registry.getNode("node-0011223344556677").kind, "managed");
-    assert.equal(provisioner.extended.length, 1);
-    assert.equal(
-      provisioner.extended[0].timeout,
-      t.config.trial.paidSandboxTimeoutSec,
-    );
+    assert.equal("trial" in response.json, false, "the verify response no longer carries a trial");
   } finally {
     await t.close();
   }
@@ -229,8 +147,7 @@ test("a delayed renewal can supersede a local wall-clock expiry sweep", async ()
   }
 });
 
-test("an Apple expiry notification pauses the machine and closes access", async () => {
-  const provisioner = makeProvisioner();
+test("an Apple expiry notification records the subscription as expired", async () => {
   let transaction;
   let notification;
   const appStoreVerifier = {
@@ -238,10 +155,9 @@ test("an Apple expiry notification pauses the machine and closes access", async 
     async verifyNotification() { return notification; },
     async verifyNotificationTransaction() { return transaction; },
   };
-  const t = await startTestApp({ env: TRIAL_ENV, provisioner, appStoreVerifier });
+  const t = await startTestApp({ appStoreVerifier });
   try {
     const session = await signIn(t);
-    installReadyTrial(t, session.accountId);
     const expiresDate = t.clock.t + 100_000;
     transaction = {
       productId: PRODUCT_ID,
@@ -274,9 +190,11 @@ test("an Apple expiry notification pauses the machine and closes access", async 
       { body: { signedPayload: "notification-jws" } },
     );
     assert.equal(expired.status, 200);
-    assert.equal(t.app.registry.getTrialByAccount(session.accountId).state, "expired");
+    assert.equal(
+      t.app.registry.getAppleSubscriptionByAccount(session.accountId).status,
+      "expired",
+    );
     assert.equal(t.app.registry.hasActiveAppleSubscription(session.accountId, t.clock.t), false);
-    assert.deepEqual(provisioner.paused, ["sbx_paid"]);
   } finally {
     await t.close();
   }
