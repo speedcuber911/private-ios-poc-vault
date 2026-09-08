@@ -1,49 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { startTestApp, api, authed, TEST_ADMIN_TOKEN } from "./helpers.mjs";
+import { startTestApp, api, TEST_ADMIN_TOKEN } from "./helpers.mjs";
 
 const ADMIN_EMAIL = "ops@example.test";
-const TRIAL_ENV = {
-  E2B_API_URL: "http://cube.invalid",
-  E2B_API_KEY: "k",
-  TRIAL_TEMPLATE_ID: "relay-trial",
-  TUNNEL_HOST: "broker.test",
-  TUNNEL_PORT: "80",
-  TUNNEL_SUFFIX: ".tun.test",
-};
-const PAIRING = {
-  pairingId: "11111111-1111-4111-8111-111111111111",
-  pairingSecret: "c2VjcmV0LXNlY3JldC1zZWNyZXQ",
-};
-
-function makeFakeProvisioner() {
-  const created = [];
-  return {
-    created,
-    writes: [],
-    killed: [],
-    extended: [],
-    resumed: [],
-    async extendSandbox(id, timeout) { this.extended.push({ id, timeout }); return true; },
-    async resumeSandbox(id, timeout) { this.resumed.push({ id, timeout }); return true; },
-    async createSandbox(opts) {
-      created.push(opts);
-      return { sandboxId: `sbx_${created.length}` };
-    },
-    async writeSandboxFile(sandboxId, filePath, content) {
-      this.writes.push({ sandboxId, filePath, content });
-      return true;
-    },
-    async killSandbox(id) {
-      this.killed.push(id);
-      return true;
-    },
-    async pauseSandbox() {
-      return true;
-    },
-  };
-}
-
 async function signUp(t, { email, username, name = username }) {
   const res = await api(t.baseUrl, "POST", "/api/auth/sign-up/email", {
     headers: { origin: t.config.betterAuthBaseURL },
@@ -67,16 +26,13 @@ function ba(t, token, extra = {}) {
 }
 
 async function startAdminApp(overrides = {}) {
-  const provisioner = overrides.provisioner ?? makeFakeProvisioner();
   const t = await startTestApp({
     env: {
-      ...TRIAL_ENV,
       RELAY_ADMIN_EMAILS: overrides.adminEmails ?? ADMIN_EMAIL,
       ...overrides.env,
     },
-    provisioner,
   });
-  return { t, provisioner };
+  return { t };
 }
 
 function userColumns(t) {
@@ -87,33 +43,24 @@ function userRow(t, email) {
   return t.app.db.prepare("SELECT * FROM user WHERE email = ?").get(email);
 }
 
-function seedReadyTrial(t, accountId, {
+function seedNode(t, accountId, {
   nodeId = "node-00112233aabbccdd",
-  sandboxId = "sbx_1",
-  name = "Trial machine",
+  name = "Machine",
 } = {}) {
-  const trial = t.app.registry.getTrialByAccount(accountId);
-  assert.ok(trial, "expected a trial row");
   t.app.registry.createNode(accountId, {
     id: nodeId,
-    kind: "trial",
+    kind: "byo",
     name,
     pubkey: "pk-must-not-leak",
     version: null,
   });
-  t.app.registry.updateTrial(trial.id, {
-    state: "ready",
-    nodeId,
-    sandboxId,
-  });
-  return { trialId: trial.id, nodeId, sandboxId };
+  return { nodeId };
 }
 
 function assertNoSecrets(value) {
   const blob = JSON.stringify(value);
   assert.doesNotMatch(blob, /pk-must-not-leak/);
   assert.doesNotMatch(blob, /enrollToken/i);
-  assert.doesNotMatch(blob, /pairingSecret/);
   assert.doesNotMatch(blob, /sessionToken/);
   assert.equal(value.pubkey, undefined);
 }
@@ -182,7 +129,7 @@ test("GET /v1/admin/accounts is 401 without a session, 403 for a member, 200 for
   }
 });
 
-test("GET /v1/admin/accounts lists newest first with trial, nodes, entitlements and no secrets", async () => {
+test("GET /v1/admin/accounts lists newest first with nodes, entitlements and no secrets", async () => {
   const { t } = await startAdminApp();
   try {
     const admin = await signUp(t, { email: ADMIN_EMAIL, username: "ops_list", name: "Ops" });
@@ -191,11 +138,7 @@ test("GET /v1/admin/accounts lists newest first with trial, nodes, entitlements 
       username: "listed_user",
       name: "Listed",
     });
-    await api(t.baseUrl, "POST", "/v1/trial-nodes", {
-      body: PAIRING,
-      ...authed(customer.token),
-    });
-    seedReadyTrial(t, customer.user.id);
+    seedNode(t, customer.user.id);
 
     const page = await api(t.baseUrl, "GET", "/v1/admin/accounts?limit=1", ba(t, admin.token));
     assert.equal(page.status, 200);
@@ -209,272 +152,34 @@ test("GET /v1/admin/accounts lists newest first with trial, nodes, entitlements 
     assert.ok(listed, "customer account must appear");
     assert.equal(listed.email, "listed@example.test");
     assert.equal(listed.name, "Listed");
-    assert.equal(listed.trial.state, "ready");
-    assert.equal(listed.trial.nodeId, "node-00112233aabbccdd");
-    assert.equal(listed.trial.sandboxId, "sbx_1");
+    assert.equal(listed.trial, undefined, "the admin row no longer carries a trial");
     assert.equal(listed.nodes.length, 1);
-    assert.equal(listed.nodes[0].kind, "trial");
-    assert.equal(listed.nodes[0].name, "Trial machine");
+    assert.equal(listed.nodes[0].id, "node-00112233aabbccdd");
+    assert.equal(listed.nodes[0].kind, "byo");
+    assert.equal(listed.nodes[0].name, "Machine");
     assert.equal(listed.nodes[0].pubkey, undefined);
     assert.ok(listed.entitlements.some((e) => e.feature === "nodes.max"));
     assertNoSecrets(listed);
     assertNoSecrets(listed.nodes[0]);
-    assertNoSecrets(listed.trial);
   } finally {
     await t.close();
   }
 });
 
-test("POST /v1/admin/accounts/:id/upgrade converts a live trial and is idempotent", async () => {
-  const { t, provisioner } = await startAdminApp();
-  try {
-    const admin = await signUp(t, { email: ADMIN_EMAIL, username: "ops_up" });
-    const customer = await signUp(t, {
-      email: "upgrade@example.test",
-      username: "upgrade_user",
-    });
-    await api(t.baseUrl, "POST", "/v1/trial-nodes", {
-      body: PAIRING,
-      ...authed(customer.token),
-    });
-    const seeded = seedReadyTrial(t, customer.user.id);
-    const killedBefore = provisioner.killed.slice();
-
-    const upgraded = await api(
-      t.baseUrl,
-      "POST",
-      `/v1/admin/accounts/${customer.user.id}/upgrade`,
-      ba(t, admin.token),
-    );
-    assert.equal(upgraded.status, 200);
-    assert.equal(upgraded.json.ok, true);
-    const row = upgraded.json.account;
-    assert.equal(row.id, customer.user.id);
-    assert.equal(row.trial.state, "upgraded");
-    assert.equal(row.trial.sandboxId, seeded.sandboxId);
-    assert.equal(row.nodes[0].kind, "byo");
-    assert.equal(row.nodes[0].name, "Machine");
-    const max = Number(row.entitlements.find((e) => e.feature === "nodes.max")?.value);
-    assert.ok(max >= 2);
-    assert.deepEqual(provisioner.killed, killedBefore);
-
-    const stored = t.app.registry.getTrialByAccount(customer.user.id);
-    assert.equal(stored.state, "upgraded");
-    assert.equal(stored.sandboxId, seeded.sandboxId);
-    assert.equal(stored.nodeId, seeded.nodeId);
-    assert.equal(t.app.registry.getNode(seeded.nodeId).kind, "byo");
-    assert.deepEqual(provisioner.extended, [{ id: seeded.sandboxId, timeout: t.config.trial.paidSandboxTimeoutSec }]);
-    assert.equal(t.app.registry.getEntitlement(customer.user.id, "hosted.auto_upgrade"), "1");
-
-    const again = await api(
-      t.baseUrl,
-      "POST",
-      `/v1/admin/accounts/${customer.user.id}/upgrade`,
-      ba(t, admin.token),
-    );
-    assert.equal(again.status, 200);
-    assert.equal(again.json.ok, true);
-    assert.equal(again.json.account.trial.state, "upgraded");
-    assert.equal(again.json.account.trial.sandboxId, seeded.sandboxId);
-    assert.equal(t.app.registry.getTrialByAccount(customer.user.id).updatedAt, stored.updatedAt);
-    assert.deepEqual(provisioner.killed, killedBefore);
-  } finally {
-    await t.close();
-  }
-});
-
-test("POST /v1/admin/accounts/:id/upgrade 404s unknown ids and 409s when there is no live machine", async () => {
+test("DELETE /v1/nodes/:id deletes the caller's own node and nothing else", async () => {
   const { t } = await startAdminApp();
   try {
-    const admin = await signUp(t, { email: ADMIN_EMAIL, username: "ops_none" });
-    const missing = await api(
-      t.baseUrl,
-      "POST",
-      "/v1/admin/accounts/00000000-0000-4000-8000-000000000000/upgrade",
-      ba(t, admin.token),
-    );
-    assert.equal(missing.status, 404);
-    assert.equal(missing.json.error, "unknown_account");
+    const owner = await signUp(t, { email: "del@example.test", username: "del_user" });
+    const other = await signUp(t, { email: "del-other@example.test", username: "del_other" });
+    const { nodeId } = seedNode(t, owner.user.id);
 
-    const customer = await signUp(t, { email: "none@example.test", username: "none_user" });
-    const none = await api(
-      t.baseUrl,
-      "POST",
-      `/v1/admin/accounts/${customer.user.id}/upgrade`,
-      ba(t, admin.token),
-    );
-    assert.equal(none.status, 409);
-    assert.equal(none.json.error, "nothing_to_upgrade");
+    const foreign = await api(t.baseUrl, "DELETE", `/v1/nodes/${nodeId}`, ba(t, other.token));
+    assert.equal(foreign.status, 404);
+    assert.ok(t.app.registry.getNode(nodeId), "a foreign DELETE must not remove the node");
 
-    await api(t.baseUrl, "POST", "/v1/trial-nodes", {
-      body: PAIRING,
-      ...authed(customer.token),
-    });
-    const creating = await api(
-      t.baseUrl,
-      "POST",
-      `/v1/admin/accounts/${customer.user.id}/upgrade`,
-      ba(t, admin.token),
-    );
-    assert.equal(creating.status, 409);
-    assert.equal(creating.json.error, "nothing_to_upgrade");
-  } finally {
-    await t.close();
-  }
-});
-
-test("trial routes after upgrade: current is upgraded, POST is spent, DELETE is blocked", async () => {
-  const { t } = await startAdminApp();
-  try {
-    const admin = await signUp(t, { email: ADMIN_EMAIL, username: "ops_trial" });
-    const customer = await signUp(t, { email: "trial-up@example.test", username: "trial_up" });
-    await api(t.baseUrl, "POST", "/v1/trial-nodes", {
-      body: PAIRING,
-      ...authed(customer.token),
-    });
-    seedReadyTrial(t, customer.user.id);
-    const up = await api(
-      t.baseUrl,
-      "POST",
-      `/v1/admin/accounts/${customer.user.id}/upgrade`,
-      ba(t, admin.token),
-    );
-    assert.equal(up.status, 200);
-
-    const current = await api(
-      t.baseUrl,
-      "GET",
-      "/v1/trial-nodes/current",
-      authed(customer.token),
-    );
-    assert.equal(current.status, 200);
-    assert.equal(current.json.trial.state, "upgraded");
-    assert.notEqual(current.json.error, "no_trial");
-
-    const create = await api(t.baseUrl, "POST", "/v1/trial-nodes", {
-      body: PAIRING,
-      ...authed(customer.token),
-    });
-    assert.equal(create.status, 409);
-    assert.equal(create.json.error, "trial_already_used");
-
-    const del = await api(
-      t.baseUrl,
-      "DELETE",
-      "/v1/trial-nodes/current",
-      authed(customer.token),
-    );
-    assert.equal(del.status, 409);
-    assert.equal(del.json.error, "trial_not_deletable");
-    assert.equal(t.app.registry.getTrialByAccount(customer.user.id).state, "upgraded");
-  } finally {
-    await t.close();
-  }
-});
-
-test("DELETE /v1/admin/accounts/:id/machine unlinks the hosted sandbox and deletes it", async () => {
-  const { t, provisioner } = await startAdminApp();
-  try {
-    const admin = await signUp(t, { email: ADMIN_EMAIL, username: "ops_unlink" });
-    const customer = await signUp(t, { email: "unlink@example.test", username: "unlink_user" });
-    await api(t.baseUrl, "POST", "/v1/trial-nodes", {
-      body: PAIRING,
-      ...authed(customer.token),
-    });
-    const seeded = seedReadyTrial(t, customer.user.id);
-
-    const forbidden = await api(
-      t.baseUrl,
-      "DELETE",
-      `/v1/admin/accounts/${customer.user.id}/machine`,
-      ba(t, customer.token),
-    );
-    assert.equal(forbidden.status, 403);
-
-    const unlinked = await api(
-      t.baseUrl,
-      "DELETE",
-      `/v1/admin/accounts/${customer.user.id}/machine`,
-      ba(t, admin.token),
-    );
-    assert.equal(unlinked.status, 200);
-    assert.equal(unlinked.json.ok, true);
-    assert.ok(provisioner.killed.includes(seeded.sandboxId));
-    assert.equal(t.app.registry.getNode(seeded.nodeId), null);
-    assert.equal(t.app.registry.getTrialByAccount(customer.user.id).state, "destroyed");
-    assert.equal(t.app.registry.getTrialByAccount(customer.user.id).sandboxId, null);
-
-    const empty = await api(
-      t.baseUrl,
-      "DELETE",
-      `/v1/admin/accounts/${customer.user.id}/machine`,
-      ba(t, admin.token),
-    );
-    assert.equal(empty.status, 409);
-    assert.equal(empty.json.error, "nothing_to_unlink");
-  } finally {
-    await t.close();
-  }
-});
-
-test("DELETE /v1/admin/accounts/:id/machine refuses BYO-only accounts and leaves the node", async () => {
-  const { t } = await startAdminApp();
-  try {
-    const admin = await signUp(t, { email: ADMIN_EMAIL, username: "ops_byo_unlink" });
-    const customer = await signUp(t, { email: "byo-only@example.test", username: "byo_only" });
-    const node = t.app.registry.createNode(customer.user.id, {
-      id: "node-byoonly000001",
-      kind: "byo",
-      name: "My laptop",
-      pubkey: "pk-byo",
-      version: null,
-    });
-    assert.equal(t.app.registry.getTrialByAccount(customer.user.id), null);
-
-    const refused = await api(
-      t.baseUrl,
-      "DELETE",
-      `/v1/admin/accounts/${customer.user.id}/machine`,
-      ba(t, admin.token),
-    );
-    assert.equal(refused.status, 409);
-    assert.equal(refused.json.error, "nothing_to_unlink");
-    assert.ok(t.app.registry.getNode(node.id), "BYO node must still exist after admin unlink refusal");
-  } finally {
-    await t.close();
-  }
-});
-
-test("DELETE /v1/nodes/:id on an upgraded node kills the sandbox and sets trial destroyed", async () => {
-  const { t, provisioner } = await startAdminApp();
-  try {
-    const admin = await signUp(t, { email: ADMIN_EMAIL, username: "ops_del" });
-    const customer = await signUp(t, { email: "del@example.test", username: "del_user" });
-    await api(t.baseUrl, "POST", "/v1/trial-nodes", {
-      body: PAIRING,
-      ...authed(customer.token),
-    });
-    const seeded = seedReadyTrial(t, customer.user.id);
-    assert.equal(
-      (await api(
-        t.baseUrl,
-        "POST",
-        `/v1/admin/accounts/${customer.user.id}/upgrade`,
-        ba(t, admin.token),
-      )).status,
-      200,
-    );
-
-    const del = await api(
-      t.baseUrl,
-      "DELETE",
-      `/v1/nodes/${seeded.nodeId}`,
-      authed(customer.token),
-    );
+    const del = await api(t.baseUrl, "DELETE", `/v1/nodes/${nodeId}`, ba(t, owner.token));
     assert.equal(del.status, 204);
-    assert.ok(provisioner.killed.includes(seeded.sandboxId));
-    assert.equal(t.app.registry.getNode(seeded.nodeId), null);
-    assert.equal(t.app.registry.getTrialByAccount(customer.user.id).state, "destroyed");
+    assert.equal(t.app.registry.getNode(nodeId), null);
   } finally {
     await t.close();
   }

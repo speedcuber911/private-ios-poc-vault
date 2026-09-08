@@ -4,20 +4,6 @@ import { generateKeyPairSync } from "node:crypto";
 import { startTestApp, api, signIn, authed, makeNodeIdentity } from "./helpers.mjs";
 import { decodeJwtUnsafe, verifyEd25519, verifyHS256 } from "../src/jwt.js";
 
-function fakeProvisioner() {
-  const writes = [];
-  return {
-    writes,
-    async createSandbox() { return { sandboxId: "sbx_1" }; },
-    async writeSandboxFile(sandboxId, filePath, content) {
-      writes.push({ sandboxId, filePath, content });
-      return true;
-    },
-    async killSandbox() { return true; },
-    async pauseSandbox() { return true; },
-  };
-}
-
 function grantKeys() {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
   return {
@@ -36,19 +22,6 @@ function grantEnv(keys, extra = {}) {
   };
 }
 
-const TRIAL_ENV = {
-  E2B_API_URL: "http://cube.invalid",
-  E2B_API_KEY: "k",
-  TRIAL_TEMPLATE_ID: "relay-trial",
-  TUNNEL_HOST: "broker.test",
-  TUNNEL_PORT: "80",
-  TUNNEL_SUFFIX: ".tun.test",
-};
-const PAIRING = {
-  pairingId: "11111111-1111-4111-8111-111111111111",
-  pairingSecret: "c2VjcmV0LXNlY3JldC1zZWNyZXQ",
-};
-
 test("mints an Ed25519 grant for the account's own node", async () => {
   const keys = grantKeys();
   const t = await startTestApp({
@@ -61,7 +34,7 @@ test("mints an Ed25519 grant for the account's own node", async () => {
   try {
     const session = await signIn(t);
     const node = t.app.registry.createNode(session.accountId, {
-      kind: "trial",
+      kind: "byo",
       pubkey: makeNodeIdentity().pubkeyPem,
     });
     const res = await api(t.baseUrl, "POST", `/v1/nodes/${node.id}/browser-grants`, authed(session.sessionToken));
@@ -85,7 +58,7 @@ test("foreign node is 404 and does not leak existence", async () => {
     const owner = await signIn(t, { sub: "owner", email: "o@example.com" });
     const other = await signIn(t, { sub: "other", email: "x@example.com" });
     const node = t.app.registry.createNode(owner.accountId, {
-      kind: "trial",
+      kind: "byo",
       pubkey: makeNodeIdentity().pubkeyPem,
     });
     const res = await api(t.baseUrl, "POST", `/v1/nodes/${node.id}/browser-grants`, authed(other.sessionToken));
@@ -120,7 +93,7 @@ test("unset private key or gateway returns 503 grants_unavailable", async () => 
     try {
       const session = await signIn(t);
       const node = t.app.registry.createNode(session.accountId, {
-        kind: "trial",
+        kind: "byo",
         pubkey: makeNodeIdentity().pubkeyPem,
       });
       const res = await api(t.baseUrl, "POST", `/v1/nodes/${node.id}/browser-grants`, authed(session.sessionToken));
@@ -138,7 +111,7 @@ test("grant is EdDSA, not HMAC, even if BROWSER_GRANT_SECRET is set", async () =
   try {
     const session = await signIn(t);
     const node = t.app.registry.createNode(session.accountId, {
-      kind: "trial",
+      kind: "byo",
       pubkey: makeNodeIdentity().pubkeyPem,
     });
     const res = await api(t.baseUrl, "POST", `/v1/nodes/${node.id}/browser-grants`, authed(session.sessionToken));
@@ -160,7 +133,7 @@ test("minted grant expires after 900 seconds", async () => {
   try {
     const session = await signIn(t);
     const node = t.app.registry.createNode(session.accountId, {
-      kind: "trial",
+      kind: "byo",
       pubkey: makeNodeIdentity().pubkeyPem,
     });
     const res = await api(t.baseUrl, "POST", `/v1/nodes/${node.id}/browser-grants`, authed(session.sessionToken));
@@ -170,39 +143,5 @@ test("minted grant expires after 900 seconds", async () => {
     assert.equal(payload.iat, Math.floor(clock.t / 1000));
     assert.ok(verifyEd25519(res.json.grant, keys.publicKey, clock.t + 899_000));
     assert.equal(verifyEd25519(res.json.grant, keys.publicKey, clock.t + 900_000), null);
-  } finally { await t.close(); }
-});
-
-test("enroll.json includes grantPublicKey when configured", async () => {
-  const keys = grantKeys();
-  const provisioner = fakeProvisioner();
-  const t = await startTestApp({
-    env: { ...TRIAL_ENV, ...grantEnv(keys) },
-    provisioner,
-  });
-  try {
-    const session = await signIn(t);
-    const res = await api(t.baseUrl, "POST", "/v1/trial-nodes", {
-      body: PAIRING,
-      ...authed(session.sessionToken),
-    });
-    assert.equal(res.status, 201);
-    const cfg = JSON.parse(provisioner.writes[0].content);
-    assert.equal(cfg.grantPublicKey, keys.publicRaw);
-  } finally { await t.close(); }
-});
-
-test("enroll.json omits grantPublicKey when unset so existing phones still work", async () => {
-  const provisioner = fakeProvisioner();
-  const t = await startTestApp({ env: TRIAL_ENV, provisioner });
-  try {
-    const session = await signIn(t);
-    const res = await api(t.baseUrl, "POST", "/v1/trial-nodes", {
-      body: PAIRING,
-      ...authed(session.sessionToken),
-    });
-    assert.equal(res.status, 201);
-    const cfg = JSON.parse(provisioner.writes[0].content);
-    assert.equal("grantPublicKey" in cfg, false);
   } finally { await t.close(); }
 });

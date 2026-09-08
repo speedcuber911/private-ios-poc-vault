@@ -30,8 +30,8 @@ src/
   pairing.js   rendezvous sessions; opaque blob relay; TTL sweep
   notify.js    signed node-event ingest (ed25519), APNs fanout, 7-day sweep
   apns.js      APNs HTTP/2 token-auth client shape behind injectable transport
-  provisioner.js  E2B-protocol sandbox provisioner (trial machines) — backend
-                  agnostic: self-hosted Cube today, hosted e2b via endpoint swap
+  app-store.js Apple subscription verification — retained, but nothing in the
+               product calls it any more (see "App Store subscriptions" below)
 test/
   helpers.mjs  in-memory app, fake Apple IdP, recording mail/APNs transports
   auth.test.mjs  notify.test.mjs  pairing.test.mjs  registry.test.mjs
@@ -39,11 +39,6 @@ test/
 
 Run tests: `npm test` (or `node --test 'test/*.test.mjs'`). The SQLite
 ExperimentalWarning on Node 22 is expected.
-
-In the complete Relay checkout, also run `npm test --prefix product/integration`
-from the repository root before release. That suite exercises encrypted hosted
-device pairing across the actual cloud and daemon implementations; it lives
-outside this standalone cloud package because it requires both source trees.
 
 ## HTTP surface
 
@@ -70,11 +65,8 @@ outside this standalone cloud package because it requires both source trees.
 | `POST /v1/waitlist` | none | `{email}`; idempotent |
 | `GET /v1/account` | session | account + entitlements |
 | `POST/GET /v1/devices`, `PATCH/DELETE /v1/devices/:id` | session | `apnsToken`, `platform`, `name`, `certSerials` |
-| `POST/GET /v1/nodes`, `GET/DELETE /v1/nodes/:id` | session | create is entitlement-gated (`nodes.max`) and validates the ed25519 pubkey |
+| `POST/GET /v1/nodes`, `GET/DELETE /v1/nodes/:id` | session | create is entitlement-gated (`nodes.max`) and validates the ed25519 pubkey; `DELETE` removes the account's node record and nothing else — the machine itself belongs to the user |
 | `POST /v1/nodes/:id/browser-grants` | session | `{ grant, expiresIn: 900, gatewayUrl }`; Ed25519 (`alg: EdDSA`); 503 if grant keys or `GRANT_GATEWAY_URL` unset |
-| `POST /v1/trial-nodes` | session | body `{pairingId, pairingSecret}`; provisions a trial sandbox for the account; 404 `trial_unavailable` when no provisioner is configured, 409 `trial_already_used` (unless the account's existing trial is `failed` or `destroyed`, in which case it's retried in place), 503 `trial_capacity`, 502 `provision_failed` |
-| `GET/DELETE /v1/trial-nodes/current` | session | poll trial state, or tear it down early (kills the sandbox, deletes the node); `DELETE` 409 `trial_not_deletable` when state is `upgraded` |
-| `POST /v1/trial-nodes/enroll` | single-use enroll token (`{token}` in body) | the sandbox's own bootstrap call — registers its node identity, burns the token, returns `{ok, sni}` |
 | `POST /v1/pairing/sessions` | session | → `{pairingId, secret, expiresAt}`; only the sha256 of the secret is stored |
 | `POST/GET /v1/pairing/sessions/:id/device-blob` | `X-Pairing-Auth` | opaque bytes (CSR direction); ≤64 KiB |
 | `POST/GET /v1/pairing/sessions/:id/node-blob` | `X-Pairing-Auth` | opaque bytes (issued-cert direction); ≤64 KiB |
@@ -88,9 +80,7 @@ outside this standalone cloud package because it requires both source trees.
 | `POST /v1/node-events` | ed25519 body signature | see below |
 | `GET /v1/tunnel/nodes/:nodeId` | `Bearer $BROKER_TOKEN` | broker authorization hook, see contract |
 | `GET /v1/admin/nodes` | `Bearer $ADMIN_TOKEN` | ops-only; response omits pubkeys |
-| `GET /v1/admin/accounts` | Better Auth admin session | paginated `{ accounts }` with trial, nodes, entitlements; newest first; `limit` default 50 max 100 |
-| `POST /v1/admin/accounts/:id/upgrade` | Better Auth admin session | extend/resume the hosted sandbox, then grant operator hosted access, set trial `upgraded`, and raise `nodes.max` to at least 2 |
-| `DELETE /v1/admin/accounts/:id/machine` | Better Auth admin session | kill the hosted sandbox, delete the node, set trial `destroyed`; 409 `nothing_to_unlink` if none |
+| `GET /v1/admin/accounts` | Better Auth admin session | paginated `{ accounts }` with nodes and entitlements; newest first; `limit` default 50 max 100 |
 
 All responses carry `cache-control: no-store` and
 `x-content-type-options: nosniff`. All body reads are bounded (JSON 32 KiB,
@@ -162,7 +152,8 @@ say.
 
 ### Handoffs
 
-A handoff moves a stopped local coding session onto the account's sandbox. The
+A handoff moves a stopped local coding session onto one of the account's
+registered machines. The
 sealed session blob travels through **GitHub**, on a `relay/handoff-*` branch —
 never through this service. The cloud only ever learns names: a repo full name,
 a branch name, a handoff id, and a state.
@@ -201,6 +192,12 @@ The cloud never parses blob contents; they are stored as bytes and returned
 verbatim. The CSR⇄cert exchange runs end-to-end between device and node —
 compromise of this box cannot mint access to any node. Sessions expire after
 15 minutes (`PAIRING_TTL_SEC`) and are physically deleted by the sweep.
+
+This is no longer the primary way a phone pairs. A phone that can reach the
+node directly scans the QR code the node prints and POSTs to the node's own
+`/v1/pair`; the cloud is not involved and never sees the exchange. The
+rendezvous remains for `sync-auth`, `session-index` and the case where the two
+sides cannot talk to each other directly.
 
 ### Device-code login (`cli` | `web`)
 
@@ -248,8 +245,8 @@ free. Two guards replace it on `/v1/*` state-changing methods (`POST`,
 
 - An `Origin` header that is present and is neither in `RELAY_WEB_ORIGINS`
   nor equal to `BETTER_AUTH_URL` is `403 { "error": "forbidden_origin" }`.
-  Browsers always send `Origin` on these methods; iOS, the CLI, relayd and
-  the trial sandbox send none and are unaffected.
+  Browsers always send `Origin` on these methods; iOS, the CLI and relayd
+  send none and are unaffected.
 - A body arriving as `text/plain`, `application/x-www-form-urlencoded`, or
   `multipart/form-data` is `415 { "error": "unsupported_media_type" }`.
   Those three are exactly the content types a cross-origin POST can use
@@ -260,45 +257,6 @@ own `trustedOrigins` there, and Apple's `form_post` OAuth callback is a
 legitimate `x-www-form-urlencoded` POST. Regression: `test/csrf.test.mjs`,
 which replays a cross-site approve of an attacker's `client=web` device
 code and asserts no session is ever minted.
-
-### Reconnect another device to an existing hosted machine
-
-This is ordinary hosted-account functionality, not an App Review exception.
-BYO pairing and the generic credential-sync notice allowlist are unchanged.
-
-1. An authenticated owner discovers the current `ready`/`upgraded` machine
-   through `GET /v1/trial-nodes/current` and its X25519 `encPubkey` through
-   `GET /v1/nodes/:id`.
-2. The device generates a fresh secret and creates a rendezvous using
-   `POST /v1/pairing/sessions` with `{authToken, kind: "hosted-device"}`.
-   It posts the normal MAC-tagged device blob first.
-3. It seals `{v:1,nodeId,pairingId,secret,expiresAt}` to the node key using
-   `RLYSEAL1` (`product/relayd/src/seal.mjs`, AES-256-GCM with no extra AAD).
-   `expiresAt` is the returned session expiry in epoch milliseconds.
-4. `POST /v1/nodes/:id/device-pairings` accepts only
-   `{pairingId,sealedSecret}` (canonical base64 ciphertext), checks account,
-   hosted-machine ownership, access entitlement, session kind/ownership/TTL,
-   and current worker capability. It returns `202 {ok,pairingId,expiresAt}`.
-   Retrying identical ciphertext is idempotent; changing it is a conflict.
-5. The node requests `hostedPairing=1` on its signed handoff poll, receives the
-   dedicated `devicePairings` array, decrypts and verifies all bindings, then
-   completes the ordinary MAC-tagged encrypted PKCS#12 response. This queue
-   never contains raw pairing secrets and is not a generic BYO pairing route.
-6. The node activates an independent bearer and signs
-   `POST /v1/node/device-pairings/:pairingId/ready`. Until then, the phone's
-   node-blob read returns `404 not_posted_yet`. The phone verifies the blob MAC,
-   pins the node CA to the expected host and stores its own bearer.
-
-Bounds: 15-minute maximum rendezvous TTL, five pending requests per node,
-twenty requests per account per hour, 4 KiB base64 envelope. Old daemons never
-consume the new queue. No capability/key returns `409
-hosted_pairing_upgrade_required`; a stale capability returns `503
-hosted_pairing_unavailable`. Cross-account/non-hosted nodes return the same
-404. Inactive hosted access is 403. Ciphertext is scrubbed on completion/expiry;
-fingerprints remain at most an hour for the rate limit. Account/node deletion
-cascades immediately. The cloud is still the hosted account authority: this
-does not promise security against a compromised operator substituting the
-node key or impersonating the owner.
 
 ### Browser activity grants
 
@@ -316,10 +274,9 @@ or an identical 404 for unknown and cross-account ids. Claims: `sub`,
 
 `BROWSER_GRANT_PRIVATE_KEY`, `BROWSER_GRANT_PUBLIC_KEY`, and
 `GRANT_GATEWAY_URL` must be set together or the route 503s
-`grants_unavailable` and trial `enroll.json` omits `grantPublicKey`
-(existing phones keep working). When present, enroll.json includes
-`grantPublicKey`; trial `start.sh` writes `RELAYD_GRANT_PUBLIC_KEY` and
-`RELAYD_NODE_ID` into mode-0600 `runtime.env`.
+`grants_unavailable`. There is no enrollment channel that distributes the
+public key any more: an operator who wants browser grants against a
+user-owned node sets `RELAYD_GRANT_PUBLIC_KEY` on that node themselves.
 
 The grant gateway (`product/grant-gateway`) listens on `127.0.0.1:8791`.
 TLS and nginx live on the **broker host**, as a sibling
@@ -328,179 +285,30 @@ broker on 80/443. Set `RELAY_WEB_ORIGINS` on the gateway the same way as
 cloud (comma-separated exact origins) so `OPTIONS /activity/{jobs,threads,events}`
 is 204 with `authorization` allowed; a foreign origin gets no ACAO.
 
-### Trial sandboxes
+### App Store subscriptions (retained, not wired to anything)
 
-Every signup can get one instantly-provisioned trial machine
-(`revamp/07-trial-sandbox-plan.md`). It is an ordinary node with
-`kind: "trial"` — same broker tunnel, same mTLS, same jail — that happens to
-have been created by the cloud instead of a user's own box.
+`app-store.js`, the `apple_subscriptions` table, the Apple root certificates
+under `certs/`, and `POST /v1/subscriptions/apple/verify` /
+`POST /v1/subscriptions/apple/notifications` are all still here and still
+tested. Nothing in the product calls them. They used to gate hosted-machine
+lifetime; there are no hosted machines, so they gate nothing.
 
-`POST /v1/trial-nodes` (session-authed) takes `{pairingId, pairingSecret}` in
-the body — the caller (iOS) creates the pairing session first via
-`POST /v1/pairing/sessions` and passes its id plus the raw pairing secret
-through so the sandbox can be handed the same secret via env vars (below);
-a missing/malformed pair is `400 pairing_required`. The route is gated by
-one-trial-per-account (409 `trial_already_used`) and a global concurrency
-cap (`TRIAL_MAX_ACTIVE`, 503 `trial_capacity`), then calls the provisioner
-(`src/provisioner.js`) to create a sandbox and hands it a single-use enroll
-token plus tunnel coordinates via env vars
-(`RELAYD_ENROLL_URL/TOKEN/PAIRING_ID/PAIRING_SECRET`,
-`RELAYD_TUNNEL_HOST/PORT/SUFFIX`) — none of which are ever returned to the
-caller. If `E2B_API_URL` is unset the provisioner is `null` and the route
-404s `trial_unavailable`, which is how the fork screen's "Try instantly"
-option feature-flags itself off.
+They are kept so the App Store Connect subscription items stay valid, not
+because they do any work. No iOS or web surface offers a purchase. If you are
+looking for what turns a subscription into access, there is nothing to find —
+that coupling was the part that was deleted.
 
-**Retry after a failed provision or a deleted machine.** `trial_nodes.account_id`
-is `UNIQUE`, so in the ordinary case a second `POST /v1/trial-nodes` for an
-account that already has a row 409s `trial_already_used` — the cap is one
-*live* trial, not raw call attempts. Two states are retried in place instead
-of 409ing: `failed` (provision never produced a machine) and `destroyed`
-(the user deleted the machine, or the reaper tore it down after grace).
-A subsequent `POST /v1/trial-nodes` reuses the same row — resetting it to
-`state: "creating"` with a fresh `enrollTokenHash` and `expiresAt`, and
-clearing `nodeId`/`sandboxId`. `creating` and `ready` still 409 (already
-live). `expired` still 409 (the TTL was spent; the paused sandbox is still
-there during grace). This exists so a transient provisioner failure or an
-in-app Delete cannot permanently burn the account.
-
-The sandbox calls back to `POST /v1/trial-nodes/enroll` with its freshly
-generated node identity pubkey; the cloud verifies the token against
-`trial_nodes.enroll_token_hash` (the trial must still be in the `creating`
-state), registers the node (`kind: "trial"`), and burns the token. From there
-the trial node is indistinguishable from any other node to the rest of this
-API.
-
-A trial node does **not** consume the account's `nodes.max` entitlement: the
-enroll route creates it bypassing the gate, and `POST /v1/nodes` counts only
-non-trial nodes (`registry.countNodes(id, { includeTrial: false })`). Counting
-it would 403 `entitlement_limit` for any trial user who tries to register their
-own box — which is exactly the "Upgrade to BYO" path the trial exists to lead
-into.
-
-A reaper (`sweepTrials`, folded into the existing 60 s `runSweeps()` timer)
-pauses the sandbox at `expires_at` (`TRIAL_TTL_SEC`, default 7 days) and
-destroys it `TRIAL_GRACE_SEC` (default 3 days) after that, deleting the node
-row. Both steps are idempotent and state-driven off `expires_at`, so a
-crashed reaper pass is safe to re-run. Each row is isolated in its own
-try/catch, so one trial's failure cannot abort the pass and strand every trial
-behind it, and the sweep holds an in-flight flag so a slow pass cannot be
-re-entered by the next 60 s tick.
-
-### Relay Hosted App Store subscriptions
-
-The seven-day hosted-machine trial is controlled by Relay's server clock; it
-is not an App Store introductory offer. After the trial expires, hosted access
-stays paused unless the account has either a current Apple subscription or the
-operator-only `hosted.auto_upgrade=1` entitlement used by App Review. Provider
-accounts and usage (Codex, Claude, Cursor, and similar services) are not part
-of Relay Hosted.
-
-The iOS app sells two auto-renewable products in one subscription group:
-
-- `com.parikshit.pocvault.hosted.monthly` — one month
-- `com.parikshit.pocvault.hosted.yearly` — one year
-
-`POST /v1/subscriptions/apple/verify` accepts an authenticated StoreKit
-transaction JWS. The service validates Apple's certificate chain, bundle id,
-product id, expiration, and a deterministic `appAccountToken` bound to the
-Relay account before activating the machine. `POST
-/v1/subscriptions/apple/notifications` is public for App Store Server
-Notifications V2; the signed outer payload and its transaction JWS are both
-verified before a renewal, expiration, refund, or revocation changes access.
-Configure that App Store Connect notification URL as:
+The App Store Server Notifications V2 URL configured in App Store Connect is
+still:
 
 ```text
 https://relay.ai-rocket-experiments.com/v1/subscriptions/apple/notifications
 ```
 
-Apple's public root certificates are checked in as DER `.cer` files under
-`certs/`. Never replace them with a private key or signing credential. Product
-ids and the numeric App Store app id can be overridden with
-`APP_STORE_HOSTED_MONTHLY_PRODUCT_ID`,
-`APP_STORE_HOSTED_YEARLY_PRODUCT_ID`, and `APP_STORE_APP_APPLE_ID`.
-`APP_STORE_ONLINE_CHECKS=0` is for isolated tests only. A paid renewal extends
-Cube's platform timeout using `HOSTED_SANDBOX_TIMEOUT_SEC` (default 370 days),
-while Relay still enforces the signed subscription expiration itself.
-
-Operator/App Review upgrades also extend the platform timeout **before**
-committing `upgraded`. An expired machine is resumed first; an unavailable or
-missing sandbox returns a retryable failure or conflict instead of claiming
-success. A successful admin upgrade grants the independent
-`hosted.auto_upgrade=1` entitlement. Repeating an upgrade preserves existing
-node names and reduced `nodes.max` values. That operator grant is not revoked
-when a separate sandbox StoreKit transaction expires.
-
-The platform timeout is finite, even for an upgraded account. The existing
-60-second lifecycle sweep renews eligible upgraded machines at most once per
-day, using the same `HOSTED_SANDBOX_TIMEOUT_SEC` backstop; failures retry after
-five minutes and do not downgrade or delete an active record. On a control-plane
-restart the first sweep renews eligible machines again. Renewal requires an
-active Apple subscription or operator grant and a current `upgraded` node;
-expired, failed, destroyed, and unentitled rows are not revived. Background
-renewal only extends a running sandbox: explicit recovery/upgrade owns resume.
-The service must remain operational within the platform backstop; no infinite
-platform lifetime is claimed.
-
-If the platform is unavailable when the phone collects its pairing credential,
-Relay still delivers the opaque credential blob and records a
-`hosted.activation_pending_trial` marker tied to that exact trial. A later sweep
-retries the operator activation, including after a control-plane restart. It
-does not promote a newly enrolled node before credential collection. Lifecycle
-operations are serialized per account so an old expiry pass cannot pause a
-machine after its upgrade has completed; shutdown stops further maintenance.
-
-**Lifecycle enforcement is not gated on the feature flag.** `E2B_API_URL`
-switches off *creating* trials; the reaper keeps running without it, because a
-kill switch that also froze every existing trial would leave users with
-indefinite access. Expiring access (state, enroll token, node row) is pure
-control-plane work and always happens. Only the sandbox-destroying half needs
-the provisioner — see "Orphaned sandboxes" below for what happens when it is
-absent or unreachable.
-
-**Account deletion destroys the sandbox.** `deleteAccount` drops the
-`trial_nodes` row, after which nothing can map the account back to a live
-microVM, so the Better Auth `deleteUser.afterDelete` hook releases the sandbox
-first (`beforeAccountDelete` in `server.js`). A failure there is recorded as an
-orphan rather than aborting the deletion: an unreachable Cube host must never
-make an account undeletable.
-
-### Orphaned sandboxes
-
-A sandbox Relay still believes is running but can no longer reach through
-`trial_nodes` is recorded in `sandbox_orphans` (sandbox id, trial id, account
-id, reason) instead of being silently forgotten. Two ways in: account deletion
-with the provisioner unreachable, and the reaper reaching its destroy point
-while the trial feature is switched off. Every sweep retries the backlog and
-clears each row as soon as the destroy succeeds.
-
-One window this does not cover: `createSandbox` returning after the machine
-exists but before the row learns its id. A response with no usable `sandboxID`
-is now a hard failure (the row lands in `failed` and the account can retry)
-rather than being silently recorded as nothing, but a crash between the create
-returning and the `updateTrial` write still leaves a machine with no id
-anywhere. `metadata.trialId` is set on every sandbox, so the backstop for that
-window is a Cube-list-vs-`trial_nodes` reconciliation sweep — **not yet built**.
-
-The provisioner itself speaks the E2B REST protocol (`POST /sandboxes`,
-`DELETE /sandboxes/:id`, `POST /sandboxes/:id/pause`, `x-api-key` auth)
-against whatever `E2B_API_URL` points at — a self-hosted Cube host today,
-hosted e2b later, with no code change. Every call carries an
-`AbortSignal.timeout` (`TRIAL_PROVISIONER_TIMEOUT_MS`, default 30 s): Node's
-fetch has no default timeout, and an unbounded call inside the reaper would
-stall the whole pass indefinitely with nothing to detect it.
-
-The sandbox-level `timeout` sent on create is in **seconds** — the unit the
-E2B/Cube protocol defines, forwarded unconverted into
-`context.WithTimeout(ctx, timeout * time.Second)`. It is derived from the trial
-lifecycle (`ttl + grace + 1 h`, overridable with `TRIAL_SANDBOX_TIMEOUT_SEC`)
-rather than being an independent constant, so the platform-level auto-kill
-expires just *after* Relay's own destroy point and acts as the backstop for
-orphans instead of killing live trials. Two traps this deliberately avoids:
-sending milliseconds asks for ~41 days (the auto-kill never fires), and a naive
-divide-by-1000 of the old 1-hour constant would destroy every trial machine an
-hour after signup. Cube treats an absent or zero `timeout` as its own 60-second
-default, so the value is validated at the call site and an unusable one fails
-the create outright.
+Product ids and the numeric App Store app id can still be overridden with
+`APP_STORE_HOSTED_MONTHLY_PRODUCT_ID`, `APP_STORE_HOSTED_YEARLY_PRODUCT_ID`,
+and `APP_STORE_APP_APPLE_ID`. `APP_STORE_ONLINE_CHECKS=0` is for isolated tests
+only. Never replace the checked-in `.cer` roots with a private key.
 
 ## Broker contract (tunnel-registry hook)
 
@@ -595,29 +403,17 @@ APNS_SIGNING_KEY_P8=<contents of the .p8, PEM>
 # this host must match the build the token came from.
 APNS_HOST=api.sandbox.push.apple.com
 
-# Trial sandboxes — optional; unset E2B_API_URL disables CREATING trials (the
-# fork screen hides "Try instantly" and POST /v1/trial-nodes 404s). The reaper
-# keeps enforcing expiry on existing trials either way.
-#
-# All-or-nothing: if E2B_API_URL is set, the service REFUSES TO START unless
-# E2B_API_KEY, TRIAL_TEMPLATE_ID, ENROLL_BASE_URL, TUNNEL_HOST and
-# TUNNEL_SUFFIX are all present. A half-configured trial feature fails
-# silently and plausibly otherwise — without ENROLL_BASE_URL the sandbox
-# enrols against loopback (itself), and without TUNNEL_SUFFIX the phone gets a
-# null SNI and quietly talks to the wrong machine.
-E2B_API_URL=<cube-or-e2b-api-url>
-E2B_API_KEY=<api-key>
-TRIAL_TEMPLATE_ID=relay-trial
+# Broker tunnel coordinates, for nodes that reach the phone through the broker
+# rather than being directly reachable. Not required otherwise.
 TUNNEL_HOST=<broker-host>
 TUNNEL_PORT=<broker-tunnel-port>
 TUNNEL_SUFFIX=.tun.<domain>
-ENROLL_BASE_URL=https://api.<domain>
-# TRIAL_TTL_SEC / TRIAL_GRACE_SEC / TRIAL_MAX_ACTIVE / TRIAL_PROVISIONER_TIMEOUT_MS
-# all have sane defaults (7d / 3d / 20 / 30s) and need not be set explicitly.
-# TRIAL_SANDBOX_TIMEOUT_SEC (SECONDS — the E2B/Cube protocol's unit) defaults to
-# ttl + grace + 1h so the platform auto-kill backstops orphans rather than
-# killing live trials; override only with that relationship in mind.
 ```
+
+`E2B_API_URL`, `E2B_API_KEY`, `TRIAL_TEMPLATE_ID`, every `TRIAL_*`,
+`ENROLL_BASE_URL` and `NODE_TLS_*` are gone from `config.js`. **Remove them from
+`/etc/relay-cloud/env` on the host**, or the service will start and silently
+ignore them, which reads like configuration that works.
 
 Front with nginx terminating public TLS for `api.<domain>` and proxy only to
 `127.0.0.1:8790`. `deploy/configure-nginx.py` renders either the ACME bootstrap
@@ -628,9 +424,10 @@ terminate tunnel TLS here.
 
 ### Web console (operator env)
 
-`product/web` is a Vite+React app (login, phone QR, `/cli-login`,
-provisioning, machines, activity). Do **not** deploy it via CodeCommit
-`relay-cloud` or `ops/deploy-poc`.
+`product/web` is a Vite+React app (login, phone QR, `/cli-login`, admin,
+activity). It has no machine list and no provisioning page — the control plane
+cannot create a machine. Do **not** deploy it via CodeCommit `relay-cloud` or
+`ops/deploy-poc`.
 
 Operator checklist (names and URL shapes only; generate values on the
 host and never commit them):
@@ -715,10 +512,6 @@ Real, tested:
   full request shape is exercised against the mock transport.
 - Broker hook + admin endpoint with timing-safe token compare, distinct
   tokens.
-- Trial sandbox provisioning: E2B/Cube-protocol provisioner
-  (`provisioner.js`), `trial_nodes` registry, the session-authed
-  create/enroll/current routes, and the pause/destroy reaper — unit-tested
-  against a mock provisioner; never exercised against a live Cube host.
 
 Stubbed / deferred (production work items):
 
@@ -739,11 +532,15 @@ Stubbed / deferred (production work items):
   headless-installer flow (node creates the session via a short enroll code
   printed by `install.sh`) is not built; W2's enrollment work defines it.
 - **Postgres DAL**: SQLite only; the registry API is the seam.
-- **Billing**: out of W3 scope. The authenticated web console lives in
-  `product/web` (login, machines, waitlist, activity) and is **not**
-  shipped through this service's CodeCommit `relay-cloud` path or
-  `ops/deploy-poc`. (The trial sandbox provisioner itself is now real —
-  see "Real, tested" above; that is provisioning, not billing.)
+- **Billing**: nothing is sold. The Apple subscription verifier is retained
+  and unwired (see above). The authenticated web console lives in
+  `product/web` (login, `/cli-login`, admin, activity) and is **not** shipped
+  through this service's CodeCommit `relay-cloud` path or `ops/deploy-poc`.
+- **Machine provisioning**: removed, not deferred. The cloud has no way to
+  create, pause, resume or destroy a machine, and `provisioner.js`,
+  `trial_nodes` and `sandbox_orphans` are gone. Users bring their own.
+- **Waitlist**: `POST /v1/waitlist` still records rows and nothing reads
+  them. It gated trial capacity; there is no capacity to gate.
 - **Admin surface**: read-only node list only.
 - **IaC**: the CodeCommit/CodeBuild/CodePipeline/SSM release path and its
   buckets/roles are CloudFormation-managed. The pre-existing VPC, EC2,
@@ -757,9 +554,11 @@ Stubbed / deferred (production work items):
 - Provider/API credentials never appear in responses or logs; secrets at rest
   are hashes (refresh tokens, magic links, pairing secrets); config comes
   from env only.
-- Bearer tokens here are **control-plane only** (session, admin, broker) —
-  node APIs remain mTLS-only; nothing this box holds can mint access to any
-  node (no CA keys, ever).
+- Bearer tokens here are **control-plane only** (session, admin, broker).
+  Node APIs authenticate against the node's own CA and its own device-token
+  table; nothing this box holds can mint access to any node (no CA keys,
+  ever). A device bearer token is derived from a pairing secret the node
+  minted and the phone scanned — it never exists on this server.
 - Every read is bounded; unset admin/broker tokens disable their endpoints
   rather than defaulting open; timing-safe comparisons for all token/secret
   checks.

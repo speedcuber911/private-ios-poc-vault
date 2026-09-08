@@ -87,8 +87,8 @@ function makeApnsSigningKey() {
 
 // ── app harness ───────────────────────────────────────────────────────────
 // `db` and `now` may be supplied to stand a SECOND app over the same database
-// and clock — how the trial kill-switch test rebuilds the service with the
-// trial config removed without losing the rows the first one wrote.
+// and clock, so a test can rebuild the service with a different config without
+// losing the rows the first one wrote.
 export async function startTestApp(overrides = {}) {
   const clock = overrides.clock ?? { t: Date.now() };
   const now = overrides.now ?? (() => clock.t);
@@ -116,7 +116,6 @@ export async function startTestApp(overrides = {}) {
     mailTransport: mail,
     apnsTransport,
     now,
-    provisioner: overrides.provisioner,
     ...(overrides.appStoreVerifier
       ? { appStoreVerifier: overrides.appStoreVerifier }
       : {}),

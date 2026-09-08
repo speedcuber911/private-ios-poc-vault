@@ -15,20 +15,17 @@
 // authenticates relayed blobs — see pairing.js for the full rationale.
 
 import { createServer } from "node:http";
-import { readFileSync } from "node:fs";
 import { timingSafeEqual, randomBytes, createHash, randomUUID } from "node:crypto";
 import { signEd25519 } from "./jwt.js";
 import { serializeSignedCookie } from "better-call";
 import { createDb } from "./db.js";
-import { createRegistry, ENTITLEMENT_HOSTED_AUTO_UPGRADE } from "./registry.js";
+import { createRegistry } from "./registry.js";
 import { createAuth, createAppleJwksFetcher } from "./auth.js";
 import { createRelayBetterAuth, isRelayAdmin, readBetterAuthUser, listBetterAuthUsers } from "./better-auth.js";
 import { webOriginStore } from "./web-origin.js";
 import { createPairing } from "./pairing.js";
-import { createHostedPairings } from "./hosted-pairing.js";
 import { createNotify, parseNodePubkey } from "./notify.js";
 import { createApnsClient, createNoopTransport } from "./apns.js";
-import { createProvisioner } from "./provisioner.js";
 import { verifyNodeRequest, createReplayGuard } from "./nodeauth.js";
 import {
   appAccountTokenForAccount,
@@ -36,34 +33,27 @@ import {
 } from "./app-store.js";
 
 const NODE_KINDS = new Set(["byo", "managed"]);
+
+// Validates the X25519 recipient key a handoff is sealed TO, using the exact
+// rule product/relayd/src/seal.mjs's sealTo() enforces: decode, require 32
+// bytes, and require the bytes to re-encode back to the identical string.
+// Node's base64 decoder is lenient — it accepts base64url characters, ignores
+// embedded whitespace, and skips other junk spliced into the string — so a
+// length-only check here would let a key through that seal.mjs later refuses
+// to use. Rejecting the same malformed key at registration, where the error is
+// diagnosable, instead of at handoff time, where it surfaces as an opaque
+// seal_bad_public_key on someone's phone, is the entire point.
+//
+// Returns the canonical string, or null when the value is unusable. `null`
+// input (no key offered) is the caller's business, not this function's.
+function parseNodeEncPubkey(value) {
+  if (typeof value !== "string" || value.length === 0) return null;
+  const raw = Buffer.from(value, "base64");
+  if (raw.length !== 32 || raw.toString("base64") !== value) return null;
+  return value;
+}
 const BROWSER_GRANT_TTL_SEC = 900;
 const BROWSER_GRANT_SCOPE = ["jobs.read", "threads.read", "events.read"];
-const HOSTED_RENEW_INTERVAL_MS = 24 * 3600 * 1000;
-const HOSTED_RENEW_RETRY_MS = 5 * 60 * 1000;
-const HOSTED_ACTIVATION_PENDING = "hosted.activation_pending_trial";
-
-// Reads the wildcard certificate handed to every trial node, or {} when none
-// is configured. Read per provision rather than cached at boot so a certbot
-// renewal is picked up without restarting the control plane — the files are
-// symlinks into letsencrypt's archive and are replaced, not rewritten.
-//
-// Returns {} on any read failure instead of throwing: a node that self-signs
-// still works, where a failed provision leaves the user with nothing.
-function nodeTlsMaterial(config) {
-  const { certFile, keyFile } = config.nodeTls ?? {};
-  if (!certFile || !keyFile) return {};
-  try {
-    return {
-      tlsCert: readFileSync(certFile, "utf8"),
-      tlsKey: readFileSync(keyFile, "utf8"),
-    };
-  } catch (error) {
-    // Path and error code only; never the key.
-    console.error(`node TLS material unreadable at ${certFile}: ${error.code || "unknown"} — node will self-sign`);
-    return {};
-  }
-}
-
 // Bounds how many polls from ONE node can be parked at once on
 // GET /v1/node/handoffs. A client that connects, signs a valid request, and
 // immediately disconnects still costs a Set entry, a timer, and a live
@@ -103,7 +93,6 @@ export function createApp({
   mailTransport = { send: async () => {} },
   apnsTransport = createNoopTransport(),
   now = () => Date.now(),
-  provisioner = createProvisioner(config),
   appStoreVerifier = createAppStoreVerifier(config),
   // Operator warnings from the push pipeline. Injectable so a test can assert
   // that a whole-account APNs refusal actually SAYS so — the fanout summary and
@@ -112,18 +101,11 @@ export function createApp({
   log = (msg) => console.warn(msg),
 } = {}) {
   const registry = createRegistry(db, { now });
-  const hostedPairings = createHostedPairings({ db, registry, now, accessAllowed: computerAccessAllowed });
   const legacyAuth = createAuth({ registry, config, jwksFetcher, mailTransport, now });
   const betterAuth = createRelayBetterAuth({
     db,
     registry,
     config,
-    // Deleting the account drops the trial_nodes row, after which nothing can
-    // map the account back to its microVM — so the sandbox has to go first.
-    // releaseSandbox never throws, so a dead Cube host degrades to a recorded
-    // orphan instead of an account that cannot be deleted.
-    beforeAccountDelete: (accountId) =>
-      releaseSandbox(registry.getTrialByAccount(accountId), "account_deleted"),
     // Shared with the legacy /v1/auth/apple route, so both paths accept
     // exactly the same tokens and there is one Apple verifier to reason about.
     verifyAppleIdToken: legacyAuth.verifyAppleIdentityToken,
@@ -138,144 +120,7 @@ export function createApp({
     },
   };
 
-  // The reaper and HTTP activations share a per-account lifecycle queue. A
-  // stale expiry pass must not pause a sandbox after its upgrade succeeded.
-  const hostedLifecycleLocks = new Map();
-  const hostedRenewAfter = new Map();
   let shuttingDown = false;
-
-  async function withHostedLifecycle(accountId, work) {
-    const previous = hostedLifecycleLocks.get(accountId) ?? Promise.resolve();
-    const operation = previous.catch(() => {}).then(() => {
-      if (shuttingDown) return { error: "service_shutting_down" };
-      return work();
-    });
-    hostedLifecycleLocks.set(accountId, operation);
-    try { return await operation; }
-    finally {
-      if (hostedLifecycleLocks.get(accountId) === operation) hostedLifecycleLocks.delete(accountId);
-    }
-  }
-
-  function hostedAccessIsEntitled(accountId) {
-    return registry.getEntitlement(accountId, ENTITLEMENT_HOSTED_AUTO_UPGRADE) === "1" ||
-      registry.hasActiveAppleSubscription(accountId, now());
-  }
-
-  function rememberHostedLease(trial) {
-    hostedRenewAfter.set(trial.id, {
-      sandboxId: trial.sandboxId,
-      at: now() + Math.min(HOSTED_RENEW_INTERVAL_MS, config.trial.paidSandboxTimeoutSec * 500),
-    });
-  }
-
-  async function upgradeHostedTrial(accountId, { grantOperatorEntitlement = false } = {}) {
-    return withHostedLifecycle(accountId, async () => {
-      if (!registry.getAccount(accountId)) return { error: "unknown_account" };
-      const trial = registry.getTrialByAccount(accountId);
-      if (!trial?.sandboxId || !trial.nodeId || !registry.getNode(trial.nodeId) ||
-          !["creating", "ready", "expired", "upgraded"].includes(trial.state)) {
-        return { error: "nothing_to_upgrade" };
-      }
-      if (!grantOperatorEntitlement &&
-          registry.getEntitlement(accountId, ENTITLEMENT_HOSTED_AUTO_UPGRADE) !== "1") {
-        return { error: "hosted_entitlement_required" };
-      }
-      if (!provisioner) return { error: "provisioner_unavailable" };
-      let exists = trial.state === "expired"
-        ? await provisioner.resumeSandbox(trial.sandboxId, config.trial.paidSandboxTimeoutSec)
-        : await provisioner.extendSandbox(trial.sandboxId, config.trial.paidSandboxTimeoutSec);
-      // A platform-paused machine may still have an old upgraded/ready row.
-      // Resume is explicit here, never inferred from an entitlement-less sweep.
-      if (!exists && trial.state !== "expired") {
-        exists = await provisioner.resumeSandbox(trial.sandboxId, config.trial.paidSandboxTimeoutSec);
-      }
-      if (!exists) return { error: "sandbox_missing" };
-      const current = registry.getTrialByAccount(accountId);
-      if (shuttingDown || current?.id !== trial.id || current.sandboxId !== trial.sandboxId ||
-          current.nodeId !== trial.nodeId || !["creating", "ready", "expired", "upgraded"].includes(current.state)) {
-        return { error: "trial_changed" };
-      }
-      const result = registry.upgradeTrialAccount(accountId);
-      if (result.error) return result;
-      if (grantOperatorEntitlement) registry.setEntitlement(accountId, ENTITLEMENT_HOSTED_AUTO_UPGRADE, "1");
-      registry.setEntitlement(accountId, HOSTED_ACTIVATION_PENDING, "");
-      rememberHostedLease(current);
-      return result;
-    });
-  }
-
-  async function activateHostedSubscription(accountId, expiresAt) {
-    return withHostedLifecycle(accountId, async () => {
-      const trial = registry.getTrialByAccount(accountId);
-      if (!trial?.nodeId || !trial.sandboxId || trial.state === "destroyed" || trial.state === "failed") {
-        return { ok: true, trial };
-      }
-      if (!provisioner) return { error: "provisioner_unavailable" };
-
-      const sandboxExists = trial.state === "expired"
-        ? await provisioner.resumeSandbox(trial.sandboxId, config.trial.paidSandboxTimeoutSec)
-        : await provisioner.extendSandbox(trial.sandboxId, config.trial.paidSandboxTimeoutSec);
-      const current = registry.getTrialByAccount(accountId);
-      if (shuttingDown || current?.id !== trial.id || current.sandboxId !== trial.sandboxId ||
-          current.nodeId !== trial.nodeId || !hostedAccessIsEntitled(accountId)) {
-        return { error: "trial_changed" };
-      }
-      if (!sandboxExists) {
-        // Keep the paid recovery contract: an authoritative missing sandbox
-        // retires the stale node so the subscriber can provision a replacement.
-        registry.deleteNode(accountId, trial.nodeId);
-        return {
-          ok: true,
-          trial: registry.updateTrial(trial.id, {
-            state: "destroyed",
-            nodeId: null,
-            sandboxId: null,
-            enrollTokenHash: null,
-          }),
-        };
-      }
-      const currentExpiry = registry.getAppleSubscriptionByAccount(accountId)?.expiresAt ?? expiresAt;
-      const result = registry.activateHostedSubscriptionAccount(accountId, currentExpiry);
-      if (!result.error) rememberHostedLease(current);
-      return result;
-    });
-  }
-
-  async function expireHostedSubscription(accountId, expiresAt) {
-    return withHostedLifecycle(accountId, async () => {
-      const trial = registry.getTrialByAccount(accountId);
-      // An independent operator grant is not revoked by a sandbox StoreKit
-      // transaction expiring, nor by a delayed expiry racing a newer renewal.
-      if (hostedAccessIsEntitled(accountId)) return { ok: true, trial };
-      if (trial?.state === "upgraded" && trial.sandboxId && provisioner) {
-        try { await provisioner.pauseSandbox(trial.sandboxId); } catch {}
-      }
-      if (shuttingDown) return { error: "service_shutting_down" };
-      if (trial) hostedRenewAfter.delete(trial.id);
-      return registry.expireHostedSubscriptionAccount(accountId, expiresAt);
-    });
-  }
-
-  function computerAccessAllowed(node) {
-    const trial = registry.getTrialByNodeId(node.id);
-    if (!trial) return true;
-    switch (trial.state) {
-    case "creating":
-    case "ready":
-      return trial.expiresAt > now();
-    case "upgraded":
-      return (
-        registry.getEntitlement(node.accountId, ENTITLEMENT_HOSTED_AUTO_UPGRADE) === "1" ||
-        registry.hasActiveAppleSubscription(node.accountId, now())
-      );
-    case "expired":
-    case "destroyed":
-    case "failed":
-    default:
-      return false;
-    }
-  }
 
   function normalizedSubscription(transaction, { accountId, status } = {}) {
     const hostedProductIds = new Set([
@@ -310,73 +155,20 @@ export function createApp({
     };
   }
 
-  async function applyVerifiedSubscription(subscription) {
+  // Records the verified subscription and nothing else. Relay no longer hands
+  // out machines, so a purchase has no lifecycle to drive — the StoreKit
+  // surface is kept (App Store Connect items stay valid) but is inert.
+  function applyVerifiedSubscription(subscription) {
     const saved = registry.upsertAppleSubscription(subscription);
     if (saved.error) return saved;
-    if (saved.subscription.status === "active") {
-      const activated = await activateHostedSubscription(
-        saved.subscription.accountId,
-        saved.subscription.expiresAt,
-      );
-      if (activated.error) return activated;
-    } else {
-      await expireHostedSubscription(
-        saved.subscription.accountId,
-        saved.subscription.expiresAt,
-      );
-    }
     return {
       ok: true,
       subscription: registry.getAppleSubscriptionByAccount(subscription.accountId),
-      trial: registry.getTrialByAccount(subscription.accountId),
     };
   }
   const pairing = createPairing({ registry, config, now });
   const apns = createApnsClient({ config, transport: apnsTransport, now });
   const notify = createNotify({ registry, apns, config, now, log });
-
-  // Destroys a trial's sandbox, or records it for reconciliation when it
-  // cannot be destroyed right now (no provisioner configured, or the Cube host
-  // refused/timed out). Never throws: every caller — account deletion and the
-  // reaper — has control-plane work that MUST still happen even when the
-  // sandbox half fails, and an unreachable host must never be able to make an
-  // account undeletable or stall a sweep pass.
-  async function releaseSandbox(trial, reason) {
-    if (!trial?.sandboxId) return;
-    if (provisioner) {
-      try {
-        await provisioner.killSandbox(trial.sandboxId);
-        registry.clearSandboxOrphan(trial.sandboxId);
-        return;
-      } catch (err) {
-        console.error(`sandbox destroy failed (${reason}): ${err?.message}`);
-      }
-    }
-    registry.recordSandboxOrphan({
-      sandboxId: trial.sandboxId,
-      trialId: trial.id,
-      accountId: trial.accountId,
-      reason,
-    });
-  }
-
-  async function unlinkHostedNode(node) {
-    if (!node) return { error: "nothing_to_unlink" };
-    const trial = registry.getTrialByNodeId(node.id);
-    if (trial?.sandboxId) {
-      await releaseSandbox(trial, "unlinked");
-    }
-    registry.deleteNode(node.accountId, node.id);
-    if (trial) {
-      registry.updateTrial(trial.id, {
-        state: "destroyed",
-        enrollTokenHash: null,
-        sandboxId: null,
-        nodeId: null,
-      });
-    }
-    return { ok: true };
-  }
 
   // Web device-code redemption: Better Auth 1.6.26 has no auth.api.createSession.
   // Password sign-ups already share the registry id (ensureRelayAccount).
@@ -416,28 +208,6 @@ export function createApp({
       return null;
     }
   }
-
-  // Second chance at sandboxes an earlier pass could not destroy. Cheap and
-  // bounded; a no-op while the trial feature is switched off, which is exactly
-  // when the backlog accumulates.
-  async function reconcileSandboxOrphans() {
-    if (!provisioner) return;
-    for (const orphan of registry.listSandboxOrphans()) {
-      try {
-        await provisioner.killSandbox(orphan.sandboxId);
-        registry.clearSandboxOrphan(orphan.sandboxId);
-      } catch (err) {
-        console.error(`orphan reconcile failed: ${err?.message}`);
-      }
-    }
-  }
-
-  // Guard against overlapping passes. runSweeps fires this without awaiting on
-  // a 60 s timer, so a pass slowed by an unresponsive provisioner would
-  // otherwise be re-entered by the next tick and double-issue pause/kill/
-  // deleteNode against the same rows.
-  let trialSweepInFlight = false;
-  let hostedSweepInFlight = false;
 
   // Waiters for GET /v1/node/handoffs, keyed by node id. Lives inside
   // createApp (not module-global) so each app instance — and therefore each
@@ -523,7 +293,7 @@ export function createApp({
           // The empty Set left behind by a natural timeout is never removed
           // by anything else — dropping it here is what keeps
           // handoffWaiters from growing without bound over the process
-          // lifetime as trial nodes churn (I-1).
+          // lifetime as nodes churn (I-1).
           if (waiters.size === 0) handoffWaiters.delete(nodeId);
           resolve();
         },
@@ -536,125 +306,12 @@ export function createApp({
     });
   }
 
-  async function sweepHostedSandboxes() {
-    if (shuttingDown || hostedSweepInFlight || !provisioner) return;
-    hostedSweepInFlight = true;
-    try {
-      const candidates = [...registry.listPendingHostedActivations(), ...registry.listUpgradedTrials()];
-      const retained = new Set(candidates.map((trial) => trial.id));
-      for (const id of hostedRenewAfter.keys()) if (!retained.has(id)) hostedRenewAfter.delete(id);
-      for (const candidate of candidates) {
-        if (shuttingDown) return;
-        if (!hostedAccessIsEntitled(candidate.accountId) || !candidate.sandboxId || !candidate.nodeId) continue;
-        const scheduled = hostedRenewAfter.get(candidate.id);
-        if (scheduled?.sandboxId === candidate.sandboxId && scheduled.at > now()) continue;
-        try {
-          if (candidate.state !== "upgraded") {
-            const result = await upgradeHostedTrial(candidate.accountId);
-            if (result.error) throw new Error(result.error);
-          } else {
-            await withHostedLifecycle(candidate.accountId, async () => {
-              const current = registry.getTrialByAccount(candidate.accountId);
-              if (current?.id !== candidate.id || current.state !== "upgraded" ||
-                  current.sandboxId !== candidate.sandboxId || !registry.getNode(current.nodeId) ||
-                  !hostedAccessIsEntitled(current.accountId)) return;
-              // Renewal extends running machines only. Explicit recovery or
-              // upgrade owns resume; no background sweep revives a paused row.
-              const exists = await provisioner.extendSandbox(current.sandboxId, config.trial.paidSandboxTimeoutSec);
-              if (!exists) throw new Error("sandbox_not_running");
-              if (!shuttingDown) rememberHostedLease(current);
-            });
-          }
-        } catch (error) {
-          if (shuttingDown) return;
-          hostedRenewAfter.set(candidate.id, { sandboxId: candidate.sandboxId, at: now() + HOSTED_RENEW_RETRY_MS });
-          // A transient timeout does not downgrade an active account or
-          // delete its node. Retain the record and retry on a bounded cadence.
-          log(`hosted sandbox maintenance deferred for ${candidate.id}: ${error?.message}`);
-        }
-      }
-    } finally {
-      hostedSweepInFlight = false;
-    }
-  }
-
-  async function sweepTrials() {
-    if (shuttingDown || trialSweepInFlight) return;
-    trialSweepInFlight = true;
-    try {
-      await sweepHostedSandboxes();
-      // Lifecycle enforcement is deliberately NOT gated on the provisioner.
-      // `E2B_API_URL` is the kill switch for CREATING trials (POST
-      // /v1/trial-nodes still 404s without it); if unsetting it also switched
-      // off the reaper, every trial already in the wild would stop expiring —
-      // node rows staying live and users keeping access indefinitely, which is
-      // the opposite of what reaching for a kill switch means. Expiring access
-      // is pure control-plane work and always runs. Only the sandbox-destroying
-      // half needs the provisioner, and what it cannot destroy is recorded as
-      // an orphan rather than silently forgotten.
-      //
-      // Each row is isolated: one trial's failure must not abort the pass and
-      // strand every trial behind it.
-      for (const trial of registry.listTrialsDue(now())) {
-        try {
-          await withHostedLifecycle(trial.accountId, async () => {
-            const current = registry.getTrialById(trial.id);
-            if (!current || !["creating", "ready"].includes(current.state) || current.expiresAt > now()) return;
-            if (current.sandboxId && provisioner) {
-              try { await provisioner.pauseSandbox(current.sandboxId); } catch {}
-            }
-            // Access expires whether or not pause succeeded. Recheck after
-            // the await so a stale timer cannot expire an upgraded machine.
-            if (!shuttingDown) registry.updateTrial(current.id, { state: "expired", enrollTokenHash: null });
-          });
-        } catch (err) {
-          console.error(`trial expire failed for ${trial.id}: ${err?.message}`);
-        }
-      }
-
-      for (const trial of registry.listTrialsPastGrace(now(), config.trial.graceSec * 1000)) {
-        try {
-          await withHostedLifecycle(trial.accountId, async () => {
-            const current = registry.getTrialById(trial.id);
-            if (!current || current.state !== "expired" || current.expiresAt + config.trial.graceSec * 1000 > now()) return;
-            await releaseSandbox(current, "trial_past_grace");
-            if (shuttingDown) return;
-            if (current.nodeId) registry.deleteNode(current.accountId, current.nodeId);
-            registry.updateTrial(current.id, { state: "destroyed" });
-          });
-        } catch (err) {
-          console.error(`trial destroy failed for ${trial.id}: ${err?.message}`);
-        }
-      }
-
-      await reconcileSandboxOrphans();
-    } finally {
-      trialSweepInFlight = false;
-    }
-  }
-
-  async function sweepExpiredSubscriptions() {
-    for (const subscription of registry.listExpiredAppleSubscriptions(now())) {
-      try {
-        registry.markAppleSubscriptionExpired(subscription.accountId);
-        await expireHostedSubscription(subscription.accountId, subscription.expiresAt);
-      } catch (error) {
-        console.error(`subscription expire failed for ${subscription.accountId}: ${error?.message}`);
-      }
-    }
-  }
-
   function runSweeps() {
-    hostedPairings.sweep();
     if (shuttingDown) return;
     pairing.sweep();
     notify.sweep();
     registry.sweepDeviceCodes(now());
     registry.sweepSyncNotices(now());
-    sweepExpiredSubscriptions().catch((err) =>
-      console.error(`subscription sweep failed: ${err?.message}`),
-    );
-    sweepTrials().catch((err) => console.error(`trial sweep failed: ${err?.message}`));
   }
 
   const server = createServer((req, res) => {
@@ -667,7 +324,6 @@ export function createApp({
   });
   server.once("close", () => {
     shuttingDown = true;
-    hostedRenewAfter.clear();
   });
 
   async function handle(req, res) {
@@ -700,7 +356,7 @@ export function createApp({
     if (path.startsWith("/v1/") && isStateChanging(method)) {
       const origin = originOf(req);
       // Browsers always send Origin on state-changing requests; native clients
-      // (iOS, the CLI, relayd, the trial sandbox) send none and are untouched.
+      // (iOS, the CLI, relayd) send none and are untouched.
       if (origin && !originAllowed(origin, config)) {
         return sendJson(res, 403, { error: "forbidden_origin" });
       }
@@ -950,10 +606,7 @@ export function createApp({
         status: explicitlyInactive ? "expired" : "active",
       });
       if (!subscription) return sendJson(res, 200, { ok: true });
-      const result = await applyVerifiedSubscription(subscription);
-      if (result.error === "provisioner_unavailable") {
-        return sendJson(res, 503, { error: result.error });
-      }
+      applyVerifiedSubscription(subscription);
       return sendJson(res, 200, { ok: true });
     }
 
@@ -1008,50 +661,10 @@ export function createApp({
         return sendJson(res, 401, { error: "unauthorized" });
       }
       if (method === "GET") {
-        // Capture ownership before getBlob potentially closes and scrubs the
-        // rendezvous. Operator-entitled hosted accounts become permanent only
-        // after the phone has actually collected its device credential; doing
-        // this at enroll time races the iOS ready/pairing sequence and strands
-        // the device without an identity.
-        const pairingSession = slot === "node" ? registry.getPairingSession(id) : null;
-        if (pairingSession?.kind === "hosted-device" && !hostedPairings.isReady(id)) {
-          if (!pairing.isAuthorized(id, authToken)) return sendJson(res, 401, { error: "unauthorized" });
-          return sendJson(res, 404, { error: "not_posted_yet" });
-        }
         const outcome = pairing.getBlob(id, authToken, slot);
         if (outcome === "unauthorized") return sendJson(res, 401, { error: "unauthorized" });
         if (outcome === "bad_slot") return sendJson(res, 400, { error: "invalid_blob" });
         if (outcome === "empty") return sendJson(res, 404, { error: "not_posted_yet" });
-        if (
-          slot === "node" &&
-          pairingSession &&
-          (
-            registry.getEntitlement(pairingSession.accountId, ENTITLEMENT_HOSTED_AUTO_UPGRADE) === "1" ||
-            registry.hasActiveAppleSubscription(pairingSession.accountId, now())
-          )
-        ) {
-          if (registry.hasActiveAppleSubscription(pairingSession.accountId, now())) {
-            const subscription = registry.getAppleSubscriptionByAccount(pairingSession.accountId);
-            try {
-              await activateHostedSubscription(pairingSession.accountId, subscription.expiresAt);
-            } catch (error) {
-              console.error(`subscription machine activation failed for ${pairingSession.accountId}: ${error?.message}`);
-            }
-          } else {
-            const trial = registry.getTrialByAccount(pairingSession.accountId);
-            if (trial?.sandboxId) {
-              registry.setEntitlement(pairingSession.accountId, HOSTED_ACTIVATION_PENDING, `${trial.id}:${trial.sandboxId}`);
-            }
-            try {
-              const activated = await upgradeHostedTrial(pairingSession.accountId);
-              if (activated.error) log(`hosted machine activation deferred for ${pairingSession.accountId}: ${activated.error}`);
-            } catch (error) {
-              // The credential blob must still reach the phone. The durable
-              // pending marker retries platform activation in a later sweep.
-              log(`hosted machine activation deferred for ${pairingSession.accountId}: ${error?.message}`);
-            }
-          }
-        }
         return sendBytes(res, 200, outcome.blob, { "x-pairing-tag": outcome.tag });
       }
     }
@@ -1077,57 +690,6 @@ export function createApp({
       });
     }
 
-    // ── trial enroll (single-use token from the sandbox bootstrap) ─────────
-    if (method === "POST" && path === "/v1/trial-nodes/enroll") {
-      const body = await readJson(req, config.jsonBodyMaxBytes);
-      const token = typeof body?.token === "string" ? body.token : "";
-      const trial = token ? registry.getTrialByTokenHash(sha256Hex(token)) : null;
-      if (!trial || trial.state !== "creating") {
-        return sendJson(res, 401, { error: "invalid_enroll_token" });
-      }
-      const nodeId = typeof body?.nodeId === "string" ? body.nodeId : "";
-      if (!/^node-[0-9a-f]{16}$/.test(nodeId)) {
-        return sendJson(res, 400, { error: "invalid_node_id" });
-      }
-      if (!parseNodePubkey(body?.pubkey)) {
-        return sendJson(res, 400, { error: "invalid_pubkey" });
-      }
-      // Present-but-wrong-typed must 400, never silently normalize to "no
-      // key" — a client bug (number/object/array/JSON null) would otherwise
-      // enroll a node with no encryption key at all, permanently unable to
-      // receive a sealed handoff, with nothing to explain why.
-      if (body?.encPubkey !== undefined && typeof body.encPubkey !== "string") {
-        return sendJson(res, 400, { error: "invalid_enc_pubkey" });
-      }
-      const encPubkey = strOrNull(body?.encPubkey);
-      // Canonical base64 only — the exact rule product/relayd/src/seal.mjs's
-      // sealTo() enforces (decode, then require the bytes to re-encode back
-      // to the identical string). Node's base64 decoder is lenient: it
-      // accepts base64url characters, ignores embedded whitespace, and skips
-      // other junk spliced into the string, so a length-only check here would
-      // let a key through that seal.mjs later refuses to use. Rejecting the
-      // same malformed key at enroll — where the error is diagnosable —
-      // instead of at handoff time — where it would surface as an opaque
-      // decrypt failure on the user's phone — is the entire point of this
-      // check. Kept byte-for-byte identical to seal.mjs's rule because this
-      // key crosses a process boundary and the two sides must agree exactly.
-      if (encPubkey !== null) {
-        const raw = Buffer.from(encPubkey, "base64");
-        if (raw.length !== 32 || raw.toString("base64") !== encPubkey) {
-          return sendJson(res, 400, { error: "invalid_enc_pubkey" });
-        }
-      }
-      if (registry.getNode(nodeId)) {
-        return sendJson(res, 409, { error: "node_exists" });
-      }
-      registry.createNode(trial.accountId, {
-        id: nodeId, kind: "trial", name: "Trial machine",
-        pubkey: String(body.pubkey), encPubkey, version: strOrNull(body?.version),
-      });
-      registry.updateTrial(trial.id, { state: "ready", nodeId, enrollTokenHash: null });
-      return sendJson(res, 200, { ok: true, sni: config.tunnel.suffix ? `${nodeId}${config.tunnel.suffix}` : nodeId });
-    }
-
     // ── admin (ops-authed) ──────────────────────────────────────────────
     if (method === "GET" && path === "/v1/admin/nodes") {
       if (!bearerMatches(req, config.adminToken)) {
@@ -1146,17 +708,6 @@ export function createApp({
       });
     }
 
-    // Hosted worker readiness is signed by the addressed node, never by an
-    // account session. It releases an already-uploaded encrypted credential
-    // only after the node has atomically activated its independent bearer.
-    if (method === "POST" && seg.length === 5 && seg[0] === "v1" && seg[1] === "node" &&
-        seg[2] === "device-pairings" && seg[4] === "ready") {
-      const verified = verifyNodeRequest(req, `${path}${url.search}`, { registry, now, replayGuard: handoffReplayGuard });
-      if (verified.error) return sendJson(res, 401, { error: "unauthorized" });
-      if (!hostedPairings.markReady(verified.node.id, seg[3])) return sendJson(res, 404, { error: "not_found" });
-      return sendJson(res, 200, { ok: true });
-    }
-
     // ── node handoff long-poll (signature-authed) ───────────────────────
     //
     // A node holds this open waiting for the next `relay handoff` ping meant
@@ -1169,8 +720,6 @@ export function createApp({
       if (verified.error) return sendJson(res, 401, { error: "unauthorized" });
 
       const nodeId = verified.node.id;
-      const hostedPairingCapable = url.searchParams.get("hostedPairing") === "1";
-      if (hostedPairingCapable) hostedPairings.noteCapability(nodeId);
       const requested = Number.parseInt(url.searchParams.get("wait") || "0", 10);
       const waitSec = Number.isSafeInteger(requested)
         ? Math.max(0, Math.min(requested, config.handoffPollMaxWaitSec))
@@ -1181,8 +730,7 @@ export function createApp({
       if (
         waitSec > 0 &&
         registry.countPendingHandoffs(nodeId) === 0 &&
-        registry.countPendingSyncNotices(nodeId) === 0 &&
-        (!hostedPairingCapable || hostedPairings.pending(nodeId).length === 0)
+        registry.countPendingSyncNotices(nodeId) === 0
       ) {
         await waitForHandoff(nodeId, waitSec * 1000, req);
       }
@@ -1215,16 +763,11 @@ export function createApp({
       registry.touchNode(nodeId);
       return sendJson(res, 200, {
         handoffs: leased.map(({ id, repo, branch, leaseToken }) => ({ id, repo, branch, lease: leaseToken })),
-        // Never delivered/consumed by old workers. Repeated until the normal
-        // MAC-tagged rendezvous closes, with node-side durable idempotency.
-        ...(hostedPairingCapable ? { devicePairings: hostedPairings.pending(nodeId) } : {}),
         notices: leasedNotices.map(({ id, pairingId, secret, leaseToken }) => ({
           id, pairingId, secret, lease: leaseToken,
         })),
         computerAccess: {
-          allowed:
-            !registry.isCliComputerAccessRevoked(verified.node.accountId) &&
-            computerAccessAllowed(verified.node),
+          allowed: !registry.isCliComputerAccessRevoked(verified.node.accountId),
           leaseSec: config.computerAccessLeaseSec,
         },
       });
@@ -1383,14 +926,13 @@ export function createApp({
       if (subscription.status !== "active") {
         return sendJson(res, 402, { error: "subscription_inactive" });
       }
-      const result = await applyVerifiedSubscription(subscription);
+      const result = applyVerifiedSubscription(subscription);
       if (result.error === "subscription_owned_by_another_account") {
         return sendJson(res, 409, { error: result.error });
       }
       if (result.error) return sendJson(res, 503, { error: result.error });
       return sendJson(res, 200, {
         subscription: publicSubscription(result.subscription),
-        trial: result.trial ? publicTrial(result.trial, config, registry) : null,
       });
     }
 
@@ -1409,63 +951,6 @@ export function createApp({
         publicAdminAccount(db, registry, user.id),
       );
       return sendJson(res, 200, { accounts });
-    }
-
-    if (
-      method === "POST" &&
-      seg.length === 5 &&
-      seg[0] === "v1" &&
-      seg[1] === "admin" &&
-      seg[2] === "accounts" &&
-      seg[4] === "upgrade"
-    ) {
-      if (!callerIsAdmin()) return sendJson(res, 403, { error: "forbidden" });
-      let result;
-      try {
-        result = await upgradeHostedTrial(seg[3], { grantOperatorEntitlement: true });
-      } catch (error) {
-        log(`hosted machine upgrade failed for ${seg[3]}: ${error?.message}`);
-        return sendJson(res, 502, { error: "hosted_activation_failed" });
-      }
-      if (result.error === "unknown_account") {
-        return sendJson(res, 404, { error: "unknown_account" });
-      }
-      if (result.error === "nothing_to_upgrade") {
-        return sendJson(res, 409, { error: "nothing_to_upgrade" });
-      }
-      if (result.error === "sandbox_missing" || result.error === "trial_changed") {
-        return sendJson(res, 409, { error: result.error });
-      }
-      if (result.error) return sendJson(res, 503, { error: result.error });
-      return sendJson(res, 200, {
-        ok: true,
-        account: publicAdminAccount(db, registry, seg[3]),
-      });
-    }
-
-    if (
-      method === "DELETE" &&
-      seg.length === 5 &&
-      seg[0] === "v1" &&
-      seg[1] === "admin" &&
-      seg[2] === "accounts" &&
-      seg[4] === "machine"
-    ) {
-      if (!callerIsAdmin()) return sendJson(res, 403, { error: "forbidden" });
-      if (!registry.getAccount(seg[3]) && !readBetterAuthUser(db, seg[3])) {
-        return sendJson(res, 404, { error: "unknown_account" });
-      }
-      const target = publicAdminAccount(db, registry, seg[3]);
-      const nodeId = target.trial?.nodeId || null;
-      const node = nodeId ? registry.getNode(nodeId) : null;
-      if (!node) {
-        return sendJson(res, 409, { error: "nothing_to_unlink" });
-      }
-      await unlinkHostedNode(node);
-      return sendJson(res, 200, {
-        ok: true,
-        account: publicAdminAccount(db, registry, seg[3]),
-      });
     }
 
     if (path === "/v1/auth/device/link" && method === "GET") {
@@ -1643,16 +1128,50 @@ export function createApp({
       if (!parseNodePubkey(body.pubkey)) {
         return sendJson(res, 400, { error: "invalid_pubkey" });
       }
-      // Entitlement gate. Trial nodes are excluded from the count: the trial
-      // machine is granted by the cloud (the enroll route creates it bypassing
-      // this gate entirely), so counting it against `nodes.max` would 403 every
-      // trial user who tries to register their own box — the exact upgrade path
-      // the trial is meant to lead to.
+      // The X25519 key `relay handoff` seals to. Optional — a node registered
+      // without one still works for everything that is not handoff — but a
+      // PRESENT-and-malformed one is a 400, never a silent null. A silently
+      // null enc_pubkey is the failure mode that hid this gap for a whole
+      // release: the seal step simply has no recipient, and the break surfaces
+      // far from its cause.
+      let encPubkey = null;
+      if (body.encPubkey !== undefined && body.encPubkey !== null) {
+        encPubkey = parseNodeEncPubkey(body.encPubkey);
+        if (!encPubkey) return sendJson(res, 400, { error: "invalid_enc_pubkey" });
+      }
+      // The node's OWN id, minted by relayd when it created its identity.
+      //
+      // This is not cosmetic. A node signs its cloud requests with
+      // `x-relay-node: <its id>`, and nodeauth resolves that header through
+      // registry.getNode() — so a node registered under an id the cloud chose
+      // instead can never authenticate, and its handoff long-poll fails
+      // forever. Trial enrolment used to pass the id through; when that route
+      // went, nothing did, and the phone had no way to say which machine it
+      // had just paired with.
+      //
+      // Absent is still allowed and still gets a generated id, for a caller
+      // that only wants a placeholder row.
+      let id;
+      if (body.id !== undefined && body.id !== null) {
+        id = String(body.id);
+        if (!/^node-[0-9a-f]{16}$/.test(id)) {
+          return sendJson(res, 400, { error: "invalid_node_id" });
+        }
+        // Claiming an id is first-come. Returning 409 for a foreign node and
+        // for the account's own duplicate alike keeps this from being an
+        // oracle for which machine ids exist.
+        if (registry.getNode(id)) {
+          return sendJson(res, 409, { error: "node_already_registered" });
+        }
+      }
+      // Entitlement gate: every node this account registered counts against
+      // `nodes.max`. Relay hands out no machines of its own any more, so there
+      // is nothing to exclude from the count.
       const max = Number.parseInt(
         registry.getEntitlement(account.id, "nodes.max") ?? "0",
         10,
       );
-      if (registry.countNodes(account.id, { includeTrial: false }) >= max) {
+      if (registry.countNodes(account.id) >= max) {
         return sendJson(res, 403, {
           error: "entitlement_limit",
           feature: "nodes.max",
@@ -1660,9 +1179,11 @@ export function createApp({
         });
       }
       const node = registry.createNode(account.id, {
+        ...(id ? { id } : {}),
         kind,
         name: strOrNull(body.name),
         pubkey: String(body.pubkey),
+        encPubkey,
         version: strOrNull(body.version),
       });
       return sendJson(res, 201, { node });
@@ -1707,14 +1228,6 @@ export function createApp({
       });
     }
 
-    if (method === "POST" && seg.length === 4 && seg[0] === "v1" &&
-        seg[1] === "nodes" && seg[3] === "device-pairings") {
-      const result = hostedPairings.enqueue(account.id, seg[2], await readJson(req, 8192));
-      if (result.error) return sendJson(res, result.status, { error: result.error });
-      wakeHandoffWaiters(seg[2]);
-      return sendJson(res, result.status, { ok: true, pairingId: result.pairingId, expiresAt: result.expiresAt });
-    }
-
     if (seg.length === 3 && seg[0] === "v1" && seg[1] === "nodes") {
       const node = registry.getNode(seg[2]);
       if (!node || node.accountId !== account.id) {
@@ -1722,7 +1235,7 @@ export function createApp({
       }
       if (method === "GET") return sendJson(res, 200, { node });
       if (method === "DELETE") {
-        await unlinkHostedNode(node);
+        registry.deleteNode(account.id, node.id);
         return sendJson(res, 204, null);
       }
     }
@@ -1822,154 +1335,13 @@ export function createApp({
       });
     }
 
-    if (path === "/v1/trial-nodes" && method === "POST") {
-      if (!provisioner) return sendJson(res, 404, { error: "trial_unavailable" });
-      const body = await readJson(req, config.jsonBodyMaxBytes);
-      const pairingId = typeof body?.pairingId === "string" ? body.pairingId : "";
-      const pairingSecret = typeof body?.pairingSecret === "string" ? body.pairingSecret : "";
-      if (!/^[0-9a-f-]{36}$/.test(pairingId) || !/^[A-Za-z0-9_-]{22,128}$/.test(pairingSecret)) {
-        return sendJson(res, 400, { error: "pairing_required" });
-      }
-      // One live trial per account: creating/ready still 409, and expired
-      // is spent (the TTL ran). failed never produced a machine; destroyed
-      // means the user (or the reaper) already tore it down. Both must be
-      // retryable in place — otherwise Delete trial machine burns the
-      // account with no way back.
-      const existingTrial = registry.getTrialByAccount(account.id);
-      const retryable = existingTrial?.state === "failed" || existingTrial?.state === "destroyed";
-      if (existingTrial && !retryable) {
-        return sendJson(res, 409, { error: "trial_already_used" });
-      }
-      if (registry.countActiveTrials() >= config.trial.maxActive) {
-        return sendJson(res, 503, { error: "trial_capacity" });
-      }
-      const enrollToken = randomBytes(32).toString("base64url");
-      const expiresAt = now() + config.trial.ttlSec * 1000;
-      // trial_nodes.account_id is UNIQUE, so a retry reuses the failed or
-      // destroyed row in place rather than inserting a second one.
-      const trial = existingTrial
-        ? registry.updateTrial(existingTrial.id, {
-            state: "creating",
-            nodeId: null,
-            sandboxId: null,
-            enrollTokenHash: sha256Hex(enrollToken),
-            expiresAt,
-          })
-        : registry.createTrialNode({
-            accountId: account.id,
-            enrollTokenHash: sha256Hex(enrollToken),
-            expiresAt,
-          });
-      try {
-        const created = await provisioner.createSandbox({
-          envVars: {
-            // main.js refuses to start when E2B_API_URL is set without
-            // ENROLL_BASE_URL, so in production this fallback is unreachable.
-            // It exists for the in-process test app, where the sandbox is a
-            // mock and host:port is the right answer.
-            RELAYD_ENROLL_URL: config.enrollBaseUrl || `http://${config.host}:${config.port}`,
-            RELAYD_ENROLL_TOKEN: enrollToken,
-            RELAYD_ENROLL_PAIRING_ID: pairingId,
-            RELAYD_ENROLL_PAIRING_SECRET: pairingSecret,
-            RELAYD_TUNNEL_HOST: config.tunnel.host,
-            RELAYD_TUNNEL_PORT: String(config.tunnel.port),
-            RELAYD_TUNNEL_SUFFIX: config.tunnel.suffix,
-          },
-          metadata: { trialId: trial.id },
-        });
-        // A create that yields no usable id is a hard failure, not something to
-        // record as nothing: updateTrial's `!== undefined` filter would skip an
-        // undefined sandboxId silently, and the reaper only acts on trials that
-        // have one — so the machine would run untouched until its platform
-        // timeout. `metadata.trialId` is set on the sandbox, so a
-        // Cube-list-vs-`trial_nodes` reconciliation sweep is the backstop for
-        // the remaining window between create returning and this write.
-        const sandboxId = typeof created?.sandboxId === "string" ? created.sandboxId : "";
-        if (!sandboxId) throw new Error("provisioner_missing_sandbox_id");
-        registry.updateTrial(trial.id, { sandboxId });
-
-        // The envVars above are NOT how the sandbox is configured. Cube
-        // restores every sandbox from a snapshot of the template's running
-        // machine, so its init process is already up with a frozen
-        // environment and never observes them; they are kept only because a
-        // directly-booted node (and the in-process test mock) still reads
-        // them. The real delivery is this file, written into the running
-        // sandbox through envd, which the boot script is waiting for.
-        //
-        // It is written AFTER sandboxId is recorded, so a crash in between
-        // leaves a reapable trial rather than an unreferenced machine.
-        await provisioner.writeSandboxFile(
-          sandboxId,
-          "/var/lib/relayd/enroll.json",
-          JSON.stringify({
-            cloudUrl: config.enrollBaseUrl || `http://${config.host}:${config.port}`,
-            token: enrollToken,
-            pairingId,
-            pairingSecret,
-            tunnelHost: config.tunnel.host,
-            tunnelPort: String(config.tunnel.port),
-            tunnelSuffix: config.tunnel.suffix,
-            // A certificate the phone's system trust store already accepts,
-            // for this node's name under the wildcard. Without it the node
-            // signs its own, the app has to override server trust, and iOS
-            // then refuses to perform client-certificate authentication at
-            // all — so mTLS cannot complete. Absent (no wildcard configured),
-            // the node falls back to self-signing and nothing else changes.
-            ...nodeTlsMaterial(config),
-            // Public half of the browser-grant key. Omitted when unset so
-            // existing phones and nodes that do not speak grants keep working.
-            ...(config.browserGrantPublicKey
-              ? { grantPublicKey: config.browserGrantPublicKey }
-              : {}),
-          }),
-        );
-      } catch {
-        // A failure AFTER the sandbox exists (config delivery is the likely
-        // one) would otherwise strand it: the reaper's due-list covers only
-        // `creating` and `ready`, so a `failed` row still holding a sandbox id
-        // is never revisited and the machine runs to its platform timeout.
-        // Destroy it best-effort and clear the id, so the row that remains
-        // describes nothing rather than something unreachable.
-        const stranded = registry.getTrialById(trial.id)?.sandboxId;
-        if (stranded) {
-          try {
-            await provisioner.killSandbox(stranded);
-          } catch {
-            // Nothing further to try here; metadata.trialId is set on the
-            // sandbox so reconciliation can still find it.
-          }
-        }
-        registry.updateTrial(trial.id, { state: "failed", enrollTokenHash: null, sandboxId: null });
-        return sendJson(res, 502, { error: "provision_failed" });
-      }
-      return sendJson(res, 201, { trial: publicTrial(registry.getTrialById(trial.id), config, registry) });
-    }
-
-    if (path === "/v1/trial-nodes/current" && method === "GET") {
-      const trial = registry.getTrialByAccount(account.id);
-      if (!trial) return sendJson(res, 404, { error: "no_trial" });
-      return sendJson(res, 200, { trial: publicTrial(trial, config, registry) });
-    }
-
-    if (path === "/v1/trial-nodes/current" && method === "DELETE") {
-      const trial = registry.getTrialByAccount(account.id);
-      if (!trial) return sendJson(res, 404, { error: "no_trial" });
-      if (trial.state === "upgraded") {
-        return sendJson(res, 409, { error: "trial_not_deletable" });
-      }
-      await releaseSandbox(trial, "user_deleted_trial");
-      if (trial.nodeId) registry.deleteNode(account.id, trial.nodeId);
-      registry.updateTrial(trial.id, { state: "destroyed", enrollTokenHash: null });
-      return sendJson(res, 204, null);
-    }
-
     return sendJson(res, 404, { error: "not_found" });
   }
 
   // handoffWaiters is exposed for test observability only (leak/cap/release
   // assertions — see the Task 8 review, I-1/I-2) — not a public API.
   return {
-    server, registry, auth, pairing, notify, runSweeps, sweepTrials, sweepHostedSandboxes, db, config, provisioner,
+    server, registry, auth, pairing, notify, runSweeps, db, config,
     handoffWaiters,
   };
 }
@@ -2249,19 +1621,6 @@ const HANDOFF_FAILURE_REASONS = new Set([
   "internal_error",
 ]);
 
-function publicTrial(trial, config, registry) {
-  const node = trial.nodeId ? registry.getNode(trial.nodeId) : null;
-  return {
-    id: trial.id,
-    state: trial.state,
-    nodeId: trial.nodeId,
-    nodeEncPubkey: node?.encPubkey ?? null,
-    sni: trial.nodeId && config.tunnel.suffix ? `${trial.nodeId}${config.tunnel.suffix}` : null,
-    createdAt: trial.createdAt,
-    expiresAt: trial.expiresAt,
-  };
-}
-
 function publicSubscription(subscription) {
   return {
     productId: subscription.productId,
@@ -2273,23 +1632,12 @@ function publicSubscription(subscription) {
 function publicAdminAccount(db, registry, accountId) {
   const user = readBetterAuthUser(db, accountId);
   const account = registry.getAccount(accountId);
-  const trial = registry.getTrialByAccount(accountId);
   return {
     id: accountId,
     email: user?.email || account?.email || null,
     name: user?.name ?? null,
     role: user?.role || "user",
     banned: Boolean(user?.banned),
-    trial: trial
-      ? {
-          id: trial.id,
-          state: trial.state,
-          nodeId: trial.nodeId,
-          sandboxId: trial.sandboxId,
-          createdAt: trial.createdAt,
-          expiresAt: trial.expiresAt,
-        }
-      : null,
     nodes: registry.listNodes(accountId).map((node) => ({
       id: node.id,
       kind: node.kind,
