@@ -772,8 +772,26 @@ function nodeServerTlsOptions({ baseDir = identityDir } = {}) {
     };
   }
   const issued = ensureServerCert({ san: publicHost, altNames: serverCertNames(), baseDir });
+  // Serve leaf + CA as an explicit chain.
+  //
+  // The phone pins the CA (`f=` in the QR) and looks for a certificate in the
+  // PRESENTED CHAIN whose SPKI matches. A leaf on its own gives it nothing to
+  // match, so it correctly refuses to pair — which is exactly what happened on
+  // the first real install: the data listener passed `ca:` to
+  // https.createServer for client-certificate verification and Node included
+  // those certs in the chain as a side effect, so port 8890 served two certs
+  // and pairing on 8891 served one. Pairing failed with "certificate does not
+  // come from the certificate authority in the pairing code" while the data
+  // port, which nothing was checking yet, looked fine.
+  //
+  // Building the chain here rather than relying on that side effect keeps the
+  // two listeners honest: `ca:` means "CAs I will accept client certs from",
+  // and using it to populate the served chain conflates two unrelated things.
+  const leaf = fs.readFileSync(issued.certPath, "utf8");
+  const ca = fs.readFileSync(identityPaths(baseDir).caCertPath, "utf8");
+  const chain = `${leaf.trimEnd()}\n${ca.trimEnd()}\n`;
   return {
-    cert: fs.readFileSync(issued.certPath),
+    cert: chain,
     key: fs.readFileSync(issued.keyPath),
     selfSigned: true,
     sans: issued.sans,

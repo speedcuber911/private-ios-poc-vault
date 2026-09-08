@@ -18,6 +18,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import https from "node:https";
+import tls from "node:tls";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -238,4 +239,87 @@ test("direct mode serves HTTPS the QR pins, and a paired bearer works over it", 
   });
   assert.equal(forged.status, 401, "forged client-cert headers must never authenticate");
   assert.equal(forged.json.error, "client certificate is required");
+});
+
+// ---------------------------------------------------------------------------
+// The pin has to be findable in the chain BOTH listeners present.
+//
+// This is the bug that stopped the first real pairing. The phone looks for a
+// certificate in the presented chain whose SPKI matches the QR's `f=`, which
+// is the CA — not the leaf. The data listener happened to serve the CA because
+// index.mjs passes `ca:` to https.createServer for client-certificate
+// verification and Node folds those into the chain; the pairing listener,
+// which passes no `ca:`, served the leaf alone. So port 8890 looked correct
+// while pairing on 8891 failed closed with "certificate does not come from the
+// certificate authority in the pairing code".
+//
+// Asserting on the SERVED CHAIN rather than on a config flag is deliberate:
+// the old behaviour was a side effect of an unrelated option, so only what
+// actually reaches the wire proves anything.
+// ---------------------------------------------------------------------------
+function spkiPinOf(pem) {
+  const key = new crypto.X509Certificate(pem).publicKey.export({ type: "spki", format: "der" });
+  return crypto.createHash("sha256").update(key).digest("base64url");
+}
+
+// Every certificate the peer sent, leaf first.
+function servedChain({ port, host = "127.0.0.1" }) {
+  return new Promise((resolve, reject) => {
+    const socket = tls.connect({ port, host, rejectUnauthorized: false, servername: host }, () => {
+      const chain = [];
+      const seen = new Set();
+      let cert = socket.getPeerCertificate(true);
+      while (cert && cert.raw && !seen.has(cert.fingerprint256)) {
+        seen.add(cert.fingerprint256);
+        chain.push(
+          `-----BEGIN CERTIFICATE-----\n${cert.raw
+            .toString("base64")
+            .replace(/(.{64})/g, "$1\n")
+            .trimEnd()}\n-----END CERTIFICATE-----\n`,
+        );
+        cert = cert.issuerCertificate && cert.issuerCertificate !== cert ? cert.issuerCertificate : null;
+      }
+      socket.end();
+      resolve(chain);
+    });
+    socket.on("error", reject);
+  });
+}
+
+test("both listeners present a chain containing the CA the QR pins", async () => {
+  // config.mjs creates its data dir on import, so point it somewhere writable
+  // before the module graph loads. The other test in this file spawns the
+  // daemon as a subprocess, so nothing has imported these yet.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-chain-"));
+  process.env.CODEX_DATA_DIR = path.join(root, "data");
+  process.env.RELAYD_IDENTITY_DIR = path.join(root, "identity");
+  process.env.CODEX_WORKSPACE_BROWSE_ROOT = path.join(root, "workspaces");
+  process.env.RELAYD_PUBLIC_HOST = "127.0.0.1";
+
+  const { nodeServerTlsOptions, caSpkiFingerprint, getCaPem, initIdentity } = await import("../src/identity.mjs");
+  initIdentity();
+  const options = nodeServerTlsOptions();
+  const pin = caSpkiFingerprint();
+
+  // The pin names the CA, and the CA is not the leaf — if these ever collapse
+  // into one value the test below would pass for the wrong reason.
+  assert.equal(pin, spkiPinOf(getCaPem()));
+  const certs = String(options.cert).match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) ?? [];
+  assert.equal(certs.length, 2, "nodeServerTlsOptions must return leaf + CA, not the leaf alone");
+  assert.notEqual(spkiPinOf(certs[0]), pin, "the first certificate should be the leaf");
+  assert.equal(spkiPinOf(certs[1]), pin, "the CA the QR pins must be in the served chain");
+
+  // And on the wire, from a listener built exactly the way pairing builds one —
+  // no `ca:` option, which is what made the two listeners differ.
+  const server = https.createServer(options, (_req, res) => res.end("ok"));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const chain = await servedChain({ port: server.address().port });
+    assert.ok(
+      chain.some((pem) => spkiPinOf(pem) === pin),
+      "a listener with no `ca:` option still has to serve the pinned CA",
+    );
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
