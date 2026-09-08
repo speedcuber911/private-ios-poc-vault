@@ -19,10 +19,12 @@ function Privacy() {
   return (
     <>
       <h1>Privacy Policy</h1>
-      <p className="legal-updated">Effective August 24, 2026</p>
+      <p className="legal-updated">Effective September 8, 2026</p>
       <p>
-        Relay is a private control surface for AI agent work. This policy explains what Relay
-        processes when you use the iPhone app, web console, hosted sandbox, or a Relay runner.
+        Relay is a private control surface for AI agent work. Relay does not supply or operate
+        computers. You run the Relay node software on a machine you already control, and the
+        iPhone app connects to it. This policy explains what Relay processes when you use the
+        iPhone app, the web console, or the Relay node and CLI software.
       </p>
 
       <h2>Information Relay processes</h2>
@@ -31,9 +33,17 @@ function Privacy() {
         <li><strong>Device information:</strong> app device identifiers, device name and platform, notification token, and signed-in session details.</li>
         <li><strong>Agent content:</strong> prompts, messages, run status, logs, outputs, attachments, workspace and repository metadata, and authenticated previews you choose to create or open.</li>
         <li><strong>Voice prompts:</strong> audio you intentionally record is sent for speech transcription. Relay keeps the resulting text and operational metadata, but does not retain the audio clip after the transcription request completes.</li>
-        <li><strong>Subscription information:</strong> Apple-signed product, transaction, renewal, and expiration details used to confirm Relay Hosted access. Apple processes your payment details; Relay does not receive your card or bank information.</li>
-        <li><strong>Service information:</strong> diagnostics, security events, machine state, and usage needed to operate, protect, and troubleshoot Relay.</li>
+        <li><strong>Service information:</strong> diagnostics, security events, machine registration records, and usage needed to operate, protect, and troubleshoot Relay.</li>
       </ul>
+
+      <h2>Where agent work happens</h2>
+      <p>
+        Agent runs, files, and command output stay on the machine you connect. Relay's servers hold
+        your account, your registered machines and devices, and the handoff and notification records
+        needed to reach your phone. When you pair the app with your own machine by scanning the code
+        that machine prints, the app connects to that machine directly and the pairing secret is not
+        sent to Relay's servers.
+      </p>
 
       <h2>How information is used</h2>
       <p>
@@ -46,13 +56,13 @@ function Privacy() {
       <h2>Service providers and agent providers</h2>
       <p>
         Relay uses infrastructure and authentication providers to operate the service, Apple for
-        Sign in with Apple, notifications, and App Store subscription processing, and Microsoft
-        Azure Speech when you request voice transcription. When you choose an agent, Relay identifies
-        its third-party AI provider before sending data: OpenAI for Codex, Anthropic for Claude,
-        Cursor for Cursor Agent, Moonshot AI for Kimi, Microsoft for Azure OpenAI, or Amazon Web
-        Services for Amazon Bedrock. Your selected provider processes agent content under the account,
-        privacy terms, and controls configured on your Relay machine. Relay does not place provider
-        credentials in its public catalog or app metadata.
+        Sign in with Apple and notifications, and Microsoft Azure Speech when you request voice
+        transcription. When you choose an agent, Relay identifies its third-party AI provider before
+        sending data: OpenAI for Codex, Anthropic for Claude, Cursor for Cursor Agent, Moonshot AI
+        for Kimi, Microsoft for Azure OpenAI, or Amazon Web Services for Amazon Bedrock. Your selected
+        provider processes agent content under the account, privacy terms, and controls configured on
+        your Relay machine. Relay does not place provider credentials in its public catalog or app
+        metadata.
       </p>
       <p>
         Before the app sends agent content to a selected AI provider for the first time, Relay shows
@@ -60,13 +70,13 @@ function Privacy() {
         conversation history, and any workspace files, attachments, or command output the agent needs
         to fulfill your request. If you decline, Relay does not send that request. Relay shares this
         content only to generate responses and perform the agent work you request; it does not include
-        your Relay name, email, password, device identifiers, or Apple payment and subscription details.
+        your Relay name, email, password, or device identifiers.
       </p>
       <p>
         Relay enables supported AI providers only when their published data-handling commitments and
         security controls provide protection equivalent to the safeguards described in this policy.
         Content remains subject to the selected provider's privacy terms and any retention or training
-        controls on the provider account you or the Relay machine operator configured.
+        controls on the provider account you configured on your machine.
       </p>
 
       <h2>Retention and deletion</h2>
@@ -74,15 +84,16 @@ function Privacy() {
         Relay retains account and agent information while your account is active and as needed for
         security, support, and legal obligations. You can delete your account in Relay under
         Settings → Security → Delete account. Deletion removes your Relay account, registered
-        devices, node records, entitlements, and hosted Relay sandbox data. Files on machines you
-        own remain under your control and must be deleted by you.
+        devices, node records, and entitlements. Relay does not operate the machines you connect,
+        so the files on them remain under your control and must be deleted by you.
       </p>
 
       <h2>Security, transfers, and children</h2>
       <p>
         Relay uses encrypted transport, restricted machine registration, and access controls, but
-        no online service can guarantee absolute security. Providers may process information in
-        countries other than your own. Relay is not directed to children under 13.
+        no online service can guarantee absolute security. You are responsible for the security of
+        the machine you run Relay on. Providers may process information in countries other than your
+        own. Relay is not directed to children under 13.
       </p>
 
       <h2>Changes and contact</h2>
@@ -98,35 +109,26 @@ function Terms() {
   return (
     <>
       <h1>Terms of Use</h1>
-      <p className="legal-updated">Effective August 18, 2026</p>
+      <p className="legal-updated">Effective September 8, 2026</p>
       <p>
         These terms supplement Apple's Standard Licensed Application End User License Agreement
-        and apply to the Relay app, web console, hosted sandbox, and runner software. By using
-        Relay, you agree to these terms.
+        and apply to the Relay app, the web console, and the Relay node and CLI software you run
+        on your own machine. By using Relay, you agree to these terms.
       </p>
 
-      <h2>Your account and services</h2>
+      <h2>Your account and your machine</h2>
       <p>
         You must provide accurate account information, protect your credentials, and be legally
-        able to use Relay. Relay may provide a hosted machine or let you connect a machine you
-        control. New eligible accounts receive seven days of Relay Hosted access. After that trial,
-        the hosted machine is paused unless you have an active Relay Hosted subscription. Relay does
+        able to use Relay. Relay does not provide computing capacity. You supply the machine,
+        install the Relay node software on it, and pair it with the app. You are responsible for
+        that machine, its network exposure, its backups, and everything that runs on it. Relay does
         not include third-party AI-provider subscriptions or their usage charges.
       </p>
 
-      <h2>Relay Hosted subscriptions</h2>
+      <h2>Payments</h2>
       <p>
-        Relay Hosted is available as an auto-renewing monthly subscription for US$9.99 or an
-        auto-renewing yearly subscription for US$99. Prices may vary by country, and the price shown
-        in the App Store purchase sheet controls. Both plans provide the same hosted Relay access.
-      </p>
-      <p>
-        Payment is charged to your Apple Account when you confirm the purchase. Your subscription
-        renews automatically unless you cancel it at least 24 hours before the end of the current
-        billing period. Apple may charge your account for renewal within 24 hours before the period
-        ends. You can manage or cancel the subscription in your Apple Account subscription settings.
-        Deleting Relay does not cancel a subscription. Refund requests are handled under Apple's
-        App Store policies.
+        Relay does not currently sell subscriptions or other in-app purchases. Any charges for the
+        machine you run and for the AI providers you connect are between you and those providers.
       </p>
 
       <h2>AI providers and agent actions</h2>
@@ -141,9 +143,8 @@ function Terms() {
       <p>You may not use Relay to:</p>
       <ul>
         <li>break the law, infringe rights, or access systems or data without authorization;</li>
-        <li>distribute malware, evade security controls, or interfere with the service;</li>
-        <li>harass, exploit, or endanger another person; or</li>
-        <li>resell or share hosted access unless Relay has approved it.</li>
+        <li>distribute malware, evade security controls, or interfere with the service; or</li>
+        <li>harass, exploit, or endanger another person.</li>
       </ul>
 
       <h2>Your content</h2>
@@ -155,7 +156,7 @@ function Terms() {
 
       <h2>Availability and responsibility</h2>
       <p>
-        Relay may change, suspend, or discontinue beta or hosted functionality. To the extent allowed
+        Relay is beta software and may change, be suspended, or be discontinued. To the extent allowed
         by law, Relay is provided “as is” without warranties, and the operator is not liable for
         indirect or consequential loss. Nothing here limits rights that cannot legally be limited.
       </p>
@@ -175,30 +176,32 @@ function Support() {
     <>
       <h1>Relay Support</h1>
       <p>
-        Relay lets you start, monitor, continue, and review AI agent work on a registered Relay
-        machine. For help, email <a href={`mailto:${supportEmail}`}>{supportEmail}</a>.
+        Relay lets you start, monitor, continue, and review AI agent work on a machine you run
+        yourself. For help, email <a href={`mailto:${supportEmail}`}>{supportEmail}</a>.
       </p>
 
       <h2>Before contacting support</h2>
       <ul>
-        <li>Confirm the phone has an internet connection and that you are signed into the expected Relay account.</li>
-        <li>Open Settings and confirm the expected computer or hosted sandbox appears under Signed in.</li>
+        <li>Confirm the phone has an internet connection and can reach the machine you paired.</li>
+        <li>Confirm the Relay node software is running on that machine.</li>
+        <li>Open Settings and confirm the expected machine is listed as paired.</li>
+        <li>If pairing fails, print a fresh pairing code on the machine and scan that one; codes are single-use.</li>
         <li>If a run is still active, open Threads and refresh before starting a duplicate run.</li>
-        <li>Provider sign-in and billing are managed by the provider configured on your Relay machine.</li>
-        <li>For Relay Hosted billing, use Restore Purchases in Relay or manage the subscription in your Apple Account settings.</li>
+        <li>Provider sign-in and billing are managed by the provider you configured on your machine.</li>
       </ul>
 
       <h2>Account deletion</h2>
       <p>
         In the iPhone app, open Settings → Security → Delete account. Password accounts must confirm
-        their current password. This permanently removes the Relay account and hosted Relay data;
-        files on machines you own remain your responsibility.
+        their current password. This permanently removes the Relay account and its records. The
+        machine you run and the files on it are yours and are not touched.
       </p>
 
       <h2>What to include</h2>
       <p>
         Include the Relay app version, the approximate time of the problem, and what you expected to
-        happen. Do not email passwords, private keys, provider tokens, or sensitive source files.
+        happen. Do not email passwords, private keys, pairing codes, provider tokens, or sensitive
+        source files.
       </p>
     </>
   );
