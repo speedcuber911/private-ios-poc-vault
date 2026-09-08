@@ -54,10 +54,10 @@
    # on the node — expect 404 op-not-found (route EXISTS), not generic "not found"
    curl -s -X POST localhost:<relayd-port>/v1/harness/ops/00000000-0000-4000-8000-000000000000/cancel
    ```
-   If the "machine" is a Cube trial sandbox instead of a plain relayd on
-   EC2: rebuild the template (`product/trial/build.sh` against the Cube
-   host per `product/trial/README.md`), then delete + recreate the trial
-   from the phone so it boots the new image.
+   (The Cube trial-sandbox branch that used to be here is gone: trials,
+   `product/trial/` and the template pipeline were deleted on 2026-09-08.
+   Every machine is now a plain `relayd` the user installed themselves, so
+   there is only the sync-and-restart path above.)
 
 3. **Sanity-check `script`, `mkfifo`, `setsid`, `node`, `pkill` exist on
    the node** (the exec fallback shells out to them):

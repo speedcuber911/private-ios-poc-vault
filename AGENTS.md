@@ -8,11 +8,33 @@ There are two main surfaces:
 
 - Hosted POCs: every POC lives under `pocs/<slug>/`, ships static files under
   `public/`, and is advertised through a signed manifest consumed by the iOS app.
-- Remote agents: the phone talks to the EC2 Codex/Claude job API in
-  `relay-server/` to start, monitor, continue, cancel, and review agent runs.
+- Remote agents: the phone talks to a machine the user runs themselves, to
+  start, monitor, continue, cancel, and review agent runs.
 
-The remote job API lives inside this repo because the Relay iOS app, static POC
-hosting, and EC2 runner are tightly coupled.
+## Relay's architecture, in five lines
+
+Relay does not supply machines. The user installs `relayd` (`product/relayd/`)
+on hardware they already own, runs `relayd pair`, and scans the QR code with the
+app. The phone then talks to that machine **directly**, over TLS the machine
+terminates itself with a certificate signed by its own CA, authenticated by a
+bearer token both sides derive from the pairing secret. The QR carries a
+fingerprint of that CA (`f=`), so the very first connection is pinned rather
+than trusted blindly — the SSH host-key-in-the-QR pattern.
+
+The control plane (`product/cloud/`) keeps accounts, handoff, push and
+`relay login`. It is **not on the path to using the product** and it cannot
+create a machine. Sign-in is optional: pair first, sign in only if you want
+laptop handoff or notifications.
+
+Anything you read in this repository that describes trial sandboxes, hosted
+machines, provisioning, or a seven-day trial is describing a feature that was
+deleted on 2026-09-08. The normative description is
+`docs/superpowers/specs/2026-09-08-byo-vm-simplification.md`; the live map is
+`docs/RELAY_ARCHITECTURE.md`. Note that none of the BYO path is deployed yet
+and `relayd` has no installer.
+
+`relay-server/` is the legacy EC2 job API and predates `product/relayd/`. New
+node work goes in `product/relayd/`.
 
 ## Read This First
 
