@@ -124,12 +124,5 @@ final class ManifestClient: NSObject, URLSessionDelegate {
     }
 }
 
-private extension Data {
-    init?(base64URLEncoded value: String) {
-        let padded = value
-            .replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-            .padding(toLength: ((value.count + 3) / 4) * 4, withPad: "=", startingAt: 0)
-        self.init(base64Encoded: padded)
-    }
-}
+// `Data(base64URLEncoded:)` now lives next to the pairing derivations that also
+// need it (Security/RelayPairing.swift). One implementation, module-wide.

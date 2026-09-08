@@ -35,12 +35,12 @@ final class ClientIdentityStore: ObservableObject {
     /// under, when the persistent reference that normally locates it is gone
     /// (restore to a new device, app reinstall).
     ///
-    /// "trial-device" is the CN a trial machine issues — see
-    /// `product/relayd/src/trialpair.mjs`, which signs the device CSR with
-    /// `-subj "/CN=trial-device"`. Without it here, a trial identity sitting in
-    /// the keychain could never be recovered. Pairing slots are put-once, so
-    /// a still-running machine cannot reissue a credential; a destroyed or
-    /// failed trial can be retried as a new machine.
+    /// "trial-device" is the CN `relayd` mints a paired device certificate
+    /// under — see `product/relayd/src/pairing.mjs`, which signs with
+    /// `-subj "/CN=trial-device"`. The name is a wire value, not a description:
+    /// without it here, a paired identity sitting in the keychain after a
+    /// reinstall could never be recovered, and a pairing code is single-use, so
+    /// the machine cannot reissue one. Pair again to replace it.
     private static let preferredClientCertificateNames = ["iphone", "trial-device"]
 
     @Published private(set) var lastImportedCertificateName: String?
@@ -48,8 +48,8 @@ final class ClientIdentityStore: ObservableObject {
     private let defaults: UserDefaults
     private let persistentRefKey = "com.parikshit.pocvault.identity.persistentRef"
 
-    /// Legacy `UserDefaults` locations for the trial material below. Read once,
-    /// migrated into the keychain, then removed. See `TrialMaterial`.
+    /// Legacy `UserDefaults` locations for the pairing material below. Read
+    /// once, migrated into the keychain, then removed. See `PairedMaterial`.
     private let legacyPinnedCAKey = "com.parikshit.pocvault.identity.pinnedCA"
     private let legacyPinnedHostKey = "com.parikshit.pocvault.identity.pinnedHost"
     private let legacyTrialIssuedKey = "com.parikshit.pocvault.identity.trialIssued"
@@ -58,10 +58,10 @@ final class ClientIdentityStore: ObservableObject {
 
     private var cachedIdentity: SecIdentity?
     private var cachedPinnedCA: SecCertificate?
-    private var cachedTrialMaterial: TrialMaterial?
+    private var cachedPairedMaterial: PairedMaterial?
 
-    /// Everything about the trial credential except the credential itself: the
-    /// marker that the stored identity came from a trial pairing, the node CA to
+    /// Everything about the paired credential except the credential itself: the
+    /// marker that the stored identity came from a node pairing, the node CA to
     /// pin, the one host it applies to, and the bearer token this device
     /// authenticates to that host with.
     ///
@@ -71,27 +71,35 @@ final class ClientIdentityStore: ObservableObject {
     /// carries "trial-device" precisely so it can be found again — but the facts
     /// ABOUT it were in the app container, which iOS deletes with the app. After
     /// a TestFlight reinstall the identity was still there and every predicate
-    /// that describes it read false, so `RelayTrialFlowModel.adoptExistingTrial`
-    /// told the user their credential "can't be reissued" while it sat in the
-    /// keychain. Worse, the device token is derived from a pairing secret that
-    /// exists only at pairing time, so losing it really was unrecoverable while
-    /// that machine is still running. A destroyed or failed trial can be retried.
+    /// that describes it read false, so the app told the user their credential
+    /// "can't be reissued" while it sat in the keychain. Worse, the device token
+    /// is derived from a pairing secret that exists only at pairing time, so
+    /// losing it really was unrecoverable without pairing the machine again.
     ///
     /// `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`: survives reinstall,
     /// available to background refresh, and never leaves this device in a backup
     /// — matching the identity it describes, which is device-bound by design.
-    private struct TrialMaterial: Codable, Equatable {
-        var trialIssued: Bool = false
+    private struct PairedMaterial: Codable, Equatable {
+        var pairingIssued: Bool = false
         var pinnedHost: String?
         var pinnedCADER: Data?
         var deviceToken: String?
         var deviceTokenHost: String?
 
-        static let empty = TrialMaterial()
+        static let empty = PairedMaterial()
+
+        /// `pairingIssued` is persisted as `trialIssued`. The Swift name was
+        /// neutralised with the rest of the trial vocabulary; the JSON key is
+        /// what is already sitting in the keychain of every installed build,
+        /// and renaming it would silently orphan a working credential.
+        private enum CodingKeys: String, CodingKey {
+            case pairingIssued = "trialIssued"
+            case pinnedHost, pinnedCADER, deviceToken, deviceTokenHost
+        }
     }
 
-    private static let trialMaterialService = "com.parikshit.pocvault.identity.trialMaterial"
-    private static let trialMaterialAccount = "default"
+    private static let pairedMaterialService = "com.parikshit.pocvault.identity.trialMaterial"
+    private static let pairedMaterialAccount = "default"
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -119,7 +127,7 @@ final class ClientIdentityStore: ObservableObject {
     }
 
     /// Diagnostic-only summary of the identity that would be offered to a
-    /// server, as `subjectCN|issuer`. A trial machine advertises exactly one
+    /// server, as `subjectCN|issuer`. A paired machine advertises exactly one
     /// acceptable client CA, so the issuer here is what decides whether iOS can
     /// satisfy that request at all — and it is not otherwise recoverable from
     /// the device, because the identity lives in the keychain rather than the
@@ -266,15 +274,16 @@ final class ClientIdentityStore: ObservableObject {
     /// fronted by a publicly-trusted certificate and its PKCS#12 carries no CA.
     @discardableResult
     func importIdentity(from url: URL, passphrase: String) throws -> URLCredential {
-        try importIdentity(from: url, passphrase: passphrase, trialHost: nil)
+        try importIdentity(from: url, passphrase: passphrase, pinnedHost: nil)
     }
 
-    /// Trial import. `trialHost` is the SNI hostname the machine answers on; when
-    /// it is supplied the node CA found in the PKCS#12 is persisted and pinned to
-    /// that one host, and the identity is marked trial-issued so sign-out can
-    /// purge it without touching a BYO identity the user imported themselves.
+    /// Pairing import. `pinnedHost` is the host the machine answers on — often
+    /// an IP literal for a BYO node; when it is supplied the node CA found in
+    /// the PKCS#12 is persisted and pinned to that one host, and the identity is
+    /// marked pairing-issued so account changes can purge it without touching a
+    /// BYO identity the user imported themselves.
     @discardableResult
-    func importIdentity(from url: URL, passphrase: String, trialHost: String?) throws -> URLCredential {
+    func importIdentity(from url: URL, passphrase: String, pinnedHost: String?) throws -> URLCredential {
         let data = try Data(contentsOf: url)
         let imported = try Self.importPKCS12(data, passphrase: passphrase)
         try save(identity: imported.identity, label: url.deletingPathExtension().lastPathComponent)
@@ -292,55 +301,55 @@ final class ClientIdentityStore: ObservableObject {
         saveCACertificate(imported.caCertificate)
         cachedIdentity = imported.identity
         lastImportedCertificateName = certificateCommonName(for: imported.identity) ?? url.lastPathComponent
-        pinTrialMaterial(caCertificate: imported.caCertificate, host: trialHost)
+        pinPairedMaterial(caCertificate: imported.caCertificate, host: pinnedHost)
         return URLCredential(identity: imported.identity, certificates: nil, persistence: .forSession)
     }
 
-    // MARK: - Trial material persistence (keychain-backed)
+    // MARK: - Pairing material persistence (keychain-backed)
 
     /// The current material, reading through to the keychain once per launch and
     /// migrating any pre-existing `UserDefaults` copy on the way.
-    private func trialMaterial() -> TrialMaterial {
-        if let cachedTrialMaterial { return cachedTrialMaterial }
-        let material = readTrialMaterial() ?? migrateLegacyTrialMaterial()
-        cachedTrialMaterial = material
+    private func pairedMaterial() -> PairedMaterial {
+        if let cachedPairedMaterial { return cachedPairedMaterial }
+        let material = readPairedMaterial() ?? migrateLegacyPairedMaterial()
+        cachedPairedMaterial = material
         return material
     }
 
-    private func updateTrialMaterial(_ mutate: (inout TrialMaterial) -> Void) {
-        var material = trialMaterial()
+    private func updatePairedMaterial(_ mutate: (inout PairedMaterial) -> Void) {
+        var material = pairedMaterial()
         mutate(&material)
-        cachedTrialMaterial = material
+        cachedPairedMaterial = material
         if material == .empty {
-            deleteTrialMaterial()
+            deletePairedMaterial()
         } else {
-            writeTrialMaterial(material)
+            writePairedMaterial(material)
         }
     }
 
-    private func trialMaterialQuery() -> [String: Any] {
+    private func pairedMaterialQuery() -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.trialMaterialService,
-            kSecAttrAccount as String: Self.trialMaterialAccount,
+            kSecAttrService as String: Self.pairedMaterialService,
+            kSecAttrAccount as String: Self.pairedMaterialAccount,
         ]
     }
 
-    private func readTrialMaterial() -> TrialMaterial? {
-        var query = trialMaterialQuery()
+    private func readPairedMaterial() -> PairedMaterial? {
+        var query = pairedMaterialQuery()
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
 
         var item: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
               let data = item as? Data,
-              let material = try? JSONDecoder().decode(TrialMaterial.self, from: data) else {
+              let material = try? JSONDecoder().decode(PairedMaterial.self, from: data) else {
             return nil
         }
         return material
     }
 
-    private func writeTrialMaterial(_ material: TrialMaterial) {
+    private func writePairedMaterial(_ material: PairedMaterial) {
         guard let data = try? JSONEncoder().encode(material) else {
             CodexDiagnostics.log("identity_trial_material_encode_failed")
             return
@@ -349,9 +358,9 @@ final class ClientIdentityStore: ObservableObject {
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
         ]
-        let updated = SecItemUpdate(trialMaterialQuery() as CFDictionary, attributes as CFDictionary)
+        let updated = SecItemUpdate(pairedMaterialQuery() as CFDictionary, attributes as CFDictionary)
         if updated == errSecItemNotFound {
-            var insert = trialMaterialQuery()
+            var insert = pairedMaterialQuery()
             insert.merge(attributes) { _, new in new }
             let added = SecItemAdd(insert as CFDictionary, nil)
             if added != errSecSuccess {
@@ -364,8 +373,8 @@ final class ClientIdentityStore: ObservableObject {
         }
     }
 
-    private func deleteTrialMaterial() {
-        let status = SecItemDelete(trialMaterialQuery() as CFDictionary)
+    private func deletePairedMaterial() {
+        let status = SecItemDelete(pairedMaterialQuery() as CFDictionary)
         if status != errSecSuccess && status != errSecItemNotFound {
             CodexDiagnostics.log("identity_trial_material_delete_failed", fields: ["status": String(status)])
         }
@@ -378,9 +387,9 @@ final class ClientIdentityStore: ObservableObject {
     /// been reinstalled yet, which is exactly the population still able to be
     /// saved. The legacy keys are removed after promotion so there is one source
     /// of truth and no half-stale copy to read later.
-    private func migrateLegacyTrialMaterial() -> TrialMaterial {
-        var material = TrialMaterial()
-        material.trialIssued = defaults.bool(forKey: legacyTrialIssuedKey)
+    private func migrateLegacyPairedMaterial() -> PairedMaterial {
+        var material = PairedMaterial()
+        material.pairingIssued = defaults.bool(forKey: legacyTrialIssuedKey)
         material.pinnedHost = defaults.string(forKey: legacyPinnedHostKey)?.trimmedNonEmpty
         material.pinnedCADER = defaults.data(forKey: legacyPinnedCAKey)
         material.deviceToken = defaults.string(forKey: legacyDeviceTokenKey)?.trimmedNonEmpty
@@ -388,8 +397,8 @@ final class ClientIdentityStore: ObservableObject {
 
         guard material != .empty else { return material }
 
-        writeTrialMaterial(material)
-        clearLegacyTrialDefaults()
+        writePairedMaterial(material)
+        clearLegacyPairedDefaults()
         CodexDiagnostics.log("identity_trial_material_migrated", fields: [
             "host": material.pinnedHost ?? "none",
         ])
@@ -399,13 +408,13 @@ final class ClientIdentityStore: ObservableObject {
     /// Test seam. The material is now global to the device rather than scoped to
     /// a `UserDefaults` suite, so a test cannot isolate itself just by using a
     /// fresh suite — which is precisely the property under test.
-    func forgetTrialMaterialForTesting() {
-        cachedTrialMaterial = nil
-        deleteTrialMaterial()
-        clearLegacyTrialDefaults()
+    func forgetPairedMaterialForTesting() {
+        cachedPairedMaterial = nil
+        deletePairedMaterial()
+        clearLegacyPairedDefaults()
     }
 
-    private func clearLegacyTrialDefaults() {
+    private func clearLegacyPairedDefaults() {
         for key in [
             legacyTrialIssuedKey, legacyPinnedHostKey, legacyPinnedCAKey,
             legacyDeviceTokenKey, legacyDeviceTokenHostKey,
@@ -417,12 +426,12 @@ final class ClientIdentityStore: ObservableObject {
     // MARK: - Pinned node CA (see RelayServerTrust)
 
     /// The node CA to evaluate `pinnedHost`'s TLS chain against, or nil when the
-    /// app has never imported a trial identity.
+    /// app has never imported a paired identity.
     var pinnedCACertificate: SecCertificate? {
         if let cachedPinnedCA {
             return cachedPinnedCA
         }
-        guard let der = trialMaterial().pinnedCADER,
+        guard let der = pairedMaterial().pinnedCADER,
               let certificate = SecCertificateCreateWithData(nil, der as CFData) else {
             return nil
         }
@@ -434,14 +443,14 @@ final class ClientIdentityStore: ObservableObject {
     /// the host it belongs to.
     ///
     /// Scoped to one host for the same reason the pinned CA is: a token left
-    /// behind by an expired trial must never be offered to the next machine,
-    /// or to a personal install. Cleared with the rest of the trial material.
+    /// behind by a machine this phone no longer uses must never be offered to
+    /// the next one, or to a personal install. Cleared with the rest of it.
     func storeDeviceToken(_ token: String, host: String?) {
         guard let host = host?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
               !host.isEmpty, !token.isEmpty else {
             return
         }
-        updateTrialMaterial { material in
+        updatePairedMaterial { material in
             material.deviceToken = token
             material.deviceTokenHost = host
         }
@@ -451,7 +460,7 @@ final class ClientIdentityStore: ObservableObject {
     /// The token for `host`, or nil when this device has none for it.
     func deviceToken(for host: String) -> String? {
         let wanted = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let material = trialMaterial()
+        let material = pairedMaterial()
         guard !wanted.isEmpty,
               let stored = material.deviceTokenHost?.lowercased(),
               stored == wanted,
@@ -463,31 +472,34 @@ final class ClientIdentityStore: ObservableObject {
 
     /// The single host `pinnedCACertificate` may be applied to.
     var pinnedHost: String? {
-        trialMaterial().pinnedHost?.trimmedNonEmpty
+        pairedMaterial().pinnedHost?.trimmedNonEmpty
     }
 
-    /// True when the stored client identity came from a trial pairing rather than
+    /// True when the stored client identity came from a node pairing rather than
     /// from a user-supplied PKCS#12.
-    var hasTrialIssuedIdentity: Bool {
-        trialMaterial().trialIssued
+    var hasPairedIdentity: Bool {
+        pairedMaterial().pairingIssued
     }
 
-    /// Sign-out purge: drops the trial-issued identity and the pinned node CA so
-    /// the next account on this phone inherits neither a pointer to another
-    /// account's machine nor a certificate that would authenticate to it. A BYO
-    /// identity the user imported themselves is deliberately left in place.
-    func discardTrialMaterial() {
-        if hasTrialIssuedIdentity {
+    /// Unpair / account-change purge: drops the pairing-issued identity and the
+    /// pinned node CA so the next account on this phone inherits neither a
+    /// pointer to another account's machine nor a certificate that would
+    /// authenticate to it. A BYO identity the user imported themselves is
+    /// deliberately left in place.
+    func discardPairedMaterial() {
+        if hasPairedIdentity {
             try? deleteStoredIdentity()
         }
         clearPinnedMaterial()
     }
 
-    /// Records the CA to pin and the one host it applies to. Called by the trial
-    /// import path; internal so the persistence can be unit-tested without a
-    /// PKCS#12 fixture. A nil/empty host means "not a trial import" and leaves
-    /// every pinning key untouched — a BYO import can never start pinning.
-    func pinTrialMaterial(caCertificate: SecCertificate?, host: String?) {
+    /// Records the CA to pin and the one host it applies to. Called by the
+    /// pairing import path; internal so the persistence can be unit-tested
+    /// without a PKCS#12 fixture, and so a caller that verified the CA out of
+    /// band (the QR fingerprint) can pin that certificate instead of the one
+    /// inside the PKCS#12. A nil/empty host means "not a pairing import" and
+    /// leaves every pinning key untouched — a BYO import can never start pinning.
+    func pinPairedMaterial(caCertificate: SecCertificate?, host: String?) {
         guard let host = host?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
               !host.isEmpty else {
             return
@@ -495,8 +507,8 @@ final class ClientIdentityStore: ObservableObject {
         guard let caCertificate else {
             // No CA in the blob: leave the app on default handling rather than
             // pinning something arbitrary. TLS to the machine will fail loudly.
-            updateTrialMaterial { material in
-                material.trialIssued = true
+            updatePairedMaterial { material in
+                material.pairingIssued = true
                 material.pinnedHost = host
                 material.pinnedCADER = nil
             }
@@ -504,8 +516,8 @@ final class ClientIdentityStore: ObservableObject {
             CodexDiagnostics.log("identity_trial_ca_missing")
             return
         }
-        updateTrialMaterial { material in
-            material.trialIssued = true
+        updatePairedMaterial { material in
+            material.pairingIssued = true
             material.pinnedHost = host
             material.pinnedCADER = SecCertificateCopyData(caCertificate) as Data
         }
@@ -513,17 +525,17 @@ final class ClientIdentityStore: ObservableObject {
         CodexDiagnostics.log("identity_trial_ca_pinned", fields: ["host": host])
     }
 
-    /// Sign-out purge. The device token is machine access just as much as the
-    /// identity is, so it goes with the rest of the trial material — leaving it
+    /// Unpair purge. The device token is machine access just as much as the
+    /// identity is, so it goes with the rest of the material — leaving it
     /// behind would hand the next account on this phone a working credential.
     /// Now that the material outlives the app container, this deletion has to be
     /// explicit: uninstalling no longer takes it with it.
     private func clearPinnedMaterial() {
-        cachedTrialMaterial = .empty
-        deleteTrialMaterial()
+        cachedPairedMaterial = .empty
+        deletePairedMaterial()
         // Belt and braces for an install that was migrated mid-session, or one
         // that never got as far as the migration.
-        clearLegacyTrialDefaults()
+        clearLegacyPairedDefaults()
         cachedPinnedCA = nil
     }
 
@@ -536,7 +548,7 @@ final class ClientIdentityStore: ObservableObject {
     /// alone and its issuer absent, it sends nothing and the connection fails
     /// as -1206 (`requires a client certificate`), which is distinct from the
     /// -1205 a server returns when it has seen a certificate and refused it.
-    /// Observed exactly that against a trial machine: the challenge fired, the
+    /// Observed exactly that against a paired machine: the challenge fired, the
     /// credential was supplied, and the machine still saw no certificate.
     ///
     /// `pinnedCACertificate` is that issuer — it arrives in the same PKCS#12 as
@@ -727,7 +739,7 @@ final class ClientIdentityStore: ObservableObject {
     }
 
     /// What a PKCS#12 blob yields: always an identity, plus the issuing CA when
-    /// the blob carries one (a trial p12 is built with `-certfile <ca.pem>`; a
+    /// the blob carries one (relayd's p12 is built with `-certfile <ca.pem>`; a
     /// BYO p12 usually is not, and a missing CA is never an error).
     struct ImportedPKCS12 {
         let identity: SecIdentity

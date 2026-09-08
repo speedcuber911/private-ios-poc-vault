@@ -1,4 +1,3 @@
-import AVFoundation
 import SwiftUI
 import UIKit
 
@@ -50,7 +49,7 @@ struct CLILinkScannerView: View {
         VStack(spacing: 16) {
             #if !targetEnvironment(simulator)
             ZStack {
-                CLILinkCameraPreview(onCode: { code in
+                RelayQRCameraPreview(onCode: { code in
                     Task { await model.submitScannedPayload(code) }
                 }, onDenied: { cameraDenied = true })
                 .frame(maxWidth: .infinity)
@@ -223,114 +222,3 @@ struct CLILinkScannerView: View {
         }
     }
 }
-
-#if !targetEnvironment(simulator)
-private struct CLILinkCameraPreview: UIViewRepresentable {
-    let onCode: (String) -> Void
-    let onDenied: () -> Void
-
-    func makeUIView(context: Context) -> CLILinkCameraUIView {
-        let view = CLILinkCameraUIView()
-        view.onCode = onCode
-        view.onDenied = onDenied
-        view.start()
-        return view
-    }
-
-    func updateUIView(_ uiView: CLILinkCameraUIView, context: Context) {
-        uiView.onCode = onCode
-        uiView.onDenied = onDenied
-    }
-
-    static func dismantleUIView(_ uiView: CLILinkCameraUIView, coordinator: ()) {
-        uiView.stop()
-    }
-}
-
-private final class CLILinkCameraUIView: UIView, AVCaptureMetadataOutputObjectsDelegate {
-    var onCode: ((String) -> Void)?
-    var onDenied: (() -> Void)?
-
-    private let session = AVCaptureSession()
-    private var previewLayer: AVCaptureVideoPreviewLayer?
-    private var didEmit = false
-
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        previewLayer?.frame = bounds
-    }
-
-    func start() {
-        switch AVCaptureDevice.authorizationStatus(for: .video) {
-        case .authorized:
-            configureSession()
-        case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
-                DispatchQueue.main.async {
-                    if granted {
-                        self?.configureSession()
-                    } else {
-                        self?.onDenied?()
-                    }
-                }
-            }
-        default:
-            onDenied?()
-        }
-    }
-
-    func stop() {
-        if session.isRunning { session.stopRunning() }
-    }
-
-    private func configureSession() {
-        guard previewLayer == nil else { return }
-        session.beginConfiguration()
-        defer { session.commitConfiguration() }
-
-        guard
-            let device = AVCaptureDevice.default(for: .video),
-            let input = try? AVCaptureDeviceInput(device: device),
-            session.canAddInput(input)
-        else {
-            onDenied?()
-            return
-        }
-        session.addInput(input)
-
-        let output = AVCaptureMetadataOutput()
-        guard session.canAddOutput(output) else {
-            onDenied?()
-            return
-        }
-        session.addOutput(output)
-        output.setMetadataObjectsDelegate(self, queue: DispatchQueue.main)
-        output.metadataObjectTypes = [.qr]
-
-        let layer = AVCaptureVideoPreviewLayer(session: session)
-        layer.videoGravity = .resizeAspectFill
-        layer.frame = bounds
-        self.layer.addSublayer(layer)
-        previewLayer = layer
-
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.session.startRunning()
-        }
-    }
-
-    func metadataOutput(
-        _ output: AVCaptureMetadataOutput,
-        didOutput metadataObjects: [AVMetadataObject],
-        from connection: AVCaptureConnection
-    ) {
-        guard !didEmit,
-              let object = metadataObjects.first as? AVMetadataMachineReadableCodeObject,
-              object.type == .qr,
-              let value = object.stringValue,
-              !value.isEmpty
-        else { return }
-        didEmit = true
-        onCode?(value)
-    }
-}
-#endif

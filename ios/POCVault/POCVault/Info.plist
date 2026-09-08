@@ -42,7 +42,7 @@
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Relay uses the microphone to turn spoken Codex prompts into text.</string>
 	<key>NSCameraUsageDescription</key>
-	<string>Relay uses the camera to scan the code shown by the relay CLI.</string>
+	<string>Relay uses the camera to scan the pairing code shown by relayd, and the sign-in code shown by the relay CLI.</string>
 	<key>UIAppFonts</key>
 	<array>
 		<string>DMSans.ttf</string>
