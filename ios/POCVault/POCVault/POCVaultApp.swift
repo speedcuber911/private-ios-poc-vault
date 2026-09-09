@@ -188,6 +188,9 @@ struct POCVaultRootView: View {
 
     @Environment(\.scenePhase) private var scenePhase
     @State private var browserPath: [BrowserRoute] = []
+    /// Restoring is a launch-time act, not an on-appear one: returning to the
+    /// Workspaces tab must not yank the user back to a folder they just left.
+    @State private var didRestoreBrowserPath = false
     @State private var chatLaunch: RelayChatLaunch?
     @State private var terminalLaunch: RelayTerminalLaunch?
     /// Raised when a handoff push is tapped: the threads list is where handoff
@@ -381,6 +384,44 @@ struct POCVaultRootView: View {
                     }
                 }
         }
+        .onAppear(perform: restoreBrowserPathIfNeeded)
+        .onChange(of: browserPath) { _, path in
+            persistBrowserPath(path)
+        }
+    }
+
+    /// Where the browser reopens.
+    ///
+    /// Landing at the root every launch is wrong for a machine you actually
+    /// work on: the folder you were last in IS the folder you want. The stack
+    /// is keyed by machine, because a path from one node means nothing on
+    /// another, and it is stored rather than derived because the app is killed
+    /// and relaunched far more often than it is repaired.
+    private var browserPathDefaultsKey: String {
+        "relay.browserPath.\(nodeStore.effectiveBaseURL.absoluteString)"
+    }
+
+    /// Only folder routes are kept. A file route carries a decoded directory
+    /// entry whose size and mtime go stale between launches, and reopening a
+    /// file viewer unprompted is not what "where I left off" means — so the
+    /// folders beneath an open file are saved and the viewer itself is not.
+    private func persistBrowserPath(_ path: [BrowserRoute]) {
+        let folders = path.compactMap { route -> String? in
+            guard case .folder(let folderPath) = route else { return nil }
+            return folderPath
+        }
+        UserDefaults.standard.set(folders, forKey: browserPathDefaultsKey)
+    }
+
+    private func restoreBrowserPathIfNeeded() {
+        guard !didRestoreBrowserPath else { return }
+        didRestoreBrowserPath = true
+        guard browserPath.isEmpty,
+              !foldersAreHiddenAfterComputerDisconnect,
+              let folders = UserDefaults.standard.array(forKey: browserPathDefaultsKey) as? [String],
+              !folders.isEmpty
+        else { return }
+        browserPath = folders.map { BrowserRoute.folder(path: $0) }
     }
 
     private var disconnectedComputerScreen: some View {

@@ -725,6 +725,40 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(diagnostics.contains("\"Not connected — optional\""))
     }
 
+    func testBrowserReopensLastFolderPerMachineWithoutRestoringFileViewers() throws {
+        let source = try AppSourceFixture.load("POCVault/POCVaultApp.swift")
+
+        // The stack is keyed by machine: a path from one node is meaningless on
+        // another, so the key carries the node's base URL.
+        XCTAssertTrue(source.contains("relay.browserPath.\\(nodeStore.effectiveBaseURL.absoluteString)"))
+        XCTAssertTrue(source.contains("restoreBrowserPathIfNeeded"))
+        XCTAssertTrue(source.contains("persistBrowserPath"))
+
+        // Restoring is launch-time only. Wiring it to every onAppear would drag
+        // the user back to a folder they had just navigated out of.
+        XCTAssertTrue(source.contains("didRestoreBrowserPath"))
+        XCTAssertTrue(source.contains("guard !didRestoreBrowserPath else { return }"))
+
+        // A file route carries decoded entry metadata that goes stale between
+        // launches, so only folders come back.
+        let persist = try sourceSnippet(
+            in: source,
+            from: "private func persistBrowserPath",
+            to: "private func restoreBrowserPathIfNeeded"
+        )
+        XCTAssertTrue(persist.contains("guard case .folder(let folderPath) = route else { return nil }"))
+        XCTAssertFalse(persist.contains(".file("))
+
+        // A machine whose folders are hidden after a disconnect must not be
+        // reopened into.
+        let restore = try sourceSnippet(
+            in: source,
+            from: "private func restoreBrowserPathIfNeeded",
+            to: "private var disconnectedComputerScreen"
+        )
+        XCTAssertTrue(restore.contains("!foldersAreHiddenAfterComputerDisconnect"))
+    }
+
     func testSessionsPlusOpensWorkspacePickerRatherThanSwitchingTabs() throws {
         let source = try AppSourceFixture.load("POCVault/POCVaultApp.swift")
         XCTAssertTrue(source.contains("showingWorkspacePicker"))
