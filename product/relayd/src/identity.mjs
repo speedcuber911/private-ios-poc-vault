@@ -37,6 +37,24 @@ const nodeNameEnv = (process.env.RELAYD_NODE_NAME || "").trim();
 
 const deviceCertDays = 825;
 
+// TLS SERVER certificates must be short-lived, and 398 is not a style choice.
+//
+// Apple rejects a TLS server certificate whose validity period exceeds 398
+// days when it was issued after 2020-09-01, and the rejection happens during
+// trust evaluation — so it fails even though the phone deliberately anchors
+// this node's CA itself. 825 was the PREVIOUS industry limit and is the value
+// this file used for every certificate it issued.
+//
+// The symptom is maximally unhelpful: pairing dies with a generic TLS error,
+// the CA pin is correct, the SANs are correct, the node is reachable, and
+// every non-Apple client (curl, openssl, Node) connects happily. It cost a
+// real debugging session on a real phone.
+//
+// Client/device certificates are NOT subject to this — the rule is specific to
+// the SSL server policy — so `deviceCertDays` stays where it is rather than
+// shortening how often a paired phone must pair again.
+const serverCertDays = 397;
+
 const caCertDays = 3650;
 
 function opensslVersion() {
@@ -745,7 +763,7 @@ function ensureServerCert({ san, altNames = [], baseDir = identityDir }) {
       "-CA", paths.caCertPath,
       "-CAkey", paths.caKeyPath,
       "-set_serial", `0x${crypto.randomBytes(9).toString("hex")}`,
-      "-days", String(deviceCertDays),
+      "-days", String(serverCertDays),
       "-sha256",
       "-extfile", extPath,
       "-out", certPath,
