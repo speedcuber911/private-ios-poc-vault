@@ -6,16 +6,16 @@ import UIKit
 /// Rows are full-width with hairline dividers on the warm flat canvas for a
 /// Files-app feel. Folders drill in, files route to the viewer, the terminal toolbar
 /// icon opens this folder's chat cover, and the root screen additionally exposes
-/// Previews / Diagnostics shortcuts behind the ellipsis menu. Sessions and Settings stay in
+/// a Diagnostics shortcut behind the ellipsis menu. Sessions, Previews and Settings stay in
 /// their dedicated bottom tabs instead of being duplicated here.
 struct FileBrowserView: View {
     @StateObject private var viewModel: FileBrowserViewModel
     private let isRoot: Bool
+    private let machineLabel: String?
     private let onOpenFolder: (String) -> Void
     private let onOpenFile: (CodexWorkspaceDirectoryEntry) -> Void
     private let onOpenChat: (_ folderPath: String?, _ workspaceID: String?) -> Void
     private let onOpenTerminal: (_ workspaceID: String, _ workspaceName: String) -> Void
-    private let onOpenLibrary: (() -> Void)?
     private let onOpenDiagnostics: (() -> Void)?
 
     @State private var showingCreateFolder = false
@@ -25,20 +25,20 @@ struct FileBrowserView: View {
         client: CodexClient,
         folderPath: String?,
         isRoot: Bool,
+        machineLabel: String? = nil,
         onOpenFolder: @escaping (String) -> Void,
         onOpenFile: @escaping (CodexWorkspaceDirectoryEntry) -> Void,
         onOpenChat: @escaping (_ folderPath: String?, _ workspaceID: String?) -> Void,
         onOpenTerminal: @escaping (_ workspaceID: String, _ workspaceName: String) -> Void,
-        onOpenLibrary: (() -> Void)? = nil,
         onOpenDiagnostics: (() -> Void)? = nil
     ) {
         _viewModel = StateObject(wrappedValue: FileBrowserViewModel(client: client, path: folderPath))
         self.isRoot = isRoot
+        self.machineLabel = machineLabel
         self.onOpenFolder = onOpenFolder
         self.onOpenFile = onOpenFile
         self.onOpenChat = onOpenChat
         self.onOpenTerminal = onOpenTerminal
-        self.onOpenLibrary = onOpenLibrary
         self.onOpenDiagnostics = onOpenDiagnostics
     }
 
@@ -84,10 +84,16 @@ struct FileBrowserView: View {
             LazyVStack(spacing: 0) {
                 if isRoot {
                     VStack(alignment: .leading, spacing: 6) {
-                        RelayCapsLabel(
-                            text: viewModel.errorMessage == nil ? "Connected · mTLS" : "Offline",
-                            color: viewModel.errorMessage == nil ? AppTheme.textTertiary : AppTheme.statusError
-                        )
+                        if viewModel.errorMessage != nil {
+                            RelayCapsLabel(
+                                text: "Offline",
+                                color: AppTheme.statusError
+                            )
+                        } else if let machineLabel {
+                            Text(machineLabel)
+                                .font(AppTheme.monoFont(size: 12))
+                                .foregroundStyle(AppTheme.textTertiary)
+                        }
                         Text("Workspaces")
                             .font(AppTheme.serifFont(size: 32))
                             .foregroundStyle(AppTheme.textPrimary)
@@ -288,13 +294,6 @@ struct FileBrowserView: View {
 
                 if isRoot {
                     Divider()
-                    if let onOpenLibrary {
-                        Button {
-                            onOpenLibrary()
-                        } label: {
-                            Label("Previews", systemImage: "rectangle.on.rectangle")
-                        }
-                    }
                     if let onOpenDiagnostics {
                         Button {
                             onOpenDiagnostics()

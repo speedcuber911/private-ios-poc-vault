@@ -2,14 +2,11 @@ import SwiftUI
 
 struct DiagnosticsView: View {
     @ObservedObject var identityStore: ClientIdentityStore
-    let manifestClient: ManifestClient
+    @ObservedObject var nodeStore: RelayNodeStore
     var showsNavigationChrome = true
 
     @Environment(\.dismiss) private var dismiss
-    @State private var passphrase = ""
     @State private var checks: [DiagnosticCheck] = []
-    @State private var importError: String?
-    @State private var isImportExpanded = false
 
     private var contentHorizontalPadding: CGFloat {
         showsNavigationChrome ? 16 : 16
@@ -42,8 +39,6 @@ struct DiagnosticsView: View {
                         }
                         .padding(.top, showsNavigationChrome ? 18 : 0)
 
-                        certificatePanel
-
                         VStack(alignment: .leading, spacing: 0) {
                             RelayCapsLabel(text: "Checks", size: 11)
                                 .padding(.bottom, 8)
@@ -73,7 +68,7 @@ struct DiagnosticsView: View {
             .refreshable {
                 refreshChecks()
             }
-            .onAppear(perform: refreshAndImportFromSetupEnvironmentIfNeeded)
+            .onAppear(perform: refreshChecks)
         }
         // Presented as a sheet/cover of its own: re-pin the deliberate dark-only
         // appearance so the surface can never flash light.
@@ -116,36 +111,13 @@ struct DiagnosticsView: View {
         }
     }
 
-    private func refreshAndImportFromSetupEnvironmentIfNeeded() {
-        refreshChecks()
-        let setupPassphrase = ClientIdentityStore.resolvedImportPassphrase(explicitPassphrase: "")
-        guard
-            !setupPassphrase.isEmpty,
-            !identityStore.hasStoredIdentity,
-            FileManager.default.fileExists(atPath: identityStore.expectedSupportP12URL.path)
-        else {
-            return
-        }
-        importDefaultCertificate()
-    }
-
-    private func importDefaultCertificate() {
-        do {
-            let resolvedPassphrase = ClientIdentityStore.resolvedImportPassphrase(explicitPassphrase: passphrase)
-            _ = try identityStore.importIdentityFromSupport(passphrase: resolvedPassphrase)
-            importError = nil
-            passphrase = ""
-        } catch {
-            importError = error.localizedDescription
-        }
-        refreshChecks()
-    }
-
     private func refreshChecks() {
-        let supportExists = identityStore.ensureSupportDirectoryExists()
-        let candidates = identityStore.supportP12Candidates()
-        let supportConfigExists = FileManager.default.fileExists(atPath: identityStore.supportConfigURL.path)
-        let manifestURLIsReachableRuntime = manifestClient.manifestURL.scheme == "https" || isSimulatorPreview
+        let node = nodeStore.pairedNode
+        let host = identityStore.pinnedHost ?? node?.host
+        let hasPinnedCA = identityStore.pinnedCACertificate != nil
+        let hasDeviceToken = host.flatMap { identityStore.deviceToken(for: $0) } != nil
+        let linkReady = hasPinnedCA && hasDeviceToken
+        let cloudConnected = node?.registeredAccountID != nil
 
         checks = [
             DiagnosticCheck(
@@ -154,150 +126,26 @@ struct DiagnosticsView: View {
                 isPassing: true
             ),
             DiagnosticCheck(
-                title: "Support directory",
-                detail: isSimulatorPreview
-                    ? "Not required for simulator preview."
-                    : supportExists ? "Documents/support exists." : "Could not create Documents/support.",
-                isPassing: isSimulatorPreview || supportExists
+                title: "Machine",
+                detail: node?.nodeName ?? "No machine paired",
+                isPassing: nodeStore.hasMachine
             ),
             DiagnosticCheck(
-                title: "Support config",
-                detail: isSimulatorPreview
-                    ? "Not required for simulator preview."
-                    : supportConfigExists ? "vault-config.json found." : "Using Xcode build setting endpoint.",
+                title: "Address",
+                detail: node?.apiBaseURL.absoluteString ?? "No address",
+                isPassing: node != nil
+            ),
+            DiagnosticCheck(
+                title: "Link",
+                detail: linkReady ? "Pinned CA, device token" : "Pairing material missing",
+                isPassing: linkReady
+            ),
+            DiagnosticCheck(
+                title: "Relay cloud",
+                detail: cloudConnected ? "Connected" : "Not connected — optional",
                 isPassing: true
-            ),
-            DiagnosticCheck(
-                title: "P12 file available",
-                detail: isSimulatorPreview
-                    ? "Not required for simulator preview."
-                    : candidates.isEmpty ? "Expected \(identityStore.expectedSupportP12URL.lastPathComponent)." : "\(candidates.count) .p12 file(s) found.",
-                isPassing: isSimulatorPreview || !candidates.isEmpty
-            ),
-            DiagnosticCheck(
-                title: "Keychain identity",
-                detail: isSimulatorPreview
-                    ? "Device builds use the installed client certificate."
-                    : identityStore.hasStoredIdentity ? "Client certificate is available for mTLS." : "Import client.p12 to enable mTLS.",
-                isPassing: isSimulatorPreview || identityStore.hasStoredIdentity
-            ),
-            DiagnosticCheck(
-                title: "Manifest URL",
-                detail: manifestClient.manifestURL.absoluteString,
-                isPassing: manifestURLIsReachableRuntime
-            ),
-            DiagnosticCheck(
-                title: "Signature public key",
-                detail: manifestClient.hasTrustedPublicKey ? "Ed25519 public key configured." : "No trusted key configured.",
-                isPassing: manifestClient.hasTrustedPublicKey
             )
         ]
-    }
-
-    @ViewBuilder
-    private var certificatePanel: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            if isSimulatorPreview {
-                certificateHeader(
-                    title: "Simulator Preview",
-                    detail: "Local signed manifest at 127.0.0.1",
-                    symbol: "macwindow",
-                    isPassing: true
-                )
-            } else {
-                certificateHeader(
-                    title: "Client certificate",
-                    detail: identityStore.hasStoredIdentity ? "Installed for mTLS" : "Import required",
-                    symbol: "key.fill",
-                    isPassing: identityStore.hasStoredIdentity
-                )
-
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Expected file")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(AppTheme.textTertiary)
-                    Text("Documents/support/client.p12")
-                        .font(.footnote.monospaced())
-                        .foregroundStyle(AppTheme.textSecondary)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.75)
-                }
-
-                if identityStore.hasStoredIdentity {
-                    DisclosureGroup(isExpanded: $isImportExpanded) {
-                        importCertificateForm
-                            .padding(.top, 10)
-                    } label: {
-                        Text("Reimport certificate")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(AppTheme.textPrimary)
-                    }
-                    .tint(AppTheme.textSecondary)
-                } else {
-                    importCertificateForm
-                }
-            }
-        }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .diagnosticCard(cornerRadius: cardCornerRadius)
-    }
-
-    private func certificateHeader(title: String, detail: String, symbol: String, isPassing: Bool) -> some View {
-        HStack(alignment: .center, spacing: 12) {
-            Image(systemName: symbol)
-                .font(.system(size: 16, weight: .medium))
-                .foregroundStyle(AppTheme.textSecondary)
-                .frame(width: 32, height: 32)
-                .background(AppTheme.textPrimary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(AppTheme.textPrimary)
-                Text(detail)
-                    .font(.system(size: 12))
-                    .foregroundStyle(AppTheme.textSecondary)
-            }
-
-            Spacer(minLength: 0)
-        }
-    }
-
-    private var importCertificateForm: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            VStack(spacing: 10) {
-                SecureField(
-                    "",
-                    text: $passphrase,
-                    prompt: Text("P12 passphrase").foregroundColor(AppTheme.textTertiary)
-                )
-                .textContentType(.password)
-                .font(AppTheme.uiFont(size: 15))
-                .foregroundStyle(AppTheme.textPrimary)
-                Rectangle()
-                    .fill(AppTheme.hairlineStrong)
-                    .frame(height: 1)
-            }
-
-            Button {
-                importDefaultCertificate()
-            } label: {
-                Label("Import certificate", systemImage: "square.and.arrow.down")
-            }
-            .buttonStyle(RelayPrimaryButtonStyle())
-
-            if let importError {
-                Text(importError)
-                    .font(.footnote)
-                    .foregroundStyle(AppTheme.statusError)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-    }
-
-    private var isSimulatorPreview: Bool {
-        AppConfiguration.runtimeMode == "Simulator Preview"
     }
 
     private var screenTitle: String {

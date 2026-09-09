@@ -5,26 +5,18 @@ struct POCVaultApp: App {
     /// iOS hands the APNs device token to a UIApplicationDelegate and nowhere else.
     @UIApplicationDelegateAdaptor(RelayAppDelegate.self) private var appDelegate
     @StateObject private var identityStore: ClientIdentityStore
-    @StateObject private var libraryViewModel: LibraryViewModel
     @StateObject private var chatSessionStore: RelayChatSessionStore
     @StateObject private var statusFeedViewModel: StatusFeedViewModel
     @StateObject private var accountStore: RelayAccountStore
     @StateObject private var nodeStore: RelayNodeStore
     @StateObject private var computerLinkStore: RelayComputerLinkStore
     @StateObject private var pushService: RelayPushService
-    private let manifestClient: ManifestClient
     private let codexClient: CodexClient
     private let authClient: RelayAuthClient
 
     init() {
         let identityStore = ClientIdentityStore()
         identityStore.importIdentityFromSetupEnvironmentIfNeeded()
-        let manifestClient = ManifestClient(
-            manifestURL: AppConfiguration.manifestURL,
-            signatureURL: AppConfiguration.signatureURL,
-            identityStore: identityStore,
-            trustedPublicKeyRawRepresentation: AppConfiguration.trustedManifestPublicKey
-        )
         // One client for the whole app, built at the node the store already
         // restored (a machine paired on a previous launch, else the personal
         // install). Chat, status and the browser all share it, so `retarget`
@@ -43,7 +35,6 @@ struct POCVaultApp: App {
 
         _identityStore = StateObject(wrappedValue: identityStore)
         _nodeStore = StateObject(wrappedValue: nodeStore)
-        _libraryViewModel = StateObject(wrappedValue: LibraryViewModel(client: manifestClient))
         _chatSessionStore = StateObject(wrappedValue: RelayChatSessionStore(
             client: codexClient,
             completionNotifier: CodexLocalNotificationService()
@@ -54,7 +45,6 @@ struct POCVaultApp: App {
             client: RelayAuthClient(baseURL: AppConfiguration.authBaseURL)
         ))
         _pushService = StateObject(wrappedValue: RelayPushService(accountStore: accountStore, codexClient: codexClient))
-        self.manifestClient = manifestClient
         self.codexClient = codexClient
         self.authClient = authClient
     }
@@ -66,16 +56,12 @@ struct POCVaultApp: App {
             // per body evaluation leaked a URLSession every time SwiftUI re-ran it.
             .onChange(of: nodeStore.effectiveBaseURL, initial: true) { _, newBaseURL in
                 codexClient.retarget(baseURL: newBaseURL)
-                libraryViewModel.reset()
             }
             .task {
                 await accountStore.restore()
                 #if DEBUG
                 await applyAuthenticationUITestHooks()
                 #endif
-            }
-            .task(id: accountStore.user?.id) {
-                libraryViewModel.reset()
             }
         }
     }
@@ -102,14 +88,12 @@ struct POCVaultApp: App {
             )
         } else {
             POCVaultRootView(
-                libraryViewModel: libraryViewModel,
                 statusFeedViewModel: statusFeedViewModel,
                 chatSessionStore: chatSessionStore,
                 accountStore: accountStore,
                 identityStore: identityStore,
                 nodeStore: nodeStore,
                 computerLinkStore: computerLinkStore,
-                manifestClient: manifestClient,
                 codexClient: codexClient,
                 authClient: authClient,
                 pushService: pushService
@@ -192,14 +176,12 @@ private struct RelayTerminalLaunch: Identifiable {
 }
 
 struct POCVaultRootView: View {
-    @ObservedObject var libraryViewModel: LibraryViewModel
     @ObservedObject var statusFeedViewModel: StatusFeedViewModel
     @ObservedObject var chatSessionStore: RelayChatSessionStore
     @ObservedObject var accountStore: RelayAccountStore
     @ObservedObject var identityStore: ClientIdentityStore
     @ObservedObject var nodeStore: RelayNodeStore
     @ObservedObject var computerLinkStore: RelayComputerLinkStore
-    let manifestClient: ManifestClient
     let codexClient: CodexClient
     let authClient: RelayAuthClient
     @ObservedObject var pushService: RelayPushService
@@ -213,7 +195,6 @@ struct POCVaultRootView: View {
     @State private var opensThreadsForHandoff = false
     @State private var selectedRootTab = RelayRootTab.workspaces
     @State private var showingDiagnostics = false
-    @State private var previewIdentityRevision = 0
 
     var body: some View {
         mainTabs
@@ -247,18 +228,11 @@ struct POCVaultRootView: View {
         .sheet(isPresented: $showingDiagnostics) {
             DiagnosticsView(
                 identityStore: identityStore,
-                manifestClient: manifestClient
+                nodeStore: nodeStore
             )
         }
         .task {
             identityStore.importIdentityFromSetupEnvironmentIfNeeded()
-        }
-        // The publisher emits on every import, including a replacement with
-        // the same certificate name. Dismiss any old preview or catalog detail
-        // without depending on a display name changing.
-        .onReceive(identityStore.$lastImportedCertificateName.dropFirst().receive(on: RunLoop.main)) { _ in
-            libraryViewModel.reset()
-            previewIdentityRevision &+= 1
         }
         // Push registration needs a session: the cloud device route is
         // session-authed. This view now exists while signed out too, so it is
@@ -350,15 +324,12 @@ struct POCVaultRootView: View {
             .tabItem { Label("Workspaces", systemImage: "square.grid.2x2") }
 
             RelayPreviewsView(
-                libraryViewModel: libraryViewModel,
                 identityStore: identityStore,
-                manifestClient: manifestClient,
                 client: codexClient,
                 workspaceAccessIsAvailable: !foldersAreHiddenAfterComputerDisconnect,
                 onOpenWorkspaces: { selectedRootTab = .workspaces },
                 onOpenJob: openPreviewSourceJob
             )
-            .id(previewIdentityRevision)
             .tag(RelayRootTab.previews)
             .tabItem { Label("Previews", systemImage: "rectangle.on.rectangle") }
             .accessibilityIdentifier("relay-previews-tab")
@@ -366,9 +337,13 @@ struct POCVaultRootView: View {
             CodexStatusView(
                 feedViewModel: statusFeedViewModel,
                 identityStore: identityStore,
-                manifestClient: manifestClient,
+                nodeStore: nodeStore,
+                client: codexClient,
                 onOpenItem: openSession,
-                onNewSession: { selectedRootTab = .workspaces }
+                onOpenNewSession: { workspaceID in
+                    openNewSession(folderPath: nil, workspaceID: workspaceID)
+                },
+                onBrowseFiles: { selectedRootTab = .workspaces }
             )
             .tag(RelayRootTab.sessions)
             .tabItem { Label("Sessions", systemImage: "bubble.left.and.text.bubble.right") }
@@ -445,6 +420,7 @@ struct POCVaultRootView: View {
             client: codexClient,
             folderPath: folderPath,
             isRoot: isRoot,
+            machineLabel: isRoot ? nodeStore.pairedNode?.nodeName : nil,
             onOpenFolder: { path in
                 browserPath.append(.folder(path: path))
             },
@@ -457,7 +433,6 @@ struct POCVaultRootView: View {
             onOpenTerminal: { workspaceID, workspaceName in
                 terminalLaunch = RelayTerminalLaunch(workspaceID: workspaceID, workspaceName: workspaceName)
             },
-            onOpenLibrary: isRoot ? { selectedRootTab = .previews } : nil,
             onOpenDiagnostics: isRoot ? { showingDiagnostics = true } : nil
         )
     }
@@ -740,11 +715,17 @@ final class StatusFeedViewModel: ObservableObject {
 private struct CodexStatusView: View {
     @ObservedObject var feedViewModel: StatusFeedViewModel
     @ObservedObject var identityStore: ClientIdentityStore
-    let manifestClient: ManifestClient
+    @ObservedObject var nodeStore: RelayNodeStore
+    let client: CodexClient
     let onOpenItem: (CodexThreadFeedItem) -> Void
-    let onNewSession: () -> Void
+    let onOpenNewSession: (String?) -> Void
+    let onBrowseFiles: () -> Void
     @State private var selectedSection = StatusSection.activity
     @State private var providerFilter: CodexProvider?
+    @State private var showingWorkspacePicker = false
+    @State private var workspacePickerError: String?
+    @State private var workspaces: [CodexWorkspace] = []
+    @State private var isLoadingWorkspaces = false
 
     var body: some View {
         NavigationStack {
@@ -757,7 +738,9 @@ private struct CodexStatusView: View {
                             .font(AppTheme.serifFont(size: 32))
                             .foregroundStyle(AppTheme.textPrimary)
                         Spacer()
-                        Button(action: onNewSession) {
+                        Button {
+                            showingWorkspacePicker = true
+                        } label: {
                             Image(systemName: "plus")
                                 .font(AppTheme.uiFont(size: 18, weight: .semibold))
                                 .foregroundStyle(AppTheme.textPrimary)
@@ -855,7 +838,7 @@ private struct CodexStatusView: View {
                     case .health:
                         DiagnosticsView(
                             identityStore: identityStore,
-                            manifestClient: manifestClient,
+                            nodeStore: nodeStore,
                             showsNavigationChrome: false
                         )
                     }
@@ -867,8 +850,44 @@ private struct CodexStatusView: View {
             .refreshable {
                 await feedViewModel.refresh()
             }
+            .sheet(isPresented: $showingWorkspacePicker) {
+                SessionsWorkspacePickerSheet(
+                    workspaces: workspaces,
+                    isLoading: isLoadingWorkspaces,
+                    errorMessage: workspacePickerError,
+                    onSelect: { workspace in
+                        showingWorkspacePicker = false
+                        onOpenNewSession(workspace.id)
+                    },
+                    onBrowseFiles: {
+                        showingWorkspacePicker = false
+                        onBrowseFiles()
+                    },
+                    onRetry: {
+                        Task { await loadWorkspacesForPicker() }
+                    }
+                )
+                .presentationDetents([.medium, .large])
+            }
+            .onChange(of: showingWorkspacePicker) { _, isPresented in
+                guard isPresented else { return }
+                Task { await loadWorkspacesForPicker() }
+            }
         }
         .preferredColorScheme(.dark)
+    }
+
+    @MainActor
+    private func loadWorkspacesForPicker() async {
+        isLoadingWorkspaces = true
+        workspacePickerError = nil
+        defer { isLoadingWorkspaces = false }
+        do {
+            workspaces = try await client.fetchCodexWorkspaces()
+        } catch {
+            workspacePickerError = error.localizedDescription
+            workspaces = []
+        }
     }
 
     private var summaryText: String {
@@ -944,6 +963,90 @@ private struct CodexStatusView: View {
             return false
         }) else { return }
         onOpenItem(item)
+    }
+}
+
+private struct SessionsWorkspacePickerSheet: View {
+    let workspaces: [CodexWorkspace]
+    let isLoading: Bool
+    let errorMessage: String?
+    let onSelect: (CodexWorkspace) -> Void
+    let onBrowseFiles: () -> Void
+    let onRetry: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                AppTheme.bgCanvas.ignoresSafeArea()
+                Group {
+                    if isLoading {
+                        ProgressView("Loading workspaces…")
+                            .tint(AppTheme.accent)
+                    } else if let errorMessage {
+                        VStack(alignment: .leading, spacing: 16) {
+                            Text(errorMessage)
+                                .font(AppTheme.uiFont(size: 14))
+                                .foregroundStyle(AppTheme.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Button("Try again", action: onRetry)
+                                .buttonStyle(RelayOutlineButtonStyle())
+                            Button("Browse files instead", action: onBrowseFiles)
+                                .buttonStyle(RelayPrimaryButtonStyle())
+                        }
+                        .padding(20)
+                    } else if workspaces.isEmpty {
+                        VStack(alignment: .leading, spacing: 16) {
+                            Text("No workspaces available on this machine.")
+                                .font(AppTheme.uiFont(size: 14))
+                                .foregroundStyle(AppTheme.textSecondary)
+                            Button("Browse files instead", action: onBrowseFiles)
+                                .buttonStyle(RelayPrimaryButtonStyle())
+                        }
+                        .padding(20)
+                    } else {
+                        List {
+                            ForEach(workspaces) { workspace in
+                                Button {
+                                    onSelect(workspace)
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(workspace.name)
+                                            .font(AppTheme.uiFont(size: 15, weight: .medium))
+                                            .foregroundStyle(AppTheme.textPrimary)
+                                        // Only registered workspaces carry a path; an
+                                        // unset one must not leave an empty mono line
+                                        // padding the row out.
+                                        if let path = workspace.path?.trimmedNonEmpty {
+                                            Text(path)
+                                                .font(AppTheme.monoFont(size: 12))
+                                                .foregroundStyle(AppTheme.textTertiary)
+                                                .lineLimit(1)
+                                                .truncationMode(.head)
+                                        }
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .listRowBackground(AppTheme.bgCanvas)
+                            }
+                        }
+                        .listStyle(.plain)
+                        .scrollContentBackground(.hidden)
+                    }
+                }
+            }
+            .navigationTitle("New session")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
     }
 }
 
@@ -1229,8 +1332,6 @@ extension Color {
 
 enum AppConfiguration {
 #if targetEnvironment(simulator)
-    static let manifestURL = URL(string: "http://127.0.0.1:8787/manifest.json")!
-    static let signatureURL = URL(string: "http://127.0.0.1:8787/manifest.sig.json")!
     static let codexBaseURL = configuredURL(
         supportValue: supportConfig?.codexBaseURL,
         infoKey: "POCVaultCodexBaseURL",
@@ -1243,16 +1344,6 @@ enum AppConfiguration {
     )
     static let runtimeMode = "Simulator Preview"
 #else
-    static let manifestURL = configuredURL(
-        supportValue: supportConfig?.manifestURL,
-        infoKey: "POCVaultManifestURL",
-        fallback: "https://vault.pocs.conformal.live/manifest.json"
-    )
-    static let signatureURL = configuredURL(
-        supportValue: supportConfig?.signatureURL,
-        infoKey: "POCVaultSignatureURL",
-        fallback: "https://vault.pocs.conformal.live/manifest.sig.json"
-    )
     /// A node URL is per-user — the owner's own machine, paired to this phone —
     /// so there is no correct global default and this fallback deliberately
     /// resolves to nothing. `.invalid` is reserved by RFC 2606 and is
@@ -1335,16 +1426,6 @@ enum AppConfiguration {
 #endif
     }()
 
-    static let trustedManifestPublicKey = configuredPublicKey(
-        supportValue: supportConfig?.manifestPublicKey,
-        infoKey: "POCVaultManifestPublicKey"
-    ) ?? Data([
-        0xf9, 0xba, 0xb6, 0x22, 0xa2, 0xad, 0x92, 0xd2,
-        0x27, 0xeb, 0x34, 0x4f, 0xfa, 0x99, 0x30, 0xb1,
-        0xaa, 0xdf, 0x77, 0xee, 0xaf, 0xb6, 0xde, 0x82,
-        0x50, 0xb5, 0xc1, 0x83, 0xfc, 0x77, 0x2c, 0xc6
-    ])
-
     private static let supportConfig: SupportConfig? = {
         guard let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
             return nil
@@ -1386,46 +1467,8 @@ enum AppConfiguration {
         return true
     }
 
-    private static func configuredPublicKey(supportValue: String?, infoKey: String) -> Data? {
-        let infoValue = Bundle.main.object(forInfoDictionaryKey: infoKey) as? String
-        return [supportValue, infoValue]
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { !$0.isEmpty && !$0.contains("$(") }
-            .flatMap(rawPublicKeyData)
-    }
-
-    private static func rawPublicKeyData(from value: String) -> Data? {
-        let compact = value
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: " ", with: "")
-        if compact.count == 64,
-           compact.allSatisfy({ $0.isHexDigit }) {
-            var bytes = Data()
-            var index = compact.startIndex
-            while index < compact.endIndex {
-                let next = compact.index(index, offsetBy: 2)
-                guard let byte = UInt8(compact[index..<next], radix: 16) else { return nil }
-                bytes.append(byte)
-                index = next
-            }
-            return bytes.count == 32 ? bytes : nil
-        }
-
-        let padded = compact
-            .replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-            .padding(toLength: ((compact.count + 3) / 4) * 4, withPad: "=", startingAt: 0)
-        guard let decoded = Data(base64Encoded: padded), decoded.count == 32 else {
-            return nil
-        }
-        return decoded
-    }
-
     private struct SupportConfig: Decodable {
-        let manifestURL: String?
-        let signatureURL: String?
         let codexBaseURL: String?
         let authBaseURL: String?
-        let manifestPublicKey: String?
     }
 }

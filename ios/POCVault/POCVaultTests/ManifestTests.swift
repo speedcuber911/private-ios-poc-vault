@@ -1,74 +1,9 @@
-import CryptoKit
 import XCTest
 import AVFoundation
 import SwiftUI
 @testable import POCVault
 
 final class ManifestTests: XCTestCase {
-    func testDecodesManifestEntriesWithISO8601Dates() throws {
-        let json = """
-        {
-          "schemaVersion": 1,
-          "generatedAt": "2026-05-15T10:00:00Z",
-          "pocs": [
-            {
-              "slug": "smoke",
-              "title": "Smoke Test",
-              "description": "Small internal POC",
-              "url": "https://smoke.pocs.example.com/",
-              "updatedAt": "2026-05-14T09:30:00Z",
-              "tags": ["demo", "ios"]
-            }
-          ]
-        }
-        """.data(using: .utf8)!
-
-        let manifest = try POCManifest.decode(from: json)
-
-        XCTAssertEqual(manifest.version, 1)
-        XCTAssertEqual(manifest.entries.first?.id, "smoke")
-        XCTAssertEqual(manifest.entries.first?.displayHost, "smoke.pocs.example.com")
-        XCTAssertEqual(manifest.entries.first?.requiresClientCertificate, true)
-    }
-
-    func testSearchMatchesTitleSummaryAndTags() throws {
-        let entry = POCEntry(
-            id: "alpha",
-            title: "Forecast Console",
-            summary: "Demand planner prototype",
-            url: URL(string: "https://poc-vault.test/forecast")!,
-            updatedAt: nil,
-            tags: ["sales"],
-            requiresClientCertificate: false
-        )
-
-        XCTAssertTrue(entry.matchesSearch("forecast"))
-        XCTAssertTrue(entry.matchesSearch("planner"))
-        XCTAssertTrue(entry.matchesSearch("sales"))
-        XCTAssertFalse(entry.matchesSearch("finance"))
-    }
-
-    func testEd25519SignatureVerificationUsesRawPublicKeyBytes() throws {
-        let privateKey = Curve25519.Signing.PrivateKey()
-        let payload = Data("manifest".utf8)
-        let signature = try privateKey.signature(for: payload)
-
-        XCTAssertTrue(
-            ManifestClient.verifySignature(
-                payload: payload,
-                signature: signature,
-                publicKeyRawRepresentation: privateKey.publicKey.rawRepresentation
-            )
-        )
-        XCTAssertFalse(
-            ManifestClient.verifySignature(
-                payload: Data("tampered".utf8),
-                signature: signature,
-                publicKeyRawRepresentation: privateKey.publicKey.rawRepresentation
-            )
-        )
-    }
-
     func testPreviewsAreFirstClassAndReuseAuthenticatedOutputViewers() throws {
         let root = try AppSourceFixture.load("POCVault/POCVaultApp.swift")
         let library = try AppSourceFixture.load("POCVault/Views/LibraryView.swift")
@@ -76,34 +11,18 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(root.contains(".tag(RelayRootTab.previews)"))
         XCTAssertTrue(root.contains("selectedRootTab = .previews"))
         XCTAssertTrue(root.contains("relay-previews-tab"))
-        XCTAssertTrue(root.contains("identityStore.$lastImportedCertificateName.dropFirst()"))
-        XCTAssertTrue(root.contains(".id(previewIdentityRevision)"))
-        XCTAssertTrue(library.contains("Workspace results"))
-        XCTAssertTrue(library.contains("Published catalog"))
+        XCTAssertFalse(root.contains("identityStore.$lastImportedCertificateName.dropFirst()"))
+        XCTAssertFalse(root.contains(".id(previewIdentityRevision)"))
+        XCTAssertFalse(root.contains("manifestClient"))
+        XCTAssertFalse(library.contains("Published catalog"))
         XCTAssertTrue(library.contains("relay-workspace-previews-list"))
         XCTAssertTrue(library.contains("RelayArtifactViewer(artifact: artifact, client: client, identityStore: identityStore)"))
         XCTAssertTrue(library.contains("RelayRemotePreviewViewer(request: request, client: client, identityStore: identityStore)"))
-        XCTAssertTrue(library.contains(".fullScreenCover(item: $openedPreview)"))
-        XCTAssertTrue(library.contains("relay-preview-open"))
+        XCTAssertFalse(library.contains(".fullScreenCover(item: $openedPreview)"))
+        XCTAssertFalse(library.contains("relay-preview-open"))
         XCTAssertTrue(library.contains("relay-workspace-preview-source-"))
         XCTAssertTrue(root.contains("onOpenJob: openPreviewSourceJob"))
         XCTAssertTrue(library.contains("latest 100 jobs"))
-    }
-
-    func testPreviewCertificateRequirementIsSeparateFromCatalogIntegrity() {
-        let protected = POCEntry(id: "protected", title: "Protected", summary: nil, url: URL(string: "https://preview.example.com/")!, updatedAt: nil, tags: [], requiresClientCertificate: true)
-        let publicEntry = POCEntry(id: "public", title: "Public", summary: nil, url: URL(string: "https://public.example.com/")!, updatedAt: nil, tags: [], requiresClientCertificate: false)
-
-        XCTAssertEqual(PreviewTrustCopy.catalogTitle, "Manifest signature verified")
-        XCTAssertTrue(PreviewTrustCopy.catalogExplanation.contains("not the contents of downloaded web pages"))
-        XCTAssertEqual(PreviewTrustCopy.accessTitle(for: protected), "Client certificate required")
-        XCTAssertEqual(PreviewTrustCopy.accessTitle(for: publicEntry), "Not required by catalog")
-        XCTAssertTrue(PreviewTrustCopy.accessExplanation(for: protected).contains("when the server requests it"))
-        XCTAssertTrue(PreviewTrustCopy.accessExplanation(for: publicEntry).contains("other sign-in rules"))
-        XCTAssertEqual(PreviewFilter.protected.entries(from: [publicEntry, protected], recentIDs: []).map(\.id), ["protected"])
-        XCTAssertEqual(PreviewFilter.all.entries(from: [publicEntry, protected], recentIDs: ["protected"]).map(\.id), ["protected", "public"])
-        XCTAssertEqual(PreviewFilter.recent.entries(from: [publicEntry, protected], recentIDs: ["missing", "public"]).map(\.id), ["public"])
-        XCTAssertFalse(PreviewFilter.allCases.map(\.rawValue).contains("Signed"))
     }
 
     func testWorkspacePreviewResultsRequireRealOutputsOrLoopbackLinks() throws {
@@ -243,19 +162,6 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(sourceRoute.contains("automaticallyOpensPreviews: false"))
         XCTAssertTrue(sourceRoute.contains("openHistoryItem(item)"))
         XCTAssertTrue(root.contains("automaticallyOpensPreviews: launch.automaticallyOpensPreviews"))
-    }
-
-    @MainActor
-    func testPreviewCatalogResetClearsVerifiedStateAndSearch() {
-        let client = ManifestClient(manifestURL: URL(string: "https://catalog.example.com/manifest.json")!, signatureURL: URL(string: "https://catalog.example.com/manifest.sig.json")!, identityStore: ClientIdentityStore(), trustedPublicKeyRawRepresentation: nil)
-        let model = LibraryViewModel(client: client)
-        model.state = .loaded(POCManifest(schemaVersion: 1, generatedAt: nil, pocs: []))
-        model.searchText = "old account"
-        XCTAssertNotNil(model.verifiedManifest)
-        model.reset()
-        XCTAssertNil(model.verifiedManifest)
-        XCTAssertEqual(model.state, .idle)
-        XCTAssertEqual(model.searchText, "")
     }
 
     func testCodexJobDisplayOutputPrefersSingleResultWhenStreamsDuplicate() throws {
@@ -794,6 +700,45 @@ final class ManifestTests: XCTestCase {
         // cached-chat launch path that can reopen the folder's current thread.
         XCTAssertTrue(source.contains("openNewSession(folderPath: path, workspaceID: workspaceID)"))
         XCTAssertTrue(source.contains("chatSessionStore.launchNewSession"))
+        XCTAssertFalse(source.contains("manifestClient"))
+    }
+
+    func testBrowserRootHeaderNamesMachineWithoutPermanentMTLSStatus() throws {
+        let browser = try AppSourceFixture.load("POCVault/Browser/FileBrowserView.swift")
+        XCTAssertFalse(browser.contains("mTLS"))
+        XCTAssertFalse(browser.contains("Connected ·"))
+        XCTAssertTrue(browser.contains("machineLabel"))
+        XCTAssertTrue(browser.contains("AppTheme.monoFont"))
+        XCTAssertTrue(browser.contains("\"Offline\""))
+        XCTAssertTrue(browser.contains("AppTheme.statusError"))
+    }
+
+    func testDiagnosticsReportPairedMachineWithoutP12OrMTLS() throws {
+        let diagnostics = try AppSourceFixture.load("POCVault/Views/DiagnosticsView.swift")
+        XCTAssertFalse(diagnostics.contains(".p12"))
+        XCTAssertFalse(diagnostics.contains("mTLS"))
+        XCTAssertFalse(diagnostics.contains("manifestClient"))
+        XCTAssertTrue(diagnostics.contains("nodeStore: RelayNodeStore"))
+        XCTAssertTrue(diagnostics.contains("\"Machine\""))
+        XCTAssertTrue(diagnostics.contains("\"No machine paired\""))
+        XCTAssertTrue(diagnostics.contains("\"Pinned CA, device token\""))
+        XCTAssertTrue(diagnostics.contains("\"Not connected — optional\""))
+    }
+
+    func testSessionsPlusOpensWorkspacePickerRatherThanSwitchingTabs() throws {
+        let source = try AppSourceFixture.load("POCVault/POCVaultApp.swift")
+        XCTAssertTrue(source.contains("showingWorkspacePicker"))
+        XCTAssertTrue(source.contains("fetchCodexWorkspaces()"))
+        XCTAssertTrue(source.contains("onOpenNewSession"))
+        XCTAssertTrue(source.contains("Browse files instead"))
+        XCTAssertTrue(source.contains("SessionsWorkspacePickerSheet"))
+        XCTAssertFalse(source.contains("onNewSession: { selectedRootTab = .workspaces }"))
+        let plusButton = try sourceSnippet(
+            in: source,
+            from: "Button {\n                            showingWorkspacePicker = true",
+            to: "accessibilityLabel(\"Choose a workspace for a new session\")"
+        )
+        XCTAssertFalse(plusButton.contains("selectedRootTab"))
     }
 
     @MainActor
@@ -891,26 +836,6 @@ final class ManifestTests: XCTestCase {
             baseURL: URL(string: "http://127.0.0.1:9")!,
             identityStore: ClientIdentityStore()
         )
-    }
-
-    func testLibraryRecentFilterShowsEmptyStateInsteadOfAllEntries() throws {
-        let source = try AppSourceFixture.load("POCVault/Views/LibraryView.swift")
-        let modelSource = try AppSourceFixture.load("POCVault/Views/LibraryViewModel.swift")
-        let filterSource = try sourceSnippet(
-            in: modelSource,
-            from: "enum PreviewFilter",
-            to: "enum PreviewTrustCopy"
-        )
-        let emptyStateSource = try sourceSnippet(
-            in: source,
-            from: "private var emptyState",
-            to: "private func markRecent"
-        )
-
-        XCTAssertFalse(filterSource.contains("recentEntries.isEmpty ? entries : recentEntries"))
-        XCTAssertTrue(filterSource.contains("return recent"))
-        XCTAssertTrue(emptyStateSource.contains("No recent previews"))
-        XCTAssertTrue(emptyStateSource.contains("Try another search or choose a different filter"))
     }
 
     func testCodexJobDefaultsMissingProviderToCodexAndDecodesClaude() throws {

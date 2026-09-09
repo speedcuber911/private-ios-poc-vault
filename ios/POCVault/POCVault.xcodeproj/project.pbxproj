@@ -9,12 +9,8 @@
 /* Begin PBXBuildFile section */
 		200000000000000000000002 /* ManifestTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000003 /* ManifestTests.swift */; };
 		200000000000000000000003 /* POCVaultApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000006 /* POCVaultApp.swift */; };
-		200000000000000000000004 /* POCEntry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000007 /* POCEntry.swift */; };
-		200000000000000000000005 /* POCManifest.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000008 /* POCManifest.swift */; };
 		200000000000000000000006 /* ClientIdentityStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000009 /* ClientIdentityStore.swift */; };
-		200000000000000000000007 /* ManifestClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000010 /* ManifestClient.swift */; };
 		200000000000000000000008 /* AuthenticatedWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000011 /* AuthenticatedWebView.swift */; };
-		200000000000000000000009 /* LibraryViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000012 /* LibraryViewModel.swift */; };
 		200000000000000000000010 /* LibraryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000013 /* LibraryView.swift */; };
 		200000000000000000000011 /* DiagnosticsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000014 /* DiagnosticsView.swift */; };
 		200000000000000000000012 /* Resources/AppIcon/AppIcon60x60@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000015 /* Resources/AppIcon/AppIcon60x60@2x.png */; };
@@ -83,12 +79,8 @@
 		100000000000000000000004 /* POCVaultTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = POCVaultTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		100000000000000000000005 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		100000000000000000000006 /* POCVaultApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = POCVaultApp.swift; sourceTree = "<group>"; };
-		100000000000000000000007 /* POCEntry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = POCEntry.swift; sourceTree = "<group>"; };
-		100000000000000000000008 /* POCManifest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = POCManifest.swift; sourceTree = "<group>"; };
 		100000000000000000000009 /* ClientIdentityStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientIdentityStore.swift; sourceTree = "<group>"; };
-		100000000000000000000010 /* ManifestClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManifestClient.swift; sourceTree = "<group>"; };
 		100000000000000000000011 /* AuthenticatedWebView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthenticatedWebView.swift; sourceTree = "<group>"; };
-		100000000000000000000012 /* LibraryViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryViewModel.swift; sourceTree = "<group>"; };
 		100000000000000000000013 /* LibraryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryView.swift; sourceTree = "<group>"; };
 		100000000000000000000014 /* DiagnosticsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsView.swift; sourceTree = "<group>"; };
 		100000000000000000000015 /* Resources/AppIcon/AppIcon60x60@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "Resources/AppIcon/AppIcon60x60@2x.png"; sourceTree = "<group>"; };
@@ -225,8 +217,6 @@
 		500000000000000000000005 /* Models */ = {
 			isa = PBXGroup;
 			children = (
-				100000000000000000000007 /* POCEntry.swift */,
-				100000000000000000000008 /* POCManifest.swift */,
 				100000000000000000000018 /* CodexModels.swift */,
 				100000000000000000000035 /* RelayAccount.swift */,
 				100000000000000000000048 /* RelayNodeStore.swift */,
@@ -249,7 +239,6 @@
 		500000000000000000000007 /* Networking */ = {
 			isa = PBXGroup;
 			children = (
-				100000000000000000000010 /* ManifestClient.swift */,
 				100000000000000000000019 /* CodexClient.swift */,
 				100000000000000000000036 /* RelayAuthClient.swift */,
 			);
@@ -267,7 +256,6 @@
 		500000000000000000000009 /* Views */ = {
 			isa = PBXGroup;
 			children = (
-				100000000000000000000012 /* LibraryViewModel.swift */,
 				100000000000000000000013 /* LibraryView.swift */,
 				100000000000000000000014 /* DiagnosticsView.swift */,
 				100000000000000000000023 /* RelayChatViewModel.swift */,
@@ -462,12 +450,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				200000000000000000000003 /* POCVaultApp.swift in Sources */,
-				200000000000000000000004 /* POCEntry.swift in Sources */,
-				200000000000000000000005 /* POCManifest.swift in Sources */,
 				200000000000000000000006 /* ClientIdentityStore.swift in Sources */,
-				200000000000000000000007 /* ManifestClient.swift in Sources */,
 				200000000000000000000008 /* AuthenticatedWebView.swift in Sources */,
-				200000000000000000000009 /* LibraryViewModel.swift in Sources */,
 				200000000000000000000010 /* LibraryView.swift in Sources */,
 				200000000000000000000011 /* DiagnosticsView.swift in Sources */,
 				200000000000000000000015 /* CodexModels.swift in Sources */,
@@ -650,9 +634,6 @@
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				MARKETING_VERSION = 1.0;
 				POC_VAULT_CODEX_BASE_URL = "";
-				POC_VAULT_MANIFEST_PUBLIC_KEY = "";
-				POC_VAULT_MANIFEST_URL = "https://vault.pocs.conformal.live/manifest.json";
-				POC_VAULT_SIGNATURE_URL = "https://vault.pocs.conformal.live/manifest.sig.json";
 				RELAY_AUTH_BASE_URL = "https://relay.ai-rocket-experiments.com";
 				PRODUCT_BUNDLE_IDENTIFIER = com.parikshit.pocvault;
 				PRODUCT_MODULE_NAME = POCVault;
@@ -677,9 +658,6 @@
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				MARKETING_VERSION = 1.0;
 				POC_VAULT_CODEX_BASE_URL = "";
-				POC_VAULT_MANIFEST_PUBLIC_KEY = "";
-				POC_VAULT_MANIFEST_URL = "https://vault.pocs.conformal.live/manifest.json";
-				POC_VAULT_SIGNATURE_URL = "https://vault.pocs.conformal.live/manifest.sig.json";
 				RELAY_AUTH_BASE_URL = "https://relay.ai-rocket-experiments.com";
 				PRODUCT_BUNDLE_IDENTIFIER = com.parikshit.pocvault;
 				PRODUCT_MODULE_NAME = POCVault;
