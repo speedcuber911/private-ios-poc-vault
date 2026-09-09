@@ -225,6 +225,9 @@ final class RelayChatViewModel: ObservableObject {
     @Published private(set) var isLoading = false
     @Published private(set) var isSending = false
     @Published private(set) var isTranscribing = false
+    /// True while `openThread` has seeded identity from the feed item and is still
+    /// waiting on `fetchThreadDetail`. Cleared when detail lands or the request fails.
+    @Published private(set) var isLoadingThreadDetail = false
     @Published private(set) var cancellingJobIDs: Set<String> = []
     /// The explicit model+mode selection. Never inferred from `supports(.task)`; the mode
     /// travels with the choice from the picker section it was tapped in.
@@ -245,6 +248,19 @@ final class RelayChatViewModel: ObservableObject {
             UserDefaults.standard.set(codexApprovalPolicy.rawValue, forKey: Self.codexApprovalDefaultsKey)
         }
     }
+    /// What a Codex job may touch, chosen independently of whether it may ask.
+    @Published var codexSandbox: RelayCodexSandbox {
+        didSet {
+            UserDefaults.standard.set(codexSandbox.rawValue, forKey: Self.codexSandboxDefaultsKey)
+        }
+    }
+    /// Approvals parked against this conversation's own jobs.
+    ///
+    /// The channel has always existed — the runner parks on `waitForDecision`, the
+    /// Sessions tab renders it and the push action buttons answer it. It was simply
+    /// absent from the screen the user is looking at while the run stalls, which is
+    /// why an approval read as a hang.
+    @Published private(set) var pendingApprovals: [CodexApproval] = []
     @Published var prompt = ""
     @Published var errorMessage: String?
     /// Live stdout/stderr tail per active job id, fed by the job SSE stream. Cleared when
@@ -276,6 +292,7 @@ final class RelayChatViewModel: ObservableObject {
 
     private let client: CodexClient
     private let fetchJobDetail: (String) async throws -> CodexJob
+    private let fetchThreadDetail: (String, String?, CodexProvider) async throws -> CodexThreadDetail
     /// Detail refreshes may finish after the user selects a different source or
     /// starts a conversation. They must not replace that newer foreground state.
     private var conversationRevision = UUID()
@@ -297,6 +314,7 @@ final class RelayChatViewModel: ObservableObject {
     private static let liveTailCharacterCap = 12_000
     private static let claudePermissionDefaultsKey = "relay.claude.permissionMode"
     private static let codexApprovalDefaultsKey = "relay.codex.approvalPolicy"
+    private static let codexSandboxDefaultsKey = "relay.codex.sandbox"
 
     var isStreaming: Bool { streamingMessageID != nil }
 
@@ -322,11 +340,19 @@ final class RelayChatViewModel: ObservableObject {
         client: CodexClient,
         workspaceID: String?,
         workspacePath: String?,
-        fetchJobDetail: ((String) async throws -> CodexJob)? = nil
+        fetchJobDetail: ((String) async throws -> CodexJob)? = nil,
+        fetchThreadDetail: ((String, String?, CodexProvider) async throws -> CodexThreadDetail)? = nil
     ) {
         self.client = client
         self.fetchJobDetail = fetchJobDetail ?? { id in
             try await client.fetchJob(id: id, includeFullLogs: false)
+        }
+        self.fetchThreadDetail = fetchThreadDetail ?? { sessionID, workspaceID, provider in
+            try await client.fetchThreadDetail(
+                sessionID: sessionID,
+                workspaceID: workspaceID,
+                provider: provider
+            )
         }
         self.workspaceID = workspaceID?.trimmedNonEmpty
         self.workspacePath = workspacePath?.trimmedNonEmpty
@@ -335,6 +361,9 @@ final class RelayChatViewModel: ObservableObject {
         self.codexApprovalPolicy = RelayCodexApprovalPolicy(
             rawValue: UserDefaults.standard.string(forKey: Self.codexApprovalDefaultsKey) ?? ""
         ) ?? .onRequest
+        self.codexSandbox = RelayCodexSandbox(
+            rawValue: UserDefaults.standard.string(forKey: Self.codexSandboxDefaultsKey) ?? ""
+        ) ?? .default
     }
 
     /// Folder name for the chat top bar ("Relay" for the root chat).
@@ -616,7 +645,39 @@ final class RelayChatViewModel: ObservableObject {
     func refreshActiveWorkIfNeeded() async {
         guard hasActiveConversationJob else { return }
         await refreshActiveJobDetails()
+        await refreshPendingApprovals()
         await refreshThreads()
+    }
+
+    /// Pull approvals parked against the jobs shown here, and only those.
+    ///
+    /// Scoped by job id rather than shown wholesale: an approval belonging to a run
+    /// started from another folder is not this conversation's to answer, and offering
+    /// it here would let one screen unblock work the user cannot see.
+    private func refreshPendingApprovals() async {
+        let jobIDs = Set(messages.compactMap { $0.job?.id })
+        guard !jobIDs.isEmpty else {
+            pendingApprovals = []
+            return
+        }
+        guard let all = try? await client.fetchPendingApprovalsIfSupported() else { return }
+        pendingApprovals = all.filter { $0.isPending && jobIDs.contains($0.jobId) }
+    }
+
+    /// Answer an approval. The card clears immediately so the run visibly resumes,
+    /// and comes back if the machine rejected the decision — a job must never look
+    /// answered when it is still parked.
+    func decideApproval(_ approval: CodexApproval, _ decision: CodexApprovalDecision) async {
+        let previous = pendingApprovals
+        pendingApprovals.removeAll { $0.id == approval.id }
+        do {
+            _ = try await client.decideApproval(id: approval.id, decision: decision)
+            await refreshActiveJobDetails()
+        } catch {
+            guard !isCancellation(error) else { return }
+            pendingApprovals = previous
+            errorMessage = error.localizedDescription
+        }
     }
 
     /// Fetch full detail for each active job card so stdout/result grows live in the UI.
@@ -902,6 +963,7 @@ final class RelayChatViewModel: ObservableObject {
                 provider: provider,
                 permissionMode: provider == .claude ? claudePermissionMode.apiValue : nil,
                 approvalPolicy: provider == .codex ? codexApprovalPolicy.rawValue : nil,
+                sandbox: provider == .codex ? codexSandbox.rawValue : nil,
                 skills: Array(selectedSkillIDsByProvider[provider] ?? []).sorted(),
                 resumeSessionId: resumeID
             ))
@@ -978,6 +1040,7 @@ final class RelayChatViewModel: ObservableObject {
         currentThreadProvider = nil
         currentThreadWorkspaceID = nil
         currentThreadWorkspaceName = nil
+        isLoadingThreadDetail = false
         messages = []
         prompt = ""
         errorMessage = nil
@@ -1007,11 +1070,20 @@ final class RelayChatViewModel: ObservableObject {
         }
         let revision = UUID()
         conversationRevision = revision
+        // Show the thread's identity and whatever the feed already carries before
+        // the detail round trip, matching the source-task "show immediately" path.
+        presentThreadSeed(thread)
+        isLoadingThreadDetail = true
+        defer {
+            if conversationRevision == revision {
+                isLoadingThreadDetail = false
+            }
+        }
         do {
-            let detail = try await client.fetchThreadDetail(
-                sessionID: thread.sessionId,
-                workspaceID: workspaceID,
-                provider: thread.provider
+            let detail = try await fetchThreadDetail(
+                thread.sessionId,
+                workspaceID,
+                thread.provider
             )
             guard conversationRevision == revision else { return }
             currentThreadID = detail.thread.sessionId
@@ -1049,6 +1121,53 @@ final class RelayChatViewModel: ObservableObject {
             guard conversationRevision == revision else { return }
             errorMessage = error.localizedDescription
         }
+    }
+
+    private func presentThreadSeed(_ thread: CodexThread) {
+        currentThreadID = thread.sessionId
+        currentThreadProvider = thread.provider
+        currentThreadWorkspaceID = thread.workspaceId
+        currentThreadWorkspaceName = thread.workspaceName
+
+        let mode = thread.mode
+        if let model = models.first(where: {
+            $0.provider == thread.provider
+                && $0.supports(mode)
+                && (thread.model == nil || $0.id == thread.model || $0.taskModel == thread.model)
+        }) ?? models.first(where: { $0.provider == thread.provider && $0.supports(mode) }) {
+            selectChoice(RelayModelChoice(model: model, mode: mode))
+        }
+
+        var items: [RelayConversationItem] = []
+        let stamp = thread.updatedAt ?? thread.timestamp ?? Date()
+        if let prompt = thread.lastPrompt?.trimmedNonEmpty {
+            items.append(RelayConversationItem(
+                role: .user,
+                text: prompt,
+                timestamp: stamp.addingTimeInterval(-1),
+                provider: thread.provider,
+                modelLabel: thread.model
+            ))
+        }
+        if let result = thread.lastResult?.trimmedNonEmpty {
+            items.append(RelayConversationItem(
+                role: .assistant,
+                text: result,
+                timestamp: stamp,
+                provider: thread.provider,
+                modelLabel: thread.model
+            ))
+        } else if let error = thread.lastError?.trimmedNonEmpty {
+            items.append(RelayConversationItem(
+                role: .status,
+                text: error,
+                timestamp: stamp,
+                provider: thread.provider,
+                modelLabel: thread.model
+            ))
+        }
+        messages = items
+        errorMessage = nil
     }
 
     /// Open either a resumable thread or a standalone invocation from the unified
@@ -1145,14 +1264,27 @@ final class RelayChatViewModel: ObservableObject {
     }
 
     func loadFullLog(for job: CodexJob) async -> String {
+        await loadFullLog(jobID: job.id)
+    }
+
+    func loadFullLog(jobID: String) async -> String {
         do {
-            let full = try await client.fetchJob(id: job.id, includeFullLogs: true)
+            let full = try await client.fetchJob(id: jobID, includeFullLogs: true)
             replaceJob(full)
             return full.rawActivityOutput ?? full.displayOutput ?? ""
         } catch {
             errorMessage = error.localizedDescription
             return error.localizedDescription
         }
+    }
+
+    /// Live job copy for the run-log sheet. Prefer the conversation message, then the
+    /// history list — never a struct captured at sheet presentation time.
+    func liveJob(id: String) -> CodexJob? {
+        if let job = messages.first(where: { $0.job?.id == id })?.job {
+            return job
+        }
+        return jobs.first(where: { $0.id == id })
     }
 
     func transcribePromptAudio(fileURL: URL) async {

@@ -701,6 +701,43 @@ enum RelayCodexApprovalPolicy: String, CaseIterable, Identifiable, Codable {
     }
 }
 
+/// How much of the machine a Codex job may touch.
+///
+/// Deliberately separate from `RelayCodexApprovalPolicy`: the policy decides
+/// whether Codex may ASK, the sandbox decides what it may DO without asking.
+/// "Never ask" alone is not permission — it makes an escaping operation fail
+/// instead of pause — so the two are chosen independently and both are sent.
+enum RelayCodexSandbox: String, CaseIterable, Identifiable, Codable {
+    case readOnly = "read-only"
+    case workspace = "workspace-write"
+    case fullAccess = "danger-full-access"
+
+    /// Today's runner behaviour, and what a job gets when nothing is chosen.
+    static let `default` = RelayCodexSandbox.workspace
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .readOnly: return "Read only"
+        case .workspace: return "This workspace"
+        case .fullAccess: return "Whole machine"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .readOnly: return "Codex can read the workspace. It cannot change files or run commands."
+        case .workspace: return "Codex can change this workspace. Anything outside it needs approval."
+        case .fullAccess: return "No sandbox. Codex can read and change anything on the machine that Relay can."
+        }
+    }
+
+    /// True where the level is a grant rather than a preference, and the picker
+    /// owes the user a plain sentence about it.
+    var isUnsandboxed: Bool { self == .fullAccess }
+}
+
 /// The slash fragment touching the current caret. A command starts at the beginning of
 /// the draft or after whitespace, so `/` discovery works in a later paragraph without
 /// treating URL and file-path slashes as commands.
@@ -1441,6 +1478,8 @@ enum CodexReasoningEffort: String, CaseIterable, Identifiable, Codable {
     case medium
     case high
     case xhigh
+    case max
+    case ultra
 
     var id: String { rawValue }
 
@@ -1454,6 +1493,10 @@ enum CodexReasoningEffort: String, CaseIterable, Identifiable, Codable {
             return "High"
         case .xhigh:
             return "XHigh"
+        case .max:
+            return "Max"
+        case .ultra:
+            return "Ultra"
         }
     }
 }
@@ -1950,6 +1993,7 @@ struct CodexCreateJobRequest: Encodable {
     let provider: CodexProvider
     let permissionMode: String?
     let approvalPolicy: String?
+    let sandbox: String?
     let skills: [String]?
     let attachments: [CodexJobAttachment]?
     let resumeSessionId: String?
@@ -1963,6 +2007,7 @@ struct CodexCreateJobRequest: Encodable {
         provider: CodexProvider = .defaultProvider,
         permissionMode: String? = nil,
         approvalPolicy: String? = nil,
+        sandbox: String? = nil,
         skills: [String] = [],
         attachments: [CodexJobAttachment] = [],
         resumeSessionId: String? = nil
@@ -1975,6 +2020,7 @@ struct CodexCreateJobRequest: Encodable {
         self.provider = provider
         self.permissionMode = permissionMode
         self.approvalPolicy = approvalPolicy
+        self.sandbox = sandbox
         self.skills = skills.isEmpty ? nil : Array(skills.prefix(6))
         self.attachments = attachments.isEmpty ? nil : attachments
         self.resumeSessionId = resumeSessionId
@@ -2220,3 +2266,121 @@ extension String {
         return trimmed.isEmpty ? nil : trimmed
     }
 }
+
+/// Parses a job's raw activity log into scannable run-log blocks for the sheet.
+struct RelayRunLogBlock: Equatable, Identifiable {
+    enum Kind: Equatable {
+        case prose(String)
+        case step(command: String, output: String, exitCode: Int?)
+        case warning(String)
+    }
+
+    let id: String
+    let kind: Kind
+}
+
+enum RelayRunLogParser {
+    private static let stepPrefix = "[relay-step] "
+    private static let warningPrefix = "WARNING:"
+
+    static func parse(_ raw: String) -> [RelayRunLogBlock] {
+        let normalized = raw.replacingOccurrences(of: "\r\n", with: "\n")
+        guard !normalized.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
+
+        var blocks: [RelayRunLogBlock] = []
+        var proseBuffer: [String] = []
+        var currentStepCommand: String?
+        var currentStepOutput: [String] = []
+
+        func nextID(_ prefix: String) -> String {
+            "\(prefix)-\(blocks.count)"
+        }
+
+        func flushProse() {
+            let text = proseBuffer.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            proseBuffer.removeAll(keepingCapacity: true)
+            guard !text.isEmpty else { return }
+            // Drop bare section headers that only exist for the mono dump.
+            let cleaned = text
+                .replacingOccurrences(of: #"^##\s+(Saved answer|Stdout|Stderr|Error)\s*"#, with: "", options: .regularExpression)
+                .split(separator: "\n", omittingEmptySubsequences: false)
+                .filter { $0.trimmingCharacters(in: .whitespacesAndNewlines) != "---" }
+                .joined(separator: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleaned.isEmpty else { return }
+            blocks.append(RelayRunLogBlock(id: nextID("prose"), kind: .prose(cleaned)))
+        }
+
+        func flushStep() {
+            guard let command = currentStepCommand else { return }
+            let output = currentStepOutput.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            blocks.append(RelayRunLogBlock(
+                id: nextID("step"),
+                kind: .step(command: command, output: output, exitCode: extractExitCode(from: output))
+            ))
+            currentStepCommand = nil
+            currentStepOutput.removeAll(keepingCapacity: true)
+        }
+
+        for line in normalized.split(separator: "\n", omittingEmptySubsequences: false).map(String.init) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix(stepPrefix) {
+                flushProse()
+                flushStep()
+                currentStepCommand = displayCommand(from: String(trimmed.dropFirst(stepPrefix.count)))
+                continue
+            }
+            if trimmed.uppercased().hasPrefix(warningPrefix) {
+                flushProse()
+                flushStep()
+                let message = trimmed
+                    .dropFirst(warningPrefix.count)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                blocks.append(RelayRunLogBlock(
+                    id: nextID("warn"),
+                    kind: .warning(message.isEmpty ? trimmed : message)
+                ))
+                continue
+            }
+            if currentStepCommand != nil {
+                currentStepOutput.append(line)
+            } else {
+                proseBuffer.append(line)
+            }
+        }
+
+        flushProse()
+        flushStep()
+        return blocks
+    }
+
+    private static func displayCommand(from raw: String) -> String {
+        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.lowercased().hasPrefix("running ") {
+            text = String(text.dropFirst("running ".count))
+        }
+        if let range = text.range(of: #"/bin/(?:ba)?sh\s+-lc\s+""#, options: .regularExpression) {
+            var rest = String(text[range.upperBound...])
+            if rest.hasSuffix("\"") { rest.removeLast() }
+            if !rest.isEmpty { return rest }
+        }
+        return text
+    }
+
+    private static func extractExitCode(from output: String) -> Int? {
+        let patterns = [
+            #"exit(?:\s*code)?[=:\s]+(-?\d+)"#,
+            #"\(exit\s+(-?\d+)\)"#,
+        ]
+        for pattern in patterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
+               let match = regex.firstMatch(in: output, range: NSRange(output.startIndex..., in: output)),
+               match.numberOfRanges > 1,
+               let range = Range(match.range(at: 1), in: output) {
+                return Int(output[range])
+            }
+        }
+        return nil
+    }
+}
+

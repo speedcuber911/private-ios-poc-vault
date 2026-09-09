@@ -225,9 +225,12 @@ final class ManifestTests: XCTestCase {
 
         XCTAssertTrue(source.contains("presentAIDataConsentIfNeeded()"))
         XCTAssertTrue(source.contains("purpose: .review"))
-        XCTAssertTrue(source.contains("relay-ai-data-sharing"))
-        XCTAssertTrue(source.contains("Work content to"))
-        XCTAssertTrue(source.contains("permission allowed"))
+        // Persistent composer row removed; disclosure stays reachable from the overflow menu.
+        XCTAssertTrue(source.contains("relay-chat-overflow"))
+        XCTAssertTrue(source.contains("Button(\"AI data sharing\")"))
+        XCTAssertTrue(source.contains("RelayAIDataConsentSheet"))
+        XCTAssertFalse(source.contains("relay-ai-data-sharing"))
+        XCTAssertFalse(source.contains("Work content to"))
         XCTAssertTrue(source.contains("purpose == .sendPrompt"))
         XCTAssertTrue(source.contains("harnessStatus?.isConfirmedUnavailable != true"))
     }
@@ -605,6 +608,85 @@ final class ManifestTests: XCTestCase {
     /// Editorial Ember rule 5: status is a small-caps word, never a colored dot, and
     /// success renders in cream rather than green. Guards against reintroducing the
     /// blob-pill/indicator-dot pattern the redesign removed.
+    func testCodexSandboxIsChosenIndependentlyOfWhetherCodexMayAsk() throws {
+        // Three levels, and the wire values relayd validates against.
+        XCTAssertEqual(
+            RelayCodexSandbox.allCases.map(\.rawValue),
+            ["read-only", "workspace-write", "danger-full-access"]
+        )
+        // Today's runner behaviour stays the default; full access is never implicit.
+        XCTAssertEqual(RelayCodexSandbox.default, .workspace)
+        XCTAssertTrue(RelayCodexSandbox.fullAccess.isUnsandboxed)
+        XCTAssertFalse(RelayCodexSandbox.workspace.isUnsandboxed)
+        XCTAssertFalse(RelayCodexSandbox.readOnly.isUnsandboxed)
+
+        // Sandbox and approval policy are orthogonal: "never ask" is not permission.
+        let request = CodexCreateJobRequest(
+            workspaceId: "ws",
+            prompt: "p",
+            timeoutMs: 1,
+            provider: .codex,
+            approvalPolicy: RelayCodexApprovalPolicy.never.rawValue,
+            sandbox: RelayCodexSandbox.fullAccess.rawValue
+        )
+        XCTAssertEqual(request.approvalPolicy, "never")
+        XCTAssertEqual(request.sandbox, "danger-full-access")
+    }
+
+    func testCodexSandboxIsPickableAndTravelsOnlyOnCodexJobs() throws {
+        let view = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
+        let model = try AppSourceFixture.load("POCVault/Views/RelayChatViewModel.swift")
+
+        // A picker section, not an env file the phone cannot see.
+        XCTAssertTrue(view.contains("What Codex can reach"))
+        XCTAssertTrue(view.contains("RelayCodexSandbox.allCases"))
+        XCTAssertTrue(view.contains("onPickCodexSandbox"))
+        // Full access states its consequence where it is chosen.
+        XCTAssertTrue(view.contains("codexSandbox.isUnsandboxed"))
+
+        XCTAssertTrue(model.contains("relay.codex.sandbox"))
+        XCTAssertTrue(model.contains("sandbox: provider == .codex ? codexSandbox.rawValue : nil"))
+    }
+
+    func testChatAnswersApprovalsForItsOwnJobsAndRestoresOnFailure() throws {
+        let model = try AppSourceFixture.load("POCVault/Views/RelayChatViewModel.swift")
+        let view = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
+
+        // Scoped by job id: this screen must not unblock work it cannot show.
+        let refresh = try sourceSnippet(
+            in: model,
+            from: "private func refreshPendingApprovals",
+            to: "func decideApproval"
+        )
+        XCTAssertTrue(refresh.contains("jobIDs.contains($0.jobId)"))
+        XCTAssertTrue(refresh.contains("$0.isPending"))
+
+        // A decision that fails must not leave the job looking answered.
+        let decide = try sourceSnippet(in: model, from: "func decideApproval", to: "// MARK: - Sending")
+        XCTAssertTrue(decide.contains("let previous = pendingApprovals"))
+        XCTAssertTrue(decide.contains("pendingApprovals = previous"))
+        XCTAssertTrue(decide.contains("client.decideApproval(id: approval.id"))
+
+        // Rendered in the transcript, where the run actually stalled.
+        XCTAssertTrue(view.contains("ForEach(viewModel.pendingApprovals)"))
+        XCTAssertTrue(view.contains("relay-chat-approval"))
+
+        // Polled on the cadence that already exists for active jobs.
+        XCTAssertTrue(model.contains("await refreshPendingApprovals()"))
+    }
+
+    func testRelayApprovalCardHasASingleDefinitionSharedByBothSurfaces() throws {
+        let shared = try AppSourceFixture.load("POCVault/Views/RelayApprovalCard.swift")
+        let root = try AppSourceFixture.load("POCVault/POCVaultApp.swift")
+
+        XCTAssertTrue(shared.contains("struct RelayApprovalCard: View"))
+        // The Sessions tab keeps "Open"; the chat omits it, so it is optional.
+        XCTAssertTrue(shared.contains("var onOpen: (() -> Void)? = nil"))
+        // Exactly one declaration in the app.
+        XCTAssertFalse(root.contains("struct RelayApprovalCard"))
+        XCTAssertTrue(root.contains("RelayApprovalCard("))
+    }
+
     func testStatusIndicatorsStayTypographic() throws {
         let files: [(name: String, relative: String)] = [
             ("POCVaultApp.swift", "POCVault/POCVaultApp.swift"),
@@ -2270,6 +2352,7 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(controlBarSource.contains("scrollBounceBehavior(.basedOnSize, axes: .horizontal)"))
         XCTAssertTrue(controlBarSource.contains("relay-control-bar"))
         XCTAssertFalse(controlBarSource.contains("VStack"))
+        XCTAssertFalse(controlBarSource.contains(".refreshable"))
         XCTAssertFalse(source.contains("usesAccessibilityLayout"))
     }
 
@@ -2381,8 +2464,10 @@ final class ManifestTests: XCTestCase {
         XCTAssertFalse(source.contains("clock.arrow.circlepath"))
         XCTAssertTrue(source.contains("@State private var fullLogRequest: RelayFullLogRequest?"))
         XCTAssertTrue(source.contains(".sheet(item: $fullLogRequest)"))
-        XCTAssertTrue(source.contains("var id: String { job.id }"))
+        XCTAssertTrue(source.contains("var id: String { jobID }"))
+        XCTAssertTrue(source.contains("RelayFullLogSheet(jobID: request.jobID, viewModel: viewModel)"))
         XCTAssertFalse(source.contains("fullLogText.map(RelayFullLogText.init"))
+        XCTAssertFalse(source.contains("let job: CodexJob\n    let load: () async -> String"))
 
         XCTAssertTrue(viewModelSource.contains("workspaceID: workspaceID, limit: 200"))
         XCTAssertTrue(viewModelSource.contains("belongsToHistoryScope($0.workspaceId)"))
@@ -2993,6 +3078,159 @@ final class ManifestTests: XCTestCase {
             URL(string: "https://relay.internal.test")
         )
         XCTAssertTrue(AppConfiguration.isConfiguredURLValue("https://relay.internal.test"))
+    }
+
+    func testRelayRunLogParserShapesProseStepsAndWarnings() {
+        let raw = """
+        ## Saved answer
+
+        I'll check the repository guidance.
+
+        ---
+
+        ## Stderr
+
+        [relay-step] Running /bin/bash -lc "git status --short --branch"
+        ## main...origin/main
+        ?? artifacts/
+        WARNING: failed to clean up stale temp dirs · os error 13
+        [relay-step] Running git fetch origin main --prune
+        """
+        let blocks = RelayRunLogParser.parse(raw)
+        XCTAssertEqual(blocks.count, 4)
+        guard case .prose(let prose) = blocks[0].kind else {
+            return XCTFail("expected leading prose")
+        }
+        XCTAssertTrue(prose.contains("repository guidance"))
+        guard case .step(let command, let output, _) = blocks[1].kind else {
+            return XCTFail("expected shell step")
+        }
+        XCTAssertEqual(command, "git status --short --branch")
+        XCTAssertTrue(output.contains("## main...origin/main"))
+        guard case .warning(let warning) = blocks[2].kind else {
+            return XCTFail("expected warning")
+        }
+        XCTAssertTrue(warning.contains("stale temp dirs"))
+        guard case .step(let fetch, _, _) = blocks[3].kind else {
+            return XCTFail("expected fetch step")
+        }
+        XCTAssertEqual(fetch, "git fetch origin main --prune")
+    }
+
+    func testRelayFullLogSheetFollowsViewModelAndStopsAtTerminalStatus() throws {
+        let source = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
+        let viewModelSource = try AppSourceFixture.load("POCVault/Views/RelayChatViewModel.swift")
+        let sheet = try sourceSnippet(
+            in: source,
+            from: "private struct RelayFullLogSheet",
+            to: "@MainActor\nprivate final class RelayPromptAudioRecorder"
+        )
+
+        XCTAssertTrue(sheet.contains("@ObservedObject var viewModel: RelayChatViewModel"))
+        XCTAssertTrue(sheet.contains("viewModel.liveJob(id: jobID)"))
+        XCTAssertTrue(sheet.contains("pollFullLogWhileActive"))
+        XCTAssertTrue(sheet.contains("latest?.status.isActive != true"))
+        XCTAssertTrue(sheet.contains("RelayMarkdownText(text:"))
+        XCTAssertTrue(sheet.contains("RelayRunLogParser.parse"))
+        XCTAssertTrue(sheet.contains("Execution receipt"))
+        XCTAssertTrue(sheet.contains("relay-run-log-raw"))
+        XCTAssertFalse(sheet.contains("guard text == nil else { return }"))
+        XCTAssertFalse(sheet.contains("let job: CodexJob"))
+        XCTAssertTrue(viewModelSource.contains("func liveJob(id: String)"))
+        XCTAssertTrue(viewModelSource.contains("func loadFullLog(jobID: String)"))
+    }
+
+    func testRelayChatScopesRefreshToConversationNotControlRail() throws {
+        let source = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
+        let chatSource = try sourceSnippet(
+            in: source,
+            from: "struct RelayChatView: View",
+            to: "private struct RelayComposerCommand"
+        )
+        XCTAssertFalse(chatSource.contains(".refreshable {\n                await viewModel.refreshThreads()\n            }\n            .sheet(item: $providerLoginRequest"))
+        XCTAssertTrue(source.contains("private var messageList: some View"))
+        let messageList = try sourceSnippet(
+            in: source,
+            from: "private var messageList: some View",
+            to: "private var streamingTextLength"
+        )
+        XCTAssertTrue(messageList.contains(".refreshable"))
+        XCTAssertTrue(messageList.contains("await viewModel.refreshThreads()"))
+    }
+
+    func testJobPushRouteOpensThreadBackedFeedItems() throws {
+        let source = try AppSourceFixture.load("POCVault/POCVaultApp.swift")
+        XCTAssertTrue(source.contains("case .thread(let thread):"))
+        XCTAssertTrue(source.contains("return thread.lastJobId == jobID"))
+        XCTAssertTrue(source.contains("reportRoutingMiss("))
+        XCTAssertTrue(source.contains("That run is not in Sessions yet."))
+        XCTAssertFalse(source.contains("if case .pendingJob(let job) = item.source { return job.id == jobID }\n                        return false\n                    }) else { return }"))
+    }
+
+    @MainActor
+    func testOpenThreadSeedsIdentityBeforeDetailArrives() async throws {
+        let thread = try decodeCodexThread("""
+        {
+          "id": "thread-seed",
+          "sessionId": "thread-seed",
+          "workspaceId": "hosted-project",
+          "workspaceName": "Hosted",
+          "provider": "codex",
+          "lastPrompt": "Check the branch",
+          "lastResult": "Branch is clean"
+        }
+        """)
+        let detail = try JSONDecoder().decode(CodexThreadDetail.self, from: Data("""
+        {
+          "thread": {
+            "id": "thread-seed",
+            "sessionId": "thread-seed",
+            "workspaceId": "hosted-project",
+            "workspaceName": "Hosted",
+            "provider": "codex",
+            "lastPrompt": "Check the branch",
+            "lastResult": "Fresh detail result"
+          },
+          "messages": [
+            { "role": "user", "text": "Check the branch" },
+            { "role": "assistant", "text": "Fresh detail result" }
+          ],
+          "jobs": []
+        }
+        """.utf8))
+        let requested = expectation(description: "thread detail requested")
+        var response: CheckedContinuation<CodexThreadDetail, Never>?
+        let model = RelayChatViewModel(
+            client: makeOfflineCodexClient(),
+            workspaceID: "hosted-project",
+            workspacePath: nil,
+            fetchThreadDetail: { _, _, _ in
+                await withCheckedContinuation { continuation in
+                    response = continuation
+                    requested.fulfill()
+                }
+            }
+        )
+        let opening = Task { await model.openThread(thread) }
+        await fulfillment(of: [requested], timeout: 2)
+
+        XCTAssertEqual(model.currentSessionProvider, .codex)
+        XCTAssertTrue(model.isLoadingThreadDetail)
+        XCTAssertEqual(model.messages.first?.text, "Check the branch")
+        XCTAssertEqual(model.messages.last?.text, "Branch is clean")
+
+        response?.resume(returning: detail)
+        await opening.value
+        XCTAssertFalse(model.isLoadingThreadDetail)
+        XCTAssertEqual(model.messages.last?.text, "Fresh detail result")
+    }
+
+    func testCodexReasoningEffortIncludesMaxAndUltra() {
+        XCTAssertEqual(CodexReasoningEffort(rawValue: "max"), .max)
+        XCTAssertEqual(CodexReasoningEffort(rawValue: "ultra"), .ultra)
+        XCTAssertNil(CodexReasoningEffort(rawValue: "ludicrous"))
+        XCTAssertTrue(CodexReasoningEffort.allCases.map(\.rawValue).contains("max"))
+        XCTAssertTrue(CodexReasoningEffort.allCases.map(\.rawValue).contains("ultra"))
     }
 
     private func decodeDirectoryEntry(_ json: String) throws -> CodexWorkspaceDirectoryEntry {

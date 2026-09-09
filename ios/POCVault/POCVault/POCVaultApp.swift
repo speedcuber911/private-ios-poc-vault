@@ -269,9 +269,18 @@ struct POCVaultRootView: View {
                 Task {
                     await statusFeedViewModel.refresh()
                     guard let item = statusFeedViewModel.feedItems.first(where: { item in
-                        if case .pendingJob(let job) = item.source { return job.id == jobID }
-                        return false
-                    }) else { return }
+                        switch item.source {
+                        case .pendingJob(let job):
+                            return job.id == jobID
+                        case .thread(let thread):
+                            return thread.lastJobId == jobID
+                        }
+                    }) else {
+                        statusFeedViewModel.reportRoutingMiss(
+                            "That run is not in Sessions yet."
+                        )
+                        return
+                    }
                     openSession(item)
                 }
             case .none:
@@ -741,6 +750,10 @@ final class StatusFeedViewModel: ObservableObject {
         }
     }
 
+    func reportRoutingMiss(_ message: String) {
+        errorMessage = message
+    }
+
     func decide(_ approval: CodexApproval, _ decision: CodexApprovalDecision) async {
         do {
             _ = try await client.decideApproval(id: approval.id, decision: decision)
@@ -1091,57 +1104,8 @@ private struct SessionsWorkspacePickerSheet: View {
     }
 }
 
-private struct RelayApprovalCard: View {
-    let approval: CodexApproval
-    let onOpen: () -> Void
-    let onDecision: (CodexApprovalDecision) -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                RelayProviderBadge(provider: approval.provider, style: .capsule, size: 9)
-                Spacer()
-                RelayCapsLabel(text: "Needs approval", color: AppTheme.statusWarn, size: 9)
-            }
-            Label(approval.title, systemImage: "checkmark.shield")
-                .font(AppTheme.uiFont(size: 15, weight: .semibold))
-                .foregroundStyle(AppTheme.textPrimary)
-            if let command = approval.command?.trimmedNonEmpty {
-                Text(command)
-                    .font(AppTheme.monoFont(size: 12))
-                    .foregroundStyle(AppTheme.textSecondary)
-                    .lineLimit(4)
-            }
-            if let reason = approval.reason?.trimmedNonEmpty {
-                Text(reason)
-                    .font(AppTheme.uiFont(size: 12))
-                    .foregroundStyle(AppTheme.textSecondary)
-            }
-            HStack(spacing: 10) {
-                Button("Deny") { onDecision(.decline) }
-                    .buttonStyle(.bordered)
-                Button("Open", action: onOpen)
-                    .buttonStyle(.bordered)
-                Spacer()
-                Button("Approve") { onDecision(.accept) }
-                    .buttonStyle(.borderedProminent)
-                    .tint(approval.provider.relayPresentation.accent)
-            }
-        }
-        .padding(14)
-        .background(AppTheme.canvasTop)
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(approval.provider.relayPresentation.accent.opacity(0.4), lineWidth: 1))
-        .overlay(alignment: .leading) {
-            RoundedRectangle(cornerRadius: 2)
-                .fill(approval.provider.relayPresentation.accent)
-                .frame(width: 3)
-                .padding(.vertical, 12)
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 14))
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("\(approval.provider.relayPresentation.title) approval request")
-    }
-}
+// RelayApprovalCard moved to Views/RelayApprovalCard.swift — the chat transcript
+// renders the same card, and two copies would drift.
 
 private enum StatusSection: String, CaseIterable, Identifiable {
     case activity

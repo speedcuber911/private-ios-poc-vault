@@ -62,15 +62,12 @@ struct RelayChatView: View {
                         efforts: viewModel.availableEfforts,
                         selectedEffort: viewModel.effectiveEffort,
                         provider: viewModel.selectedTaskProvider,
-                        aiDataProvider: viewModel.selectedChoice?.model.provider,
-                        aiDataConsentGranted: viewModel.selectedChoice.map {
-                            RelayAIDataConsentStore.hasConsent(for: $0.model.provider)
-                        } ?? false,
                         harnessStatus: viewModel.selectedHarnessStatus,
                         skills: viewModel.availableSkills,
                         selectedSkillIDs: viewModel.selectedSkillIDs,
                         claudePermissionMode: viewModel.claudePermissionMode,
                         codexApprovalPolicy: viewModel.codexApprovalPolicy,
+                        codexSandbox: viewModel.codexSandbox,
                         isSending: viewModel.isSending,
                         isStreaming: viewModel.isStreaming,
                         isTranscribing: viewModel.isTranscribing,
@@ -79,12 +76,10 @@ struct RelayChatView: View {
                         onToggleSkill: { viewModel.toggleSkill($0) },
                         onPickClaudePermission: { viewModel.claudePermissionMode = $0 },
                         onPickCodexApproval: { viewModel.codexApprovalPolicy = $0 },
+                        onPickCodexSandbox: { viewModel.codexSandbox = $0 },
                         onNewConversation: { viewModel.startNewConversation() },
                         onVoice: { fileURL in
                             Task { await viewModel.transcribePromptAudio(fileURL: fileURL) }
-                        },
-                        onReviewAIDataSharing: {
-                            presentAIDataConsent(purpose: .review)
                         },
                         onSend: {
                             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
@@ -119,9 +114,6 @@ struct RelayChatView: View {
             .onChange(of: automaticPreviewCandidate?.key) { _, _ in
                 openRequestedPreviewIfNeeded()
             }
-            .refreshable {
-                await viewModel.refreshThreads()
-            }
             .sheet(item: $providerLoginRequest, onDismiss: {
                 // The machine's login state changed (or the user backed out);
                 // either way the composer notice must reflect reality.
@@ -140,9 +132,7 @@ struct RelayChatView: View {
                     .presentationDragIndicator(.visible)
             }
             .sheet(item: $fullLogRequest) { request in
-                RelayFullLogSheet(job: request.job) {
-                    await viewModel.loadFullLog(for: request.job)
-                }
+                RelayFullLogSheet(jobID: request.jobID, viewModel: viewModel)
             }
             .sheet(item: $aiDataConsentRequest) { request in
                 RelayAIDataConsentSheet(
@@ -246,6 +236,21 @@ struct RelayChatView: View {
             }
 
             Spacer()
+
+            if let provider = viewModel.selectedChoice?.model.provider {
+                Menu {
+                    Button("AI data sharing") {
+                        presentAIDataConsent(for: provider, purpose: .review)
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(AppTheme.uiFont(size: 16, weight: .semibold))
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .frame(width: 36, height: 36)
+                }
+                .accessibilityIdentifier("relay-chat-overflow")
+                .accessibilityLabel("Chat options")
+            }
         }
         .padding(.horizontal, 16)
         .padding(.top, 14)
@@ -376,7 +381,14 @@ struct RelayChatView: View {
                         RelayStatusBanner(text: error)
                     }
 
-                    if viewModel.messages.isEmpty && !viewModel.isSending {
+                    if viewModel.isLoadingThreadDetail {
+                        ProgressView("Loading conversation…")
+                            .tint(AppTheme.accent)
+                            .foregroundStyle(AppTheme.textSecondary)
+                            .frame(maxWidth: .infinity, minHeight: 120)
+                    }
+
+                    if viewModel.messages.isEmpty && !viewModel.isSending && !viewModel.isLoadingThreadDetail {
                         RelayEmptyConversation(choice: viewModel.selectedChoice)
                     } else {
                         ForEach(viewModel.messages) { item in
@@ -390,7 +402,7 @@ struct RelayChatView: View {
                                         Task { await viewModel.cancel(job: job) }
                                     },
                                     onFullLog: {
-                                        fullLogRequest = RelayFullLogRequest(job: job)
+                                        fullLogRequest = RelayFullLogRequest(jobID: job.id)
                                     },
                                     onArtifact: { artifact in
                                         artifactRequest = artifact
@@ -411,16 +423,32 @@ struct RelayChatView: View {
                             }
                         }
                     }
+                    // An approval belongs where the run stalled, not in another tab.
+                    // It sits at the tail because that is where the transcript stops
+                    // until it is answered.
+                    ForEach(viewModel.pendingApprovals) { approval in
+                        RelayApprovalCard(approval: approval) { decision in
+                            Task { await viewModel.decideApproval(approval, decision) }
+                        }
+                        .id(approval.id)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                        .accessibilityIdentifier("relay-chat-approval")
+                    }
+
                     Color.clear.frame(height: 1).id(Self.bottomAnchor)
                 }
                 .padding(.horizontal, 14)
                 .padding(.top, 8)
                 .padding(.bottom, 20)
             }
+            .refreshable {
+                await viewModel.refreshThreads()
+            }
             .scrollDismissesKeyboard(.interactively)
             .scrollBounceBehavior(.basedOnSize)
             .animation(.spring(response: 0.36, dampingFraction: 0.82), value: viewModel.messages.count)
             .onChange(of: viewModel.messages.count) { _, _ in scrollToBottom(proxy) }
+            .onChange(of: viewModel.pendingApprovals.count) { _, _ in scrollToBottom(proxy) }
             .onChange(of: streamingTextLength) { _, _ in scrollToBottom(proxy, animated: false) }
             // Task completion updates an existing message rather than appending one.
             // Follow that height change so newly-added artifacts do not land beneath
@@ -553,13 +581,12 @@ private struct RelayComposer: View {
     let efforts: [CodexReasoningEffort]
     let selectedEffort: CodexReasoningEffort?
     let provider: CodexProvider?
-    let aiDataProvider: CodexProvider?
-    let aiDataConsentGranted: Bool
     let harnessStatus: RelayHarnessStatus?
     let skills: [CodexSkillDescriptor]
     let selectedSkillIDs: Set<String>
     let claudePermissionMode: RelayClaudePermissionMode
     let codexApprovalPolicy: RelayCodexApprovalPolicy
+    let codexSandbox: RelayCodexSandbox
     let isSending: Bool
     let isStreaming: Bool
     let isTranscribing: Bool
@@ -568,9 +595,9 @@ private struct RelayComposer: View {
     let onToggleSkill: (CodexSkillDescriptor) -> Void
     let onPickClaudePermission: (RelayClaudePermissionMode) -> Void
     let onPickCodexApproval: (RelayCodexApprovalPolicy) -> Void
+    let onPickCodexSandbox: (RelayCodexSandbox) -> Void
     let onNewConversation: () -> Void
     let onVoice: (URL) -> Void
-    let onReviewAIDataSharing: () -> Void
     let onSend: () -> Void
     let onStop: () -> Void
     /// Direct provider sign-in from this iPhone; nil hides the affordance.
@@ -785,6 +812,16 @@ private struct RelayComposer: View {
         .accessibilityIdentifier("relay-effort-chip")
     }
 
+    /// "Codex approvals · Ask when needed", plus the sandbox only when it has been
+    /// moved off the default -- a chip that always names both is a chip nobody reads.
+    private func permissionChipText(_ scopedProvider: CodexProvider) -> String {
+        let title = scopedProvider.relayPresentation.permissionsTitle ?? "Permissions"
+        if provider == .claude { return "\(title) · \(claudePermissionMode.label)" }
+        let policy = codexApprovalPolicy.label
+        guard codexSandbox != .default else { return "\(title) · \(policy)" }
+        return "\(title) · \(codexSandbox.label) · \(policy)"
+    }
+
     private var permissionChip: some View {
         Button {
             showingPermissionPicker = true
@@ -792,7 +829,7 @@ private struct RelayComposer: View {
             let scopedProvider = provider ?? .codex
             chipLabel(
                 icon: "checkmark.shield",
-                text: "\(scopedProvider.relayPresentation.permissionsTitle ?? "Permissions") · \(provider == .claude ? claudePermissionMode.label : codexApprovalPolicy.label)",
+                text: permissionChipText(scopedProvider),
                 tint: scopedProvider.relayPresentation.accent
             )
         }
@@ -844,6 +881,9 @@ private struct RelayComposer: View {
         }
         .frame(height: Layout.controlHeight)
         .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+        // RefreshAction is not writable on this SDK (KeyPath, not WritableKeyPath), so
+        // the fix is structural: pull-to-refresh lives only on the conversation ScrollView,
+        // and this rail is not in that subtree.
         .accessibilityIdentifier("relay-control-bar")
     }
 
@@ -855,46 +895,6 @@ private struct RelayComposer: View {
             }
 
             controlBar
-
-            if let aiDataProvider {
-                Button(action: onReviewAIDataSharing) {
-                    HStack(spacing: 10) {
-                        Image(systemName: "hand.raised.fill")
-                            .font(AppTheme.uiFont(size: 13, weight: .semibold))
-                            .foregroundStyle(aiDataProvider.relayPresentation.accent)
-
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("AI data sharing")
-                                .font(AppTheme.uiFont(size: 12, weight: .semibold))
-                                .foregroundStyle(AppTheme.textPrimary)
-                            Text("Work content to \(aiDataProvider.aiDataRecipient)")
-                                .font(AppTheme.uiFont(size: 10))
-                                .foregroundStyle(AppTheme.textTertiary)
-                                .lineLimit(1)
-                        }
-
-                        Spacer()
-
-                        RelayCapsLabel(
-                            text: aiDataConsentGranted ? "Allowed" : "Review",
-                            color: aiDataConsentGranted ? aiDataProvider.relayPresentation.accent : AppTheme.statusWarn,
-                            size: 8
-                        )
-
-                        Image(systemName: "chevron.right")
-                            .font(AppTheme.uiFont(size: 9, weight: .semibold))
-                            .foregroundStyle(AppTheme.textFaint)
-                    }
-                    .padding(.horizontal, 4)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("relay-ai-data-sharing")
-                .accessibilityLabel(
-                    "AI data sharing with \(aiDataProvider.aiDataRecipient), "
-                        + (aiDataConsentGranted ? "permission allowed" : "review permission")
-                )
-            }
 
             if let harnessStatus, harnessStatus.isConfirmedUnavailable {
                 HStack(alignment: .top, spacing: 8) {
@@ -1222,7 +1222,27 @@ private struct RelayComposer: View {
                             .foregroundStyle(AppTheme.textSecondary)
                     }
                 } else {
-                    Section("Codex") {
+                    Section("What Codex can reach") {
+                        ForEach(RelayCodexSandbox.allCases) { level in
+                            Button {
+                                onPickCodexSandbox(level)
+                            } label: {
+                                pickerRow(
+                                    title: level.label,
+                                    detail: level.detail,
+                                    selected: level == codexSandbox,
+                                    provider: .codex
+                                )
+                            }
+                        }
+                        if codexSandbox.isUnsandboxed {
+                            Text("Codex will not be stopped from changing anything on this machine, including files outside your work.")
+                                .font(AppTheme.uiFont(size: 12))
+                                .foregroundStyle(AppTheme.statusWarn)
+                        }
+                    }
+
+                    Section("When Codex asks") {
                         ForEach(RelayCodexApprovalPolicy.allCases) { policy in
                             Button {
                                 onPickCodexApproval(policy)
@@ -2580,8 +2600,8 @@ private struct RelayEmptyConversation: View {
 }
 
 private struct RelayFullLogRequest: Identifiable {
-    var id: String { job.id }
-    let job: CodexJob
+    var id: String { jobID }
+    let jobID: String
 }
 
 private enum RelayAIDataConsentPurpose: Equatable {
@@ -2675,68 +2695,465 @@ private struct RelayAIDataConsentSheet: View {
 }
 
 private struct RelayFullLogSheet: View {
-    let job: CodexJob
-    let load: () async -> String
+    let jobID: String
+    @ObservedObject var viewModel: RelayChatViewModel
     @Environment(\.dismiss) private var dismiss
-    @State private var text: String?
+    @State private var rawText: String?
+    @State private var showingRaw = false
+    @State private var expandedStepIDs: Set<String> = []
+    @State private var stepsExpanded = true
+    @State private var receiptExpanded = false
+    @State private var pinToBottom = true
+
+    private var job: CodexJob? {
+        viewModel.liveJob(id: jobID)
+    }
+
+    private var blocks: [RelayRunLogBlock] {
+        RelayRunLogParser.parse(rawText ?? "")
+    }
+
+    private var proseBlocks: [RelayRunLogBlock] {
+        blocks.filter {
+            if case .prose = $0.kind { return true }
+            return false
+        }
+    }
+
+    private var stepBlocks: [RelayRunLogBlock] {
+        blocks.filter {
+            switch $0.kind {
+            case .step, .warning:
+                return true
+            case .prose:
+                return false
+            }
+        }
+    }
+
+    private var warningCount: Int {
+        blocks.reduce(0) { count, block in
+            if case .warning = block.kind { return count + 1 }
+            return count
+        }
+    }
+
+    private var stepCount: Int {
+        blocks.reduce(0) { count, block in
+            if case .step = block.kind { return count + 1 }
+            return count
+        }
+    }
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    RelayProviderBadge(
-                        provider: job.provider,
-                        detail: job.model,
-                        style: .capsule,
-                        size: 10
-                    )
-
-                    if let receipt = job.execution {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("EXECUTION RECEIPT")
-                                .font(AppTheme.monoFont(size: 10))
-                                .foregroundStyle(AppTheme.textTertiary)
-                            Text(receipt.summaryLines.joined(separator: "\n"))
-                                .font(AppTheme.monoFont(size: 11))
-                                .foregroundStyle(AppTheme.textSecondary)
-                                .textSelection(.enabled)
-                        }
-                        .padding(12)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color.white.opacity(0.04))
-                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    }
-
-                    if let text {
-                        Text(text.isEmpty ? "No log output." : text)
-                            .font(AppTheme.monoFont(size: 12))
-                            .foregroundStyle(AppTheme.textPrimary)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    } else {
-                        ProgressView("Loading \(job.provider.relayPresentation.title) log…")
-                            .tint(job.provider.relayPresentation.accent)
-                            .foregroundStyle(AppTheme.textSecondary)
-                            .frame(maxWidth: .infinity, minHeight: 260)
-                    }
+            Group {
+                if showingRaw {
+                    rawLogView
+                } else {
+                    structuredLogView
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(16)
             }
             .background(AppTheme.bgCanvas)
-            .navigationTitle("\(job.provider.relayPresentation.title) log")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .principal) {
+                    EmptyView()
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
+                        .foregroundStyle(AppTheme.textPrimary)
                 }
             }
             .preferredColorScheme(.dark)
         }
-        .task(id: job.id) {
-            guard text == nil else { return }
-            text = await load()
+        .task(id: jobID) {
+            await pollFullLogWhileActive()
         }
+    }
+
+    @ViewBuilder
+    private var structuredLogView: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    header
+                    hairline
+
+                    if rawText == nil {
+                        ProgressView("Loading run log…")
+                            .tint(AppTheme.accent)
+                            .foregroundStyle(AppTheme.textSecondary)
+                            .frame(maxWidth: .infinity, minHeight: 260)
+                            .padding(.top, 24)
+                    } else if let job, !job.status.isActive {
+                        finishedBody(job)
+                    } else {
+                        runningBody
+                    }
+
+                    Color.clear.frame(height: 1).id("run-log-bottom")
+                }
+            }
+            .onChange(of: rawText) { _, _ in
+                guard pinToBottom else { return }
+                withAnimation(.easeOut(duration: 0.15)) {
+                    proxy.scrollTo("run-log-bottom", anchor: .bottom)
+                }
+            }
+            .simultaneousGesture(
+                DragGesture().onChanged { value in
+                    if value.translation.height < -8 {
+                        pinToBottom = false
+                    }
+                }
+            )
+        }
+    }
+
+    private var rawLogView: some View {
+        ScrollView {
+            Text((rawText?.isEmpty == false) ? (rawText ?? "") : "No log output.")
+                .font(AppTheme.monoFont(size: 12))
+                .foregroundStyle(AppTheme.textPrimary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(16)
+        }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            HStack {
+                Button {
+                    showingRaw = false
+                } label: {
+                    RelayCapsLabel(text: "Structured", color: AppTheme.textTertiary, size: 9)
+                }
+                .buttonStyle(.plain)
+                Spacer()
+                Button {
+                    UIPasteboard.general.string = rawText ?? ""
+                } label: {
+                    RelayCapsLabel(text: "Copy", color: AppTheme.accent, size: 9)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .background(AppTheme.bgCanvas)
+            .overlay(alignment: .bottom) { hairline }
+        }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Run")
+                    .font(AppTheme.serifFont(size: 22, weight: .medium))
+                    .foregroundStyle(AppTheme.textPrimary)
+                Spacer()
+            }
+
+            HStack(spacing: 8) {
+                if let job {
+                    RelayCapsLabel(
+                        text: providerModelLabel(job),
+                        color: job.provider.relayPresentation.accent,
+                        size: 9
+                    )
+                    durationLabel(for: job)
+                    statusLabel(for: job)
+                }
+                Spacer()
+                Button {
+                    showingRaw = true
+                } label: {
+                    RelayCapsLabel(text: "Raw", color: AppTheme.textTertiary, size: 9)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("relay-run-log-raw")
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.bottom, 14)
+        .padding(.top, 4)
+    }
+
+    @ViewBuilder
+    private var runningBody: some View {
+        ForEach(Array(blocks.enumerated()), id: \.element.id) { _, block in
+            blockView(block, compact: false)
+            hairline
+        }
+
+        if let receipt = job?.execution {
+            receiptDisclosure(receipt)
+            hairline
+        }
+
+        if let job, job.status.isActive, let tail = viewModel.liveJobTails[jobID]?.trimmedNonEmpty {
+            HStack(spacing: 8) {
+                RelayCapsLabel(text: "Following", color: AppTheme.accentBright, size: 9)
+                Text(tail.components(separatedBy: .newlines).last ?? tail)
+                    .font(AppTheme.monoFont(size: 11.5))
+                    .foregroundStyle(AppTheme.textTertiary)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 13)
+        }
+    }
+
+    @ViewBuilder
+    private func finishedBody(_ job: CodexJob) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(proseBlocks) { block in
+                if case .prose(let text) = block.kind {
+                    proseSection(text, provider: job.provider)
+                }
+            }
+
+            if proseBlocks.isEmpty, let answer = job.displayOutput?.trimmedNonEmpty {
+                proseSection(answer, provider: job.provider)
+            }
+
+            hairline
+
+            Button {
+                stepsExpanded.toggle()
+            } label: {
+                HStack(spacing: 9) {
+                    Image(systemName: stepsExpanded ? "chevron.down" : "chevron.right")
+                        .font(AppTheme.uiFont(size: 10, weight: .semibold))
+                        .foregroundStyle(AppTheme.textTertiary)
+                    Text("\(stepCount) steps")
+                        .font(AppTheme.uiFont(size: 13.5))
+                        .foregroundStyle(AppTheme.textPrimary)
+                    Spacer()
+                    if warningCount > 0 {
+                        RelayCapsLabel(
+                            text: "\(warningCount) warning\(warningCount == 1 ? "" : "s")",
+                            color: AppTheme.statusWarn,
+                            size: 9
+                        )
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 11)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if stepsExpanded {
+                hairline
+                ForEach(stepBlocks) { block in
+                    blockView(block, compact: true)
+                }
+            }
+
+            hairline
+            if let receipt = job.execution {
+                receiptDisclosure(receipt)
+                hairline
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func blockView(_ block: RelayRunLogBlock, compact: Bool) -> some View {
+        switch block.kind {
+        case .prose(let text):
+            if !compact, let job {
+                proseSection(text, provider: job.provider)
+            }
+        case .step(let command, let output, let exitCode):
+            stepRow(id: block.id, command: command, output: output, exitCode: exitCode, compact: compact)
+        case .warning(let message):
+            warningRow(message, compact: compact)
+        }
+    }
+
+    private func proseSection(_ text: String, provider: CodexProvider) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            RelayCapsLabel(text: provider.relayPresentation.title, color: provider.relayPresentation.accent, size: 9)
+            RelayMarkdownText(text: text, userAligned: false)
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 16)
+        .padding(.bottom, 14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func stepRow(id: String, command: String, output: String, exitCode: Int?, compact: Bool) -> some View {
+        let expanded = expandedStepIDs.contains(id)
+        return VStack(alignment: .leading, spacing: 0) {
+            Button {
+                if expanded {
+                    expandedStepIDs.remove(id)
+                } else {
+                    expandedStepIDs.insert(id)
+                }
+            } label: {
+                HStack(spacing: 9) {
+                    if !compact {
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                            .font(AppTheme.uiFont(size: 10, weight: .semibold))
+                            .foregroundStyle(AppTheme.textTertiary)
+                    }
+                    Text(command)
+                        .font(AppTheme.monoFont(size: compact ? 11.5 : 12))
+                        .foregroundStyle(expanded || job?.status.isActive == true ? AppTheme.textPrimary : AppTheme.textSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if let exitCode {
+                        RelayCapsLabel(text: "Exit \(exitCode)", color: AppTheme.textSecondary, size: 9)
+                    } else if job?.status.isActive == true, blocks.last?.id == id {
+                        // Liveness for the in-flight step is the duration, never a dot.
+                        if let job {
+                            durationLabel(for: job)
+                        }
+                    }
+                }
+                .padding(.horizontal, compact ? 35 : 16)
+                .padding(.vertical, compact ? 11 : 13)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if expanded, !output.isEmpty {
+                Text(output)
+                    .font(AppTheme.monoFont(size: 11.5))
+                    .foregroundStyle(AppTheme.textSecondary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(11)
+                    .background(AppTheme.textPrimary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .padding(.leading, compact ? 35 : 35)
+                    .padding(.trailing, 16)
+                    .padding(.bottom, 13)
+            }
+        }
+    }
+
+    private func warningRow(_ message: String, compact: Bool) -> some View {
+        HStack(alignment: .top, spacing: 9) {
+            RelayCapsLabel(text: "Warning", color: AppTheme.statusWarn, size: 9)
+            Text(message)
+                .font(AppTheme.uiFont(size: compact ? 12 : 12.5))
+                .foregroundStyle(AppTheme.textSecondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, compact ? 35 : 16)
+        .padding(.vertical, compact ? 11 : 13)
+    }
+
+    private func receiptDisclosure(_ receipt: CodexExecutionReceipt) -> some View {
+        DisclosureGroup(isExpanded: $receiptExpanded) {
+            Text(receipt.summaryLines.joined(separator: "\n"))
+                .font(AppTheme.monoFont(size: 11))
+                .foregroundStyle(AppTheme.textSecondary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 12)
+        } label: {
+            Text("Execution receipt")
+                .font(AppTheme.uiFont(size: 13.5))
+                .foregroundStyle(AppTheme.textSecondary)
+                .padding(.vertical, 4)
+        }
+        .tint(AppTheme.textFaint)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+    }
+
+    private var hairline: some View {
+        Rectangle()
+            .fill(AppTheme.hairline)
+            .frame(height: 1)
+    }
+
+    private func providerModelLabel(_ job: CodexJob) -> String {
+        let provider = job.provider.relayPresentation.title
+        if let model = job.model?.trimmedNonEmpty {
+            return "\(provider) · \(model)"
+        }
+        return provider
+    }
+
+    @ViewBuilder
+    private func durationLabel(for job: CodexJob) -> some View {
+        if job.status.isActive, let startedAt = job.startedAt ?? job.createdAt {
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                RelayCapsLabel(
+                    text: Self.elapsedLabel(from: startedAt, to: context.date),
+                    color: AppTheme.accentBright,
+                    size: 9
+                )
+            }
+        } else if let durationMs = job.durationMs {
+            RelayCapsLabel(
+                text: Self.elapsedLabel(milliseconds: durationMs),
+                color: AppTheme.textSecondary,
+                size: 9
+            )
+        } else if let startedAt = job.startedAt ?? job.createdAt,
+                  let finishedAt = job.completedAt ?? job.updatedAt {
+            RelayCapsLabel(
+                text: Self.elapsedLabel(from: startedAt, to: finishedAt),
+                color: AppTheme.textSecondary,
+                size: 9
+            )
+        }
+    }
+
+    private func statusLabel(for job: CodexJob) -> some View {
+        let text: String
+        let color: Color
+        switch job.status {
+        case .queued, .running, .canceling:
+            text = "Working"
+            color = AppTheme.accentBright
+        case .waitingForApproval:
+            text = "Needs approval"
+            color = AppTheme.statusWarn
+        case .succeeded:
+            text = "Finished"
+            color = AppTheme.textSecondary
+        case .failed:
+            text = "Failed"
+            color = AppTheme.statusError
+        case .canceled:
+            text = "Canceled"
+            color = AppTheme.textTertiary
+        case .timeout:
+            text = "Timed out"
+            color = AppTheme.statusError
+        case .unknown:
+            text = job.status.label
+            color = AppTheme.textTertiary
+        }
+        return RelayCapsLabel(text: text, color: color, size: 9)
+    }
+
+    private func pollFullLogWhileActive() async {
+        repeat {
+            rawText = await viewModel.loadFullLog(jobID: jobID)
+            let latest = viewModel.liveJob(id: jobID)
+            if latest?.status.isActive != true {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+        } while !Task.isCancelled
+    }
+
+    private static func elapsedLabel(from startedAt: Date, to now: Date) -> String {
+        let seconds = max(0, Int(now.timeIntervalSince(startedAt)))
+        return String(format: "%d:%02d", seconds / 60, seconds % 60)
+    }
+
+    private static func elapsedLabel(milliseconds: Int) -> String {
+        let seconds = max(0, milliseconds / 1000)
+        return String(format: "%d:%02d", seconds / 60, seconds % 60)
     }
 }
 
