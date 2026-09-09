@@ -64,6 +64,7 @@
 		200000000000000000000076 /* NodePairingModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000076 /* NodePairingModel.swift */; };
 		200000000000000000000077 /* NodePairingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000077 /* NodePairingView.swift */; };
 		200000000000000000000078 /* NodePairingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000078 /* NodePairingTests.swift */; };
+		200000000000000000000079 /* LivePairingDiagnosticTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000079 /* LivePairingDiagnosticTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -139,6 +140,7 @@
 		100000000000000000000076 /* NodePairingModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NodePairingModel.swift; sourceTree = "<group>"; };
 		100000000000000000000077 /* NodePairingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NodePairingView.swift; sourceTree = "<group>"; };
 		100000000000000000000078 /* NodePairingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NodePairingTests.swift; sourceTree = "<group>"; };
+		100000000000000000000079 /* LivePairingDiagnosticTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LivePairingDiagnosticTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -206,6 +208,7 @@
 				100000000000000000000068 /* SignedInPlacesTests.swift */,
 				100000000000000000000074 /* ProviderLoginTests.swift */,
 				100000000000000000000078 /* NodePairingTests.swift */,
+				100000000000000000000079 /* LivePairingDiagnosticTests.swift */,
 			);
 			path = POCVaultTests;
 			sourceTree = "<group>";
@@ -514,6 +517,7 @@
 				200000000000000000000068 /* SignedInPlacesTests.swift in Sources */,
 				200000000000000000000074 /* ProviderLoginTests.swift in Sources */,
 				200000000000000000000078 /* NodePairingTests.swift in Sources */,
+				200000000000000000000079 /* LivePairingDiagnosticTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -618,3 +618,66 @@ final class NodePairingTests: XCTestCase {
             .joined(separator: "\n")
     }
 }
+
+// MARK: - App Transport Security
+
+/// ATS configuration is load-bearing for bring-your-own-machine, and it failed
+/// in a way that looked like a certificate problem for an entire debugging
+/// session.
+///
+/// A BYO node is reached at a user-supplied address — usually a bare public IP
+/// with a certificate the node signed itself. ATS refuses that by default, and
+/// the refusal happens in the networking stack: the server-trust delegate is
+/// still consulted, still returns `.useCredential`, and the connection is torn
+/// down anyway with a bare `NSURLErrorSecureConnectionFailed (-1200)`. On the
+/// node it appears as `tlsClientError ECONNRESET` with no completed handshake.
+/// Nothing in either message mentions ATS.
+///
+/// The trap that cost the most time: `NSAllowsArbitraryLoads` is IGNORED on
+/// iOS 10+ when `NSAllowsLocalNetworking` is also present. Both were set, so an
+/// experiment that appeared to rule ATS out had in fact changed nothing.
+final class AppTransportSecurityTests: XCTestCase {
+    private var ats: [String: Any] {
+        let url = Bundle(for: NodePairingTests.self).url(forResource: "Info", withExtension: "plist")
+        let hostInfo = Bundle.main.infoDictionary?["NSAppTransportSecurity"] as? [String: Any]
+        if let hostInfo { return hostInfo }
+        guard let url,
+              let data = try? Data(contentsOf: url),
+              let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              let dict = plist["NSAppTransportSecurity"] as? [String: Any] else { return [:] }
+        return dict
+    }
+
+    func testArbitraryLoadsIsEnabledForUserSuppliedMachines() {
+        XCTAssertEqual(
+            ats["NSAllowsArbitraryLoads"] as? Bool, true,
+            "a BYO node is a user-supplied address with a self-signed certificate; without this, pairing fails with a bare -1200"
+        )
+    }
+
+    func testLocalNetworkingKeyIsAbsent() {
+        // Presence of this key makes iOS 10+ IGNORE NSAllowsArbitraryLoads
+        // entirely. Setting both looks strictly more permissive and is in fact
+        // strictly less: it silently restores the default ATS policy.
+        XCTAssertNil(
+            ats["NSAllowsLocalNetworking"],
+            "NSAllowsLocalNetworking nullifies NSAllowsArbitraryLoads on iOS 10+ — the two must never both be set"
+        )
+    }
+
+    func testKnownDomainsStayHeldToATSStandards() {
+        // Opening the door for arbitrary machines must not lower the bar for
+        // the servers we DO control.
+        let domains = ats["NSExceptionDomains"] as? [String: Any] ?? [:]
+        XCTAssertFalse(domains.isEmpty, "the control plane should keep its ATS guarantees")
+        for (name, raw) in domains {
+            let entry = raw as? [String: Any] ?? [:]
+            XCTAssertEqual(entry["NSExceptionMinimumTLSVersion"] as? String, "TLSv1.2", "\(name)")
+            XCTAssertEqual(entry["NSExceptionRequiresForwardSecrecy"] as? Bool, true, "\(name)")
+            XCTAssertNotEqual(
+                entry["NSExceptionAllowsInsecureHTTPLoads"] as? Bool, true,
+                "\(name) must not permit cleartext"
+            )
+        }
+    }
+}
