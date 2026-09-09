@@ -13,7 +13,7 @@ function buildCodexArgs(job) {
   // `exec` also makes them valid for the narrower `exec resume` parser.
   const args = [
     "-a", job.approvalPolicy || "on-request",
-    "--sandbox", "workspace-write",
+    "--sandbox", job.sandbox || "workspace-write",
     "exec", "-C", job.worktree?.path || job.workspacePath,
     "--skip-git-repo-check", "--ignore-rules",
   ];
@@ -27,7 +27,7 @@ function buildCodexArgs(job) {
 function buildCodexResumeArgs(job) {
   const args = [
     "-a", job.approvalPolicy || "on-request",
-    "--sandbox", "workspace-write",
+    "--sandbox", job.sandbox || "workspace-write",
     "exec", "resume", "--skip-git-repo-check", "--ignore-rules",
   ];
   if (job.model) args.push("-m", job.model);

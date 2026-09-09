@@ -90,11 +90,20 @@ class ApprovalStore {
     return { ...record, status: "resolved", resolution };
   }
 
-  waitForDecision(id, { signal = null, pollMs = 200 } = {}) {
+  waitForDecision(id, { signal = null, pollMs = 200, timeoutMs = null } = {}) {
     return new Promise((resolve, reject) => {
+      const startedAt = Date.now();
+      const keepAliveForTimeout = timeoutMs != null && timeoutMs >= 0;
       const tick = () => {
         if (signal?.aborted) {
           reject(signal.reason || new Error("approval wait cancelled"));
+          return;
+        }
+        if (keepAliveForTimeout && Date.now() - startedAt >= timeoutMs) {
+          reject(Object.assign(
+            new Error("Timed out waiting for an approval decision from Relay."),
+            { code: "approval_timeout" },
+          ));
           return;
         }
         const record = this.get(id);
@@ -107,10 +116,12 @@ class ApprovalStore {
           return;
         }
         timer = setTimeout(tick, pollMs);
-        timer.unref?.();
+        // Unref only when there is no bounded wait; otherwise the event loop can
+        // drain and cancel an approval timeout before it fires.
+        if (!keepAliveForTimeout) timer.unref?.();
       };
       let timer = setTimeout(tick, pollMs);
-      timer.unref?.();
+      if (!keepAliveForTimeout) timer.unref?.();
     });
   }
 

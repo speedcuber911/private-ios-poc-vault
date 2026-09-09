@@ -190,7 +190,7 @@ const fsReadDenylist = splitCsv(
 
 const terminalStatuses = new Set(["succeeded", "failed", "cancelled", "timeout"]);
 
-const allowedReasoningEfforts = new Set(["low", "medium", "high", "xhigh"]);
+const allowedReasoningEfforts = new Set(["low", "medium", "high", "xhigh", "max", "ultra"]);
 
 const allowedJobProviders = new Set(["codex", "claude", "cursor", "kimi"]);
 
@@ -201,6 +201,8 @@ const allowedThreadProviders = new Set([...allowedJobProviders, ...allowedChatPr
 const allowedClaudePermissionModes = new Set(["acceptEdits", "auto", "bypassPermissions", "default", "manual", "dontAsk", "plan"]);
 
 const allowedCodexApprovalPolicies = new Set(["untrusted", "on-failure", "on-request", "never"]);
+
+const allowedCodexSandboxes = new Set(["read-only", "workspace-write", "danger-full-access"]);
 
 const claudeAwsProfile = cleanOptionalAwsProfile(process.env.CLAUDE_AWS_PROFILE);
 
@@ -1089,6 +1091,7 @@ export {
   fsReadDenylist,
   terminalStatuses,
   allowedReasoningEfforts,
+  allowedCodexSandboxes,
   allowedJobProviders,
   allowedChatProviders,
   allowedThreadProviders,

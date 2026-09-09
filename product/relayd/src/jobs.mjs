@@ -8,7 +8,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { dataDir, jobsDir, logsDir, attachmentsDir, artifactsDir, approvalsDir, codexBin, claudeBin, cursorBin, kimiBin, runHome, codexHome, kimiHome, npmCacheDir, bunCacheDir, codexTransport, maxConcurrent, maxJobStreams, jobStreamHeartbeatMs, maxBodyBytes, maxJobAttachments, maxJobAttachmentBytes, maxJobAttachmentTotalBytes, maxOutputBytes, maxJobSkills, maxSkillPromptBytes, responseOutputBytes, listOutputBytes, maxTimeoutMs, defaultTimeoutMs, terminalStatuses, allowedReasoningEfforts, allowedJobProviders, allowedClaudePermissionModes, allowedCodexApprovalPolicies, claudeAwsProfile, claudeAwsRegion, claudeDefaultModel, cleanOptionalModel, normalizeClaudeModel, realpathOrResolve } from "./config.mjs";
+import { dataDir, jobsDir, logsDir, attachmentsDir, artifactsDir, approvalsDir, codexBin, claudeBin, cursorBin, kimiBin, runHome, codexHome, kimiHome, npmCacheDir, bunCacheDir, codexTransport, maxConcurrent, maxJobStreams, jobStreamHeartbeatMs, maxBodyBytes, maxJobAttachments, maxJobAttachmentBytes, maxJobAttachmentTotalBytes, maxOutputBytes, maxJobSkills, maxSkillPromptBytes, responseOutputBytes, listOutputBytes, maxTimeoutMs, defaultTimeoutMs, terminalStatuses, allowedReasoningEfforts, allowedJobProviders, allowedClaudePermissionModes, allowedCodexApprovalPolicies, allowedCodexSandboxes, claudeAwsProfile, claudeAwsRegion, claudeDefaultModel, cleanOptionalModel, normalizeClaudeModel, realpathOrResolve } from "./config.mjs";
 import { nowIso, durationMs, sendError, initSse, sendSse, isSafeJobId, headerValue, shapeTextPayload, prefixByBytes, cleanAssistantResult, cleanApiText, readTextFileBounded } from "./util.mjs";
 import { appendAudit } from "./audit.mjs";
 import { resolveWorkspaceById, cleanWorkspaceId } from "./workspaces.mjs";
@@ -197,6 +197,9 @@ function createJob(body, certSubject, validatedTaskSelection = null) {
   const approvalPolicy = provider === "codex"
     ? cleanOptionalCodexApprovalPolicy(body.approvalPolicy)
     : null;
+  const sandbox = provider === "codex"
+    ? cleanOptionalCodexSandbox(body.sandbox)
+    : null;
   pruneRuntimeCachesIfIdle();
   const job = {
     id,
@@ -229,6 +232,7 @@ function createJob(body, certSubject, validatedTaskSelection = null) {
     reasoningEffort: provider === "codex" || provider === "claude" ? taskSelection.reasoningEffort : null,
     permissionMode,
     approvalPolicy,
+    sandbox,
     execution: null,
     resumeSessionId,
     sessionId: resumeSessionId || (provider === "claude" ? crypto.randomUUID() : null),
@@ -278,6 +282,9 @@ function validateProviderControlFields(provider, body) {
   if (provider !== "codex" && hasControlValue(body.approvalPolicy)) {
     throw Object.assign(new Error("approvalPolicy is supported only for Codex jobs"), { status: 400 });
   }
+  if (provider !== "codex" && hasControlValue(body.sandbox)) {
+    throw Object.assign(new Error("sandbox is supported only for Codex jobs"), { status: 400 });
+  }
 }
 
 
@@ -320,7 +327,7 @@ function cleanOptionalReasoningEffort(value) {
   }
   const normalized = value.trim().toLowerCase();
   if (!allowedReasoningEfforts.has(normalized)) {
-    throw Object.assign(new Error("reasoningEffort must be low, medium, high, or xhigh"), { status: 400 });
+    throw Object.assign(new Error("reasoningEffort must be low, medium, high, xhigh, max, or ultra"), { status: 400 });
   }
   return normalized;
 }
@@ -343,6 +350,15 @@ function cleanOptionalCodexApprovalPolicy(value) {
   if (value === undefined || value === null || value === "") return "on-request";
   if (typeof value !== "string" || !allowedCodexApprovalPolicies.has(value.trim())) {
     throw Object.assign(new Error("approvalPolicy must be untrusted, on-failure, on-request, or never"), { status: 400 });
+  }
+  return value.trim();
+}
+
+
+function cleanOptionalCodexSandbox(value) {
+  if (value === undefined || value === null || value === "") return "workspace-write";
+  if (typeof value !== "string" || !allowedCodexSandboxes.has(value.trim())) {
+    throw Object.assign(new Error("sandbox must be read-only, workspace-write, or danger-full-access"), { status: 400 });
   }
   return value.trim();
 }
@@ -759,6 +775,7 @@ function buildJobEnv(job) {
     RELAY_APPROVAL_DIR: approvalsDir,
     RELAY_CODEX_BIN: codexBin,
     RELAY_CODEX_APPROVAL_POLICY: job.approvalPolicy || "on-request",
+    RELAY_CODEX_SANDBOX: job.sandbox || "workspace-write",
     RELAY_CODEX_SKILL_INPUTS: JSON.stringify(
       job.provider === "codex" && codexTransport === "app-server" ? (job.skillInputs || []) : [],
     ),
@@ -829,7 +846,7 @@ function buildExecutionReceipt(job) {
     reasoningEffort: job.reasoningEffort || null,
     permissionMode: job.permissionMode || null,
     approvalPolicy: job.approvalPolicy || null,
-    sandbox: provider === "codex" ? "workspace-write" : null,
+    sandbox: provider === "codex" ? (job.sandbox || "workspace-write") : null,
     skills: Array.isArray(job.skills) ? [...job.skills] : [],
     launchedAt: nowIso(),
   };
@@ -847,7 +864,7 @@ function publicExecutionReceipt(receipt) {
     reasoningEffort: allowedReasoningEfforts.has(receipt.reasoningEffort) ? receipt.reasoningEffort : null,
     permissionMode: allowedClaudePermissionModes.has(receipt.permissionMode) ? receipt.permissionMode : null,
     approvalPolicy: allowedCodexApprovalPolicies.has(receipt.approvalPolicy) ? receipt.approvalPolicy : null,
-    sandbox: receipt.sandbox === "workspace-write" ? receipt.sandbox : null,
+    sandbox: allowedCodexSandboxes.has(receipt.sandbox) ? receipt.sandbox : null,
     skills: Array.isArray(receipt.skills)
       ? receipt.skills.filter((value) => typeof value === "string").map((value) => cleanApiText(value).slice(0, 160))
       : [],
@@ -1543,6 +1560,7 @@ async function toJobResponse(job, shape = responseShape("preview")) {
     reasoningEffort: job.reasoningEffort || null,
     permissionMode: job.permissionMode || null,
     approvalPolicy: job.approvalPolicy || null,
+    sandbox: job.sandbox || null,
     skills: Array.isArray(job.skills) ? job.skills : [],
     execution: publicExecutionReceipt(job.execution),
     resumeSessionId: job.resumeSessionId || null,
@@ -1587,6 +1605,7 @@ export {
   cleanOptionalReasoningEffort,
   cleanOptionalClaudePermissionMode,
   cleanOptionalCodexApprovalPolicy,
+  cleanOptionalCodexSandbox,
   validateProviderControlFields,
   cleanSelectedSkills,
   saveJobAttachments,

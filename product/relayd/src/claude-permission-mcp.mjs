@@ -74,7 +74,10 @@ async function handleApproval(message) {
     cwd: typeof input.cwd === "string" ? input.cwd : workspacePath,
     toolName,
   });
-  const resolution = await store.waitForDecision(record.id, { signal: controller.signal });
+  const resolution = await store.waitForDecision(record.id, {
+    signal: controller.signal,
+    timeoutMs: approvalWaitTimeoutMs(),
+  });
   const payload = resolution.decision.startsWith("accept")
     ? { behavior: "allow", updatedInput: input }
     : { behavior: "deny", message: resolution.message || "Denied from Relay." };
@@ -101,6 +104,11 @@ function claudeTitle(toolName) {
 }
 function respond(id, result) { process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`); }
 function respondError(id, code, message) { process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } })}\n`); }
+function approvalWaitTimeoutMs() {
+  const raw = Number(process.env.RELAY_APPROVAL_TIMEOUT_MS);
+  if (Number.isFinite(raw) && raw >= 1_000) return Math.floor(raw);
+  return 15 * 60 * 1000;
+}
 function requiredEnv(name) {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`${name} is required`);

@@ -57,7 +57,7 @@ try {
         cwd: workspacePath,
         approvalPolicy: approvalPolicy(),
         approvalsReviewer: "user",
-        sandbox: "workspace-write",
+        sandbox: sandbox(),
         model: optionalEnv("RELAY_MODEL"),
       })
     : await client.request("thread/start", {
@@ -67,7 +67,7 @@ try {
         // must route these decisions to the phone instead, otherwise the
         // auto-review subagent can approve a sandbox escape before iOS sees it.
         approvalsReviewer: "user",
-        sandbox: "workspace-write",
+        sandbox: sandbox(),
         model: optionalEnv("RELAY_MODEL"),
         serviceName: "relay",
       });
@@ -120,12 +120,18 @@ async function handleServerRequest(message) {
       availableDecisions: params.availableDecisions,
     });
     step(`Waiting for approval: ${record.title}${record.command ? ` — ${record.command}` : ""}`);
-    const resolution = await approvalStore.waitForDecision(record.id, { signal: controller.signal });
+    const resolution = await approvalStore.waitForDecision(record.id, {
+      signal: controller.signal,
+      timeoutMs: approvalWaitTimeoutMs(),
+    });
     client.respond(message.id, { decision: resolution.decision });
     step(resolution.decision.startsWith("accept") ? "Approved from Relay" : "Denied from Relay");
   } catch (error) {
     client.respond(message.id, { decision: "cancel" });
     process.stderr.write(`[approval] ${error.message}\n`);
+    if (error?.code === "approval_timeout" || /Timed out waiting for an approval decision/i.test(error?.message || "")) {
+      fail(error);
+    }
   }
 }
 
@@ -202,6 +208,18 @@ function selectedSkillInputs() {
 function approvalPolicy() {
   const value = process.env.RELAY_CODEX_APPROVAL_POLICY;
   return ["untrusted", "on-failure", "on-request", "never"].includes(value) ? value : "on-request";
+}
+
+function sandbox() {
+  const value = process.env.RELAY_CODEX_SANDBOX;
+  return ["read-only", "workspace-write", "danger-full-access"].includes(value) ? value : "workspace-write";
+}
+
+/** Bounded wait so an unanswered approval cannot hang a job forever. */
+function approvalWaitTimeoutMs() {
+  const raw = Number(process.env.RELAY_APPROVAL_TIMEOUT_MS);
+  if (Number.isFinite(raw) && raw >= 1_000) return Math.floor(raw);
+  return 15 * 60 * 1000;
 }
 
 function optionalEnv(name) { return process.env[name]?.trim() || null; }

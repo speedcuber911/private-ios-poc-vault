@@ -58,7 +58,7 @@ function defaultModelCatalog() {
       label: "Codex CLI",
       provider: "codex",
       modes: ["task"],
-      effortLevels: ["low", "medium", "high", "xhigh"],
+      effortLevels: ["low", "medium", "high", "xhigh", "max", "ultra"],
     },
     {
       id: "codex-gpt-5.6-sol",
@@ -66,7 +66,7 @@ function defaultModelCatalog() {
       provider: "codex",
       modes: ["task"],
       taskModel: "gpt-5.6-sol",
-      effortLevels: ["low", "medium", "high", "xhigh"],
+      effortLevels: ["low", "medium", "high", "xhigh", "max", "ultra"],
     },
     {
       id: "codex-gpt-5.6-terra",
@@ -74,7 +74,7 @@ function defaultModelCatalog() {
       provider: "codex",
       modes: ["task"],
       taskModel: "gpt-5.6-terra",
-      effortLevels: ["low", "medium", "high", "xhigh"],
+      effortLevels: ["low", "medium", "high", "xhigh", "max", "ultra"],
     },
     {
       id: "codex-gpt-5.6-luna",
@@ -82,7 +82,7 @@ function defaultModelCatalog() {
       provider: "codex",
       modes: ["task"],
       taskModel: "gpt-5.6-luna",
-      effortLevels: ["low", "medium", "high", "xhigh"],
+      effortLevels: ["low", "medium", "high", "xhigh", "max", "ultra"],
     },
     {
       id: "claude-code",
@@ -208,7 +208,7 @@ function cleanModelDescriptor(entry) {
   if (Array.isArray(entry.effortLevels)) {
     descriptor.effortLevels = entry.effortLevels
       .map((level) => (typeof level === "string" ? level.trim().toLowerCase() : ""))
-      .filter((level) => ["low", "medium", "high", "xhigh"].includes(level));
+      .filter((level) => ["low", "medium", "high", "xhigh", "max", "ultra"].includes(level));
   }
   return descriptor;
 }
@@ -290,7 +290,7 @@ async function publicRuntimeModelCatalog() {
 function runtimeCodexDescriptor(model) {
   if (!model || typeof model.id !== "string" || !/^[A-Za-z0-9._:/-]{1,180}$/.test(model.id)) return null;
   const efforts = Array.isArray(model.supportedReasoningEfforts)
-    ? model.supportedReasoningEfforts.map((entry) => entry?.reasoningEffort).filter((value) => ["low", "medium", "high", "xhigh"].includes(value))
+    ? model.supportedReasoningEfforts.map((entry) => entry?.reasoningEffort).filter((value) => ["low", "medium", "high", "xhigh", "max", "ultra"].includes(value))
     : [];
   return {
     id: `codex-${model.id}`,

@@ -101,7 +101,7 @@ test("every entry exposes effort levels, so the picker is never empty", () => {
     );
     for (const level of entry.effortLevels) {
       assert.ok(
-        ["low", "medium", "high", "xhigh"].includes(level),
+        ["low", "medium", "high", "xhigh", "max", "ultra"].includes(level),
         `${entry.id} declares an effort level the server will drop: ${level}`,
       );
     }
