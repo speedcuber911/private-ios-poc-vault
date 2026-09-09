@@ -989,6 +989,23 @@ function realpathOrResolve(value) {
   }
 }
 
+// Containment test for an already-resolved path against an already-resolved root.
+//
+// The obvious spelling, `candidate.startsWith(root + path.sep)`, is correct for
+// every root EXCEPT the filesystem root: "/" + "/" is "//", which no real path
+// begins with, so a browse root of "/" rejects everything below it while still
+// admitting "/" itself. A machine whose owner asked for whole-disk access could
+// therefore list the root and nothing else -- every folder returned HTTP 400
+// "workspace path must stay inside the workspace root".
+//
+// Appending the separator is still what keeps "/home/ubuntu-evil" out of
+// "/home/ubuntu", so the guard is kept and only the doubled separator removed.
+function pathWithinRoot(candidate, root) {
+  if (candidate === root) return true;
+  const prefix = root.endsWith(path.sep) ? root : `${root}${path.sep}`;
+  return candidate.startsWith(prefix);
+}
+
 
 export {
   host,
@@ -1064,6 +1081,7 @@ export {
   defaultTimeoutMs,
   threadSummaryCharacters,
   workspaceBrowseRoot,
+  pathWithinRoot,
   maxWorkspaceDirEntries,
   maxFsListEntries,
   maxFsReadBytes,

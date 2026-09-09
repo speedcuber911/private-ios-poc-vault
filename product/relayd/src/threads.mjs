@@ -7,7 +7,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 
-import { runHome, codexHome, threadSummaryCharacters, workspaceBrowseRoot, terminalStatuses, allowedThreadProviders, realpathOrResolve } from "./config.mjs";
+import { runHome, codexHome, threadSummaryCharacters, workspaceBrowseRoot, terminalStatuses, allowedThreadProviders, realpathOrResolve, pathWithinRoot } from "./config.mjs";
 import { isSafeJobId, cleanApiText } from "./util.mjs";
 import { isResumableSessionId, isKimiSessionId } from "./sessionid.mjs";
 import { appendAudit } from "./audit.mjs";
@@ -736,7 +736,7 @@ function sessionBelongsToWorkspace(sessionCwd, workspacePath) {
   const resolvedWorkspacePath = realpathOrResolve(workspacePath);
   return (
     resolvedSessionCwd === resolvedWorkspacePath ||
-    resolvedSessionCwd.startsWith(`${resolvedWorkspacePath}${path.sep}`)
+    pathWithinRoot(resolvedSessionCwd, resolvedWorkspacePath)
   );
 }
 

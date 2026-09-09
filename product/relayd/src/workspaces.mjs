@@ -7,7 +7,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 
-import { workspaceBrowseRoot, maxWorkspaceDirEntries, cleanDisplayName, realpathOrResolve } from "./config.mjs";
+import { workspaceBrowseRoot, maxWorkspaceDirEntries, cleanDisplayName, realpathOrResolve, pathWithinRoot } from "./config.mjs";
 
 const dynamicWorkspaces = new Map();
 
@@ -444,7 +444,7 @@ function resolveBrowsePath(value, { kind = "dir" } = {}) {
 // realpath is needed on hot listing paths.
 
 function resolvedPathWithinRoot(resolvedPath) {
-  return resolvedPath === workspaceBrowseRoot || resolvedPath.startsWith(`${workspaceBrowseRoot}${path.sep}`);
+  return pathWithinRoot(resolvedPath, workspaceBrowseRoot);
 }
 
 
@@ -470,7 +470,7 @@ function relativeBrowsePath(value) {
 function pathBelongsToRoot(candidate, root) {
   const resolvedCandidate = realpathOrResolve(candidate);
   const resolvedRoot = realpathOrResolve(root);
-  return resolvedCandidate === resolvedRoot || resolvedCandidate.startsWith(`${resolvedRoot}${path.sep}`);
+  return pathWithinRoot(resolvedCandidate, resolvedRoot);
 }
 
 
