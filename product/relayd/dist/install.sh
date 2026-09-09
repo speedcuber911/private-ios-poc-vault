@@ -5,8 +5,8 @@
 #   1. sanity checks (root, apt, arch, openssl, git)
 #   2. installs a bundled Node 22 runtime under /opt/relayd/node if the
 #      system node is missing or too old
-#   3. creates the `relay` runner user, the workspace jail
-#      (/srv/relay-workspaces) and a seeded `welcome` workspace
+#   3. runs as the human who invoked it (RELAYD_RUN_USER overrides; falls back
+#      to a `relay` system account), and seeds a workspace jail
 #   4. copies the relayd app to /opt/relayd/app
 #   5. writes /etc/relayd/relayd.env (0640 root:relay) with safe defaults
 #   6. installs + enables the systemd unit
@@ -34,7 +34,21 @@ NODE_DIR="/opt/relayd/node"
 DATA_DIR="/var/lib/relayd"
 JAIL_DIR="/srv/relay-workspaces"
 ENV_FILE="/etc/relayd/relayd.env"
-RUN_USER="relay"
+# Who relayd runs as.
+#
+# It used to always be a locked-down `relay` system account with its own empty
+# home. That was right when the node was OUR machine running someone else's
+# agent. It is wrong for bring-your-own-machine, and wrong in a way that looks
+# like four unrelated bugs: the file browser shows one empty folder, the agent
+# cannot see any of your code, `codex`/`claude` appear "not logged in" because
+# their credentials live in YOUR home, and reading threads fails with EACCES on
+# a ~/.codex the daemon may not even traverse.
+#
+# So it defaults to the human who ran the installer. Set RELAYD_RUN_USER=relay
+# to get the old isolated account back (appropriate if you are hosting a node
+# for somebody else).
+RUN_USER="${RELAYD_RUN_USER:-${SUDO_USER:-relay}}"
+if [ "$RUN_USER" = "root" ]; then RUN_USER="relay"; fi
 PAIRING_PORT="8788"
 
 log() { printf '[relayd-install] %s\n' "$*"; }
@@ -188,11 +202,16 @@ fi
 if ! id -u "$RUN_USER" >/dev/null 2>&1; then
   log "creating runner user '$RUN_USER'"
   useradd --system --create-home --home-dir "/home/$RUN_USER" --shell /usr/sbin/nologin "$RUN_USER"
+else
+  log "running as existing user '$RUN_USER'"
 fi
+RUN_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6)"
+[ -n "$RUN_HOME" ] || RUN_HOME="/home/$RUN_USER"
+RUN_GROUP="$(id -gn "$RUN_USER")"
 
 log "creating data dir and workspace jail"
 mkdir -p "$DATA_DIR"
-chown "$RUN_USER:$RUN_USER" "$DATA_DIR"
+chown "$RUN_USER:$RUN_GROUP" "$DATA_DIR"
 chmod 0750 "$DATA_DIR"
 
 mkdir -p "$JAIL_DIR/welcome"
@@ -211,7 +230,7 @@ Things to try from the app:
 3. Browse the files the agent produced, right from the app.
 WELCOME
 fi
-chown -R "$RUN_USER:$RUN_USER" "$JAIL_DIR"
+chown -R "$RUN_USER:$RUN_GROUP" "$JAIL_DIR"
 chmod 0750 "$JAIL_DIR"
 
 # --- 4. app -----------------------------------------------------------------
@@ -294,9 +313,15 @@ if [ ! -f "$ENV_FILE" ]; then
     env_kv CODEX_DATA_DIR "$DATA_DIR"
     env_kv RELAYD_IDENTITY_DIR "$DATA_DIR/identity"
     env_kv RELAYD_STORE json
-    env_kv CODEX_WORKSPACE_BROWSE_ROOT "$JAIL_DIR"
-    env_kv CODEX_WORKSPACES "[{\"id\":\"welcome\",\"name\":\"Welcome\",\"path\":\"$JAIL_DIR/welcome\"}]"
-    env_kv CODEX_RUN_HOME "/home/$RUN_USER"
+    printf '%s\n' \
+      '# What the phone can browse. The default is the whole machine, because' \
+      '# that is what "bring your own machine" means: the agent works on your' \
+      '# code, where your code already is. Narrow it to a directory if you want' \
+      '# a smaller blast radius, e.g.' \
+      "#     CODEX_WORKSPACE_BROWSE_ROOT='$RUN_HOME'"
+    env_kv CODEX_WORKSPACE_BROWSE_ROOT "/"
+    env_kv CODEX_WORKSPACES "[{\"id\":\"home\",\"name\":\"Home\",\"path\":\"$RUN_HOME\"},{\"id\":\"machine\",\"name\":\"Whole machine\",\"path\":\"/\"}]"
+    env_kv CODEX_RUN_HOME "$RUN_HOME"
     env_kv RELAYD_WORKTREE_MODE false
     printf '%s\n' \
       '# Pairing listener. Still a SECOND listener, separate from the data' \
@@ -336,6 +361,9 @@ fi
 
 log "installing systemd unit"
 cp "$APP_SRC_DIR/dist/relayd.service" /etc/systemd/system/relayd.service
+# The unit ships with the historical `relay` account; point it at whoever this
+# install actually runs as.
+sed -i "s/^User=.*/User=$RUN_USER/; s/^Group=.*/Group=$RUN_GROUP/" /etc/systemd/system/relayd.service
 systemctl daemon-reload
 systemctl enable relayd.service >/dev/null
 systemctl restart relayd.service

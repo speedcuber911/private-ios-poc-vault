@@ -1444,3 +1444,57 @@ test("dist/install.sh: the allowlist comment documents a format that works", () 
     "O=Relay",
   ]);
 });
+
+// The shipped unit must not re-jail the owner out of their own machine.
+test("dist/relayd.service does not hide the owner's files from their own agent", () => {
+  const unit = fs.readFileSync(path.join(repoRelaydDir, "dist", "relayd.service"), "utf8");
+  // ProtectHome=true makes /home empty for the daemon. The file browser then
+  // shows nothing, and `codex`/`claude` report "not logged in" because their
+  // credentials are in a home the process cannot see — with no error anywhere
+  // that names the cause.
+  assert.match(unit, /^ProtectHome=false$/m);
+  assert.match(unit, /^ProtectSystem=false$/m);
+  // The cheap protections stay.
+  for (const directive of [
+    "NoNewPrivileges=true",
+    "RestrictSUIDSGID=true",
+    "ProtectKernelTunables=true",
+    "ProtectKernelModules=true",
+    "LockPersonality=true",
+  ]) {
+    assert.ok(unit.includes(directive), `${directive} costs nothing here and must stay`);
+  }
+  // ReadWritePaths only means something under ProtectSystem, and listing a
+  // hardcoded /home/relay there was part of the same wrong model.
+  assert.ok(!/^ReadWritePaths=/m.test(unit), "ReadWritePaths is meaningless without ProtectSystem");
+});
+
+// Who the daemon runs as is a product decision, not a detail.
+test("dist/install.sh runs as the machine's owner and can see the whole machine", () => {
+  const text = fs.readFileSync(path.join(repoRelaydDir, "dist", "install.sh"), "utf8");
+
+  // The `relay` system account produced four symptoms that look unrelated: an
+  // empty file browser, an agent that can reach none of your code, harnesses
+  // reporting "not logged in" because their credentials live in YOUR home, and
+  // a 500 from EACCES on ~/.codex/sessions. Defaulting to the invoking human
+  // fixes all four at once.
+  assert.ok(
+    text.includes('RUN_USER="${RELAYD_RUN_USER:-${SUDO_USER:-relay}}"'),
+    "the runner must default to the human who ran the installer",
+  );
+  assert.ok(
+    text.includes('if [ "$RUN_USER" = "root" ]; then RUN_USER="relay"; fi'),
+    "a direct root install must fall back to a dedicated account rather than running as root",
+  );
+  assert.ok(
+    text.includes('env_kv CODEX_WORKSPACE_BROWSE_ROOT "/"'),
+    "bring-your-own-machine means the browse root is the machine",
+  );
+  // The shipped unit still carries the historical account, so the installer has
+  // to point it at whoever this install actually runs as.
+  assert.ok(text.includes("s/^User=.*/User=$RUN_USER/"), "the unit must be pointed at the real run user");
+  assert.ok(text.includes("RUN_GROUP="), "group must be derived, not assumed equal to the user name");
+  // Ownership must follow the resolved group: an existing human user is
+  // frequently not in a group of the same name.
+  assert.ok(!/chown -R "\$RUN_USER:\$RUN_USER"/.test(text), "ownership must use $RUN_GROUP");
+});

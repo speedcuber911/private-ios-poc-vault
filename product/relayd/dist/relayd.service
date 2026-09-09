@@ -31,12 +31,22 @@ RestartSec=3
 KillSignal=SIGTERM
 TimeoutStopSec=10
 
-# Hardening: relayd only needs its data dir, the workspace jail, and the
-# runner home. Everything else is read-only or invisible.
+# Hardening, sized for a machine its owner brought.
+#
+# ProtectHome/ProtectSystem=strict were written for a multi-tenant trial
+# sandbox, where the node was OUR machine running somebody else's agent. That
+# model is gone. relayd runs on hardware the user owns, as that user, and the
+# entire point is to let their coding agent read and edit their files — a jail
+# that hides /home makes the product do nothing, and does it silently: an empty
+# file browser and a harness that reports "not logged in" because the
+# credentials are in a home the daemon cannot see.
+#
+# The protections that still cost nothing here are kept. If you are hosting a
+# node for someone else, install with RELAYD_RUN_USER=relay and restore
+# ProtectHome=true.
 NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/relayd /srv/relay-workspaces /home/relay
+ProtectSystem=false
+ProtectHome=false
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
