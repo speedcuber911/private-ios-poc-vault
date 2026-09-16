@@ -1,24 +1,9 @@
-import org.jetbrains.kotlin.gradle.dsl.JvmTarget
-
 plugins {
     id("org.jetbrains.kotlin.multiplatform")
-    id("com.android.kotlin.multiplatform.library")
     id("org.jetbrains.kotlin.plugin.serialization")
 }
 
 kotlin {
-    android {
-        namespace = "live.relay.core"
-        compileSdk = 36
-        minSdk = 28
-
-        compilerOptions {
-            jvmTarget.set(JvmTarget.JVM_17)
-        }
-
-        withHostTestBuilder {}
-    }
-
     iosArm64 {
         binaries.framework {
             baseName = "RelayCore"
