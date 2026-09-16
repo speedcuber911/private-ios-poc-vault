@@ -57,6 +57,39 @@ const serverCertDays = 397;
 
 const caCertDays = 3650;
 
+// The same 398 days as above, read from the other direction: what this node
+// may still SERVE, as opposed to what it may issue.
+const appleMaxServerCertDays = 398;
+
+// Whether a server certificate already on disk has to be thrown away rather
+// than served.
+//
+// This exists because `serverCertDays` governs only the certificates this
+// function issues from now on — it says nothing about the ones an earlier
+// version already wrote. A node set up before 90f16b2 holds an 825-day leaf,
+// and since its SAN list never changes, the reuse check in ensureServerCert
+// handed that same leaf back through every upgrade and every restart. The cap
+// therefore reached new installs only, while an existing machine went on
+// failing every iPhone with a bare TLS error and no way to tell why.
+//
+// Reissuing is cheap, and a printed pairing code survives it: the QR pins the
+// CA's public key, not the leaf's.
+function serverCertNeedsReissue(certPath) {
+  let cert;
+  try {
+    cert = new crypto.X509Certificate(fs.readFileSync(certPath));
+  } catch {
+    // Unreadable, truncated, or not a certificate at all. Serving it is not an
+    // option and neither is guessing what it was meant to be.
+    return true;
+  }
+  const from = Date.parse(cert.validFrom);
+  const to = Date.parse(cert.validTo);
+  if (!Number.isFinite(from) || !Number.isFinite(to)) return true;
+  if (to <= Date.now()) return true;
+  return to - from > appleMaxServerCertDays * 86400000;
+}
+
 function opensslVersion() {
   try {
     return execFileSync("openssl", ["version"], { encoding: "utf8", timeout: 10000 }).trim();
@@ -736,7 +769,12 @@ function ensureServerCert({ san, altNames = [], baseDir = identityDir }) {
   const certPath = path.join(paths.serverDir, `${fileKey}.cert.pem`);
   const sansPath = path.join(paths.serverDir, `${fileKey}.sans`);
   const wanted = entries.join(",");
-  if (fs.existsSync(keyPath) && fs.existsSync(certPath) && readFileOrNull(sansPath)?.trim() === wanted) {
+  if (
+    fs.existsSync(keyPath) &&
+    fs.existsSync(certPath) &&
+    readFileOrNull(sansPath)?.trim() === wanted &&
+    !serverCertNeedsReissue(certPath)
+  ) {
     return { keyPath, certPath, sans: entries };
   }
 
@@ -774,6 +812,38 @@ function ensureServerCert({ san, altNames = [], baseDir = identityDir }) {
   } finally {
     fs.rmSync(workDir, { recursive: true, force: true });
   }
+}
+
+// What the on-disk server certificate for `san` would look like to an iPhone,
+// WITHOUT issuing one. `relayd doctor` needs to report a certificate that is
+// already wrong; making the report itself fix the problem would hide how long
+// the machine had been failing, and doctor is a diagnosis, not a repair.
+//
+// Returns { present: false } before the first listener has ever started.
+function serverCertStatus({ san = publicHost, baseDir = identityDir } = {}) {
+  const paths = identityPaths(baseDir);
+  const certPath = path.join(paths.serverDir, `${serverCertFileKey(san)}.cert.pem`);
+  if (!fs.existsSync(certPath)) return { present: false, certPath };
+  let cert;
+  try {
+    cert = new crypto.X509Certificate(fs.readFileSync(certPath));
+  } catch (error) {
+    return { present: true, certPath, readable: false, error: error.message, needsReissue: true };
+  }
+  const from = Date.parse(cert.validFrom);
+  const to = Date.parse(cert.validTo);
+  const days = Number.isFinite(from) && Number.isFinite(to) ? Math.round((to - from) / 86400000) : null;
+  return {
+    present: true,
+    readable: true,
+    certPath,
+    days,
+    expired: Number.isFinite(to) ? to <= Date.now() : true,
+    overAppleLimit: days === null ? true : days > appleMaxServerCertDays,
+    sans: cert.subjectAltName || null,
+    validTo: cert.validTo,
+    needsReissue: serverCertNeedsReissue(certPath),
+  };
 }
 
 // TLS material for a listener this node terminates itself: the operator's own
@@ -834,6 +904,9 @@ export {
   revokeDevice,
   isRevokedSerial,
   ensureServerCert,
+  serverCertNeedsReissue,
+  serverCertStatus,
+  appleMaxServerCertDays,
   nodeServerTlsOptions,
   sanEntry,
   spkiFingerprint,

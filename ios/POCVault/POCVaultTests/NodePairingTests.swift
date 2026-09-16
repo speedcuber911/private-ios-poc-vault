@@ -342,6 +342,43 @@ final class NodePairingTests: XCTestCase {
     /// A tag mismatch and a CA mismatch mean somebody is in the middle; a
     /// timeout means the machine is asleep. Only the first kind is worded, and
     /// treated, as a security event.
+    /// -1200 is the failure a build with the wrong ATS configuration produces,
+    /// and the failure an over-long server certificate produces. Telling the
+    /// user to check their network and restart relayd — which is what
+    /// `.unreachable` says — is wrong in both cases and cost a tester a day.
+    func testAHandshakeRefusedBelowTheAppIsNotReportedAsUnreachable() {
+        let tls = NSError(domain: NSURLErrorDomain, code: NSURLErrorSecureConnectionFailed)
+        XCTAssertEqual(
+            RelayNodePairingClient.failure(for: tls, rejectedTrust: false),
+            .handshakeRefused
+        )
+        let message = RelayNodePairingError.handshakeRefused.message
+        XCTAssertFalse(
+            message.contains("same network"),
+            "a refused handshake must not send the user to debug their network"
+        )
+        XCTAssertTrue(message.contains("398"), "the message must name the certificate limit that causes it")
+    }
+
+    func testAnOrdinaryTransportFailureIsStillReportedAsUnreachable() {
+        let offline = NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotConnectToHost)
+        XCTAssertEqual(
+            RelayNodePairingClient.failure(for: offline, rejectedTrust: false),
+            .unreachable(offline.localizedDescription)
+        )
+    }
+
+    /// A delegate rejection outranks the transport error, whatever it was:
+    /// URLSession reports a cancelled challenge as a generic cancellation, so
+    /// the flag is the only evidence that Relay itself refused the chain.
+    func testADelegateRejectionOutranksTheTransportError() {
+        let tls = NSError(domain: NSURLErrorDomain, code: NSURLErrorSecureConnectionFailed)
+        XCTAssertEqual(
+            RelayNodePairingClient.failure(for: tls, rejectedTrust: true),
+            .untrustedCertificate
+        )
+    }
+
     func testOnlyInterpositionFailuresAreFlaggedAsSecurityEvents() {
         XCTAssertTrue(RelayNodePairingError.tagMismatch.isSecurityEvent)
         XCTAssertTrue(RelayNodePairingError.caFingerprintMismatch.isSecurityEvent)
@@ -349,6 +386,10 @@ final class NodePairingTests: XCTestCase {
         XCTAssertFalse(RelayNodePairingError.codeRejected.isSecurityEvent)
         XCTAssertFalse(RelayNodePairingError.rateLimited.isSecurityEvent)
         XCTAssertFalse(RelayNodePairingError.unreachable("timed out").isSecurityEvent)
+        // A refused handshake is a broken build or a stale certificate, not
+        // someone on the wire. Wording it as an attack would train users to
+        // ignore the two cases that really are.
+        XCTAssertFalse(RelayNodePairingError.handshakeRefused.isSecurityEvent)
         XCTAssertFalse(RelayNodePairingError.server(status: 500).isSecurityEvent)
     }
 

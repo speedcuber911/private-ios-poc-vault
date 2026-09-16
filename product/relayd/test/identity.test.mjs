@@ -1,6 +1,7 @@
 // W2-MODULES identity tests: CA generation, device cert issuance from a CSR,
 // chain verification with `openssl verify`, revocation, file modes.
 import assert from "node:assert/strict";
+import cryptoMod from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -701,4 +702,82 @@ test("regression (adopt-logic-removed mutant): the lock loser adopts the winner'
   assert.equal(resultB.pub, resultA.pub, "the loser must report adopting, not regenerating, the winner's pubkey");
   const finalPub = identity.readEncPublicKeyB64(paths);
   assert.equal(finalPub, resultA.pub, "the winner's own already-published keypair must not be silently replaced");
+});
+
+// --- Apple's 398-day server-certificate limit survives an upgrade ----------
+//
+// serverCertDays was 825 before 90f16b2. The cap alone only governs
+// certificates issued AFTER it — ensureServerCert reuses whatever is on disk
+// whenever the recorded SAN list is unchanged, so a node set up before that
+// commit keeps serving its 825-day leaf through every upgrade and restart,
+// and every iPhone keeps refusing it with a bare TLS error. Reported by a
+// second user on 2026-09-16.
+
+function plantServerCert(baseDir, san, days, { notBefore = null, notAfter = null } = {}) {
+  const paths = identity.identityPaths(baseDir);
+  const keyPath = path.join(paths.serverDir, `${san}.key.pem`);
+  const certPath = path.join(paths.serverDir, `${san}.cert.pem`);
+  const sansPath = path.join(paths.serverDir, `${san}.sans`);
+  const work = fs.mkdtempSync(path.join(paths.tmpDir, "plant-"));
+  const csrPath = path.join(work, "s.csr.pem");
+  const extPath = path.join(work, "ext.cnf");
+  openssl(["ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", keyPath]);
+  openssl(["req", "-new", "-key", keyPath, "-subj", `/CN=${san}`, "-out", csrPath]);
+  fs.writeFileSync(
+    extPath,
+    ["basicConstraints=critical,CA:FALSE", "keyUsage=critical,digitalSignature,keyEncipherment",
+     "extendedKeyUsage=serverAuth", `subjectAltName=DNS:${san}`, ""].join("\n"),
+  );
+  const window = notBefore && notAfter
+    ? ["-not_before", notBefore, "-not_after", notAfter]
+    : ["-days", String(days)];
+  openssl(["x509", "-req", "-in", csrPath, "-CA", paths.caCertPath, "-CAkey", paths.caKeyPath,
+    "-set_serial", "0x01", ...window, "-sha256", "-extfile", extPath, "-out", certPath]);
+  fs.writeFileSync(sansPath, `DNS:${san}\n`);
+  return { certPath, keyPath };
+}
+
+function certDays(certPath) {
+  const x = new (cryptoMod).X509Certificate(fs.readFileSync(certPath));
+  return Math.round((Date.parse(x.validTo) - Date.parse(x.validFrom)) / 86400000);
+}
+
+test("ensureServerCert reissues a leaf that exceeds Apple's 398-day server limit", () => {
+  const baseDir = fs.mkdtempSync(path.join(tmpRoot, "stale-"));
+  identity.initIdentity({ baseDir });
+  const san = "legacy.tun.test";
+  const planted = plantServerCert(baseDir, san, 825);
+  assert.equal(certDays(planted.certPath), 825, "precondition: an 825-day leaf is on disk");
+
+  const result = identity.ensureServerCert({ san, baseDir });
+
+  assert.ok(certDays(result.certPath) <= 398, "an over-long leaf must be reissued, not reused");
+});
+
+test("ensureServerCert reissues an expired leaf", () => {
+  const baseDir = fs.mkdtempSync(path.join(tmpRoot, "expired-"));
+  identity.initIdentity({ baseDir });
+  const san = "expired.tun.test";
+  const stamp = (offsetDays) => {
+    const d = new Date(Date.now() + offsetDays * 86400000);
+    return d.toISOString().replace(/[-:T]/g, "").replace(/\.\d{3}Z$/, "Z");
+  };
+  const planted = plantServerCert(baseDir, san, 0, { notBefore: stamp(-30), notAfter: stamp(-1) });
+  const before = new (cryptoMod).X509Certificate(fs.readFileSync(planted.certPath));
+  assert.ok(Date.parse(before.validTo) < Date.now(), "precondition: the leaf is expired");
+
+  const result = identity.ensureServerCert({ san, baseDir });
+
+  const after = new (cryptoMod).X509Certificate(fs.readFileSync(result.certPath));
+  assert.ok(Date.parse(after.validTo) > Date.now(), "an expired leaf must be reissued");
+});
+
+test("ensureServerCert still reuses a healthy leaf", () => {
+  const baseDir = fs.mkdtempSync(path.join(tmpRoot, "healthy-"));
+  identity.initIdentity({ baseDir });
+  const first = identity.ensureServerCert({ san: "fresh.tun.test", baseDir });
+  const serial = openssl(["x509", "-in", first.certPath, "-noout", "-serial"]);
+  const second = identity.ensureServerCert({ san: "fresh.tun.test", baseDir });
+  assert.equal(openssl(["x509", "-in", second.certPath, "-noout", "-serial"]), serial,
+    "a healthy leaf must not be churned on every start");
 });

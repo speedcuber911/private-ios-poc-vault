@@ -150,6 +150,14 @@ async function cmdDoctor() {
   }
 
   if (config) {
+    // Snapshot the server certificate BEFORE the direct-TLS check below, which
+    // calls nodeServerTlsOptions() and so reissues a stale leaf as a side
+    // effect. Read afterwards, this would always show the repaired certificate
+    // and never the problem the user is calling about.
+    const serverCertBefore = config.externalTlsConfigured
+      ? null
+      : (await import("../src/identity.mjs")).serverCertStatus();
+
     // Listen mode. Tunneled mode needs a broker endpoint and an initialized
     // identity; direct mode needs neither.
     ok("listen mode", config.listenMode);
@@ -323,6 +331,38 @@ async function cmdDoctor() {
       // to — so it is called out rather than left to be discovered.
       if (status.hasEncKey) ok("handoff key", "X25519 keypair present");
       else warn("handoff key", "no X25519 keypair — this node cannot receive `relay handoff` sessions");
+
+      // The served leaf, read the way an iPhone reads it.
+      //
+      // Apple refuses a TLS server certificate whose validity period exceeds
+      // 398 days, and refuses it during trust evaluation — so the phone shows
+      // a bare TLS error while curl, openssl and Node all connect happily.
+      // Every other check in this command can pass with such a certificate in
+      // place, which is precisely how it cost two separate people a debugging
+      // session. Say it out loud instead.
+      if (config.externalTlsConfigured) {
+        ok("server certificate", "supplied by the operator (RELAYD_TLS_CERT_FILE) — relayd does not manage it");
+      } else {
+        const cert = serverCertBefore || { present: false };
+        if (!cert.present) {
+          warn("server certificate", `none issued yet for ${config.publicHost} (the first listener start creates it)`);
+        } else if (!cert.readable) {
+          bad("server certificate", `${cert.certPath} cannot be parsed (${cert.error}) — restart relayd to reissue it`);
+          failures += 1;
+        } else if (cert.expired) {
+          bad("server certificate", `expired ${cert.validTo} — restart relayd so it reissues and serves a fresh one`);
+          failures += 1;
+        } else if (cert.overAppleLimit) {
+          bad(
+            "server certificate",
+            `${cert.days} days of validity exceeds the 398 Apple allows, so every iPhone will refuse this machine ` +
+              "with a bare TLS error — restart relayd so it reissues and serves a fresh one",
+          );
+          failures += 1;
+        } else {
+          ok("server certificate", `${cert.days} days, ${cert.sans || "no SANs"}`);
+        }
+      }
     } catch (error) {
       bad("identity", error.message);
       failures += 1;

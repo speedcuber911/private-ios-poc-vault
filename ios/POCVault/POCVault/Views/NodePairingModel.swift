@@ -242,6 +242,17 @@ struct RelayNodePairingResult: Equatable {
 
 enum RelayNodePairingError: Error, Equatable {
     case unreachable(String)
+    /// The TLS handshake was torn down by the networking stack itself, before
+    /// the pin delegate's verdict could matter.
+    ///
+    /// This is its own case because the advice it needs is the opposite of
+    /// `unreachable`'s. The machine was reached; something about the
+    /// connection was refused below the app. On a BYO node that is almost
+    /// always App Transport Security in a build predating f84d30a, or a
+    /// server certificate whose validity exceeds the 398 days Apple allows —
+    /// neither of which the user can fix by checking their network or
+    /// restarting relayd, which is what the generic message told them to do.
+    case handshakeRefused
     /// TLS was refused because the machine's chain did not terminate in the CA
     /// the QR pinned.
     case untrustedCertificate
@@ -275,6 +286,8 @@ enum RelayNodePairingError: Error, Equatable {
         switch self {
         case .unreachable(let detail):
             return "Relay couldn't reach your machine. Check that it's on the same network and that `relayd` is running. (\(detail))"
+        case .handshakeRefused:
+            return "iOS refused the TLS connection to your machine before Relay could check its certificate, so the machine itself has nothing to answer for. Update Relay to the latest build and pair again. If you are already on it, run `relayd doctor` on the machine — a server certificate valid for more than 398 days fails in exactly this way."
         case .untrustedCertificate:
             return "Your machine presented a TLS certificate that does not come from the certificate authority in the pairing code. Relay stopped before sending anything. Pair again from a fresh `relayd pair`, and if it happens twice, treat this network as hostile."
         case .codeRejected:
@@ -348,10 +361,7 @@ struct RelayNodePairingClient {
         do {
             (data, response) = try await session.data(for: request)
         } catch {
-            if delegate.rejectedTrust {
-                throw RelayNodePairingError.untrustedCertificate
-            }
-            throw RelayNodePairingError.unreachable((error as NSError).localizedDescription)
+            throw Self.failure(for: error, rejectedTrust: delegate.rejectedTrust)
         }
 
         guard let http = response as? HTTPURLResponse else {
@@ -366,6 +376,25 @@ struct RelayNodePairingClient {
         }
 
         return try Self.decodeResponse(data, invite: invite, macKey: macKey)
+    }
+
+    /// Classifies a failed pairing request into the error whose advice is
+    /// actually actionable.
+    ///
+    /// Kept separate from `exchange` so it can be tested without a live node:
+    /// the distinction it draws only ever showed up on real hardware, which is
+    /// how a build with the wrong ATS configuration reached a second user and
+    /// sent them to debug machines that were never at fault.
+    static func failure(for error: Error, rejectedTrust: Bool) -> RelayNodePairingError {
+        // A rejection by our own delegate is the most specific thing we know,
+        // and URLSession reports it as a bare cancellation, so it is checked
+        // first — see `RelayPairingTrustDelegate.rejectedTrust`.
+        if rejectedTrust { return .untrustedCertificate }
+        let nsError = error as NSError
+        if nsError.domain == NSURLErrorDomain, nsError.code == NSURLErrorSecureConnectionFailed {
+            return .handshakeRefused
+        }
+        return .unreachable(nsError.localizedDescription)
     }
 
     /// `{"error": "..."}` — relayd's `sendError` shape.
