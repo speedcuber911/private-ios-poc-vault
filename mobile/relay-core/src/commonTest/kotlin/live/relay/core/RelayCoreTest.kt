@@ -50,6 +50,47 @@ class RelayCoreTest {
     }
 
     @Test
+    fun taskModelsAreGroupedUnderProvidersAndDefaultsAreNotPresentedAsAgents() {
+        val models = listOf(
+            ModelDescriptor("codex-cli", "Codex CLI", RelayProvider.CODEX, listOf("task")),
+            ModelDescriptor(
+                "codex-gpt-5.6-sol",
+                "Codex · GPT-5.6 Sol",
+                RelayProvider.CODEX,
+                listOf("task"),
+                taskModel = "gpt-5.6-sol",
+            ),
+            ModelDescriptor("claude-code", "Claude Code", RelayProvider.CLAUDE, listOf("task")),
+            ModelDescriptor(
+                "claude-code-opus",
+                "Claude Code · Opus",
+                RelayProvider.CLAUDE,
+                listOf("task"),
+                taskModel = "opus",
+            ),
+        )
+
+        val groups = RelayModelCatalog.taskGroups(models)
+
+        assertEquals(listOf(RelayProvider.CODEX, RelayProvider.CLAUDE), groups.map(TaskModelGroup::provider))
+        assertEquals(listOf("Default", "GPT-5.6 Sol"), groups[0].models.map(ModelDescriptor::selectionLabel))
+        assertEquals(listOf("Default", "Opus"), groups[1].models.map(ModelDescriptor::selectionLabel))
+        assertEquals("gpt-5.6-sol", RelayModelCatalog.preferredModel(models, RelayProvider.CODEX, currentTaskModel = "gpt-5.6-sol")?.taskModel)
+        assertEquals(null, RelayModelCatalog.preferredModel(models, RelayProvider.CLAUDE)?.taskModel)
+    }
+
+    @Test
+    fun refreshedCatalogAcceptsNewModelsAndKeepsTheCurrentSelection() {
+        val sol = ModelDescriptor("codex-sol", "Sol", RelayProvider.CODEX, listOf("task"), taskModel = "gpt-5.6-sol")
+        val astra = ModelDescriptor("codex-astra", "Astra", RelayProvider.CODEX, listOf("task"), taskModel = "gpt-6-astra")
+        val future = ModelDescriptor("codex-future", "Future", RelayProvider.CODEX, listOf("task"), taskModel = "future-model")
+        val refreshed = listOf(astra, sol, future)
+        assertEquals(listOf(astra, sol, future), RelayModelCatalog.modelsForProvider(refreshed, RelayProvider.CODEX))
+        assertEquals(sol, RelayModelCatalog.preferredModel(refreshed, RelayProvider.CODEX, currentId = sol.id))
+        assertEquals(astra, RelayModelCatalog.preferredModel(refreshed, RelayProvider.CODEX, currentId = astra.id))
+    }
+
+    @Test
     fun localhostPreviewUrlsAreExtractedAndValidated() {
         assertEquals(
             listOf("http://localhost:4317/demo", "https://127.0.0.1:8080/health"),

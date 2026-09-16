@@ -367,8 +367,8 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(events, [.delta("last token")])
     }
 
-    /// The live eight-entry catalog shape: Codex dual-mode Sol/Terra/Luna, Claude Code
-    /// task trio, Cursor Auto, and Kimi K3. Agents group by harness; chat models stay flat.
+    /// The live catalog shape: each provider has one Default entry plus its named models.
+    /// Providers are groups; their model rows are not presented as peer agents.
     func testRelayModelDiscoveryGroupsAgentsByHarness() throws {
         let models = try decodeCodexModels(liveShapeCatalogJSON)
 
@@ -378,12 +378,18 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(sections.agents.map(\.title), ["Codex", "Claude Code", "Cursor", "Kimi K3"])
         XCTAssertEqual(
             sections.agents[0].choices.map(\.model.id),
-            ["codex-gpt-5.6-sol", "codex-gpt-5.6-terra", "codex-gpt-5.6-luna"]
+            ["codex-cli", "codex-gpt-5.6-sol", "codex-gpt-5.6-terra", "codex-gpt-5.6-luna"]
+        )
+        XCTAssertEqual(
+            sections.agents[0].choices.map(\.shortModelLabel),
+            ["Default", "GPT-5.6 Sol", "GPT-5.6 Terra", "GPT-5.6 Luna"]
         )
         XCTAssertEqual(
             sections.agents[1].choices.map(\.shortModelLabel),
-            ["Sonnet", "Opus", "Haiku"]
+            ["Default", "Sonnet", "Opus", "Haiku"]
         )
+        XCTAssertTrue(sections.agents[0].choices[0].isProviderDefault)
+        XCTAssertTrue(sections.agents[1].choices[0].isProviderDefault)
         XCTAssertTrue(sections.agents.flatMap(\.choices).allSatisfy { $0.mode == .task })
 
         // Chat models: only the chat-capable Codex trio (no Azure advertised here).
@@ -556,13 +562,15 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(viewModel.messages.isEmpty)
     }
 
-    /// Live-catalog-shaped fixture used by the harness grouping tests.
+    /// Live-catalog-shaped fixture used by the provider-first model grouping tests.
     private var liveShapeCatalogJSON: String {
         """
         [
+          { "id": "codex-cli", "label": "Codex CLI", "provider": "codex", "modes": ["task"], "effortLevels": ["low", "medium", "high", "xhigh"] },
           { "id": "codex-gpt-5.6-sol", "label": "Codex · GPT-5.6 Sol", "provider": "codex", "modes": ["chat", "task"], "taskModel": "gpt-5.6-sol", "effortLevels": ["low", "medium", "high", "xhigh"] },
           { "id": "codex-gpt-5.6-terra", "label": "Codex · GPT-5.6 Terra", "provider": "codex", "modes": ["chat", "task"], "taskModel": "gpt-5.6-terra", "effortLevels": ["low", "medium", "high", "xhigh"] },
           { "id": "codex-gpt-5.6-luna", "label": "Codex · GPT-5.6 Luna", "provider": "codex", "modes": ["chat", "task"], "taskModel": "gpt-5.6-luna", "effortLevels": ["low", "medium", "high", "xhigh"] },
+          { "id": "claude-code", "label": "Claude Code", "provider": "claude", "modes": ["task"], "effortLevels": ["low", "medium", "high"] },
           { "id": "claude-code-sonnet", "label": "Claude Code · Sonnet", "provider": "claude", "modes": ["task"], "taskModel": "sonnet", "effortLevels": ["low", "medium", "high"] },
           { "id": "claude-code-opus", "label": "Claude Code · Opus", "provider": "claude", "modes": ["task"], "taskModel": "opus", "effortLevels": ["low", "medium", "high"] },
           { "id": "claude-code-haiku", "label": "Claude Code · Haiku", "provider": "claude", "modes": ["task"], "taskModel": "haiku", "effortLevels": ["low", "medium", "high"] },
@@ -2415,11 +2423,16 @@ final class ManifestTests: XCTestCase {
         XCTAssertFalse(source.contains("play.fill"))
         XCTAssertFalse(source.contains("threadsByWorkspace"))
 
-        // Harness-first picker: Agents submenus per harness + flat Chat models.
+        // The compact menu nests models per provider. The onboarding sheet uses one
+        // provider section per harness instead of flattening every model as an Agent.
         XCTAssertTrue(source.contains("Section(\"Agents\")"))
         XCTAssertTrue(source.contains("Section(\"Chat models\")"))
         XCTAssertTrue(source.contains("ForEach(visibleSections.agents)"))
         XCTAssertTrue(source.contains("Menu(harness.title)"))
+        XCTAssertTrue(source.contains("Section(harness.title)"))
+        XCTAssertTrue(source.contains("title: choice.shortModelLabel"))
+        XCTAssertTrue(source.contains("choice.isProviderDefault"))
+        XCTAssertFalse(source.contains("title: \"\\(harness.title) · \\(choice.shortModelLabel)\""))
         XCTAssertTrue(source.contains("ForEach(visibleSections.chatModels)"))
         XCTAssertTrue(source.contains("relay-model-chip"))
         XCTAssertTrue(source.contains("relay-effort-chip"))

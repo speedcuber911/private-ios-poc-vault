@@ -430,7 +430,83 @@ data class ModelDescriptor(
     val azureDeployment: String? = null,
     val taskModel: String? = null,
     val effortLevels: List<String> = emptyList(),
+) {
+    val supportsTask: Boolean get() = modes.isEmpty() || "task" in modes
+    val isProviderDefault: Boolean get() = supportsTask && taskModel.isNullOrBlank()
+
+    /** A model-only label for a row already grouped under its provider. */
+    val selectionLabel: String
+        get() {
+            if (isProviderDefault) return "Default"
+            if (provider == RelayProvider.KIMI && label.trim().lowercase() in setOf("kimi k3", "k3")) {
+                return "K3"
+            }
+            var value = label.trim()
+            for (alias in providerLabelAliases(provider)) {
+                val prefix = value.takeIf { it.startsWith(alias, ignoreCase = true) }
+                if (prefix != null) {
+                    val stripped = value.drop(alias.length).trim(' ', '\t', '·', ':', '-', '–', '—')
+                    if (stripped.isNotEmpty()) value = stripped
+                    break
+                }
+                val parenthetical = "($alias)"
+                if (value.endsWith(parenthetical, ignoreCase = true)) {
+                    val stripped = value.dropLast(parenthetical.length).trim()
+                    if (stripped.isNotEmpty()) value = stripped
+                    break
+                }
+            }
+            return value
+        }
+}
+
+data class TaskModelGroup(
+    val provider: RelayProvider,
+    val models: List<ModelDescriptor>,
 )
+
+/** Provider-first task model discovery shared by both native mobile surfaces. */
+object RelayModelCatalog {
+    private val providerOrder = listOf(
+        RelayProvider.CODEX,
+        RelayProvider.CLAUDE,
+        RelayProvider.CURSOR,
+        RelayProvider.KIMI,
+        RelayProvider.BEDROCK,
+        RelayProvider.AZURE,
+    )
+
+    fun taskGroups(models: List<ModelDescriptor>): List<TaskModelGroup> = providerOrder.mapNotNull { provider ->
+        val providerModels = models
+            .filter { it.provider == provider && it.supportsTask }
+            .sortedByDescending(ModelDescriptor::isProviderDefault)
+        providerModels.takeIf(List<ModelDescriptor>::isNotEmpty)?.let { TaskModelGroup(provider, it) }
+    }
+
+    fun modelsForProvider(models: List<ModelDescriptor>, provider: RelayProvider): List<ModelDescriptor> =
+        taskGroups(models).firstOrNull { it.provider == provider }?.models.orEmpty()
+
+    fun preferredModel(
+        models: List<ModelDescriptor>,
+        provider: RelayProvider,
+        currentId: String? = null,
+        currentTaskModel: String? = null,
+    ): ModelDescriptor? {
+        val available = modelsForProvider(models, provider)
+        return available.firstOrNull { it.id == currentId }
+            ?: available.firstOrNull { it.taskModel == currentTaskModel && !currentTaskModel.isNullOrBlank() }
+            ?: available.firstOrNull()
+    }
+}
+
+private fun providerLabelAliases(provider: RelayProvider): List<String> = when (provider) {
+    RelayProvider.CODEX -> listOf("Codex")
+    RelayProvider.CLAUDE -> listOf("Claude Code", "Claude")
+    RelayProvider.CURSOR -> listOf("Cursor Agent", "Cursor")
+    RelayProvider.KIMI -> listOf("Kimi K3", "Kimi Code", "Kimi")
+    RelayProvider.BEDROCK -> listOf("Bedrock")
+    RelayProvider.AZURE -> listOf("Azure OpenAI", "Azure")
+}
 
 @Serializable
 data class SkillDescriptor(

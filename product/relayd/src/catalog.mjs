@@ -7,11 +7,12 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 
-import { allowedThreadProviders, bedrockRegion, cleanDisplayName, cleanOptionalEndpoint, cleanOptionalFilePath, cleanEnvironmentVariableName, cleanOptionalAwsProfile, codexBin, cursorBin, kimiBin, codexHome, runHome, codexTransport, workspaceBrowseRoot } from "./config.mjs";
+import { allowedThreadProviders, bedrockRegion, cleanDisplayName, cleanOptionalEndpoint, cleanOptionalFilePath, cleanEnvironmentVariableName, cleanOptionalAwsProfile, codexBin, cursorBin, kimiBin, codexHome, runHome, workspaceBrowseRoot } from "./config.mjs";
 import { AppServerClient } from "./appserver-client.mjs";
 
 const modelCatalog = loadModelCatalog();
 let runtimeCodexModelsCache = { expiresAt: 0, models: null };
+let runtimeCodexModelsRefresh = null;
 
 function loadModelCatalog() {
   const configured = process.env.CODEX_MODEL_CATALOG
@@ -263,10 +264,22 @@ function publicModelCatalog() {
 
 async function publicRuntimeModelCatalog() {
   const configured = publicModelCatalog();
-  if (codexTransport !== "app-server") return configured;
-  if (runtimeCodexModelsCache.models && runtimeCodexModelsCache.expiresAt > Date.now()) {
-    return mergeRuntimeCodexModels(configured, runtimeCodexModelsCache.models);
+  // Discovery is independent of whether jobs run through exec or app-server.
+  // Share refreshes across phone requests and task validation.
+  if (runtimeCodexModelsCache.expiresAt <= Date.now()) {
+    if (!runtimeCodexModelsRefresh) {
+      runtimeCodexModelsRefresh = refreshRuntimeCodexModels().finally(() => {
+        runtimeCodexModelsRefresh = null;
+      });
+    }
+    await runtimeCodexModelsRefresh;
   }
+  return runtimeCodexModelsCache.models
+    ? mergeRuntimeCodexModels(configured, runtimeCodexModelsCache.models)
+    : configured;
+}
+
+async function refreshRuntimeCodexModels() {
   let client;
   try {
     client = new AppServerClient({
@@ -276,28 +289,46 @@ async function publicRuntimeModelCatalog() {
       requestTimeoutMs: 5000,
     });
     await client.start();
-    const response = await client.request("model/list", {});
-    const models = Array.isArray(response?.data) ? response.data.map(runtimeCodexDescriptor).filter(Boolean) : [];
-    if (models.length) runtimeCodexModelsCache = { models, expiresAt: Date.now() + 5 * 60 * 1000 };
-    return models.length ? mergeRuntimeCodexModels(configured, models) : configured;
+    const models = new Map();
+    const cursors = new Set();
+    let cursor;
+    do {
+      const response = await client.request("model/list", { limit: 100, includeHidden: false, ...(cursor ? { cursor } : {}) });
+      if (!Array.isArray(response?.data)) throw new Error("Invalid Codex model list");
+      for (const entry of response.data) {
+        const model = runtimeCodexDescriptor(entry);
+        if (model) models.set(model.taskModel, model);
+      }
+      cursor = response.nextCursor;
+      if (cursor && (typeof cursor !== "string" || cursors.has(cursor) || cursors.size >= 100)) {
+        throw new Error("Invalid Codex model list cursor");
+      }
+      if (cursor) cursors.add(cursor);
+    } while (cursor);
+    if (!models.size) throw new Error("Empty Codex model list");
+    runtimeCodexModelsCache = { models: [...models.values()], expiresAt: Date.now() + 60 * 1000 };
   } catch {
-    return configured;
+    // Keep the last successful discovery on transient failures, and back off
+    // instead of spawning a failing CLI for every request.
+    runtimeCodexModelsCache.expiresAt = Date.now() + 30 * 1000;
   } finally {
     client?.stop();
   }
 }
 
 function runtimeCodexDescriptor(model) {
-  if (!model || typeof model.id !== "string" || !/^[A-Za-z0-9._:/-]{1,180}$/.test(model.id)) return null;
+  if (!model || model.hidden === true) return null;
+  const taskModel = model.model ?? model.id;
+  if (typeof taskModel !== "string" || !/^[A-Za-z0-9._:/-]{1,180}$/.test(taskModel)) return null;
   const efforts = Array.isArray(model.supportedReasoningEfforts)
     ? model.supportedReasoningEfforts.map((entry) => entry?.reasoningEffort).filter((value) => ["low", "medium", "high", "xhigh", "max", "ultra"].includes(value))
     : [];
   return {
-    id: `codex-${model.id}`,
-    label: `Codex · ${cleanDisplayName(model.displayName || model.name || model.id, "model label", 120)}`,
+    id: `codex-${taskModel}`,
+    label: `Codex · ${cleanDisplayName(model.displayName || model.name || taskModel, "model label", 120)}`,
     provider: "codex",
     modes: ["task"],
-    taskModel: model.id,
+    taskModel,
     effortLevels: efforts,
   };
 }

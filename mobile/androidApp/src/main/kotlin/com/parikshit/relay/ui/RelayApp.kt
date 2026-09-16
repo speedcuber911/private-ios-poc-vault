@@ -12,6 +12,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -95,6 +96,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.net.toUri
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.delay
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.parikshit.relay.data.RelaySettings
 import live.relay.core.Approval
@@ -102,6 +107,7 @@ import live.relay.core.JobArtifact
 import live.relay.core.ModelDescriptor
 import live.relay.core.PocEntry
 import live.relay.core.RelayLocalPreviewUrls
+import live.relay.core.RelayModelCatalog
 import live.relay.core.RelayProvider
 import live.relay.core.RelayAIDataSharing
 import live.relay.core.RelayArtifactPresentation
@@ -138,6 +144,16 @@ private enum class PreviewSource(val label: String) {
 @Composable
 fun RelayApp(viewModel: RelayViewModel = viewModel()) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(lifecycleOwner, state.connectionRevision, state.selectedWorkspace?.workspaceId) {
+        if (state.selectedWorkspace == null) return@LaunchedEffect
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                viewModel.refreshModels()
+                delay(60_000)
+            }
+        }
+    }
     val snackbar = remember { SnackbarHostState() }
     var tab by rememberSaveable { mutableStateOf(RootTab.WORKSPACES) }
     var previewSource by rememberSaveable(state.connectionRevision) { mutableStateOf(PreviewSource.WORKSPACE_RESULTS) }
@@ -958,6 +974,21 @@ private fun WorkspaceSessionScreen(
     var pendingConsentPrompt by rememberSaveable { mutableStateOf<String?>(null) }
     var showingConsentReview by rememberSaveable { mutableStateOf(false) }
     var automaticallyPresentedConsentProviders by remember { mutableStateOf(emptySet<RelayProvider>()) }
+    var selectedModelId by rememberSaveable { mutableStateOf<String?>(null) }
+    val providerOptions = availableProviders(state)
+    val modelOptions = RelayModelCatalog.modelsForProvider(state.models, provider)
+    val selectedModel = RelayModelCatalog.preferredModel(state.models, provider, currentId = selectedModelId)
+
+    LaunchedEffect(providerOptions) {
+        if (provider !in providerOptions) provider = providerOptions.firstOrNull() ?: RelayProvider.CODEX
+    }
+    LaunchedEffect(provider, state.models) {
+        selectedModelId = RelayModelCatalog.preferredModel(
+            state.models,
+            provider,
+            currentId = selectedModelId,
+        )?.id
+    }
     BackHandler(onBack = onBack)
 
     LaunchedEffect(provider, state.aiDataConsentProviders) {
@@ -994,14 +1025,20 @@ private fun WorkspaceSessionScreen(
                 prompt = prompt,
                 onPrompt = { prompt = it },
                 provider = provider,
-                availableProviders = availableProviders(state),
+                availableProviders = providerOptions,
                 providerLocked = false,
-                onProvider = { provider = it },
+                onProvider = {
+                    provider = it
+                    selectedModelId = null
+                },
+                modelOptions = modelOptions,
+                selectedModelId = selectedModel?.id,
+                onModel = { selectedModelId = it.id },
                 aiDataConsentGranted = provider in state.aiDataConsentProviders,
                 onReviewAIDataSharing = { showingConsentReview = true },
                 onSend = {
                     if (provider in state.aiDataConsentProviders) {
-                        onSubmit(prompt, provider, defaultModel(state, provider))
+                        onSubmit(prompt, provider, selectedModel?.taskModel)
                         prompt = ""
                     } else {
                         pendingConsentPrompt = prompt
@@ -1058,7 +1095,7 @@ private fun WorkspaceSessionScreen(
             onAllow = {
                 if (provider !in state.aiDataConsentProviders) onGrantAIDataConsent(provider)
                 if (pendingPrompt != null) {
-                    onSubmit(pendingPrompt, provider, defaultModel(state, provider))
+                    onSubmit(pendingPrompt, provider, selectedModel?.taskModel)
                     prompt = ""
                 }
                 pendingConsentPrompt = null
@@ -1090,6 +1127,22 @@ private fun ConversationScreen(
     var pendingConsentPrompt by rememberSaveable(detail.thread.resolvedId) { mutableStateOf<String?>(null) }
     var showingConsentReview by rememberSaveable(detail.thread.resolvedId) { mutableStateOf(false) }
     var automaticallyPresentedConsent by remember(detail.thread.resolvedId) { mutableStateOf(false) }
+    var selectedModelId by rememberSaveable(detail.thread.resolvedId) { mutableStateOf<String?>(null) }
+    val modelOptions = RelayModelCatalog.modelsForProvider(state.models, provider)
+    val selectedModel = RelayModelCatalog.preferredModel(
+        state.models,
+        provider,
+        currentId = selectedModelId,
+        currentTaskModel = detail.thread.model,
+    )
+    LaunchedEffect(detail.thread.resolvedId, state.models) {
+        selectedModelId = RelayModelCatalog.preferredModel(
+            state.models,
+            provider,
+            currentId = selectedModelId,
+            currentTaskModel = detail.thread.model,
+        )?.id
+    }
     BackHandler(onBack = onBack)
 
     LaunchedEffect(provider, state.aiDataConsentProviders) {
@@ -1125,11 +1178,14 @@ private fun ConversationScreen(
                 availableProviders = listOf(provider),
                 providerLocked = true,
                 onProvider = {},
+                modelOptions = modelOptions,
+                selectedModelId = selectedModel?.id,
+                onModel = { selectedModelId = it.id },
                 aiDataConsentGranted = provider in state.aiDataConsentProviders,
                 onReviewAIDataSharing = { showingConsentReview = true },
                 onSend = {
                     if (provider in state.aiDataConsentProviders) {
-                        onSubmit(prompt, provider, defaultModel(state, provider))
+                        onSubmit(prompt, provider, selectedModel?.taskModel)
                         prompt = ""
                     } else {
                         pendingConsentPrompt = prompt
@@ -1163,7 +1219,7 @@ private fun ConversationScreen(
             onAllow = {
                 if (provider !in state.aiDataConsentProviders) onGrantAIDataConsent(provider)
                 if (pendingPrompt != null) {
-                    onSubmit(pendingPrompt, provider, defaultModel(state, provider))
+                    onSubmit(pendingPrompt, provider, selectedModel?.taskModel)
                     prompt = ""
                 }
                 pendingConsentPrompt = null
@@ -1266,13 +1322,19 @@ private fun Composer(
     availableProviders: List<RelayProvider>,
     providerLocked: Boolean,
     onProvider: (RelayProvider) -> Unit,
+    modelOptions: List<ModelDescriptor>,
+    selectedModelId: String?,
+    onModel: (ModelDescriptor) -> Unit,
     aiDataConsentGranted: Boolean,
     onReviewAIDataSharing: () -> Unit,
     onSend: () -> Unit,
 ) {
     Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 4.dp) {
         Column(Modifier.padding(horizontal = 12.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Row(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+            Row(
+                Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(7.dp),
+            ) {
                 availableProviders.forEach { option ->
                     FilterChip(
                         selected = option == provider,
@@ -1282,9 +1344,28 @@ private fun Composer(
                     )
                 }
             }
+            if (modelOptions.isNotEmpty()) {
+                Text(
+                    "${provider.displayName} model",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(
+                    Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(7.dp),
+                ) {
+                    modelOptions.forEach { option ->
+                        FilterChip(
+                            selected = option.id == selectedModelId,
+                            onClick = { onModel(option) },
+                            label = { Text(option.selectionLabel) },
+                        )
+                    }
+                }
+            }
             if (providerLocked) {
                 Text(
-                    "Provider is locked for this thread. Start a new session to switch.",
+                    "Provider is locked for this thread; its model can still change.",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -1588,14 +1669,11 @@ private fun RelayWebView(
 }
 
 private fun availableProviders(state: RelayUiState): List<RelayProvider> {
-    val fromModels = state.models.filter { "task" in it.modes || it.modes.isEmpty() }.map(ModelDescriptor::provider).distinct()
+    val fromModels = RelayModelCatalog.taskGroups(state.models).map { it.provider }
     return fromModels.ifEmpty {
         listOf(RelayProvider.CODEX, RelayProvider.CLAUDE, RelayProvider.CURSOR, RelayProvider.KIMI)
     }
 }
-
-private fun defaultModel(state: RelayUiState, provider: RelayProvider): String? =
-    state.models.firstOrNull { it.provider == provider && ("task" in it.modes || it.modes.isEmpty()) }?.taskModel
 
 private fun artifactUrl(artifact: JobArtifact, baseUrl: String): String? {
     val value = artifact.previewURL ?: artifact.rawURL ?: return null

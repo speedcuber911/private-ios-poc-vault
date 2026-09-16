@@ -88,9 +88,16 @@ struct RelayModelChoice: Identifiable, Hashable {
 
     var harnessTitle: String { Self.harnessTitle(for: model.provider) }
 
+    /// A task catalog entry without a `taskModel` delegates model choice to the
+    /// provider CLI. It is the provider's Default model choice, not another agent.
+    var isProviderDefault: Bool {
+        mode == .task && model.taskModel?.trimmedNonEmpty == nil
+    }
+
     /// The model label with any redundant harness prefix/suffix stripped, so submenu rows
-    /// read "GPT-5.6 Sol" under Codex, "Auto" under Cursor, "Sonnet" under Claude Code.
+    /// read "Default" / "GPT-5.6 Sol" under Codex and "Sonnet" under Claude Code.
     var shortModelLabel: String {
+        if isProviderDefault { return "Default" }
         var text = model.label.trimmingCharacters(in: .whitespacesAndNewlines)
         if model.provider == .kimi, ["kimi k3", "k3"].contains(text.lowercased()) {
             return "K3"
@@ -199,9 +206,19 @@ enum RelayModelDiscovery {
         let agents = agentProviderOrder.compactMap { provider -> RelayHarnessGroup? in
             let entries = models.filter { $0.provider == provider && $0.supports(.task) }
             guard !entries.isEmpty else { return nil }
+            let choices = entries
+                .map { RelayModelChoice(model: $0, mode: .task) }
+                .enumerated()
+                .sorted { lhs, rhs in
+                    if lhs.element.isProviderDefault != rhs.element.isProviderDefault {
+                        return lhs.element.isProviderDefault
+                    }
+                    return lhs.offset < rhs.offset
+                }
+                .map(\.element)
             return RelayHarnessGroup(
                 provider: provider,
-                choices: entries.map { RelayModelChoice(model: $0, mode: .task) }
+                choices: choices
             )
         }
         let chatModels = chatProviderOrder.flatMap { provider in
@@ -449,7 +466,8 @@ final class RelayChatViewModel: ObservableObject {
 
     private func ensureSelectedChoiceValid() {
         let sections = pickerSections
-        if let selectedChoice, sections.allChoices.contains(selectedChoice) {
+        if let selectedChoice, let refreshed = sections.allChoices.first(where: { $0.id == selectedChoice.id }) {
+            self.selectedChoice = refreshed
             return
         }
         if let fallback = sections.defaultChoice {
@@ -458,6 +476,23 @@ final class RelayChatViewModel: ObservableObject {
     }
 
     // MARK: - Bootstrap / refresh
+
+    private var isRefreshingModels = false
+
+    func refreshModels() async {
+        guard !isRefreshingModels else { return }
+        isRefreshingModels = true
+        defer { isRefreshingModels = false }
+        do {
+            let refreshed = try await client.fetchModels()
+            guard !Task.isCancelled else { return }
+            models = refreshed
+            ensureSelectedChoiceValid()
+        } catch {
+            // A failed refresh must not erase the last usable picker or selection.
+            CodexDiagnostics.log("model_refresh_failed", fields: ["error": String(describing: error)])
+        }
+    }
 
     func bootstrap() async {
         guard !isLoading else { return }

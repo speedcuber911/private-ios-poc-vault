@@ -158,6 +158,20 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
 
     fun navigateToDirectory(path: String) = loadWorkspaces(path)
 
+    suspend fun refreshModels() {
+        val revision = _uiState.value.connectionRevision
+        if (!_uiState.value.isReadyForMachineRequests) return
+        try {
+            val models = repository().listModels()
+            _uiState.update {
+                if (it.connectionRevision == revision) it.copy(models = models) else it
+            }
+        } catch (error: Exception) {
+            kotlin.coroutines.coroutineContext.ensureActive()
+            // Preserve the last successful catalog during connection failures.
+        }
+    }
+
     fun navigateUp() {
         _uiState.value.listing?.upNavigationPath?.let(::loadWorkspaces)
     }

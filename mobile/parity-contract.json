@@ -35,6 +35,22 @@
       }
     },
     {
+      "id": "provider-first-model-selection",
+      "surfaces": {
+        "shared": [{"path": "mobile/relay-core/src/commonMain/kotlin/live/relay/core/RelayModels.kt", "contains": ["RelayModelCatalog", "modelsForProvider", "selectionLabel"]}],
+        "ios": [{"path": "ios/POCVault/POCVault/Views/RelayChatView.swift", "contains": ["Section(harness.title)", "title: choice.shortModelLabel", "choice.isProviderDefault"]}],
+        "android": [{"path": "mobile/androidApp/src/main/kotlin/com/parikshit/relay/ui/RelayApp.kt", "contains": ["modelOptions", "selectedModelId", "option.selectionLabel"]}]
+      }
+    },
+    {
+      "id": "automatic-model-catalog-refresh",
+      "surfaces": {
+        "shared": [{"path": "mobile/relay-core/src/commonMain/kotlin/live/relay/core/RelayRepository.kt", "contains": ["listModels"]}],
+        "ios": [{"path": "ios/POCVault/POCVault/Views/RelayChatView.swift", "contains": [".task(id: scenePhase)", "refreshModels()"]}],
+        "android": [{"path": "mobile/androidApp/src/main/kotlin/com/parikshit/relay/ui/RelayApp.kt", "contains": ["repeatOnLifecycle", "refreshModels()"]}]
+      }
+    },
+    {
       "id": "older-runner-approval-fallback",
       "surfaces": {
         "shared": [{"path": "mobile/relay-core/src/commonMain/kotlin/live/relay/core/RelayRepository.kt", "contains": ["isGenericRouteNotFound", "listPendingApprovalsIfSupported"]}],

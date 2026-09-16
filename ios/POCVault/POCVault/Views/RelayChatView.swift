@@ -3,6 +3,7 @@ import SwiftUI
 import UIKit
 
 struct RelayChatView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var viewModel: RelayChatViewModel
     let client: CodexClient
     @ObservedObject var identityStore: ClientIdentityStore
@@ -105,6 +106,19 @@ struct RelayChatView: View {
                     modelPickerRequest += 1
                 }
             }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active {
+                    Task { await viewModel.refreshModels() }
+                }
+            }
+            .task(id: scenePhase) {
+                guard scenePhase == .active else { return }
+                while !Task.isCancelled {
+                    do { try await Task.sleep(for: .seconds(60)) }
+                    catch { return }
+                    await viewModel.refreshModels()
+                }
+            }
             .onChange(of: threadsRequest.wrappedValue) { _, _ in
                 honorThreadsRequest()
             }
@@ -117,7 +131,10 @@ struct RelayChatView: View {
             .sheet(item: $providerLoginRequest, onDismiss: {
                 // The machine's login state changed (or the user backed out);
                 // either way the composer notice must reflect reality.
-                Task { await viewModel.refreshHarnesses() }
+                Task {
+                    await viewModel.refreshHarnesses()
+                    await viewModel.refreshModels()
+                }
             }) { provider in
                 ProviderLoginView(client: client, provider: provider)
             }
@@ -1150,16 +1167,18 @@ private struct RelayComposer: View {
         NavigationStack {
             List {
                 if !visibleSections.agents.isEmpty {
-                    Section("Agents") {
-                        ForEach(visibleSections.agents) { harness in
+                    ForEach(visibleSections.agents) { harness in
+                        Section(harness.title) {
                             ForEach(harness.choices) { choice in
                                 Button {
                                     requestChoice(choice)
                                     showingModelPicker = false
                                 } label: {
                                     pickerRow(
-                                        title: "\(harness.title) · \(choice.shortModelLabel)",
-                                        detail: "Agent session",
+                                        title: choice.shortModelLabel,
+                                        detail: choice.isProviderDefault
+                                            ? "Uses \(harness.title)'s configured default model"
+                                            : "Runs this \(harness.title) session with \(choice.shortModelLabel)",
                                         selected: choice == selectedChoice,
                                         provider: choice.executionProvider
                                     )
