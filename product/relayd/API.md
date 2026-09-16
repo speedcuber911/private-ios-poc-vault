@@ -422,7 +422,10 @@ workspace (`id` = `dir-<slug>`, 432–446) and returns 200
 **`POST /v1/codex/workspaces/create`** (1466–1469, 1043–1088) — body
 `{"parentPath": "…", "name": "…"}` (`path` accepted as alias for
 `parentPath`). Name rules: 1–80 chars, `^[A-Za-z0-9][A-Za-z0-9._ -]*$`, no
-leading dot, no separators. Creates the directory (mode 0755,
+leading dot, no separators. Leading/trailing whitespace is trimmed; after
+validation, runs of spaces become one hyphen (`this is a test` →
+`this-is-a-test`). Existing directory paths are preserved. A normalized name
+that already exists returns 409. Creates the directory (mode 0755,
 non-recursive) and returns **201** `{"id","name","path"}`. Errors: 400
 invalid name/escape, 409 `workspace folder already exists`, 500.
 

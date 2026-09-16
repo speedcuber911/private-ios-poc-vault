@@ -375,7 +375,9 @@ function cleanWorkspaceDirectoryName(value) {
   ) {
     throw Object.assign(new Error("workspace folder name is invalid"), { status: 400 });
   }
-  return name;
+  // Validate the original input first so normalization cannot hide invalid
+  // characters. Only new folder names change; existing paths stay literal.
+  return name.replace(/ +/g, "-");
 }
 
 

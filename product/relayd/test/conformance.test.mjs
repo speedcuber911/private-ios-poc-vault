@@ -2390,6 +2390,60 @@ localTest("browses and selects only directories inside the workspace root", "cre
   }
 });
 
+localTest("normalizes spaces in new folder names while preserving existing paths", "creates and lists real directories on the server filesystem", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "relayd-folder-names-"));
+  const browseRoot = path.join(tmpDir, "workspaces");
+  const parentDir = path.join(browseRoot, "existing folder");
+  await fs.mkdir(parentDir, { recursive: true });
+  const server = await startServer({
+    CODEX_REQUIRE_MTLS: "false",
+    CODEX_DATA_DIR: path.join(tmpDir, "data"),
+    CODEX_WORKSPACE_BROWSE_ROOT: browseRoot,
+    CODEX_WORKSPACES: JSON.stringify([{ id: "existing", name: "Existing", path: parentDir }]),
+    CODEX_BIN: await makeFakeCodex(tmpDir),
+  });
+  const create = (name) => fetch(`${server.baseUrl}/v1/codex/workspaces/create`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ parentPath: parentDir, name }),
+  });
+  try {
+    const response = await create("  this is  a test  ");
+    assert.equal(response.status, 201);
+    const workspace = await response.json();
+    const expectedPath = await fs.realpath(path.join(parentDir, "this-is-a-test"));
+    assert.equal(workspace.path, expectedPath);
+    assert.equal(workspace.name, "Existing / this-is-a-test");
+    assert.deepEqual(await fs.readdir(parentDir), ["this-is-a-test"]);
+
+    for (const name of ["this is a test", "this-is-a-test"]) {
+      assert.equal((await create(name)).status, 409, name);
+    }
+    for (const name of ["'this is a test'", "../escape", "a/b", "a\\b", "a\tb", "a\nb", "a\0b", "   ", "a".repeat(81)]) {
+      assert.equal((await create(name)).status, 400, JSON.stringify(name));
+    }
+
+    const legacyDir = path.join(parentDir, "old folder");
+    await fs.mkdir(legacyDir);
+    const listingResponse = await fetch(`${server.baseUrl}/v1/codex/workspace-dirs?${new URLSearchParams({ path: parentDir })}`);
+    assert.equal(listingResponse.status, 200);
+    const listing = await listingResponse.json();
+    assert.deepEqual(listing.entries.map((entry) => entry.name).sort(), ["old folder", "this-is-a-test"]);
+    for (const selectedPath of [legacyDir, expectedPath]) {
+      const selection = await fetch(`${server.baseUrl}/v1/codex/workspaces/select`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path: selectedPath }),
+      });
+      assert.equal(selection.status, 200);
+      assert.equal((await selection.json()).path, await fs.realpath(selectedPath));
+    }
+  } finally {
+    await server.stop();
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
 localTest("runs jobs and aggregates threads from a selected directory workspace", "runs real jobs and seeds a directory workspace tree on the server", async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
   const browseRoot = path.join(tmpDir, "workspaces");
