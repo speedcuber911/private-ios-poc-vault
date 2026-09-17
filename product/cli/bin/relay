@@ -1,14 +1,16 @@
 #!/usr/bin/env node
-// relay — the desk end of the handoff.
+// relay — direct session sync plus the legacy account-backed handoff tools.
 //
-// Every subcommand except `login` requires a git repository whose origin points
-// at github.com; the repo is the unit of everything this tool does. Modules are
+// Repository commands use the current Git checkout as their unit of work.
+// Direct pairing and account commands do not require a repository. Modules are
 // imported lazily so `relay help` never touches credentials or spawns git.
 const [, , command, ...rest] = process.argv;
 
 const usage = `usage: relay <command>
 
   login       sign in to Relay and pin the machine this desk hands off to
+  connect     pair this laptop directly with a relayd machine
+  sync-sessions copy this repository's Codex sessions directly to relayd
   init        register this repository for handoffs
   handoff     hand the current session to your machine
   sync-auth   copy your GitHub and harness logins to your machine
@@ -34,6 +36,16 @@ async function withProgress() {
 
 try {
   switch (command) {
+    case "connect": {
+      const { cmdConnect } = await import("../src/commands/connect.mjs");
+      await cmdConnect(rest);
+      break;
+    }
+    case "sync-sessions": {
+      const { cmdSyncSessions } = await import("../src/commands/syncsessions.mjs");
+      await cmdSyncSessions(rest);
+      break;
+    }
     case "login": {
       const { cmdLogin } = await import("../src/commands/login.mjs");
       await cmdLogin(rest, { progress: await withProgress() });

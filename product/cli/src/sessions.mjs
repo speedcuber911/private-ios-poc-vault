@@ -269,7 +269,10 @@ function readCodexSessionMeta(records) {
     if (!payload || typeof payload !== "object") continue;
     if (!isResumableSessionId(payload.id)) continue;
     if (typeof payload.cwd !== "string" || payload.cwd.length === 0) continue;
-    return { id: payload.id, cwd: payload.cwd };
+    const timestamp = typeof payload.timestamp === "string"
+      ? payload.timestamp
+      : typeof record.timestamp === "string" ? record.timestamp : null;
+    return { id: payload.id, cwd: payload.cwd, timestamp };
   }
   return null;
 }
@@ -309,6 +312,8 @@ function discoverCodexSessions({ cwd, home }) {
         format: "codex-rollout",
         title: titleFrom(records, "Codex session"),
         lastActive: stat.mtime.toISOString(),
+        createdAt: meta.timestamp,
+        sourceCwd: meta.cwd,
         filePath: entryPath,
         sizeBytes: stat.size,
       });

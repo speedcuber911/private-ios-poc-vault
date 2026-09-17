@@ -1,13 +1,12 @@
 # Relay CLI
 
-The Relay CLI hands a local Claude Code or Codex session to the machine you
-run Relay on, and copies your provider credentials onto it. Relay does not
-supply that machine: you install `relayd` on your own VM or box and pair it
-with the phone by scanning the QR code `relayd pair` prints. Moving credentials
-to that machine is the reason this CLI exists.
+The Relay CLI can pair a laptop directly with the machine running `relayd` and
+copy a repository's native Codex sessions to it. This transcript sync is
+separate from Git: it does not inspect, stage, commit, or push the working tree.
+Relay does not supply the machine; you run `relayd` on your own VM or box.
 
-It requires macOS or Linux, Node.js 20 or newer, Git, and a GitHub remote for
-repository handoffs.
+It requires macOS or Linux, Node.js 20 or newer, and Git. A GitHub remote is
+required only for the older account-backed handoff commands.
 
 ## Install
 
@@ -38,12 +37,29 @@ relay handoff
 
 ## Commands
 
+`relay connect '<Link>'` performs a one-time direct pairing between the laptop
+and `relayd`. Obtain the Link from `relayd pair --no-qr` on the target machine.
+The CLI verifies the QR link's CA SPKI pin on the live TLS connection before it
+sends the single-use pairing secret, then stores the issued host-scoped bearer
+and CA under `~/.relay/direct.json` with mode `0600`.
+
+`relay sync-sessions` discovers native Codex rollouts whose recorded cwd is the
+current repository, compares their hashes with the selected relayd workspace,
+and uploads only missing or changed transcripts. The daemon rewrites the local
+cwd to the remote workspace and installs each rollout under the same native
+session id. A session changed on both machines is reported as a conflict and is
+never overwritten. Use `--workspace <id>` for the first ambiguous repository;
+the mapping is remembered. `--list-workspaces` prints available ids.
+
 `relay install-skill` installs the shared `relay-handoff` Agent Skill into the
 user-level skill directories for Codex, Claude Code, Cursor, and Kimi Code.
 After starting a new agent session, phrases such as “handoff to Relay”, “send
 this to Relay”, or “continue this on my phone” trigger the workflow. The skill
-drives the existing CLI commands; it does not add an MCP server or copy agent
-settings, plugins, skills, or slash commands to the Relay runner. Re-run with
+publishes only the active task's Git changes, safely fast-forwards an available
+paired-machine checkout, and then runs the direct session sync. The underlying
+`relay sync-sessions` command remains Git-independent. The skill does not add
+an MCP server or copy agent settings, plugins, skills, or slash commands to the
+Relay runner. Re-run with
 `--force` only when intentionally replacing a locally modified copy. Relay
 records a content digest in copies it installed: `relay update` can refresh an
 unchanged managed copy automatically, but refuses to overwrite a user-edited

@@ -1,7 +1,7 @@
 {
   "name": "@relay/cli",
   "version": "0.1.4",
-  "description": "Hand a local coding-agent session off to your Relay machine",
+  "description": "Publish repository work and sync native Codex sessions to your Relay machine",
   "type": "module",
   "engines": { "node": ">=20" },
   "bin": { "relay": "bin/relay" },

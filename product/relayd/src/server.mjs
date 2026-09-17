@@ -19,7 +19,8 @@ import { cleanThreadProviderFilter, workspaceForJob, listWorkspaceSessions, list
 import { handleChatRequest } from "./chat.mjs";
 import { isSafeArtifactId, serveJobArtifact } from "./artifacts.mjs";
 import { transcribeAudio, cleanAudioContentType, cleanAudioFilename } from "./transcribe.mjs";
-import { jobsState, jobs, activeChildren, responseShape, wantsFullLogs, enqueueJob, cleanJobProviderFilter, normalizeJobProvider, cancelJob, streamJobEvents, toJobResponse } from "./jobs.mjs";
+import { jobsState, jobs, activeChildren, responseShape, wantsFullLogs, enqueueJob, cleanJobProviderFilter, normalizeJobProvider, jobThreadId, cancelJob, streamJobEvents, toJobResponse } from "./jobs.mjs";
+import { planSessionImports, importCodexSession, createSessionUpload, appendSessionUpload, completeSessionUpload } from "./session-sync.mjs";
 import { codexThreadUiHtml } from "./ui.mjs";
 import { handleAdditionRoutes } from "./additions.mjs";
 import { ApprovalStore, publicApproval, terminalDecisions } from "./approval-store.mjs";
@@ -301,6 +302,68 @@ async function routeRequest(req, res) {
   if (req.method === "POST" && url.pathname === "/v1/codex/workspaces/create") {
     const body = await readBody(req);
     return sendJson(res, 201, publicWorkspace(createWorkspaceDirectory(body)));
+  }
+
+  if (req.method === "POST" && url.pathname === "/v1/codex/session-imports/plan") {
+    const body = await readBody(req);
+    const plan = planSessionImports(body);
+    const activeSessionIds = new Set(
+      [...jobs.values()]
+        .filter((job) => !["succeeded", "failed", "cancelled", "timed_out"].includes(job.status))
+        .map(jobThreadId)
+        .filter(Boolean),
+    );
+    plan.sessions = plan.sessions.map((entry) => activeSessionIds.has(entry.id)
+      ? { ...entry, status: "conflict", reason: "session_is_active" }
+      : entry);
+    return sendJson(res, 200, plan);
+  }
+
+  if (req.method === "POST" && url.pathname === "/v1/codex/session-imports") {
+    const body = await readBody(req);
+    const sessionId = body?.session?.id;
+    const active = [...jobs.values()].some((job) =>
+      jobThreadId(job) === sessionId && !["succeeded", "failed", "cancelled", "timed_out"].includes(job.status));
+    if (active) return sendError(res, 409, "session_is_active");
+    const imported = importCodexSession(body);
+    appendAudit("session_imported", null, {
+      sessionId: imported.sessionId,
+      workspaceId: imported.workspaceId,
+      status: imported.status,
+      importedBy: auth.subject || null,
+    });
+    return sendJson(res, imported.status === "current" ? 200 : 201, imported);
+  }
+
+  if (req.method === "POST" && url.pathname === "/v1/codex/session-imports/uploads") {
+    const body = await readBody(req);
+    const sessionId = body?.session?.id;
+    const active = [...jobs.values()].some((job) =>
+      jobThreadId(job) === sessionId && !["succeeded", "failed", "cancelled", "timed_out"].includes(job.status));
+    if (active) return sendError(res, 409, "session_is_active");
+    const created = createSessionUpload(body);
+    return sendJson(res, created.status === "current" ? 200 : 201, created);
+  }
+
+  const uploadChunkMatch = url.pathname.match(/^\/v1\/codex\/session-imports\/uploads\/([^/]+)\/chunks$/);
+  if (uploadChunkMatch && req.method === "POST") {
+    const body = await readBody(req);
+    return sendJson(res, 200, appendSessionUpload(decodeURIComponent(uploadChunkMatch[1]), body));
+  }
+
+  const uploadCompleteMatch = url.pathname.match(/^\/v1\/codex\/session-imports\/uploads\/([^/]+)\/complete$/);
+  if (uploadCompleteMatch && req.method === "POST") {
+    const imported = completeSessionUpload(decodeURIComponent(uploadCompleteMatch[1]), {
+      isSessionActive: (sessionId) => [...jobs.values()].some((job) =>
+        jobThreadId(job) === sessionId && !["succeeded", "failed", "cancelled", "timed_out"].includes(job.status)),
+    });
+    appendAudit("session_imported", null, {
+      sessionId: imported.sessionId,
+      workspaceId: imported.workspaceId,
+      status: imported.status,
+      importedBy: auth.subject || null,
+    });
+    return sendJson(res, imported.status === "current" ? 200 : 201, imported);
   }
 
   if (req.method === "GET" && url.pathname === "/v1/codex/sessions") {

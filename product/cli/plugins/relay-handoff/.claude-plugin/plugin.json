@@ -1,7 +1,7 @@
 {
   "name": "relay-handoff",
   "version": "0.1.0",
-  "description": "Hand the active local coding-agent session off to Relay.",
+  "description": "Publish repository work and sync native Codex sessions directly to Relay.",
   "author": {
     "name": "Relay"
   }

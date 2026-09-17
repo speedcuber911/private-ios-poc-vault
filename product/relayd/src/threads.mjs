@@ -182,7 +182,15 @@ function workspaceForPath(value) {
 
 
 function readSessionMeta(sessionFile, expectedSessionId = null) {
-  const lines = fs.readFileSync(sessionFile, "utf8").split("\n");
+  // session_meta is written at the beginning of a native Codex rollout. Read
+  // a bounded prefix so listing a workspace cannot allocate every byte of a
+  // long-running 100+ MiB conversation merely to learn its id and cwd.
+  const stat = fs.statSync(sessionFile);
+  const maxBytes = Math.min(stat.size, 1024 * 1024);
+  const buffer = Buffer.alloc(maxBytes);
+  const fd = fs.openSync(sessionFile, "r");
+  try { fs.readSync(fd, buffer, 0, maxBytes, 0); } finally { fs.closeSync(fd); }
+  const lines = buffer.toString("utf8").split("\n");
   for (const line of lines) {
     if (!line.trim()) continue;
     try {

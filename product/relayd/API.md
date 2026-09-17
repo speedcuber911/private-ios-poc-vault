@@ -494,6 +494,37 @@ Serving semantics (935–998):
 
 ### 1.13 Sessions & threads
 
+**`POST /v1/codex/session-imports/plan`** — compares up to 500 repo-scoped
+Codex session descriptors with the daemon's direct-sync ledger. Body:
+
+```json
+{"v":1,"workspaceId":"poc-vault","workspacePath":"/srv/codex-workspaces/poc-vault","sessions":[
+  {"id":"<uuid>","sha256":"<hex>","sizeBytes":123,"createdAt":"…","updatedAt":"…"}
+]}
+```
+
+Each result is `upload`, `current`, or `conflict`. A conflict means a native
+rollout already existed outside direct sync, disappeared after import, or was
+continued on the Relay machine. Active sessions also conflict.
+`workspacePath` lets relayd safely rematerialize a dynamic workspace after a
+daemon restart; the resolved path must remain inside the configured browse root
+and must derive the supplied workspace id.
+
+**`POST /v1/codex/session-imports`** — imports one planned Codex rollout. The
+request carries `workspaceId`, the exact `sourceCwd` recorded by the rollout,
+and a `session` with `id`, timestamps, SHA-256, and a base64 transcript. Inline
+transcripts are capped at 20 MiB; their hash, native session id, and source cwd are
+verified before the hardened session importer rewrites the cwd and installs it
+under `CODEX_HOME/sessions`. Returns 201 for `imported`/`updated`, 200 for an
+already-current retry, and 409 rather than overwriting a remotely changed or
+active session.
+
+Larger rollouts, up to 256 MiB, use
+`POST /v1/codex/session-imports/uploads`, repeated authenticated
+`POST /uploads/:id/chunks` calls with exact byte offsets, and
+`POST /uploads/:id/complete`. Chunks are capped at 4 MiB. Completion verifies
+the declared total size and SHA-256 before entering the same native importer.
+
 **`GET /v1/codex/sessions`** (1471–1476, `listWorkspaceSessions`
 3401–3459) — provider CLI sessions found under the runner's
 `CODEX_HOME/sessions` (`*.jsonl` with a `session_meta` line, 3365–3395)

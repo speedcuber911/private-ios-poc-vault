@@ -65,6 +65,18 @@ async function git(root, args, execFileImpl = execFileAsync) {
   return stdout;
 }
 
+// Direct session sync needs only the repository boundary. It deliberately does
+// not inspect origin, branch, commits, or working-tree state: Git is not the
+// transcript transport and an uncommitted repository is a valid sync source.
+async function findGitRoot({ cwd = process.cwd(), execFileImpl = execFileAsync } = {}) {
+  try {
+    const { stdout } = await execFileImpl("git", ["-C", cwd, "rev-parse", "--show-toplevel"]);
+    return fs.realpathSync(stdout.trim());
+  } catch {
+    throw new Error("not_a_git_repo: run relay inside a git repository");
+  }
+}
+
 // Bounds the work workingTreeSummary will do counting untracked lines: a
 // repo with an untracked `node_modules` (30k-100k files — exactly the "quick
 // experiment, no .gitignore yet" repo a handoff targets) must not turn the
@@ -255,4 +267,4 @@ async function workingTreeSummary({ root, execFileImpl = execFileAsync }) {
   return { files, insertions, deletions, summary, truncated: untrackedTruncated };
 }
 
-export { requireGitHubRepo, parseGitHubRemote, currentBranch, workingTreeSummary, git, MAX_UNTRACKED_FILES_COUNTED };
+export { requireGitHubRepo, findGitRoot, parseGitHubRemote, currentBranch, workingTreeSummary, git, MAX_UNTRACKED_FILES_COUNTED };

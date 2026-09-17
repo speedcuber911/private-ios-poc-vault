@@ -1,4 +1,4 @@
 interface:
-  display_name: "Relay Handoff"
-  short_description: "Hand active agent work off to Relay"
-  default_prompt: "Use $relay-handoff to hand this active coding session off to Relay."
+  display_name: "Relay Repository Sync"
+  short_description: "Push repo work and sync Codex chats to Relay"
+  default_prompt: "Use $relay-handoff to publish this repository's current task and sync its Codex sessions to Relay."
