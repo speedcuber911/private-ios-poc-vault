@@ -196,7 +196,7 @@ struct POCVaultRootView: View {
     /// Raised when a handoff push is tapped: the threads list is where handoff
     /// cards live, so that is where the tap has to land.
     @State private var opensThreadsForHandoff = false
-    @State private var selectedRootTab = RelayRootTab.workspaces
+    @State private var selectedRootTab = RelayRootTab.sessions
     @State private var showingDiagnostics = false
 
     var body: some View {
@@ -325,27 +325,6 @@ struct POCVaultRootView: View {
 
     private var mainTabs: some View {
         TabView(selection: $selectedRootTab) {
-            Group {
-                if foldersAreHiddenAfterComputerDisconnect {
-                    disconnectedComputerScreen
-                } else {
-                    browserNavigation
-                }
-            }
-            .tag(RelayRootTab.workspaces)
-            .tabItem { Label("Workspaces", systemImage: "square.grid.2x2") }
-
-            RelayPreviewsView(
-                identityStore: identityStore,
-                client: codexClient,
-                workspaceAccessIsAvailable: !foldersAreHiddenAfterComputerDisconnect,
-                onOpenWorkspaces: { selectedRootTab = .workspaces },
-                onOpenJob: openPreviewSourceJob
-            )
-            .tag(RelayRootTab.previews)
-            .tabItem { Label("Previews", systemImage: "rectangle.on.rectangle") }
-            .accessibilityIdentifier("relay-previews-tab")
-
             CodexStatusView(
                 feedViewModel: statusFeedViewModel,
                 identityStore: identityStore,
@@ -358,8 +337,29 @@ struct POCVaultRootView: View {
                 onBrowseFiles: { selectedRootTab = .workspaces }
             )
             .tag(RelayRootTab.sessions)
-            .tabItem { Label("Sessions", systemImage: "bubble.left.and.text.bubble.right") }
+            .tabItem { Label("Chats", systemImage: "bubble.left.and.bubble.right") }
             .badge(statusFeedViewModel.approvals.count)
+
+            Group {
+                if foldersAreHiddenAfterComputerDisconnect {
+                    disconnectedComputerScreen
+                } else {
+                    browserNavigation
+                }
+            }
+            .tag(RelayRootTab.workspaces)
+            .tabItem { Label("Folders", systemImage: "folder") }
+
+            RelayPreviewsView(
+                identityStore: identityStore,
+                client: codexClient,
+                workspaceAccessIsAvailable: !foldersAreHiddenAfterComputerDisconnect,
+                onOpenWorkspaces: { selectedRootTab = .workspaces },
+                onOpenJob: openPreviewSourceJob
+            )
+            .tag(RelayRootTab.previews)
+            .tabItem { Label("Previews", systemImage: "rectangle.on.rectangle") }
+            .accessibilityIdentifier("relay-previews-tab")
 
             AccountSettingsView(
                 accountStore: accountStore,
@@ -480,6 +480,11 @@ struct POCVaultRootView: View {
             onOpenChat: { path, workspaceID in
                 openNewSession(folderPath: path, workspaceID: workspaceID)
             },
+            onOpenConversation: { item in
+                let launch = chatSessionStore.launch(folderPath: folderPath, workspaceID: item.workspaceID)
+                chatLaunch = launch
+                Task { await launch.viewModel.openHistoryItem(item) }
+            },
             onOpenTerminal: { workspaceID, workspaceName in
                 terminalLaunch = RelayTerminalLaunch(workspaceID: workspaceID, workspaceName: workspaceName)
             },
@@ -530,6 +535,7 @@ struct POCVaultRootView: View {
         let env = ProcessInfo.processInfo.environment
         if let folder = env["RELAY_UITEST_PATH"]?.trimmedNonEmpty {
             browserPath.append(.folder(path: folder))
+            selectedRootTab = .workspaces
         }
         if let file = env["RELAY_UITEST_FILE"]?.trimmedNonEmpty,
            let data = try? JSONSerialization.data(withJSONObject: ["path": file, "kind": "file"]),
@@ -774,8 +780,9 @@ private struct CodexStatusView: View {
     let onOpenItem: (CodexThreadFeedItem) -> Void
     let onOpenNewSession: (String?) -> Void
     let onBrowseFiles: () -> Void
-    @State private var selectedSection = StatusSection.activity
+    @State private var searchText = ""
     @State private var providerFilter: CodexProvider?
+    @State private var showingDiagnostics = false
     @State private var showingWorkspacePicker = false
     @State private var workspacePickerError: String?
     @State private var workspaces: [CodexWorkspace] = []
@@ -783,126 +790,103 @@ private struct CodexStatusView: View {
 
     var body: some View {
         NavigationStack {
-            ZStack {
-                AppTheme.bgCanvas.ignoresSafeArea()
-
-                VStack(alignment: .leading, spacing: 0) {
-                    HStack {
-                        Text("Sessions")
-                            .font(AppTheme.serifFont(size: 32))
-                            .foregroundStyle(AppTheme.textPrimary)
-                        Spacer()
-                        Button {
-                            showingWorkspacePicker = true
-                        } label: {
-                            Image(systemName: "plus")
-                                .font(AppTheme.uiFont(size: 18, weight: .semibold))
-                                .foregroundStyle(AppTheme.textPrimary)
-                                .frame(width: 40, height: 40)
-                                .background(AppTheme.canvasTop, in: Circle())
-                                .overlay { Circle().stroke(AppTheme.hairlineStrong, lineWidth: 1) }
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Choose a workspace for a new session")
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    if let error = feedViewModel.errorMessage {
+                        Text(error)
+                            .font(.subheadline)
+                            .foregroundStyle(AppTheme.statusError)
+                            .padding(18)
                     }
-                    .padding(.horizontal, 20)
-                    .padding(.top, 16)
-                    .padding(.bottom, 16)
 
-                    HStack(spacing: 18) {
-                        ForEach(StatusSection.allCases) { section in
-                            Button {
-                                withAnimation(.easeInOut(duration: 0.18)) {
-                                    selectedSection = section
+                    if !displayedApprovals.isEmpty {
+                        sectionHeading("Needs your attention")
+                        ForEach(displayedApprovals) { approval in
+                            RelayApprovalCard(
+                                approval: approval,
+                                onOpen: { openApproval(approval) },
+                                onDecision: { decision in
+                                    Task { await feedViewModel.decide(approval, decision) }
                                 }
-                            } label: {
-                                VStack(spacing: 5) {
-                                    Text(section.title)
-                                        .font(.system(size: 14, weight: selectedSection == section ? .medium : .regular))
-                                        .foregroundStyle(selectedSection == section ? AppTheme.textPrimary : AppTheme.textTertiary)
-                                    Rectangle()
-                                        .fill(selectedSection == section ? AppTheme.accent : Color.clear)
-                                        .frame(height: 2)
-                                }
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
+                            )
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 10)
                         }
                     }
-                    .padding(.horizontal, 20)
-                    .padding(.bottom, 16)
 
-                    switch selectedSection {
-                    case .activity:
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 0) {
-                                if let error = feedViewModel.errorMessage {
-                                    Text(error)
-                                        .font(.system(size: 13))
-                                        .foregroundStyle(AppTheme.statusError)
-                                        .padding(.horizontal, 20)
-                                        .padding(.bottom, 12)
-                                }
-
-                                providerFilterBar
-                                    .padding(.bottom, 14)
-
-                                if !displayedApprovals.isEmpty {
-                                    RelayCapsLabel(text: "Needs attention", color: AppTheme.statusWarn)
-                                        .padding(.horizontal, 20)
-                                        .padding(.bottom, 8)
-                                    ForEach(displayedApprovals) { approval in
-                                        RelayApprovalCard(
-                                            approval: approval,
-                                            onOpen: { openApproval(approval) },
-                                            onDecision: { decision in
-                                                Task { await feedViewModel.decide(approval, decision) }
-                                            }
-                                        )
-                                        .padding(.horizontal, 16)
-                                        .padding(.bottom, 10)
+                    if displayedItems.isEmpty {
+                        if feedViewModel.isRefreshing && feedViewModel.feedItems.isEmpty {
+                            ProgressView("Loading chats…")
+                                .frame(maxWidth: .infinity)
+                                .padding(.top, 64)
+                        } else if feedViewModel.errorMessage == nil {
+                            emptyState
+                        }
+                    } else {
+                        ForEach(RecentChatSection.allCases) { section in
+                            let items = displayedItems.filter { section.contains($0) }
+                            if !items.isEmpty {
+                                sectionHeading(section.title)
+                                ForEach(items) { item in
+                                    Button {
+                                        onOpenItem(item)
+                                    } label: {
+                                        RelayConversationRow(item: item)
+                                            .padding(.horizontal, 18)
                                     }
-                                }
-
-                                Text(summaryText)
-                                    .font(.system(size: 13))
-                                    .foregroundStyle(AppTheme.textSecondary)
-                                    .padding(.horizontal, 20)
-                                    .padding(.bottom, 12)
-
-                                LazyVStack(spacing: 0) {
-                                    ForEach(Array(displayedItems.prefix(24))) { item in
-                                        Button {
-                                            onOpenItem(item)
-                                        } label: {
-                                            CodexActivityRow(item: item)
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-                                }
-                                .overlay(alignment: .top) {
-                                    Rectangle()
-                                        .fill(AppTheme.hairline)
-                                        .frame(height: 0.5)
+                                    .buttonStyle(.plain)
+                                    .accessibilityIdentifier("relay-recent-chat-\(item.id)")
                                 }
                             }
-                            .padding(.bottom, 110)
                         }
-                        .scrollDismissesKeyboard(.interactively)
-                    case .health:
-                        DiagnosticsView(
-                            identityStore: identityStore,
-                            nodeStore: nodeStore,
-                            showsNavigationChrome: false
-                        )
                     }
                 }
+                .padding(.bottom, 20)
             }
-            .navigationTitle("")
+            .background(AppTheme.bgCanvas)
+            .scrollDismissesKeyboard(.interactively)
+            .navigationTitle("Chats")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar(.hidden, for: .navigationBar)
+            .searchable(text: $searchText, prompt: "Search chats and folders")
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Menu {
+                        Picker("Agent", selection: $providerFilter) {
+                            Text("All agents").tag(nil as CodexProvider?)
+                            ForEach(availableProviders) { provider in
+                                Text(provider.relayPresentation.title).tag(Optional(provider))
+                            }
+                        }
+                        Divider()
+                        Button {
+                            showingDiagnostics = true
+                        } label: {
+                            Label("Diagnostics", systemImage: "stethoscope")
+                        }
+                    } label: {
+                        Image(systemName: providerFilter == nil ? "line.3.horizontal.decrease" : "line.3.horizontal.decrease.circle.fill")
+                            .frame(minWidth: 44, minHeight: 44)
+                    }
+                    .tint(AppTheme.textPrimary)
+                    .accessibilityLabel(providerFilter.map { "Filter chats, \($0.relayPresentation.title)" } ?? "Filter chats, all agents")
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showingWorkspacePicker = true
+                    } label: {
+                        Image(systemName: "square.and.pencil")
+                            .frame(minWidth: 44, minHeight: 44)
+                    }
+                    .tint(AppTheme.textPrimary)
+                    .accessibilityLabel("New chat")
+                    .accessibilityIdentifier("relay-new-chat")
+                }
+            }
             .refreshable {
                 await feedViewModel.refresh()
+            }
+            .sheet(isPresented: $showingDiagnostics) {
+                DiagnosticsView(identityStore: identityStore, nodeStore: nodeStore)
             }
             .sheet(isPresented: $showingWorkspacePicker) {
                 SessionsWorkspacePickerSheet(
@@ -922,6 +906,7 @@ private struct CodexStatusView: View {
                     }
                 )
                 .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
             }
             .onChange(of: showingWorkspacePicker) { _, isPresented in
                 guard isPresented else { return }
@@ -929,6 +914,36 @@ private struct CodexStatusView: View {
             }
         }
         .preferredColorScheme(.dark)
+    }
+
+    private func sectionHeading(_ title: String) -> some View {
+        Text(title)
+            .font(.custom("DMSans-9ptRegular", size: 13, relativeTo: .subheadline).weight(.medium))
+            .foregroundStyle(AppTheme.textPrimary.opacity(0.65))
+            .padding(.horizontal, 18)
+            .padding(.top, 20)
+            .padding(.bottom, 6)
+            .accessibilityAddTraits(.isHeader)
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 12) {
+            Text(searchText.isEmpty && providerFilter == nil ? "A place to pick up your work" : "No chats found")
+                .font(.title3.weight(.medium))
+                .foregroundStyle(AppTheme.textPrimary)
+            Text(searchText.isEmpty && providerFilter == nil ? "Start a chat in one of your folders. Your conversations will appear here." : "Try a different title, folder, or agent.")
+                .font(.subheadline)
+                .foregroundStyle(AppTheme.textPrimary.opacity(0.7))
+                .multilineTextAlignment(.center)
+            if searchText.isEmpty {
+                Button("New chat") { showingWorkspacePicker = true }
+                    .buttonStyle(RelayOutlineButtonStyle())
+                    .padding(.top, 8)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 32)
+        .padding(.top, 72)
     }
 
     @MainActor
@@ -944,21 +959,16 @@ private struct CodexStatusView: View {
         }
     }
 
-    private var summaryText: String {
-        let items = displayedItems
-        let activeCount = items.filter(\.isActive).count
-        let scope = providerFilter?.relayPresentation.title ?? "all agents"
-        if activeCount == 0 {
-            return "\(items.count) threads · \(scope)"
-        }
-        return "\(activeCount) active · \(items.count) recent · \(scope)"
-    }
-
     private var displayedItems: [CodexThreadFeedItem] {
-        guard let providerFilter else { return feedViewModel.feedItems }
-        return feedViewModel.feedItems.filter { $0.provider == providerFilter }
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return feedViewModel.feedItems.filter { item in
+            (providerFilter == nil || item.provider == providerFilter) &&
+            (query.isEmpty || [item.title, item.workspaceLabel, item.provider.relayPresentation.title]
+                .contains { $0.localizedCaseInsensitiveContains(query) })
+        }
     }
 
+    // Pending decisions stay visible even when searching conversation titles.
     private var displayedApprovals: [CodexApproval] {
         guard let providerFilter else { return feedViewModel.approvals }
         return feedViewModel.approvals.filter { $0.provider == providerFilter }
@@ -969,54 +979,34 @@ private struct CodexStatusView: View {
         return CodexProvider.allCases.filter(providers.contains)
     }
 
-    private var providerFilterBar: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                Button {
-                    providerFilter = nil
-                } label: {
-                    Text("ALL")
-                        .font(AppTheme.uiFont(size: 10, weight: .semibold))
-                        .tracking(0.9)
-                        .foregroundStyle(providerFilter == nil ? AppTheme.textPrimary : AppTheme.textTertiary)
-                        .padding(.horizontal, 12)
-                        .frame(height: 30)
-                        .background(providerFilter == nil ? AppTheme.textPrimary.opacity(0.08) : Color.clear, in: Capsule())
-                        .overlay(Capsule().stroke(providerFilter == nil ? AppTheme.hairlineStrong : AppTheme.hairline, lineWidth: 1))
-                }
-                .buttonStyle(.plain)
+    private func openApproval(_ approval: CodexApproval) {
+        guard let item = feedViewModel.feedItems.first(where: { $0.jobID == approval.jobId }) else { return }
+        onOpenItem(item)
+    }
+}
 
-                ForEach(availableProviders) { provider in
-                    Button {
-                        providerFilter = provider
-                    } label: {
-                        RelayProviderBadge(
-                            provider: provider,
-                            style: providerFilter == provider ? .capsule : .plain,
-                            size: 9
-                        )
-                        .frame(height: 30)
-                        .padding(.horizontal, providerFilter == provider ? 0 : 9)
-                        .overlay {
-                            if providerFilter != provider {
-                                Capsule().stroke(AppTheme.hairline, lineWidth: 1)
-                            }
-                        }
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal, 20)
+/// Local presentation grouping; the server's thread order and status semantics stay intact.
+private enum RecentChatSection: String, CaseIterable, Identifiable {
+    case active, today, yesterday, week, earlier
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .active: return "In progress"
+        case .today: return "Today"
+        case .yesterday: return "Yesterday"
+        case .week: return "Previous 7 days"
+        case .earlier: return "Earlier"
         }
-        .accessibilityLabel("Filter sessions by provider")
     }
 
-    private func openApproval(_ approval: CodexApproval) {
-        guard let item = feedViewModel.feedItems.first(where: { item in
-            if case .pendingJob(let job) = item.source { return job.id == approval.jobId }
-            return false
-        }) else { return }
-        onOpenItem(item)
+    func contains(_ item: CodexThreadFeedItem) -> Bool {
+        if item.isActive { return self == .active }
+        guard let date = item.updatedAt else { return self == .earlier }
+        let calendar = Calendar.current
+        if calendar.isDateInToday(date) { return self == .today }
+        if calendar.isDateInYesterday(date) { return self == .yesterday }
+        let weekStart = calendar.date(byAdding: .day, value: -7, to: calendar.startOfDay(for: Date())) ?? .distantPast
+        return self == (date >= weekStart ? .week : .earlier)
     }
 }
 
@@ -1036,7 +1026,7 @@ private struct SessionsWorkspacePickerSheet: View {
                 AppTheme.bgCanvas.ignoresSafeArea()
                 Group {
                     if isLoading {
-                        ProgressView("Loading workspaces…")
+                        ProgressView("Loading folders…")
                             .tint(AppTheme.accent)
                     } else if let errorMessage {
                         VStack(alignment: .leading, spacing: 16) {
@@ -1052,7 +1042,7 @@ private struct SessionsWorkspacePickerSheet: View {
                         .padding(20)
                     } else if workspaces.isEmpty {
                         VStack(alignment: .leading, spacing: 16) {
-                            Text("No workspaces available on this machine.")
+                            Text("No folders available on this machine.")
                                 .font(AppTheme.uiFont(size: 14))
                                 .foregroundStyle(AppTheme.textSecondary)
                             Button("Browse files instead", action: onBrowseFiles)
@@ -1092,7 +1082,7 @@ private struct SessionsWorkspacePickerSheet: View {
                     }
                 }
             }
-            .navigationTitle("New session")
+            .navigationTitle("Choose a folder")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -1107,22 +1097,6 @@ private struct SessionsWorkspacePickerSheet: View {
 // RelayApprovalCard moved to Views/RelayApprovalCard.swift — the chat transcript
 // renders the same card, and two copies would drift.
 
-private enum StatusSection: String, CaseIterable, Identifiable {
-    case activity
-    case health
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .activity:
-            return "Activity"
-        case .health:
-            return "Health"
-        }
-    }
-}
-
 private extension CodexThreadFeedItem {
     var provider: CodexProvider {
         switch source {
@@ -1134,85 +1108,67 @@ private extension CodexThreadFeedItem {
     }
 }
 
-private struct CodexActivityRow: View {
+/// Shared native row for recent chats and the folder-scoped Threads sheet.
+struct RelayConversationRow: View {
     let item: CodexThreadFeedItem
-
-    private var provider: CodexProvider { item.provider }
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            RelayProviderMark(provider: provider, size: 17)
-                .frame(width: 32, height: 32)
-                .background(provider.relayPresentation.accent.opacity(0.11), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(provider.relayPresentation.accent.opacity(0.24), lineWidth: 1)
-                }
-
-            VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
                 Text(item.title)
-                    .font(.system(size: 14))
+                    .font(.custom("DMSans-9ptRegular", size: 16, relativeTo: .body).weight(.medium))
                     .foregroundStyle(AppTheme.textPrimary)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                HStack(spacing: 7) {
-                    RelayProviderBadge(provider: provider, style: .plain, size: 9)
-                    Text("\(item.workspaceLabel) · \(timestampText)")
-                        .font(.system(size: 11))
-                        .foregroundStyle(AppTheme.textSecondary)
-                    RelayCapsLabel(
-                        text: item.status?.label ?? "Thread",
-                        color: statusColor,
-                        size: 9
-                    )
+                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? 3 : 2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if !dynamicTypeSize.isAccessibilitySize, let updatedAt = item.updatedAt {
+                    Text(updatedAt, format: .dateTime.month(.abbreviated).day())
+                        .font(.custom("DMSans-9ptRegular", size: 12, relativeTo: .caption))
+                        .foregroundStyle(AppTheme.textPrimary.opacity(0.6))
+                        .fixedSize()
                 }
-                .lineLimit(1)
             }
-
-            Spacer(minLength: 0)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    contextLabel
+                    if let attentionLabel { statusLabel(attentionLabel) }
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    contextLabel
+                    if let attentionLabel { statusLabel(attentionLabel) }
+                }
+            }
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 12)
-        .overlay(alignment: .leading) {
-            Rectangle()
-                .fill(provider.relayPresentation.accent.opacity(0.75))
-                .frame(width: 2)
-        }
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(AppTheme.hairline)
-                .frame(height: 0.5)
-                .padding(.leading, 62)
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("\(provider.relayPresentation.title), \(item.title)")
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 13)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
     }
 
-    private var timestampText: String {
-        guard let updatedAt = item.updatedAt else { return "" }
-        return Self.relativeFormatter.localizedString(for: updatedAt, relativeTo: Date())
+    private var contextLabel: some View {
+        Text("\(item.workspaceLabel) · \(item.provider.relayPresentation.title)")
+            .font(.custom("DMSans-9ptRegular", size: 13, relativeTo: .subheadline))
+            .foregroundStyle(AppTheme.textPrimary.opacity(0.65))
+            .lineLimit(1)
+            .truncationMode(.middle)
     }
 
-    private var statusColor: Color {
-        guard let status = item.status else { return AppTheme.textTertiary }
+    private var attentionLabel: String? {
+        guard let status = item.status else { return item.isActive ? "Running" : nil }
         switch status {
-        case .queued, .running, .waitingForApproval, .canceling:
-            return AppTheme.accentBright
-        case .succeeded:
-            return AppTheme.textSecondary
-        case .failed, .timeout:
-            return AppTheme.statusError
-        case .canceled, .unknown:
-            return AppTheme.textTertiary
+        case .queued, .running, .waitingForApproval, .canceling, .failed, .timeout:
+            return status.label
+        case .succeeded, .canceled, .unknown:
+            return nil
         }
     }
 
-    private static let relativeFormatter: RelativeDateTimeFormatter = {
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .abbreviated
-        return formatter
-    }()
+    private func statusLabel(_ text: String) -> some View {
+        Text(text)
+            .font(.custom("DMSans-9ptRegular", size: 12, relativeTo: .caption).weight(.medium))
+            .foregroundStyle(item.status == .failed || item.status == .timeout ? AppTheme.statusError : AppTheme.accentBright)
+            .fixedSize(horizontal: true, vertical: false)
+    }
 }
 
 /// Editorial Ember design language — see docs/superpowers/specs/2026-08-11-editorial-ember-design.md.

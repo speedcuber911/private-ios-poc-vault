@@ -22,6 +22,9 @@ final class FileBrowserViewModel: ObservableObject {
     @Published private(set) var isLoadingMore = false
     @Published private(set) var isCreatingFolder = false
     @Published private(set) var errorMessage: String?
+    @Published private(set) var conversations: [CodexThreadFeedItem] = []
+    @Published private(set) var isLoadingConversations = false
+    @Published private(set) var conversationError: String?
 
     /// Bound to `.searchable`; the view debounces via `runSearchAfterDebounce()`.
     @Published var searchText = ""
@@ -80,6 +83,25 @@ final class FileBrowserViewModel: ObservableObject {
 
     func refresh() async {
         await load()
+    }
+
+    /// The daemon includes saved CLI transcripts as well as runs started by Relay.
+    /// Use the server-resolved workspace identity, never a folder-name comparison.
+    func refreshConversations() async {
+        guard let workspaceID = listing?.selectedWorkspace?.id else { return }
+        isLoadingConversations = true
+        defer { isLoadingConversations = false }
+        do {
+            async let threads = client.fetchThreads(workspaceID: workspaceID, limit: 200)
+            async let jobs = client.fetchJobs(workspaceID: workspaceID, limit: 100)
+            let items = try await CodexThreadFeedItem.makeFeed(threads: threads, jobs: jobs, workspaceID: workspaceID)
+            guard listing?.selectedWorkspace?.id == workspaceID else { return }
+            conversations = items
+            conversationError = nil
+        } catch {
+            guard !isCancellation(error) else { return }
+            conversationError = error.localizedDescription
+        }
     }
 
     /// Page in the next chunk of a truncated listing.

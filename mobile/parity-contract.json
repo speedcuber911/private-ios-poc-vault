@@ -14,7 +14,7 @@
       "id": "provider-specific-ai-data-consent",
       "surfaces": {
         "shared": [{"path": "mobile/relay-core/src/commonMain/kotlin/live/relay/core/RelayModels.kt", "contains": ["RelayAIDataSharing", "recipient", "disclosure"]}],
-        "ios": [{"path": "ios/POCVault/POCVault/Views/RelayChatView.swift", "contains": ["RelayAIDataConsentSheet", "AI data sharing", "Work content to", "Allow & Send", "Not Now"]}],
+        "ios": [{"path": "ios/POCVault/POCVault/Views/RelayChatView.swift", "contains": ["RelayAIDataConsentSheet", "AI data sharing", "Share work content with", "Allow & Send", "Not Now"]}],
         "android": [{"path": "mobile/androidApp/src/main/kotlin/com/parikshit/relay/ui/RelayApp.kt", "contains": ["AIDataConsentDialog", "AI data sharing", "Work content to", "Allow & Send", "Not Now"]}]
       }
     },
@@ -100,6 +100,7 @@
     }
   ],
   "knownDifferences": [
+    {"id": "ios-quiet-chat-presentation", "status": "platform-specific", "reason": "The requested iPhone redesign opens on searchable recent Chats, puts Folders one tab away with scoped Chats and Files views, uses compact folder and conversation rows, moves terminal access into folder options, and uses a compact native header with Threads access, neutral user messages, larger chat text, a fixed composer with model and run-settings access, expandable recent activity, and persistent Activity/Raw log controls with pause/follow. Android retains its existing Compose layout. This is an intentional iOS presentation difference; Android already loads saved threads on opening a workspace. Both mobile decoders now accept the fs/list workspace and absolutePath aliases, with shared regression coverage. Provider locking, approval/sandbox values and defaults, shared request construction, SSE reduction, and log retrieval remain unchanged."},
     {"id": "apple-identity-and-apns", "status": "platform-specific", "reason": "Sign in with Apple and APNs require native Apple implementations; Android equivalents must use Android identity and FCM."},
     {"id": "apple-app-store-subscriptions", "status": "platform-specific", "reason": "The iOS App Store build purchases Relay Hosted through StoreKit; Android billing requires its own store implementation before Android distribution."},
     {"id": "account-trial-cli-handoff", "status": "android-gap", "reason": "Android 0.1 still uses manual private-operator setup and does not yet expose the iOS account, trial, CLI-link, or handoff flows."},

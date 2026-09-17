@@ -1,6 +1,7 @@
 package live.relay.core
 
 import kotlinx.serialization.KSerializer
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.descriptors.PrimitiveKind
@@ -8,6 +9,7 @@ import kotlinx.serialization.descriptors.PrimitiveSerialDescriptor
 import kotlinx.serialization.descriptors.SerialDescriptor
 import kotlinx.serialization.encoding.Decoder
 import kotlinx.serialization.encoding.Encoder
+import kotlinx.serialization.json.JsonNames
 
 @Serializable(with = RelayProviderSerializer::class)
 enum class RelayProvider(val wireValue: String, val displayName: String) {
@@ -142,34 +144,38 @@ data class Workspace(
         get() = firstNonBlank(resolvedPath, summary, description, resolvedId) ?: resolvedId
 }
 
+@OptIn(ExperimentalSerializationApi::class)
 @Serializable
 data class WorkspaceEntry(
     val name: String = "",
     val kind: String = "dir",
     val path: String = "",
+    val absolutePath: String? = null,
     val relativePath: String? = null,
     val workspaceId: String? = null,
     val workspaceName: String? = null,
     val hasGit: Boolean = false,
     val isRegistered: Boolean = false,
     val size: Long? = null,
-    val mtime: String? = null,
+    @JsonNames("modifiedAt") val mtime: String? = null,
     val mime: String? = null,
     val isText: Boolean? = null,
     val readDenied: Boolean = false,
 ) {
     val isDirectory: Boolean get() = kind != "file"
+    val navigationPath: String get() = firstNonBlank(absolutePath, path) ?: ""
     val displayName: String get() = firstNonBlank(workspaceName, name) ?: path.substringAfterLast('/')
     val detail: String get() = firstNonBlank(relativePath, path) ?: displayName
 }
 
+@OptIn(ExperimentalSerializationApi::class)
 @Serializable
 data class WorkspaceListing(
     val rootPath: String = "",
-    val currentPath: String = "",
-    val relativePath: String? = null,
+    @JsonNames("absolutePath") val currentPath: String = "",
+    @JsonNames("path") val relativePath: String? = null,
     val parentPath: String? = null,
-    val selectedWorkspace: Workspace? = null,
+    @JsonNames("workspace") val selectedWorkspace: Workspace? = null,
     val entries: List<WorkspaceEntry> = emptyList(),
     val truncated: Boolean = false,
     val total: Int? = null,

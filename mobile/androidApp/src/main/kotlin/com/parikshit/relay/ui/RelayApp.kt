@@ -444,7 +444,7 @@ private fun WorkspacesScreen(state: RelayUiState, viewModel: RelayViewModel) {
         items(listing?.entries.orEmpty(), key = WorkspaceEntry::path) { entry ->
             WorkspaceRow(
                 entry = entry,
-                onBrowse = { if (entry.isDirectory) viewModel.navigateToDirectory(entry.path) },
+                onBrowse = { if (entry.isDirectory) viewModel.navigateToDirectory(entry.navigationPath) },
                 onOpen = { viewModel.openWorkspace(entry) },
             )
             HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)

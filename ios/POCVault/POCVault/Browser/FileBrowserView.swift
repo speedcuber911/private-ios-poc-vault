@@ -1,13 +1,8 @@
 import SwiftUI
 import UIKit
 
-/// One folder screen of the workspace file browser — the app's root surface.
-///
-/// Rows are full-width with hairline dividers on the warm flat canvas for a
-/// Files-app feel. Folders drill in, files route to the viewer, the terminal toolbar
-/// icon opens this folder's chat cover, and the root screen additionally exposes
-/// a Diagnostics shortcut behind the ellipsis menu. Sessions, Previews and Settings stay in
-/// their dedicated bottom tabs instead of being duplicated here.
+/// Compact native file browser, one tap from recent chats. Folder navigation,
+/// file previews, and the current folder's new-chat action keep their existing routes.
 struct FileBrowserView: View {
     @StateObject private var viewModel: FileBrowserViewModel
     private let isRoot: Bool
@@ -15,11 +10,13 @@ struct FileBrowserView: View {
     private let onOpenFolder: (String) -> Void
     private let onOpenFile: (CodexWorkspaceDirectoryEntry) -> Void
     private let onOpenChat: (_ folderPath: String?, _ workspaceID: String?) -> Void
+    private let onOpenConversation: (CodexThreadFeedItem) -> Void
     private let onOpenTerminal: (_ workspaceID: String, _ workspaceName: String) -> Void
     private let onOpenDiagnostics: (() -> Void)?
 
     @State private var showingCreateFolder = false
     @State private var newFolderName = ""
+    @State private var showingConversations = true
 
     init(
         client: CodexClient,
@@ -29,6 +26,7 @@ struct FileBrowserView: View {
         onOpenFolder: @escaping (String) -> Void,
         onOpenFile: @escaping (CodexWorkspaceDirectoryEntry) -> Void,
         onOpenChat: @escaping (_ folderPath: String?, _ workspaceID: String?) -> Void,
+        onOpenConversation: @escaping (CodexThreadFeedItem) -> Void,
         onOpenTerminal: @escaping (_ workspaceID: String, _ workspaceName: String) -> Void,
         onOpenDiagnostics: (() -> Void)? = nil
     ) {
@@ -38,27 +36,51 @@ struct FileBrowserView: View {
         self.onOpenFolder = onOpenFolder
         self.onOpenFile = onOpenFile
         self.onOpenChat = onOpenChat
+        self.onOpenConversation = onOpenConversation
         self.onOpenTerminal = onOpenTerminal
         self.onOpenDiagnostics = onOpenDiagnostics
     }
 
     var body: some View {
         ZStack {
-            AppTheme.canvasGradient.ignoresSafeArea()
-            listContent
+            AppTheme.bgCanvas.ignoresSafeArea()
+            VStack(spacing: 0) {
+                if !isRoot {
+                    Picker("Folder content", selection: $showingConversations) {
+                        Text("Chats").tag(true)
+                        Text("Files").tag(false)
+                    }
+                    .pickerStyle(.segmented)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 8)
+                }
+                if !isRoot && showingConversations {
+                    conversationList
+                } else {
+                    listContent
+                }
+            }
         }
-        .navigationTitle(isRoot ? "" : viewModel.folderName)
+        .navigationTitle(isRoot ? "Folders" : viewModel.folderName)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { toolbarContent }
-        .searchable(text: $viewModel.searchText, prompt: "Search folders")
+        .searchable(text: $viewModel.searchText, prompt: !isRoot && showingConversations ? "Search this folder’s chats" : "Search folders")
         .refreshable {
             await viewModel.refresh()
+            if !isRoot { await viewModel.refreshConversations() }
         }
         .task {
             await viewModel.loadIfNeeded()
         }
         .task(id: viewModel.searchText) {
+            guard isRoot || !showingConversations else { return }
             await viewModel.runSearchAfterDebounce()
+        }
+        .task(id: viewModel.listing?.selectedWorkspace?.id) {
+            if !isRoot { await viewModel.refreshConversations() }
+        }
+        .onChange(of: showingConversations) { _, _ in
+            viewModel.searchText = ""
         }
         .alert("New folder", isPresented: $showingCreateFolder) {
             TextField("folder-name", text: $newFolderName)
@@ -79,60 +101,68 @@ struct FileBrowserView: View {
 
     // MARK: - List
 
+    private var conversationList: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                if let error = viewModel.conversationError ?? viewModel.errorMessage {
+                    FileBrowserErrorBanner(text: error)
+                        .padding(18)
+                    Button("Try again") {
+                        Task {
+                            await viewModel.loadIfNeeded()
+                            await viewModel.refreshConversations()
+                        }
+                    }
+                    .padding(.horizontal, 18)
+                } else if viewModel.isLoading || viewModel.isLoadingConversations {
+                    ProgressView("Loading chats…")
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 64)
+                } else if filteredConversations.isEmpty {
+                    VStack(spacing: 12) {
+                        Text(viewModel.searchText.isEmpty ? "No chats in this folder yet" : "No matching chats")
+                            .font(.title3.weight(.medium))
+                        Text("Saved Codex conversations on this machine appear here alongside chats started in Relay.")
+                            .font(.subheadline)
+                            .foregroundStyle(AppTheme.textPrimary.opacity(0.7))
+                        if viewModel.searchText.isEmpty {
+                            Button("New chat") {
+                                onOpenChat(viewModel.path, viewModel.listing?.selectedWorkspace?.id)
+                            }
+                            .buttonStyle(RelayOutlineButtonStyle())
+                        }
+                    }
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, 28)
+                    .padding(.top, 56)
+                } else {
+                    ForEach(filteredConversations) { item in
+                        Button { onOpenConversation(item) } label: {
+                            RelayConversationRow(item: item)
+                                .padding(.horizontal, 18)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(.bottom, 20)
+        }
+        .scrollDismissesKeyboard(.interactively)
+    }
+
+    private var filteredConversations: [CodexThreadFeedItem] {
+        let query = viewModel.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return viewModel.conversations.filter { query.isEmpty || $0.title.localizedCaseInsensitiveContains(query) }
+    }
+
     private var listContent: some View {
         ScrollView {
             LazyVStack(spacing: 0) {
-                if isRoot {
-                    VStack(alignment: .leading, spacing: 6) {
-                        if viewModel.errorMessage != nil {
-                            RelayCapsLabel(
-                                text: "Offline",
-                                color: AppTheme.statusError
-                            )
-                        } else if let machineLabel {
-                            Text(machineLabel)
-                                .font(AppTheme.monoFont(size: 12))
-                                .foregroundStyle(AppTheme.textTertiary)
-                        }
-                        Text("Workspaces")
-                            .font(AppTheme.serifFont(size: 32))
-                            .foregroundStyle(AppTheme.textPrimary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 20)
-                    .padding(.top, 6)
-                    .padding(.bottom, 14)
-                }
-
                 if let error = viewModel.errorMessage {
                     FileBrowserErrorBanner(text: error)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 10)
-                }
-
-                if !isRoot, let workspace = viewModel.listing?.selectedWorkspace {
-                    Button {
-                        onOpenTerminal(workspace.id, workspace.name)
-                    } label: {
-                        HStack(spacing: 12) {
-                            Image(systemName: "terminal.fill")
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Open terminal").font(AppTheme.uiFont(size: 16, weight: .semibold))
-                                Text("Live shell in this workspace").font(AppTheme.uiFont(size: 12))
-                            }
-                            Spacer()
-                            Image(systemName: "arrow.up.right")
-                        }
-                        .foregroundStyle(AppTheme.onEmber)
-                        .padding(.horizontal, 16)
-                        .frame(height: 64)
-                        .background(AppTheme.accent)
-                        .clipShape(RoundedRectangle(cornerRadius: 14))
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 14)
-                    .accessibilityIdentifier("relay-open-terminal")
                 }
 
                 if viewModel.visibleEntries.isEmpty {
@@ -146,11 +176,6 @@ struct FileBrowserView: View {
                 } else {
                     ForEach(viewModel.visibleEntries) { entry in
                         entryRow(entry)
-                    }
-                    .overlay(alignment: .top) {
-                        Rectangle()
-                            .fill(AppTheme.hairline)
-                            .frame(height: 0.5)
                     }
                 }
 
@@ -192,7 +217,7 @@ struct FileBrowserView: View {
             Button {
                 onOpenChat(entry.path, entry.workspaceId)
             } label: {
-                Label("Open chat here", systemImage: "apple.terminal")
+                Label("New chat in folder", systemImage: "square.and.pencil")
             }
         } else if !entry.readDenied {
             Button {
@@ -214,7 +239,7 @@ struct FileBrowserView: View {
                 .font(.system(size: 30, weight: .medium))
                 .foregroundStyle(AppTheme.textTertiary)
             Text(viewModel.isShowingSearchResults ? "No matches" : "Empty folder")
-                .font(AppTheme.serifFont(size: 20))
+                .font(.title3.weight(.medium))
                 .foregroundStyle(AppTheme.textPrimary)
             Text(viewModel.isShowingSearchResults
                  ? "No folders match \u{201C}\(viewModel.searchText)\u{201D}."
@@ -262,12 +287,18 @@ struct FileBrowserView: View {
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
-        if !isRoot {
-            ToolbarItem(placement: .principal) {
-                Text(viewModel.folderName)
-                    .font(AppTheme.serifFont(size: 17))
+        ToolbarItem(placement: .principal) {
+            VStack(spacing: 2) {
+                Text(isRoot ? "Folders" : viewModel.folderName)
+                    .font(.custom("DMSans-9ptRegular", size: 17, relativeTo: .headline).weight(.semibold))
                     .foregroundStyle(AppTheme.textPrimary)
                     .lineLimit(1)
+                if isRoot, let machineLabel {
+                    Text(machineLabel)
+                        .font(.custom("DMSans-9ptRegular", size: 11, relativeTo: .caption))
+                        .foregroundStyle(AppTheme.textPrimary.opacity(0.65))
+                        .lineLimit(1)
+                }
             }
         }
 
@@ -275,16 +306,24 @@ struct FileBrowserView: View {
             Button {
                 onOpenChat(viewModel.path, viewModel.listing?.selectedWorkspace?.id)
             } label: {
-                Label("New session", systemImage: "plus.bubble")
-                    .font(AppTheme.uiFont(size: 13, weight: .semibold))
-                    .foregroundStyle(AppTheme.accent)
+                Image(systemName: "square.and.pencil")
+                    .foregroundStyle(AppTheme.textPrimary)
+                    .frame(minWidth: 44, minHeight: 44)
             }
-            .accessibilityLabel("Start a new agent session in this folder")
+            .accessibilityLabel("New chat in this folder")
             .accessibilityIdentifier("relay-open-chat")
         }
 
         ToolbarItem(placement: .topBarTrailing) {
             Menu {
+                if let workspace = viewModel.listing?.selectedWorkspace {
+                    Button {
+                        onOpenTerminal(workspace.id, workspace.name)
+                    } label: {
+                        Label("Open terminal", systemImage: "terminal")
+                    }
+                    .accessibilityIdentifier("relay-open-terminal")
+                }
                 Button {
                     newFolderName = ""
                     showingCreateFolder = true
@@ -303,9 +342,9 @@ struct FileBrowserView: View {
                     }
                 }
             } label: {
-                // Cream, not ember: the chat action is this screen's one earned accent.
                 Image(systemName: "ellipsis")
-                    .foregroundStyle(AppTheme.textSecondary)
+                    .foregroundStyle(AppTheme.textPrimary)
+                    .frame(minWidth: 44, minHeight: 44)
             }
             .accessibilityLabel("Folder options")
         }
@@ -321,8 +360,8 @@ private struct FileBrowserRowButtonStyle: ButtonStyle {
     }
 }
 
-/// A single full-width browser row: icon tile, name (+ workspace badge), metadata
-/// subtitle, hairline bottom divider. Read-denied files render greyed out.
+/// A quiet folder/file row. Type is carried by the symbol; metadata only appears
+/// when it adds information, rather than repeating "Folder" underneath every name.
 private struct FileBrowserRow: View {
     let entry: CodexWorkspaceDirectoryEntry
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -330,76 +369,47 @@ private struct FileBrowserRow: View {
     var body: some View {
         HStack(spacing: 13) {
             Image(systemName: entry.browserGlyph)
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(entry.isDirectory ? AppTheme.accent : AppTheme.textSecondary)
-                .frame(width: 32, height: 32)
-                .background(
-                    (entry.isDirectory ? AppTheme.accent.opacity(0.12) : AppTheme.textPrimary.opacity(0.06)),
-                    in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-                )
+                .font(.system(size: 19, weight: .regular))
+                .foregroundStyle(AppTheme.textPrimary.opacity(0.65))
+                .frame(width: 24)
 
             VStack(alignment: .leading, spacing: 3) {
-                if dynamicTypeSize.isAccessibilitySize {
-                    // Accessibility sizes: the badge wraps below the name so the
-                    // folder name keeps the row's full width instead of truncating.
-                    VStack(alignment: .leading, spacing: 4) {
-                        nameText.lineLimit(2)
-                        workspaceBadge
-                    }
-                } else {
-                    HStack(spacing: 6) {
-                        nameText.lineLimit(1)
-                        workspaceBadge
-                    }
+                Text(entry.displayName)
+                    .font(.custom("DMSans-9ptRegular", size: 16, relativeTo: .body))
+                    .foregroundStyle(AppTheme.textPrimary)
+                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? 3 : 1)
+                if let subtitle {
+                    Text(subtitle)
+                        .font(.custom("DMSans-9ptRegular", size: 12, relativeTo: .caption))
+                        .foregroundStyle(AppTheme.textPrimary.opacity(0.65))
+                        .lineLimit(1)
                 }
-                Text(subtitle)
-                    .font(AppTheme.uiFont(size: 11))
-                    .foregroundStyle(AppTheme.textTertiary)
-                    .lineLimit(1)
             }
-
-            Spacer(minLength: 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             if entry.isDirectory {
                 Image(systemName: "chevron.right")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(AppTheme.textFaint)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(AppTheme.textPrimary.opacity(0.45))
             }
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 13)
+        .padding(.horizontal, 18)
+        .padding(.vertical, 11)
+        .frame(minHeight: 52)
         .contentShape(Rectangle())
-        .opacity(entry.readDenied ? 0.4 : 1)
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(AppTheme.hairline)
-                .frame(height: 0.5)
-                .padding(.leading, 64)
-        }
+        .opacity(entry.readDenied ? 0.5 : 1)
+        .accessibilityElement(children: .combine)
     }
 
-    private var nameText: some View {
-        Text(entry.displayName)
-            .font(AppTheme.uiFont(size: 15, weight: .medium))
-            .foregroundStyle(AppTheme.textPrimary)
-    }
-
-    @ViewBuilder
-    private var workspaceBadge: some View {
-        if entry.isRegistered {
-            RelayCapsLabel(text: "Workspace", color: AppTheme.accent, size: 9)
-        }
-    }
-
-    private var subtitle: String {
+    private var subtitle: String? {
         if entry.isDirectory {
-            return entry.hasGit ? "Git repository" : "Folder"
+            return entry.hasGit ? "Git repository" : nil
         }
         if entry.readDenied {
             return "Not readable from the phone"
         }
         let parts = [entry.sizeLabel, entry.mtimeLabel].compactMap { $0 }
-        return parts.isEmpty ? "File" : parts.joined(separator: " · ")
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 }
 

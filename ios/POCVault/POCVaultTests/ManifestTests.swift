@@ -732,8 +732,8 @@ final class ManifestTests: XCTestCase {
         let source = try AppSourceFixture.load("POCVault/POCVaultApp.swift")
         let browserSource = try AppSourceFixture.load("POCVault/Browser/FileBrowserView.swift")
 
-        // Workspaces keeps its real BrowserRoute navigation inside the new, deliberately
-        // small Workspaces / Previews / Sessions / Settings information architecture.
+        // Chats is home; Folders keeps real BrowserRoute navigation, and Previews
+        // and Settings remain directly accessible through native tabs.
         XCTAssertTrue(source.contains("NavigationStack(path: $browserPath)"))
         XCTAssertTrue(source.contains(".navigationDestination(for: BrowserRoute.self)"))
         XCTAssertTrue(source.contains("case folder(path: String)"))
@@ -741,11 +741,11 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(source.contains("FileViewerView("))
         XCTAssertFalse(source.contains("FileViewerPlaceholderView"))
         XCTAssertTrue(source.contains("TabView(selection: $selectedRootTab)"))
-        XCTAssertTrue(source.contains("Label(\"Workspaces\""))
+        XCTAssertTrue(source.contains("Label(\"Folders\""))
         XCTAssertTrue(source.contains("Label(\"Previews\""))
-        XCTAssertTrue(source.contains("Label(\"Sessions\""))
+        XCTAssertTrue(source.contains("Label(\"Chats\""))
         XCTAssertTrue(source.contains("Label(\"Settings\""))
-        XCTAssertTrue(source.contains("RelayRootTab"))
+        XCTAssertTrue(source.contains("@State private var selectedRootTab = RelayRootTab.sessions"))
         XCTAssertFalse(source.contains("RelayTabBar"))
 
         // Sessions must not keep the empty snapshot it may have loaded before the user
@@ -786,20 +786,20 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(source.contains("RELAY_UITEST_CHAT"))
         XCTAssertTrue(source.contains("RELAY_UITEST_OPEN"))
 
-        // The folder toolbar says "New session", so it must not use the ordinary
+        // The folder toolbar starts a new chat, so it must not use the ordinary
         // cached-chat launch path that can reopen the folder's current thread.
         XCTAssertTrue(source.contains("openNewSession(folderPath: path, workspaceID: workspaceID)"))
         XCTAssertTrue(source.contains("chatSessionStore.launchNewSession"))
         XCTAssertFalse(source.contains("manifestClient"))
     }
 
-    func testBrowserRootHeaderNamesMachineWithoutPermanentMTLSStatus() throws {
+    func testBrowserRootHeaderNamesMachineWithoutPermanentConnectionStatus() throws {
         let browser = try AppSourceFixture.load("POCVault/Browser/FileBrowserView.swift")
         XCTAssertFalse(browser.contains("mTLS"))
         XCTAssertFalse(browser.contains("Connected ·"))
         XCTAssertTrue(browser.contains("machineLabel"))
-        XCTAssertTrue(browser.contains("AppTheme.monoFont"))
-        XCTAssertTrue(browser.contains("\"Offline\""))
+        XCTAssertFalse(browser.contains("\"Offline\""))
+        XCTAssertTrue(browser.contains("if let error = viewModel.errorMessage"))
         XCTAssertTrue(browser.contains("AppTheme.statusError"))
     }
 
@@ -859,8 +859,8 @@ final class ManifestTests: XCTestCase {
         XCTAssertFalse(source.contains("onNewSession: { selectedRootTab = .workspaces }"))
         let plusButton = try sourceSnippet(
             in: source,
-            from: "Button {\n                            showingWorkspacePicker = true",
-            to: "accessibilityLabel(\"Choose a workspace for a new session\")"
+            from: "Button {\n                        showingWorkspacePicker = true",
+            to: "accessibilityLabel(\"New chat\")"
         )
         XCTAssertFalse(plusButton.contains("selectedRootTab"))
     }
@@ -1469,6 +1469,21 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(listing.entries[1].detailText, "SigiQ/notes")
         XCTAssertFalse(listing.entries[1].hasGit)
         XCTAssertFalse(listing.entries[1].isRegistered)
+    }
+
+    func testFileListingKeepsWorkspaceIdentityForFolderHistory() throws {
+        let listing = try JSONDecoder().decode(CodexWorkspaceDirectoryListing.self, from: Data("""
+        {"rootPath":"/work","absolutePath":"/work/relay","path":"relay",
+         "workspace":{"id":"relay","name":"Relay","path":"/work/relay"},
+         "entries":[{"name":"src","kind":"dir","absolutePath":"/work/relay/src","path":"relay/src",
+                     "modifiedAt":"2026-09-17T10:00:00Z"}]}
+        """.utf8))
+        XCTAssertEqual(listing.selectedWorkspace?.id, "relay")
+        XCTAssertEqual(listing.currentPath, "/work/relay")
+        XCTAssertEqual(listing.relativePath, "relay")
+        XCTAssertEqual(listing.upNavigationPath, "/work")
+        XCTAssertEqual(listing.entries.first?.path, "/work/relay/src")
+        XCTAssertNotNil(listing.entries.first?.mtime)
     }
 
     func testCodexWorkspaceDirectoryListingCanNavigateUpFromEmptyParentPath() throws {
@@ -2346,7 +2361,7 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(source.contains("#selector(UIResponder.resignFirstResponder)"))
     }
 
-    func testRelayComposerKeepsControlsInOnePinnedHorizontalBar() throws {
+    func testRelayComposerKeepsPrimaryControlsVisibleWithoutScrolling() throws {
         let source = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
         let controlBarSource = try sourceSnippet(
             in: source,
@@ -2354,11 +2369,12 @@ final class ManifestTests: XCTestCase {
             to: "var body: some View"
         )
 
-        XCTAssertTrue(controlBarSource.contains("ScrollView(.horizontal, showsIndicators: false)"))
-        XCTAssertTrue(controlBarSource.contains("HStack(alignment: .center, spacing: 8)"))
-        XCTAssertTrue(controlBarSource.contains(".frame(height: Layout.controlHeight)"))
-        XCTAssertTrue(controlBarSource.contains("scrollBounceBehavior(.basedOnSize, axes: .horizontal)"))
-        XCTAssertTrue(controlBarSource.contains("relay-control-bar"))
+        XCTAssertFalse(controlBarSource.contains("ScrollView"))
+        XCTAssertTrue(controlBarSource.contains("modelPickerMenu"))
+        XCTAssertTrue(controlBarSource.contains("showingRunSettings = true"))
+        XCTAssertTrue(controlBarSource.contains("Record prompt"))
+        XCTAssertTrue(controlBarSource.contains("relay-send"))
+        XCTAssertTrue(controlBarSource.contains("relay-run-settings"))
         XCTAssertFalse(controlBarSource.contains("VStack"))
         XCTAssertFalse(controlBarSource.contains(".refreshable"))
         XCTAssertFalse(source.contains("usesAccessibilityLayout"))
@@ -2372,13 +2388,12 @@ final class ManifestTests: XCTestCase {
             to: "private struct RelayChatBubble"
         )
 
-        XCTAssertTrue(composerSource.contains("static let horizontalInset: CGFloat = 16"))
-        XCTAssertTrue(composerSource.contains("static let controlHeight: CGFloat = 38"))
-        XCTAssertTrue(composerSource.contains("static let actionSize: CGFloat = 36"))
+        XCTAssertTrue(composerSource.contains("static let horizontalInset: CGFloat = 12"))
+        XCTAssertTrue(composerSource.contains("static let controlHeight: CGFloat = 44"))
+        XCTAssertTrue(composerSource.contains("static let actionSize: CGFloat = 44"))
         XCTAssertTrue(composerSource.contains("VStack(spacing: Layout.rowSpacing)"))
-        XCTAssertTrue(composerSource.contains("HStack(alignment: .bottom, spacing: 9)"))
-        XCTAssertFalse(composerSource.contains(".padding(.vertical, 6)"))
-        XCTAssertTrue(composerSource.contains(".fill(AppTheme.hairlineStrong)"))
+        XCTAssertTrue(composerSource.contains("RoundedRectangle(cornerRadius: 20"))
+        XCTAssertTrue(composerSource.contains(".stroke(AppTheme.hairlineStrong, lineWidth: 1)"))
         XCTAssertFalse(composerSource.contains(".frame(height: 2)"))
     }
 
@@ -2465,7 +2480,9 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(source.contains("ForEach(viewModel.historyItems)"))
         XCTAssertTrue(source.contains("Section(\"This folder\")"))
         XCTAssertFalse(source.contains("All conversations & invocations"))
-        XCTAssertTrue(source.contains("item.workspaceLabel"))
+        XCTAssertTrue(source.contains("RelayConversationRow(item: item)"))
+        let rowSource = try AppSourceFixture.load("POCVault/POCVaultApp.swift")
+        XCTAssertTrue(rowSource.contains("item.workspaceLabel"))
         XCTAssertTrue(source.contains("await viewModel.openHistoryItem(item)"))
         XCTAssertTrue(source.contains("Text(\"Threads\")"))
         // The explanatory subtitle was dropped by the Editorial Ember copy rule; the

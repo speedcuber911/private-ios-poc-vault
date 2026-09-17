@@ -11,6 +11,31 @@ import kotlinx.coroutines.test.runTest
 
 class RelayCoreTest {
     @Test
+    fun fileListingPreservesWorkspaceIdentityAndAbsoluteNavigationPaths() {
+        val listing = RelayJson.decode(WorkspaceListing.serializer(), """
+            {"rootPath":"/work","absolutePath":"/work/relay","path":"relay",
+             "workspace":{"id":"relay","name":"Relay","path":"/work/relay"},
+             "entries":[{"name":"src","kind":"dir","absolutePath":"/work/relay/src","path":"relay/src",
+                         "modifiedAt":"2026-09-17T10:00:00Z"}]}
+        """.trimIndent())
+        assertEquals("relay", listing.selectedWorkspace?.resolvedId)
+        assertEquals("/work/relay", listing.currentPath)
+        assertEquals("relay", listing.relativePath)
+        assertEquals("/work", listing.upNavigationPath)
+        assertEquals("/work/relay/src", listing.entries.single().navigationPath)
+        assertEquals("2026-09-17T10:00:00Z", listing.entries.single().mtime)
+
+        val legacy = RelayJson.decode(WorkspaceListing.serializer(), """
+            {"rootPath":"/work","currentPath":"/work/relay","relativePath":"relay",
+             "selectedWorkspace":{"id":"relay","name":"Relay"},
+             "entries":[{"name":"src","path":"/work/relay/src"}]}
+        """.trimIndent())
+        assertEquals(listing.currentPath, legacy.currentPath)
+        assertEquals(listing.selectedWorkspace?.resolvedId, legacy.selectedWorkspace?.resolvedId)
+        assertEquals(listing.entries.single().navigationPath, legacy.entries.single().navigationPath)
+    }
+
+    @Test
     fun providerAliasesMatchTheExistingRelayContract() {
         assertEquals(RelayProvider.CLAUDE, RelayProvider.fromWireValue("anthropic"))
         assertEquals(RelayProvider.CURSOR, RelayProvider.fromWireValue("cursor-agent"))

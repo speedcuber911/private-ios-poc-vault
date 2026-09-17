@@ -11,16 +11,19 @@ struct RelayMarkdownText: View {
     let text: String
     let userAligned: Bool
     let onOpenLoopbackURL: ((URL) -> Void)?
+    let bodyFont: Font
     @State private var blockedLoopbackURL: URL?
 
     init(
         text: String,
         userAligned: Bool,
-        onOpenLoopbackURL: ((URL) -> Void)? = nil
+        onOpenLoopbackURL: ((URL) -> Void)? = nil,
+        bodyFont: Font = AppTheme.uiFont(size: 14)
     ) {
         self.text = text
         self.userAligned = userAligned
         self.onOpenLoopbackURL = onOpenLoopbackURL
+        self.bodyFont = bodyFont
     }
 
     var body: some View {
@@ -31,7 +34,8 @@ struct RelayMarkdownText: View {
                     RelayMarkdownProse(
                         text: segment.text,
                         color: userAligned ? AppTheme.onEmber : AppTheme.textPrimary,
-                        isOnAccent: userAligned
+                        isOnAccent: userAligned,
+                        bodyFont: bodyFont
                     )
                 case .code(let language):
                     RelayCodeBlock(text: segment.text, language: language)
@@ -111,6 +115,7 @@ struct RelayMarkdownProse: View {
     let text: String
     let color: Color
     let isOnAccent: Bool
+    var bodyFont: Font = AppTheme.uiFont(size: 14)
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -125,7 +130,7 @@ struct RelayMarkdownProse: View {
                         .padding(.top, level <= 2 ? 2 : 0)
                 case .paragraph:
                     Text(inlineMarkdown(block.text))
-                        .font(AppTheme.uiFont(size: 14))
+                        .font(bodyFont)
                         .foregroundStyle(color)
                         .lineSpacing(3)
                         .fixedSize(horizontal: false, vertical: true)
@@ -153,7 +158,7 @@ struct RelayMarkdownProse: View {
                 .foregroundStyle(color.opacity(0.78))
                 .frame(width: 22, alignment: .trailing)
             Text(inlineMarkdown(text))
-                .font(AppTheme.uiFont(size: 14))
+                .font(bodyFont)
                 .foregroundStyle(color)
                 .lineSpacing(3)
                 .fixedSize(horizontal: false, vertical: true)

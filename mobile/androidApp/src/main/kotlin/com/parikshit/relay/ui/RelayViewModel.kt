@@ -181,7 +181,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             runLoading {
                 val repository = repository()
-                val workspace = repository.selectWorkspace(entry.path)
+                val workspace = repository.selectWorkspace(entry.navigationPath)
                 val selected = entry.copy(
                     workspaceId = workspace.resolvedId,
                     workspaceName = workspace.displayName,

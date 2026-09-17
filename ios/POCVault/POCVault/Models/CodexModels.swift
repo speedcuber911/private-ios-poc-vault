@@ -101,9 +101,12 @@ struct CodexWorkspaceDirectoryListing: Decodable, Hashable {
     enum CodingKeys: String, CodingKey {
         case rootPath
         case currentPath
+        case absolutePath
+        case path
         case relativePath
         case parentPath
         case selectedWorkspace
+        case workspace
         case entries
         case truncated
         case total
@@ -114,10 +117,13 @@ struct CodexWorkspaceDirectoryListing: Decodable, Hashable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.rootPath = try container.decodeLooseStringIfPresent(forKey: .rootPath) ?? ""
-        self.currentPath = try container.decodeLooseStringIfPresent(forKey: .currentPath) ?? rootPath
+        self.currentPath = try container.decodeLooseStringIfPresent(forKey: .currentPath)
+            ?? container.decodeLooseStringIfPresent(forKey: .absolutePath) ?? rootPath
         self.relativePath = try container.decodeLooseStringIfPresent(forKey: .relativePath)
+            ?? container.decodeLooseStringIfPresent(forKey: .path)
         self.parentPath = try container.decodeLooseStringIfPresent(forKey: .parentPath)
         self.selectedWorkspace = try container.decodeIfPresent(CodexWorkspace.self, forKey: .selectedWorkspace)
+            ?? container.decodeIfPresent(CodexWorkspace.self, forKey: .workspace)
         self.entries = (try? container.decodeIfPresent([CodexWorkspaceDirectoryEntry].self, forKey: .entries)) ?? []
         self.truncated = (try? container.decodeIfPresent(Bool.self, forKey: .truncated)) ?? false
         self.total = try? container.decodeIntegerIfPresent(forKey: .total)
@@ -186,6 +192,7 @@ struct CodexWorkspaceDirectoryEntry: Decodable, Hashable, Identifiable {
         case name
         case kind
         case path
+        case absolutePath
         case relativePath
         case workspaceId
         case workspaceName
@@ -193,6 +200,7 @@ struct CodexWorkspaceDirectoryEntry: Decodable, Hashable, Identifiable {
         case isRegistered
         case size
         case mtime
+        case modifiedAt
         case mime
         case isText
         case readDenied
@@ -200,7 +208,8 @@ struct CodexWorkspaceDirectoryEntry: Decodable, Hashable, Identifiable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        let path = try container.decodeLooseStringIfPresent(forKey: .path) ?? ""
+        let path = try container.decodeLooseStringIfPresent(forKey: .absolutePath)
+            ?? container.decodeLooseStringIfPresent(forKey: .path) ?? ""
         self.path = path
         self.name = try container.decodeLooseStringIfPresent(forKey: .name)
             ?? URL(fileURLWithPath: path).lastPathComponent
@@ -212,7 +221,8 @@ struct CodexWorkspaceDirectoryEntry: Decodable, Hashable, Identifiable {
         self.hasGit = (try container.decodeIfPresent(Bool.self, forKey: .hasGit)) ?? false
         self.isRegistered = (try container.decodeIfPresent(Bool.self, forKey: .isRegistered)) ?? false
         self.size = (try? container.decodeIntegerIfPresent(forKey: .size)).flatMap { $0.map(Int64.init) }
-        self.mtime = try? container.decodeLossyDateIfPresent(forKey: .mtime)
+        self.mtime = (try? container.decodeLossyDateIfPresent(forKey: .mtime))
+            ?? (try? container.decodeLossyDateIfPresent(forKey: .modifiedAt))
         self.mime = try container.decodeLooseStringIfPresent(forKey: .mime)
         self.isText = try? container.decodeIfPresent(Bool.self, forKey: .isText)
         self.readDenied = (try? container.decodeIfPresent(Bool.self, forKey: .readDenied)) ?? false
@@ -2383,4 +2393,3 @@ enum RelayRunLogParser {
         return nil
     }
 }
-
