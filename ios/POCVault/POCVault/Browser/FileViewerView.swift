@@ -181,6 +181,220 @@ struct RelayDelimitedTableView: View {
     }
 }
 
+enum RelaySyntaxTokenKind: String, Hashable {
+    case keyword
+    case string
+    case comment
+    case number
+    case type
+    case function
+    case property
+    case annotation
+
+    fileprivate var color: Color {
+        switch self {
+        case .keyword: return Color(red: 0.78, green: 0.56, blue: 0.92)
+        case .string: return Color(red: 0.81, green: 0.57, blue: 0.47)
+        case .comment: return Color(red: 0.42, green: 0.62, blue: 0.36)
+        case .number: return Color(red: 0.71, green: 0.81, blue: 0.66)
+        case .type: return Color(red: 0.31, green: 0.79, blue: 0.69)
+        case .function: return Color(red: 0.86, green: 0.86, blue: 0.67)
+        case .property: return Color(red: 0.61, green: 0.86, blue: 0.98)
+        case .annotation: return Color(red: 0.82, green: 0.68, blue: 0.87)
+        }
+    }
+}
+
+struct RelaySyntaxToken: Hashable {
+    let kind: RelaySyntaxTokenKind
+    let location: Int
+    let length: Int
+
+    fileprivate var range: NSRange { NSRange(location: location, length: length) }
+}
+
+/// A deliberately small, dependency-free highlighter for the read-only phone viewer.
+/// It recognizes the token classes that carry most of a code file's visual structure,
+/// while keeping the original text byte-for-byte intact for selection and copying.
+enum RelayCodeSyntax {
+    static func highlighted(_ text: String, fileName: String) -> AttributedString {
+        var value = AttributedString(text)
+        value.foregroundColor = AppTheme.textPrimary
+        for token in tokens(in: text, fileName: fileName) {
+            guard let stringRange = Range(token.range, in: text),
+                  let lower = AttributedString.Index(stringRange.lowerBound, within: value),
+                  let upper = AttributedString.Index(stringRange.upperBound, within: value) else {
+                continue
+            }
+            value[lower..<upper].foregroundColor = token.kind.color
+        }
+        return value
+    }
+
+    static func tokens(in text: String, fileName: String) -> [RelaySyntaxToken] {
+        guard !text.isEmpty else { return [] }
+        let fileExtension = URL(fileURLWithPath: fileName).pathExtension.lowercased()
+        let stringTokens = matches(
+            #"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`"#,
+            in: text,
+            kind: .string
+        )
+        let commentTokens = commentPattern(for: fileExtension).map {
+            matches($0, in: text, kind: .comment).filter { candidate in
+                !stringTokens.contains(where: { contains(candidate.location, in: $0.range) })
+            }
+        } ?? []
+        let protectedRanges = (stringTokens + commentTokens).map(\.range)
+
+        var result: [RelaySyntaxToken] = []
+        if let keywordPattern = keywordPattern(for: fileExtension) {
+            result += unprotectedMatches(keywordPattern, in: text, kind: .keyword, protectedRanges: protectedRanges)
+        }
+        result += unprotectedMatches(
+            #"(?<![A-Za-z0-9_$])(?:0x[0-9A-Fa-f]+|\d+(?:\.\d+)?)(?![A-Za-z0-9_$])"#,
+            in: text,
+            kind: .number,
+            protectedRanges: protectedRanges
+        )
+        result += unprotectedMatches(
+            #"\b[A-Z][A-Za-z0-9_]*\b"#,
+            in: text,
+            kind: .type,
+            protectedRanges: protectedRanges
+        )
+        result += unprotectedMatches(
+            #"\b[A-Za-z_$][A-Za-z0-9_$]*(?=\s*\()"#,
+            in: text,
+            kind: .function,
+            protectedRanges: protectedRanges
+        )
+        result += unprotectedMatches(
+            #"\b[A-Za-z_$][A-Za-z0-9_$]*(?=\s*:)"#,
+            in: text,
+            kind: .property,
+            protectedRanges: protectedRanges
+        )
+        result += unprotectedMatches(
+            #"@[A-Za-z_][A-Za-z0-9_.]*"#,
+            in: text,
+            kind: .annotation,
+            protectedRanges: protectedRanges
+        )
+
+        // Literal and comment colors win over identifier-shaped text inside them.
+        result += stringTokens
+        result += commentTokens
+        return result
+    }
+
+    private static func commentPattern(for fileExtension: String) -> String? {
+        switch fileExtension {
+        case "py", "rb", "sh", "bash", "zsh", "pl", "yaml", "yml", "toml":
+            return #"(?m:#[^\n]*$)"#
+        case "sql":
+            return #"(?m:--[^\n]*$)|(?s:/\*.*?\*/)"#
+        case "xml":
+            return #"(?s:<!--.*?-->)"#
+        case "json":
+            return nil
+        default:
+            return #"(?m://[^\n]*$)|(?s:/\*.*?\*/)"#
+        }
+    }
+
+    private static func keywordPattern(for fileExtension: String) -> String? {
+        let words: [String]
+        switch fileExtension {
+        case "js", "jsx", "mjs", "cjs", "ts", "tsx":
+            words = javascriptKeywords
+        case "swift":
+            words = swiftKeywords
+        case "py":
+            words = pythonKeywords
+        case "sh", "bash", "zsh":
+            words = shellKeywords
+        case "sql":
+            words = sqlKeywords
+        case "json", "yaml", "yml", "toml", "xml", "css", "scss", "less", "pbxproj":
+            return nil
+        default:
+            words = generalKeywords
+        }
+        let alternatives = words
+            .sorted { $0.count > $1.count }
+            .map(NSRegularExpression.escapedPattern(for:))
+            .joined(separator: "|")
+        return "(?<![A-Za-z0-9_$])(?:\(alternatives))(?![A-Za-z0-9_$])"
+    }
+
+    private static func unprotectedMatches(
+        _ pattern: String,
+        in text: String,
+        kind: RelaySyntaxTokenKind,
+        protectedRanges: [NSRange]
+    ) -> [RelaySyntaxToken] {
+        matches(pattern, in: text, kind: kind).filter { token in
+            !protectedRanges.contains { NSIntersectionRange(token.range, $0).length > 0 }
+        }
+    }
+
+    private static func matches(
+        _ pattern: String,
+        in text: String,
+        kind: RelaySyntaxTokenKind
+    ) -> [RelaySyntaxToken] {
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let searchRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        return expression.matches(in: text, range: searchRange).map {
+            RelaySyntaxToken(kind: kind, location: $0.range.location, length: $0.range.length)
+        }
+    }
+
+    private static func contains(_ location: Int, in range: NSRange) -> Bool {
+        location >= range.location && location < NSMaxRange(range)
+    }
+
+    private static let javascriptKeywords = [
+        "as", "async", "await", "break", "case", "catch", "class", "const", "continue", "debugger",
+        "declare", "default", "delete", "do", "else", "enum", "export", "extends", "false", "finally",
+        "for", "from", "function", "get", "if", "implements", "import", "in", "infer", "instanceof",
+        "interface", "keyof", "let", "namespace", "new", "null", "of", "private", "protected", "public",
+        "readonly", "return", "satisfies", "set", "static", "super", "switch", "this", "throw", "true",
+        "try", "type", "typeof", "undefined", "var", "void", "while", "with", "yield"
+    ]
+    private static let swiftKeywords = [
+        "actor", "any", "as", "associatedtype", "async", "await", "break", "case", "catch", "class",
+        "continue", "convenience", "default", "defer", "deinit", "do", "else", "enum", "extension", "false",
+        "fileprivate", "for", "func", "guard", "if", "import", "in", "indirect", "init", "inout", "internal",
+        "is", "isolated", "let", "mutating", "nil", "nonisolated", "open", "operator", "override", "private",
+        "protocol", "public", "repeat", "required", "rethrows", "return", "Self", "self", "some", "static",
+        "struct", "subscript", "super", "switch", "throw", "throws", "true", "try", "typealias", "var", "where", "while"
+    ]
+    private static let pythonKeywords = [
+        "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class", "continue", "def",
+        "del", "elif", "else", "except", "finally", "for", "from", "global", "if", "import", "in", "is",
+        "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while", "with", "yield"
+    ]
+    private static let shellKeywords = [
+        "case", "do", "done", "elif", "else", "esac", "export", "fi", "for", "function", "if", "in", "local",
+        "readonly", "return", "select", "then", "time", "until", "while"
+    ]
+    private static let sqlKeywords = [
+        "ADD", "ALTER", "AND", "AS", "ASC", "BEGIN", "BETWEEN", "BY", "CASE", "CREATE", "DELETE", "DESC",
+        "DISTINCT", "DROP", "ELSE", "END", "EXISTS", "FROM", "GROUP", "HAVING", "IN", "INDEX", "INNER",
+        "INSERT", "INTO", "IS", "JOIN", "LEFT", "LIKE", "LIMIT", "NOT", "NULL", "ON", "OR", "ORDER",
+        "OUTER", "PRIMARY", "REFERENCES", "RIGHT", "SELECT", "SET", "TABLE", "THEN", "UNION", "UNIQUE",
+        "UPDATE", "VALUES", "WHEN", "WHERE"
+    ]
+    private static let generalKeywords = [
+        "abstract", "break", "case", "catch", "class", "const", "continue", "default", "defer", "do", "else",
+        "enum", "false", "final", "finally", "for", "func", "function", "if", "import", "in", "interface",
+        "let", "match", "mod", "new", "nil", "null", "override", "package", "private", "protected", "protocol",
+        "pub", "public", "return", "static", "struct", "super", "switch", "this", "throw", "trait", "true",
+        "try", "type", "use", "using", "var", "void", "while"
+    ]
+}
+
 struct RelayQuickLookPreview: UIViewControllerRepresentable {
     let fileURL: URL
 
@@ -484,7 +698,7 @@ struct FileViewerView: View {
         } else {
             switch viewModel.kind {
             case .text:
-                textContent(raw: false)
+                textContent(forceWrap: false)
             case .markdown:
                 markdownContent
             case .table:
@@ -500,32 +714,35 @@ struct FileViewerView: View {
         }
     }
 
-    private func textContent(raw: Bool) -> some View {
-        Group {
-            if raw || wrapsText {
-                ScrollView {
-                    scrollBody
+    private func textContent(forceWrap: Bool) -> some View {
+        let shouldWrap = forceWrap || wrapsText
+        return Group {
+            if shouldWrap {
+                GeometryReader { proxy in
+                    ScrollView(.vertical) {
+                        scrollBody(wrapWidth: proxy.size.width)
+                    }
                 }
             } else {
                 ScrollView([.horizontal, .vertical]) {
-                    scrollBody
+                    scrollBody(wrapWidth: nil)
                 }
             }
         }
         .scrollDismissesKeyboard(.interactively)
     }
 
-    private var scrollBody: some View {
+    private func scrollBody(wrapWidth: CGFloat?) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             inlineErrorBanner
-            monoText
+            monoText(wrapWidth: wrapWidth)
             statusRows
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(width: wrapWidth, alignment: .leading)
     }
 
     @ViewBuilder
-    private var monoText: some View {
+    private func monoText(wrapWidth: CGFloat?) -> some View {
         if viewModel.textChunks.isEmpty {
             Text("This file is empty.")
                 .font(AppTheme.monoFont(size: 12))
@@ -535,22 +752,31 @@ struct FileViewerView: View {
         } else {
             LazyVStack(alignment: .leading, spacing: 0) {
                 ForEach(Array(viewModel.textChunks.enumerated()), id: \.offset) { _, chunk in
-                    Text(chunk)
+                    Group {
+                        if viewModel.entry.fileCategory == .code {
+                            Text(RelayCodeSyntax.highlighted(chunk, fileName: viewModel.entry.displayName))
+                        } else {
+                            Text(chunk)
+                                .foregroundStyle(AppTheme.textPrimary)
+                        }
+                    }
                         .font(AppTheme.monoFont(size: 12))
-                        .foregroundStyle(AppTheme.textPrimary)
+                        .lineSpacing(2.5)
                         .textSelection(.enabled)
-                        .fixedSize(horizontal: !wrapsText, vertical: false)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: wrapWidth == nil, vertical: true)
+                        .frame(maxWidth: wrapWidth == nil ? nil : .infinity, alignment: .leading)
                 }
             }
-            .padding(16)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 16)
+            .frame(width: wrapWidth, alignment: .leading)
         }
     }
 
     private var markdownContent: some View {
         Group {
             if showsRawMarkdown {
-                textContent(raw: true)
+                textContent(forceWrap: true)
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
@@ -751,12 +977,21 @@ struct FileViewerView: View {
 
         if viewModel.kind == .text {
             ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    wrapsText.toggle()
+                Menu {
+                    Button {
+                        wrapsText = true
+                    } label: {
+                        Label("Wrap long lines", systemImage: wrapsText ? "checkmark" : "return")
+                    }
+                    Button {
+                        wrapsText = false
+                    } label: {
+                        Label("Scroll horizontally", systemImage: wrapsText ? "arrow.left.and.right" : "checkmark")
+                    }
                 } label: {
-                    Image(systemName: wrapsText ? "arrow.left.and.right" : "return")
+                    Image(systemName: "textformat")
                 }
-                .accessibilityLabel(wrapsText ? "Scroll long lines horizontally" : "Wrap long lines")
+                .accessibilityLabel(wrapsText ? "Text layout, wrapped" : "Text layout, horizontal scrolling")
                 .accessibilityIdentifier("relay-viewer-wrap-toggle")
             }
         }

@@ -2788,6 +2788,29 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(capped.isTruncated)
     }
 
+    func testRelayCodeSyntaxSeparatesTypeScriptStructureFromLiteralsAndComments() throws {
+        let source = """
+        export const endpoint: URL = "https://relay.dev/v1";
+        // Retry 42 times only during local development.
+        """
+        let tokens = RelayCodeSyntax.tokens(in: source, fileName: "settings.ts")
+
+        func kinds(at needle: String) throws -> Set<RelaySyntaxTokenKind> {
+            let range = try XCTUnwrap(source.range(of: needle))
+            let location = NSRange(range, in: source).location
+            return Set(tokens.compactMap { token in
+                (location >= token.location && location < token.location + token.length) ? token.kind : nil
+            })
+        }
+
+        XCTAssertTrue(try kinds(at: "export").contains(.keyword))
+        XCTAssertTrue(try kinds(at: "endpoint").contains(.property))
+        XCTAssertTrue(try kinds(at: "URL").contains(.type))
+        XCTAssertEqual(try kinds(at: "https://relay.dev/v1"), [.string])
+        XCTAssertEqual(try kinds(at: "42"), [.comment], "tokens inside comments must keep comment color")
+        XCTAssertEqual(String(RelayCodeSyntax.highlighted(source, fileName: "settings.ts").characters), source)
+    }
+
     @MainActor
     func testRelayFileViewerLoadMoreRangesContinueFromLoadedBytes() throws {
         let firstRange = FileViewerViewModel.nextRange(afterLoadedByteCount: 0)

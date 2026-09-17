@@ -474,6 +474,9 @@ struct POCVaultRootView: View {
             onOpenFolder: { path in
                 browserPath.append(.folder(path: path))
             },
+            onNavigateToFolder: { path in
+                navigateBrowser(to: path)
+            },
             onOpenFile: { entry in
                 browserPath.append(.file(entry: entry))
             },
@@ -490,6 +493,26 @@ struct POCVaultRootView: View {
             },
             onOpenDiagnostics: isRoot ? { showingDiagnostics = true } : nil
         )
+    }
+
+    /// Breadcrumb taps move within the existing navigation stack when possible.
+    /// A direct visual-test route may not have its ancestors in the stack, so that
+    /// case starts a clean stack at the selected folder instead of pushing sideways
+    /// from a deeper location.
+    private func navigateBrowser(to folderPath: String?) {
+        guard let folderPath else {
+            browserPath.removeAll()
+            return
+        }
+
+        if let index = browserPath.firstIndex(where: { route in
+            guard case .folder(let path) = route else { return false }
+            return path == folderPath
+        }) {
+            browserPath = Array(browserPath.prefix(through: index))
+        } else {
+            browserPath = [.folder(path: folderPath)]
+        }
     }
 
     private func openChat(folderPath: String?, workspaceID: String?) {

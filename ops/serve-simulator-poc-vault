@@ -32,6 +32,7 @@ class SimulatorVaultServer(ThreadingHTTPServer):
         self.approval_pending = True
         self.approval_resolution: dict | None = None
         self.terminals: dict[str, dict] = {}
+        self.dynamic_workspaces: dict[str, dict] = {}
         self.terminal_counter = 0
         self.active_job_provider = "codex"
         self.active_job_model: str | None = None
@@ -174,6 +175,7 @@ class Handler(BaseHTTPRequestHandler):
             body = self.read_json_body()
             workspace_id = str(body.get("workspaceId") or "")
             workspace = next((item for item in _SIM_WORKSPACES if item["id"] == workspace_id), None)
+            workspace = workspace or self.server.dynamic_workspaces.get(workspace_id)
             if workspace is None:
                 self.send_json_error(400, "unknown workspaceId")
                 return
@@ -206,7 +208,8 @@ class Handler(BaseHTTPRequestHandler):
                 record["output"] += text
                 if command == "pwd":
                     workspace_id = record["terminal"]["workspaceId"]
-                    workspace = next(item for item in _SIM_WORKSPACES if item["id"] == workspace_id)
+                    workspace = next((item for item in _SIM_WORKSPACES if item["id"] == workspace_id), None)
+                    workspace = workspace or self.server.dynamic_workspaces[workspace_id]
                     record["output"] += f"{workspace['path']}\n$ "
                 elif command in {"exit", "logout"}:
                     record["output"] += "logout\n"
@@ -241,7 +244,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"text": "Simulator voice transcript", "durationMs": 1200})
             return
         if path == "/v1/codex/workspaces/select":
-            self.send_json(codex_fixture_workspace())
+            body = self.read_json_body()
+            listing = codex_fixture_fs_list(str(body.get("path") or ""), {})
+            workspace = listing.get("workspace") if listing else None
+            if workspace is None:
+                self.send_json_error(400, "workspace root cannot be selected")
+                return
+            with self.server.fixture_lock:
+                self.server.dynamic_workspaces[workspace["id"]] = workspace
+            self.send_json(workspace)
             return
         if path == "/v1/codex/workspaces/create":
             self.send_json(codex_fixture_workspace(id="sim-new-workspace", name="New Workspace", path="/srv/codex-workspaces/new-workspace"))
@@ -886,6 +897,32 @@ _SIM_FS_PNG = __import__("base64").b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
 )
 
+_SIM_FS_TYPESCRIPT = """// Relay syntax and wrapping preview
+export type PricingPlanKey = 'starter' | 'scale' | 'enterprise';
+
+export interface SaaSPricingPlan {
+  key: PricingPlanKey;
+  tier: string;
+  price: string;
+  period: string;
+  copy: string;
+  features: readonly string[];
+  featured: boolean;
+}
+
+export const saasPricingPlans: SaaSPricingPlan[] = [
+  {
+    key: 'starter',
+    tier: 'Starter',
+    price: '₹2,000',
+    period: 'credits/month',
+    copy: 'Start with a focused monthly credit pool and everything needed to ship a polished production workflow from your phone.',
+    features: ['Maya for everyday work', 'Presets and reusable skills', 'Native Codex conversation history'],
+    featured: false,
+  },
+];
+""".encode()
+
 # Real-size image and static browser-result fixtures for the typed job-output cards.
 _SIM_ARTIFACT_SCREENSHOT = ROOT / "pocs" / "relay" / "public" / "og.png"
 _SIM_ARTIFACT_PREVIEW = _SIM_LIVE_PREVIEW
@@ -905,6 +942,8 @@ _SIM_FS_TREE = {
                      "mime": "text/plain; charset=utf-8", "isText": True},
             "readme.md": {"kind": "file", "content": b"# Launch checklist\n\nRepresentative local sample project for Relay.\n\nOpen launch-checklist.html to inspect the interactive release checklist.\nThe sample task exposes the same HTML as an artifact and a local app preview.\n",
                           "mime": "text/markdown; charset=utf-8", "isText": True},
+            "pricing.ts": {"kind": "file", "content": _SIM_FS_TYPESCRIPT,
+                           "mime": "text/typescript; charset=utf-8", "isText": True},
             "launch-checklist.html": {"kind": "file", "content": _SIM_LIVE_PREVIEW,
                                       "mime": "text/html; charset=utf-8", "isText": True},
             "assets": {"kind": "dir", "children": {

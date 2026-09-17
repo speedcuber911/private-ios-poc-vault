@@ -4,9 +4,9 @@ import Foundation
 /// these via `@StateObject`, so navigating deeper never disturbs the listings behind it.
 ///
 /// Listing comes from the bounded jail listing endpoint (`/v1/codex/fs/list`) with
-/// offset/limit paging. Search reuses the proven recursive `q` search on the
-/// workspace-dirs endpoint (harvested from the old workspace picker sheet); results
-/// replace the listing until the query clears.
+/// offset/limit paging. The visible page is filtered locally so the explorer responds
+/// immediately and files do not disappear from results just because the older
+/// workspace-directory search endpoint only knows about directories.
 @MainActor
 final class FileBrowserViewModel: ObservableObject {
     static let pageSize = 200
@@ -26,11 +26,14 @@ final class FileBrowserViewModel: ObservableObject {
     @Published private(set) var isLoadingConversations = false
     @Published private(set) var conversationError: String?
 
-    /// Bound to `.searchable`; the view debounces via `runSearchAfterDebounce()`.
+    /// The workspace identity returned by `POST /workspaces/select`. A plain file
+    /// listing can describe a dynamic workspace without materializing it in relayd;
+    /// jobs, threads, skills and terminals must only receive this confirmed identity.
+    @Published private(set) var workspace: CodexWorkspace?
+
+    /// Bound to the explorer's compact filter field.
     @Published var searchText = ""
-    /// Non-nil while a server search is active; replaces `entries` in the UI.
-    @Published private(set) var searchResults: [CodexWorkspaceDirectoryEntry]?
-    @Published private(set) var isSearching = false
+    @Published private(set) var isResolvingWorkspace = false
 
     init(client: CodexClient, path: String? = nil) {
         self.client = client
@@ -43,13 +46,19 @@ final class FileBrowserViewModel: ObservableObject {
         return URL(fileURLWithPath: path).lastPathComponent
     }
 
-    var isShowingSearchResults: Bool { searchResults != nil }
+    var isShowingSearchResults: Bool { searchText.trimmedNonEmpty != nil }
 
-    var visibleEntries: [CodexWorkspaceDirectoryEntry] { searchResults ?? entries }
+    var visibleEntries: [CodexWorkspaceDirectoryEntry] {
+        guard let query = searchText.trimmedNonEmpty?.lowercased() else { return entries }
+        return entries.filter { entry in
+            entry.displayName.lowercased().contains(query)
+                || (entry.relativePath?.lowercased().contains(query) ?? false)
+        }
+    }
 
     /// True when the server bounded the current listing and more rows can be paged in.
     var showsTruncationBanner: Bool {
-        guard searchResults == nil, let listing else { return false }
+        guard searchText.trimmedNonEmpty == nil, let listing else { return false }
         return listing.truncated
     }
 
@@ -75,6 +84,7 @@ final class FileBrowserViewModel: ObservableObject {
             listing = loaded
             entries = loaded.entries
             errorMessage = nil
+            await resolveWorkspaceIfNeeded(from: loaded)
         } catch {
             guard !isCancellation(error) else { return }
             errorMessage = error.localizedDescription
@@ -86,16 +96,19 @@ final class FileBrowserViewModel: ObservableObject {
     }
 
     /// The daemon includes saved CLI transcripts as well as runs started by Relay.
-    /// Use the server-resolved workspace identity, never a folder-name comparison.
+    /// `fs/list` may only *describe* a dynamic workspace, so explicitly select this
+    /// path before using its id in a workspace-scoped endpoint. This is what prevents
+    /// the intermittent `workspaceId is not registered` response in nested folders.
     func refreshConversations() async {
-        guard let workspaceID = listing?.selectedWorkspace?.id else { return }
+        guard let workspace = await ensureWorkspaceResolved() else { return }
+        let workspaceID = workspace.id
         isLoadingConversations = true
         defer { isLoadingConversations = false }
         do {
             async let threads = client.fetchThreads(workspaceID: workspaceID, limit: 200)
             async let jobs = client.fetchJobs(workspaceID: workspaceID, limit: 100)
             let items = try await CodexThreadFeedItem.makeFeed(threads: threads, jobs: jobs, workspaceID: workspaceID)
-            guard listing?.selectedWorkspace?.id == workspaceID else { return }
+            guard self.workspace?.id == workspaceID else { return }
             conversations = items
             conversationError = nil
         } catch {
@@ -114,35 +127,6 @@ final class FileBrowserViewModel: ObservableObject {
             listing = next
             let knownIDs = Set(entries.map(\.id))
             entries.append(contentsOf: next.entries.filter { !knownIDs.contains($0.id) })
-            errorMessage = nil
-        } catch {
-            guard !isCancellation(error) else { return }
-            errorMessage = error.localizedDescription
-        }
-    }
-
-    /// Debounced server-backed search; call from a `.task(id: searchText)` so edits cancel
-    /// the previous pass. Empty query drops straight back to the plain listing.
-    func runSearchAfterDebounce() async {
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else {
-            searchResults = nil
-            isSearching = false
-            return
-        }
-        try? await Task.sleep(nanoseconds: 350_000_000)
-        guard !Task.isCancelled else { return }
-        await runSearch(query: query)
-    }
-
-    private func runSearch(query: String) async {
-        isSearching = true
-        defer { isSearching = false }
-        do {
-            let result = try await client.fetchWorkspaceDirectories(path: path, query: query)
-            // Ignore stale responses if the query moved on while the request was in flight.
-            guard searchText.trimmingCharacters(in: .whitespacesAndNewlines) == query else { return }
-            searchResults = result.entries
             errorMessage = nil
         } catch {
             guard !isCancellation(error) else { return }
@@ -170,5 +154,38 @@ final class FileBrowserViewModel: ObservableObject {
     /// its root until the first listing reports the resolved path).
     var currentFolderPath: String {
         path ?? listing?.currentPath ?? listing?.rootPath ?? ""
+    }
+
+    private func ensureWorkspaceResolved() async -> CodexWorkspace? {
+        if let workspace { return workspace }
+        if isResolvingWorkspace {
+            while isResolvingWorkspace, !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+            return workspace
+        }
+        guard let listing else {
+            conversationError = "This folder is still loading."
+            return nil
+        }
+        await resolveWorkspaceIfNeeded(from: listing)
+        return workspace
+    }
+
+    private func resolveWorkspaceIfNeeded(from listing: CodexWorkspaceDirectoryListing) async {
+        guard workspace == nil,
+              !isResolvingWorkspace,
+              listing.currentPath != listing.rootPath,
+              !listing.currentPath.isEmpty else { return }
+
+        isResolvingWorkspace = true
+        defer { isResolvingWorkspace = false }
+        do {
+            workspace = try await client.selectWorkspace(path: listing.currentPath)
+            conversationError = nil
+        } catch {
+            guard !isCancellation(error) else { return }
+            conversationError = "Chats are unavailable in this folder: \(error.localizedDescription)"
+        }
     }
 }
