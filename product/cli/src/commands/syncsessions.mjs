@@ -138,8 +138,16 @@ async function cmdSyncSessions(args = [], deps = {}) {
     }, { home });
   }
 
-  const discovered = discoverSessionsImpl({ cwd: root, home })
-    .filter((session) => session.harness === "codex");
+  const discoveredById = new Map();
+  for (const session of discoverSessionsImpl({ cwd: root, home })) {
+    if (session.harness !== "codex") continue;
+    const existing = discoveredById.get(session.id);
+    if (!existing || String(session.lastActive || "") > String(existing.lastActive || "")) {
+      discoveredById.set(session.id, session);
+    }
+  }
+  const discovered = [...discoveredById.values()]
+    .sort((left, right) => String(right.lastActive || "").localeCompare(String(left.lastActive || "")));
   const skipped = [];
   const eligible = [];
   for (const session of discovered) {
@@ -152,6 +160,7 @@ async function cmdSyncSessions(args = [], deps = {}) {
         session,
         descriptor: {
           id: session.id,
+          title: session.title || null,
           sha256: sha256File(session.filePath),
           sizeBytes: session.sizeBytes,
           updatedAt: session.lastActive,
@@ -209,6 +218,7 @@ async function cmdSyncSessions(args = [], deps = {}) {
           sourceCwd: entry.session.sourceCwd || root,
           session: {
             id: entry.session.id,
+            title: entry.session.title || null,
             createdAt: entry.session.createdAt || entry.session.lastActive,
             updatedAt: entry.session.lastActive,
             sha256: sourceSha256,

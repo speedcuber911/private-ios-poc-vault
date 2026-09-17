@@ -66,6 +66,15 @@ function cleanIso(value, fallback = null) {
   return Number.isFinite(date.getTime()) ? date.toISOString() : fallback;
 }
 
+function cleanTitle(value) {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value !== "string" || value.length > 500 || /[\0\r\n]/.test(value)) {
+    fail(400, "session title is invalid");
+  }
+  const title = value.replace(/\s+/g, " ").trim();
+  return title ? title.slice(0, 200) : null;
+}
+
 function cleanDescriptor(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) fail(400, "session descriptor is invalid");
   if (!isResumableSessionId(value.id)) fail(400, "session id is invalid");
@@ -75,6 +84,7 @@ function cleanDescriptor(value) {
   }
   return {
     id: value.id,
+    title: cleanTitle(value.title),
     sha256: value.sha256,
     sizeBytes: value.sizeBytes,
     createdAt: cleanIso(value.createdAt),
@@ -111,8 +121,9 @@ function recordFilePath(record, targetCodexHome) {
 function classifyDescriptor(descriptor, workspace, {
   baseDir = dataDir,
   targetCodexHome = codexHome,
+  state: suppliedState = null,
 } = {}) {
-  const state = readState(baseDir);
+  const state = suppliedState || readState(baseDir);
   const key = stateKey(workspace.id, descriptor.id);
   const record = state.sessions[key] || null;
   if (!record) {
@@ -131,6 +142,16 @@ function classifyDescriptor(descriptor, workspace, {
     : { status: "upload", reason: null };
 }
 
+function storeCurrentTitle(descriptor, workspace, { baseDir = dataDir, state: suppliedState = null } = {}) {
+  if (!descriptor.title) return false;
+  const state = suppliedState || readState(baseDir);
+  const record = state.sessions[stateKey(workspace.id, descriptor.id)];
+  if (!record || record.title === descriptor.title) return false;
+  record.title = descriptor.title;
+  if (!suppliedState) writeState(state, baseDir);
+  return true;
+}
+
 function planSessionImports(body, options = {}) {
   if (body?.v !== SESSION_SYNC_VERSION || !Array.isArray(body?.sessions)) fail(400, "session sync plan is invalid");
   if (body.sessions.length > 500) fail(400, "too many sessions");
@@ -140,12 +161,21 @@ function planSessionImports(body, options = {}) {
     body.workspacePath,
     options.browseWorkspace || browseWorkspaceForPath,
   );
+  const baseDir = options.baseDir || dataDir;
+  const state = readState(baseDir);
+  let stateChanged = false;
+  const sessions = body.sessions.map((value) => {
+    const descriptor = cleanDescriptor(value);
+    const classification = classifyDescriptor(descriptor, workspace, { ...options, state });
+    if (classification.status === "current") {
+      stateChanged = storeCurrentTitle(descriptor, workspace, { baseDir, state }) || stateChanged;
+    }
+    return { id: descriptor.id, ...classification };
+  });
+  if (stateChanged) writeState(state, baseDir);
   return {
     workspaceId: workspace.id,
-    sessions: body.sessions.map((value) => {
-      const descriptor = cleanDescriptor(value);
-      return { id: descriptor.id, ...classifyDescriptor(descriptor, workspace, options) };
-    }),
+    sessions,
   };
 }
 
@@ -196,13 +226,17 @@ function importCodexSessionBytes(body, bytes, options = {}) {
   }
   const descriptor = cleanDescriptor({
     id: sessionId,
+    title: body.session.title,
     sha256: sourceSha256,
     sizeBytes: bytes.length,
     createdAt: body.session.createdAt || meta.timestamp,
     updatedAt: body.session.updatedAt,
   });
   const classification = classifyDescriptor(descriptor, workspace, options);
-  if (classification.status === "current") return { status: "current", sessionId, workspaceId: workspace.id };
+  if (classification.status === "current") {
+    storeCurrentTitle(descriptor, workspace, options);
+    return { status: "current", sessionId, workspaceId: workspace.id };
+  }
   if (classification.status === "conflict") fail(409, classification.reason || "remote session changed");
 
   const baseDir = options.baseDir || dataDir;
@@ -220,7 +254,7 @@ function importCodexSessionBytes(body, bytes, options = {}) {
       sessionId,
       cwd: meta.cwd,
       createdAt,
-      title: "Synced Codex session",
+      title: descriptor.title || "Synced Codex session",
     },
     sessionBytes: bytes,
     runHome: targetRunHome,
@@ -234,6 +268,7 @@ function importCodexSessionBytes(body, bytes, options = {}) {
   state.sessions[key] = {
     workspaceId: workspace.id,
     sessionId,
+    title: descriptor.title,
     sourceSha256,
     installedSha256,
     fileName,
@@ -274,7 +309,10 @@ function createSessionUpload(body, options = {}) {
     fail(400, "sourceCwd is invalid");
   }
   const classification = classifyDescriptor(descriptor, workspace, options);
-  if (classification.status === "current") return { status: "current", sessionId: descriptor.id, workspaceId: workspace.id };
+  if (classification.status === "current") {
+    storeCurrentTitle(descriptor, workspace, options);
+    return { status: "current", sessionId: descriptor.id, workspaceId: workspace.id };
+  }
   if (classification.status === "conflict") fail(409, classification.reason || "remote session changed");
   const uploadId = crypto.randomUUID();
   const baseDir = options.baseDir || dataDir;

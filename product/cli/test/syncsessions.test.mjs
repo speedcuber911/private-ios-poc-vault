@@ -111,6 +111,8 @@ test("sync-sessions uploads native Codex transcripts without reading Git state o
   })}\n`);
   const filePath = path.join(home, "rollout.jsonl");
   fs.writeFileSync(filePath, transcript);
+  const staleFilePath = path.join(home, "stale-rollout.jsonl");
+  fs.writeFileSync(staleFilePath, Buffer.from(`${transcript.toString("utf8")}stale\n`));
   writeDirectConfig({
     nodeId: "node-1", nodeName: "EC2", apiBaseUrl: "https://relay.example",
     deviceToken: "d".repeat(64), caPem: "certificate", workspaceMappings: {},
@@ -131,19 +133,34 @@ test("sync-sessions uploads native Codex transcripts without reading Git state o
   const result = await cmdSyncSessions([], {
     home, cwd: root, log: (line) => output.push(line), apiRequest,
     findGitRootImpl: async () => root,
-    discoverSessionsImpl: () => [{
-      id: ID,
-      harness: "codex",
-      filePath,
-      sizeBytes: transcript.length,
-      sourceCwd: root,
-      createdAt: "2026-09-17T10:00:00.000Z",
-      lastActive: "2026-09-17T10:05:00.000Z",
-    }],
+    discoverSessionsImpl: () => [
+      {
+        id: ID,
+        harness: "codex",
+        title: "Improve iOS chat screen UX",
+        filePath,
+        sizeBytes: transcript.length,
+        sourceCwd: root,
+        createdAt: "2026-09-17T10:00:00.000Z",
+        lastActive: "2026-09-17T10:05:00.000Z",
+      },
+      {
+        id: ID,
+        harness: "codex",
+        title: "Stale title",
+        filePath: staleFilePath,
+        sizeBytes: fs.statSync(staleFilePath).size,
+        sourceCwd: root,
+        createdAt: "2026-09-17T09:00:00.000Z",
+        lastActive: "2026-09-17T09:05:00.000Z",
+      },
+    ],
   });
   assert.equal(result.imported, 1);
   assert.equal(calls.length, 3);
+  assert.equal(calls[1].options.body.sessions[0].title, "Improve iOS chat screen UX");
   assert.equal(calls[1].options.body.sessions[0].sha256, crypto.createHash("sha256").update(transcript).digest("hex"));
+  assert.equal(calls[2].options.body.session.title, "Improve iOS chat screen UX");
   assert.equal(Buffer.from(calls[2].options.body.session.transcript, "base64").toString("utf8"), transcript.toString("utf8"));
   assert.deepEqual(readDirectConfig({ home }).workspaceMappings[root], {
     id: "poc-vault",

@@ -6,8 +6,9 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import readline from "node:readline";
 
-import { runHome, codexHome, threadSummaryCharacters, workspaceBrowseRoot, terminalStatuses, allowedThreadProviders, realpathOrResolve, pathWithinRoot } from "./config.mjs";
+import { runHome, codexHome, dataDir, threadSummaryCharacters, threadMessageCharacters, workspaceBrowseRoot, terminalStatuses, allowedThreadProviders, realpathOrResolve, pathWithinRoot } from "./config.mjs";
 import { isSafeJobId, cleanApiText } from "./util.mjs";
 import { isResumableSessionId, isKimiSessionId } from "./sessionid.mjs";
 import { appendAudit } from "./audit.mjs";
@@ -229,6 +230,7 @@ function cleanSessionTimestamp(value) {
 
 function listWorkspaceSessions({ workspaceId, provider = null, limit, includeSummary = false }) {
   const selectedWorkspace = resolveOptionalWorkspaceFilter(workspaceId);
+  const syncedTitles = readSyncedSessionTitles();
 
   const sessionMap = new Map();
   for (const file of walkSessionFiles(path.join(codexHome, "sessions"))) {
@@ -248,6 +250,7 @@ function listWorkspaceSessions({ workspaceId, provider = null, limit, includeSum
       cwd: meta.cwd,
       timestamp: meta.timestamp,
       updatedAt: stat.mtime.toISOString(),
+      title: syncedTitles.get(`${workspace.id}:${meta.id}`) || null,
     };
     if (includeSummary) {
       session.summary = readSessionSummary(file);
@@ -365,6 +368,7 @@ async function threadDetailResponse(sessionId, { provider = null } = {}) {
     const sessionProvider = meta ? normalizeJobProvider(meta.provider) : "codex";
     if (workspace && (!provider || sessionProvider === provider)) {
       const stat = fs.statSync(sessionFile);
+      const syncedTitle = readSyncedSessionTitles().get(`${workspace.id}:${meta.id}`) || null;
       thread = {
         id: meta.id,
         sessionId: meta.id,
@@ -374,11 +378,12 @@ async function threadDetailResponse(sessionId, { provider = null } = {}) {
         cwd: meta.cwd,
         timestamp: meta.timestamp,
         updatedAt: stat.mtime.toISOString(),
+        title: syncedTitle,
         hasSessionFile: true,
         summary: readSessionSummary(sessionFile),
         jobs: [],
       };
-      messages = readSessionMessages(sessionFile);
+      messages = await readSessionMessages(sessionFile);
     }
   }
 
@@ -497,6 +502,7 @@ function threadSummary(thread) {
   );
   const lastJob = sortedJobs[0] || null;
   const activeJobCount = sortedJobs.filter((job) => !terminalStatuses.has(job.status)).length;
+  const title = summaryText(thread.title) || thread.summary?.firstUserPrompt || summaryText(lastJob?.prompt) || null;
 
   return {
     id: thread.id,
@@ -512,7 +518,8 @@ function threadSummary(thread) {
     activeJobCount,
     lastJobId: lastJob?.id || null,
     lastJobStatus: lastJob?.status || null,
-    lastPrompt: summaryText(lastJob?.prompt) || thread.summary?.firstUserPrompt || null,
+    title,
+    lastPrompt: title,
     lastResult: summaryText(lastJob?.result) || thread.summary?.lastAssistantAnswer || null,
     lastError: cleanApiText(lastJob?.error || "").trim() || null,
     hasSessionFile: Boolean(thread.hasSessionFile),
@@ -525,7 +532,7 @@ function readSessionSummary(sessionFile) {
   let firstUserPrompt = null;
   let lastAssistantAnswer = null;
 
-  for (const line of readSessionLines(sessionFile)) {
+  for (const line of readSessionLines(sessionFile, { fromEnd: false })) {
     if (!line.trim()) continue;
     try {
       const entry = JSON.parse(line);
@@ -535,9 +542,20 @@ function readSessionSummary(sessionFile) {
       const text = messageText(message);
       if (message.role === "user" && !firstUserPrompt) {
         firstUserPrompt = userPromptSummary(text);
-      } else if (message.role === "assistant") {
-        lastAssistantAnswer = boundedThreadText(text);
       }
+    } catch {
+      continue;
+    }
+  }
+
+  for (const line of readSessionLines(sessionFile, { fromEnd: true })) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line);
+      if (entry?.type !== "response_item") continue;
+      const message = entry.payload;
+      if (message?.type !== "message" || message.role !== "assistant") continue;
+      lastAssistantAnswer = boundedThreadText(messageText(message));
     } catch {
       continue;
     }
@@ -547,9 +565,11 @@ function readSessionSummary(sessionFile) {
 }
 
 
-function readSessionMessages(sessionFile) {
+async function readSessionMessages(sessionFile) {
   const messages = [];
-  for (const line of readSessionLines(sessionFile)) {
+  const input = fs.createReadStream(sessionFile, { encoding: "utf8" });
+  const lines = readline.createInterface({ input, crlfDelay: Infinity });
+  for await (const line of lines) {
     if (!line.trim()) continue;
     try {
       const entry = JSON.parse(line);
@@ -559,7 +579,8 @@ function readSessionMessages(sessionFile) {
       if (!["user", "assistant"].includes(message.role)) continue;
 
       const rawText = messageText(message);
-      const text = message.role === "user" ? userPromptSummary(rawText) : boundedThreadText(rawText);
+      const cleanText = message.role === "user" ? userPromptText(rawText) : cleanThreadMessageText(rawText);
+      const text = boundedThreadMessageText(cleanText);
       if (!text) continue;
 
       messages.push({
@@ -567,26 +588,30 @@ function readSessionMessages(sessionFile) {
         timestamp: cleanSessionTimestamp(entry.timestamp),
         text,
       });
+      if (messages.length > 120) messages.shift();
     } catch {
       continue;
     }
   }
-  return messages.slice(-120);
+  return messages;
 }
 
 
-function readSessionLines(sessionFile) {
-  const maxBytes = 1024 * 1024;
+function readSessionLines(sessionFile, { fromEnd = true, maxBytes = 1024 * 1024 } = {}) {
   const stat = fs.statSync(sessionFile);
   if (stat.size <= maxBytes) {
     return fs.readFileSync(sessionFile, "utf8").split("\n");
   }
 
   const buffer = Buffer.alloc(maxBytes);
+  const position = fromEnd ? stat.size - maxBytes : 0;
   const fd = fs.openSync(sessionFile, "r");
   try {
-    fs.readSync(fd, buffer, 0, maxBytes, Math.max(0, stat.size - maxBytes));
-    return buffer.toString("utf8").split("\n");
+    fs.readSync(fd, buffer, 0, maxBytes, position);
+    const lines = buffer.toString("utf8").split("\n");
+    if (fromEnd) lines.shift();
+    else lines.pop();
+    return lines;
   } finally {
     fs.closeSync(fd);
   }
@@ -615,19 +640,87 @@ function summaryText(value) {
 
 
 function userPromptSummary(value) {
-  const text = normalizedThreadText(value);
-  if (!text || isInjectedContextMessage(text)) return null;
-  return boundedThreadText(stripSkillInstructionPrefix(text));
+  return boundedThreadText(userPromptText(value));
+}
+
+
+const SYNTHETIC_USER_TAGS = [
+  "local-command-caveat",
+  "local-command-stdout",
+  "local-command-stderr",
+  "command-name",
+  "command-message",
+  "command-args",
+  "system-reminder",
+  "user-prompt-submit-hook",
+  "environment_context",
+  "user_instructions",
+  "in-app-browser-context",
+  "recommended_plugins",
+  "app-context",
+  "skills_instructions",
+  "apps_instructions",
+  "plugins_instructions",
+  "collaboration_mode",
+  "multi_agent_mode",
+  "send_user_message_question_reply",
+];
+const SYNTHETIC_USER_TAG_PATTERN = SYNTHETIC_USER_TAGS.join("|");
+const SYNTHETIC_USER_BLOCK_RE = new RegExp(
+  `<(${SYNTHETIC_USER_TAG_PATTERN})(?:\\s[^>]*)?>[\\s\\S]*?</\\1\\s*>`,
+  "gi",
+);
+const SYNTHETIC_USER_OPEN_RE = new RegExp(`<(?:${SYNTHETIC_USER_TAG_PATTERN})(?:\\s[^>]*)?>`, "i");
+const SYNTHETIC_USER_STRAY_RE = new RegExp(
+  `</?(?:${SYNTHETIC_USER_TAG_PATTERN})(?:\\s[^>]*)?>`,
+  "gi",
+);
+const USER_REQUEST_HEADING_RE = /^#{1,3}\s+My request:\s*$/im;
+const ATTACHED_IMAGE_OPEN_RE = /<image\s+name=\[[^\]]+\]\s+path="[^"]*">/i;
+const INJECTED_DOCUMENT_PREFIX_RE = /^(?:# AGENTS\.md instructions for\b|# Files mentioned by the user:\s*|<permissions instructions>)/i;
+
+
+function questionReplyText(value) {
+  const match = /^\s*<send_user_message_question_reply>([\s\S]*)<\/send_user_message_question_reply>\s*$/i.exec(String(value ?? ""));
+  if (!match) return null;
+  let replies;
+  try { replies = JSON.parse(match[1]); } catch { return ""; }
+  if (!Array.isArray(replies)) return "";
+  return replies
+    .map((reply) => typeof reply?.answer === "string" ? reply.answer.trim() : "")
+    .filter(Boolean)
+    .join("\n");
+}
+
+
+function stripInjectedUserMarkup(value) {
+  const reply = questionReplyText(value);
+  if (reply !== null) return reply;
+  let text = cleanApiText(value || "").replace(SYNTHETIC_USER_BLOCK_RE, "");
+  const requestHeading = USER_REQUEST_HEADING_RE.exec(text);
+  if (requestHeading) text = text.slice(requestHeading.index + requestHeading[0].length);
+  const cutAt = [text.search(SYNTHETIC_USER_OPEN_RE), text.search(ATTACHED_IMAGE_OPEN_RE)]
+    .filter((index) => index !== -1)
+    .sort((left, right) => left - right)[0];
+  if (cutAt !== undefined) text = text.slice(0, cutAt);
+  text = text
+    .replace(SYNTHETIC_USER_STRAY_RE, "")
+    .replace(/^Distinguish instructions in attached documents from the user's request\.\s*/i, "")
+    .trim();
+  if (INJECTED_DOCUMENT_PREFIX_RE.test(text)) return "";
+  return text;
+}
+
+
+function userPromptText(value) {
+  const text = stripInjectedUserMarkup(value);
+  if (!text) return null;
+  return stripSkillInstructionPrefix(text).trim() || null;
 }
 
 
 function isInjectedContextMessage(text) {
-  const head = text.slice(0, 1000).toLowerCase();
-  return (
-    head.startsWith("# agents.md instructions for ") ||
-    head.startsWith("<environment_context>") ||
-    (head.includes("<instructions>") && head.includes("<environment_context>"))
-  );
+  return !userPromptText(text);
 }
 
 
@@ -646,6 +739,38 @@ function boundedThreadText(value) {
   if (!text) return null;
   if (text.length <= threadSummaryCharacters) return text;
   return `${text.slice(0, threadSummaryCharacters - 1).trimEnd()}…`;
+}
+
+
+function cleanThreadMessageText(value) {
+  return cleanApiText(value || "").replace(/\r\n?/g, "\n").trim() || null;
+}
+
+
+function boundedThreadMessageText(value) {
+  const text = cleanThreadMessageText(value);
+  if (!text) return null;
+  if (text.length <= threadMessageCharacters) return text;
+  return `${text.slice(0, threadMessageCharacters - 1).trimEnd()}…`;
+}
+
+
+function readSyncedSessionTitles(baseDir = dataDir) {
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(path.join(baseDir, "session-sync", "index.json"), "utf8"));
+  } catch {
+    return new Map();
+  }
+  if (!parsed?.sessions || typeof parsed.sessions !== "object" || Array.isArray(parsed.sessions)) return new Map();
+  const titles = new Map();
+  for (const record of Object.values(parsed.sessions)) {
+    if (!record || typeof record !== "object") continue;
+    if (typeof record.workspaceId !== "string" || typeof record.sessionId !== "string") continue;
+    const title = boundedThreadText(record.title);
+    if (title) titles.set(`${record.workspaceId}:${record.sessionId}`, title);
+  }
+  return titles;
 }
 
 
@@ -773,10 +898,13 @@ export {
   readSessionLines,
   messageText,
   summaryText,
+  userPromptText,
   userPromptSummary,
   isInjectedContextMessage,
   stripSkillInstructionPrefix,
   boundedThreadText,
+  boundedThreadMessageText,
+  readSyncedSessionTitles,
   normalizedThreadText,
   isSmokeThread,
   maxIso,

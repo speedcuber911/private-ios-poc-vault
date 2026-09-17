@@ -167,6 +167,8 @@ const defaultTimeoutMs = Math.min(
 
 const threadSummaryCharacters = parseIntegerEnv("CODEX_THREAD_SUMMARY_CHARACTERS", 240, 40, 2000);
 
+const threadMessageCharacters = parseIntegerEnv("CODEX_THREAD_MESSAGE_CHARACTERS", 50_000, 1_000, 250_000);
+
 const workspaceBrowseRoot = realpathOrResolve(
   process.env.CODEX_WORKSPACE_BROWSE_ROOT || process.env.CODEX_WORKSPACE_ROOT || "/srv/codex-workspaces",
 );
@@ -1082,6 +1084,7 @@ export {
   maxTimeoutMs,
   defaultTimeoutMs,
   threadSummaryCharacters,
+  threadMessageCharacters,
   workspaceBrowseRoot,
   pathWithinRoot,
   maxWorkspaceDirEntries,

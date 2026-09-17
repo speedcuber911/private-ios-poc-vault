@@ -27,6 +27,7 @@ import path from "node:path";
 
 const MAX_SCAN_FILES = 500;
 const BOUNDED_READ_BYTES = 256 * 1024;
+const SESSION_INDEX_READ_BYTES = 4 * 1024 * 1024;
 
 // Kept byte-identical to `RESUMABLE_SESSION_ID_RE` in
 // `product/relayd/src/sessionid.mjs`. The two packages share no runtime code by
@@ -177,22 +178,64 @@ const SYNTHETIC_TAGS = [
   "user-prompt-submit-hook",
   "environment_context",
   "user_instructions",
+  "in-app-browser-context",
+  "recommended_plugins",
+  "app-context",
+  "skills_instructions",
+  "apps_instructions",
+  "plugins_instructions",
+  "collaboration_mode",
+  "multi_agent_mode",
+  "send_user_message_question_reply",
 ];
-const SYNTHETIC_BLOCK_RE = new RegExp(`<(${SYNTHETIC_TAGS.join("|")})>[\\s\\S]*?</\\1>`, "gi");
-const SYNTHETIC_OPEN_RE = new RegExp(`<(?:${SYNTHETIC_TAGS.join("|")})>`, "i");
-const SYNTHETIC_STRAY_RE = new RegExp(`</?(?:${SYNTHETIC_TAGS.join("|")})>`, "gi");
+const SYNTHETIC_TAG_PATTERN = SYNTHETIC_TAGS.join("|");
+const SYNTHETIC_BLOCK_RE = new RegExp(
+  `<(${SYNTHETIC_TAG_PATTERN})(?:\\s[^>]*)?>[\\s\\S]*?</\\1\\s*>`,
+  "gi",
+);
+const SYNTHETIC_OPEN_RE = new RegExp(`<(?:${SYNTHETIC_TAG_PATTERN})(?:\\s[^>]*)?>`, "i");
+const SYNTHETIC_STRAY_RE = new RegExp(
+  `</?(?:${SYNTHETIC_TAG_PATTERN})(?:\\s[^>]*)?>`,
+  "gi",
+);
+const USER_REQUEST_HEADING_RE = /^#{1,3}\s+My request:\s*$/im;
+const ATTACHED_IMAGE_OPEN_RE = /<image\s+name=\[[^\]]+\]\s+path="[^"]*">/i;
+const INJECTED_DOCUMENT_PREFIX_RE = /^(?:# AGENTS\.md instructions for\b|# Files mentioned by the user:\s*|<permissions instructions>)/i;
+
+function questionReplyText(value) {
+  const match = /^\s*<send_user_message_question_reply>([\s\S]*)<\/send_user_message_question_reply>\s*$/i.exec(String(value ?? ""));
+  if (!match) return null;
+  let replies;
+  try { replies = JSON.parse(match[1]); } catch { return ""; }
+  if (!Array.isArray(replies)) return "";
+  return replies
+    .map((reply) => typeof reply?.answer === "string" ? reply.answer.trim() : "")
+    .filter(Boolean)
+    .join("\n");
+}
 
 // Returns the human-written part of a turn, or "" when the whole turn was
 // machine-generated.
 function stripSyntheticMarkup(value) {
+  const reply = questionReplyText(value);
+  if (reply !== null) return reply;
   let text = String(value ?? "").replace(SYNTHETIC_BLOCK_RE, "");
+  const requestHeading = USER_REQUEST_HEADING_RE.exec(text);
+  if (requestHeading) text = text.slice(requestHeading.index + requestHeading[0].length);
   // An unclosed opener is the common case, not an edge case — the caveat that
   // broke this arrives with no closing tag, and everything after it belongs to
   // the machine. Cutting to the end is what keeps that text out of the title;
   // stripping only the tag would leave the caveat body behind as the title.
-  const unclosed = text.search(SYNTHETIC_OPEN_RE);
-  if (unclosed !== -1) text = text.slice(0, unclosed);
-  return text.replace(SYNTHETIC_STRAY_RE, "").trim();
+  const cutAt = [text.search(SYNTHETIC_OPEN_RE), text.search(ATTACHED_IMAGE_OPEN_RE)]
+    .filter((index) => index !== -1)
+    .sort((left, right) => left - right)[0];
+  if (cutAt !== undefined) text = text.slice(0, cutAt);
+  text = text
+    .replace(SYNTHETIC_STRAY_RE, "")
+    .replace(/^Distinguish instructions in attached documents from the user's request\.\s*/i, "")
+    .trim();
+  if (INJECTED_DOCUMENT_PREFIX_RE.test(text)) return "";
+  return text;
 }
 
 function titleFrom(records, fallback) {
@@ -277,9 +320,29 @@ function readCodexSessionMeta(records) {
   return null;
 }
 
+// Codex Desktop keeps the task names the user sees in its sidebar in a small
+// append-only index. A rollout deliberately contains no display title, so
+// deriving one from its first `role: user` record is only a fallback: that
+// record may be injected context and a renamed task should retain its native
+// name when it reaches Relay.
+function readCodexThreadNames(home) {
+  const filePath = path.join(home, ".codex", "session_index.jsonl");
+  const text = readBoundedChunk(filePath, { maxBytes: SESSION_INDEX_READ_BYTES, fromEnd: true });
+  const names = new Map();
+  for (const line of text.split("\n")) {
+    let record;
+    try { record = JSON.parse(line); } catch { continue; }
+    if (!isResumableSessionId(record?.id) || typeof record?.thread_name !== "string") continue;
+    const title = record.thread_name.replace(/\s+/g, " ").trim().slice(0, 200);
+    if (title) names.set(record.id, title);
+  }
+  return names;
+}
+
 function discoverCodexSessions({ cwd, home }) {
   const root = path.join(home, ".codex", "sessions");
   const wantedCwd = normalizeCwd(cwd);
+  const threadNames = readCodexThreadNames(home);
   const found = [];
   const stack = [root];
   let visited = 0;
@@ -310,7 +373,7 @@ function discoverCodexSessions({ cwd, home }) {
         id: meta.id,
         harness: "codex",
         format: "codex-rollout",
-        title: titleFrom(records, "Codex session"),
+        title: threadNames.get(meta.id) || titleFrom(records, "Codex session"),
         lastActive: stat.mtime.toISOString(),
         createdAt: meta.timestamp,
         sourceCwd: meta.cwd,
@@ -323,8 +386,15 @@ function discoverCodexSessions({ cwd, home }) {
 }
 
 function discoverSessions({ cwd, home = os.homedir() } = {}) {
-  return [...discoverClaudeSessions({ cwd, home }), ...discoverCodexSessions({ cwd, home })]
+  const sorted = [...discoverClaudeSessions({ cwd, home }), ...discoverCodexSessions({ cwd, home })]
     .sort((left, right) => right.lastActive.localeCompare(left.lastActive));
+  const seen = new Set();
+  return sorted.filter((session) => {
+    const key = `${session.harness}:${session.id}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function readSessionBytes(session, { maxBytes = 20 * 1024 * 1024 } = {}) {

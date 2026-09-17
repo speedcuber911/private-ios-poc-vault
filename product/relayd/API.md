@@ -212,6 +212,7 @@ All from env, parsed at 9–124. Contract-relevant defaults:
 | `CODEX_FS_READ_DENYLIST` | see below | secret-file read denylist |
 | `CODEX_MAX_TRANSCRIPTION_AUDIO_BYTES` | 25 MiB | transcription body cap |
 | `CODEX_THREAD_SUMMARY_CHARACTERS` | 240 | summary text truncation |
+| `CODEX_THREAD_MESSAGE_CHARACTERS` | 50000 | per-message limit in thread detail responses |
 | `CODEX_WORKSPACES` | 3 seeded entries | static workspace registry (JSON array of `{id,name,path}`, 169–205) |
 | `CODEX_MODEL_CATALOG` | built-in | fallback model catalog and non-Codex providers; app-server installs discover Codex models live |
 | `CODEX_DANGEROUS_MODE` | `false` | legacy chat execution policy; task jobs always use `workspace-write` and their selected approval policy |
@@ -557,6 +558,7 @@ sliced to `limit`. Same query params as sessions. Thread summary shape
   "timestamp": "…", "updatedAt": "…",
   "jobCount": 3, "activeJobCount": 0,
   "lastJobId": "<uuid>", "lastJobStatus": "succeeded",
+  "title": "…",                       // synced native title or stable first prompt
   "lastPrompt": "…",                  // ≤ CODEX_THREAD_SUMMARY_CHARACTERS, "…"-suffixed
   "lastResult": "…", "lastError": null,
   "hasSessionFile": true,
@@ -576,10 +578,10 @@ sliced to `limit`. Same query params as sessions. Thread summary shape
 }
 ```
 
-Messages come from the session transcript, bounded: last 1 MiB of the
-`.jsonl` read, last 120 messages, each text summary-truncated (3906–3948);
-injected context/skill-prefix messages are filtered from user prompts
-(3969–3991). Chat threads return their stored messages with role
+For task threads, `messages` contains the newest 120 human/assistant turns from
+the complete rollout. Each message preserves line breaks and is bounded
+independently by `CODEX_THREAD_MESSAGE_CHARACTERS`; injected Codex app/context
+turns are omitted. Chat threads return their stored messages with role
 `user|assistant|status` and `"jobs": []` (3813–3826). Unknown id → 404
 `thread not found`.
 

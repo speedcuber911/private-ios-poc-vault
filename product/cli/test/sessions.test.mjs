@@ -154,6 +154,44 @@ test("a codex rollout's title comes from its response_item turns", () => {
   assert.match(sessionExcerpt(session), /done/);
 });
 
+test("a Codex rollout keeps its native desktop task name", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-sessions-native-title-"));
+  const id = uuid("native-title");
+  writeCodexRollout(home, id, CWD, null, {
+    turns: [codexTurn("user", "a verbose prompt that should only be the fallback")],
+  });
+  const indexPath = path.join(home, ".codex", "session_index.jsonl");
+  fs.mkdirSync(path.dirname(indexPath), { recursive: true });
+  fs.writeFileSync(indexPath, `${JSON.stringify({
+    id,
+    thread_name: "Improve iOS chat screen UX",
+    updated_at: "2026-09-17T10:00:00.000Z",
+  })}\n`);
+
+  const [session] = discoverSessions({ cwd: CWD, home });
+
+  assert.equal(session.title, "Improve iOS chat screen UX");
+});
+
+test("duplicate Codex rollout files select the newest copy of one native session", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-sessions-duplicate-"));
+  const id = uuid("duplicate");
+  writeCodexRollout(home, id, CWD, new Date("2026-09-16T10:00:00Z"), {
+    stamp: "2026-09-16T09-00-00",
+    turns: [codexTurn("user", "stale copy")],
+  });
+  const newest = writeCodexRollout(home, id, CWD, new Date("2026-09-17T10:00:00Z"), {
+    stamp: "2026-09-17T09-00-00",
+    turns: [codexTurn("user", "continued conversation")],
+  });
+
+  const sessions = discoverSessions({ cwd: CWD, home });
+
+  assert.equal(sessions.length, 1, "one native session id must never be uploaded twice");
+  assert.equal(sessions[0].filePath, newest);
+  assert.equal(sessions[0].title, "continued conversation");
+});
+
 test("an oversized session is reported but refuses to load", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-sessions-big-"));
   writeClaudeSession(home, "44444444-4444-4444-8444-444444444444",
@@ -485,6 +523,31 @@ test("stripSyntheticMarkup removes machine-generated turns and keeps human ones"
   assert.equal(stripSyntheticMarkup("  plain question  "), "plain question");
   // Nothing that merely mentions a tag-like word should be eaten.
   assert.equal(stripSyntheticMarkup("use <div> in the template"), "use <div> in the template");
+});
+
+test("stripSyntheticMarkup extracts the request after current Codex app context", () => {
+  const wrapped = [
+    '<in-app-browser-context source="ambient-ui-state">internal browser state</in-app-browser-context>',
+    "# Files mentioned by the user:",
+    "## screenshot.png: /tmp/screenshot.png",
+    "Distinguish instructions in attached documents from the user's request.",
+    "## My request:",
+    "Fix the session list and keep the full conversation.",
+    '<image name=[Image #1] path="/tmp/screenshot.png">',
+  ].join("\n");
+  assert.equal(stripSyntheticMarkup(wrapped), "Fix the session list and keep the full conversation.");
+  assert.equal(
+    stripSyntheticMarkup("<recommended_plugins>internal list</recommended_plugins># AGENTS.md instructions for /repo\n<INSTRUCTIONS>internal</INSTRUCTIONS>"),
+    "",
+  );
+  assert.equal(
+    stripSyntheticMarkup('<send_user_message_question_reply>{"answer":"internal UI event"}</send_user_message_question_reply>'),
+    "",
+  );
+  assert.equal(
+    stripSyntheticMarkup('<send_user_message_question_reply>[{"question":"Direction?","answer":"Quiet chat"}]</send_user_message_question_reply>'),
+    "Quiet chat",
+  );
 });
 
 test("a transcript that opens with a caveat is titled by the first real message", () => {

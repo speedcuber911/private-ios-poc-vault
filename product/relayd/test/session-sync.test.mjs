@@ -132,6 +132,27 @@ test("direct session sync rematerializes a dynamic workspace from its validated 
   }, options), (error) => error.status === 400 && error.message === "unknown workspaceId");
 });
 
+test("a current transcript accepts a renamed native Codex title without reuploading", () => {
+  const f = fixture();
+  const bytes = transcript();
+  importCodexSession({
+    v: 1,
+    workspaceId: "repo",
+    sourceCwd: SOURCE_CWD,
+    session: { ...descriptor(bytes), title: "Old title", transcript: bytes.toString("base64") },
+  }, f);
+
+  const plan = planSessionImports({
+    v: 1,
+    workspaceId: "repo",
+    sessions: [{ ...descriptor(bytes), title: "Improve iOS chat screen UX" }],
+  }, f);
+
+  assert.equal(plan.sessions[0].status, "current");
+  const state = JSON.parse(fs.readFileSync(syncStatePath(f.baseDir), "utf8"));
+  assert.equal(state.sessions[`repo:${ID}`].title, "Improve iOS chat screen UX");
+});
+
 test("direct session sync never overwrites a session continued on the Relay machine", () => {
   const f = fixture();
   const first = transcript();
