@@ -3,6 +3,7 @@
 import { loadConfig, webOriginsRequireHttps } from "./config.js";
 import { createApp } from "./server.js";
 import { createHttp2Transport, createNoopTransport, apnsConfigured } from "./apns.js";
+import { createSttStream } from "./stt-stream.js";
 
 const config = loadConfig();
 
@@ -22,6 +23,11 @@ if (config.adminEmails.length === 0) {
   console.warn("RELAY_ADMIN_EMAILS unset — no env-pinned admin.");
 }
 if (!config.brokerToken) console.warn("BROKER_TOKEN unset — /v1/tunnel/* disabled.");
+if (!config.stt.sharedSecret) {
+  console.warn("RELAY_STT_SHARED_SECRET unset — /v1/stt/stream refuses every upgrade.");
+} else if (!config.stt.sarvamApiKey) {
+  console.warn("SARVAM_API_KEY unset — /v1/stt/stream answers 503.");
+}
 
 // Browser grants are a half-configuration trap: GRANT_GATEWAY_URL in a
 // response with no private key to sign it looks configured and fails at
@@ -73,6 +79,13 @@ if (!apnsConfigured(config)) {
 
 const app = createApp({ config, apnsTransport });
 await app.auth.ready;
+
+// Dictation rides the same listener as the HTTP API, on the 'upgrade' event
+// rather than a request handler. Attached unconditionally even when unset
+// config makes it refuse every connection: an operator reading a 401 or a 503
+// can act on it, where an unattached listener gives them a reset connection
+// and nothing to go on.
+createSttStream({ server: app.server, config });
 
 if (!app.auth.appleConfigured) {
   console.warn(

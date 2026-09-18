@@ -121,6 +121,32 @@ export function loadConfig(env = process.env) {
       host: env.APNS_HOST || "api.push.apple.com",
     },
 
+    // Live dictation (/v1/stt/stream). SARVAM_API_KEY is the one credential in
+    // this file that a user's phone would otherwise have to carry, which is the
+    // entire reason the proxy exists: the app holds RELAY_STT_SHARED_SECRET,
+    // which gates dictation and authorizes nothing else, and the provider key
+    // never leaves this host. Unset shared secret ⇒ every upgrade is 401; unset
+    // provider key ⇒ 503.
+    //
+    // languageCode "unknown" is not a fallback for "we forgot to configure it":
+    // it is what makes Sarvam auto-detect, and auto-detection is what makes a
+    // sentence that switches between Hindi and English transcribe at all.
+    //
+    // The caps bound one session, not one account. A phone that stops sending
+    // a close (backgrounded, out of coverage, killed) holds a provider session
+    // open otherwise, and a provider session is metered.
+    stt: {
+      sharedSecret: env.RELAY_STT_SHARED_SECRET || "",
+      sarvamApiKey: env.SARVAM_API_KEY || "",
+      model: env.SARVAM_STT_MODEL || "saarika:v2.5",
+      languageCode: env.SARVAM_STT_LANGUAGE_CODE || "unknown",
+      // Overridden only by tests, which point it at an in-process fake so no
+      // suite ever reaches the real provider.
+      sarvamUrl: env.SARVAM_STT_WS_URL || "wss://api.sarvam.ai/speech-to-text/ws",
+      maxSessionSec: Math.max(1, intFrom(env.STT_MAX_SESSION_SEC, 300)),
+      maxAudioBytes: intFrom(env.STT_MAX_AUDIO_BYTES, 25 * 1024 * 1024),
+    },
+
     // Entitlement defaults granted to every new account.
     defaultMaxNodes: intFrom(env.DEFAULT_MAX_NODES, 1),
 

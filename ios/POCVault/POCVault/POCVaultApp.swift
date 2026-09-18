@@ -1358,6 +1358,25 @@ enum AppConfiguration {
     static let runtimeMode = "Relay Cloud"
 #endif
 
+    /// Live dictation streams to Relay's own STT service, never to the speech
+    /// provider directly: the provider key lives on that server and must not ship
+    /// inside the app. Declared outside the build branches because the simulator
+    /// and a device build both talk to the same hosted endpoint.
+    static let sttStreamURL = configuredURL(
+        supportValue: supportConfig?.sttStreamURL,
+        infoKey: "RelaySTTStreamURL",
+        fallback: "wss://relay.ai-rocket-experiments.com/v1/stt/stream"
+    )
+
+    /// Gates the shared STT service. Empty in a build nobody configured, which
+    /// hides the mic entirely — better than a control that always fails on tap.
+    static let sttSharedSecret = configuredSecret(
+        supportValue: supportConfig?.sttSharedSecret,
+        infoKey: "RelaySTTSharedSecret"
+    )
+
+    static var supportsDictation: Bool { !sttSharedSecret.isEmpty }
+
     /// True only when someone deliberately pointed this install at a personal
     /// machine, via `support/vault-config.json`.
     ///
@@ -1451,8 +1470,20 @@ enum AppConfiguration {
         return true
     }
 
+    /// Same placeholder discipline as `configuredURL`, minus the URL parsing: an
+    /// unset build setting reaches Info.plist as the literal `$(VAR)` token, and
+    /// treating that as a real secret would ship a control that fails on every tap.
+    private static func configuredSecret(supportValue: String?, infoKey: String) -> String {
+        let infoValue = Bundle.main.object(forInfoDictionaryKey: infoKey) as? String
+        return [supportValue, infoValue]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty && !$0.contains("$(") } ?? ""
+    }
+
     private struct SupportConfig: Decodable {
         let codexBaseURL: String?
         let authBaseURL: String?
+        let sttStreamURL: String?
+        let sttSharedSecret: String?
     }
 }
