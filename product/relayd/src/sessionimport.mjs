@@ -439,6 +439,28 @@ function rewriteSessionCwd(text, { fromCwd, toCwd }) {
   return text.replace(new RegExp(`${escaped}${CWD_BOUNDARY}`, "gm"), () => toCwd);
 }
 
+// Codex Desktop currently writes some native rollouts with
+// `history_mode: "paginated"`. App-server can list those records, but its
+// documented resume path deliberately rejects them with
+// `paginated_threads is not supported yet`. The transferred JSONL already
+// contains the complete native event stream Relay needs, so mark the imported
+// copy as legacy before installing it on the Relay machine. This changes only
+// the target copy; the source transcript on the laptop remains untouched.
+function makeCodexRolloutResumable(text) {
+  const newline = text.indexOf("\n");
+  const firstLine = newline === -1 ? text : text.slice(0, newline);
+  let record;
+  try {
+    record = JSON.parse(firstLine);
+  } catch {
+    return text;
+  }
+  if (record?.type !== "session_meta" || record?.payload?.history_mode !== "paginated") return text;
+  record.payload.history_mode = "legacy";
+  const suffix = newline === -1 ? "" : text.slice(newline);
+  return `${JSON.stringify(record)}${suffix}`;
+}
+
 // ---------------------------------------------------------------------------
 // The jail.
 
@@ -822,10 +844,12 @@ function importSession({ manifest, sessionBytes, runHome, codexHome, worktreePat
     // path resolves to the workspace being resumed into. Leaving the laptop
     // path here is therefore both a hard functional break and the same
     // username leak the Claude branch has always rewritten away.
-    const rewritten = rewriteSessionCwd(sessionBytes.toString("utf8"), {
-      fromCwd: manifest.cwd,
-      toCwd: worktreePath,
-    });
+    const rewritten = makeCodexRolloutResumable(
+      rewriteSessionCwd(sessionBytes.toString("utf8"), {
+        fromCwd: manifest.cwd,
+        toCwd: worktreePath,
+      }),
+    );
     stageSessionFile({
       jailRoot: codexHome,
       components: ["sessions"],
@@ -846,6 +870,7 @@ export {
   codexRolloutLeafName,
   repairLegacyCodexRollout,
   rewriteSessionCwd,
+  makeCodexRolloutResumable,
   summaryPrompt,
   importSession,
 };

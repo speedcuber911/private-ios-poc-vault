@@ -7,7 +7,7 @@ import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 
 const {
-  importSession, rewriteSessionCwd, claudeProjectSlug, summaryPrompt,
+  importSession, rewriteSessionCwd, makeCodexRolloutResumable, claudeProjectSlug, summaryPrompt,
   assertContained, codexRolloutLeafName, repairLegacyCodexRollout, SessionImportSecurityError,
 } = await import("../src/sessionimport.mjs");
 // The shared contract this module now stages by. Imported directly (it is
@@ -246,6 +246,41 @@ test("a codex rollout is staged under the codex home with its recorded cwd retar
   assert.equal(stagedText.split(TO_CWD).join(FROM_CWD), rollout.toString("utf8"), "only the cwd may change");
   assert.equal(result.resumeSessionId, sessionId);
   assert.equal(result.provider, "codex");
+});
+
+test("a paginated Codex rollout is installed in app-server's resumable legacy mode", () => {
+  const { runHome, codexHome } = homes();
+  const sessionId = "0199aaab-bbbb-4ccc-8ddd-eeeeffff0000";
+  const metaLine = {
+    type: "session_meta",
+    timestamp: "2026-09-18T00:00:00.000Z",
+    payload: {
+      id: sessionId,
+      cwd: FROM_CWD,
+      history_mode: "paginated",
+      context_window: { window_id: "0199aaac-bbbb-4ccc-8ddd-eeeeffff0000" },
+    },
+  };
+  const turnLine = { type: "response_item", payload: { type: "message", role: "user", content: [{ text: "hello" }] } };
+  const rollout = Buffer.from(`${JSON.stringify(metaLine)}\n${JSON.stringify(turnLine)}\n`, "utf8");
+
+  importSession({
+    manifest: manifest({ harness: "codex", sessionFormat: "codex-rollout", sessionId }),
+    sessionBytes: rollout, runHome, codexHome, worktreePath: TO_CWD,
+  });
+
+  const staged = path.join(codexHome, "sessions", codexRolloutLeafName(sessionId, manifest().createdAt));
+  const lines = fs.readFileSync(staged, "utf8").trim().split("\n").map(JSON.parse);
+  assert.equal(lines[0].payload.history_mode, "legacy");
+  assert.deepEqual(lines[0].payload.context_window, metaLine.payload.context_window, "other session metadata is preserved");
+  assert.equal(lines[0].payload.cwd, TO_CWD);
+  assert.deepEqual(lines[1], turnLine, "the native conversation stream is preserved");
+});
+
+test("Codex history-mode normalization leaves legacy and malformed input untouched", () => {
+  const legacy = `${JSON.stringify({ type: "session_meta", payload: { history_mode: "legacy" } })}\n`;
+  assert.equal(makeCodexRolloutResumable(legacy), legacy);
+  assert.equal(makeCodexRolloutResumable("not-json\n"), "not-json\n");
 });
 
 test("a codex rollout whose cwd already equals the worktree is staged byte-for-byte", () => {
