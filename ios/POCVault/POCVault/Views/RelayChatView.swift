@@ -76,7 +76,6 @@ struct RelayChatView: View {
                         codexSandbox: viewModel.codexSandbox,
                         isSending: viewModel.isSending,
                         isStreaming: viewModel.isStreaming,
-                        isTranscribing: viewModel.isTranscribing,
                         onPickChoice: { viewModel.selectChoice($0) },
                         onPickEffort: { viewModel.selectEffort($0) },
                         onToggleSkill: { viewModel.toggleSkill($0) },
@@ -84,9 +83,6 @@ struct RelayChatView: View {
                         onPickCodexApproval: { viewModel.codexApprovalPolicy = $0 },
                         onPickCodexSandbox: { viewModel.codexSandbox = $0 },
                         onNewConversation: { viewModel.startNewConversation() },
-                        onVoice: { fileURL in
-                            Task { await viewModel.transcribePromptAudio(fileURL: fileURL) }
-                        },
                         onSend: {
                             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                             requestPromptSend()
@@ -558,7 +554,6 @@ private struct RelayComposer: View {
     let codexSandbox: RelayCodexSandbox
     let isSending: Bool
     let isStreaming: Bool
-    let isTranscribing: Bool
     let onPickChoice: (RelayModelChoice) -> Void
     let onPickEffort: (CodexReasoningEffort) -> Void
     let onToggleSkill: (CodexSkillDescriptor) -> Void
@@ -566,7 +561,6 @@ private struct RelayComposer: View {
     let onPickCodexApproval: (RelayCodexApprovalPolicy) -> Void
     let onPickCodexSandbox: (RelayCodexSandbox) -> Void
     let onNewConversation: () -> Void
-    let onVoice: (URL) -> Void
     let onSend: () -> Void
     let onStop: () -> Void
     /// Direct provider sign-in from this iPhone; nil hides the affordance.
@@ -579,7 +573,12 @@ private struct RelayComposer: View {
     @State private var showingPermissionPicker = false
     @State private var showingSkillPicker = false
     @State private var skillSearch = ""
-    @StateObject private var recorder = RelayPromptAudioRecorder()
+    @StateObject private var dictation = RelayStreamingTranscriber()
+    /// Whatever the user had already typed when dictation started. Live transcript
+    /// is appended to this rather than replacing the field, so starting to dictate
+    /// mid-draft never eats the draft.
+    @State private var dictationPrefix = ""
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// Provider identity is part of the thread, not a mutable composer setting.
     /// A clean conversation has no provider yet and therefore sees the full catalog.
@@ -718,6 +717,57 @@ private struct RelayComposer: View {
         }
     }
 
+    /// Live dictation state. Status is a small-caps word and a ticking duration —
+    /// never a coloured dot (design spec rule 5) — and liveness is carried by a rule
+    /// that answers to the microphone rather than by a spinner that answers to nothing.
+    @ViewBuilder private var dictationBar: some View {
+        if dictation.isActive {
+            VStack(spacing: 5) {
+                HStack(spacing: 8) {
+                    RelayCapsLabel(
+                        text: dictation.phase == .finalizing ? "Transcribing" : "Listening",
+                        color: AppTheme.accent
+                    )
+                    Text(RelayStreamingTranscriber.durationLabel(dictation.elapsed))
+                        .font(AppTheme.monoFont(size: 11))
+                        .monospacedDigit()
+                        .foregroundStyle(RelayChatStyle.secondary)
+                    Spacer(minLength: 0)
+                }
+                voiceRule
+            }
+            .padding(.horizontal, 6)
+            .padding(.bottom, 8)
+            .transition(.opacity)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(
+                dictation.phase == .finalizing
+                    ? "Transcribing"
+                    : "Listening, \(RelayStreamingTranscriber.durationLabel(dictation.elapsed))"
+            )
+        } else if case .failed(let message) = dictation.phase {
+            Text(message)
+                .font(RelayChatStyle.labelFont)
+                .foregroundStyle(AppTheme.statusWarn)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 6)
+                .padding(.bottom, 8)
+                .transition(.opacity)
+                .accessibilityIdentifier("relay-dictation-error")
+        }
+    }
+
+    /// Full-width ember hairline whose opacity tracks loudness. Deliberately not a
+    /// left-to-right fill: this is not progress, and a growing bar would imply an
+    /// end point that dictation does not have.
+    private var voiceRule: some View {
+        Rectangle()
+            .fill(AppTheme.accent)
+            .frame(height: 1)
+            .opacity(reduceMotion ? 0.55 : 0.2 + 0.8 * dictation.level)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: dictation.level)
+    }
+
     /// Frequent controls fit in the composer. Less frequent choices live in a sheet,
     /// so neither narrow screens nor long policy labels need a scrolling chip rail.
     private var controlBar: some View {
@@ -746,21 +796,21 @@ private struct RelayComposer: View {
             .accessibilityIdentifier("relay-run-settings")
             .accessibilityLabel("Run settings, \(selectedSkillIDs.count) skills selected")
 
-            Button(action: toggleRecording) {
-                Group {
-                    if isTranscribing {
-                        ProgressView().tint(RelayChatStyle.secondary).controlSize(.small)
-                    } else {
-                        Image(systemName: recorder.isRecording ? "stop.fill" : "mic")
-                            .font(AppTheme.uiFont(size: 18, weight: .medium))
-                            .foregroundStyle(recorder.isRecording ? AppTheme.statusWarn : RelayChatStyle.secondary)
-                    }
+            // Hidden rather than disabled when the build has no STT credentials:
+            // a control that can only ever fail is worse than no control.
+            if AppConfiguration.supportsDictation {
+                Button(action: toggleDictation) {
+                    Image(systemName: dictation.isActive ? "stop.fill" : "mic")
+                        .font(AppTheme.uiFont(size: 18, weight: .medium))
+                        .foregroundStyle(dictation.isActive ? AppTheme.accent : RelayChatStyle.secondary)
+                        .frame(width: Layout.actionSize, height: Layout.actionSize)
+                        .contentShape(Rectangle())
                 }
-                .frame(width: Layout.actionSize, height: Layout.actionSize)
+                .buttonStyle(.plain)
+                .disabled(isSending || dictation.phase == .finalizing)
+                .accessibilityIdentifier("relay-dictate")
+                .accessibilityLabel(dictation.isActive ? "Stop dictation" : "Dictate prompt")
             }
-            .buttonStyle(.plain)
-            .disabled(isSending || isTranscribing)
-            .accessibilityLabel(recorder.isRecording ? "Stop recording" : "Record prompt")
 
             Button {
                 isFocused = false
@@ -818,6 +868,8 @@ private struct RelayComposer: View {
             }
 
             VStack(spacing: 0) {
+                dictationBar
+
                 ZStack(alignment: .leading) {
                     if text.isEmpty {
                         Text("Message…")
@@ -858,6 +910,12 @@ private struct RelayComposer: View {
             Rectangle().fill(AppTheme.hairline).frame(height: 1)
         }
         .animation(.easeOut(duration: 0.16), value: slashContext)
+        .animation(.easeOut(duration: 0.18), value: dictation.isActive)
+        .onChange(of: dictation.transcript) { _, transcript in
+            applyDictation(transcript)
+        }
+        // A dismissed composer must not leave the microphone hot or a socket open.
+        .onDisappear { dictation.cancel() }
         .sheet(isPresented: $showingRunSettings) { runSettingsSheet }
         .sheet(isPresented: $showingModelPicker) { modelPickerSheet }
         .sheet(isPresented: $showingPermissionPicker) { permissionPickerSheet }
@@ -1299,8 +1357,7 @@ private struct RelayComposer: View {
     private var canSend: Bool {
         !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !isSending
-            && !isTranscribing
-            && !recorder.isRecording
+            && !dictation.isActive
             && harnessStatus?.isConfirmedUnavailable != true
     }
 
@@ -1309,17 +1366,25 @@ private struct RelayComposer: View {
         onPickChoice(choice)
     }
 
-    private func toggleRecording() {
-        if recorder.isRecording {
-            if let fileURL = recorder.stopRecording() {
-                onVoice(fileURL)
-            }
+    private func toggleDictation() {
+        if dictation.isActive {
+            Task { await dictation.stop() }
             return
         }
         isFocused = false
-        Task {
-            try? await recorder.startRecording()
-        }
+        // Anchor to the draft as it stands now; live transcript is appended to this
+        // so a half-typed message survives someone reaching for the mic.
+        dictationPrefix = text
+        Task { try? await dictation.start() }
+    }
+
+    /// Mirrors live transcript into the field the user is about to send from, so the
+    /// words are editable the instant they land rather than after a round trip.
+    private func applyDictation(_ transcript: String) {
+        let spoken = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !spoken.isEmpty else { return }
+        let base = dictationPrefix.trimmingCharacters(in: .whitespacesAndNewlines)
+        text = base.isEmpty ? spoken : "\(base)\n\n\(spoken)"
     }
 }
 

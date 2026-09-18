@@ -77,6 +77,10 @@
 	<string>$(POC_VAULT_CODEX_BASE_URL)</string>
 	<key>RelayAuthBaseURL</key>
 	<string>$(RELAY_AUTH_BASE_URL)</string>
+	<key>RelaySTTStreamURL</key>
+	<string>$(RELAY_STT_STREAM_URL)</string>
+	<key>RelaySTTSharedSecret</key>
+	<string>$(RELAY_STT_SHARED_SECRET)</string>
 	<key>UIAppFonts</key>
 	<array>
 		<string>DMSans.ttf</string>
