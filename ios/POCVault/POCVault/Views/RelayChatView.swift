@@ -718,12 +718,12 @@ private struct RelayComposer: View {
     }
 
     /// Live dictation state. Status is a small-caps word and a ticking duration —
-    /// never a coloured dot (design spec rule 5) — and liveness is carried by a rule
-    /// that answers to the microphone rather than by a spinner that answers to nothing.
+    /// never a coloured dot (design spec rule 5) — beside a waveform of what the
+    /// microphone is actually hearing.
     @ViewBuilder private var dictationBar: some View {
         if dictation.isActive {
-            VStack(spacing: 5) {
-                HStack(spacing: 8) {
+            HStack(alignment: .center, spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
                     RelayCapsLabel(
                         text: dictation.phase == .finalizing ? "Transcribing" : "Listening",
                         color: AppTheme.accent
@@ -731,12 +731,16 @@ private struct RelayComposer: View {
                     Text(RelayStreamingTranscriber.durationLabel(dictation.elapsed))
                         .font(AppTheme.monoFont(size: 11))
                         .monospacedDigit()
-                        .foregroundStyle(RelayChatStyle.secondary)
-                    Spacer(minLength: 0)
+                        .foregroundStyle(
+                            dictation.phase == .finalizing ? AppTheme.textTertiary : RelayChatStyle.secondary
+                        )
                 }
-                voiceRule
+                .fixedSize()
+
+                waveform
             }
             .padding(.horizontal, 6)
+            .padding(.top, 4)
             .padding(.bottom, 8)
             .transition(.opacity)
             .accessibilityElement(children: .combine)
@@ -757,15 +761,35 @@ private struct RelayComposer: View {
         }
     }
 
-    /// Full-width ember hairline whose opacity tracks loudness. Deliberately not a
-    /// left-to-right fill: this is not progress, and a growing bar would imply an
-    /// end point that dictation does not have.
-    private var voiceRule: some View {
-        Rectangle()
-            .fill(AppTheme.accent)
-            .frame(height: 1)
-            .opacity(reduceMotion ? 0.55 : 0.2 + 0.8 * dictation.level)
-            .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: dictation.level)
+    /// Centre-anchored bars of measured loudness, newest at the trailing edge and
+    /// older ones fading out, so the shape reads as moving in a direction. The two
+    /// newest carry the brighter ember: that is where the eye should land.
+    ///
+    /// Not a progress fill — dictation has no end point to fill toward — and not a
+    /// spinner, which would prove only that a timer is running.
+    private var waveform: some View {
+        let samples = paddedLevels
+        let newest = samples.count - 1
+        return HStack(alignment: .center, spacing: 2) {
+            ForEach(samples.indices, id: \.self) { index in
+                Capsule(style: .continuous)
+                    .fill(index >= newest - 1 ? AppTheme.accentBright : AppTheme.accent)
+                    .frame(width: 3, height: max(3, 30 * samples[index]))
+                    .opacity(0.2 + 0.8 * (Double(index) / Double(max(1, newest))))
+            }
+        }
+        .frame(height: 30)
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.1), value: samples)
+        .accessibilityHidden(true)
+    }
+
+    /// A short session must still fill the strip from the right, so the history is
+    /// left-padded with silence rather than drawn from the leading edge.
+    private var paddedLevels: [Double] {
+        let count = RelayStreamingTranscriber.waveformSampleCount
+        let live = dictation.levels.suffix(count)
+        return Array(repeating: 0, count: count - live.count) + live
     }
 
     /// Frequent controls fit in the composer. Less frequent choices live in a sheet,
@@ -800,11 +824,34 @@ private struct RelayComposer: View {
             // a control that can only ever fail is worse than no control.
             if AppConfiguration.supportsDictation {
                 Button(action: toggleDictation) {
-                    Image(systemName: dictation.isActive ? "stop.fill" : "mic")
-                        .font(AppTheme.uiFont(size: 18, weight: .medium))
-                        .foregroundStyle(dictation.isActive ? AppTheme.accent : RelayChatStyle.secondary)
-                        .frame(width: Layout.actionSize, height: Layout.actionSize)
-                        .contentShape(Rectangle())
+                    Group {
+                        if dictation.isActive {
+                            // Carries Send's weight on purpose: while dictation runs it
+                            // IS the live control, and an 18pt glyph read as a footnote.
+                            ZStack {
+                                Circle()
+                                    .fill(dictation.phase == .finalizing ? .clear : AppTheme.accent)
+                                    .overlay {
+                                        Circle().stroke(
+                                            dictation.phase == .finalizing
+                                                ? AppTheme.accent.opacity(0.45) : .clear,
+                                            lineWidth: 1.5
+                                        )
+                                    }
+                                    .frame(width: 34, height: 34)
+                                RoundedRectangle(cornerRadius: 2.5, style: .continuous)
+                                    .fill(dictation.phase == .finalizing
+                                          ? AppTheme.accent.opacity(0.45) : AppTheme.onEmber)
+                                    .frame(width: 11, height: 11)
+                            }
+                        } else {
+                            Image(systemName: "mic")
+                                .font(AppTheme.uiFont(size: 22, weight: .medium))
+                                .foregroundStyle(RelayChatStyle.secondary)
+                        }
+                    }
+                    .frame(width: Layout.actionSize, height: Layout.actionSize)
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .disabled(isSending || dictation.phase == .finalizing)

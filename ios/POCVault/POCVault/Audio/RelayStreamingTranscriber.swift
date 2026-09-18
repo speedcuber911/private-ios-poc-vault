@@ -37,10 +37,14 @@ final class RelayStreamingTranscriber: NSObject, ObservableObject {
     /// Transcript so far. Grows as segments arrive and is the value the composer mirrors.
     @Published private(set) var transcript = ""
     @Published private(set) var elapsed: TimeInterval = 0
-    /// 0...1 short-window loudness. Drives the composer's live rule so the user can
-    /// see the microphone is hearing them — the one honest alternative to a spinner,
-    /// which would only prove that a timer is running.
+    /// 0...1 short-window loudness, smoothed. Drives the mic control's own reaction.
     @Published private(set) var level: Double = 0
+    /// Rolling loudness history, oldest first, for the composer's waveform. A single
+    /// level can only pulse; a history draws the shape of what was actually said,
+    /// which is what tells the user the microphone is really hearing them.
+    @Published private(set) var levels: [Double] = []
+
+    static let waveformSampleCount = 42
 
     var isActive: Bool {
         switch phase {
@@ -90,6 +94,8 @@ final class RelayStreamingTranscriber: NSObject, ObservableObject {
         segments = []
         transcript = ""
         elapsed = 0
+        level = 0
+        levels = []
 
         try openSocket()
         do {
@@ -178,8 +184,12 @@ final class RelayStreamingTranscriber: NSObject, ObservableObject {
             Task { @MainActor in
                 self.sendAudio(pcm)
                 // Asymmetric smoothing: rise fast so speech registers immediately,
-                // fall slowly so the rule breathes instead of strobing per syllable.
+                // fall slowly so the bars settle instead of strobing per syllable.
                 self.level = max(loudness, self.level * 0.82)
+                self.levels.append(loudness)
+                if self.levels.count > Self.waveformSampleCount {
+                    self.levels.removeFirst(self.levels.count - Self.waveformSampleCount)
+                }
             }
         }
 

@@ -223,8 +223,19 @@ export function createSttStream({ server, config, log = (msg) => console.warn(ms
 // The colon in "saarika:v2.5" is left unencoded, which is what the verified
 // production client sends. Both values are operator configuration, never
 // anything a caller supplies, so nothing user-controlled reaches this query.
+// `vad_signals=true` is what makes this a streaming transcriber rather than a
+// slow batch one: without it the provider stays silent for the whole utterance
+// and answers only the flush, so the composer would fill in one jump after the
+// user stops talking. Verified against a live session — 9.2 s of real-time
+// audio produced zero frames until flush until this was added.
+//
+// The codec and rate are declared on the connection as well as on every frame.
+// The frames alone were not enough to earn interim results.
 function upstreamUrl({ sarvamUrl, model, languageCode }) {
-  return `${sarvamUrl}?model=${model}&language-code=${languageCode}`;
+  return (
+    `${sarvamUrl}?model=${model}&language-code=${languageCode}` +
+    "&sample_rate=16000&input_audio_codec=pcm_s16le&vad_signals=true"
+  );
 }
 
 // Same shape as server.js's bearerMatches, and for the same reason: an unset

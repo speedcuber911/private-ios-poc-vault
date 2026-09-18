@@ -201,7 +201,14 @@ test("audio reaches Sarvam in its exact frame shape and partials stream back", a
       t.sarvam.sessions.length === 1 ? t.sarvam.sessions : null,
     );
 
-    assert.equal(upstream.url, "/speech-to-text/ws?model=saarika:v2.5&language-code=unknown");
+    // vad_signals is the difference between a streaming transcriber and a slow
+    // batch one: a live session sent 9.2 s of real-time audio and got nothing
+    // back until flush until this was on. Pinned so it cannot be dropped.
+    assert.equal(
+      upstream.url,
+      "/speech-to-text/ws?model=saarika:v2.5&language-code=unknown" +
+        "&sample_rate=16000&input_audio_codec=pcm_s16le&vad_signals=true",
+    );
     assert.equal(upstream.headers["api-subscription-key"], SARVAM_KEY);
 
     socket.send(JSON.stringify(audioFrame(PCM)));
