@@ -17,4 +17,3 @@ dependencyResolutionManagement {
 rootProject.name = "relay-mobile"
 
 include(":relay-core")
-include(":androidApp")

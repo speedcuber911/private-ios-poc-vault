@@ -1,27 +1,26 @@
 # Relay mobile
 
-Relay now uses a Kotlin Multiplatform core with native applications on both
-platforms:
+Relay ships one mobile application — native SwiftUI on iOS — over a UI-free
+Kotlin Multiplatform core.
 
-- iOS remains SwiftUI and keeps its existing bundle, lifecycle, Keychain,
-  networking, WebKit, and Apple-specific integrations.
-- Android is a native Jetpack Compose application with Android Keystore,
-  OkHttp, and Android WebView integrations.
-- `relay-core` is UI-free Kotlin shared by both apps.
+- iOS is SwiftUI and owns its bundle, lifecycle, Keychain, networking, WebKit,
+  and Apple-specific integrations.
+- `relay-core` is UI-free Kotlin compiled into `RelayCore.framework` and linked
+  into the iOS target.
 
-This keeps the parts that must behave identically in one place without forcing
-either application into a cross-platform UI framework.
+The Android application was removed; `relay-core` stays because it holds the
+wire contract and normalization rules, and it carries its own tests that run
+without a simulator or a UI.
 
 ## Project layout
 
 ```text
 mobile/
-  androidApp/   Native Android application
   relay-core/   Shared models, wire contract, API repository, and SSE parsing
-ios/POCVault/   Existing native Relay iOS application
+ios/POCVault/   Native Relay iOS application
 ```
 
-The shared core owns:
+The core owns:
 
 - provider and job-status normalization
 - tolerant API and signed-manifest data models
@@ -31,11 +30,11 @@ The shared core owns:
 
 Platform code owns:
 
-- SwiftUI or Compose presentation and navigation
-- Keychain or Android Keystore credential storage
-- URLSession or OkHttp transport and mTLS client identity wiring
-- WKWebView or Android WebView certificate handling
-- platform permissions, lifecycle, notifications, and other OS features
+- SwiftUI presentation and navigation
+- Keychain credential storage
+- URLSession transport and mTLS client identity wiring
+- WKWebView certificate handling
+- permissions, lifecycle, notifications, and other OS features
 
 Keep this boundary: business and wire behavior belongs in `relay-core`; user
 interface and operating-system capabilities stay native.
@@ -47,20 +46,11 @@ Use JDK 17 and the checked-in Gradle wrapper:
 ```bash
 cd mobile
 ./gradlew :relay-core:allTests
-./gradlew :androidApp:assembleDebug
 ```
 
-The debug APK is written to:
-
-```text
-mobile/androidApp/build/outputs/apk/debug/androidApp-debug.apk
-```
-
-Open `mobile/` as the project root in Android Studio to run the app on an
-Android 9 (API 28) or newer device.
-
-The existing Xcode target has a build phase that compiles and links
-`RelayCore.framework` automatically. A simulator build can be checked with:
+The Xcode target has a build phase that compiles and links
+`RelayCore.framework` automatically, so building the app builds the core. A
+simulator build can be checked with:
 
 ```bash
 xcodebuild \
@@ -76,36 +66,12 @@ Xcode Cloud installs the required JDK 17 from
 Homebrew JDK explicitly because versioned Homebrew JDKs are keg-only and may
 not appear on the build phase's default `PATH`.
 
-## Android first run
-
-1. Open **Settings** in Relay.
-2. Set the Relay API base URL for the linked machine or runner.
-3. Select the same PKCS#12 client identity used for authorized Relay access and
-   enter its passphrase.
-4. Save, then open **Workspaces** or **POCs**.
-
-The application does not ship an active machine URL. It fails closed until one
-is configured. The imported PKCS#12 bytes and passphrase are encrypted with an
-app-only, non-exportable Android Keystore AES-GCM key. They are never written
-to this repository or logs. The POC manifest is decoded only after its embedded
-Ed25519 public key verifies the exact downloaded bytes.
-
-Relay's current perimeter remains a valid configured client certificate; this
-does not claim the credential is hardware-bound to one phone.
-
-## Extending both apps
-
-For a new Relay API capability:
+## Adding a Relay API capability
 
 1. Add its serializable models and repository method to `relay-core`.
 2. Add common contract tests under `relay-core/src/commonTest`.
-3. Expose the behavior through native view models on iOS and Android.
-4. Build both targets before handoff.
-
-The enforced workflow and current parity boundary are documented in
-[`docs/MOBILE_PARITY.md`](../docs/MOBILE_PARITY.md). Run `ops/verify-mobile` from
-the repository root; CI runs the same contract check and both platform builds.
+3. Expose the behavior through the iOS view models.
 
 Avoid moving UI state, secure-storage implementations, WebViews, or other
 platform APIs into the shared module. That would save little code while making
-both applications harder to evolve naturally.
+the application harder to evolve naturally.
