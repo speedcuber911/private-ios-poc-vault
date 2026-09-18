@@ -780,7 +780,12 @@ private struct RelayComposer: View {
         }
         .frame(height: 30)
         .frame(maxWidth: .infinity, alignment: .trailing)
+        // Capture has stopped, so the bars are history, not a live reading. Dimming
+        // them is what separates LISTENING from TRANSCRIBING at a glance; leaving
+        // them lit reads as though the microphone were still open.
+        .opacity(dictation.phase == .finalizing ? 0.3 : 1)
         .animation(reduceMotion ? nil : .easeOut(duration: 0.1), value: samples)
+        .animation(.easeOut(duration: 0.18), value: dictation.phase)
         .accessibilityHidden(true)
     }
 
@@ -928,7 +933,8 @@ private struct RelayComposer: View {
                         text: $text,
                         selection: $editorSelection,
                         isFocused: $isFocused,
-                        height: $editorHeight
+                        height: $editorHeight,
+                        textColor: dictation.phase == .listening ? AppTheme.accent : AppTheme.textPrimary
                     )
                     .frame(height: editorHeight)
                 }
@@ -1404,7 +1410,10 @@ private struct RelayComposer: View {
     private var canSend: Bool {
         !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !isSending
-            && !dictation.isActive
+            // Only LISTENING blocks the send. Once capture has stopped the words are
+            // already in the field, and making someone wait out the finalize grace
+            // to send what they can read is the composer arguing with them.
+            && dictation.phase != .listening
             && harnessStatus?.isConfirmedUnavailable != true
     }
 
@@ -1443,6 +1452,10 @@ private struct RelayCommandTextEditor: UIViewRepresentable {
     @Binding var selection: NSRange
     @Binding var isFocused: Bool
     @Binding var height: CGFloat
+    /// Ember while words are still provisional, cream once they are the user's to
+    /// edit. Colouring the whole field avoids attributed ranges, which this bridge
+    /// would have to rebuild on every keystroke.
+    var textColor: Color = AppTheme.textPrimary
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -1469,6 +1482,10 @@ private struct RelayCommandTextEditor: UIViewRepresentable {
         context.coordinator.parent = self
         if view.text != text {
             view.text = text
+        }
+        let resolved = UIColor(textColor)
+        if view.textColor != resolved {
+            view.textColor = resolved
         }
         let safeLocation = min(selection.location, (view.text as NSString).length)
         let safeSelection = NSRange(location: safeLocation, length: 0)
