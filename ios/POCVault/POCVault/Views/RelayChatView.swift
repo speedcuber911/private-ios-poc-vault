@@ -660,29 +660,12 @@ private struct RelayComposer: View {
         }
     }
 
-    /// Harness-first model picker: each agent harness (Codex, Claude Code, Cursor) is a
-    /// submenu holding its own task-mode models; chat-capable models live in a flat
-    /// "Chat models" section. Both render only what the server catalog advertises.
+    /// Nested menus on iPhone hide sibling harnesses after the first pick. The
+    /// sheet is the same catalog the on-appear flow already uses, so a draft can
+    /// still move from Cursor to Codex or Claude Code before anything is sent.
     private var modelPickerMenu: some View {
-        Menu {
-            if !visibleSections.agents.isEmpty {
-                Section("Agents") {
-                    ForEach(visibleSections.agents) { harness in
-                        Menu(harness.title) {
-                            ForEach(harness.choices) { choice in
-                                choiceButton(choice, title: choice.shortModelLabel)
-                            }
-                        }
-                    }
-                }
-            }
-            if !visibleSections.chatModels.isEmpty {
-                Section("Chat models") {
-                    ForEach(visibleSections.chatModels) { choice in
-                        choiceButton(choice, title: choice.chipLabel)
-                    }
-                }
-            }
+        Button {
+            showingModelPicker = true
         } label: {
             HStack(spacing: 6) {
                 if let provider = selectedChoice?.executionProvider {
@@ -700,21 +683,9 @@ private struct RelayComposer: View {
             .frame(maxWidth: .infinity, minHeight: Layout.controlHeight, alignment: .leading)
             .contentShape(Rectangle())
         }
-        .menuOrder(.fixed)
+        .buttonStyle(.plain)
         .accessibilityIdentifier("relay-model-chip")
         .accessibilityLabel(threadProvider == nil ? "Choose provider and model" : "Choose model for this provider")
-    }
-
-    @ViewBuilder private func choiceButton(_ choice: RelayModelChoice, title: String) -> some View {
-        Button {
-            requestChoice(choice)
-        } label: {
-            if choice == selectedChoice {
-                Label(title, systemImage: "checkmark")
-            } else {
-                Text(title)
-            }
-        }
     }
 
     /// Live dictation state. Status is a small-caps word and a ticking duration —
@@ -1188,30 +1159,39 @@ private struct RelayComposer: View {
 
     private var modelPickerSheet: some View {
         NavigationStack {
-            List {
-                if !visibleSections.agents.isEmpty {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    if threadProvider != nil {
+                        Text("This conversation stays with its original provider.")
+                            .font(AppTheme.uiFont(size: 13))
+                            .foregroundStyle(AppTheme.textSecondary)
+                            .padding(.horizontal, 18)
+                            .padding(.top, 16)
+                    }
                     ForEach(visibleSections.agents) { harness in
-                        Section(harness.title) {
-                            ForEach(harness.choices) { choice in
-                                Button {
-                                    requestChoice(choice)
-                                    showingModelPicker = false
-                                } label: {
-                                    pickerRow(
-                                        title: choice.shortModelLabel,
-                                        detail: choice.isProviderDefault
-                                            ? "Uses \(harness.title)'s configured default model"
-                                            : "Runs this \(harness.title) session with \(choice.shortModelLabel)",
-                                        selected: choice == selectedChoice,
-                                        provider: choice.executionProvider
-                                    )
-                                }
+                        pickerSectionHeading(harness.title)
+                        ForEach(harness.choices) { choice in
+                            Button {
+                                requestChoice(choice)
+                                showingModelPicker = false
+                            } label: {
+                                pickerRow(
+                                    title: choice.shortModelLabel,
+                                    detail: choice.isProviderDefault
+                                        ? "Uses \(harness.title)'s configured default model"
+                                        : "Runs this \(harness.title) session with \(choice.shortModelLabel)",
+                                    selected: choice == selectedChoice,
+                                    provider: choice.executionProvider
+                                )
+                                .padding(.horizontal, 18)
+                                .padding(.vertical, 12)
+                                .contentShape(Rectangle())
                             }
+                            .buttonStyle(.plain)
                         }
                     }
-                }
-                if !visibleSections.chatModels.isEmpty {
-                    Section("Chat models") {
+                    if !visibleSections.chatModels.isEmpty {
+                        pickerSectionHeading("Chat")
                         ForEach(visibleSections.chatModels) { choice in
                             Button {
                                 requestChoice(choice)
@@ -1223,12 +1203,16 @@ private struct RelayComposer: View {
                                     selected: choice == selectedChoice,
                                     provider: choice.executionProvider
                                 )
+                                .padding(.horizontal, 18)
+                                .padding(.vertical, 12)
+                                .contentShape(Rectangle())
                             }
+                            .buttonStyle(.plain)
                         }
                     }
                 }
+                .padding(.bottom, 28)
             }
-            .scrollContentBackground(.hidden)
             .background(AppTheme.bgCanvas)
             .navigationTitle("Model")
             .toolbar {
@@ -1238,6 +1222,16 @@ private struct RelayComposer: View {
             }
         }
         .preferredColorScheme(.dark)
+    }
+
+    private func pickerSectionHeading(_ title: String) -> some View {
+        Text(title)
+            .font(AppTheme.uiFont(size: 13, weight: .medium))
+            .foregroundStyle(AppTheme.textPrimary.opacity(0.65))
+            .padding(.horizontal, 18)
+            .padding(.top, 22)
+            .padding(.bottom, 4)
+            .accessibilityAddTraits(.isHeader)
     }
 
     private var permissionPickerSheet: some View {

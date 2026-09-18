@@ -150,8 +150,8 @@ struct RelayModelChoice: Identifiable, Hashable {
 }
 
 /// One harness (agent CLI) advertised by the server catalog, carrying its task-mode
-/// model choices. A harness with a single "let the harness choose" entry (Cursor Auto)
-/// simply has one choice — the client never synthesizes extra rows.
+/// model choices. The client never synthesizes extra rows; a harness with one
+/// advertised model simply has one choice.
 struct RelayHarnessGroup: Identifiable, Hashable {
     let provider: CodexProvider
     let choices: [RelayModelChoice]

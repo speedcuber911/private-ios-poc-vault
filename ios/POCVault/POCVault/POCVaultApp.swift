@@ -1033,6 +1033,82 @@ private enum RecentChatSection: String, CaseIterable, Identifiable {
     }
 }
 
+/// Groups registered workspaces by parent folder so the new-chat picker reads as a
+/// tree instead of a flat list of duplicated names and absolute paths.
+enum RelayFolderPickerLayout {
+    struct Group: Identifiable, Equatable {
+        let title: String
+        let folders: [Item]
+        var id: String { title }
+        var showsHeading: Bool { folders.count > 1 }
+    }
+
+    struct Item: Identifiable, Equatable {
+        let workspace: CodexWorkspace
+        let title: String
+        let isNested: Bool
+        var id: String { workspace.id }
+    }
+
+    static func groups(from workspaces: [CodexWorkspace]) -> [Group] {
+        let roots = workspaces.filter { nearestParent(of: $0, in: workspaces) == nil }
+        return roots.map { root in
+            let descendants = workspaces.filter { isDescendant($0, of: root) }
+            var folders = [Item(workspace: root, title: displayTitle(for: root, nested: false), isNested: false)]
+            folders.append(contentsOf: descendants.map {
+                Item(workspace: $0, title: displayTitle(for: $0, nested: true), isNested: true)
+            })
+            return Group(title: displayTitle(for: root, nested: false), folders: folders)
+        }
+    }
+
+    private static func isDescendant(_ workspace: CodexWorkspace, of root: CodexWorkspace) -> Bool {
+        guard workspace.id != root.id,
+              let rootPath = normalizedPath(root),
+              let childPath = normalizedPath(workspace)
+        else { return false }
+        let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+        return childPath.hasPrefix(prefix)
+    }
+
+    private static func nearestParent(of workspace: CodexWorkspace, in workspaces: [CodexWorkspace]) -> CodexWorkspace? {
+        guard let childPath = normalizedPath(workspace) else { return nil }
+        return workspaces
+            .compactMap { candidate -> (CodexWorkspace, Int)? in
+                guard candidate.id != workspace.id, let parentPath = normalizedPath(candidate) else { return nil }
+                let prefix = parentPath.hasSuffix("/") ? parentPath : parentPath + "/"
+                guard childPath.hasPrefix(prefix) else { return nil }
+                return (candidate, parentPath.count)
+            }
+            .max { $0.1 < $1.1 }?
+            .0
+    }
+
+    private static func displayTitle(for workspace: CodexWorkspace, nested: Bool) -> String {
+        if nested, let path = normalizedPath(workspace) {
+            return URL(fileURLWithPath: path).lastPathComponent
+        }
+        if let name = workspace.name.trimmedNonEmpty {
+            if nested {
+                return name.split(separator: "/").last.map { $0.trimmingCharacters(in: .whitespaces) } ?? name
+            }
+            return name
+        }
+        if let path = normalizedPath(workspace) {
+            return URL(fileURLWithPath: path).lastPathComponent
+        }
+        return workspace.id
+    }
+
+    private static func normalizedPath(_ workspace: CodexWorkspace) -> String? {
+        guard var path = workspace.path?.trimmedNonEmpty else { return nil }
+        while path.count > 1, path.hasSuffix("/") {
+            path.removeLast()
+        }
+        return path
+    }
+}
+
 private struct SessionsWorkspacePickerSheet: View {
     let workspaces: [CodexWorkspace]
     let isLoading: Bool
@@ -1073,35 +1149,7 @@ private struct SessionsWorkspacePickerSheet: View {
                         }
                         .padding(20)
                     } else {
-                        List {
-                            ForEach(workspaces) { workspace in
-                                Button {
-                                    onSelect(workspace)
-                                } label: {
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(workspace.name)
-                                            .font(AppTheme.uiFont(size: 15, weight: .medium))
-                                            .foregroundStyle(AppTheme.textPrimary)
-                                        // Only registered workspaces carry a path; an
-                                        // unset one must not leave an empty mono line
-                                        // padding the row out.
-                                        if let path = workspace.path?.trimmedNonEmpty {
-                                            Text(path)
-                                                .font(AppTheme.monoFont(size: 12))
-                                                .foregroundStyle(AppTheme.textTertiary)
-                                                .lineLimit(1)
-                                                .truncationMode(.head)
-                                        }
-                                    }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-                                .listRowBackground(AppTheme.bgCanvas)
-                            }
-                        }
-                        .listStyle(.plain)
-                        .scrollContentBackground(.hidden)
+                        folderList
                     }
                 }
             }
@@ -1114,6 +1162,56 @@ private struct SessionsWorkspacePickerSheet: View {
             }
         }
         .preferredColorScheme(.dark)
+    }
+
+    private var folderList: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(RelayFolderPickerLayout.groups(from: workspaces)) { group in
+                    if group.showsHeading {
+                        Text(group.title)
+                            .font(AppTheme.uiFont(size: 13, weight: .medium))
+                            .foregroundStyle(AppTheme.textPrimary.opacity(0.65))
+                            .padding(.horizontal, 18)
+                            .padding(.top, 22)
+                            .padding(.bottom, 4)
+                            .accessibilityAddTraits(.isHeader)
+                    } else {
+                        Color.clear.frame(height: 12)
+                    }
+                    ForEach(group.folders) { item in
+                        Button {
+                            onSelect(item.workspace)
+                        } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: "folder")
+                                    .font(.system(size: 16, weight: .medium))
+                                    .foregroundStyle(AppTheme.accentBright.opacity(0.85))
+                                    .frame(width: 22)
+                                Text(item.title)
+                                    .font(AppTheme.uiFont(size: 16, weight: .medium))
+                                    .foregroundStyle(AppTheme.textPrimary)
+                                    .lineLimit(2)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .padding(.leading, item.isNested ? 32 : 18)
+                            .padding(.trailing, 18)
+                            .frame(minHeight: 48)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(item.workspace.path ?? item.title)
+                    }
+                }
+
+                Button("Browse files instead", action: onBrowseFiles)
+                    .font(AppTheme.uiFont(size: 14, weight: .medium))
+                    .foregroundStyle(AppTheme.accent)
+                    .padding(.horizontal, 18)
+                    .padding(.top, 28)
+                    .padding(.bottom, 20)
+            }
+        }
     }
 }
 

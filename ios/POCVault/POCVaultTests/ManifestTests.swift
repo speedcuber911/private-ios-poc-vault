@@ -440,6 +440,44 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(RelayModelDiscovery.sections(from: []).isEmpty)
     }
 
+    func testRelayModelDiscoveryShowsNamedCursorModels() throws {
+        let models = try decodeCodexModels(
+            """
+            [
+              { "id": "cursor-agent-auto", "label": "Cursor Agent · Auto", "provider": "cursor", "modes": ["task"], "taskModel": "auto" },
+              { "id": "cursor-grok-4.6-xhigh-fast", "label": "Cursor Agent · Cursor Grok 4.6 Extra High Fast", "provider": "cursor", "modes": ["task"], "taskModel": "cursor-grok-4.6-xhigh-fast" },
+              { "id": "cursor-composer-2.5-fast", "label": "Cursor Agent · Composer 2.5 Fast", "provider": "cursor", "modes": ["task"], "taskModel": "composer-2.5-fast" },
+              { "id": "cursor-claude-opus-5-thinking-high", "label": "Cursor Agent · Claude Opus 5 High", "provider": "cursor", "modes": ["task"], "taskModel": "claude-opus-5-thinking-high" },
+              { "id": "cursor-claude-opus-4-8-thinking-high", "label": "Cursor Agent · Claude Opus 4.8 High", "provider": "cursor", "modes": ["task"], "taskModel": "claude-opus-4-8-thinking-high" },
+              { "id": "cursor-gpt-5.6-sol-max-fast", "label": "Cursor Agent · GPT-5.6 Sol Max Fast", "provider": "cursor", "modes": ["task"], "taskModel": "gpt-5.6-sol-max-fast" },
+              { "id": "cursor-gpt-5.5-medium", "label": "Cursor Agent · GPT-5.5 Medium", "provider": "cursor", "modes": ["task"], "taskModel": "gpt-5.5-medium" },
+              { "id": "cursor-claude-fable-5-1-thinking-high", "label": "Cursor Agent · Claude Fable 5.1 High", "provider": "cursor", "modes": ["task"], "taskModel": "claude-fable-5-1-thinking-high" }
+            ]
+            """
+        )
+        let cursor = try XCTUnwrap(RelayModelDiscovery.sections(from: models).agents.first { $0.provider == .cursor })
+        XCTAssertEqual(cursor.choices.map(\.shortModelLabel), [
+            "Auto",
+            "Cursor Grok 4.6 Extra High Fast",
+            "Composer 2.5 Fast",
+            "Claude Opus 5 High",
+            "Claude Opus 4.8 High",
+            "GPT-5.6 Sol Max Fast",
+            "GPT-5.5 Medium",
+            "Claude Fable 5.1 High",
+        ])
+        XCTAssertEqual(cursor.choices.map(\.chipLabel), [
+            "Cursor · Auto",
+            "Cursor · Cursor Grok 4.6 Extra High Fast",
+            "Cursor · Composer 2.5 Fast",
+            "Cursor · Claude Opus 5 High",
+            "Cursor · Claude Opus 4.8 High",
+            "Cursor · GPT-5.6 Sol Max Fast",
+            "Cursor · GPT-5.5 Medium",
+            "Cursor · Claude Fable 5.1 High",
+        ])
+    }
+
     /// An Azure catalog entry (fixture-style) is chat-only: it lands in Chat models,
     /// never under Agents, and its jobs would route through the Codex runner.
     func testRelayModelDiscoveryRoutesAzureEntriesToChatModels() throws {
@@ -847,6 +885,28 @@ final class ManifestTests: XCTestCase {
             to: "private var disconnectedComputerScreen"
         )
         XCTAssertTrue(restore.contains("!foldersAreHiddenAfterComputerDisconnect"))
+    }
+
+    func testSessionsWorkspacePickerGroupsNestedFoldersWithoutPathRows() throws {
+        let source = try AppSourceFixture.load("POCVault/POCVaultApp.swift")
+        XCTAssertTrue(source.contains("RelayFolderPickerLayout"))
+        XCTAssertTrue(source.contains("item.isNested"))
+        XCTAssertFalse(source.contains(".listStyle(.plain)"))
+
+        let groups = RelayFolderPickerLayout.groups(from: [
+            CodexWorkspace(id: "komal", name: "Komal", path: "/home/komal/Komal"),
+            CodexWorkspace(id: "agents", name: "Komal / cloud-agents", path: "/home/komal/Komal/cloud-agents"),
+            CodexWorkspace(id: "rocket", name: "rocketizer", path: "/home/komal/rocketizer"),
+            CodexWorkspace(id: "rocket-test", name: "rocketizer / this is a test", path: "/home/komal/rocketizer/this is a test"),
+            CodexWorkspace(id: "stuff", name: "stuff", path: "/home/komal/stuff"),
+        ])
+        XCTAssertEqual(groups.map(\.title), ["Komal", "rocketizer", "stuff"])
+        XCTAssertEqual(groups[0].folders.map(\.title), ["Komal", "cloud-agents"])
+        XCTAssertEqual(groups[0].folders.map(\.isNested), [false, true])
+        XCTAssertTrue(groups[0].showsHeading)
+        XCTAssertEqual(groups[1].folders.map(\.title), ["rocketizer", "this is a test"])
+        XCTAssertFalse(groups[2].showsHeading)
+        XCTAssertEqual(groups[2].folders.map(\.title), ["stuff"])
     }
 
     func testSessionsPlusOpensWorkspacePickerRatherThanSwitchingTabs() throws {
@@ -2439,13 +2499,13 @@ final class ManifestTests: XCTestCase {
         XCTAssertFalse(source.contains("play.fill"))
         XCTAssertFalse(source.contains("threadsByWorkspace"))
 
-        // The compact menu nests models per provider. The onboarding sheet uses one
-        // provider section per harness instead of flattening every model as an Agent.
-        XCTAssertTrue(source.contains("Section(\"Agents\")"))
-        XCTAssertTrue(source.contains("Section(\"Chat models\")"))
+        // The composer chip opens the same Model sheet used on new-session appear,
+        // grouped by harness. Nested Menus hid sibling providers after the first pick.
+        XCTAssertFalse(source.contains("Menu(harness.title)"))
+        XCTAssertFalse(source.contains("Section(\"Agents\")"))
+        XCTAssertTrue(source.contains("showingModelPicker = true"))
         XCTAssertTrue(source.contains("ForEach(visibleSections.agents)"))
-        XCTAssertTrue(source.contains("Menu(harness.title)"))
-        XCTAssertTrue(source.contains("Section(harness.title)"))
+        XCTAssertTrue(source.contains("pickerSectionHeading(harness.title)"))
         XCTAssertTrue(source.contains("title: choice.shortModelLabel"))
         XCTAssertTrue(source.contains("choice.isProviderDefault"))
         XCTAssertFalse(source.contains("title: \"\\(harness.title) · \\(choice.shortModelLabel)\""))
