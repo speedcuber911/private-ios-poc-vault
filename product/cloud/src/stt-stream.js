@@ -224,10 +224,15 @@ export function createSttStream({ server, config, log = (msg) => console.warn(ms
 // production client sends. Both values are operator configuration, never
 // anything a caller supplies, so nothing user-controlled reaches this query.
 // `vad_signals=true` is what makes this a streaming transcriber rather than a
-// slow batch one: without it the provider stays silent for the whole utterance
-// and answers only the flush, so the composer would fill in one jump after the
-// user stops talking. Verified against a live session — 9.2 s of real-time
-// audio produced zero frames until flush until this was added.
+// slow batch one: without it the provider answers only the flush, so the
+// composer fills in one jump after the user stops talking.
+//
+// What it buys is segmentation on detected SILENCE, not a running word-by-word
+// transcript: a live session gets a partial at each natural pause, and a single
+// unbroken sentence still arrives whole at the flush. Worth knowing before
+// chasing a "partials are broken" report — test audio without a real pause in
+// it (`say` output, for one) produces no partials no matter what is set here,
+// which cost an afternoon to work out.
 //
 // The codec and rate are declared on the connection as well as on every frame.
 // The frames alone were not enough to earn interim results.
