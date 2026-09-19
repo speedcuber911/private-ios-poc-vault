@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 
 import {
   cpuPercent,
@@ -10,6 +11,7 @@ import {
   parseProcNetDev,
   parseProcDiskstats,
   ioRate,
+  streamHostStats,
   METRICS,
 } from "../src/hoststats.mjs";
 
@@ -146,6 +148,72 @@ test("snapshot takes a new reading when the last one is stale", () => {
   assert.notEqual(second.sampledAt, first.sampledAt);
   assert.ok(second.history.length > first.history.length);
   assert.notEqual(second.cpu.usedPercent, first.cpu.usedPercent);
+});
+
+test("live stream sends full history once, incremental samples, and stops on close", () => {
+  let t = 1_000;
+  let cpu = 10;
+  const monitor = createHostMonitor({
+    now: () => t,
+    sampleMs: 15_000,
+    freshMs: 5_000,
+    collect: () => ({
+      cpuTimes: { idle: cpu, total: cpu * 2 },
+      cpuPercent: cpu++,
+      cpuCount: 2,
+      memory: { usedBytes: 20, totalBytes: 100, availableBytes: 80 },
+      disk: { usedBytes: 30, totalBytes: 100, freeBytes: 70, path: "/" },
+      load1: 0.2,
+      load5: 0.2,
+      load15: 0.2,
+      uptimeSec: 10,
+      hostname: "box-1",
+      platform: "linux",
+      arch: "x64",
+    }),
+    setIntervalFn: () => ({ unref() {} }),
+    clearIntervalFn: () => {},
+  });
+
+  const req = new EventEmitter();
+  const writes = [];
+  const res = new EventEmitter();
+  res.writeHead = (status, headers) => {
+    assert.equal(status, 200);
+    assert.equal(headers["content-type"], "text/event-stream");
+  };
+  res.write = (chunk) => { writes.push(chunk); return true; };
+
+  let tick;
+  let cleared = 0;
+  let closed = 0;
+  streamHostStats(req, res, {
+    monitor,
+    onClose: () => { closed += 1; },
+    setIntervalFn: (callback, delay) => {
+      assert.equal(delay, 5_000);
+      tick = callback;
+      return { unref() {} };
+    },
+    clearIntervalFn: () => { cleared += 1; },
+  });
+
+  assert.match(writes.join(""), /event: snapshot/);
+  assert.equal(JSON.parse(writes[0].match(/data: (.*)\n\n/s)[1]).history.length, 1);
+
+  t += 5_000;
+  tick();
+  assert.match(writes.at(-1), /event: sample/);
+  assert.equal(JSON.parse(writes.at(-1).match(/data: (.*)\n\n/s)[1]).history.length, 1);
+
+  tick();
+  assert.equal(writes.at(-1), ": heartbeat\n\n");
+
+  req.emit("close");
+  req.emit("close");
+  assert.equal(cleared, 1);
+  assert.equal(closed, 1);
+  monitor.stop();
 });
 
 test("proc parsers skip loopback, virtual nics, and partition disks", () => {

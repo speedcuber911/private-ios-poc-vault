@@ -60,14 +60,47 @@ final class MachineMonitorTests: XCTestCase {
         XCTAssertNotNil(stats.lastUpdatedText)
         XCTAssertNotNil(RelayMachineStats.parseDate("2026-09-19T14:38:01.234Z"))
         XCTAssertNotNil(RelayMachineStats.parseDate("2026-09-19T14:38:01Z"))
+
+        let payload = try XCTUnwrap(String(data: json, encoding: .utf8))
+        guard case .snapshot(let streamed)? = CodexClient.decodeMachineStatsEvent(
+            event: "snapshot",
+            data: payload
+        ) else {
+            return XCTFail("Expected a machine stats snapshot event")
+        }
+        XCTAssertEqual(streamed.host.hostname, "box-1")
+        XCTAssertNil(CodexClient.decodeMachineStatsEvent(event: "future", data: payload))
+
+        let latestOnly = RelayMachineStats(
+            ok: stats.ok,
+            sampledAt: stats.sampledAt,
+            host: stats.host,
+            cpu: stats.cpu,
+            memory: stats.memory,
+            disk: stats.disk,
+            jobs: stats.jobs,
+            network: stats.network,
+            io: stats.io,
+            alerts: stats.alerts,
+            history: [try XCTUnwrap(stats.history.last)]
+        )
+        let merged = stats.mergingLiveSample(latestOnly)
+        XCTAssertEqual(merged.history.count, stats.history.count)
+        XCTAssertEqual(merged.history.last, latestOnly.history.last)
     }
 
     func testUsageExplainersLiveOnTheInfoControl() throws {
         let source = try AppSourceFixture.load("POCVault/Views/RelayMachineMonitorView.swift")
         XCTAssertTrue(source.contains("RelayInfoButton"))
         XCTAssertTrue(source.contains("unsupportedInfo"))
-        XCTAssertTrue(source.contains("model.start(client: client)"))
+        XCTAssertTrue(source.contains(".task(id: scenePhase)"))
+        XCTAssertTrue(source.contains("await model.monitor(client: client)"))
+        XCTAssertTrue(source.contains("client.streamMachineStats()"))
+        XCTAssertTrue(source.contains("mergingLiveSample"))
         XCTAssertTrue(source.contains(".seconds(5)"))
+        XCTAssertFalse(source.contains("nonisolated(unsafe) private var pollTask"))
+        XCTAssertFalse(source.contains(".onAppear { model.start"))
+        XCTAssertFalse(source.contains(".id(sampledAt"))
         XCTAssertFalse(source.contains("15_000_000_000"))
         XCTAssertFalse(source.contains("placeholder("))
     }

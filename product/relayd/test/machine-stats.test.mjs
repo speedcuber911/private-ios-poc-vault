@@ -67,6 +67,16 @@ test("GET /v1/machine/stats returns the live snapshot", async () => {
     assert.ok(Array.isArray(body.history));
     assert.ok(Array.isArray(body.alerts));
     assert.equal(body.history.at(-1).netRxBytesPerSec, 1200);
+
+    const stream = await fetch(`http://127.0.0.1:${port}/v1/machine/stats/stream`);
+    assert.equal(stream.status, 200);
+    assert.match(stream.headers.get("content-type"), /text\/event-stream/);
+    const reader = stream.body.getReader();
+    const first = await reader.read();
+    const text = new TextDecoder().decode(first.value);
+    assert.match(text, /event: snapshot/);
+    assert.match(text, /"hostname":"box-1"/);
+    await reader.cancel();
   } finally {
     monitor.stop();
     await new Promise((resolve) => server.close(resolve));

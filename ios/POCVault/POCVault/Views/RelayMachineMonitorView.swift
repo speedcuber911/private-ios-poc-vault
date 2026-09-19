@@ -8,25 +8,39 @@ final class RelayMachineMonitorModel: ObservableObject {
     @Published var isLoading = false
     @Published var unsupported = false
 
-    nonisolated(unsafe) private var pollTask: Task<Void, Never>?
+    /// Runs inside SwiftUI's visibility- and scene-bound `.task`. There is no
+    /// model-owned background task: leaving Usage or backgrounding the app
+    /// cancels the consumer, which closes the daemon's SSE connection.
+    func monitor(client: CodexClient) async {
+        if stats == nil { isLoading = true }
+        defer { isLoading = false }
 
-    func start(client: CodexClient) {
-        if let pollTask, !pollTask.isCancelled { return }
-        pollTask = Task { [weak self] in
-            while !Task.isCancelled {
-                await self?.refresh(client: client)
-                try? await Task.sleep(for: .seconds(5))
+        var retryDelay = 1.0
+        while !Task.isCancelled {
+            do {
+                for try await event in client.streamMachineStats() {
+                    guard !Task.isCancelled else { return }
+                    apply(event)
+                    retryDelay = 1
+                }
+                guard !Task.isCancelled else { return }
+            } catch let error as CodexClientError where error.isGenericRouteNotFound {
+                // One-release compatibility for a linked machine that has the
+                // snapshot route but predates its SSE companion.
+                await pollLegacySnapshot(client: client)
+                return
+            } catch {
+                guard !Task.isCancelled else { return }
+                errorMessage = "Relay couldn't reach your machine. Reconnecting…"
             }
+
+            do {
+                try await Task.sleep(for: .seconds(retryDelay))
+            } catch {
+                return
+            }
+            retryDelay = min(retryDelay * 2, 10)
         }
-    }
-
-    func stop() {
-        pollTask?.cancel()
-        pollTask = nil
-    }
-
-    deinit {
-        pollTask?.cancel()
     }
 
     func refresh(client: CodexClient) async {
@@ -45,6 +59,29 @@ final class RelayMachineMonitorModel: ObservableObject {
             errorMessage = "Relay couldn't reach your machine."
         }
     }
+
+    private func apply(_ event: RelayMachineStatsStreamEvent) {
+        switch event {
+        case .snapshot(let next):
+            stats = next
+        case .sample(let next):
+            stats = stats?.mergingLiveSample(next) ?? next
+        }
+        isLoading = false
+        errorMessage = nil
+        unsupported = false
+    }
+
+    private func pollLegacySnapshot(client: CodexClient) async {
+        while !Task.isCancelled {
+            await refresh(client: client)
+            do {
+                try await Task.sleep(for: .seconds(5))
+            } catch {
+                return
+            }
+        }
+    }
 }
 
 private struct RelayUsagePoint: Identifiable {
@@ -59,6 +96,7 @@ struct RelayMachineMonitorView: View {
     let machineName: String
     var showsDismissButton = false
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model = RelayMachineMonitorModel()
 
     var body: some View {
@@ -112,7 +150,10 @@ struct RelayMachineMonitorView: View {
         .refreshable {
             await model.refresh(client: client)
         }
-        .onAppear { model.start(client: client) }
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            await model.monitor(client: client)
+        }
         .preferredColorScheme(.dark)
     }
 
@@ -264,7 +305,7 @@ struct RelayMachineMonitorView: View {
                 detail: detail,
                 emphasize: firing
             )
-            usageChart(points: points, yDomain: 0...100, firing: firing, rateAxis: false, sampledAt: model.stats?.sampledAt)
+            usageChart(points: points, yDomain: 0...100, firing: firing, rateAxis: false)
         }
     }
 
@@ -286,7 +327,7 @@ struct RelayMachineMonitorView: View {
                 detail: "\(outboundTitle) \(RelayMachineStats.rateText(outbound)) · \(model.stats?.historyWindowLabel ?? "Recent")",
                 emphasize: false
             )
-            usageChart(points: points, yDomain: 0...peak, firing: false, dualSeries: true, rateAxis: true, sampledAt: model.stats?.sampledAt)
+            usageChart(points: points, yDomain: 0...peak, firing: false, dualSeries: true, rateAxis: true)
         }
     }
 
@@ -314,8 +355,7 @@ struct RelayMachineMonitorView: View {
         yDomain: ClosedRange<Double>,
         firing: Bool,
         dualSeries: Bool = false,
-        rateAxis: Bool = false,
-        sampledAt: String? = nil
+        rateAxis: Bool = false
     ) -> some View {
         let span = points.count >= 2
             ? points[points.count - 1].date.timeIntervalSince(points[0].date)
@@ -374,7 +414,6 @@ struct RelayMachineMonitorView: View {
             plot.background(AppTheme.textPrimary.opacity(0.03))
         }
         .frame(height: 104)
-        .id(sampledAt ?? "\(points.count)-\(points.last?.value ?? 0)")
         .accessibilityHidden(true)
     }
 
@@ -449,7 +488,35 @@ struct RelayMachineMonitorView: View {
                 RelayUsagePoint(id: "\(series)-b", date: now, value: current, series: series)
             ]
         }
-        return result
+        return downsample(result, maximumCount: 240)
+    }
+
+    /// Keep Swift Charts work bounded even after an hour of five-second live
+    /// samples. Min/max pairs retain short spikes better than a simple stride.
+    private func downsample(_ points: [RelayUsagePoint], maximumCount: Int) -> [RelayUsagePoint] {
+        guard points.count > maximumCount, maximumCount >= 4 else { return points }
+        let interior = points.count - 2
+        let bucketCount = max(1, (maximumCount - 2) / 2)
+        let bucketSize = (interior + bucketCount - 1) / bucketCount
+        var sampled: [RelayUsagePoint] = [points[0]]
+        sampled.reserveCapacity(maximumCount)
+
+        var start = 1
+        while start < points.count - 1 {
+            let end = min(start + bucketSize, points.count - 1)
+            let indices = start..<end
+            guard let minimum = indices.min(by: { points[$0].value < points[$1].value }),
+                  let maximum = indices.max(by: { points[$0].value < points[$1].value })
+            else { break }
+            for index in [minimum, maximum].sorted() {
+                if sampled.last?.id != points[index].id {
+                    sampled.append(points[index])
+                }
+            }
+            start = end
+        }
+        sampled.append(points[points.count - 1])
+        return sampled
     }
 
     static let usageInfo =

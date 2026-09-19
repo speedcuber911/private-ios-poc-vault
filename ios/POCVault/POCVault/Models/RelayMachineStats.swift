@@ -164,6 +164,38 @@ struct RelayMachineStats: Decodable, Equatable {
             || history.contains { $0.diskReadBytesPerSec != nil || $0.diskWriteBytesPerSec != nil }
     }
 
+    /// Applies an incremental SSE sample without making the daemon resend or
+    /// the phone re-decode the complete chart history every five seconds.
+    func mergingLiveSample(_ next: RelayMachineStats, historyLimit: Int = 720) -> RelayMachineStats {
+        var mergedHistory = history
+        for sample in next.history {
+            if let timestamp = sample.ts,
+               let lastIndex = mergedHistory.indices.last,
+               mergedHistory[lastIndex].ts == timestamp {
+                mergedHistory[lastIndex] = sample
+            } else {
+                mergedHistory.append(sample)
+            }
+        }
+        if mergedHistory.count > historyLimit {
+            mergedHistory.removeFirst(mergedHistory.count - historyLimit)
+        }
+
+        return RelayMachineStats(
+            ok: next.ok,
+            sampledAt: next.sampledAt,
+            host: next.host,
+            cpu: next.cpu,
+            memory: next.memory,
+            disk: next.disk,
+            jobs: next.jobs,
+            network: next.network,
+            io: next.io,
+            alerts: next.alerts,
+            history: mergedHistory
+        )
+    }
+
     static func parseDate(_ value: String?) -> Date? {
         guard let value, !value.isEmpty else { return nil }
         if let date = try? Date(value, strategy: .iso8601) { return date }

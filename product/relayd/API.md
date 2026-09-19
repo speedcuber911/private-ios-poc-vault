@@ -946,6 +946,19 @@ default 720, enough for 5 s readings).
 Network and disk I/O rates are Linux `/proc` counters; other platforms
 leave those fields null.
 
+#### `GET /v1/machine/stats/stream` — live host usage (SSE)
+
+The Usage screen opens this authenticated stream only while it is visible and
+the iOS app is active. The first `snapshot` event has the same payload as
+`GET /v1/machine/stats`, including bounded history. Each later `sample` event
+contains the current fields plus only the newest history point, keeping stream
+bandwidth and phone-side JSON/chart work constant over time. A comment
+heartbeat is sent when there is no newer sample.
+
+The stream samples at the freshness cadence (5 s by default), closes when the
+screen leaves, and shares the existing bounded SSE slot pool with job and node
+event streams. Errors: 503 `too many concurrent job streams`.
+
 Sustained CPU/memory ≥ 90% or disk ≥ 90% / under 1 GB free posts
 `node.pressure` (content-free) to the control plane when the node is
 registered. A 2-minute `POST /v1/node/heartbeat` keeps `last_seen`

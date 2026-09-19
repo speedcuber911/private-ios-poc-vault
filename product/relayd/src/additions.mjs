@@ -13,13 +13,22 @@ import { serveExportTar } from "./fsapi.mjs";
 import { serveExec } from "./exec.mjs";
 import { continueHandoff } from "./handoff.mjs";
 import { store, isInvalidRecordIdError } from "./store.mjs";
-import { toJobResponse, responseShape } from "./jobs.mjs";
+import { toJobResponse, responseShape, tryAcquireStreamSlot, releaseStreamSlot } from "./jobs.mjs";
 import { readMacSessions } from "./syncauth.mjs";
 import { dataDir } from "./config.mjs";
-import { getHostMonitor } from "./hoststats.mjs";
+import { getHostMonitor, streamHostStats } from "./hoststats.mjs";
 
 // Returns true when the request was handled.
 async function handleAdditionRoutes(req, res, url, auth) {
+  if (req.method === "GET" && url.pathname === "/v1/machine/stats/stream") {
+    if (!tryAcquireStreamSlot()) {
+      sendError(res, 503, "too many concurrent job streams");
+      return true;
+    }
+    streamHostStats(req, res, { onClose: releaseStreamSlot });
+    return true;
+  }
+
   if (req.method === "GET" && url.pathname === "/v1/machine/stats") {
     sendJson(res, 200, getHostMonitor().snapshot());
     return true;

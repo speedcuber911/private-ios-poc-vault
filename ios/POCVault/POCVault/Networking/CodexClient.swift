@@ -75,6 +75,11 @@ enum CodexChatEvent: Hashable {
     case error(String)
 }
 
+enum RelayMachineStatsStreamEvent {
+    case snapshot(RelayMachineStats)
+    case sample(RelayMachineStats)
+}
+
 /// Incremental SSE line parser. The decode step is injected so the same accumulation
 /// logic serves both the chat stream (`CodexChatEvent`) and the job stream
 /// (`CodexJobStreamEvent`). A decode returning nil drops the event (unknown/heartbeat).
@@ -897,6 +902,70 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
             return try decoder.decode(RelayMachineStats.self, from: data)
         } catch let error as CodexClientError where error.isGenericRouteNotFound {
             return nil
+        }
+    }
+
+    /// Live host usage while the Usage screen is visible. The server sends one
+    /// bounded history snapshot, then incremental samples on the same mTLS
+    /// connection. Cancelling the consumer closes the HTTP stream.
+    func streamMachineStats() -> AsyncThrowingStream<RelayMachineStatsStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let path = "/v1/machine/stats/stream"
+                    let url = endpoint(path: path, queryItems: [])
+                    guard url.scheme != nil, url.host != nil else {
+                        throw CodexClientError.invalidEndpoint(url)
+                    }
+
+                    var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
+                    applyDeviceToken(to: &request, url: url)
+                    request.httpMethod = "GET"
+                    request.timeoutInterval = 30
+                    request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+
+                    let (bytes, response) = try await session.bytes(for: request)
+                    guard let http = response as? HTTPURLResponse else {
+                        throw CodexClientError.emptyResponse
+                    }
+                    guard (200...299).contains(http.statusCode) else {
+                        let message = try await Self.errorMessage(from: bytes)
+                        throw CodexClientError.httpFailure(http.statusCode, message)
+                    }
+
+                    var parser = CodexSSELineParser<RelayMachineStatsStreamEvent> {
+                        Self.decodeMachineStatsEvent(event: $0, data: $1)
+                    }
+                    for try await line in bytes.lines {
+                        guard !Task.isCancelled else { return }
+                        for event in parser.ingest(line.trimmingCharacters(in: .newlines)) {
+                            continuation.yield(event)
+                        }
+                    }
+                    for event in parser.finish() {
+                        continuation.yield(event)
+                    }
+                    continuation.finish()
+                } catch {
+                    if Task.isCancelled {
+                        continuation.finish()
+                    } else {
+                        continuation.finish(throwing: error)
+                    }
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    static func decodeMachineStatsEvent(event: String, data: String) -> RelayMachineStatsStreamEvent? {
+        guard let stats = try? makeDecoder().decode(RelayMachineStats.self, from: Data(data.utf8)) else {
+            return nil
+        }
+        switch event.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "snapshot": return .snapshot(stats)
+        case "sample": return .sample(stats)
+        default: return nil
         }
     }
 

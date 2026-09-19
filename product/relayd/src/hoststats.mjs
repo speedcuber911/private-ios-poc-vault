@@ -440,7 +440,14 @@ export function createHostMonitor({
 
   sample();
 
-  return { sample, snapshot, setCloud, stop, alerts };
+  return {
+    sample,
+    snapshot,
+    setCloud,
+    stop,
+    alerts,
+    streamIntervalMs: Math.min(sampleMs, freshMs),
+  };
 }
 
 export function getHostMonitor() {
@@ -452,6 +459,82 @@ export function startHostMonitor(options) {
   defaultMonitor?.stop?.();
   defaultMonitor = createHostMonitor(options);
   return defaultMonitor;
+}
+
+// GET /v1/machine/stats/stream — an ephemeral, screen-scoped SSE feed.
+//
+// The first event carries the complete bounded history so the chart can draw
+// immediately. Later events carry only the newest point; repeatedly sending
+// the whole history would make bandwidth and JSON decoding grow for as long as
+// the screen stayed open. snapshot() performs the at-most-once fresh sample,
+// so multiple paired viewers do not multiply host reads.
+export function streamHostStats(req, res, {
+  monitor = getHostMonitor(),
+  onClose = () => {},
+  setIntervalFn = setInterval,
+  clearIntervalFn = clearInterval,
+} = {}) {
+  let closed = false;
+  let blocked = false;
+  let timer = null;
+  let lastSampledAt = null;
+
+  function close() {
+    if (closed) return;
+    closed = true;
+    if (timer) clearIntervalFn(timer);
+    onClose();
+  }
+
+  function write(event, payload) {
+    if (closed || blocked) return false;
+    try {
+      const writable = res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+      if (writable === false) {
+        blocked = true;
+        res.once?.("drain", () => { blocked = false; });
+      }
+      return true;
+    } catch {
+      close();
+      return false;
+    }
+  }
+
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    "x-accel-buffering": "no",
+  });
+  req.once?.("close", close);
+  req.once?.("aborted", close);
+
+  const initial = monitor.snapshot();
+  lastSampledAt = initial.sampledAt;
+  write("snapshot", initial);
+  if (closed) return close;
+
+  const intervalMs = Math.max(1_000, Number(monitor.streamIntervalMs) || DEFAULT_FRESH_MS);
+  timer = setIntervalFn(() => {
+    if (closed || blocked) return;
+    const next = monitor.snapshot();
+    if (next.sampledAt === lastSampledAt) {
+      try {
+        res.write(": heartbeat\n\n");
+      } catch {
+        close();
+      }
+      return;
+    }
+    lastSampledAt = next.sampledAt;
+    write("sample", {
+      ...next,
+      history: Array.isArray(next.history) ? next.history.slice(-1) : [],
+    });
+  }, intervalMs);
+  timer?.unref?.();
+  return close;
 }
 
 export {
