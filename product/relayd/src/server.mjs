@@ -267,7 +267,7 @@ async function routeRequest(req, res) {
 
   if (req.method === "GET" && url.pathname === "/v1/codex/workspaces") {
     return sendJson(res, 200, {
-      workspaces: pickerWorkspaceList().map((workspace) => ({)
+      workspaces: pickerWorkspaceList().map((workspace) => ({
         id: workspace.id,
         name: workspace.name,
         path: workspace.path,
