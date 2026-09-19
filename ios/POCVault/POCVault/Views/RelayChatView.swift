@@ -2622,13 +2622,20 @@ private struct RelayThreadDrawer: View {
     /// handoff is the thing the user was just pushed about.
     @ViewBuilder private var handoffSection: some View {
         if !viewModel.handoffs.isEmpty {
-            Text("Continue from your computer")
-                .font(AppTheme.uiFont(size: 13, weight: .medium))
-                .foregroundStyle(AppTheme.textPrimary.opacity(0.65))
-                .padding(.horizontal, 20)
-                .padding(.top, 22)
-                .padding(.bottom, 4)
-                .accessibilityAddTraits(.isHeader)
+            HStack(spacing: 4) {
+                Text("Continue from your computer")
+                    .font(AppTheme.uiFont(size: 13, weight: .medium))
+                    .foregroundStyle(AppTheme.textPrimary.opacity(0.65))
+                RelayInfoButton(
+                    title: "Handoff",
+                    message: "These are Codex or Claude Code sessions sent from your linked computer. Continue resumes the same work on your Relay machine."
+                )
+                Spacer()
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 22)
+            .padding(.bottom, 4)
+            .accessibilityAddTraits(.isHeader)
             ForEach(viewModel.handoffs) { card in
                 RelayHandoffCardView(
                     card: card,
@@ -2641,11 +2648,6 @@ private struct RelayThreadDrawer: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)
             }
-            Text("These are Codex or Claude Code sessions sent from your linked computer. Continue resumes the same work on your Relay machine.")
-                .font(AppTheme.uiFont(size: 12))
-                .foregroundStyle(AppTheme.textFaint)
-                .padding(.horizontal, 20)
-                .padding(.top, 4)
         }
     }
 

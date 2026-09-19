@@ -811,11 +811,16 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(source.contains("CodexAgentMonitorPolicy.shouldStartAppMonitor"))
 
         // Settings lives under the tab bar, so the Form must not bounce when
-        // the page fits and must keep Security's footer above the tabs.
+        // the page fits and must keep the last section above the tabs.
+        // Explainer copy sits behind RelayInfoButton, not Form footers.
         let settings = try AppSourceFixture.load("POCVault/Views/AccountSettingsView.swift")
         XCTAssertTrue(settings.contains("scrollBounceBehavior(.basedOnSize)"))
         XCTAssertTrue(settings.contains("contentMargins(.bottom"))
         XCTAssertTrue(settings.contains("adoptPlaces(") || settings.contains("adoptPlaces ("))
+        XCTAssertTrue(settings.contains("RelayFormHeader"))
+        XCTAssertFalse(settings.contains("footer:"))
+        XCTAssertTrue(source.contains("struct RelayInfoButton"))
+        XCTAssertTrue(source.contains("info.circle"))
 
         // Deep-link hooks still use semantic destinations rather than a numeric tab id.
         XCTAssertFalse(source.contains("RELAY_UITEST_TAB"))

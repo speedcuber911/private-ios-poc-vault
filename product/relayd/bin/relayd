@@ -368,6 +368,25 @@ async function cmdDoctor() {
       failures += 1;
     }
 
+    // Host usage sampler — the phone's Usage screen reads this from the node.
+    try {
+      const { createHostMonitor } = await import("../src/hoststats.mjs");
+      const monitor = createHostMonitor({
+        setIntervalFn: () => ({ unref() {} }),
+        clearIntervalFn: () => {},
+      });
+      const snap = monitor.snapshot();
+      monitor.stop();
+      if (snap?.ok) ok("host usage", snap.host?.hostname || "sampler ready");
+      else {
+        bad("host usage", "sampler did not produce a snapshot");
+        failures += 1;
+      }
+    } catch (error) {
+      bad("host usage", error.message);
+      failures += 1;
+    }
+
     // Provider CLIs (informational — a missing harness is not a failure).
     try {
       const harness = await import("../src/harness.mjs");

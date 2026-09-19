@@ -1380,6 +1380,68 @@ enum AppTheme {
     }
 }
 
+/// Quiet info control. Explainer copy lives here, not as a footnote on the page
+/// (Editorial Ember rule 6: copy earns its place).
+struct RelayInfoButton: View {
+    let title: String
+    let message: String
+    @State private var showing = false
+
+    var body: some View {
+        Button {
+            showing = true
+        } label: {
+            Image(systemName: "info.circle")
+                .font(.system(size: 15, weight: .regular))
+                .foregroundStyle(AppTheme.textTertiary)
+                .frame(width: 28, height: 28)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("About \(title)")
+        .accessibilityHint("Shows more information")
+        .popover(isPresented: $showing, arrowEdge: .top) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text(title)
+                    .font(AppTheme.serifFont(size: 20))
+                    .foregroundStyle(AppTheme.textPrimary)
+                Text(message)
+                    .font(AppTheme.uiFont(size: 15))
+                    .foregroundStyle(AppTheme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(20)
+            .frame(width: 300, alignment: .leading)
+            .background(AppTheme.bgCanvas)
+            .presentationCompactAdaptation(.popover)
+            .preferredColorScheme(.dark)
+        }
+    }
+}
+
+/// Form section title plus an optional trailing info control.
+struct RelayFormHeader: View {
+    let title: String
+    var infoTitle: String? = nil
+    var info: String? = nil
+
+    init(_ title: String, infoTitle: String? = nil, info: String? = nil) {
+        self.title = title
+        self.infoTitle = infoTitle
+        self.info = info
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text(title)
+            if let info, !info.isEmpty {
+                RelayInfoButton(title: infoTitle ?? title, message: info)
+            }
+        }
+        .textCase(nil)
+    }
+}
+
 /// Small-caps letterspaced label — the only rendering for status words, bylines,
 /// and section labels (spec rule 5: status is typographic, never a dot).
 struct RelayCapsLabel: View {

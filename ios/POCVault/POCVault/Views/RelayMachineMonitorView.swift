@@ -45,11 +45,14 @@ struct RelayMachineMonitorView: View {
             if let stats = model.stats {
                 usageScroll(stats)
             } else if model.unsupported {
-                placeholder(
-                    "This machine's Relay service is too old to report usage. Update relayd on that computer."
+                statusPage(
+                    status: "Unavailable",
+                    warn: false,
+                    info: Self.unsupportedInfo
                 )
             } else if let errorMessage = model.errorMessage {
-                VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 20) {
+                    statusHeader(status: "Unreachable", warn: true, info: Self.usageInfo)
                     Text(errorMessage)
                         .font(AppTheme.uiFont(size: 16))
                         .foregroundStyle(AppTheme.statusError)
@@ -58,17 +61,20 @@ struct RelayMachineMonitorView: View {
                     }
                     .buttonStyle(RelayPrimaryButtonStyle())
                 }
-                .padding(24)
+                .padding(22)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             } else {
-                HStack(spacing: 10) {
-                    ProgressView()
-                    Text("Reading this machine…")
-                        .font(AppTheme.uiFont(size: 15))
-                        .foregroundStyle(AppTheme.textSecondary)
+                VStack(alignment: .leading, spacing: 16) {
+                    statusHeader(status: "Reading", warn: false, info: Self.usageInfo)
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text("Reading this machine…")
+                            .font(AppTheme.uiFont(size: 15))
+                            .foregroundStyle(AppTheme.textSecondary)
+                    }
                 }
+                .padding(22)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .padding(24)
             }
         }
         .background(AppTheme.bgCanvas.ignoresSafeArea())
@@ -167,23 +173,48 @@ struct RelayMachineMonitorView: View {
     }
 
     private func header(_ stats: RelayMachineStats) -> some View {
+        statusHeader(
+            status: stats.firingAlerts.isEmpty ? "Reachable" : "Under load",
+            warn: !stats.firingAlerts.isEmpty,
+            name: stats.host.hostname ?? machineName,
+            uptime: RelayMachineStats.uptimeText(stats.host.uptimeSec),
+            info: Self.usageInfo
+        )
+    }
+
+    private func statusPage(status: String, warn: Bool, info: String) -> some View {
+        statusHeader(status: status, warn: warn, info: info)
+            .padding(22)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private func statusHeader(
+        status: String,
+        warn: Bool,
+        name: String? = nil,
+        uptime: String? = nil,
+        info: String
+    ) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
                 RelayCapsLabel(
-                    text: stats.firingAlerts.isEmpty ? "Reachable" : "Under load",
-                    color: stats.firingAlerts.isEmpty ? AppTheme.textTertiary : AppTheme.statusWarn,
+                    text: status,
+                    color: warn ? AppTheme.statusWarn : AppTheme.textTertiary,
                     size: 10
                 )
                 Spacer()
-                if let uptime = RelayMachineStats.uptimeText(stats.host.uptimeSec) {
+                if let uptime {
                     Text(uptime)
                         .font(AppTheme.monoFont(size: 12))
                         .foregroundStyle(AppTheme.textTertiary)
                 }
             }
-            Text(stats.host.hostname ?? machineName)
-                .font(AppTheme.serifFont(size: 26))
-                .foregroundStyle(AppTheme.textPrimary)
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(name ?? machineName)
+                    .font(AppTheme.serifFont(size: 26))
+                    .foregroundStyle(AppTheme.textPrimary)
+                RelayInfoButton(title: "Usage", message: info)
+            }
             Text("This machine")
                 .font(AppTheme.uiFont(size: 14))
                 .foregroundStyle(AppTheme.textSecondary)
@@ -327,18 +358,7 @@ struct RelayMachineMonitorView: View {
             Text(loadLine(stats))
                 .font(AppTheme.uiFont(size: 13))
                 .foregroundStyle(AppTheme.textTertiary)
-            Text("Numbers stay on this computer. Relay notifies your phone when something stays high or the machine goes quiet, and only if this machine is connected to your account.")
-                .font(AppTheme.uiFont(size: 13))
-                .foregroundStyle(AppTheme.textFaint)
         }
-    }
-
-    private func placeholder(_ message: String) -> some View {
-        Text(message)
-            .font(AppTheme.uiFont(size: 16))
-            .foregroundStyle(AppTheme.textSecondary)
-            .padding(24)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private func isFiring(_ stats: RelayMachineStats, _ kind: RelayMachineStats.Alert.Kind) -> Bool {
@@ -403,4 +423,10 @@ struct RelayMachineMonitorView: View {
         }
         return result
     }
+
+    static let usageInfo =
+        "Numbers stay on this computer. Relay notifies your phone when something stays high or the machine goes quiet, and only if this machine is connected to your account."
+
+    static let unsupportedInfo =
+        "This machine's Relay service is too old to report usage. Update relayd on that computer, then open Usage again."
 }

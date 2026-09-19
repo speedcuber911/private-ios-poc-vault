@@ -56,6 +56,10 @@ struct RelayPreviewsView: View {
                     Text("Previews")
                         .font(AppTheme.serifFont(size: 32))
                         .foregroundStyle(AppTheme.textPrimary)
+                    RelayInfoButton(
+                        title: "Previews",
+                        message: "Review files and live app links produced by sessions on your connected machine. Each output stays linked to the workspace that created it. Showing outputs found in the latest 100 jobs. Live app links work while the app is running on the connected machine."
+                    )
                     Spacer()
                     Button { Task { await refreshResults() } } label: {
                         Image(systemName: "arrow.clockwise")
@@ -66,10 +70,6 @@ struct RelayPreviewsView: View {
                     .accessibilityLabel("Refresh workspace results")
                     .accessibilityIdentifier("relay-workspace-previews-refresh")
                 }
-                Text("Review files and live app links produced by sessions on your connected machine. Each output stays linked to the workspace that created it.")
-                    .font(AppTheme.uiFont(size: 14))
-                    .foregroundStyle(AppTheme.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
 
                 if !workspaceAccessIsAvailable {
                     StatusCard(symbol: "desktopcomputer.trianglebadge.exclamationmark", title: "Computer disconnected", message: "Reconnect your computer in Settings to load its workspace results.")
@@ -91,9 +91,6 @@ struct RelayPreviewsView: View {
                     LazyVStack(alignment: .leading, spacing: 24) {
                         ForEach(results) { result in resultCard(result) }
                     }
-                    Text("Showing outputs found in the latest 100 jobs. Live app links work while the app is running on the connected machine.")
-                        .font(AppTheme.uiFont(size: 12))
-                        .foregroundStyle(AppTheme.textTertiary)
                 }
             }
             .frame(maxWidth: 760, alignment: .leading)

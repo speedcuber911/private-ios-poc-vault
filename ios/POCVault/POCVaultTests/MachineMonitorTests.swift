@@ -59,6 +59,13 @@ final class MachineMonitorTests: XCTestCase {
         XCTAssertEqual(RelayMachineStats.rateText(1200), "1.2 KB/s")
     }
 
+    func testUsageExplainersLiveOnTheInfoControl() throws {
+        let source = try AppSourceFixture.load("POCVault/Views/RelayMachineMonitorView.swift")
+        XCTAssertTrue(source.contains("RelayInfoButton"))
+        XCTAssertTrue(source.contains("unsupportedInfo"))
+        XCTAssertFalse(source.contains("placeholder("))
+    }
+
     func testUnknownAlertKindDoesNotFailDecode() throws {
         let json = """
         {

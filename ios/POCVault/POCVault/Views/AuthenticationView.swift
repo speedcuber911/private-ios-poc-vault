@@ -69,16 +69,18 @@ struct AuthenticationView: View {
                 .foregroundStyle(AppTheme.accentGradient)
 
             VStack(alignment: .leading, spacing: 8) {
-                Text("Relay")
-                    .font(AppTheme.serifFont(size: 40))
-                    .foregroundStyle(AppTheme.textPrimary)
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text("Relay")
+                        .font(AppTheme.serifFont(size: 40))
+                        .foregroundStyle(AppTheme.textPrimary)
+                    RelayInfoButton(
+                        title: "Relay",
+                        message: "Your subscriptions stay on your computer and Relay machine — never on the phone."
+                    )
+                }
                 Text("Continue Codex and Claude Code work from your phone.")
                     .font(AppTheme.uiFont(size: 16, weight: .medium))
                     .foregroundStyle(AppTheme.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text("Your subscriptions stay on your computer and Relay machine — never on the phone.")
-                    .font(AppTheme.uiFont(size: 13))
-                    .foregroundStyle(AppTheme.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }

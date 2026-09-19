@@ -38,9 +38,7 @@ struct AccountSettingsView: View {
                         Button("Sign in to Relay") { showingSignIn = true }
                             .accessibilityIdentifier("relay-settings-sign-in")
                     } header: {
-                        Text("Account")
-                    } footer: {
-                        Text("Optional. An account adds handoff from a laptop, push notifications, and approving `relay login` on a computer. Files, agents and terminals work without one.")
+                        RelayFormHeader("Account", info: accountFooter)
                     }
                 }
 
@@ -125,9 +123,7 @@ struct AccountSettingsView: View {
                             }
                         }
                     } header: {
-                        Text("Signed in")
-                    } footer: {
-                        Text(computerFooter)
+                        RelayFormHeader("Signed in", info: computerFooter)
                     }
 
                     Section {
@@ -146,9 +142,7 @@ struct AccountSettingsView: View {
                         .disabled(accountStore.isWorking)
                         .accessibilityIdentifier("relay-delete-account")
                     } header: {
-                        Text("Security")
-                    } footer: {
-                        Text("Deleting removes your Relay account, registered devices, node records, entitlements, and this phone’s local Relay certificate. Files on servers you own are not deleted.")
+                        RelayFormHeader("Security", info: securityFooter)
                     }
 
                     if let error = accountStore.errorMessage {
@@ -195,9 +189,7 @@ struct AccountSettingsView: View {
                             }
                         }
                     } header: {
-                        Text("Coding agents")
-                    } footer: {
-                        Text("Sign in to each agent right from this iPhone — no laptop needed. The session is stored on your machine, and `relay sync-auth` from a Mac still works too.")
+                        RelayFormHeader("Coding agents", info: agentsFooter)
                     }
                 }
 
@@ -379,7 +371,7 @@ struct AccountSettingsView: View {
     private var machineSection: some View {
         Section {
             if let node = nodeStore.pairedNode {
-                LabeledContent("Machine", value: node.nodeName)
+                LabeledContent("Name", value: node.nodeName)
                 LabeledContent("Address", value: node.apiBaseURL.absoluteString)
                 LabeledContent(
                     "Account",
@@ -419,7 +411,7 @@ struct AccountSettingsView: View {
                 }
                 .accessibilityIdentifier("relay-settings-unpair")
             } else if AppConfiguration.hasConfiguredPersonalInstall {
-                LabeledContent("Machine", value: AppConfiguration.codexBaseURL.absoluteString)
+                LabeledContent("Address", value: AppConfiguration.codexBaseURL.absoluteString)
                 LabeledContent("Configured by", value: "support/vault-config.json")
                 NavigationLink {
                     RelayMachineMonitorView(
@@ -436,9 +428,7 @@ struct AccountSettingsView: View {
                     .accessibilityIdentifier("relay-settings-pair")
             }
         } header: {
-            Text("Machine")
-        } footer: {
-            Text(machineFooter)
+            RelayFormHeader("Machine", info: machineFooter)
         }
     }
 
@@ -450,6 +440,18 @@ struct AccountSettingsView: View {
             return "This machine is paired directly to this phone and fully usable. Usage is visible here. It is not connected to a Relay account, so there is no handoff from a laptop and no push if the machine is under load or goes quiet — add those whenever you want them."
         }
         return "Connected to your Relay account, so `relay handoff` from a laptop and usage alerts reach this phone."
+    }
+
+    private var accountFooter: String {
+        "Optional. An account adds handoff from a laptop, push notifications, and approving `relay login` on a computer. Files, agents and terminals work without one."
+    }
+
+    private var securityFooter: String {
+        "Deleting removes your Relay account, registered devices, node records, entitlements, and this phone’s local Relay certificate. Files on servers you own are not deleted."
+    }
+
+    private var agentsFooter: String {
+        "Sign in to each agent right from this iPhone — no laptop needed. The session is stored on your machine, and `relay sync-auth` from a Mac still works too."
     }
 
     private func registerMachine() async {

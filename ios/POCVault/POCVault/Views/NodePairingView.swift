@@ -86,9 +86,15 @@ struct NodePairingView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("Connect your machine")
-                        .font(AppTheme.serifFont(size: 31))
-                        .foregroundStyle(AppTheme.textPrimary)
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text("Connect your machine")
+                            .font(AppTheme.serifFont(size: 31))
+                            .foregroundStyle(AppTheme.textPrimary)
+                        RelayInfoButton(
+                            title: "Pairing",
+                            message: "The code carries your machine's address and the fingerprint of its certificate authority, so this phone can verify the very first connection. Nothing is sent to Relay."
+                        )
+                    }
                     Text("On the computer or server you want to work from, run `relayd pair`. Scan the QR code it prints.")
                         .font(AppTheme.uiFont(size: 16))
                         .foregroundStyle(AppTheme.textSecondary)
@@ -99,13 +105,6 @@ struct NodePairingView: View {
                 .padding(.top, 8)
 
                 scanner
-                    .padding(.horizontal, 22)
-
-                Text("The code carries your machine's address and the fingerprint of its certificate authority, so this phone can verify the very first connection. Nothing is sent to Relay.")
-                    .font(AppTheme.uiFont(size: 12))
-                    .foregroundStyle(AppTheme.textTertiary)
-                    .lineSpacing(3)
-                    .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 22)
 
                 manualEntry
