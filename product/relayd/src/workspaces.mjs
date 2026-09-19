@@ -60,6 +60,95 @@ function workspaceList() {
   return [...byId.values()].sort((left, right) => left.name.localeCompare(right.name));
 }
 
+const PICKER_SKIP_DIRS = new Set([
+  "node_modules",
+  "dist",
+  "build",
+  "out",
+  "target",
+  "vendor",
+  "__pycache__",
+  "venv",
+  "DerivedData",
+  "Pods",
+  "Coverage",
+]);
+
+const PICKER_LEAF_ONLY = new Set([
+  "Library",
+  "Applications",
+  "Movies",
+  "Music",
+  "Pictures",
+  "Public",
+]);
+
+function shouldExpandPickerDirectory(entryPath) {
+  const name = path.basename(entryPath);
+  if (PICKER_LEAF_ONLY.has(name)) return false;
+  try {
+    return !fs.existsSync(path.join(entryPath, ".git"));
+  } catch {
+    return false;
+  }
+}
+
+function discoverPickerWorkspaces() {
+  const found = [];
+  const seen = new Set();
+  const add = (entryPath) => {
+    if (seen.has(entryPath) || found.length >= maxWorkspaceDirEntries) return null;
+    const workspace = browseWorkspaceForPath(entryPath, { materialize: false });
+    if (!workspace) return null;
+    seen.add(entryPath);
+    found.push(workspace);
+    return workspace;
+  };
+
+  let topLevel = [];
+  try {
+    topLevel = fs.readdirSync(workspaceBrowseRoot, { withFileTypes: true });
+  } catch {
+    return found;
+  }
+
+  topLevel.sort((left, right) => left.name.localeCompare(right.name));
+  for (const entry of topLevel) {
+    if (found.length >= maxWorkspaceDirEntries) break;
+    if (entry.name.startsWith(".") || PICKER_SKIP_DIRS.has(entry.name)) continue;
+    const entryPath = resolveListedDirectory(workspaceBrowseRoot, entry);
+    if (!entryPath) continue;
+    add(entryPath);
+    if (!shouldExpandPickerDirectory(entryPath)) continue;
+
+    let children = [];
+    try {
+      children = fs.readdirSync(entryPath, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    children.sort((left, right) => left.name.localeCompare(right.name));
+    for (const child of children) {
+      if (found.length >= maxWorkspaceDirEntries) break;
+      if (child.name.startsWith(".") || PICKER_SKIP_DIRS.has(child.name)) continue;
+      const childPath = resolveListedDirectory(entryPath, child);
+      if (childPath) add(childPath);
+    }
+  }
+  return found;
+}
+
+function pickerWorkspaceList() {
+  const byPath = new Map();
+  for (const workspace of workspaceList()) {
+    byPath.set(workspace.path, workspace);
+  }
+  for (const workspace of discoverPickerWorkspaces()) {
+    if (!byPath.has(workspace.path)) byPath.set(workspace.path, workspace);
+  }
+  return [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path));
+}
+
 
 function resolveWorkspaceById(id) {
   return workspaces.get(id) || dynamicWorkspaces.get(id) || findDynamicWorkspaceById(id);
@@ -481,6 +570,7 @@ export {
   workspaces,
   loadWorkspaces,
   workspaceList,
+  pickerWorkspaceList,
   resolveWorkspaceById,
   publicWorkspace,
   browseWorkspaceForPath,

@@ -50,6 +50,13 @@ test("runtime Cursor descriptors skip hidden or invalid ids", () => {
   assert.equal(runtimeCursorDescriptor({ id: "not a model" }), null);
 });
 
+test("parseCursorModelList ignores CLI errors and reserved words", () => {
+  assert.deepEqual(parseCursorModelList("Error: Authentication required\n"), []);
+  assert.deepEqual(parseCursorModelList("Authentication required"), []);
+  assert.equal(runtimeCursorDescriptor("Error"), null);
+  assert.equal(runtimeCursorDescriptor("auto").taskModel, "auto");
+});
+
 test("parseCursorModelList accepts JSON, JSONL, and dashed CLI tables", () => {
   const json = parseCursorModelList(JSON.stringify({
     models: [

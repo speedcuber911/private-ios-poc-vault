@@ -361,7 +361,7 @@ function cursorCatalogEntries(models) {
   const entries = [];
   for (const model of models) {
     const taskModel = typeof model?.id === "string" ? model.id.trim() : "";
-    if (!taskModel || !/^[A-Za-z0-9._:/-]{1,180}$/.test(taskModel) || seen.has(taskModel)) continue;
+    if (!taskModel || !isPlausibleCursorModelId(taskModel) || seen.has(taskModel)) continue;
     seen.add(taskModel);
     const label = model.label || cursorModelDisplayName(taskModel);
     entries.push({
@@ -401,10 +401,18 @@ function runtimeCursorDescriptor(model) {
   }
   if (model.hidden === true) return null;
   const taskModel = model.model ?? model.id ?? model.slug;
-  if (typeof taskModel !== "string" || !/^[A-Za-z0-9._:/-]{1,180}$/.test(taskModel.trim())) return null;
+  if (typeof taskModel !== "string" || !isPlausibleCursorModelId(taskModel.trim())) return null;
   const id = taskModel.trim();
   const label = model.displayName || model.name || cursorModelDisplayName(id);
   return cursorCatalogEntries([{ id, label }])[0] || null;
+}
+
+function isPlausibleCursorModelId(value) {
+  if (!/^[A-Za-z0-9._:/-]{1,180}$/.test(value)) return false;
+  if (/^(error|errors|warning|info|debug|authentication|required|usage|help|tip|available|models?)$/i.test(value)) {
+    return false;
+  }
+  return value === "auto" || /[./_-]/.test(value);
 }
 
 function parseCursorModelList(text) {
@@ -482,7 +490,12 @@ function cursorDiscoveryEnv() {
 function execFileText(bin, args, env, timeoutMs = 8000) {
   return new Promise((resolve) => {
     execFile(bin, args, { env, timeout: timeoutMs, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
-      resolve({ ok: !error, text: `${stdout || ""}\n${stderr || ""}` });
+      resolve({
+        ok: !error,
+        stdout: String(stdout || ""),
+        stderr: String(stderr || ""),
+        text: `${stdout || ""}\n${stderr || ""}`,
+      });
     });
   });
 }
@@ -496,7 +509,7 @@ async function refreshRuntimeCursorModels() {
     let listed = [];
     for (const args of [["--list-models"], ["models"]]) {
       const result = await execFileText(cursorBin, args, cursorDiscoveryEnv());
-      listed = parseCursorModelList(result.text);
+      listed = parseCursorModelList(result.stdout);
       if (listed.length) break;
     }
     const models = listed.length ? mergeRuntimeCursorModels(cursorCatalogEntries(CURSOR_FALLBACK_MODELS), listed) : null;

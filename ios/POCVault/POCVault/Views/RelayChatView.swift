@@ -9,6 +9,15 @@ private enum RelayChatStyle {
     static let labelFont = Font.custom("DMSans-9ptRegular", size: 13, relativeTo: .subheadline)
 }
 
+private extension View {
+    func relayHiddenListRow() -> some View {
+        self
+            .listRowSeparator(.hidden)
+            .listSectionSeparator(.hidden)
+            .listRowBackground(AppTheme.bgCanvas)
+    }
+}
+
 struct RelayChatView: View {
     @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var viewModel: RelayChatViewModel
@@ -1023,7 +1032,10 @@ private struct RelayComposer: View {
                     }
                 }
             }
+            .listStyle(.plain)
             .scrollContentBackground(.hidden)
+            .listRowSeparator(.hidden)
+            .listSectionSeparator(.hidden)
             .background(AppTheme.bgCanvas)
             .navigationTitle("Run settings")
             .navigationBarTitleDisplayMode(.inline)
@@ -1177,9 +1189,6 @@ private struct RelayComposer: View {
                             } label: {
                                 pickerRow(
                                     title: choice.shortModelLabel,
-                                    detail: choice.isProviderDefault
-                                        ? "Uses \(harness.title)'s configured default model"
-                                        : "Runs this \(harness.title) session with \(choice.shortModelLabel)",
                                     selected: choice == selectedChoice,
                                     provider: choice.executionProvider
                                 )
@@ -1199,7 +1208,6 @@ private struct RelayComposer: View {
                             } label: {
                                 pickerRow(
                                     title: choice.chipLabel,
-                                    detail: "Conversation",
                                     selected: choice == selectedChoice,
                                     provider: choice.executionProvider
                                 )
@@ -1250,6 +1258,7 @@ private struct RelayComposer: View {
                                     provider: .claude
                                 )
                             }
+                            .relayHiddenListRow()
                         }
                     }
                     Section {
@@ -1270,6 +1279,7 @@ private struct RelayComposer: View {
                                     provider: .codex
                                 )
                             }
+                            .relayHiddenListRow()
                         }
                         if codexSandbox.isUnsandboxed {
                             Text("Codex will not be stopped from changing anything on this machine, including files outside your work.")
@@ -1290,6 +1300,7 @@ private struct RelayComposer: View {
                                     provider: .codex
                                 )
                             }
+                            .relayHiddenListRow()
                         }
                     }
                     Section {
@@ -1299,7 +1310,10 @@ private struct RelayComposer: View {
                     }
                 }
             }
+            .listStyle(.plain)
             .scrollContentBackground(.hidden)
+            .listRowSeparator(.hidden)
+            .listSectionSeparator(.hidden)
             .background(AppTheme.bgCanvas)
             .navigationTitle((provider ?? .codex).relayPresentation.permissionsTitle ?? "Permissions")
             .toolbar {
@@ -1340,6 +1354,7 @@ private struct RelayComposer: View {
                                 provider: skill.provider
                             )
                         }
+                        .relayHiddenListRow()
                     }
                 } header: {
                     RelayProviderBadge(provider: provider ?? .codex, style: .plain, size: 9)
@@ -1347,7 +1362,10 @@ private struct RelayComposer: View {
             }
         }
         .searchable(text: $skillSearch, prompt: "Search installed skills")
+        .listStyle(.plain)
         .scrollContentBackground(.hidden)
+        .listRowSeparator(.hidden)
+        .listSectionSeparator(.hidden)
         .background(AppTheme.bgCanvas)
         .navigationTitle((provider ?? .codex).relayPresentation.skillsTitle)
         .toolbar {
@@ -1372,11 +1390,11 @@ private struct RelayComposer: View {
 
     private func pickerRow(
         title: String,
-        detail: String,
+        detail: String? = nil,
         selected: Bool,
         provider: CodexProvider? = nil
     ) -> some View {
-        HStack(alignment: .top, spacing: 12) {
+        HStack(alignment: .center, spacing: 12) {
             if let provider {
                 RelayProviderMark(provider: provider, size: 16)
                     .frame(width: 30, height: 30)
@@ -1384,12 +1402,14 @@ private struct RelayComposer: View {
             }
             VStack(alignment: .leading, spacing: 4) {
                 Text(title)
-                    .font(AppTheme.uiFont(size: 15, weight: .semibold))
+                    .font(AppTheme.uiFont(size: 16, weight: .medium))
                     .foregroundStyle(AppTheme.textPrimary)
-                Text(detail)
-                    .font(AppTheme.uiFont(size: 12))
-                    .foregroundStyle(AppTheme.textSecondary)
-                    .multilineTextAlignment(.leading)
+                if let detail, !detail.isEmpty {
+                    Text(detail)
+                        .font(AppTheme.uiFont(size: 12))
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .multilineTextAlignment(.leading)
+                }
             }
             Spacer()
             if selected {
@@ -2540,47 +2560,48 @@ private struct RelayThreadDrawer: View {
 
     var body: some View {
         NavigationStack {
-            List {
-                Section {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
                     Button {
                         viewModel.startNewConversation()
                         dismiss()
                     } label: {
                         Label("New conversation", systemImage: "square.and.pencil")
+                            .font(AppTheme.uiFont(size: 16, weight: .medium))
                             .foregroundStyle(AppTheme.accent)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 20)
+                            .frame(minHeight: 48)
+                            .contentShape(Rectangle())
                     }
-                    .listRowBackground(Color.clear)
-                }
+                    .buttonStyle(.plain)
+                    .padding(.top, 6)
 
-                handoffSection
+                    handoffSection
 
-                if viewModel.historyItems.isEmpty {
-                    Text("No chats in this folder yet.")
-                        .font(AppTheme.uiFont(size: 13))
-                        .foregroundStyle(AppTheme.textTertiary)
-                        .listRowBackground(AppTheme.bgCanvas)
-                }
-
-                // Exact-folder conversations plus invocations that do not have a session yet.
-                Section("This folder") {
-                    ForEach(viewModel.historyItems) { item in
-                        historyRow(item)
-                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                                if case .thread(let thread) = item.source {
-                                    Button(role: .destructive) {
-                                        Task { await viewModel.delete(thread) }
-                                    } label: {
-                                        Label("Delete", systemImage: "trash")
-                                    }
-                                }
-                            }
+                    if viewModel.historyItems.isEmpty {
+                        Text("No chats in this folder yet.")
+                            .font(AppTheme.uiFont(size: 13))
+                            .foregroundStyle(AppTheme.textTertiary)
+                            .padding(.horizontal, 20)
+                            .padding(.top, 20)
+                    } else {
+                        Text("This folder")
+                            .font(AppTheme.uiFont(size: 13, weight: .medium))
+                            .foregroundStyle(AppTheme.textPrimary.opacity(0.65))
+                            .padding(.horizontal, 20)
+                            .padding(.top, 22)
+                            .padding(.bottom, 4)
+                            .accessibilityAddTraits(.isHeader)
+                        ForEach(viewModel.historyItems) { item in
+                            historyRow(item)
+                        }
                     }
-                }
 
-                macSessionSection
+                    macSessionSection
+                }
+                .padding(.bottom, 28)
             }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
             .background(AppTheme.bgCanvas)
             .navigationTitle("Threads")
             .toolbar {
@@ -2601,26 +2622,30 @@ private struct RelayThreadDrawer: View {
     /// handoff is the thing the user was just pushed about.
     @ViewBuilder private var handoffSection: some View {
         if !viewModel.handoffs.isEmpty {
-            Section {
-                ForEach(viewModel.handoffs) { card in
-                    RelayHandoffCardView(
-                        card: card,
-                        manifest: viewModel.handoffManifests[card.id],
-                        isContinuing: viewModel.continuingHandoffIDs.contains(card.id),
-                        onContinue: {
-                            onContinueHandoff(card)
-                        }
-                    )
-                    .listRowBackground(Color.clear)
-                    .listRowInsets(EdgeInsets(top: 6, leading: 8, bottom: 6, trailing: 8))
-                }
-            } header: {
-                Text("Continue from your computer")
-            } footer: {
-                Text("These are Codex or Claude Code sessions sent from your linked computer. Continue resumes the same work on your Relay machine.")
-                    .font(AppTheme.uiFont(size: 12))
-                    .foregroundStyle(AppTheme.textFaint)
+            Text("Continue from your computer")
+                .font(AppTheme.uiFont(size: 13, weight: .medium))
+                .foregroundStyle(AppTheme.textPrimary.opacity(0.65))
+                .padding(.horizontal, 20)
+                .padding(.top, 22)
+                .padding(.bottom, 4)
+                .accessibilityAddTraits(.isHeader)
+            ForEach(viewModel.handoffs) { card in
+                RelayHandoffCardView(
+                    card: card,
+                    manifest: viewModel.handoffManifests[card.id],
+                    isContinuing: viewModel.continuingHandoffIDs.contains(card.id),
+                    onContinue: {
+                        onContinueHandoff(card)
+                    }
+                )
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
             }
+            Text("These are Codex or Claude Code sessions sent from your linked computer. Continue resumes the same work on your Relay machine.")
+                .font(AppTheme.uiFont(size: 12))
+                .foregroundStyle(AppTheme.textFaint)
+                .padding(.horizontal, 20)
+                .padding(.top, 4)
         }
     }
 
@@ -2628,29 +2653,33 @@ private struct RelayThreadDrawer: View {
     /// affordances — start fresh here, or run `relay handoff` over there.
     @ViewBuilder private var macSessionSection: some View {
         if let index = viewModel.macSessions, !index.sessions.isEmpty {
-            Section {
-                ForEach(index.sessions) { session in
-                    RelayMacSessionRow(session: session, onStartFresh: {
-                        viewModel.startFresh(from: session)
-                        dismiss()
-                    })
-                    .listRowBackground(Color.clear)
+            HStack(spacing: 8) {
+                Text(index.sectionTitle)
+                Spacer()
+                if let updatedAt = index.updatedAtDate {
+                    Text(RelayRelativeTime.string(for: updatedAt))
+                        .font(AppTheme.monoFont(size: 10))
+                        .foregroundStyle(AppTheme.textFaint)
                 }
-            } header: {
-                HStack(spacing: 8) {
-                    Text(index.sectionTitle)
-                    Spacer()
-                    if let updatedAt = index.updatedAtDate {
-                        Text(RelayRelativeTime.string(for: updatedAt))
-                            .font(AppTheme.monoFont(size: 10))
-                            .foregroundStyle(AppTheme.textFaint)
-                    }
-                }
-            } footer: {
-                Text("Run relay handoff there to continue one of these exactly.")
-                    .font(AppTheme.uiFont(size: 12))
-                    .foregroundStyle(AppTheme.textFaint)
             }
+            .font(AppTheme.uiFont(size: 13, weight: .medium))
+            .foregroundStyle(AppTheme.textPrimary.opacity(0.65))
+            .padding(.horizontal, 20)
+            .padding(.top, 22)
+            .padding(.bottom, 4)
+            .accessibilityAddTraits(.isHeader)
+            ForEach(index.sessions) { session in
+                RelayMacSessionRow(session: session, onStartFresh: {
+                    viewModel.startFresh(from: session)
+                    dismiss()
+                })
+                .padding(.horizontal, 20)
+            }
+            Text("Run relay handoff there to continue one of these exactly.")
+                .font(AppTheme.uiFont(size: 12))
+                .foregroundStyle(AppTheme.textFaint)
+                .padding(.horizontal, 20)
+                .padding(.top, 8)
         }
     }
 
@@ -2662,11 +2691,18 @@ private struct RelayThreadDrawer: View {
             }
         } label: {
             RelayConversationRow(item: item)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 10)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .listRowInsets(EdgeInsets(top: 0, leading: 18, bottom: 0, trailing: 18))
-        .listRowSeparator(.hidden)
-        .listRowBackground(Color.clear)
+        .contextMenu {
+            if case .thread(let thread) = item.source {
+                Button("Delete", role: .destructive) {
+                    Task { await viewModel.delete(thread) }
+                }
+            }
+        }
     }
 
 

@@ -11,7 +11,7 @@ import { host, port, requireMtls, allowedCertSubjects, maxConcurrent, maxBodyByt
 import { isJwtShaped, verifyBrowserGrant, activityScope, scopeCovers } from "./grant.mjs";
 import { sendJson, sendHtml, sendError, readBody, readBinaryBody, headerValue, clampLimit, isSafeJobId } from "./util.mjs";
 import { isThreadSessionId } from "./sessionid.mjs";
-import { workspaces, workspaceList, resolveWorkspaceById, publicWorkspace, workspaceDirectoryResponse, selectWorkspaceDirectory, createWorkspaceDirectory } from "./workspaces.mjs";
+import { workspaces, workspaceList, pickerWorkspaceList, resolveWorkspaceById, publicWorkspace, workspaceDirectoryResponse, selectWorkspaceDirectory, createWorkspaceDirectory } from "./workspaces.mjs";
 import { publicRuntimeModelCatalog } from "./catalog.mjs";
 import { fsListResponse, serveFsFile } from "./fsapi.mjs";
 import { listProviderSkills, publicSkill } from "./skills.mjs";
@@ -267,7 +267,7 @@ async function routeRequest(req, res) {
 
   if (req.method === "GET" && url.pathname === "/v1/codex/workspaces") {
     return sendJson(res, 200, {
-      workspaces: workspaceList().map((workspace) => ({
+      workspaces: pickerWorkspaceList().map((workspace) => ({)
         id: workspace.id,
         name: workspace.name,
         path: workspace.path,

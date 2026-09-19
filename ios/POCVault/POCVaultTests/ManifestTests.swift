@@ -907,6 +907,8 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(groups[1].folders.map(\.title), ["rocketizer", "this is a test"])
         XCTAssertFalse(groups[2].showsHeading)
         XCTAssertEqual(groups[2].folders.map(\.title), ["stuff"])
+        XCTAssertTrue(source.contains("groupedFolders"))
+        XCTAssertTrue(source.contains("item.isNested ? 44 : 20"))
     }
 
     func testSessionsPlusOpensWorkspacePickerRatherThanSwitchingTabs() throws {
@@ -2507,8 +2509,19 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(source.contains("ForEach(visibleSections.agents)"))
         XCTAssertTrue(source.contains("pickerSectionHeading(harness.title)"))
         XCTAssertTrue(source.contains("title: choice.shortModelLabel"))
-        XCTAssertTrue(source.contains("choice.isProviderDefault"))
+        XCTAssertTrue(viewModelSource.contains("isProviderDefault"))
+        XCTAssertFalse(source.contains("Runs this \\(harness.title) session"))
         XCTAssertFalse(source.contains("title: \"\\(harness.title) · \\(choice.shortModelLabel)\""))
+
+        let threads = try sourceSnippet(
+            in: source,
+            from: "private struct RelayThreadDrawer",
+            to: "private struct RelayStatusBanner"
+        )
+        XCTAssertFalse(threads.contains("List {"))
+        XCTAssertFalse(threads.contains(".listStyle(.plain)"))
+        XCTAssertTrue(threads.contains("No chats in this folder yet."))
+        XCTAssertTrue(threads.contains("contextMenu"))
         XCTAssertTrue(source.contains("ForEach(visibleSections.chatModels)"))
         XCTAssertTrue(source.contains("relay-model-chip"))
         XCTAssertTrue(source.contains("relay-effort-chip"))

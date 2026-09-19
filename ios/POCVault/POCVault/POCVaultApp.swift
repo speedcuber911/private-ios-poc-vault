@@ -1051,9 +1051,13 @@ enum RelayFolderPickerLayout {
     }
 
     static func groups(from workspaces: [CodexWorkspace]) -> [Group] {
-        let roots = workspaces.filter { nearestParent(of: $0, in: workspaces) == nil }
+        let roots = workspaces
+            .filter { nearestParent(of: $0, in: workspaces) == nil }
+            .sorted { displayTitle(for: $0, nested: false).localizedCaseInsensitiveCompare(displayTitle(for: $1, nested: false)) == .orderedAscending }
         return roots.map { root in
-            let descendants = workspaces.filter { isDescendant($0, of: root) }
+            let descendants = workspaces
+                .filter { isDescendant($0, of: root) }
+                .sorted { displayTitle(for: $0, nested: true).localizedCaseInsensitiveCompare(displayTitle(for: $1, nested: true)) == .orderedAscending }
             var folders = [Item(workspace: root, title: displayTitle(for: root, nested: false), isNested: false)]
             folders.append(contentsOf: descendants.map {
                 Item(workspace: $0, title: displayTitle(for: $0, nested: true), isNested: true)
@@ -1164,20 +1168,24 @@ private struct SessionsWorkspacePickerSheet: View {
         .preferredColorScheme(.dark)
     }
 
+    private var groupedFolders: [RelayFolderPickerLayout.Group] {
+        RelayFolderPickerLayout.groups(from: workspaces)
+    }
+
     private var folderList: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(RelayFolderPickerLayout.groups(from: workspaces)) { group in
+                ForEach(Array(groupedFolders.enumerated()), id: \.element.id) { index, group in
                     if group.showsHeading {
                         Text(group.title)
                             .font(AppTheme.uiFont(size: 13, weight: .medium))
                             .foregroundStyle(AppTheme.textPrimary.opacity(0.65))
-                            .padding(.horizontal, 18)
-                            .padding(.top, 22)
-                            .padding(.bottom, 4)
+                            .padding(.horizontal, 20)
+                            .padding(.top, 18)
+                            .padding(.bottom, 2)
                             .accessibilityAddTraits(.isHeader)
-                    } else {
-                        Color.clear.frame(height: 12)
+                    } else if index > 0 {
+                        Color.clear.frame(height: 10)
                     }
                     ForEach(group.folders) { item in
                         Button {
@@ -1185,18 +1193,18 @@ private struct SessionsWorkspacePickerSheet: View {
                         } label: {
                             HStack(spacing: 12) {
                                 Image(systemName: "folder")
-                                    .font(.system(size: 16, weight: .medium))
+                                    .font(.system(size: 15, weight: .medium))
                                     .foregroundStyle(AppTheme.accentBright.opacity(0.85))
-                                    .frame(width: 22)
+                                    .frame(width: 20)
                                 Text(item.title)
                                     .font(AppTheme.uiFont(size: 16, weight: .medium))
                                     .foregroundStyle(AppTheme.textPrimary)
                                     .lineLimit(2)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                             }
-                            .padding(.leading, item.isNested ? 32 : 18)
-                            .padding(.trailing, 18)
-                            .frame(minHeight: 48)
+                            .padding(.leading, item.isNested ? 44 : 20)
+                            .padding(.trailing, 20)
+                            .frame(minHeight: 44)
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
