@@ -889,7 +889,10 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
     /// An older relayd answers the route fallback with a generic 404.
     func fetchMachineStats() async throws -> RelayMachineStats? {
         do {
-            let data = try await perform(path: "/v1/machine/stats")
+            let data = try await perform(
+                path: "/v1/machine/stats",
+                cachePolicy: .reloadIgnoringLocalCacheData
+            )
             guard !data.isEmpty else { return nil }
             return try decoder.decode(RelayMachineStats.self, from: data)
         } catch let error as CodexClientError where error.isGenericRouteNotFound {
@@ -1071,7 +1074,8 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         queryItems: [URLQueryItem] = [],
         body: Data? = nil,
         contentType: String = "application/json",
-        additionalHeaders: [String: String] = [:]
+        additionalHeaders: [String: String] = [:],
+        cachePolicy: URLRequest.CachePolicy? = nil
     ) async throws -> Data {
         try await performWithResponse(
             path: path,
@@ -1079,7 +1083,8 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
             queryItems: queryItems,
             body: body,
             contentType: contentType,
-            additionalHeaders: additionalHeaders
+            additionalHeaders: additionalHeaders,
+            cachePolicy: cachePolicy
         ).data
     }
 
@@ -1092,7 +1097,8 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         body: Data? = nil,
         contentType: String = "application/json",
         accept: String = "application/json",
-        additionalHeaders: [String: String] = [:]
+        additionalHeaders: [String: String] = [:],
+        cachePolicy: URLRequest.CachePolicy? = nil
     ) async throws -> (data: Data, response: HTTPURLResponse) {
         let url = endpoint(path: path, queryItems: queryItems)
         guard url.scheme != nil, url.host != nil else {
@@ -1110,6 +1116,9 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         applyDeviceToken(to: &request, url: url)
         request.httpMethod = method
         request.timeoutInterval = 45
+        if let cachePolicy {
+            request.cachePolicy = cachePolicy
+        }
         request.setValue(accept, forHTTPHeaderField: "Accept")
         if let body {
             request.httpBody = body

@@ -8,6 +8,27 @@ final class RelayMachineMonitorModel: ObservableObject {
     @Published var isLoading = false
     @Published var unsupported = false
 
+    nonisolated(unsafe) private var pollTask: Task<Void, Never>?
+
+    func start(client: CodexClient) {
+        if let pollTask, !pollTask.isCancelled { return }
+        pollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.refresh(client: client)
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
+    }
+
+    func stop() {
+        pollTask?.cancel()
+        pollTask = nil
+    }
+
+    deinit {
+        pollTask?.cancel()
+    }
+
     func refresh(client: CodexClient) async {
         if stats == nil { isLoading = true }
         defer { isLoading = false }
@@ -91,14 +112,7 @@ struct RelayMachineMonitorView: View {
         .refreshable {
             await model.refresh(client: client)
         }
-        .task {
-            await model.refresh(client: client)
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 15_000_000_000)
-                guard !Task.isCancelled else { return }
-                await model.refresh(client: client)
-            }
-        }
+        .onAppear { model.start(client: client) }
         .preferredColorScheme(.dark)
     }
 
@@ -178,6 +192,7 @@ struct RelayMachineMonitorView: View {
             warn: !stats.firingAlerts.isEmpty,
             name: stats.host.hostname ?? machineName,
             uptime: RelayMachineStats.uptimeText(stats.host.uptimeSec),
+            updated: stats.lastUpdatedText,
             info: Self.usageInfo
         )
     }
@@ -193,6 +208,7 @@ struct RelayMachineMonitorView: View {
         warn: Bool,
         name: String? = nil,
         uptime: String? = nil,
+        updated: String? = nil,
         info: String
     ) -> some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -203,10 +219,11 @@ struct RelayMachineMonitorView: View {
                     size: 10
                 )
                 Spacer()
-                if let uptime {
-                    Text(uptime)
+                if let updated {
+                    Text(updated)
                         .font(AppTheme.monoFont(size: 12))
                         .foregroundStyle(AppTheme.textTertiary)
+                        .monospacedDigit()
                 }
             }
             HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -215,7 +232,7 @@ struct RelayMachineMonitorView: View {
                     .foregroundStyle(AppTheme.textPrimary)
                 RelayInfoButton(title: "Usage", message: info)
             }
-            Text("This machine")
+            Text(uptime.map { "This machine · up \($0)" } ?? "This machine")
                 .font(AppTheme.uiFont(size: 14))
                 .foregroundStyle(AppTheme.textSecondary)
         }
@@ -247,7 +264,7 @@ struct RelayMachineMonitorView: View {
                 detail: detail,
                 emphasize: firing
             )
-            usageChart(points: points, yDomain: 0...100, firing: firing, rateAxis: false)
+            usageChart(points: points, yDomain: 0...100, firing: firing, rateAxis: false, sampledAt: model.stats?.sampledAt)
         }
     }
 
@@ -269,7 +286,7 @@ struct RelayMachineMonitorView: View {
                 detail: "\(outboundTitle) \(RelayMachineStats.rateText(outbound)) · \(model.stats?.historyWindowLabel ?? "Recent")",
                 emphasize: false
             )
-            usageChart(points: points, yDomain: 0...peak, firing: false, dualSeries: true, rateAxis: true)
+            usageChart(points: points, yDomain: 0...peak, firing: false, dualSeries: true, rateAxis: true, sampledAt: model.stats?.sampledAt)
         }
     }
 
@@ -297,9 +314,13 @@ struct RelayMachineMonitorView: View {
         yDomain: ClosedRange<Double>,
         firing: Bool,
         dualSeries: Bool = false,
-        rateAxis: Bool = false
+        rateAxis: Bool = false,
+        sampledAt: String? = nil
     ) -> some View {
-        Chart(points) { point in
+        let span = points.count >= 2
+            ? points[points.count - 1].date.timeIntervalSince(points[0].date)
+            : 0
+        return Chart(points) { point in
             if !dualSeries {
                 AreaMark(
                     x: .value("Time", point.date),
@@ -320,9 +341,15 @@ struct RelayMachineMonitorView: View {
         .chartXAxis {
             AxisMarks(values: .automatic(desiredCount: 3)) { _ in
                 AxisGridLine().foregroundStyle(AppTheme.hairline)
-                AxisValueLabel(format: .dateTime.hour().minute())
-                    .foregroundStyle(AppTheme.textFaint)
-                    .font(AppTheme.uiFont(size: 10))
+                if span < 180 {
+                    AxisValueLabel(format: .dateTime.minute().second())
+                        .foregroundStyle(AppTheme.textFaint)
+                        .font(AppTheme.uiFont(size: 10))
+                } else {
+                    AxisValueLabel(format: .dateTime.hour().minute())
+                        .foregroundStyle(AppTheme.textFaint)
+                        .font(AppTheme.uiFont(size: 10))
+                }
             }
         }
         .chartYAxis {
@@ -347,6 +374,7 @@ struct RelayMachineMonitorView: View {
             plot.background(AppTheme.textPrimary.opacity(0.03))
         }
         .frame(height: 104)
+        .id(sampledAt ?? "\(points.count)-\(points.last?.value ?? 0)")
         .accessibilityHidden(true)
     }
 
@@ -412,7 +440,7 @@ struct RelayMachineMonitorView: View {
             guard let value = sample[keyPath: keyPath],
                   let date = RelayMachineStats.parseDate(sample.ts)
             else { continue }
-            result.append(RelayUsagePoint(id: "\(series)-\(index)", date: date, value: value, series: series))
+            result.append(RelayUsagePoint(id: "\(series)-\(sample.ts ?? "\(index)")", date: date, value: value, series: series))
         }
         if result.isEmpty, let current {
             let now = Date()

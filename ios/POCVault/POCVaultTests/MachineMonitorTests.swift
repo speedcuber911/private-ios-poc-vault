@@ -57,12 +57,18 @@ final class MachineMonitorTests: XCTestCase {
         XCTAssertEqual(RelayMachineStats.uptimeText(90_000), "1d 1h")
         XCTAssertEqual(RelayMachineStats.percentText(12.4), "12%")
         XCTAssertEqual(RelayMachineStats.rateText(1200), "1.2 KB/s")
+        XCTAssertNotNil(stats.lastUpdatedText)
+        XCTAssertNotNil(RelayMachineStats.parseDate("2026-09-19T14:38:01.234Z"))
+        XCTAssertNotNil(RelayMachineStats.parseDate("2026-09-19T14:38:01Z"))
     }
 
     func testUsageExplainersLiveOnTheInfoControl() throws {
         let source = try AppSourceFixture.load("POCVault/Views/RelayMachineMonitorView.swift")
         XCTAssertTrue(source.contains("RelayInfoButton"))
         XCTAssertTrue(source.contains("unsupportedInfo"))
+        XCTAssertTrue(source.contains("model.start(client: client)"))
+        XCTAssertTrue(source.contains(".seconds(5)"))
+        XCTAssertFalse(source.contains("15_000_000_000"))
         XCTAssertFalse(source.contains("placeholder("))
     }
 

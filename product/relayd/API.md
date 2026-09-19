@@ -910,8 +910,11 @@ with job streams.
 ### 2.2a `GET /v1/machine/stats` — host usage
 
 Authenticated snapshot of the machine `relayd` is running on. The phone
-reads this directly; the control plane never sees the numbers. Sampled
-on a 15 s interval (override `RELAYD_HOST_SAMPLE_MS`).
+reads this directly; the control plane never sees the numbers. The
+daemon samples on a 15 s interval (override `RELAYD_HOST_SAMPLE_MS`).
+`GET` also takes a fresh reading when the last one is older than 5 s
+(override `RELAYD_HOST_FRESH_MS`), so a phone that is sitting on Usage
+does not stay pinned to the first snapshot if the interval hiccups.
 
 ```json
 {
@@ -938,7 +941,8 @@ on a 15 s interval (override `RELAYD_HOST_SAMPLE_MS`).
 }
 ```
 
-History is the last hour of 15 s samples (override `RELAYD_HOST_HISTORY`).
+History is about an hour of samples (override `RELAYD_HOST_HISTORY`;
+default 720, enough for 5 s readings).
 Network and disk I/O rates are Linux `/proc` counters; other platforms
 leave those fields null.
 

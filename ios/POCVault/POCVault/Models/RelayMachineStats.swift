@@ -136,6 +136,11 @@ struct RelayMachineStats: Decodable, Equatable {
         return parts.isEmpty ? "Usage" : parts.joined(separator: " · ")
     }
 
+    var lastUpdatedText: String? {
+        guard let date = Self.parseDate(sampledAt) else { return nil }
+        return date.formatted(Date.FormatStyle().hour().minute().second())
+    }
+
     var historyWindowLabel: String {
         guard
             let first = history.compactMap({ Self.parseDate($0.ts) }).first,
@@ -161,8 +166,10 @@ struct RelayMachineStats: Decodable, Equatable {
 
     static func parseDate(_ value: String?) -> Date? {
         guard let value, !value.isEmpty else { return nil }
+        if let date = try? Date(value, strategy: .iso8601) { return date }
         if let date = fractionalISO.date(from: value) { return date }
-        return plainISO.date(from: value)
+        if let date = plainISO.date(from: value) { return date }
+        return fallbackISO.date(from: value)
     }
 
     static func percentText(_ value: Double) -> String {
@@ -179,12 +186,22 @@ struct RelayMachineStats: Decodable, Equatable {
     private static let fractionalISO: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
         return formatter
     }()
 
     private static let plainISO: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        return formatter
+    }()
+
+    private static let fallbackISO: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSXXXXX"
         return formatter
     }()
 

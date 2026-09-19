@@ -111,6 +111,43 @@ test("monitor posts node.pressure once CPU stays high", () => {
   assert.ok(snap.history.length >= 3);
 });
 
+test("snapshot takes a new reading when the last one is stale", () => {
+  let t = 1_000;
+  let cpu = 10;
+  const monitor = createHostMonitor({
+    now: () => t,
+    sampleMs: 15_000,
+    freshMs: 5_000,
+    collect: () => ({
+      cpuTimes: { idle: 1, total: 2 },
+      cpuPercent: cpu++,
+      cpuCount: 2,
+      memory: { usedBytes: 20, totalBytes: 100, availableBytes: 80 },
+      disk: { usedBytes: 30, totalBytes: 100, freeBytes: 70, path: "/" },
+      load1: 0.2,
+      load5: 0.2,
+      load15: 0.2,
+      uptimeSec: 10,
+      hostname: "box-1",
+      platform: "linux",
+      arch: "x64",
+    }),
+    setIntervalFn: () => ({ unref() {} }),
+    clearIntervalFn: () => {},
+  });
+  const first = monitor.snapshot();
+  const again = monitor.snapshot();
+  t += 5_000;
+  const second = monitor.snapshot();
+  monitor.stop();
+
+  assert.equal(again.sampledAt, first.sampledAt);
+  assert.equal(again.history.length, first.history.length);
+  assert.notEqual(second.sampledAt, first.sampledAt);
+  assert.ok(second.history.length > first.history.length);
+  assert.notEqual(second.cpu.usedPercent, first.cpu.usedPercent);
+});
+
 test("proc parsers skip loopback, virtual nics, and partition disks", () => {
   const net = parseProcNetDev(`
 Inter-|   Receive                                                |  Transmit

@@ -10,8 +10,9 @@ import fs from "node:fs";
 import os from "node:os";
 
 const DEFAULT_SAMPLE_MS = 15_000;
+const DEFAULT_FRESH_MS = 5_000;
 const DEFAULT_HEARTBEAT_MS = 120_000;
-const DEFAULT_HISTORY = 240;
+const DEFAULT_HISTORY = 720;
 const DEFAULT_COOLDOWN_MS = 30 * 60 * 1000;
 const DISK_FREE_FLOOR_BYTES = 1_000_000_000;
 const DISK_FREE_FLOOR_MIN_TOTAL = 2_000_000_000;
@@ -292,6 +293,7 @@ let defaultMonitor = null;
 export function createHostMonitor({
   now = () => Date.now(),
   sampleMs = envInt("RELAYD_HOST_SAMPLE_MS", DEFAULT_SAMPLE_MS, 5_000, 120_000),
+  freshMs = envInt("RELAYD_HOST_FRESH_MS", DEFAULT_FRESH_MS, 2_000, 60_000),
   heartbeatMs = envInt("RELAYD_HOST_HEARTBEAT_MS", DEFAULT_HEARTBEAT_MS, 30_000, 600_000),
   historyLimit = envInt("RELAYD_HOST_HISTORY", DEFAULT_HISTORY, 12, 720),
   cooldownMs = envInt("RELAYD_HOST_ALERT_COOLDOWN_MS", DEFAULT_COOLDOWN_MS, 60_000, 24 * 3600 * 1000),
@@ -334,7 +336,13 @@ export function createHostMonitor({
     if (raw.cpuTimes) prevCpu = raw.cpuTimes;
     if (raw.ioCounters) prevIO = raw.ioCounters;
     prevSampleMs = t;
-    const snapshot = toPublic(raw, sampledAt, jobsReader());
+    let jobs = { active: 0, queued: 0 };
+    try {
+      jobs = jobsReader() || jobs;
+    } catch {
+      /* job counts are decorative; a reader fault must not freeze samples */
+    }
+    const snapshot = toPublic(raw, sampledAt, jobs);
     lastSnapshot = snapshot;
     history.push({
       ts: sampledAt,
@@ -374,7 +382,36 @@ export function createHostMonitor({
   }
 
   function snapshot() {
-    const current = lastSnapshot || sample();
+    const staleAfter = Math.min(Number(freshMs) || DEFAULT_FRESH_MS, sampleMs);
+    const age = prevSampleMs == null ? Infinity : now() - prevSampleMs;
+    if (!lastSnapshot || age >= staleAfter) {
+      try {
+        sample();
+      } catch (error) {
+        console.warn(`[relayd] host sample failed: ${error?.message ?? error}`);
+      }
+    }
+    const current = lastSnapshot;
+    if (!current) {
+      return {
+        ok: false,
+        sampledAt: new Date(now()).toISOString(),
+        host: { hostname: null, platform: null, arch: null, uptimeSec: null },
+        cpu: { usedPercent: null, count: null, load1: null, load5: null, load15: null },
+        memory: { usedPercent: null, usedBytes: null, totalBytes: null, availableBytes: null },
+        disk: { usedPercent: null, usedBytes: null, totalBytes: null, freeBytes: null, path: null },
+        jobs: { active: 0, queued: 0 },
+        network: { rxBytesPerSec: null, txBytesPerSec: null },
+        io: {
+          readBytesPerSec: null,
+          writeBytesPerSec: null,
+          readOpsPerSec: null,
+          writeOpsPerSec: null,
+        },
+        alerts: publicAlerts(),
+        history: [],
+      };
+    }
     return {
       ...current,
       alerts: publicAlerts(),
@@ -390,11 +427,10 @@ export function createHostMonitor({
   const sampleTimer = setIntervalFn(() => {
     try {
       sample();
-    } catch {
-      /* a bad reading must not take the daemon down */
+    } catch (error) {
+      console.warn(`[relayd] host sample failed: ${error?.message ?? error}`);
     }
   }, sampleMs);
-  sampleTimer?.unref?.();
 
   const heartbeatTimer = setIntervalFn(() => {
     if (!cloud?.heartbeat) return;
@@ -420,6 +456,7 @@ export function startHostMonitor(options) {
 
 export {
   DEFAULT_SAMPLE_MS,
+  DEFAULT_FRESH_MS,
   DEFAULT_HEARTBEAT_MS,
   DEFAULT_COOLDOWN_MS,
   METRICS,
