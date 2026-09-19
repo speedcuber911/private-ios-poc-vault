@@ -12,7 +12,8 @@
 #   SIMCTL_CHILD_RELAY_UITEST_FILE=/abs/file     push the read-only file viewer route
 #   SIMCTL_CHILD_RELAY_UITEST_CHAT=1             open the chat cover (for RELAY_UITEST_PATH's
 #                                                folder when set, else the root)
-#   SIMCTL_CHILD_RELAY_UITEST_OPEN=library|status  present the Library cover / Status sheet
+#   SIMCTL_CHILD_RELAY_UITEST_OPEN=library|status|account|usage  select that tab
+#                                                (`usage` also opens the machine Usage sheet)
 #   SIMCTL_CHILD_RELAY_UITEST_CREATE_USERNAME=...  create a local simulator account
 #   SIMCTL_CHILD_RELAY_UITEST_CREATE_EMAIL=...     email for that local account
 #   SIMCTL_CHILD_RELAY_UITEST_CREATE_PASSWORD=...  password for that local account

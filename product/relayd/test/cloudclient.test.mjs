@@ -43,6 +43,30 @@ function freshNode() {
   return { baseDir, nodeId: status.nodeId, publicKey };
 }
 
+test("heartbeat signs POST /v1/node/heartbeat and does not treat it as an event", async () => {
+  const node = freshNode();
+  const cloud = await startFakeCloud((res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, lastSeen: 1 }));
+  });
+  try {
+    const client = createCloudClient({ cloudUrl: cloud.url, baseDir: node.baseDir });
+    const body = await client.heartbeat();
+    assert.deepEqual(body, { ok: true, lastSeen: 1 });
+    const call = cloud.calls[0];
+    assert.equal(call.method, "POST");
+    assert.equal(call.url, "/v1/node/heartbeat");
+    const input = Buffer.from(
+      `${SIGNING_LABEL}\nPOST\n/v1/node/heartbeat\n${node.nodeId}\n${call.headers["x-relay-ts"]}`,
+      "utf8",
+    );
+    const signature = Buffer.from(call.headers["x-relay-signature"], "base64url");
+    assert.ok(crypto.verify(null, input, node.publicKey, signature));
+  } finally {
+    await cloud.close();
+  }
+});
+
 test("pollHandoffs signs the exact method, path, node id, and timestamp", async () => {
   const node = freshNode();
   const cloud = await startFakeCloud((res) => {

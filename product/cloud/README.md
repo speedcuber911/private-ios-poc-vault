@@ -96,14 +96,19 @@ registered pubkey (SPKI PEM or base64 raw 32 bytes accepted at registration).
 Push mapping (asserted in tests):
 
 - `job.needs_input`, `job.completed`, `job.failed`, `handoff.ready`,
-  `handoff.failed`, `credentials.failed` → **mutable** alert push
+  `handoff.failed`, `credentials.failed`, `node.pressure`,
+  `node.unreachable`, `node.recovered` → **mutable** alert push
   (`apns-push-type: alert`, `mutable-content: 1`, categories
   `RELAY_NEEDS_INPUT` / `RELAY_JOB_DONE` / `RELAY_JOB_FAILED` /
   `RELAY_HANDOFF_READY` / `RELAY_HANDOFF_FAILED` /
-  `RELAY_CREDENTIALS_FAILED`).
+  `RELAY_CREDENTIALS_FAILED` / `RELAY_NODE_PRESSURE` /
+  `RELAY_NODE_UNREACHABLE` / `RELAY_NODE_RECOVERED`).
 - `job.state`, `job.silence`, `node.health`, `credentials.installed` →
   **silent** background push (`apns-push-type: background`,
   `content-available: 1`).
+- `POST /v1/node/heartbeat` is a signed presence ping: it updates
+  `last_seen` and does not fan out. Three missed 2-minute heartbeats
+  become `node.unreachable`.
 
 Events are retained 7 days (`EVENT_RETENTION_DAYS`), swept every minute.
 

@@ -385,6 +385,15 @@ struct AccountSettingsView: View {
                     "Account",
                     value: node.registeredAccountID == nil ? "Not connected" : "Connected"
                 )
+                NavigationLink {
+                    RelayMachineMonitorView(
+                        client: codexClient,
+                        machineName: node.nodeName
+                    )
+                } label: {
+                    Text("Usage")
+                }
+                .accessibilityIdentifier("relay-settings-machine-usage")
 
                 if node.registeredAccountID == nil {
                     Button(accountStore.user == nil
@@ -412,6 +421,14 @@ struct AccountSettingsView: View {
             } else if AppConfiguration.hasConfiguredPersonalInstall {
                 LabeledContent("Machine", value: AppConfiguration.codexBaseURL.absoluteString)
                 LabeledContent("Configured by", value: "support/vault-config.json")
+                NavigationLink {
+                    RelayMachineMonitorView(
+                        client: codexClient,
+                        machineName: "Linked computer"
+                    )
+                } label: {
+                    Text("Usage")
+                }
                 Button("Pair a machine") { showingPairing = true }
                     .accessibilityIdentifier("relay-settings-pair")
             } else {
@@ -430,9 +447,9 @@ struct AccountSettingsView: View {
             return "Run `relayd pair` on a computer or server you own and scan the code it prints."
         }
         if node.registeredAccountID == nil {
-            return "This machine is paired directly to this phone and fully usable. It is not connected to a Relay account, so there is no handoff from a laptop and no push notifications — add those whenever you want them."
+            return "This machine is paired directly to this phone and fully usable. Usage is visible here. It is not connected to a Relay account, so there is no handoff from a laptop and no push if the machine is under load or goes quiet — add those whenever you want them."
         }
-        return "Connected to your Relay account, so `relay handoff` from a laptop and push notifications reach this phone."
+        return "Connected to your Relay account, so `relay handoff` from a laptop and usage alerts reach this phone."
     }
 
     private func registerMachine() async {

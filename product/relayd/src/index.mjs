@@ -37,7 +37,9 @@ import {
   codexHome,
   kimiHome,
 } from "./config.mjs";
-import { loadPersistedJobs, processQueue } from "./jobs.mjs";
+import { loadPersistedJobs, processQueue, activeChildren, jobsState } from "./jobs.mjs";
+import { emitEvent } from "./events.mjs";
+import { startHostMonitor } from "./hoststats.mjs";
 import { routeRequest } from "./server.mjs";
 import { sendError } from "./util.mjs";
 import { appendAudit } from "./audit.mjs";
@@ -47,6 +49,14 @@ import { startPairingListener, prunePairingSessions } from "./pairing.mjs";
 
 loadPersistedJobs();
 processQueue();
+
+const hostMonitor = startHostMonitor({
+  emit: emitEvent,
+  jobsReader: () => ({
+    active: activeChildren.size,
+    queued: jobsState.queuedJobIds.length,
+  }),
+});
 
 function handleRequest(req, res) {
   routeRequest(req, res).catch((error) => {
@@ -259,6 +269,10 @@ async function startHandoffPickup() {
         }),
     });
     setJobNotificationHook((type, job) => cloud.postEvent(type, { jobId: job.id }));
+    hostMonitor.setCloud({
+      postEvent: (type) => cloud.postEvent(type),
+      heartbeat: () => cloud.heartbeat(),
+    });
     if (handoffEnabled) {
       startHandoffLoop({ cloud, waitSec: handoffPollWaitSec });
       console.log(`relayd: handoff + credential-sync loop and job notifications started against ${cloudUrl}`);

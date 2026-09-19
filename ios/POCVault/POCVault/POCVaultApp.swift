@@ -37,7 +37,13 @@ struct POCVaultApp: App {
         _nodeStore = StateObject(wrappedValue: nodeStore)
         _chatSessionStore = StateObject(wrappedValue: RelayChatSessionStore(
             client: codexClient,
-            completionNotifier: CodexLocalNotificationService()
+            completionNotifier: {
+#if targetEnvironment(simulator)
+                CodexNoopCompletionNotifier()
+#else
+                CodexLocalNotificationService()
+#endif
+            }()
         ))
         _statusFeedViewModel = StateObject(wrappedValue: StatusFeedViewModel(client: codexClient))
         _accountStore = StateObject(wrappedValue: accountStore)
@@ -198,6 +204,7 @@ struct POCVaultRootView: View {
     @State private var opensThreadsForHandoff = false
     @State private var selectedRootTab = RelayRootTab.sessions
     @State private var showingDiagnostics = false
+    @State private var showingMachineMonitor = false
 
     var body: some View {
         mainTabs
@@ -234,6 +241,16 @@ struct POCVaultRootView: View {
                 nodeStore: nodeStore
             )
         }
+        .sheet(isPresented: $showingMachineMonitor) {
+            NavigationStack {
+                RelayMachineMonitorView(
+                    client: codexClient,
+                    machineName: nodeStore.pairedNode?.nodeName ?? "Machine",
+                    showsDismissButton: true
+                )
+            }
+            .preferredColorScheme(.dark)
+        }
         .task {
             identityStore.importIdentityFromSetupEnvironmentIfNeeded()
         }
@@ -263,6 +280,10 @@ struct POCVaultRootView: View {
                     openChat(folderPath: nil, workspaceID: nil)
                 }
                 opensThreadsForHandoff = true
+            case .machine:
+                pushService.clearPendingRoute()
+                selectedRootTab = .settings
+                showingMachineMonitor = true
             case .job(_, let jobID):
                 pushService.clearPendingRoute()
                 selectedRootTab = .sessions
@@ -553,7 +574,8 @@ struct POCVaultRootView: View {
     /// - RELAY_UITEST_CHAT=1               open the chat cover (for RELAY_UITEST_PATH's
     ///   folder when set, else the root); the existing RELAY_UITEST_MODEL /
     ///   RELAY_UITEST_PROMPT / RELAY_UITEST_TASK_PROMPT auto-drive then takes over.
-    /// - RELAY_UITEST_OPEN=previews|library|status|account select that tab
+    /// - RELAY_UITEST_OPEN=previews|library|status|account|usage select that tab
+    ///   (`usage` also presents the machine Usage sheet)
     private func applyUITestHooks() {
         let env = ProcessInfo.processInfo.environment
         if let folder = env["RELAY_UITEST_PATH"]?.trimmedNonEmpty {
@@ -572,6 +594,9 @@ struct POCVaultRootView: View {
             selectedRootTab = .sessions
         case "account":
             selectedRootTab = .settings
+        case "usage":
+            selectedRootTab = .settings
+            showingMachineMonitor = true
         default:
             break
         }

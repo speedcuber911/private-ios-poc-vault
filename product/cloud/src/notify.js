@@ -81,6 +81,9 @@ const MUTABLE_TYPES = new Set([
   // (background sync) — `relay sync-auth` already reported it at the
   // terminal.
   "credentials.failed",
+  "node.pressure",
+  "node.unreachable",
+  "node.recovered",
 ]);
 
 const KNOWN_TYPES = new Set([
@@ -90,11 +93,18 @@ const KNOWN_TYPES = new Set([
   "job.completed",
   "job.failed",
   "node.health",
+  "node.pressure",
+  "node.unreachable",
+  "node.recovered",
   "handoff.ready",
   "handoff.failed",
   "credentials.installed",
   "credentials.failed",
 ]);
+
+// Three missed 2-minute heartbeats. Cloud-generated, so a dead node can
+// still raise a banner — the node cannot post this itself.
+export const UNREACHABLE_AFTER_MS = 6 * 60 * 1000;
 
 const PROTOCOL_VERSION = 1;
 
@@ -496,9 +506,50 @@ export function createNotify({
   function sweep() {
     const cutoff = now() - config.eventRetentionDays * 24 * 3600 * 1000;
     registry.sweepNodeEvents(cutoff);
+    sweepWatchdog();
   }
 
-  return { ingest, sweep, drain, stats: () => ({ ...stats }) };
+  // last_seen is written by ingest and by POST /v1/node/heartbeat. A node
+  // that never heartbeated is skipped. The first observation of an already-
+  // stale last_seen (cloud restart, first sweep after a long clock jump)
+  // records unreachable without pushing, so we do not re-page on every boot.
+  const watchdog = new Map();
+
+  function dispatchLocal(type, node) {
+    const nowMs = now();
+    const kind = MUTABLE_TYPES.has(type) ? "mutable" : "silent";
+    const payload = { nodeId: node.id, jobId: null, type, ts: nowMs, seq: 0 };
+    const devices = registry.listPushDevices(node.accountId);
+    stats.queued += devices.length;
+    track(
+      fanout({
+        devices,
+        kind,
+        category: kind === "mutable" ? categoryFor(type) : undefined,
+        payload,
+        collapseId: apnsCollapseId(node.id, type, kind),
+        banner: kind === "mutable" ? bannerFor(type, { registry, nodeId: node.id, nowMs }) : undefined,
+      }),
+    );
+  }
+
+  function sweepWatchdog() {
+    const nowMs = now();
+    for (const node of registry.adminListNodes()) {
+      if (!Number.isFinite(node.lastSeen)) continue;
+      const stale = nowMs - node.lastSeen >= UNREACHABLE_AFTER_MS;
+      const prior = watchdog.get(node.id);
+      if (stale) {
+        if (prior?.status === "ok") dispatchLocal("node.unreachable", node);
+        watchdog.set(node.id, { status: "unreachable", at: nowMs });
+      } else {
+        if (prior?.status === "unreachable") dispatchLocal("node.recovered", node);
+        watchdog.set(node.id, { status: "ok", at: nowMs });
+      }
+    }
+  }
+
+  return { ingest, sweep, sweepWatchdog, drain, stats: () => ({ ...stats }) };
 }
 
 // ── Banner text ────────────────────────────────────────────────────────────
@@ -621,6 +672,24 @@ function bannerFor(type, { registry, nodeId, nowMs }) {
         body: "Your machine is still unauthenticated — run relay sync-auth again.",
       };
 
+    case "node.pressure":
+      return {
+        title: "Machine is under load",
+        body: "Open Relay to see CPU, memory, and disk.",
+      };
+
+    case "node.unreachable":
+      return {
+        title: "Machine is unreachable",
+        body: "Relay hasn't heard from your computer.",
+      };
+
+    case "node.recovered":
+      return {
+        title: "Machine is back",
+        body: "Your computer is reachable again.",
+      };
+
     default:
       return { title: "Relay", body: "Open Relay to see what changed." };
   }
@@ -640,6 +709,12 @@ function categoryFor(type) {
       return "RELAY_HANDOFF_FAILED";
     case "credentials.failed":
       return "RELAY_CREDENTIALS_FAILED";
+    case "node.pressure":
+      return "RELAY_NODE_PRESSURE";
+    case "node.unreachable":
+      return "RELAY_NODE_UNREACHABLE";
+    case "node.recovered":
+      return "RELAY_NODE_RECOVERED";
     default:
       return "RELAY_EVENT";
   }

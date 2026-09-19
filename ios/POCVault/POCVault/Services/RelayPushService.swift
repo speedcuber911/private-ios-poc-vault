@@ -6,6 +6,7 @@ import UserNotifications
 enum RelayPushRoute: Equatable {
     case handoff(nodeID: String)
     case job(nodeID: String, jobID: String)
+    case machine(nodeID: String)
     case none
 }
 
@@ -56,6 +57,9 @@ final class RelayPushService: NSObject, ObservableObject, UNUserNotificationCent
     /// Ask once, then register with APNs. Declining is a normal outcome: the app
     /// keeps working, it just will not be told when a handoff lands.
     func registerForPushNotifications() {
+#if targetEnvironment(simulator)
+        return
+#endif
         let center = UNUserNotificationCenter.current()
         center.delegate = self
         center.setNotificationCategories([
@@ -165,6 +169,9 @@ final class RelayPushService: NSObject, ObservableObject, UNUserNotificationCent
         if type.hasPrefix("handoff.") { return .handoff(nodeID: nodeID) }
         if type.hasPrefix("job."), let jobID = (relay["jobId"] as? String)?.trimmedNonEmpty {
             return .job(nodeID: nodeID, jobID: jobID)
+        }
+        if type == "node.pressure" || type == "node.unreachable" || type == "node.recovered" {
+            return .machine(nodeID: nodeID)
         }
         return .none
     }

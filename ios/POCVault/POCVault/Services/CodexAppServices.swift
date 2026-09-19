@@ -192,6 +192,12 @@ final class CodexLocalNotificationService: NSObject, CodexCompletionNotifying, U
     func prepareForNotifications() async {
         guard !preparedAuthorization else { return }
         preparedAuthorization = true
+#if targetEnvironment(simulator)
+        // Fixture review and UITEST screenshots must not be blocked by the
+        // system permission alert. Job-completion banners stay a device concern.
+        canSendNotifications = false
+        return
+#endif
 
         let settings = await center.notificationSettings()
         switch settings.authorizationStatus {

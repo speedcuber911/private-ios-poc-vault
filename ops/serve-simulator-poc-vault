@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import math
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -72,6 +73,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/v1/harness":
             self.send_json({"harnesses": simulator_harnesses()})
+            return
+        if path == "/v1/machine/stats":
+            self.send_json(simulator_machine_stats())
             return
         if path.startswith("/v1/codex/"):
             self.serve_codex_fixture(path, query)
@@ -749,6 +753,99 @@ def simulator_mac_session_index() -> dict:
                 "lastActive": "2026-08-13T12:00:00Z",
             }
         ],
+    }
+
+
+def simulator_machine_stats() -> dict:
+    now = datetime.now(timezone.utc)
+    sample_count = 72
+    history = []
+    for index in range(sample_count):
+        sampled = now - timedelta(seconds=15 * (sample_count - 1 - index))
+        wave = 2.0 * math.sin(index / 6.0)
+        if 28 <= index <= 34:
+            cpu_spike = 62.0
+        elif index in (27, 35):
+            cpu_spike = 28.0
+        else:
+            cpu_spike = 0.0
+        if index == 30:
+            net_in = 19_300_000
+            net_out = 4_200_000
+            disk_read = 2_800_000
+            disk_write = 860_000
+        elif 29 <= index <= 32:
+            net_in = 180_000
+            net_out = 42_000
+            disk_read = 120_000
+            disk_write = 48_000
+        else:
+            net_in = 800 + 220 * abs(math.sin(index / 11.0))
+            net_out = 360 + 90 * abs(math.cos(index / 8.0))
+            disk_read = 11_000 + 3_400 * abs(math.sin(index / 7.0))
+            disk_write = 7_200 + 1_800 * abs(math.cos(index / 5.0))
+        cpu = round(16.4 + wave + cpu_spike, 1)
+        memory = round(40.8 + 0.7 * math.sin(index / 9.0), 1)
+        disk = round(66.8 + 0.2 * index / sample_count, 1)
+        history.append(
+            {
+                "ts": sampled.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                "cpuPercent": cpu,
+                "memoryUsedPercent": memory,
+                "diskUsedPercent": disk,
+                "netRxBytesPerSec": int(net_in),
+                "netTxBytesPerSec": int(net_out),
+                "diskReadBytesPerSec": int(disk_read),
+                "diskWriteBytesPerSec": int(disk_write),
+            }
+        )
+    latest = history[-1]
+    return {
+        "ok": True,
+        "sampledAt": latest["ts"],
+        "host": {
+            "hostname": "relay-ec2",
+            "platform": "linux",
+            "arch": "x64",
+            "uptimeSec": 356400,
+        },
+        "cpu": {
+            "usedPercent": latest["cpuPercent"],
+            "count": 4,
+            "load1": 0.42,
+            "load5": 0.38,
+            "load15": 0.31,
+        },
+        "memory": {
+            "usedPercent": latest["memoryUsedPercent"],
+            "usedBytes": 3534225408,
+            "totalBytes": 8589934592,
+            "availableBytes": 5055709184,
+        },
+        "disk": {
+            "usedPercent": latest["diskUsedPercent"],
+            "usedBytes": 57409536000,
+            "totalBytes": 85899345920,
+            "freeBytes": 28489809920,
+            "path": "/",
+        },
+        "jobs": {"active": 1, "queued": 0},
+        "network": {
+            "rxBytesPerSec": latest["netRxBytesPerSec"],
+            "txBytesPerSec": latest["netTxBytesPerSec"],
+        },
+        "io": {
+            "readBytesPerSec": latest["diskReadBytesPerSec"],
+            "writeBytesPerSec": latest["diskWriteBytesPerSec"],
+            "readOpsPerSec": 3,
+            "writeOpsPerSec": 1,
+        },
+        "alerts": [
+            {"kind": "cpu", "state": "ok"},
+            {"kind": "memory", "state": "ok"},
+            {"kind": "disk", "state": "ok"},
+        ],
+        "history": history,
     }
 
 

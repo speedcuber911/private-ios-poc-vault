@@ -556,7 +556,18 @@ export function createApp({
       return sendJson(res, 202, { ok: true });
     }
 
-    // ── node event ingest (signature-authed) ────────────────────────────
+    // ── node heartbeat + event ingest (signature-authed) ────────────────
+    // Signed presence ping. Updates last_seen only — no event row, no APNs.
+    // The watchdog in notify.sweepWatchdog uses that timestamp to page
+    // `node.unreachable` when a registered machine goes quiet.
+    if (method === "POST" && path === "/v1/node/heartbeat") {
+      const pathWithQuery = `${path}${url.search}`;
+      const verified = verifyNodeRequest(req, pathWithQuery, { registry, now, replayGuard: handoffReplayGuard });
+      if (verified.error) return sendJson(res, 401, { error: "unauthorized" });
+      registry.touchNode(verified.node.id);
+      return sendJson(res, 200, { ok: true, lastSeen: now() });
+    }
+
     if (method === "POST" && path === "/v1/node-events") {
       const raw = await readRaw(req, config.nodeEventMaxBytes);
       if (raw === null) return sendJson(res, 413, { error: "body_too_large" });

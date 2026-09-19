@@ -898,6 +898,7 @@ same bus feeds cloud push fanout with minimal payloads).
 | `job.needs_input` | needs-input payload (§2.7) |
 | `job.silence` | `{"id","workspaceId","silentForMs"}` — long-running job with no output (threshold server-configured) |
 | `node.health` | `healthPayload` (§1.5) + `{"diskFreeBytes": n}` |
+| `node.pressure` | `{"kinds": ["cpu"|"memory"|"disk", ...]}` — sustained host pressure |
 | `device.paired` / `device.revoked` | public device record (§2.4) |
 | `pairing.rejected` | `{"sessionId","slot","reason"}` — a pairing blob failed its MAC check; no certificate was issued (§2.3) |
 | `harness.changed` | harness status record (§2.5) |
@@ -905,6 +906,46 @@ same bus feeds cloud push fanout with minimal payloads).
 
 Errors: 400 `since must be a non-negative integer`; 503 stream cap shared
 with job streams.
+
+### 2.2a `GET /v1/machine/stats` — host usage
+
+Authenticated snapshot of the machine `relayd` is running on. The phone
+reads this directly; the control plane never sees the numbers. Sampled
+on a 15 s interval (override `RELAYD_HOST_SAMPLE_MS`).
+
+```json
+{
+  "ok": true,
+  "sampledAt": "2026-09-19T10:00:00.000Z",
+  "host": { "hostname": "box-1", "platform": "linux", "arch": "x64", "uptimeSec": 86400 },
+  "cpu": { "usedPercent": 12.4, "count": 4, "load1": 0.3, "load5": 0.4, "load15": 0.5 },
+  "memory": { "usedPercent": 41.2, "usedBytes": 1, "totalBytes": 2, "availableBytes": 1 },
+  "disk": { "usedPercent": 67.0, "usedBytes": 1, "totalBytes": 2, "freeBytes": 1, "path": "/" },
+  "jobs": { "active": 0, "queued": 0 },
+  "network": { "rxBytesPerSec": 1200, "txBytesPerSec": 300 },
+  "io": { "readBytesPerSec": 4096, "writeBytesPerSec": 512, "readOpsPerSec": 2, "writeOpsPerSec": 1 },
+  "alerts": [{ "kind": "cpu", "state": "ok" }],
+  "history": [{
+    "ts": "…Z",
+    "cpuPercent": 12.4,
+    "memoryUsedPercent": 41.2,
+    "diskUsedPercent": 67.0,
+    "netRxBytesPerSec": 1200,
+    "netTxBytesPerSec": 300,
+    "diskReadBytesPerSec": 4096,
+    "diskWriteBytesPerSec": 512
+  }]
+}
+```
+
+History is the last hour of 15 s samples (override `RELAYD_HOST_HISTORY`).
+Network and disk I/O rates are Linux `/proc` counters; other platforms
+leave those fields null.
+
+Sustained CPU/memory ≥ 90% or disk ≥ 90% / under 1 GB free posts
+`node.pressure` (content-free) to the control plane when the node is
+registered. A 2-minute `POST /v1/node/heartbeat` keeps `last_seen`
+fresh so the cloud can page `node.unreachable` if the machine goes quiet.
 
 ### 2.3 Pairing — protocol v2
 

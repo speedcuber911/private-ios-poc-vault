@@ -885,6 +885,18 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         return try decoder.decode(RelayMacSessionEnvelope.self, from: data).index
     }
 
+    /// Host usage on the paired machine (`GET /v1/machine/stats`).
+    /// An older relayd answers the route fallback with a generic 404.
+    func fetchMachineStats() async throws -> RelayMachineStats? {
+        do {
+            let data = try await perform(path: "/v1/machine/stats")
+            guard !data.isEmpty else { return nil }
+            return try decoder.decode(RelayMachineStats.self, from: data)
+        } catch let error as CodexClientError where error.isGenericRouteNotFound {
+            return nil
+        }
+    }
+
     func transcribeAudio(fileURL: URL) async throws -> CodexTranscriptionResponse {
         let data = try Data(contentsOf: fileURL)
         return try await transcribeAudio(

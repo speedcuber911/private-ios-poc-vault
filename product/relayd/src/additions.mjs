@@ -16,9 +16,15 @@ import { store, isInvalidRecordIdError } from "./store.mjs";
 import { toJobResponse, responseShape } from "./jobs.mjs";
 import { readMacSessions } from "./syncauth.mjs";
 import { dataDir } from "./config.mjs";
+import { getHostMonitor } from "./hoststats.mjs";
 
 // Returns true when the request was handled.
 async function handleAdditionRoutes(req, res, url, auth) {
+  if (req.method === "GET" && url.pathname === "/v1/machine/stats") {
+    sendJson(res, 200, getHostMonitor().snapshot());
+    return true;
+  }
+
   if (req.method === "GET" && url.pathname === "/v1/events") {
     streamNodeEvents(req, res, url);
     return true;

@@ -357,6 +357,14 @@ final class HandoffTests: XCTestCase {
             RelayPushRoute.none
         )
         XCTAssertEqual(
+            RelayPushService.route(from: ["relay": ["nodeId": "node-1", "type": "node.pressure"]]),
+            .machine(nodeID: "node-1")
+        )
+        XCTAssertEqual(
+            RelayPushService.route(from: ["relay": ["nodeId": "node-1", "type": "node.unreachable"]]),
+            .machine(nodeID: "node-1")
+        )
+        XCTAssertEqual(
             RelayPushService.route(from: ["relay": ["nodeId": "node-1", "type": "job.completed"]]),
             RelayPushRoute.none,
             "a job push with no job id has nowhere to go"

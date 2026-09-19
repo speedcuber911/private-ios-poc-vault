@@ -428,7 +428,21 @@ function createCloudClient({
     return result;
   }
 
-  return { nodeId, pollHandoffs, postEvent, reportHandoffFailure, reportHandoffReady };
+  async function heartbeat() {
+    const pathWithQuery = "/v1/node/heartbeat";
+    const res = await fetchImpl(`${base}${pathWithQuery}`, {
+      method: "POST",
+      headers: {
+        ...signedHeaders("POST", pathWithQuery),
+        "content-type": "application/json",
+      },
+      body: "{}",
+    });
+    if (res.status !== 200) throw new Error(`cloud_heartbeat_${res.status}`);
+    return res.json().catch(() => ({ ok: true }));
+  }
+
+  return { nodeId, pollHandoffs, postEvent, heartbeat, reportHandoffFailure, reportHandoffReady };
 }
 
 export { createCloudClient, nodeRequestSigningInput, mapFailureReason };

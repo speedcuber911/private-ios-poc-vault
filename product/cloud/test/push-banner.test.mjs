@@ -162,6 +162,9 @@ test("no banner is ever a loc-key or the string RELAY_EVENT", async () => {
     ["job.completed", 4],
     ["job.failed", 5],
     ["credentials.failed", 6],
+    ["node.pressure", 7],
+    ["node.unreachable", 8],
+    ["node.recovered", 9],
   ];
   const { t, identity } = await setup();
   try {
