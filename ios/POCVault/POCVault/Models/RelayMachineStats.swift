@@ -165,7 +165,7 @@ struct RelayMachineStats: Decodable, Equatable {
     }
 
     /// Applies an incremental SSE sample without making the daemon resend or
-    /// the phone re-decode the complete chart history every five seconds.
+    /// the phone re-decode the complete chart history for every live sample.
     func mergingLiveSample(_ next: RelayMachineStats, historyLimit: Int = 720) -> RelayMachineStats {
         var mergedHistory = history
         for sample in next.history {

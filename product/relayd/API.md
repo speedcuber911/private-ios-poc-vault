@@ -912,7 +912,7 @@ with job streams.
 Authenticated snapshot of the machine `relayd` is running on. The phone
 reads this directly; the control plane never sees the numbers. The
 daemon samples on a 15 s interval (override `RELAYD_HOST_SAMPLE_MS`).
-`GET` also takes a fresh reading when the last one is older than 5 s
+`GET` also takes a fresh reading when the last one is older than 2 s
 (override `RELAYD_HOST_FRESH_MS`), so a phone that is sitting on Usage
 does not stay pinned to the first snapshot if the interval hiccups.
 
@@ -941,8 +941,8 @@ does not stay pinned to the first snapshot if the interval hiccups.
 }
 ```
 
-History is about an hour of samples (override `RELAYD_HOST_HISTORY`;
-default 720, enough for 5 s readings).
+History is bounded (override `RELAYD_HOST_HISTORY`; default 720, about
+24 minutes at the live 2 s cadence and longer at the background cadence).
 Network and disk I/O rates are Linux `/proc` counters; other platforms
 leave those fields null.
 
@@ -955,7 +955,7 @@ contains the current fields plus only the newest history point, keeping stream
 bandwidth and phone-side JSON/chart work constant over time. A comment
 heartbeat is sent when there is no newer sample.
 
-The stream samples at the freshness cadence (5 s by default), closes when the
+The stream samples at the freshness cadence (2 s by default), closes when the
 screen leaves, and shares the existing bounded SSE slot pool with job and node
 event streams. Errors: 503 `too many concurrent job streams`.
 

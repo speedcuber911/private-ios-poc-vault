@@ -119,7 +119,7 @@ test("snapshot takes a new reading when the last one is stale", () => {
   const monitor = createHostMonitor({
     now: () => t,
     sampleMs: 15_000,
-    freshMs: 5_000,
+    freshMs: 2_000,
     collect: () => ({
       cpuTimes: { idle: 1, total: 2 },
       cpuPercent: cpu++,
@@ -156,7 +156,7 @@ test("live stream sends full history once, incremental samples, and stops on clo
   const monitor = createHostMonitor({
     now: () => t,
     sampleMs: 15_000,
-    freshMs: 5_000,
+    freshMs: 2_000,
     collect: () => ({
       cpuTimes: { idle: cpu, total: cpu * 2 },
       cpuPercent: cpu++,
@@ -191,7 +191,7 @@ test("live stream sends full history once, incremental samples, and stops on clo
     monitor,
     onClose: () => { closed += 1; },
     setIntervalFn: (callback, delay) => {
-      assert.equal(delay, 5_000);
+      assert.equal(delay, 2_000);
       tick = callback;
       return { unref() {} };
     },
@@ -201,7 +201,7 @@ test("live stream sends full history once, incremental samples, and stops on clo
   assert.match(writes.join(""), /event: snapshot/);
   assert.equal(JSON.parse(writes[0].match(/data: (.*)\n\n/s)[1]).history.length, 1);
 
-  t += 5_000;
+  t += 2_000;
   tick();
   assert.match(writes.at(-1), /event: sample/);
   assert.equal(JSON.parse(writes.at(-1).match(/data: (.*)\n\n/s)[1]).history.length, 1);

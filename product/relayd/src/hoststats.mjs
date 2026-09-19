@@ -10,7 +10,7 @@ import fs from "node:fs";
 import os from "node:os";
 
 const DEFAULT_SAMPLE_MS = 15_000;
-const DEFAULT_FRESH_MS = 5_000;
+const DEFAULT_FRESH_MS = 2_000;
 const DEFAULT_HEARTBEAT_MS = 120_000;
 const DEFAULT_HISTORY = 720;
 const DEFAULT_COOLDOWN_MS = 30 * 60 * 1000;
@@ -293,7 +293,7 @@ let defaultMonitor = null;
 export function createHostMonitor({
   now = () => Date.now(),
   sampleMs = envInt("RELAYD_HOST_SAMPLE_MS", DEFAULT_SAMPLE_MS, 5_000, 120_000),
-  freshMs = envInt("RELAYD_HOST_FRESH_MS", DEFAULT_FRESH_MS, 2_000, 60_000),
+  freshMs = envInt("RELAYD_HOST_FRESH_MS", DEFAULT_FRESH_MS, 1_000, 60_000),
   heartbeatMs = envInt("RELAYD_HOST_HEARTBEAT_MS", DEFAULT_HEARTBEAT_MS, 30_000, 600_000),
   historyLimit = envInt("RELAYD_HOST_HISTORY", DEFAULT_HISTORY, 12, 720),
   cooldownMs = envInt("RELAYD_HOST_ALERT_COOLDOWN_MS", DEFAULT_COOLDOWN_MS, 60_000, 24 * 3600 * 1000),
