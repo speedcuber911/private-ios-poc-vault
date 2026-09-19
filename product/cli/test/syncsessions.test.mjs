@@ -210,3 +210,63 @@ test("sync-sessions streams large rollouts in bounded chunks", async () => {
   assert.equal(result.imported, 1);
   assert.deepEqual(chunkOffsets, [0, 4, 8, 12, 16, 20].map((mb) => mb * 1024 * 1024));
 });
+
+test("sync-sessions uploads Claude Code and Cursor transcripts with their harness", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-sync-providers-"));
+  const root = path.join(home, "repo");
+  fs.mkdirSync(root);
+  const claudePath = path.join(home, "claude.jsonl");
+  const cursorPath = path.join(home, "cursor.jsonl");
+  fs.writeFileSync(claudePath, '{"type":"user","message":{"content":"claude"}}\n');
+  fs.writeFileSync(cursorPath, '{"role":"user","message":{"content":[{"type":"text","text":"cursor"}]}}\n');
+  writeDirectConfig({
+    nodeId: "node-1", nodeName: "EC2", apiBaseUrl: "https://relay.example",
+    deviceToken: "d".repeat(64), caPem: "certificate", workspaceMappings: { [root]: "repo" },
+  }, { home });
+  const uploaded = [];
+  const apiRequest = async (_config, endpoint, options = {}) => {
+    if (endpoint === "/v1/codex/workspaces") {
+      return { status: 200, json: { workspaces: [{ id: "repo", name: "Repo", path: "/srv/repo" }] } };
+    }
+    if (endpoint.endsWith("/plan")) {
+      uploaded.push({ plan: options.body.sessions.map((session) => session.harness) });
+      return {
+        status: 200,
+        json: { sessions: options.body.sessions.map((session) => ({ id: session.id, status: "upload" })) },
+      };
+    }
+    uploaded.push({
+      harness: options.body.session.harness,
+      sessionFormat: options.body.session.sessionFormat,
+    });
+    return { status: 201, json: { status: "imported", sessionId: options.body.session.id, workspaceId: "repo" } };
+  };
+  const result = await cmdSyncSessions([], {
+    home, cwd: root, log: () => {}, apiRequest,
+    findGitRootImpl: async () => root,
+    discoverSessionsImpl: () => [
+      {
+        id: "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb",
+        harness: "claude",
+        format: "claude-jsonl",
+        filePath: claudePath,
+        sizeBytes: fs.statSync(claudePath).size,
+        sourceCwd: root,
+        lastActive: "2026-09-19T10:00:00.000Z",
+      },
+      {
+        id: "cccccccc-1111-4222-8333-dddddddddddd",
+        harness: "cursor",
+        format: "cursor-jsonl",
+        filePath: cursorPath,
+        sizeBytes: fs.statSync(cursorPath).size,
+        sourceCwd: root,
+        lastActive: "2026-09-19T11:00:00.000Z",
+      },
+    ],
+  });
+  assert.equal(result.imported, 2);
+  assert.deepEqual(uploaded[0].plan.sort(), ["claude", "cursor"]);
+  assert.deepEqual(uploaded.slice(1).map((entry) => entry.harness).sort(), ["claude", "cursor"]);
+  assert.deepEqual(uploaded.slice(1).map((entry) => entry.sessionFormat).sort(), ["claude-jsonl", "cursor-jsonl"]);
+});

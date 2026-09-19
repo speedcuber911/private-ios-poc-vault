@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
-const { discoverSessions, readSessionBytes, sessionExcerpt, claudeProjectSlug, RESUMABLE_SESSION_ID_RE } =
+const { discoverSessions, readSessionBytes, sessionExcerpt, claudeProjectSlug, cursorWorkspaceHash, RESUMABLE_SESSION_ID_RE } =
   await import("../src/sessions.mjs");
 
 const CWD = "/Users/dev/code/relay";
@@ -598,4 +598,48 @@ test("a wholly synthetic transcript falls back to the generic title", () => {
 
   assert.equal(sessions.length, 1);
   assert.equal(sessions[0].title, "Claude Code session");
+});
+
+function writeCursorChat(home, id, cwd, prompt, mtime) {
+  const sessionDir = path.join(home, ".cursor", "chats", cursorWorkspaceHash(cwd), id);
+  fs.mkdirSync(sessionDir, { recursive: true });
+  fs.writeFileSync(path.join(sessionDir, "meta.json"), `${JSON.stringify({ schemaVersion: 1, cwd })}\n`);
+  const file = path.join(sessionDir, "transcript.jsonl");
+  fs.writeFileSync(file, `${JSON.stringify({
+    role: "user",
+    message: { content: [{ type: "text", text: prompt }] },
+  })}\n`);
+  if (mtime) fs.utimesSync(file, mtime, mtime);
+  return file;
+}
+
+test("cursor chats for this cwd are discovered from meta.json and the transcript", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-sessions-cursor-"));
+  writeCursorChat(home, uuid("cur1"), CWD, "Show Cursor history", new Date("2026-09-19T11:00:00Z"));
+  writeCursorChat(home, uuid("cur2"), "/Users/dev/code/other", "Wrong folder");
+
+  const sessions = discoverSessions({ cwd: CWD, home });
+  assert.equal(sessions.length, 1);
+  assert.equal(sessions[0].harness, "cursor");
+  assert.equal(sessions[0].format, "cursor-jsonl");
+  assert.equal(sessions[0].id, uuid("cur1"));
+  assert.match(sessions[0].title, /Show Cursor history/);
+});
+
+test("cursor IDE agent transcripts for this encoded cwd are discovered", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-sessions-cursor-ide-"));
+  const id = uuid("ide1");
+  const slug = CWD.replace(/^\/+/, "").replace(/\//g, "-");
+  const file = path.join(home, ".cursor", "projects", slug, "agent-transcripts", id, `${id}.jsonl`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify({
+    role: "user",
+    message: { content: [{ type: "text", text: "Continue the folder chats work" }] },
+  })}\n`);
+
+  const sessions = discoverSessions({ cwd: CWD, home });
+  assert.equal(sessions.length, 1);
+  assert.equal(sessions[0].harness, "cursor");
+  assert.equal(sessions[0].id, id);
+  assert.match(sessions[0].title, /Continue the folder chats work/);
 });

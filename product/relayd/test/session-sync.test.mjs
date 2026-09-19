@@ -20,6 +20,7 @@ const {
   planSessionImports, importCodexSession, createSessionUpload,
   appendSessionUpload, completeSessionUpload, syncStatePath,
 } = await import("../src/session-sync.mjs");
+const { claudeProjectSlug, cursorWorkspaceHash } = await import("../src/sessionimport.mjs");
 
 const ID = "11111111-2222-4333-8444-555555555555";
 const SOURCE_CWD = "/Users/dev/code/relay";
@@ -177,6 +178,62 @@ test("direct session sync never overwrites a session continued on the Relay mach
   }, f), (error) => error.status === 409 && error.message === "remote_session_changed");
   assert.match(fs.readFileSync(installed, "utf8"), /remote turn/);
   assert.doesNotMatch(fs.readFileSync(installed, "utf8"), /local turn/);
+});
+
+test("direct session sync imports Claude and Cursor transcripts into native runner homes", () => {
+  const f = fixture();
+  const claudeId = "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb";
+  const cursorId = "cccccccc-1111-4222-8333-dddddddddddd";
+  const claudeBytes = Buffer.from(`${JSON.stringify({
+    type: "user",
+    cwd: SOURCE_CWD,
+    message: { content: "Fix Claude history" },
+  })}\n`, "utf8");
+  const cursorBytes = Buffer.from(`${JSON.stringify({
+    role: "user",
+    message: { content: [{ type: "text", text: "Show Cursor history" }] },
+  })}\n`, "utf8");
+
+  const claude = importCodexSession({
+    v: 1,
+    workspaceId: "repo",
+    sourceCwd: SOURCE_CWD,
+    session: {
+      id: claudeId,
+      harness: "claude",
+      sessionFormat: "claude-jsonl",
+      sha256: crypto.createHash("sha256").update(claudeBytes).digest("hex"),
+      sizeBytes: claudeBytes.length,
+      transcript: claudeBytes.toString("base64"),
+    },
+  }, f);
+  const cursor = importCodexSession({
+    v: 1,
+    workspaceId: "repo",
+    sourceCwd: SOURCE_CWD,
+    session: {
+      id: cursorId,
+      harness: "cursor",
+      sessionFormat: "cursor-jsonl",
+      sha256: crypto.createHash("sha256").update(cursorBytes).digest("hex"),
+      sizeBytes: cursorBytes.length,
+      transcript: cursorBytes.toString("base64"),
+    },
+  }, f);
+  assert.equal(claude.status, "imported");
+  assert.equal(cursor.status, "imported");
+
+  const claudeFile = path.join(f.targetRunHome, ".claude", "projects", claudeProjectSlug(f.workspace.path), `${claudeId}.jsonl`);
+  const cursorFile = path.join(
+    f.targetRunHome, ".cursor", "chats", cursorWorkspaceHash(f.workspace.path), cursorId, "transcript.jsonl",
+  );
+  assert.match(fs.readFileSync(claudeFile, "utf8"), /Fix Claude history/);
+  assert.match(fs.readFileSync(claudeFile, "utf8"), new RegExp(f.workspace.path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(fs.readFileSync(cursorFile, "utf8"), /Show Cursor history/);
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(path.dirname(cursorFile), "meta.json"), "utf8")).cwd,
+    f.workspace.path,
+  );
 });
 
 test("direct session sync rejects transcript identity and cwd mismatches", () => {

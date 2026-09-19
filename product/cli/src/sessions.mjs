@@ -1,9 +1,9 @@
 // Find the local agent sessions that belong to this repository.
 //
 // Claude Code keys its transcripts by a slugified absolute cwd; Codex records
-// the cwd inside the rollout. Cursor keeps no portable session file, so it is
-// absent here by design and the handoff falls back to summary-priming rather
-// than pretending a resume is possible.
+// the cwd inside the rollout. Cursor Agent stores chats under
+// `~/.cursor/chats/<md5(cwd)>/<sessionId>/` (cwd in meta.json) and IDE
+// transcripts under `~/.cursor/projects/<encoded-cwd>/agent-transcripts/`.
 //
 // TWO RULES EVERY DISCOVERY PATH HERE OBEYS, because breaking either one broke
 // the feature outright and neither was checked on both harnesses:
@@ -21,6 +21,7 @@
 //      id outside it is worse than offering nothing: the handoff succeeds, the
 //      transcript is staged, and then Continue is rejected forever. Falling
 //      back to the summary-primed path instead actually works.
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -154,6 +155,7 @@ function messageContentOf(record) {
 
 function roleOf(record) {
   if (record?.type === "user" || record?.type === "assistant") return record.type;
+  if (record?.role === "user" || record?.role === "assistant") return record.role;
   const payload = record?.payload;
   if (payload && typeof payload === "object" && payload.type === "message") {
     return payload.role === "user" || payload.role === "assistant" ? payload.role : null;
@@ -289,6 +291,7 @@ function discoverClaudeSessions({ cwd, home }) {
       format: "claude-jsonl",
       title: titleFrom(records, "Claude Code session"),
       lastActive: stat.mtime.toISOString(),
+      sourceCwd: wantedCwd,
       filePath,
       sizeBytes: stat.size,
     });
@@ -385,8 +388,109 @@ function discoverCodexSessions({ cwd, home }) {
   return found;
 }
 
+function cursorWorkspaceHash(cwd) {
+  return crypto.createHash("md5").update(String(cwd)).digest("hex");
+}
+
+function cursorProjectSlug(cwd) {
+  return String(cwd).replace(/^\/+/, "").replace(/\//g, "-");
+}
+
+function readCursorMeta(sessionDir) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(sessionDir, "meta.json"), "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function cursorTranscriptPath(home, cwd, sessionId, sessionDir) {
+  const nested = [
+    path.join(sessionDir, "transcript.jsonl"),
+    path.join(sessionDir, `${sessionId}.jsonl`),
+    path.join(home, ".cursor", "projects", cursorProjectSlug(cwd), "agent-transcripts", sessionId, `${sessionId}.jsonl`),
+  ];
+  for (const filePath of nested) {
+    const stat = safeStat(filePath);
+    if (stat?.isFile()) return { filePath, stat };
+  }
+  return null;
+}
+
+function discoverCursorSessions({ cwd, home }) {
+  const wantedCwd = normalizeCwd(cwd);
+  const found = new Map();
+  const hashes = new Set([cursorWorkspaceHash(wantedCwd), cursorWorkspaceHash(cwd)]);
+  for (const hash of hashes) {
+    const bucket = path.join(home, ".cursor", "chats", hash);
+    let names = [];
+    try {
+      names = fs.readdirSync(bucket, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of names) {
+      if (found.size >= MAX_SCAN_FILES) break;
+      if (!entry.isDirectory() || !isResumableSessionId(entry.name)) continue;
+      const sessionDir = path.join(bucket, entry.name);
+      const meta = readCursorMeta(sessionDir);
+      const recordedCwd = typeof meta?.cwd === "string" ? meta.cwd : null;
+      if (!recordedCwd || normalizeCwd(recordedCwd) !== wantedCwd) continue;
+      const transcript = cursorTranscriptPath(home, wantedCwd, entry.name, sessionDir);
+      if (!transcript) continue;
+      const records = readJsonLines(transcript.filePath, { limit: 40 });
+      found.set(entry.name, {
+        id: entry.name,
+        harness: "cursor",
+        format: "cursor-jsonl",
+        title: titleFrom(records, "Cursor session"),
+        lastActive: transcript.stat.mtime.toISOString(),
+        sourceCwd: wantedCwd,
+        filePath: transcript.filePath,
+        sizeBytes: transcript.stat.size,
+      });
+    }
+  }
+
+  for (const slug of [cursorProjectSlug(wantedCwd), cursorProjectSlug(cwd)]) {
+    const transcriptsDir = path.join(home, ".cursor", "projects", slug, "agent-transcripts");
+    let names = [];
+    try {
+      names = fs.readdirSync(transcriptsDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of names) {
+      if (found.size >= MAX_SCAN_FILES) break;
+      if (!entry.isDirectory() || !isResumableSessionId(entry.name)) continue;
+      if (found.has(entry.name)) continue;
+      const filePath = path.join(transcriptsDir, entry.name, `${entry.name}.jsonl`);
+      const stat = safeStat(filePath);
+      if (!stat?.isFile()) continue;
+      const records = readJsonLines(filePath, { limit: 40 });
+      found.set(entry.name, {
+        id: entry.name,
+        harness: "cursor",
+        format: "cursor-jsonl",
+        title: titleFrom(records, "Cursor session"),
+        lastActive: stat.mtime.toISOString(),
+        sourceCwd: wantedCwd,
+        filePath,
+        sizeBytes: stat.size,
+      });
+    }
+  }
+
+  return [...found.values()];
+}
+
 function discoverSessions({ cwd, home = os.homedir() } = {}) {
-  const sorted = [...discoverClaudeSessions({ cwd, home }), ...discoverCodexSessions({ cwd, home })]
+  const sorted = [
+    ...discoverClaudeSessions({ cwd, home }),
+    ...discoverCodexSessions({ cwd, home }),
+    ...discoverCursorSessions({ cwd, home }),
+  ]
     .sort((left, right) => right.lastActive.localeCompare(left.lastActive));
   const seen = new Set();
   return sorted.filter((session) => {
@@ -429,6 +533,7 @@ export {
   sessionExcerpt,
   stripSyntheticMarkup,
   claudeProjectSlug,
+  cursorWorkspaceHash,
   isResumableSessionId,
   RESUMABLE_SESSION_ID_RE,
 };

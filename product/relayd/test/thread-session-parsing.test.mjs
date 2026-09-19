@@ -116,6 +116,32 @@ test("synced native titles remain stable ahead of transcript and follow-up promp
   assert.equal(summary.lastPrompt, "Improve iOS chat screen UX");
 });
 
+test("Claude Code and Cursor transcripts yield the same conversation turns as Codex", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-thread-providers-"));
+  const claudeFile = path.join(dir, "claude.jsonl");
+  const cursorFile = path.join(dir, "cursor.jsonl");
+  fs.writeFileSync(claudeFile, `${[
+    { type: "user", cwd: "/repo", timestamp: "2026-09-19T10:00:00.000Z", message: { content: "Fix the Claude session list" } },
+    { type: "assistant", timestamp: "2026-09-19T10:00:01.000Z", message: { content: [{ type: "text", text: "Claude answer" }] } },
+  ].map((line) => JSON.stringify(line)).join("\n")}\n`);
+  fs.writeFileSync(cursorFile, `${[
+    { role: "user", message: { content: [{ type: "text", text: "Show Cursor history" }] } },
+    { role: "assistant", message: { content: [{ type: "text", text: "Cursor answer" }] } },
+  ].map((line) => JSON.stringify(line)).join("\n")}\n`);
+
+  const claude = await readSessionMessages(claudeFile);
+  const cursor = await readSessionMessages(cursorFile);
+  assert.deepEqual(claude.map((entry) => entry.role), ["user", "assistant"]);
+  assert.equal(claude[0].text, "Fix the Claude session list");
+  assert.equal(claude[1].text, "Claude answer");
+  assert.deepEqual(cursor.map((entry) => [entry.role, entry.text]), [
+    ["user", "Show Cursor history"],
+    ["assistant", "Cursor answer"],
+  ]);
+  assert.equal(readSessionSummary(claudeFile).firstUserPrompt, "Fix the Claude session list");
+  assert.equal(readSessionSummary(cursorFile).lastAssistantAnswer, "Cursor answer");
+});
+
 test("pure Codex UI events do not become conversation titles", () => {
   assert.equal(userPromptSummary("<send_user_message_question_reply>{}</send_user_message_question_reply>"), null);
   assert.equal(userPromptSummary("<environment_context><cwd>/repo</cwd></environment_context>"), null);

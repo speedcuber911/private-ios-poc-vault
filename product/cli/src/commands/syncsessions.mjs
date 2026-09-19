@@ -140,7 +140,7 @@ async function cmdSyncSessions(args = [], deps = {}) {
 
   const discoveredById = new Map();
   for (const session of discoverSessionsImpl({ cwd: root, home })) {
-    if (session.harness !== "codex") continue;
+    if (!["codex", "claude", "cursor"].includes(session.harness)) continue;
     const existing = discoveredById.get(session.id);
     if (!existing || String(session.lastActive || "") > String(existing.lastActive || "")) {
       discoveredById.set(session.id, session);
@@ -160,6 +160,8 @@ async function cmdSyncSessions(args = [], deps = {}) {
         session,
         descriptor: {
           id: session.id,
+          harness: session.harness,
+          sessionFormat: session.format,
           title: session.title || null,
           sha256: sha256File(session.filePath),
           sizeBytes: session.sizeBytes,
@@ -218,6 +220,8 @@ async function cmdSyncSessions(args = [], deps = {}) {
           sourceCwd: entry.session.sourceCwd || root,
           session: {
             id: entry.session.id,
+            harness: entry.session.harness,
+            sessionFormat: entry.session.format,
             title: entry.session.title || null,
             createdAt: entry.session.createdAt || entry.session.lastActive,
             updatedAt: entry.session.lastActive,

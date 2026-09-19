@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { codexHome, dataDir, runHome } from "./config.mjs";
-import { importSession, codexRolloutLeafName } from "./sessionimport.mjs";
+import { importSession, claudeProjectSlug, cursorWorkspaceHash, codexRolloutLeafName } from "./sessionimport.mjs";
 import { isResumableSessionId } from "./sessionid.mjs";
 import { findSessionFile } from "./threads.mjs";
 import { browseWorkspaceForPath, resolveWorkspaceById } from "./workspaces.mjs";
@@ -75,6 +75,23 @@ function cleanTitle(value) {
   return title ? title.slice(0, 200) : null;
 }
 
+function cleanSessionHarness(value) {
+  if (value === undefined || value === null || value === "") return "codex";
+  if (typeof value !== "string") fail(400, "session harness is invalid");
+  const harness = value.trim().toLowerCase();
+  if (!["codex", "claude", "cursor"].includes(harness)) fail(400, "session harness is invalid");
+  return harness;
+}
+
+function cleanSessionFormat(value, harness) {
+  const expected = harness === "claude" ? "claude-jsonl" : harness === "cursor" ? "cursor-jsonl" : "codex-rollout";
+  if (value === undefined || value === null || value === "") return expected;
+  if (typeof value !== "string") fail(400, "session format is invalid");
+  const format = value.trim().toLowerCase();
+  if (format !== expected) fail(400, "session format does not match harness");
+  return format;
+}
+
 function cleanDescriptor(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) fail(400, "session descriptor is invalid");
   if (!isResumableSessionId(value.id)) fail(400, "session id is invalid");
@@ -82,8 +99,11 @@ function cleanDescriptor(value) {
   if (!Number.isSafeInteger(value.sizeBytes) || value.sizeBytes < 1 || value.sizeBytes > MAX_SESSION_BYTES) {
     fail(400, "session size is invalid");
   }
+  const harness = cleanSessionHarness(value.harness);
   return {
     id: value.id,
+    harness,
+    sessionFormat: cleanSessionFormat(value.sessionFormat ?? value.format, harness),
     title: cleanTitle(value.title),
     sha256: value.sha256,
     sizeBytes: value.sizeBytes,
@@ -113,24 +133,60 @@ function resolveSyncWorkspace(
   return workspace;
 }
 
-function recordFilePath(record, targetCodexHome) {
+function recordFilePath(record, targetCodexHome, targetRunHome = runHome) {
   if (!record?.fileName || path.basename(record.fileName) !== record.fileName) return null;
+  if (record.harness === "claude") {
+    if (typeof record.projectSlug !== "string" || path.basename(record.projectSlug) !== record.projectSlug) return null;
+    return path.join(targetRunHome, ".claude", "projects", record.projectSlug, record.fileName);
+  }
+  if (record.harness === "cursor") {
+    if (typeof record.workspaceHash !== "string" || !/^[a-f0-9]{32}$/.test(record.workspaceHash)) return null;
+    if (!isResumableSessionId(record.sessionId)) return null;
+    return path.join(targetRunHome, ".cursor", "chats", record.workspaceHash, record.sessionId, record.fileName);
+  }
   return path.join(targetCodexHome, "sessions", record.fileName);
+}
+
+function existingRemoteSession(descriptor, workspace, {
+  targetCodexHome = codexHome,
+  targetRunHome = runHome,
+} = {}) {
+  if (descriptor.harness === "claude") {
+    return fs.existsSync(path.join(
+      targetRunHome,
+      ".claude",
+      "projects",
+      claudeProjectSlug(workspace.path),
+      `${descriptor.id}.jsonl`,
+    ));
+  }
+  if (descriptor.harness === "cursor") {
+    const sessionDir = path.join(
+      targetRunHome,
+      ".cursor",
+      "chats",
+      cursorWorkspaceHash(workspace.path),
+      descriptor.id,
+    );
+    return fs.existsSync(path.join(sessionDir, "transcript.jsonl")) || fs.existsSync(path.join(sessionDir, "meta.json"));
+  }
+  return Boolean(findSessionFile(path.join(targetCodexHome, "sessions"), descriptor.id));
 }
 
 function classifyDescriptor(descriptor, workspace, {
   baseDir = dataDir,
   targetCodexHome = codexHome,
+  targetRunHome = runHome,
   state: suppliedState = null,
 } = {}) {
   const state = suppliedState || readState(baseDir);
   const key = stateKey(workspace.id, descriptor.id);
   const record = state.sessions[key] || null;
   if (!record) {
-    const existing = findSessionFile(path.join(targetCodexHome, "sessions"), descriptor.id);
+    const existing = existingRemoteSession(descriptor, workspace, { targetCodexHome, targetRunHome });
     return { status: existing ? "conflict" : "upload", reason: existing ? "session_already_exists" : null };
   }
-  const filePath = recordFilePath(record, targetCodexHome);
+  const filePath = recordFilePath(record, targetCodexHome, targetRunHome);
   if (!filePath || !fs.existsSync(filePath)) return { status: "conflict", reason: "remote_session_missing" };
   let remoteSha;
   try { remoteSha = sha256File(filePath); } catch { return { status: "conflict", reason: "remote_session_unreadable" }; }
@@ -219,17 +275,26 @@ function importCodexSessionBytes(body, bytes, options = {}) {
   if (!SHA256_RE.test(String(body.session.sha256 || ""))) fail(400, "session sha256 is invalid");
   const sourceSha256 = sha256Bytes(bytes);
   if (sourceSha256 !== body.session.sha256) fail(400, "session sha256 does not match transcript");
-  const meta = codexMeta(bytes);
-  if (meta.id !== sessionId) fail(400, "session id does not match transcript");
-  if (typeof body.sourceCwd !== "string" || body.sourceCwd !== meta.cwd) {
-    fail(400, "sourceCwd does not match transcript");
+  const harness = cleanSessionHarness(body.session.harness);
+  const sessionFormat = cleanSessionFormat(body.session.sessionFormat ?? body.session.format, harness);
+  let sourceCwd = typeof body.sourceCwd === "string" ? body.sourceCwd : null;
+  let createdAtHint = cleanIso(body.session.createdAt);
+  if (harness === "codex") {
+    const meta = codexMeta(bytes);
+    if (meta.id !== sessionId) fail(400, "session id does not match transcript");
+    if (sourceCwd !== meta.cwd) fail(400, "sourceCwd does not match transcript");
+    createdAtHint = createdAtHint || meta.timestamp;
+  } else if (!sourceCwd || sourceCwd.length < 2 || sourceCwd.length > 4096 || /[\0\r\n]/.test(sourceCwd)) {
+    fail(400, "sourceCwd is invalid");
   }
   const descriptor = cleanDescriptor({
     id: sessionId,
+    harness,
+    sessionFormat,
     title: body.session.title,
     sha256: sourceSha256,
     sizeBytes: bytes.length,
-    createdAt: body.session.createdAt || meta.timestamp,
+    createdAt: createdAtHint,
     updatedAt: body.session.updatedAt,
   });
   const classification = classifyDescriptor(descriptor, workspace, options);
@@ -245,16 +310,16 @@ function importCodexSessionBytes(body, bytes, options = {}) {
   const state = readState(baseDir);
   const key = stateKey(workspace.id, sessionId);
   const prior = state.sessions[key] || null;
-  const createdAt = prior?.createdAt || descriptor.createdAt || meta.timestamp || new Date(0).toISOString();
+  const createdAt = prior?.createdAt || descriptor.createdAt || new Date(0).toISOString();
   const importer = options.importSessionImpl || importSession;
   importer({
     manifest: {
-      harness: "codex",
-      sessionFormat: "codex-rollout",
+      harness,
+      sessionFormat,
       sessionId,
-      cwd: meta.cwd,
+      cwd: sourceCwd,
       createdAt,
-      title: descriptor.title || "Synced Codex session",
+      title: descriptor.title || `Synced ${harness} session`,
     },
     sessionBytes: bytes,
     runHome: targetRunHome,
@@ -262,20 +327,29 @@ function importCodexSessionBytes(body, bytes, options = {}) {
     worktreePath: workspace.path,
   });
 
-  const fileName = codexRolloutLeafName(sessionId, createdAt);
-  const installedPath = path.join(targetCodexHome, "sessions", fileName);
-  const installedSha256 = sha256File(installedPath);
-  state.sessions[key] = {
+  const fileName = harness === "codex"
+    ? codexRolloutLeafName(sessionId, createdAt)
+    : harness === "claude"
+      ? `${sessionId}.jsonl`
+      : "transcript.jsonl";
+  const record = {
     workspaceId: workspace.id,
     sessionId,
+    harness,
+    sessionFormat,
     title: descriptor.title,
     sourceSha256,
-    installedSha256,
     fileName,
     createdAt,
     sourceUpdatedAt: descriptor.updatedAt,
     importedAt: new Date().toISOString(),
   };
+  if (harness === "claude") record.projectSlug = claudeProjectSlug(workspace.path);
+  if (harness === "cursor") record.workspaceHash = cursorWorkspaceHash(workspace.path);
+  const installedPath = recordFilePath(record, targetCodexHome, targetRunHome);
+  if (!installedPath || !fs.existsSync(installedPath)) fail(500, "session import did not produce a transcript");
+  record.installedSha256 = sha256File(installedPath);
+  state.sessions[key] = record;
   writeState(state, baseDir);
   return { status: prior ? "updated" : "imported", sessionId, workspaceId: workspace.id };
 }

@@ -511,7 +511,8 @@ continued on the Relay machine. Active sessions also conflict.
 daemon restart; the resolved path must remain inside the configured browse root
 and must derive the supplied workspace id.
 
-**`POST /v1/codex/session-imports`** — imports one planned Codex rollout. The
+**`POST /v1/codex/session-imports`** — imports one planned Codex, Claude Code,
+or Cursor transcript. The
 request carries `workspaceId`, the exact `sourceCwd` recorded by the rollout,
 and a `session` with `id`, timestamps, SHA-256, and a base64 transcript. Inline
 transcripts are capped at 20 MiB; their hash, native session id, and source cwd are
@@ -528,11 +529,14 @@ the declared total size and SHA-256 before entering the same native importer.
 
 **`GET /v1/codex/sessions`** (1471–1476, `listWorkspaceSessions`
 3401–3459) — provider CLI sessions found under the runner's
-`CODEX_HOME/sessions` (`*.jsonl` with a `session_meta` line, 3365–3395)
-merged with in-memory job sessions. Query: `workspaceId` (400 if not
-registered), `provider` (any of `codex|claude|cursor|kimi|azure|bedrock`),
-`limit` (default 50, clamp 1–200; `clampLimit` 1592–1596). Sessions whose
-cwd lies outside every workspace are excluded. 200:
+`CODEX_HOME/sessions` (`*.jsonl` with a `session_meta` line, 3365–3395),
+Claude Code transcripts under `CODEX_RUN_HOME/.claude/projects/<slug>/<id>.jsonl`,
+and Cursor chats under `CODEX_RUN_HOME/.cursor/chats/<md5(cwd)>/<id>/` (plus
+`projects/<encoded-cwd>/agent-transcripts`), merged with in-memory job
+sessions. Query: `workspaceId` (400 if not registered), `provider` (any of
+`codex|claude|cursor|kimi|azure|bedrock`), `limit` (default 50, clamp 1–200;
+`clampLimit` 1592–1596). Sessions whose cwd lies outside every workspace are
+excluded. 200:
 
 ```json
 {"sessions": [{"id": "<uuid>", "provider": "codex",

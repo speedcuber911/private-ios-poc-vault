@@ -119,6 +119,227 @@ function findClaudeSessionMeta(sessionId) {
   return readClaudeSessionMeta(sessionFile);
 }
 
+function cursorWorkspaceHash(cwd) {
+  return crypto.createHash("md5").update(String(cwd)).digest("hex");
+}
+
+function cursorProjectSlug(cwd) {
+  return String(cwd).replace(/^\/+/, "").replace(/\//g, "-");
+}
+
+function readJsonObject(filePath) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function readCursorMeta(sessionDir) {
+  const parsed = readJsonObject(path.join(sessionDir, "meta.json"));
+  const cwd = parsed?.cwd;
+  if (typeof cwd !== "string" || cwd.length === 0 || /[\0\r\n]/.test(cwd)) return null;
+  const createdAtMs = Number(parsed.createdAtMs);
+  return {
+    cwd,
+    provider: "cursor",
+    timestamp: Number.isFinite(createdAtMs) ? new Date(createdAtMs).toISOString() : cleanSessionTimestamp(parsed.timestamp),
+  };
+}
+
+function cursorTranscriptInDir(sessionDir, sessionId) {
+  const candidates = [
+    path.join(sessionDir, "transcript.jsonl"),
+    path.join(sessionDir, `${sessionId}.jsonl`),
+  ];
+  for (const file of candidates) {
+    try {
+      if (fs.statSync(file).isFile()) return file;
+    } catch {
+      // try the next known leaf name
+    }
+  }
+  return null;
+}
+
+function findCursorProjectTranscript(sessionId) {
+  const projectsRoot = path.join(runHome, ".cursor", "projects");
+  let projectNames = [];
+  try {
+    projectNames = fs.readdirSync(projectsRoot, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+
+  let newest = null;
+  let newestMtimeMs = -Infinity;
+  for (const entry of projectNames) {
+    if (!entry.isDirectory()) continue;
+    const file = path.join(projectsRoot, entry.name, "agent-transcripts", sessionId, `${sessionId}.jsonl`);
+    let stat;
+    try {
+      stat = fs.statSync(file);
+    } catch {
+      continue;
+    }
+    if (!stat.isFile()) continue;
+    if (newest === null || stat.mtimeMs > newestMtimeMs) {
+      newest = { file, slug: entry.name, stat };
+      newestMtimeMs = stat.mtimeMs;
+    }
+  }
+  if (!newest) return null;
+
+  let matchedWorkspace = null;
+  for (const workspace of [...workspaces.values(), ...dynamicWorkspaces.values()]) {
+    if (cursorProjectSlug(workspace.path) === newest.slug || cursorProjectSlug(realpathOrResolve(workspace.path)) === newest.slug) {
+      if (!matchedWorkspace || workspace.path.length > matchedWorkspace.path.length) matchedWorkspace = workspace;
+    }
+  }
+  return {
+    id: sessionId,
+    cwd: matchedWorkspace?.path || null,
+    provider: "cursor",
+    timestamp: newest.stat.mtime.toISOString(),
+    file: newest.file,
+    sessionDir: path.dirname(newest.file),
+    updatedAt: newest.stat.mtime.toISOString(),
+    workspace: matchedWorkspace,
+  };
+}
+
+function findCursorSession(sessionId) {
+  if (!isResumableSessionId(sessionId)) return null;
+  const chatsRoot = path.join(runHome, ".cursor", "chats");
+  let buckets = [];
+  try {
+    buckets = fs.readdirSync(chatsRoot, { withFileTypes: true });
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+
+  let newest = null;
+  let newestMtimeMs = -Infinity;
+  for (const bucket of buckets) {
+    if (!bucket.isDirectory() || !/^[a-f0-9]{32}$/.test(bucket.name)) continue;
+    const sessionDir = path.join(chatsRoot, bucket.name, sessionId);
+    let stat;
+    try {
+      stat = fs.statSync(sessionDir);
+    } catch {
+      continue;
+    }
+    if (!stat.isDirectory()) continue;
+    const meta = readCursorMeta(sessionDir);
+    if (!meta) continue;
+    if (newest === null || stat.mtimeMs > newestMtimeMs) {
+      newest = {
+        id: sessionId,
+        ...meta,
+        file: cursorTranscriptInDir(sessionDir, sessionId),
+        sessionDir,
+        updatedAt: stat.mtime.toISOString(),
+      };
+      newestMtimeMs = stat.mtimeMs;
+    }
+  }
+  return newest || findCursorProjectTranscript(sessionId);
+}
+
+function findCursorSessionMeta(sessionId) {
+  const session = findCursorSession(sessionId);
+  if (!session?.cwd) return null;
+  return { cwd: session.cwd, provider: "cursor", timestamp: session.timestamp };
+}
+
+function listCursorSessionsForWorkspace(workspace) {
+  const found = new Map();
+  const chatsRoot = path.join(runHome, ".cursor", "chats");
+  let buckets = [];
+  try {
+    buckets = fs.readdirSync(chatsRoot, { withFileTypes: true });
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  for (const bucket of buckets) {
+    if (!bucket.isDirectory() || !/^[a-f0-9]{32}$/.test(bucket.name)) continue;
+    let names = [];
+    try {
+      names = fs.readdirSync(path.join(chatsRoot, bucket.name), { withFileTypes: true });
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      continue;
+    }
+    for (const entry of names) {
+      if (!entry.isDirectory() || !isResumableSessionId(entry.name)) continue;
+      const sessionDir = path.join(chatsRoot, bucket.name, entry.name);
+      const meta = readCursorMeta(sessionDir);
+      if (!meta) continue;
+      const sessionWorkspace = workspaceForSessionCwd(meta.cwd);
+      if (!sessionWorkspace || sessionWorkspace.id !== workspace.id) continue;
+      let stat;
+      try {
+        stat = fs.statSync(sessionDir);
+      } catch {
+        continue;
+      }
+      found.set(entry.name, {
+        id: entry.name,
+        provider: "cursor",
+        cwd: meta.cwd,
+        timestamp: meta.timestamp,
+        updatedAt: stat.mtime.toISOString(),
+        file: cursorTranscriptInDir(sessionDir, entry.name),
+      });
+    }
+  }
+
+  for (const slug of [cursorProjectSlug(workspace.path), cursorProjectSlug(realpathOrResolve(workspace.path))]) {
+    const transcriptsDir = path.join(runHome, ".cursor", "projects", slug, "agent-transcripts");
+    let names = [];
+    try {
+      names = fs.readdirSync(transcriptsDir, { withFileTypes: true });
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      continue;
+    }
+    for (const entry of names) {
+      if (!entry.isDirectory() || !isResumableSessionId(entry.name)) continue;
+      if (found.has(entry.name)) {
+        if (!found.get(entry.name).file) {
+          const nested = path.join(transcriptsDir, entry.name, `${entry.name}.jsonl`);
+          try {
+            if (fs.statSync(nested).isFile()) found.get(entry.name).file = nested;
+          } catch {
+            // keep the chat metadata even when the nested transcript is missing
+          }
+        }
+        continue;
+      }
+      const file = path.join(transcriptsDir, entry.name, `${entry.name}.jsonl`);
+      let stat;
+      try {
+        stat = fs.statSync(file);
+      } catch {
+        continue;
+      }
+      if (!stat.isFile()) continue;
+      found.set(entry.name, {
+        id: entry.name,
+        provider: "cursor",
+        cwd: workspace.path,
+        timestamp: stat.mtime.toISOString(),
+        updatedAt: stat.mtime.toISOString(),
+        file,
+      });
+    }
+  }
+
+  return [...found.values()];
+}
+
 
 function findThreadResumeMeta(sessionId) {
   const relatedJobs = [...jobs.values()]
@@ -134,12 +355,10 @@ function findThreadResumeMeta(sessionId) {
     };
   }
 
-  // A session with no job yet is either a Codex rollout or a freshly staged
-  // Claude handoff transcript -- check both layouts sessionimport.mjs can
-  // have written before giving up. Cursor and Kimi never stage resumable
-  // session files (see importSession's summary-primed fallback), so there is
-  // no additional layout to check.
-  const sessionMeta = findSessionMeta(sessionId) || findClaudeSessionMeta(sessionId);
+  // A session with no job yet is a native or staged transcript: Codex
+  // rollouts, Claude Code jsonl, or Cursor chats/transcripts. Kimi still has
+  // no portable file here.
+  const sessionMeta = findSessionMeta(sessionId) || findClaudeSessionMeta(sessionId) || findCursorSessionMeta(sessionId);
   if (!sessionMeta) return null;
   return {
     provider: normalizeJobProvider(sessionMeta.provider),
@@ -228,6 +447,31 @@ function cleanSessionTimestamp(value) {
 }
 
 
+function recordDiscoveredSession(sessionMap, {
+  id,
+  sessionProvider,
+  workspace,
+  cwd,
+  timestamp,
+  updatedAt,
+  file,
+  includeSummary,
+  syncedTitles,
+}) {
+  const session = {
+    id,
+    provider: sessionProvider,
+    workspaceId: workspace.id,
+    workspaceName: workspace.name,
+    cwd,
+    timestamp,
+    updatedAt,
+    title: syncedTitles.get(`${workspace.id}:${id}`) || null,
+  };
+  if (includeSummary && file) session.summary = readSessionSummary(file);
+  sessionMap.set(id, session);
+}
+
 function listWorkspaceSessions({ workspaceId, provider = null, limit, includeSummary = false }) {
   const selectedWorkspace = resolveOptionalWorkspaceFilter(workspaceId);
   const syncedTitles = readSyncedSessionTitles();
@@ -242,20 +486,62 @@ function listWorkspaceSessions({ workspaceId, provider = null, limit, includeSum
     if (provider && sessionProvider !== provider) continue;
     if (selectedWorkspace && workspace.id !== selectedWorkspace.id) continue;
     const stat = fs.statSync(file);
-    const session = {
+    recordDiscoveredSession(sessionMap, {
       id: meta.id,
-      provider: sessionProvider,
-      workspaceId: workspace.id,
-      workspaceName: workspace.name,
+      sessionProvider,
+      workspace,
       cwd: meta.cwd,
       timestamp: meta.timestamp,
       updatedAt: stat.mtime.toISOString(),
-      title: syncedTitles.get(`${workspace.id}:${meta.id}`) || null,
-    };
-    if (includeSummary) {
-      session.summary = readSessionSummary(file);
+      file,
+      includeSummary,
+      syncedTitles,
+    });
+  }
+
+  if (!provider || provider === "claude") {
+    for (const file of walkSessionFiles(path.join(runHome, ".claude", "projects"))) {
+      const id = path.basename(file, ".jsonl");
+      if (!isResumableSessionId(id)) continue;
+      const meta = readClaudeSessionMeta(file);
+      if (!meta) continue;
+      const workspace = workspaceForSessionCwd(meta.cwd);
+      if (!workspace) continue;
+      if (selectedWorkspace && workspace.id !== selectedWorkspace.id) continue;
+      const stat = fs.statSync(file);
+      recordDiscoveredSession(sessionMap, {
+        id,
+        sessionProvider: "claude",
+        workspace,
+        cwd: meta.cwd,
+        timestamp: meta.timestamp,
+        updatedAt: stat.mtime.toISOString(),
+        file,
+        includeSummary,
+        syncedTitles,
+      });
     }
-    sessionMap.set(session.id, session);
+  }
+
+  if (!provider || provider === "cursor") {
+    const cursorWorkspaces = selectedWorkspace
+      ? [selectedWorkspace]
+      : [...workspaces.values(), ...dynamicWorkspaces.values()];
+    for (const workspace of cursorWorkspaces) {
+      for (const session of listCursorSessionsForWorkspace(workspace)) {
+        recordDiscoveredSession(sessionMap, {
+          id: session.id,
+          sessionProvider: "cursor",
+          workspace,
+          cwd: session.cwd,
+          timestamp: session.timestamp,
+          updatedAt: session.updatedAt,
+          file: session.file,
+          includeSummary,
+          syncedTitles,
+        });
+      }
+    }
   }
 
   for (const job of jobs.values()) {
@@ -356,6 +642,31 @@ function resolveOptionalWorkspaceFilter(workspaceId) {
 }
 
 
+function threadFromSessionFile(sessionFile, {
+  id,
+  sessionProvider,
+  workspace,
+  cwd,
+  timestamp,
+  updatedAt,
+}) {
+  const syncedTitle = readSyncedSessionTitles().get(`${workspace.id}:${id}`) || null;
+  return {
+    id,
+    sessionId: id,
+    provider: sessionProvider,
+    workspaceId: workspace.id,
+    workspaceName: workspace.name,
+    cwd,
+    timestamp,
+    updatedAt,
+    title: syncedTitle,
+    hasSessionFile: true,
+    summary: sessionFile ? readSessionSummary(sessionFile) : { firstUserPrompt: syncedTitle, lastAssistantAnswer: null },
+    jobs: [],
+  };
+}
+
 async function threadDetailResponse(sessionId, { provider = null } = {}) {
   const sessionsDir = path.join(codexHome, "sessions");
   const sessionFile = findSessionFile(sessionsDir, sessionId);
@@ -368,22 +679,49 @@ async function threadDetailResponse(sessionId, { provider = null } = {}) {
     const sessionProvider = meta ? normalizeJobProvider(meta.provider) : "codex";
     if (workspace && (!provider || sessionProvider === provider)) {
       const stat = fs.statSync(sessionFile);
-      const syncedTitle = readSyncedSessionTitles().get(`${workspace.id}:${meta.id}`) || null;
-      thread = {
+      thread = threadFromSessionFile(sessionFile, {
         id: meta.id,
-        sessionId: meta.id,
-        provider: sessionProvider,
-        workspaceId: workspace.id,
-        workspaceName: workspace.name,
+        sessionProvider,
+        workspace,
         cwd: meta.cwd,
         timestamp: meta.timestamp,
         updatedAt: stat.mtime.toISOString(),
-        title: syncedTitle,
-        hasSessionFile: true,
-        summary: readSessionSummary(sessionFile),
-        jobs: [],
-      };
+      });
       messages = await readSessionMessages(sessionFile);
+    }
+  }
+
+  if (!thread) {
+    const claudeFile = findClaudeSessionFile(sessionId);
+    const claudeMeta = claudeFile ? readClaudeSessionMeta(claudeFile) : null;
+    const workspace = claudeMeta ? workspaceForSessionCwd(claudeMeta.cwd) : null;
+    if (claudeFile && workspace && (!provider || provider === "claude")) {
+      const stat = fs.statSync(claudeFile);
+      thread = threadFromSessionFile(claudeFile, {
+        id: sessionId,
+        sessionProvider: "claude",
+        workspace,
+        cwd: claudeMeta.cwd,
+        timestamp: claudeMeta.timestamp,
+        updatedAt: stat.mtime.toISOString(),
+      });
+      messages = await readSessionMessages(claudeFile);
+    }
+  }
+
+  if (!thread) {
+    const cursor = findCursorSession(sessionId);
+    const workspace = cursor?.workspace || (cursor?.cwd ? workspaceForSessionCwd(cursor.cwd) : null);
+    if (cursor && workspace && (!provider || provider === "cursor")) {
+      thread = threadFromSessionFile(cursor.file, {
+        id: sessionId,
+        sessionProvider: "cursor",
+        workspace,
+        cwd: cursor.cwd || workspace.path,
+        timestamp: cursor.timestamp,
+        updatedAt: cursor.updatedAt,
+      });
+      if (cursor.file) messages = await readSessionMessages(cursor.file);
     }
   }
 
@@ -442,6 +780,21 @@ function deleteThread(sessionId, { workspaceId = null, provider = null, certSubj
     (!provider || sessionProvider === provider) &&
     (!selectedWorkspace || sessionWorkspace.id === selectedWorkspace.id);
 
+  const claudeFile = findClaudeSessionFile(sessionId);
+  const claudeMeta = claudeFile ? readClaudeSessionMeta(claudeFile) : null;
+  const claudeWorkspace = claudeMeta ? workspaceForSessionCwd(claudeMeta.cwd) : null;
+  const claudeMatches =
+    Boolean(claudeFile && claudeMeta && claudeWorkspace) &&
+    (!provider || provider === "claude") &&
+    (!selectedWorkspace || claudeWorkspace.id === selectedWorkspace.id);
+
+  const cursor = findCursorSession(sessionId);
+  const cursorWorkspace = cursor?.workspace || (cursor?.cwd ? workspaceForSessionCwd(cursor.cwd) : null);
+  const cursorMatches =
+    Boolean(cursor && cursorWorkspace) &&
+    (!provider || provider === "cursor") &&
+    (!selectedWorkspace || cursorWorkspace.id === selectedWorkspace.id);
+
   const matchedJobs = [...jobs.values()].filter((job) => {
     if (jobThreadId(job) !== sessionId) return false;
     const jobProvider = normalizeJobProvider(job.provider);
@@ -452,7 +805,7 @@ function deleteThread(sessionId, { workspaceId = null, provider = null, certSubj
     return true;
   });
 
-  if (!sessionMatches && matchedJobs.length === 0) {
+  if (!sessionMatches && !claudeMatches && !cursorMatches && matchedJobs.length === 0) {
     const deletedChat = deleteChatThread(sessionId, { workspace: selectedWorkspace, provider, certSubject });
     if (deletedChat) return deletedChat;
     return null;
@@ -469,8 +822,21 @@ function deleteThread(sessionId, { workspaceId = null, provider = null, certSubj
     removePersistedJobFiles(job);
   }
 
-  const deletedSessionFile = sessionMatches ? removePathInsideRoot(sessionFile, sessionsDir) : false;
-  const workspaceForAudit = selectedWorkspace || sessionWorkspace || workspaceForJob(matchedJobs[0]);
+  const deletedCodexFile = sessionMatches ? removePathInsideRoot(sessionFile, sessionsDir) : false;
+  const deletedClaudeFile = claudeMatches
+    ? removePathInsideRoot(claudeFile, path.join(runHome, ".claude", "projects"))
+    : false;
+  let deletedCursorFile = false;
+  if (cursorMatches) {
+    const cursorRoot = path.join(runHome, ".cursor");
+    if (cursor.file) deletedCursorFile = removePathInsideRoot(cursor.file, cursorRoot);
+    if (cursor.sessionDir) {
+      const metaFile = path.join(cursor.sessionDir, "meta.json");
+      removePathInsideRoot(metaFile, cursorRoot);
+    }
+  }
+  const deletedSessionFile = deletedCodexFile || deletedClaudeFile || deletedCursorFile;
+  const workspaceForAudit = selectedWorkspace || sessionWorkspace || claudeWorkspace || cursorWorkspace || workspaceForJob(matchedJobs[0]);
   appendAudit(
     "thread_deleted",
     {
@@ -528,6 +894,40 @@ function threadSummary(thread) {
 }
 
 
+function firstText(value) {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => firstText(item?.text ?? item?.content ?? item?.input_text ?? item?.output_text ?? item))
+      .filter(Boolean)
+      .join("\n\n");
+  }
+  if (value && typeof value === "object") {
+    return firstText(value.text ?? value.content ?? value.input_text ?? value.output_text ?? "");
+  }
+  return "";
+}
+
+function parseTranscriptTurn(entry) {
+  if (!entry || typeof entry !== "object") return null;
+  if (entry.type === "response_item" && entry.payload?.type === "message") {
+    const role = entry.payload.role;
+    if (role !== "user" && role !== "assistant") return null;
+    return { role, text: messageText(entry.payload), timestamp: cleanSessionTimestamp(entry.timestamp) };
+  }
+  if (entry.type === "user" || entry.type === "assistant") {
+    const text = firstText(entry.message?.content ?? entry.message ?? entry.text);
+    if (!text) return null;
+    return { role: entry.type, text, timestamp: cleanSessionTimestamp(entry.timestamp) };
+  }
+  if (entry.role === "user" || entry.role === "assistant") {
+    const text = firstText(entry.message?.content ?? entry.message ?? entry.text);
+    if (!text) return null;
+    return { role: entry.role, text, timestamp: cleanSessionTimestamp(entry.timestamp) };
+  }
+  return null;
+}
+
 function readSessionSummary(sessionFile) {
   let firstUserPrompt = null;
   let lastAssistantAnswer = null;
@@ -535,13 +935,9 @@ function readSessionSummary(sessionFile) {
   for (const line of readSessionLines(sessionFile, { fromEnd: false })) {
     if (!line.trim()) continue;
     try {
-      const entry = JSON.parse(line);
-      if (entry?.type !== "response_item") continue;
-      const message = entry.payload;
-      if (message?.type !== "message") continue;
-      const text = messageText(message);
-      if (message.role === "user" && !firstUserPrompt) {
-        firstUserPrompt = userPromptSummary(text);
+      const turn = parseTranscriptTurn(JSON.parse(line));
+      if (turn?.role === "user" && !firstUserPrompt) {
+        firstUserPrompt = userPromptSummary(turn.text);
       }
     } catch {
       continue;
@@ -551,11 +947,10 @@ function readSessionSummary(sessionFile) {
   for (const line of readSessionLines(sessionFile, { fromEnd: true })) {
     if (!line.trim()) continue;
     try {
-      const entry = JSON.parse(line);
-      if (entry?.type !== "response_item") continue;
-      const message = entry.payload;
-      if (message?.type !== "message" || message.role !== "assistant") continue;
-      lastAssistantAnswer = boundedThreadText(messageText(message));
+      const turn = parseTranscriptTurn(JSON.parse(line));
+      if (turn?.role !== "assistant") continue;
+      lastAssistantAnswer = boundedThreadText(turn.text);
+      break;
     } catch {
       continue;
     }
@@ -572,20 +967,16 @@ async function readSessionMessages(sessionFile) {
   for await (const line of lines) {
     if (!line.trim()) continue;
     try {
-      const entry = JSON.parse(line);
-      if (entry?.type !== "response_item") continue;
-      const message = entry.payload;
-      if (message?.type !== "message") continue;
-      if (!["user", "assistant"].includes(message.role)) continue;
+      const turn = parseTranscriptTurn(JSON.parse(line));
+      if (!turn) continue;
 
-      const rawText = messageText(message);
-      const cleanText = message.role === "user" ? userPromptText(rawText) : cleanThreadMessageText(rawText);
+      const cleanText = turn.role === "user" ? userPromptText(turn.text) : cleanThreadMessageText(turn.text);
       const text = boundedThreadMessageText(cleanText);
       if (!text) continue;
 
       messages.push({
-        role: message.role,
-        timestamp: cleanSessionTimestamp(entry.timestamp),
+        role: turn.role,
+        timestamp: turn.timestamp,
         text,
       });
       if (messages.length > 120) messages.shift();
@@ -881,6 +1272,10 @@ export {
   findClaudeSessionFile,
   readClaudeSessionMeta,
   findClaudeSessionMeta,
+  findCursorSession,
+  findCursorSessionMeta,
+  cursorWorkspaceHash,
+  listCursorSessionsForWorkspace,
   findThreadResumeMeta,
   resumeMetaBelongsToWorkspace,
   workspaceForJob,

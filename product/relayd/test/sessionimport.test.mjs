@@ -7,7 +7,7 @@ import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 
 const {
-  importSession, rewriteSessionCwd, makeCodexRolloutResumable, claudeProjectSlug, summaryPrompt,
+  importSession, rewriteSessionCwd, makeCodexRolloutResumable, claudeProjectSlug, cursorWorkspaceHash, summaryPrompt,
   assertContained, codexRolloutLeafName, repairLegacyCodexRollout, SessionImportSecurityError,
 } = await import("../src/sessionimport.mjs");
 // The shared contract this module now stages by. Imported directly (it is
@@ -343,6 +343,29 @@ test("re-importing over a session file we staged earlier replaces it", () => {
   assert.equal(JSON.parse(fs.readFileSync(staged, "utf8").trim()).n, 2);
   assert.equal(fs.statSync(staged).mode & 0o777, 0o600);
   assert.deepEqual(fs.readdirSync(path.dirname(staged)).length, 1, "no staging temp file is left behind");
+});
+
+test("a cursor transcript is staged where listing can find it", () => {
+  const { runHome, codexHome } = homes();
+  const sessionBytes = Buffer.from(`${JSON.stringify({
+    role: "user",
+    message: { content: [{ type: "text", text: "Show Cursor history" }] },
+  })}\n`, "utf8");
+  const result = importSession({
+    manifest: manifest({ harness: "cursor", sessionFormat: "cursor-jsonl" }),
+    sessionBytes, runHome, codexHome, worktreePath: TO_CWD,
+  });
+  assert.equal(result.provider, "cursor");
+  assert.equal(result.resumeSessionId, "11111111-2222-4333-8444-555555555555");
+  assert.equal(result.primedPrompt, null);
+  const staged = path.join(
+    runHome, ".cursor", "chats", cursorWorkspaceHash(TO_CWD),
+    "11111111-2222-4333-8444-555555555555", "transcript.jsonl",
+  );
+  const meta = JSON.parse(fs.readFileSync(path.join(path.dirname(staged), "meta.json"), "utf8"));
+  assert.match(fs.readFileSync(staged, "utf8"), /Show Cursor history/);
+  assert.doesNotMatch(fs.readFileSync(staged, "utf8"), /\/Users\/dev\/code\/relay/);
+  assert.equal(meta.cwd, TO_CWD);
 });
 
 test("a session-less handoff falls back to a primed prompt", () => {
