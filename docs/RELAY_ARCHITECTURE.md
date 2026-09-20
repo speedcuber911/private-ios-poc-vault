@@ -300,6 +300,28 @@ and not installed by any script in this repository — the user copies the sourc
 onto their machine and runs it. An installer is the obvious next piece of work
 and does not exist.
 
+## Machine power
+
+The control plane on `poc-ec2` can start and stop allowlisted EC2 workers. This
+is not a Relay account action and it is not on the data path.
+
+While a machine is on, `relayd` registers `{nodeId, instanceId, sha256(wake
+token)}` with `POST /v1/power/registration`, signed by the node's ed25519
+identity. `RELAY_POWER_INSTANCE_ALLOWLIST` is the only set of instances the
+control plane will touch. The phone receives `wakeToken` at pairing (or later
+via `GET /v1/power/credential` on the node) and, when the worker is
+unreachable, calls `POST /v1/power/:nodeId/start` with that bearer. After AWS
+reports `running` the phone talks to the machine the way it already did.
+
+Sign-in is not required. Compromising the control plane can boot or halt an
+allowlisted instance; it still cannot mint the pairing bearer or read jobs.
+
+Operator env on `poc-ec2`: `RELAY_POWER_INSTANCE_ALLOWLIST`, optional
+`RELAY_POWER_ENROLL_TOKEN`, `RELAY_POWER_AWS_REGION`. The instance role needs
+`ec2:StartInstances` / `StopInstances` / `DescribeInstances` on those instance
+ARNs. On the worker: `RELAYD_CLOUD_URL`, optional `RELAYD_POWER_INSTANCE_ID`
+(else IMDS), optional `RELAYD_POWER_ENROLL_TOKEN`.
+
 ## Known gaps
 
 - **`DEVICE_LOGIN_URL` must still be set on the control-plane host.** The

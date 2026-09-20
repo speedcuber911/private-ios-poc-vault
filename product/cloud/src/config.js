@@ -197,6 +197,16 @@ export function loadConfig(env = process.env) {
       120,
       Math.max(10, intFrom(env.COMPUTER_ACCESS_LEASE_SEC, 45)),
     ),
+
+    // Machine power plane. Empty allowlist disables start/stop entirely —
+    // the control plane must not be able to boot arbitrary instances. The
+    // enroll token is optional extra TOFU protection: when set, a node must
+    // present it to bind an allowlisted instance. It is not a Relay account.
+    power: {
+      allowlist: parseInstanceAllowlist(env.RELAY_POWER_INSTANCE_ALLOWLIST),
+      region: env.RELAY_POWER_AWS_REGION || env.AWS_REGION || "ap-south-1",
+      enrollToken: env.RELAY_POWER_ENROLL_TOKEN || "",
+    },
   };
 }
 
@@ -219,4 +229,13 @@ function stripTrailingSlash(value) {
 function intFrom(value, fallback) {
   const n = Number.parseInt(value, 10);
   return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+export const EC2_INSTANCE_ID_RE = /^i-[0-9a-f]{8,17}$/;
+
+function parseInstanceAllowlist(value) {
+  return String(value || "")
+    .split(",")
+    .map((entry) => entry.trim().toLowerCase())
+    .filter((entry) => EC2_INSTANCE_ID_RE.test(entry));
 }

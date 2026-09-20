@@ -27,6 +27,8 @@ struct AccountSettingsView: View {
     @State private var isLoadingHarnesses = false
     @State private var harnessError: String?
     @State private var providerLoginRequest: CodexProvider?
+    @State private var showingStopPower = false
+    @StateObject private var powerModel = RelayMachinePowerModel()
 
     var body: some View {
         NavigationStack {
@@ -316,6 +318,18 @@ struct AccountSettingsView: View {
             } message: {
                 Text("This phone forgets the machine and deletes the credential it was issued. To retire that credential on the machine too, run `relayd devices revoke` there. Nothing else on the machine is deleted; run `relayd pair` again to reconnect.")
             }
+            .confirmationDialog(
+                "Stop \(nodeStore.pairedNode?.nodeName ?? "this machine")?",
+                isPresented: $showingStopPower,
+                titleVisibility: .visible
+            ) {
+                Button("Stop machine", role: .destructive) {
+                    Task { await powerModel.stop() }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Runs stop. Pairing stays on disk. Start it again from this phone when you need it.")
+            }
             .sheet(isPresented: $showingCLILink, onDismiss: {
                 Task { await loadLinkedComputer() }
             }) {
@@ -341,6 +355,10 @@ struct AccountSettingsView: View {
                     await loadLinkedComputer(showProgress: false)
                     if computerLinkStore.computer?.status != .connecting { return }
                 }
+            }
+            .task(id: identityStore.wakeCredential()?.nodeID) {
+                powerModel.configure(identityStore: identityStore)
+                await powerModel.refresh()
             }
         }
         .preferredColorScheme(.dark)
@@ -380,12 +398,39 @@ struct AccountSettingsView: View {
                 NavigationLink {
                     RelayMachineMonitorView(
                         client: codexClient,
+                        identityStore: identityStore,
                         machineName: node.nodeName
                     )
                 } label: {
                     Text("Usage")
                 }
                 .accessibilityIdentifier("relay-settings-machine-usage")
+
+                if identityStore.wakeCredential() != nil {
+                    LabeledContent("Power", value: powerModel.status.label)
+                    if powerModel.status.isBusy {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                            Text(powerModel.status == .stopping ? "Stopping this machine…" : "Starting this machine…")
+                                .foregroundStyle(AppTheme.textSecondary)
+                        }
+                    } else if powerModel.status == .on {
+                        Button("Stop machine", role: .destructive) {
+                            showingStopPower = true
+                        }
+                        .accessibilityIdentifier("relay-settings-stop-machine")
+                    } else if powerModel.status != .unavailable {
+                        Button("Start machine") {
+                            Task { await powerModel.start() }
+                        }
+                        .disabled(powerModel.status.isBusy)
+                        .accessibilityIdentifier("relay-settings-start-machine")
+                    }
+                    if let notice = powerModel.notice {
+                        Label(notice, systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(AppTheme.statusError)
+                    }
+                }
 
                 if node.registeredAccountID == nil {
                     Button(accountStore.user == nil
@@ -416,6 +461,7 @@ struct AccountSettingsView: View {
                 NavigationLink {
                     RelayMachineMonitorView(
                         client: codexClient,
+                        identityStore: identityStore,
                         machineName: "Linked computer"
                     )
                 } label: {
@@ -437,7 +483,7 @@ struct AccountSettingsView: View {
             return "Run `relayd pair` on a computer or server you own and scan the code it prints."
         }
         if node.registeredAccountID == nil {
-            return "This machine is paired directly to this phone and fully usable. Usage is visible here. It is not connected to a Relay account, so there is no handoff from a laptop and no push if the machine is under load or goes quiet — add those whenever you want them."
+            return "This machine is paired directly to this phone and fully usable. Usage and power are on this screen. It is not connected to a Relay account, so there is no handoff from a laptop and no push if the machine is under load or goes quiet — add those whenever you want them."
         }
         return "Connected to your Relay account, so `relay handoff` from a laptop and usage alerts reach this phone."
     }

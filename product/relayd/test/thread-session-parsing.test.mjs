@@ -142,11 +142,126 @@ test("Claude Code and Cursor transcripts yield the same conversation turns as Co
   assert.equal(readSessionSummary(cursorFile).lastAssistantAnswer, "Cursor answer");
 });
 
+test("Cursor agent transcripts unwrap user_query and skip IDE chrome", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-thread-cursor-native-"));
+  const file = path.join(dir, "cursor.jsonl");
+  fs.writeFileSync(file, `${[
+    {
+      role: "user",
+      message: {
+        content: [{
+          type: "text",
+          text: [
+            "<timestamp>Friday, Sep 18, 2026, 7:12 PM (UTC+5:30)</timestamp>",
+            "<user_query>",
+            "Can i somehow use my cursor subscription from the ec2 and then from the app too",
+            "</user_query>",
+          ].join("\n"),
+        }],
+      },
+    },
+    { role: "assistant", message: { content: [{ type: "text", text: "Cursor auth lives on the machine." }, { type: "tool_use", name: "Grep", input: {} }] } },
+    {
+      role: "user",
+      message: {
+        content: [{
+          type: "text",
+          text: "<timestamp>Friday, Sep 18, 2026, 7:20 PM (UTC+5:30)</timestamp>\n\n<user_query>Briefly inform the user about the task result and perform any follow-up actions (if needed). If there's no follow-ups needed, don't explicitly say that.</user_query>",
+        }],
+      },
+    },
+    { role: "user", message: { content: [{ type: "text", text: "<timestamp>later</timestamp>\n<user_query>Do they get graphs?</user_query>" }] } },
+    { role: "assistant", message: { content: [{ type: "text", text: "Yes, on Usage." }] } },
+  ].map((line) => JSON.stringify(line)).join("\n")}\n`);
+
+  const messages = await readSessionMessages(file);
+  assert.deepEqual(messages.map((entry) => [entry.role, entry.text]), [
+    ["user", "Can i somehow use my cursor subscription from the ec2 and then from the app too"],
+    ["assistant", "Cursor auth lives on the machine."],
+    ["user", "Do they get graphs?"],
+    ["assistant", "Yes, on Usage."],
+  ]);
+  assert.equal(
+    readSessionSummary(file).firstUserPrompt,
+    "Can i somehow use my cursor subscription from the ec2 and then from the app too",
+  );
+});
+
+test("Claude Code skill wrappers and tool results are not conversation turns", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-thread-claude-native-"));
+  const file = path.join(dir, "claude.jsonl");
+  const skillPrompt = [
+    "Selected Claude skills are included below. Follow these SKILL.md instructions when they are relevant to the task.",
+    "",
+    "## command:relay-runtime-smoke",
+    "",
+    "Reply with exactly RELAY_CLAUDE_COMMAND_OK and do not use any tools.",
+    "",
+    "User task:",
+    "Run the selected command.",
+  ].join("\n");
+  fs.writeFileSync(file, `${[
+    { type: "user", cwd: "/repo", message: { role: "user", content: skillPrompt } },
+    { type: "assistant", message: { content: [{ type: "thinking", thinking: "" }] } },
+    { type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: "pwd" } }] } },
+    { type: "user", message: { content: [{ type: "tool_result", content: "(Bash completed with no output)" }] } },
+    { type: "assistant", message: { content: [{ type: "text", text: "RELAY_CLAUDE_COMMAND_OK" }] } },
+  ].map((line) => JSON.stringify(line)).join("\n")}\n`);
+
+  const messages = await readSessionMessages(file);
+  assert.deepEqual(messages.map((entry) => [entry.role, entry.text]), [
+    ["user", "Run the selected command."],
+    ["assistant", "RELAY_CLAUDE_COMMAND_OK"],
+  ]);
+  assert.equal(readSessionSummary(file).firstUserPrompt, "Run the selected command.");
+  assert.equal(readSessionSummary(file).lastAssistantAnswer, "RELAY_CLAUDE_COMMAND_OK");
+});
+
+test("already synced Cursor timestamp titles yield to the real prompt", () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-thread-synced-chrome-"));
+  const statePath = path.join(dataDir, "session-sync", "index.json");
+  fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  fs.writeFileSync(statePath, `${JSON.stringify({
+    v: 1,
+    sessions: {
+      [`repo:${SESSION_ID}`]: {
+        workspaceId: "repo",
+        sessionId: SESSION_ID,
+        title: "<timestamp>Friday, Sep 18, 2026, 7:12 PM (UTC+5:30)</timestamp>",
+      },
+    },
+  })}\n`);
+
+  assert.equal(readSyncedSessionTitles(dataDir).size, 0);
+});
+
+test("already synced Claude skill-header titles yield to the real prompt", () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-thread-synced-skill-"));
+  const statePath = path.join(dataDir, "session-sync", "index.json");
+  fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  fs.writeFileSync(statePath, `${JSON.stringify({
+    v: 1,
+    sessions: {
+      [`repo:${SESSION_ID}`]: {
+        workspaceId: "repo",
+        sessionId: SESSION_ID,
+        title: "Selected Claude skills are included below. Follow these SKILL.md instructions when they are relevant to the task.",
+      },
+    },
+  })}\n`);
+
+  assert.equal(readSyncedSessionTitles(dataDir).size, 0);
+});
+
 test("pure Codex UI events do not become conversation titles", () => {
   assert.equal(userPromptSummary("<send_user_message_question_reply>{}</send_user_message_question_reply>"), null);
   assert.equal(userPromptSummary("<environment_context><cwd>/repo</cwd></environment_context>"), null);
   assert.equal(
     userPromptSummary('<send_user_message_question_reply>[{"question":"Direction?","answer":"Quiet chat"}]</send_user_message_question_reply>'),
     "Quiet chat",
+  );
+  assert.equal(
+    userPromptSummary("<timestamp>Friday, Sep 18, 2026, 7:12 PM (UTC+5:30)</timestamp>\n<user_query>\nWake the machine\n</user_query>"),
+    "Wake the machine",
   );
 });

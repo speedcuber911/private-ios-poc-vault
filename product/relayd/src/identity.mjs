@@ -131,6 +131,7 @@ function identityPaths(baseDir = identityDir) {
     issuedDir: path.join(baseDir, "issued"),
     tmpDir: path.join(baseDir, "tmp"),
     revokedSerialsPath: path.join(baseDir, "revoked-serials.txt"),
+    wakeSecretPath: path.join(baseDir, "wake.secret"),
   };
 }
 

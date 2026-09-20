@@ -34,6 +34,12 @@ async function handleAdditionRoutes(req, res, url, auth) {
     return true;
   }
 
+  if (req.method === "GET" && url.pathname === "/v1/power/credential") {
+    const { powerCredential } = await import("./power.mjs");
+    sendJson(res, 200, powerCredential());
+    return true;
+  }
+
   if (req.method === "GET" && url.pathname === "/v1/events") {
     streamNodeEvents(req, res, url);
     return true;

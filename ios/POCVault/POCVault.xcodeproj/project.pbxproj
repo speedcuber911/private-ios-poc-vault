@@ -66,6 +66,8 @@
 		200000000000000000000080 /* RelayMachineStats.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000080 /* RelayMachineStats.swift */; };
 		200000000000000000000081 /* RelayMachineMonitorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000081 /* RelayMachineMonitorView.swift */; };
 		200000000000000000000082 /* MachineMonitorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000082 /* MachineMonitorTests.swift */; };
+		200000000000000000000083 /* RelayPowerClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000083 /* RelayPowerClient.swift */; };
+		200000000000000000000084 /* MachinePowerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000084 /* MachinePowerTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -143,6 +145,8 @@
 		100000000000000000000080 /* RelayMachineStats.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayMachineStats.swift; sourceTree = "<group>"; };
 		100000000000000000000081 /* RelayMachineMonitorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayMachineMonitorView.swift; sourceTree = "<group>"; };
 		100000000000000000000082 /* MachineMonitorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MachineMonitorTests.swift; sourceTree = "<group>"; };
+		100000000000000000000083 /* RelayPowerClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayPowerClient.swift; sourceTree = "<group>"; };
+		100000000000000000000084 /* MachinePowerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MachinePowerTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -212,6 +216,7 @@
 				100000000000000000000078 /* NodePairingTests.swift */,
 				100000000000000000000079 /* LivePairingDiagnosticTests.swift */,
 				100000000000000000000082 /* MachineMonitorTests.swift */,
+				100000000000000000000084 /* MachinePowerTests.swift */,
 			);
 			path = POCVaultTests;
 			sourceTree = "<group>";
@@ -253,6 +258,7 @@
 			children = (
 				100000000000000000000019 /* CodexClient.swift */,
 				100000000000000000000036 /* RelayAuthClient.swift */,
+				100000000000000000000083 /* RelayPowerClient.swift */,
 			);
 			path = Networking;
 			sourceTree = "<group>";
@@ -486,6 +492,7 @@
 				200000000000000000000031 /* RelayMarkdownViews.swift in Sources */,
 				200000000000000000000032 /* RelayAccount.swift in Sources */,
 				200000000000000000000033 /* RelayAuthClient.swift in Sources */,
+				200000000000000000000083 /* RelayPowerClient.swift in Sources */,
 				200000000000000000000034 /* RelayAccountStore.swift in Sources */,
 				200000000000000000000035 /* AuthenticationView.swift in Sources */,
 				200000000000000000000036 /* RelayOnboardingView.swift in Sources */,
@@ -522,6 +529,7 @@
 				200000000000000000000078 /* NodePairingTests.swift in Sources */,
 				200000000000000000000079 /* LivePairingDiagnosticTests.swift in Sources */,
 				200000000000000000000082 /* MachineMonitorTests.swift in Sources */,
+				200000000000000000000084 /* MachinePowerTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

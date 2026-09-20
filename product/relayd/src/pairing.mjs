@@ -83,6 +83,7 @@ import {
   pairLinkBase,
   servesTls,
 } from "./config.mjs";
+import { wakeToken } from "./power.mjs";
 
 const pairingTtlMs = 15 * 60 * 1000;
 
@@ -488,6 +489,7 @@ function redeemPairing({ secret, deviceBlob, deviceTag, source = null }) {
       notAfter: issued.notAfter,
       apiBaseUrl: apiBaseUrl(),
       verificationCode: session.code,
+      wakeToken: wakeToken(),
       ...keys,
     };
   } else {
@@ -505,6 +507,7 @@ function redeemPairing({ secret, deviceBlob, deviceTag, source = null }) {
       notAfter: issued.notAfter,
       apiBaseUrl: apiBaseUrl(),
       verificationCode: session.code,
+      wakeToken: wakeToken(),
       ...keys,
     };
   }

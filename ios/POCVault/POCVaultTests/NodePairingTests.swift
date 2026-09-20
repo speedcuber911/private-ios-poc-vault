@@ -283,6 +283,7 @@ final class NodePairingTests: XCTestCase {
         XCTAssertEqual(result.deviceID, "device-1")
         XCTAssertEqual(result.verificationCode, "PQRS-TUVW")
         XCTAssertEqual(result.pubkeyPEM, "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----")
+        XCTAssertEqual(result.wakeToken, String(repeating: "ab", count: 32))
 
         // Signed by nobody we agreed with: rejected as a tag mismatch, and the
         // node blob's fields never get looked at.
@@ -562,6 +563,7 @@ final class NodePairingTests: XCTestCase {
             "apiBaseUrl": "https://192.168.1.20:8443",
             "pubkey": "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----",
             "encPubkey": "ZW5jLXB1YmtleS0zMi1ieXRlcy1nb2VzLWhlcmU=",
+            "wakeToken": String(repeating: "ab", count: 32),
             "verificationCode": verificationCode
         ], options: [.sortedKeys])
         let tag = RelayPairing.blobTag(macKey: macKey, slot: RelayPairing.nodeSlot, blob: blob)

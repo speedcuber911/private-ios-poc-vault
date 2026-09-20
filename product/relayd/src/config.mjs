@@ -302,6 +302,12 @@ const tunnelBackoffMaxMs = Math.max(
 // cloud traffic somewhere its operator no longer expects.
 const cloudUrl = cleanOptionalUrlBase(process.env.RELAYD_CLOUD_URL || "", "RELAYD_CLOUD_URL");
 
+// Optional EC2 power registration. Unset means "discover from IMDS, or skip".
+const powerEnabled = parseBooleanEnv("RELAYD_POWER", true);
+const powerInstanceId = (process.env.RELAYD_POWER_INSTANCE_ID || "").trim().toLowerCase() || null;
+const powerRegion = (process.env.RELAYD_POWER_REGION || process.env.AWS_REGION || "ap-south-1").trim().toLowerCase();
+const powerEnrollToken = (process.env.RELAYD_POWER_ENROLL_TOKEN || "").trim() || null;
+
 // Ed25519 public key for browser grants (raw 32 bytes, base64url), taken from
 // this node's own environment. It used to arrive in the provisioner's
 // enroll.json; a BYO node has no provisioner, so the operator sets
@@ -1128,6 +1134,10 @@ export {
   tunnelBackoffBaseMs,
   tunnelBackoffMaxMs,
   cloudUrl,
+  powerEnabled,
+  powerInstanceId,
+  powerRegion,
+  powerEnrollToken,
   grantPublicKey,
   nodeId,
   handoffEnabled,

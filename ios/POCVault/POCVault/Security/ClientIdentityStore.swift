@@ -85,6 +85,8 @@ final class ClientIdentityStore: ObservableObject {
         var pinnedCADER: Data?
         var deviceToken: String?
         var deviceTokenHost: String?
+        var wakeToken: String?
+        var wakeNodeID: String?
 
         static let empty = PairedMaterial()
 
@@ -95,6 +97,7 @@ final class ClientIdentityStore: ObservableObject {
         private enum CodingKeys: String, CodingKey {
             case pairingIssued = "trialIssued"
             case pinnedHost, pinnedCADER, deviceToken, deviceTokenHost
+            case wakeToken, wakeNodeID
         }
     }
 
@@ -468,6 +471,30 @@ final class ClientIdentityStore: ObservableObject {
             return nil
         }
         return token
+    }
+
+    /// Stores the control-plane wake token for `nodeID`. Distinct from the
+    /// data-path device bearer: poc-ec2 may learn this hash, never the token
+    /// used to talk to the machine once it is up.
+    func storeWakeToken(_ token: String, nodeID: String) {
+        let node = nodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !node.isEmpty, !value.isEmpty else { return }
+        updatePairedMaterial { material in
+            material.wakeToken = value
+            material.wakeNodeID = node
+        }
+        CodexDiagnostics.log("identity_wake_token_stored", fields: ["nodeId": node])
+    }
+
+    /// The wake credential for starting this machine from the control plane.
+    func wakeCredential() -> (nodeID: String, token: String)? {
+        let material = pairedMaterial()
+        guard let nodeID = material.wakeNodeID?.trimmedNonEmpty,
+              let token = material.wakeToken?.trimmedNonEmpty else {
+            return nil
+        }
+        return (nodeID, token)
     }
 
     /// The single host `pinnedCACertificate` may be applied to.

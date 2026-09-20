@@ -120,6 +120,7 @@ export async function startTestApp(overrides = {}) {
       ? { appStoreVerifier: overrides.appStoreVerifier }
       : {}),
     ...(overrides.log ? { log: overrides.log } : {}),
+    ...(overrides.ec2 ? { ec2: overrides.ec2 } : {}),
   });
 
   await app.auth.ready;

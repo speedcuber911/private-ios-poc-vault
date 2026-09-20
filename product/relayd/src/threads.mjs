@@ -894,6 +894,16 @@ function threadSummary(thread) {
 }
 
 
+const SKIP_CONTENT_TYPES = new Set([
+  "tool_use",
+  "tool_result",
+  "thinking",
+  "redacted_thinking",
+  "function_call",
+  "function_call_output",
+  "server_tool_use",
+]);
+
 function firstText(value) {
   if (typeof value === "string") return value;
   if (Array.isArray(value)) {
@@ -908,6 +918,26 @@ function firstText(value) {
   return "";
 }
 
+function contentPartsText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) {
+    if (content && typeof content === "object" && SKIP_CONTENT_TYPES.has(content.type)) return "";
+    return firstText(content);
+  }
+  return content
+    .map((item) => {
+      if (typeof item === "string") return item;
+      if (!item || typeof item !== "object") return "";
+      if (SKIP_CONTENT_TYPES.has(item.type)) return "";
+      if (typeof item.text === "string") return item.text;
+      if (typeof item.input_text === "string") return item.input_text;
+      if (typeof item.output_text === "string") return item.output_text;
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n\n");
+}
+
 function parseTranscriptTurn(entry) {
   if (!entry || typeof entry !== "object") return null;
   if (entry.type === "response_item" && entry.payload?.type === "message") {
@@ -916,12 +946,12 @@ function parseTranscriptTurn(entry) {
     return { role, text: messageText(entry.payload), timestamp: cleanSessionTimestamp(entry.timestamp) };
   }
   if (entry.type === "user" || entry.type === "assistant") {
-    const text = firstText(entry.message?.content ?? entry.message ?? entry.text);
+    const text = contentPartsText(entry.message?.content ?? entry.message ?? entry.text);
     if (!text) return null;
     return { role: entry.type, text, timestamp: cleanSessionTimestamp(entry.timestamp) };
   }
   if (entry.role === "user" || entry.role === "assistant") {
-    const text = firstText(entry.message?.content ?? entry.message ?? entry.text);
+    const text = contentPartsText(entry.message?.content ?? entry.message ?? entry.text);
     if (!text) return null;
     return { role: entry.role, text, timestamp: cleanSessionTimestamp(entry.timestamp) };
   }
@@ -1084,10 +1114,32 @@ function questionReplyText(value) {
 }
 
 
+const CURSOR_HOUSEKEEPING_RE = /^\s*Briefly inform the user about the task result\b/i;
+
+function unwrapNativeUserPrompt(value) {
+  let text = String(value ?? "");
+  const queries = [];
+  const queryRe = /<user_query(?:\s[^>]*)?>\s*([\s\S]*?)\s*<\/user_query\s*>/gi;
+  let match;
+  while ((match = queryRe.exec(text))) {
+    const body = match[1].replace(/\r\n?/g, "\n").trim();
+    if (body) queries.push(body);
+  }
+  if (queries.length) text = queries.join("\n\n");
+  return text
+    .replace(/<timestamp(?:\s[^>]*)?>[\s\S]*?<\/timestamp\s*>/gi, "")
+    .replace(/<image_files(?:\s[^>]*)?>[\s\S]*?<\/image_files\s*>/gi, "")
+    .replace(/<conversation_summary(?:\s[^>]*)?>[\s\S]*?<\/conversation_summary\s*>/gi, "")
+    .replace(/\[Image\]/g, "")
+    .trim();
+}
+
 function stripInjectedUserMarkup(value) {
-  const reply = questionReplyText(value);
+  const unwrapped = unwrapNativeUserPrompt(value);
+  if (CURSOR_HOUSEKEEPING_RE.test(unwrapped)) return "";
+  const reply = questionReplyText(unwrapped);
   if (reply !== null) return reply;
-  let text = cleanApiText(value || "").replace(SYNTHETIC_USER_BLOCK_RE, "");
+  let text = cleanApiText(unwrapped || "").replace(SYNTHETIC_USER_BLOCK_RE, "");
   const requestHeading = USER_REQUEST_HEADING_RE.exec(text);
   if (requestHeading) text = text.slice(requestHeading.index + requestHeading[0].length);
   const cutAt = [text.search(SYNTHETIC_USER_OPEN_RE), text.search(ATTACHED_IMAGE_OPEN_RE)]
@@ -1116,12 +1168,19 @@ function isInjectedContextMessage(text) {
 
 
 function stripSkillInstructionPrefix(text) {
-  return text
-    .replace(/^Use these (Codex|Claude) skills for this task: [^.]+[.]\s*/i, "")
+  const stripped = text
+    .replace(/^Use these (Codex|Claude|Cursor) skills for this task: [^.]+[.]\s*/i, "")
     .replace(
-      /^Selected (Codex|Claude) skills are included below[.]\s*Follow these SKILL[.]md instructions when they are relevant to the task[.]\s+[\s\S]*?\s+User task:\s*/i,
+      /^Selected (Codex|Claude|Cursor) skills are included below[.]\s*Follow these SKILL[.]md instructions when they are relevant to the task[.]\s+[\s\S]*?\s+User task:\s*/i,
       "",
     );
+  if (stripped !== text) return stripped;
+  if (!/^Selected (Codex|Claude|Cursor) skills are included below\b/i.test(text)) return text;
+  const userTask = /\nUser task:\s*/i.exec(text);
+  // A synced title is only the first line. If that line is the skill header
+  // and the user task never made it into the stored title, drop it so the
+  // transcript prompt can win.
+  return userTask ? text.slice(userTask.index + userTask[0].length) : "";
 }
 
 
@@ -1158,7 +1217,7 @@ function readSyncedSessionTitles(baseDir = dataDir) {
   for (const record of Object.values(parsed.sessions)) {
     if (!record || typeof record !== "object") continue;
     if (typeof record.workspaceId !== "string" || typeof record.sessionId !== "string") continue;
-    const title = boundedThreadText(record.title);
+    const title = userPromptSummary(record.title);
     if (title) titles.set(`${record.workspaceId}:${record.sessionId}`, title);
   }
   return titles;

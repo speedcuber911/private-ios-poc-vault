@@ -43,7 +43,7 @@ import { startHostMonitor } from "./hoststats.mjs";
 import { routeRequest } from "./server.mjs";
 import { sendError } from "./util.mjs";
 import { appendAudit } from "./audit.mjs";
-import { identityPaths, readNodeId, getCaPem, ensureServerCert, nodeServerTlsOptions, caSpkiFingerprint, isRevokedSerial } from "./identity.mjs";
+import { identityPaths, readNodeId, getCaPem, ensureServerCert, nodeServerTlsOptions, caSpkiFingerprint, isRevokedSerial, initIdentity } from "./identity.mjs";
 import { startTunnelService, wrapTunneledHandler } from "./tunnel.mjs";
 import { startPairingListener, prunePairingSessions } from "./pairing.mjs";
 
@@ -286,6 +286,30 @@ async function startHandoffPickup() {
 }
 
 startHandoffPickup();
+
+async function startPowerRegistration() {
+  if (!cloudUrl) {
+    console.log("relayd: machine power registration skipped (no RELAYD_CLOUD_URL)");
+    return;
+  }
+  try {
+    initIdentity();
+    const { createCloudClient } = await import("./cloudclient.mjs");
+    const { registerPowerWithCloud } = await import("./power.mjs");
+    const cloud = createCloudClient({ cloudUrl });
+    const result = await registerPowerWithCloud(cloud);
+    if (result.skipped) {
+      console.log(`relayd: machine power registration skipped (${result.skipped})`);
+      return;
+    }
+    console.log(`relayd: registered power target ${result.instanceId} in ${result.region}`);
+  } catch (error) {
+    console.error(`relayd: power registration failed — ${error?.message || String(error)}`);
+    appendAudit("power_register_failed", null, { error: error?.message || String(error) });
+  }
+}
+
+startPowerRegistration();
 
 // --- tunneled listen mode --------------------------------------------------
 

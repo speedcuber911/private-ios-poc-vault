@@ -234,6 +234,9 @@ struct RelayNodePairingResult: Equatable {
     let caPEM: String
     let pubkeyPEM: String?
     let encPubkey: String?
+    /// Control-plane wake token. Optional so older nodes that pair without
+    /// one still complete; the phone can fetch it later from the node.
+    let wakeToken: String?
     /// The short code the machine printed in the terminal, for the user to
     /// compare against. Deliberately absent from the QR: comparing a value the
     /// phone just read off the same QR would prove nothing.
@@ -452,6 +455,7 @@ struct RelayNodePairingClient {
             let apiBaseUrl: String?
             let pubkey: String?
             let encPubkey: String?
+            let wakeToken: String?
             let verificationCode: String?
         }
         guard let payload = try? JSONDecoder().decode(NodeBlob.self, from: nodeBlob),
@@ -482,6 +486,7 @@ struct RelayNodePairingClient {
             caPEM: payload.caPem,
             pubkeyPEM: payload.pubkey?.trimmedNonEmpty,
             encPubkey: payload.encPubkey?.trimmedNonEmpty,
+            wakeToken: payload.wakeToken?.trimmedNonEmpty,
             verificationCode: payload.verificationCode?.trimmedNonEmpty
         )
     }
@@ -729,6 +734,9 @@ final class NodePairingModel: ObservableObject {
             host: host
         )
         identityStore.storeDeviceToken(RelayPairing.deviceToken(secret: secret), host: host)
+        if let wakeToken = result.wakeToken?.trimmedNonEmpty {
+            identityStore.storeWakeToken(wakeToken, nodeID: result.nodeID)
+        }
 
         let node = RelayPairedNode(
             nodeID: result.nodeID,

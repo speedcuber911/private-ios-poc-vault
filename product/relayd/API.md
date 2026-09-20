@@ -1133,7 +1133,8 @@ CLI and desktop callers.
  "apiBaseUrl": "https://…",
  "verificationCode": "WXYZ-1234",           // show it; the terminal shows the same
  "pubkey": "-----BEGIN PUBLIC KEY-----…",   // node ed25519 identity, SPKI PEM
- "encPubkey": "<base64 32 bytes>"}          // node X25519 key, for sealed handoff
+ "encPubkey": "<base64 32 bytes>",          // node X25519 key, for sealed handoff
+ "wakeToken": "<hex hmac>"}                 // control-plane start/stop; not the data-path bearer
 ```
 
 **Mint variant** — the caller has no CSR stack, so the node generates the
@@ -1154,7 +1155,8 @@ keypair. This is what the iOS scanner sends.
  "apiBaseUrl": "https://…",
  "verificationCode": "WXYZ-1234",
  "pubkey": "-----BEGIN PUBLIC KEY-----…",
- "encPubkey": "<base64 32 bytes>"}
+ "encPubkey": "<base64 32 bytes>",
+ "wakeToken": "<hex hmac>"}
 ```
 
 The p12 passphrase is `hex(hmac-sha256(key = secret, msg =
@@ -1185,6 +1187,13 @@ device private key never leaves the device.
 enrolment removed the only publisher of the node's X25519 key, and `relay
 handoff` seals a session to it, so pairing is now the only way a phone learns
 it — a signed-in user later registers the machine with `POST /v1/nodes`.
+
+`wakeToken` is also carried by both variants. It is `hex(hmac-sha256(key =
+wake.secret, msg = "relay-wake-token-v1"))` — a node-held secret, not the
+pairing secret, so already-paired phones can fetch the same value later with
+authenticated `GET /v1/power/credential`. The phone presents it to the control
+plane (`POST /v1/power/:nodeId/start`) to boot a stopped EC2. The control
+plane stores `sha256(wakeToken)` only and never sees the data-path bearer.
 
 Rules: the token is single-use and expiring, with a 15-minute TTL (403
 `pairing token is invalid or expired`; **a used token is indistinguishable from

@@ -57,6 +57,7 @@ test("mint variant: the p12 opens with the derived passphrase and nothing else",
   assert.ok(!("certificatePem" in body), "the mint variant ships the leaf inside the p12, not beside it");
   assert.equal(body.apiBaseUrl, "http://203.0.113.7:8787");
   assert.equal(body.verificationCode, session.code);
+  assert.match(body.wakeToken, /^[a-f0-9]{64}$/);
 
   const p12Path = path.join(tmpRoot, `mint-${body.deviceId}.p12`);
   fs.writeFileSync(p12Path, Buffer.from(body.p12, "base64"));

@@ -23,6 +23,9 @@ if (config.adminEmails.length === 0) {
   console.warn("RELAY_ADMIN_EMAILS unset — no env-pinned admin.");
 }
 if (!config.brokerToken) console.warn("BROKER_TOKEN unset — /v1/tunnel/* disabled.");
+if (!config.power.allowlist.length) {
+  console.warn("RELAY_POWER_INSTANCE_ALLOWLIST unset — machine start/stop disabled.");
+}
 if (!config.stt.sharedSecret) {
   console.warn("RELAY_STT_SHARED_SECRET unset — /v1/stt/stream refuses every upgrade.");
 } else if (!config.stt.sarvamApiKey) {

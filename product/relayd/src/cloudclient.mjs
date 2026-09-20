@@ -442,7 +442,36 @@ function createCloudClient({
     return res.json().catch(() => ({ ok: true }));
   }
 
-  return { nodeId, pollHandoffs, postEvent, heartbeat, reportHandoffFailure, reportHandoffReady };
+  async function registerPower({ instanceId, region, wakeTokenHash, enrollToken = null } = {}) {
+    const pubkey = fs.readFileSync(paths.identityPubPath, "utf8");
+    const bodyObj = {
+      v: 1,
+      nodeId,
+      pubkey,
+      instanceId,
+      region,
+      wakeTokenHash,
+      ts: now(),
+    };
+    if (enrollToken) bodyObj.enrollToken = enrollToken;
+    const body = Buffer.from(JSON.stringify(bodyObj), "utf8");
+    const signature = crypto.sign(null, body, privateKey).toString("base64url");
+    const res = await fetchImpl(`${base}/v1/power/registration`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-relay-node": nodeId,
+        "x-relay-signature": signature,
+      },
+      body,
+    });
+    if (res.status !== 200 && res.status !== 201) {
+      throw new Error(`cloud_power_register_${res.status}`);
+    }
+    return res.json().catch(() => ({ ok: true }));
+  }
+
+  return { nodeId, pollHandoffs, postEvent, heartbeat, reportHandoffFailure, reportHandoffReady, registerPower };
 }
 
 export { createCloudClient, nodeRequestSigningInput, mapFailureReason };

@@ -187,8 +187,12 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
     private var storedBaseURL: URL
     private let baseURLLock = NSLock()
     private let identityStore: ClientIdentityStore
+    private let powerClient: RelayMachinePowering
     private let encoder = JSONEncoder()
     private let decoder = CodexClient.makeDecoder()
+    private let wakeLock = NSLock()
+    private var wakeTask: Task<Void, Error>?
+    private var didFetchPowerCredential = false
 
     /// The exact decoder every node response goes through. Exposed so tests can
     /// decode fixtures the way the client will, instead of keeping a second
@@ -265,9 +269,14 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         return URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
     }()
 
-    init(baseURL: URL, identityStore: ClientIdentityStore) {
+    init(
+        baseURL: URL,
+        identityStore: ClientIdentityStore,
+        powerClient: RelayMachinePowering? = nil
+    ) {
         self.storedBaseURL = baseURL
         self.identityStore = identityStore
+        self.powerClient = powerClient ?? RelayPowerClient(baseURL: AppConfiguration.authBaseURL)
         super.init()
         CodexDiagnostics.log("codex_client_init", fields: [
             "baseURL": baseURL.absoluteString,
@@ -1144,7 +1153,8 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         body: Data? = nil,
         contentType: String = "application/json",
         additionalHeaders: [String: String] = [:],
-        cachePolicy: URLRequest.CachePolicy? = nil
+        cachePolicy: URLRequest.CachePolicy? = nil,
+        allowWake: Bool = true
     ) async throws -> Data {
         try await performWithResponse(
             path: path,
@@ -1153,7 +1163,8 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
             body: body,
             contentType: contentType,
             additionalHeaders: additionalHeaders,
-            cachePolicy: cachePolicy
+            cachePolicy: cachePolicy,
+            allowWake: allowWake
         ).data
     }
 
@@ -1167,7 +1178,8 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         contentType: String = "application/json",
         accept: String = "application/json",
         additionalHeaders: [String: String] = [:],
-        cachePolicy: URLRequest.CachePolicy? = nil
+        cachePolicy: URLRequest.CachePolicy? = nil,
+        allowWake: Bool = true
     ) async throws -> (data: Data, response: HTTPURLResponse) {
         let url = endpoint(path: path, queryItems: queryItems)
         guard url.scheme != nil, url.host != nil else {
@@ -1202,27 +1214,18 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         do {
             (data, response) = try await session.data(for: request)
         } catch {
-            let nsError = error as NSError
-            // NSURLErrorDomain -1200 is the same opaque code for every TLS
-            // failure. The underlying error carries the actual OSStatus (a
-            // handshake abort and a rejected client certificate are different
-            // numbers), and the identity description says what we would have
-            // offered had iOS asked — together they separate "we sent the wrong
-            // certificate" from "we were never asked for one".
-            let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError
-            CodexDiagnostics.log("codex_request_error", fields: [
-                "method": method,
-                "path": path,
-                "url": url.absoluteString,
-                "domain": nsError.domain,
-                "code": String(nsError.code),
-                "description": error.localizedDescription,
-                "hasClientIdentity": String(identityStore.hasStoredIdentity),
-                "underlyingDomain": underlying?.domain ?? "",
-                "underlyingCode": underlying.map { String($0.code) } ?? "",
-                "identity": identityStore.storedIdentityDescription
-            ])
-            throw error
+            if allowWake, RelayPowerClient.isMachineUnreachable(error) {
+                do {
+                    try await wakeMachineIfNeeded()
+                    (data, response) = try await session.data(for: request)
+                } catch {
+                    Self.logRequestError(error, method: method, path: path, url: url, identityStore: identityStore)
+                    throw error
+                }
+            } else {
+                Self.logRequestError(error, method: method, path: path, url: url, identityStore: identityStore)
+                throw error
+            }
         }
 
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -1246,7 +1249,111 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
             "status": String(httpResponse.statusCode),
             "bytes": String(data.count)
         ])
+        if allowWake {
+            Task { await self.refreshPowerCredentialIfNeeded() }
+        }
         return (data, httpResponse)
+    }
+
+    private static func logRequestError(
+        _ error: Error,
+        method: String,
+        path: String,
+        url: URL,
+        identityStore: ClientIdentityStore
+    ) {
+        let nsError = error as NSError
+        let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError
+        CodexDiagnostics.log("codex_request_error", fields: [
+            "method": method,
+            "path": path,
+            "url": url.absoluteString,
+            "domain": nsError.domain,
+            "code": String(nsError.code),
+            "description": error.localizedDescription,
+            "hasClientIdentity": String(identityStore.hasStoredIdentity),
+            "underlyingDomain": underlying?.domain ?? "",
+            "underlyingCode": underlying.map { String($0.code) } ?? "",
+            "identity": identityStore.storedIdentityDescription
+        ])
+    }
+
+    /// Starts the paired machine via the control plane, then waits until
+    /// AWS says running and the node's health endpoint answers. Returns
+    /// false when this phone has no wake token — the original connection
+    /// error should stand.
+    @discardableResult
+    private func wakeMachineIfNeeded() async -> Bool {
+        guard let credential = identityStore.wakeCredential() else { return false }
+
+        wakeLock.lock()
+        if let wakeTask {
+            wakeLock.unlock()
+            do {
+                try await wakeTask.value
+                return true
+            } catch {
+                return false
+            }
+        }
+        let task = Task { [powerClient] in
+            _ = try await powerClient.start(nodeID: credential.nodeID, wakeToken: credential.token)
+            let deadline = Date().addingTimeInterval(90)
+            while Date() < deadline {
+                if let state = try? await powerClient.state(nodeID: credential.nodeID, wakeToken: credential.token),
+                   state.isRunning {
+                    break
+                }
+                try await Task.sleep(nanoseconds: 2_000_000_000)
+            }
+            let healthDeadline = Date().addingTimeInterval(60)
+            while Date() < healthDeadline {
+                if (try? await perform(path: "/healthz", allowWake: false)) != nil {
+                    return
+                }
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+            throw RelayMachinePowerError.timeout
+        }
+        wakeTask = task
+        wakeLock.unlock()
+        defer {
+            wakeLock.lock()
+            wakeTask = nil
+            wakeLock.unlock()
+        }
+        do {
+            try await task.value
+            return true
+        } catch {
+            CodexDiagnostics.log("codex_machine_wake_failed", fields: [
+                "error": error.localizedDescription
+            ])
+            return false
+        }
+    }
+
+    private func refreshPowerCredentialIfNeeded() async {
+        if identityStore.wakeCredential() != nil { return }
+        var shouldFetch = false
+        wakeLock.lock()
+        if !didFetchPowerCredential {
+            didFetchPowerCredential = true
+            shouldFetch = true
+        }
+        wakeLock.unlock()
+        guard shouldFetch else { return }
+        struct Payload: Decodable {
+            var nodeId: String?
+            var wakeToken: String?
+        }
+        guard let data = try? await perform(path: "/v1/power/credential", allowWake: false),
+              let payload = try? decoder.decode(Payload.self, from: data),
+              let nodeID = payload.nodeId?.trimmedNonEmpty,
+              let token = payload.wakeToken?.trimmedNonEmpty else {
+            return
+        }
+        identityStore.storeWakeToken(token, nodeID: nodeID)
     }
 
     /// Downloads the node's whole workspace jail as a tar and returns a local

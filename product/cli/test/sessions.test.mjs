@@ -548,6 +548,50 @@ test("stripSyntheticMarkup extracts the request after current Codex app context"
     stripSyntheticMarkup('<send_user_message_question_reply>[{"question":"Direction?","answer":"Quiet chat"}]</send_user_message_question_reply>'),
     "Quiet chat",
   );
+  assert.equal(
+    stripSyntheticMarkup("<timestamp>Friday, Sep 18, 2026, 7:12 PM (UTC+5:30)</timestamp>\n<user_query>\nWake the machine from the phone\n</user_query>"),
+    "Wake the machine from the phone",
+  );
+  assert.equal(
+    stripSyntheticMarkup("Selected Claude skills are included below. Follow these SKILL.md instructions when they are relevant to the task.\n\n## command:relay-runtime-smoke\n\nUser task:\nRun the selected command."),
+    "Run the selected command.",
+  );
+  assert.equal(
+    stripSyntheticMarkup("<timestamp>later</timestamp>\n\n<user_query>Briefly inform the user about the task result and perform any follow-up actions (if needed). If there's no follow-ups needed, don't explicitly say that.</user_query>"),
+    "",
+  );
+});
+
+test("a Cursor agent transcript is titled by the user_query, not the timestamp tag", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-sessions-cursor-query-"));
+  const id = uuid("curq");
+  writeCursorChat(home, id, CWD, [
+    "<timestamp>Friday, Sep 18, 2026, 7:12 PM (UTC+5:30)</timestamp>",
+    "<user_query>",
+    "Can i somehow use my cursor subscription from the ec2 and then from the app too",
+    "</user_query>",
+  ].join("\n"));
+
+  const [session] = discoverSessions({ cwd: CWD, home });
+  assert.equal(
+    session.title,
+    "Can i somehow use my cursor subscription from the ec2 and then from the app too",
+  );
+  assert.doesNotMatch(session.title, /timestamp|user_query/i);
+});
+
+test("a Claude skill-wrapped command is titled by the user task", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-sessions-claude-skill-"));
+  writeClaudeSession(home, uuid("sk1"), [{
+    type: "user",
+    cwd: CWD,
+    message: {
+      content: "Selected Claude skills are included below. Follow these SKILL.md instructions when they are relevant to the task.\n\n## command:relay-runtime-smoke\n\nUser task:\nRun the selected command.",
+    },
+  }]);
+
+  const [session] = discoverSessions({ cwd: CWD, home });
+  assert.equal(session.title, "Run the selected command.");
 });
 
 test("a transcript that opens with a caveat is titled by the first real message", () => {

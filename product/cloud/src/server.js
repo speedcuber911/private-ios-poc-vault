@@ -31,6 +31,7 @@ import {
   appAccountTokenForAccount,
   createAppStoreVerifier,
 } from "./app-store.js";
+import { createPower } from "./power.js";
 
 const NODE_KINDS = new Set(["byo", "managed"]);
 
@@ -99,6 +100,9 @@ export function createApp({
   // the bad-token alert are the only signal an operator gets, and both were
   // silently wrong or absent during the 2026-08-13 token-deletion incident.
   log = (msg) => console.warn(msg),
+  // EC2 start/stop/describe. Tests inject a fake; production builds one from
+  // the instance role when RELAY_POWER_INSTANCE_ALLOWLIST is set.
+  ec2 = null,
 } = {}) {
   const registry = createRegistry(db, { now });
   const legacyAuth = createAuth({ registry, config, jwksFetcher, mailTransport, now });
@@ -225,6 +229,7 @@ export function createApp({
   // per instance, like handoffWaiters, so tests don't leak claimed
   // (nodeId, ts, signature) triples across app instances.
   const handoffReplayGuard = createReplayGuard();
+  const power = createPower({ db, config, now, ec2, replayGuard: handoffReplayGuard, log });
 
   // Per-account sliding window for POST /v1/auth/device/inspect. Mirrors the
   // spirit of the per-IP live-code ceiling on /device/start, but inspect is
@@ -371,6 +376,32 @@ export function createApp({
     // ── health ──────────────────────────────────────────────────────────
     if (method === "GET" && path === "/healthz") {
       return sendJson(res, 200, { ok: true });
+    }
+
+    // ── machine power (pairing wake token, no account) ──────────────────
+    if (method === "POST" && path === "/v1/power/registration") {
+      const raw = await readRaw(req, config.jsonBodyMaxBytes);
+      if (raw === null) return sendJson(res, 413, { error: "body_too_large" });
+      const result = power.register(
+        raw,
+        req.headers["x-relay-signature"],
+        String(req.headers["x-relay-node"] || ""),
+      );
+      return sendJson(res, result.status, result.body);
+    }
+    if (seg[0] === "v1" && seg[1] === "power" && seg[2] && seg[2] !== "registration") {
+      const nodeId = decodeURIComponent(seg[2]);
+      const authed = power.authorizeWake(req, nodeId);
+      if (authed.error === "invalid_node") return sendJson(res, 400, { error: authed.error });
+      if (authed.error) return sendJson(res, 401, { error: "unauthorized" });
+      if (method === "GET" && seg.length === 3) {
+        const result = await power.describe(authed.row);
+        return sendJson(res, result.status, result.body);
+      }
+      if (method === "POST" && seg.length === 4 && (seg[3] === "start" || seg[3] === "stop")) {
+        const result = await power.mutate(authed.row, seg[3]);
+        return sendJson(res, result.status, result.body);
+      }
     }
 
     // ── auth ────────────────────────────────────────────────────────────
@@ -1353,7 +1384,7 @@ export function createApp({
   // assertions — see the Task 8 review, I-1/I-2) — not a public API.
   return {
     server, registry, auth, pairing, notify, runSweeps, db, config,
-    handoffWaiters,
+    handoffWaiters, power,
   };
 }
 

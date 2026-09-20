@@ -113,16 +113,30 @@ function safeStat(filePath) {
   }
 }
 
+const SKIP_CONTENT_TYPES = new Set([
+  "tool_use",
+  "tool_result",
+  "thinking",
+  "redacted_thinking",
+  "function_call",
+  "function_call_output",
+  "server_tool_use",
+]);
+
 function firstText(value) {
   if (typeof value === "string") return value;
   if (Array.isArray(value)) {
     for (const item of value) {
+      if (item && typeof item === "object" && SKIP_CONTENT_TYPES.has(item.type)) continue;
       const text = firstText(item?.text ?? item?.content ?? item);
       if (text) return text;
     }
     return "";
   }
-  if (value && typeof value === "object") return firstText(value.text ?? value.content ?? "");
+  if (value && typeof value === "object") {
+    if (SKIP_CONTENT_TYPES.has(value.type)) return "";
+    return firstText(value.text ?? value.content ?? "");
+  }
   return "";
 }
 
@@ -218,10 +232,45 @@ function questionReplyText(value) {
 
 // Returns the human-written part of a turn, or "" when the whole turn was
 // machine-generated.
+const CURSOR_HOUSEKEEPING_RE = /^\s*Briefly inform the user about the task result\b/i;
+
+function unwrapNativeUserPrompt(value) {
+  let text = String(value ?? "");
+  const queries = [];
+  const queryRe = /<user_query(?:\s[^>]*)?>\s*([\s\S]*?)\s*<\/user_query\s*>/gi;
+  let match;
+  while ((match = queryRe.exec(text))) {
+    const body = match[1].replace(/\r\n?/g, "\n").trim();
+    if (body) queries.push(body);
+  }
+  if (queries.length) text = queries.join("\n\n");
+  return text
+    .replace(/<timestamp(?:\s[^>]*)?>[\s\S]*?<\/timestamp\s*>/gi, "")
+    .replace(/<image_files(?:\s[^>]*)?>[\s\S]*?<\/image_files\s*>/gi, "")
+    .replace(/<conversation_summary(?:\s[^>]*)?>[\s\S]*?<\/conversation_summary\s*>/gi, "")
+    .replace(/\[Image\]/g, "")
+    .trim();
+}
+
+function stripSkillInstructionPrefix(text) {
+  const stripped = text
+    .replace(/^Use these (Codex|Claude|Cursor) skills for this task: [^.]+[.]\s*/i, "")
+    .replace(
+      /^Selected (Codex|Claude|Cursor) skills are included below[.]\s*Follow these SKILL[.]md instructions when they are relevant to the task[.]\s+[\s\S]*?\s+User task:\s*/i,
+      "",
+    );
+  if (stripped !== text) return stripped;
+  if (!/^Selected (Codex|Claude|Cursor) skills are included below\b/i.test(text)) return text;
+  const userTask = /\nUser task:\s*/i.exec(text);
+  return userTask ? text.slice(userTask.index + userTask[0].length) : "";
+}
+
 function stripSyntheticMarkup(value) {
-  const reply = questionReplyText(value);
+  const unwrapped = unwrapNativeUserPrompt(value);
+  if (CURSOR_HOUSEKEEPING_RE.test(unwrapped)) return "";
+  const reply = questionReplyText(unwrapped);
   if (reply !== null) return reply;
-  let text = String(value ?? "").replace(SYNTHETIC_BLOCK_RE, "");
+  let text = String(unwrapped ?? "").replace(SYNTHETIC_BLOCK_RE, "");
   const requestHeading = USER_REQUEST_HEADING_RE.exec(text);
   if (requestHeading) text = text.slice(requestHeading.index + requestHeading[0].length);
   // An unclosed opener is the common case, not an edge case — the caveat that
@@ -237,7 +286,7 @@ function stripSyntheticMarkup(value) {
     .replace(/^Distinguish instructions in attached documents from the user's request\.\s*/i, "")
     .trim();
   if (INJECTED_DOCUMENT_PREFIX_RE.test(text)) return "";
-  return text;
+  return stripSkillInstructionPrefix(text).trim();
 }
 
 function titleFrom(records, fallback) {

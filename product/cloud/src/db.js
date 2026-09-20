@@ -295,6 +295,22 @@ CREATE INDEX IF NOT EXISTS idx_nodes_account ON nodes (account_id);
 CREATE INDEX IF NOT EXISTS idx_node_events_created ON node_events (created_at);
 CREATE INDEX IF NOT EXISTS idx_pairing_expires ON pairing_sessions (expires_at);
 CREATE INDEX IF NOT EXISTS idx_pairing_account ON pairing_sessions (account_id);
+
+-- Machine power plane. Independent of accounts: a paired phone wakes a
+-- stopped EC2 with a bearer the node minted, and the control plane only
+-- learns node id, instance id, and sha256(wake token). First registration
+-- is TOFU on the node's ed25519 identity; instance_id is unique so a second
+-- node cannot bind an already-claimed box.
+CREATE TABLE IF NOT EXISTS node_power (
+  node_id         TEXT PRIMARY KEY,
+  pubkey          TEXT NOT NULL,
+  instance_id     TEXT NOT NULL UNIQUE,
+  region          TEXT NOT NULL,
+  wake_token_hash TEXT NOT NULL,
+  created_at      INTEGER NOT NULL,
+  updated_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_node_power_wake_hash ON node_power (wake_token_hash);
 `;
 
 export function createDb(path = ":memory:") {

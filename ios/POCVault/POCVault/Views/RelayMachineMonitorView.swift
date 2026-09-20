@@ -93,11 +93,14 @@ private struct RelayUsagePoint: Identifiable {
 
 struct RelayMachineMonitorView: View {
     let client: CodexClient
+    var identityStore: ClientIdentityStore? = nil
     let machineName: String
     var showsDismissButton = false
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model = RelayMachineMonitorModel()
+    @StateObject private var powerModel = RelayMachinePowerModel()
+    @State private var showingStopPower = false
 
     var body: some View {
         Group {
@@ -111,14 +114,57 @@ struct RelayMachineMonitorView: View {
                 )
             } else if let errorMessage = model.errorMessage {
                 VStack(alignment: .leading, spacing: 20) {
-                    statusHeader(status: "Unreachable", warn: true, info: Self.usageInfo)
-                    Text(errorMessage)
-                        .font(AppTheme.uiFont(size: 16))
-                        .foregroundStyle(AppTheme.statusError)
-                    Button("Try again") {
-                        Task { await model.refresh(client: client) }
+                    statusHeader(
+                        status: powerModel.status == .off ? "Off" : "Unreachable",
+                        warn: true,
+                        info: canControlPower ? Self.powerInfo : Self.usageInfo
+                    )
+                    if powerModel.status.isBusy {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                            Text(powerModel.status == .stopping ? "Stopping this machine…" : "Starting this machine…")
+                                .font(AppTheme.uiFont(size: 16))
+                                .foregroundStyle(AppTheme.textSecondary)
+                        }
+                    } else {
+                        if powerModel.status != .off {
+                            Text(errorMessage)
+                                .font(AppTheme.uiFont(size: 16))
+                                .foregroundStyle(AppTheme.statusError)
+                        } else {
+                            Text("This machine is stopped. Start it from here. No Relay account needed.")
+                                .font(AppTheme.uiFont(size: 16))
+                                .foregroundStyle(AppTheme.textSecondary)
+                        }
+                        if canControlPower, powerModel.status != .unavailable {
+                            Button("Start machine") {
+                                Task {
+                                    await powerModel.start()
+                                    if powerModel.status == .on {
+                                        await model.refresh(client: client)
+                                    }
+                                }
+                            }
+                            .buttonStyle(RelayPrimaryButtonStyle())
+                            .accessibilityIdentifier("relay-usage-start-machine")
+                        }
+                        if canControlPower {
+                            Button("Try again") {
+                                Task { await model.refresh(client: client) }
+                            }
+                            .buttonStyle(RelayOutlineButtonStyle())
+                        } else {
+                            Button("Try again") {
+                                Task { await model.refresh(client: client) }
+                            }
+                            .buttonStyle(RelayPrimaryButtonStyle())
+                        }
                     }
-                    .buttonStyle(RelayPrimaryButtonStyle())
+                    if let notice = powerModel.notice {
+                        Text(notice)
+                            .font(AppTheme.uiFont(size: 15))
+                            .foregroundStyle(AppTheme.statusError)
+                    }
                 }
                 .padding(22)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -149,10 +195,27 @@ struct RelayMachineMonitorView: View {
         }
         .refreshable {
             await model.refresh(client: client)
+            await powerModel.refresh()
         }
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
+            if let identityStore {
+                powerModel.configure(identityStore: identityStore)
+                await powerModel.refresh()
+            }
             await model.monitor(client: client)
+        }
+        .confirmationDialog(
+            "Stop \(machineName)?",
+            isPresented: $showingStopPower,
+            titleVisibility: .visible
+        ) {
+            Button("Stop machine", role: .destructive) {
+                Task { await powerModel.stop() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Runs stop. Pairing stays on disk. Start it again from this phone when you need it.")
         }
         .preferredColorScheme(.dark)
     }
@@ -276,6 +339,19 @@ struct RelayMachineMonitorView: View {
             Text(uptime.map { "This machine · up \($0)" } ?? "This machine")
                 .font(AppTheme.uiFont(size: 14))
                 .foregroundStyle(AppTheme.textSecondary)
+            if canControlPower {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text("Power \(powerModel.status.label.lowercased())")
+                        .font(AppTheme.uiFont(size: 14))
+                        .foregroundStyle(AppTheme.textTertiary)
+                    if powerModel.status == .on {
+                        Button("Stop") { showingStopPower = true }
+                            .font(AppTheme.uiFont(size: 14, weight: .medium))
+                            .foregroundStyle(AppTheme.statusError)
+                            .accessibilityIdentifier("relay-usage-stop-machine")
+                    }
+                }
+            }
         }
     }
 
@@ -432,6 +508,8 @@ struct RelayMachineMonitorView: View {
         stats.alerts.contains { $0.kind == kind && $0.state == .firing }
     }
 
+    private var canControlPower: Bool { identityStore?.wakeCredential() != nil }
+
     private func loadLine(_ stats: RelayMachineStats) -> String {
         let loads = [stats.cpu.load1, stats.cpu.load5, stats.cpu.load15]
             .compactMap { value -> String? in
@@ -521,6 +599,9 @@ struct RelayMachineMonitorView: View {
 
     static let usageInfo =
         "Numbers stay on this computer. Relay notifies your phone when something stays high or the machine goes quiet, and only if this machine is connected to your account."
+
+    static let powerInfo =
+        "Start and stop use a wake token this phone received when it paired. No Relay account. Jobs and files still go only to this machine."
 
     static let unsupportedInfo =
         "This machine's Relay service is too old to report usage. Update relayd on that computer, then open Usage again."

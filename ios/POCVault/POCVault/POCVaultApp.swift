@@ -245,6 +245,7 @@ struct POCVaultRootView: View {
             NavigationStack {
                 RelayMachineMonitorView(
                     client: codexClient,
+                    identityStore: identityStore,
                     machineName: nodeStore.pairedNode?.nodeName ?? "Machine",
                     showsDismissButton: true
                 )
