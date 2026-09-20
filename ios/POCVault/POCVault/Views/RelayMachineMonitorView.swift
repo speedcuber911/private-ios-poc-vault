@@ -119,46 +119,35 @@ struct RelayMachineMonitorView: View {
                         warn: true,
                         info: canControlPower ? Self.powerInfo : Self.usageInfo
                     )
-                    if powerModel.status.isBusy {
-                        HStack(spacing: 10) {
-                            ProgressView()
-                            Text(powerModel.status == .stopping ? "Stopping this machine…" : "Starting this machine…")
-                                .font(AppTheme.uiFont(size: 16))
-                                .foregroundStyle(AppTheme.textSecondary)
-                        }
+                    if powerModel.status != .off {
+                        Text(errorMessage)
+                            .font(AppTheme.uiFont(size: 16))
+                            .foregroundStyle(AppTheme.statusError)
                     } else {
-                        if powerModel.status != .off {
-                            Text(errorMessage)
-                                .font(AppTheme.uiFont(size: 16))
-                                .foregroundStyle(AppTheme.statusError)
-                        } else {
-                            Text("This machine is stopped. Start it from here. No Relay account needed.")
-                                .font(AppTheme.uiFont(size: 16))
-                                .foregroundStyle(AppTheme.textSecondary)
-                        }
-                        if canControlPower, powerModel.status != .unavailable {
-                            Button("Start machine") {
-                                Task {
-                                    await powerModel.start()
-                                    if powerModel.status == .on {
-                                        await model.refresh(client: client)
-                                    }
+                        Text("This machine is stopped. Turn Power on from here. No Relay account needed.")
+                            .font(AppTheme.uiFont(size: 16))
+                            .foregroundStyle(AppTheme.textSecondary)
+                    }
+                    if canControlPower {
+                        RelayMachinePowerSwitch(
+                            model: powerModel,
+                            onStarted: {
+                                if powerModel.status == .on {
+                                    await model.refresh(client: client)
                                 }
-                            }
-                            .buttonStyle(RelayPrimaryButtonStyle())
-                            .accessibilityIdentifier("relay-usage-start-machine")
+                            },
+                            confirmStop: { showingStopPower = true },
+                            accessibilityIdentifier: "relay-usage-power"
+                        )
+                        Button("Try again") {
+                            Task { await model.refresh(client: client) }
                         }
-                        if canControlPower {
-                            Button("Try again") {
-                                Task { await model.refresh(client: client) }
-                            }
-                            .buttonStyle(RelayOutlineButtonStyle())
-                        } else {
-                            Button("Try again") {
-                                Task { await model.refresh(client: client) }
-                            }
-                            .buttonStyle(RelayPrimaryButtonStyle())
+                        .buttonStyle(RelayOutlineButtonStyle())
+                    } else {
+                        Button("Try again") {
+                            Task { await model.refresh(client: client) }
                         }
+                        .buttonStyle(RelayPrimaryButtonStyle())
                     }
                     if let notice = powerModel.notice {
                         Text(notice)
@@ -340,17 +329,16 @@ struct RelayMachineMonitorView: View {
                 .font(AppTheme.uiFont(size: 14))
                 .foregroundStyle(AppTheme.textSecondary)
             if canControlPower {
-                HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    Text("Power \(powerModel.status.label.lowercased())")
-                        .font(AppTheme.uiFont(size: 14))
-                        .foregroundStyle(AppTheme.textTertiary)
-                    if powerModel.status == .on {
-                        Button("Stop") { showingStopPower = true }
-                            .font(AppTheme.uiFont(size: 14, weight: .medium))
-                            .foregroundStyle(AppTheme.statusError)
-                            .accessibilityIdentifier("relay-usage-stop-machine")
-                    }
-                }
+                RelayMachinePowerSwitch(
+                    model: powerModel,
+                    onStarted: {
+                        if powerModel.status == .on {
+                            await model.refresh(client: client)
+                        }
+                    },
+                    confirmStop: { showingStopPower = true },
+                    accessibilityIdentifier: "relay-usage-power"
+                )
             }
         }
     }

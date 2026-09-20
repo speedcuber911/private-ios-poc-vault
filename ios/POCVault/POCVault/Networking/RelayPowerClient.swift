@@ -173,6 +173,26 @@ final class RelayMachinePowerModel: ObservableObject {
         var isBusy: Bool {
             self == .starting || self == .stopping
         }
+
+        var isPowered: Bool {
+            self == .on || self == .starting
+        }
+
+        var canToggle: Bool {
+            switch self {
+            case .unavailable, .starting, .stopping: return false
+            case .unknown, .on, .off: return true
+            }
+        }
+
+        var switchDetail: String? {
+            switch self {
+            case .starting: return "Starting…"
+            case .stopping: return "Stopping…"
+            case .unavailable: return "Unavailable"
+            case .unknown, .on, .off: return nil
+            }
+        }
     }
 
     @Published private(set) var status: Status = .unknown

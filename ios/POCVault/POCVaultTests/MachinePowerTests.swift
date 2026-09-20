@@ -84,6 +84,18 @@ final class MachinePowerTests: XCTestCase {
         XCTAssertFalse(stopped.isRunning)
     }
 
+    func testPowerSwitchTreatsStartingAsOnAndLocksWhileBusy() {
+        XCTAssertTrue(RelayMachinePowerModel.Status.on.isPowered)
+        XCTAssertTrue(RelayMachinePowerModel.Status.starting.isPowered)
+        XCTAssertFalse(RelayMachinePowerModel.Status.off.isPowered)
+        XCTAssertFalse(RelayMachinePowerModel.Status.stopping.isPowered)
+        XCTAssertFalse(RelayMachinePowerModel.Status.unavailable.canToggle)
+        XCTAssertFalse(RelayMachinePowerModel.Status.starting.canToggle)
+        XCTAssertTrue(RelayMachinePowerModel.Status.off.canToggle)
+        XCTAssertEqual(RelayMachinePowerModel.Status.starting.switchDetail, "Starting…")
+        XCTAssertNil(RelayMachinePowerModel.Status.on.switchDetail)
+    }
+
     private func urlSessionReturning(status: Int, body: String) -> URLSessionConfiguration {
         MockPowerURLProtocol.status = status
         MockPowerURLProtocol.body = Data(body.utf8)

@@ -389,12 +389,35 @@ struct AccountSettingsView: View {
     private var machineSection: some View {
         Section {
             if let node = nodeStore.pairedNode {
-                LabeledContent("Name", value: node.nodeName)
-                LabeledContent("Address", value: node.apiBaseURL.absoluteString)
-                LabeledContent(
-                    "Account",
-                    value: node.registeredAccountID == nil ? "Not connected" : "Connected"
-                )
+                VStack(alignment: .leading, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(node.nodeName)
+                            .font(AppTheme.serifFont(size: 22))
+                            .foregroundStyle(AppTheme.textPrimary)
+                        Text(node.apiBaseURL.absoluteString)
+                            .font(AppTheme.monoFont(size: 13))
+                            .foregroundStyle(AppTheme.textSecondary)
+                            .textSelection(.enabled)
+                        Text(node.registeredAccountID == nil ? "Paired to this phone" : "Connected to your account")
+                            .font(AppTheme.uiFont(size: 13))
+                            .foregroundStyle(AppTheme.textTertiary)
+                    }
+
+                    if identityStore.wakeCredential() != nil {
+                        RelayMachinePowerSwitch(
+                            model: powerModel,
+                            confirmStop: { showingStopPower = true },
+                            accessibilityIdentifier: "relay-settings-power"
+                        )
+                        if let notice = powerModel.notice {
+                            Text(notice)
+                                .font(AppTheme.uiFont(size: 13))
+                                .foregroundStyle(AppTheme.statusError)
+                        }
+                    }
+                }
+                .padding(.vertical, 4)
+
                 NavigationLink {
                     RelayMachineMonitorView(
                         client: codexClient,
@@ -405,32 +428,6 @@ struct AccountSettingsView: View {
                     Text("Usage")
                 }
                 .accessibilityIdentifier("relay-settings-machine-usage")
-
-                if identityStore.wakeCredential() != nil {
-                    LabeledContent("Power", value: powerModel.status.label)
-                    if powerModel.status.isBusy {
-                        HStack(spacing: 10) {
-                            ProgressView()
-                            Text(powerModel.status == .stopping ? "Stopping this machine…" : "Starting this machine…")
-                                .foregroundStyle(AppTheme.textSecondary)
-                        }
-                    } else if powerModel.status == .on {
-                        Button("Stop machine", role: .destructive) {
-                            showingStopPower = true
-                        }
-                        .accessibilityIdentifier("relay-settings-stop-machine")
-                    } else if powerModel.status != .unavailable {
-                        Button("Start machine") {
-                            Task { await powerModel.start() }
-                        }
-                        .disabled(powerModel.status.isBusy)
-                        .accessibilityIdentifier("relay-settings-start-machine")
-                    }
-                    if let notice = powerModel.notice {
-                        Label(notice, systemImage: "exclamationmark.triangle.fill")
-                            .foregroundStyle(AppTheme.statusError)
-                    }
-                }
 
                 if node.registeredAccountID == nil {
                     Button(accountStore.user == nil
@@ -456,8 +453,18 @@ struct AccountSettingsView: View {
                 }
                 .accessibilityIdentifier("relay-settings-unpair")
             } else if AppConfiguration.hasConfiguredPersonalInstall {
-                LabeledContent("Address", value: AppConfiguration.codexBaseURL.absoluteString)
-                LabeledContent("Configured by", value: "support/vault-config.json")
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Linked computer")
+                        .font(AppTheme.serifFont(size: 22))
+                        .foregroundStyle(AppTheme.textPrimary)
+                    Text(AppConfiguration.codexBaseURL.absoluteString)
+                        .font(AppTheme.monoFont(size: 13))
+                        .foregroundStyle(AppTheme.textSecondary)
+                    Text("support/vault-config.json")
+                        .font(AppTheme.uiFont(size: 13))
+                        .foregroundStyle(AppTheme.textTertiary)
+                }
+                .padding(.vertical, 4)
                 NavigationLink {
                     RelayMachineMonitorView(
                         client: codexClient,
@@ -622,4 +629,57 @@ struct AccountSettingsView: View {
         formatter.timeStyle = .short
         return formatter
     }()
+}
+
+struct RelayMachinePowerSwitch: View {
+    @ObservedObject var model: RelayMachinePowerModel
+    var onStarted: (() async -> Void)? = nil
+    var confirmStop: () -> Void
+    var accessibilityIdentifier: String
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Power")
+                    .font(AppTheme.uiFont(size: 17))
+                    .foregroundStyle(AppTheme.textPrimary)
+                if let detail = model.status.switchDetail {
+                    Text(detail)
+                        .font(AppTheme.uiFont(size: 13))
+                        .foregroundStyle(
+                            model.status == .unavailable ? AppTheme.statusError : AppTheme.textTertiary
+                        )
+                }
+            }
+            Spacer(minLength: 12)
+            if model.status.isBusy {
+                ProgressView()
+            }
+            Toggle("Power", isOn: binding)
+                .labelsHidden()
+                .tint(AppTheme.accent)
+                .disabled(!model.status.canToggle)
+                .accessibilityIdentifier(accessibilityIdentifier)
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    private var binding: Binding<Bool> {
+        Binding(
+            get: { model.status.isPowered },
+            set: { on in
+                guard !model.status.isBusy else { return }
+                if on {
+                    Task {
+                        await model.start()
+                        if model.status == .on {
+                            await onStarted?()
+                        }
+                    }
+                } else if model.status == .on {
+                    confirmStop()
+                }
+            }
+        )
+    }
 }
