@@ -92,7 +92,11 @@ final class FileBrowserViewModel: ObservableObject {
     }
 
     func loadIfNeeded() async {
-        guard listing == nil, !isLoading else { return }
+        if listing != nil { return }
+        if isLoading {
+            await waitWhileListingLoads()
+            return
+        }
         await load()
     }
 
@@ -121,6 +125,10 @@ final class FileBrowserViewModel: ObservableObject {
     /// path before using its id in a workspace-scoped endpoint. This is what prevents
     /// the intermittent `workspaceId is not registered` response in nested folders.
     func refreshConversations() async {
+        if listing == nil {
+            await loadIfNeeded()
+        }
+        await waitWhileListingLoads()
         guard let workspace = await ensureWorkspaceResolved() else { return }
         let workspaceID = workspace.id
         isLoadingConversations = true
@@ -177,8 +185,17 @@ final class FileBrowserViewModel: ObservableObject {
         path ?? listing?.currentPath ?? listing?.rootPath ?? ""
     }
 
+    private func waitWhileListingLoads() async {
+        while isLoading, listing == nil, !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+    }
+
     private func ensureWorkspaceResolved() async -> CodexWorkspace? {
         if let workspace { return workspace }
+        if isLoading {
+            await waitWhileListingLoads()
+        }
         if isResolvingWorkspace {
             while isResolvingWorkspace, !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 20_000_000)
@@ -186,7 +203,7 @@ final class FileBrowserViewModel: ObservableObject {
             return workspace
         }
         guard let listing else {
-            conversationError = "This folder is still loading."
+            conversationError = errorMessage ?? "This folder is still loading."
             return nil
         }
         await resolveWorkspaceIfNeeded(from: listing)

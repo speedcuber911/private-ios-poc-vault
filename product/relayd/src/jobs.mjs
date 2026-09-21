@@ -1531,6 +1531,7 @@ async function toJobResponse(job, shape = responseShape("preview")) {
     provider: normalizeJobProvider(job.provider),
     workspaceId: workspace?.id || job.workspaceId,
     workspaceName: workspace?.name || job.workspaceName,
+    workspacePath: workspace?.path || job.workspacePath || null,
     prompt: job.prompt,
     attachments: sanitizeAttachmentResponses(job.attachments),
     artifacts: publicArtifactResponses(job),

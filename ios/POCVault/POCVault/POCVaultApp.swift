@@ -506,7 +506,10 @@ struct POCVaultRootView: View {
                 openNewSession(folderPath: path, workspaceID: workspaceID)
             },
             onOpenConversation: { item in
-                let launch = chatSessionStore.launch(folderPath: folderPath, workspaceID: item.workspaceID)
+                let launch = chatSessionStore.launch(
+                    folderPath: folderPath ?? item.folderPath,
+                    workspaceID: item.workspaceID
+                )
                 chatLaunch = launch
                 Task { await launch.viewModel.openHistoryItem(item) }
             },
@@ -546,7 +549,10 @@ struct POCVaultRootView: View {
     }
 
     private func openSession(_ item: CodexThreadFeedItem) {
-        let launch = chatSessionStore.launch(folderPath: nil, workspaceID: item.workspaceID)
+        let launch = chatSessionStore.launch(
+            folderPath: item.folderPath,
+            workspaceID: item.workspaceID
+        )
         chatLaunch = launch
         Task { await launch.viewModel.openHistoryItem(item) }
     }
@@ -554,7 +560,7 @@ struct POCVaultRootView: View {
     private func openPreviewSourceJob(_ job: CodexJob) {
         let item = CodexThreadFeedItem(source: .pendingJob(job))
         let launch = chatSessionStore.launch(
-            folderPath: nil,
+            folderPath: item.folderPath,
             workspaceID: item.workspaceID,
             automaticallyOpensPreviews: false
         )

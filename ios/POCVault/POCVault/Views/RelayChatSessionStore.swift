@@ -63,15 +63,31 @@ final class RelayChatSessionStore: ObservableObject {
     // MARK: - Session lookup
 
     /// Canonical dictionary key for a folder path: trimmed, trailing slashes dropped,
-    /// nil/empty mapping to the shared root key.
-    nonisolated static func canonicalKey(forFolderPath path: String?) -> String {
+    /// nil/empty mapping to the shared root key. Sessions that only know a workspace
+    /// id (no folder path yet) get their own slot so they cannot steal the root chat.
+    nonisolated static func canonicalKey(forFolderPath path: String?, workspaceID: String? = nil) -> String {
+        if let folder = normalizedFolderPath(path) {
+            return folder
+        }
+        if let workspaceID = workspaceID?.trimmedNonEmpty {
+            return "workspace:\(workspaceID)"
+        }
+        return rootKey
+    }
+
+    nonisolated static func normalizedFolderPath(_ path: String?) -> String? {
         guard var trimmed = path?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
-            return rootKey
+            return nil
         }
         while trimmed.count > 1, trimmed.hasSuffix("/") {
             trimmed.removeLast()
         }
         return trimmed
+    }
+
+    nonisolated static func workspacePath(forKey key: String) -> String? {
+        if key == rootKey || key.hasPrefix("workspace:") { return nil }
+        return key
     }
 
     var cachedSessionCount: Int { sessionsByKey.count }
@@ -84,7 +100,7 @@ final class RelayChatSessionStore: ObservableObject {
     /// recently used, and pre-associate the folder's workspace.
     @discardableResult
     func session(forFolderPath path: String?, workspaceID: String? = nil) -> RelayChatViewModel {
-        let key = Self.canonicalKey(forFolderPath: path)
+        let key = Self.canonicalKey(forFolderPath: path, workspaceID: workspaceID)
         let viewModel: RelayChatViewModel
         if let cached = sessionsByKey[key] {
             viewModel = cached
@@ -92,7 +108,7 @@ final class RelayChatSessionStore: ObservableObject {
             viewModel = RelayChatViewModel(
                 client: client,
                 workspaceID: workspaceID,
-                workspacePath: key == Self.rootKey ? nil : key
+                workspacePath: Self.workspacePath(forKey: key)
             )
             sessionsByKey[key] = viewModel
         }
@@ -105,7 +121,7 @@ final class RelayChatSessionStore: ObservableObject {
     /// Session lookup packaged for `fullScreenCover(item:)`.
     func launch(folderPath: String?, workspaceID: String? = nil, automaticallyOpensPreviews: Bool = true) -> RelayChatLaunch {
         RelayChatLaunch(
-            id: Self.canonicalKey(forFolderPath: folderPath),
+            id: Self.canonicalKey(forFolderPath: folderPath, workspaceID: workspaceID),
             viewModel: session(forFolderPath: folderPath, workspaceID: workspaceID),
             presentsProviderPicker: false,
             automaticallyOpensPreviews: automaticallyOpensPreviews
@@ -119,7 +135,7 @@ final class RelayChatSessionStore: ObservableObject {
         let viewModel = session(forFolderPath: folderPath, workspaceID: workspaceID)
         viewModel.startNewConversation()
         return RelayChatLaunch(
-            id: Self.canonicalKey(forFolderPath: folderPath),
+            id: Self.canonicalKey(forFolderPath: folderPath, workspaceID: workspaceID),
             viewModel: viewModel,
             presentsProviderPicker: true,
             automaticallyOpensPreviews: true

@@ -254,6 +254,33 @@ function findCursorSessionMeta(sessionId) {
   return { cwd: session.cwd, provider: "cursor", timestamp: session.timestamp };
 }
 
+function materializeCursorChatWorkspaces() {
+  const chatsRoot = path.join(runHome, ".cursor", "chats");
+  let buckets = [];
+  try {
+    buckets = fs.readdirSync(chatsRoot, { withFileTypes: true });
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    return;
+  }
+  for (const bucket of buckets) {
+    if (!bucket.isDirectory() || !/^[a-f0-9]{32}$/.test(bucket.name)) continue;
+    let names = [];
+    try {
+      names = fs.readdirSync(path.join(chatsRoot, bucket.name), { withFileTypes: true });
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      continue;
+    }
+    for (const entry of names) {
+      if (!entry.isDirectory() || !isResumableSessionId(entry.name)) continue;
+      const meta = readCursorMeta(path.join(chatsRoot, bucket.name, entry.name));
+      if (meta?.cwd) workspaceForSessionCwd(meta.cwd);
+    }
+  }
+}
+
+
 function listCursorSessionsForWorkspace(workspace) {
   const found = new Map();
   const chatsRoot = path.join(runHome, ".cursor", "chats");
@@ -524,6 +551,7 @@ function listWorkspaceSessions({ workspaceId, provider = null, limit, includeSum
   }
 
   if (!provider || provider === "cursor") {
+    if (!selectedWorkspace) materializeCursorChatWorkspaces();
     const cursorWorkspaces = selectedWorkspace
       ? [selectedWorkspace]
       : [...workspaces.values(), ...dynamicWorkspaces.values()];

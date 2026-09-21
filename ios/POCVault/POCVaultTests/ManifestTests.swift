@@ -1023,6 +1023,92 @@ final class ManifestTests: XCTestCase {
         XCTAssertNil(cached.currentSessionProvider)
     }
 
+    @MainActor
+    func testOpeningASessionBindsTheChatToTheThreadFolder() throws {
+        let thread = try decodeCodexThread("""
+        {
+          "id": "019e46a3-aaaa-7000-8000-000000000001",
+          "sessionId": "019e46a3-aaaa-7000-8000-000000000001",
+          "workspaceId": "dir-komal-private-ios-poc-vault",
+          "workspaceName": "Komal / private-ios-poc-vault",
+          "cwd": "/home/komal/Komal/private-ios-poc-vault",
+          "provider": "cursor",
+          "lastPrompt": "continue this thread"
+        }
+        """)
+        let item = CodexThreadFeedItem(source: .thread(thread))
+        XCTAssertEqual(item.folderPath, "/home/komal/Komal/private-ios-poc-vault")
+        XCTAssertEqual(item.workspaceID, "dir-komal-private-ios-poc-vault")
+
+        let store = RelayChatSessionStore(
+            client: makeOfflineCodexClient(),
+            capacity: 4,
+            isPinned: { _ in false }
+        )
+        let launch = store.launch(folderPath: item.folderPath, workspaceID: item.workspaceID)
+        XCTAssertEqual(launch.viewModel.workspacePath, "/home/komal/Komal/private-ios-poc-vault")
+        XCTAssertEqual(launch.viewModel.workspaceID, "dir-komal-private-ios-poc-vault")
+        XCTAssertNotEqual(launch.id, RelayChatSessionStore.rootKey)
+
+        let other = store.launch(folderPath: nil, workspaceID: "scratch")
+        XCTAssertEqual(other.id, "workspace:scratch")
+        XCTAssertFalse(launch.viewModel === other.viewModel)
+        XCTAssertTrue(RelayChatViewModel.isInHistoryScope(
+            itemWorkspaceID: item.workspaceID,
+            folderWorkspaceID: launch.viewModel.workspaceID,
+            isWorkspaceRoot: launch.viewModel.workspacePath == nil
+        ))
+
+        let root = try AppSourceFixture.load("POCVault/POCVaultApp.swift")
+        XCTAssertTrue(root.contains("folderPath: item.folderPath"))
+        XCTAssertFalse(root.contains("launch(folderPath: nil, workspaceID: item.workspaceID)"))
+        let browser = try AppSourceFixture.load("POCVault/Browser/FileBrowserViewModel.swift")
+        XCTAssertTrue(browser.contains("waitWhileListingLoads"))
+    }
+
+    func testChoiceMatchingThreadKeepsTheThreadHarness() throws {
+        let models = try decodeCodexModels("""
+        [
+          {"id":"gpt-5.5","label":"GPT-5.5","provider":"codex","modes":["chat","task"]},
+          {"id":"cursor-composer","label":"Composer","provider":"cursor","modes":["task"]}
+        ]
+        """)
+        let cursor = RelayChatViewModel.choiceMatchingThread(
+            from: models,
+            provider: .cursor,
+            mode: .task,
+            model: nil
+        )
+        XCTAssertEqual(cursor?.executionProvider, .cursor)
+        XCTAssertEqual(cursor?.model.id, "cursor-composer")
+        XCTAssertNil(
+            RelayChatViewModel.choiceMatchingThread(
+                from: [],
+                provider: .cursor,
+                mode: .task,
+                model: nil
+            ),
+            "An empty catalog must not invent a different harness"
+        )
+    }
+
+    func testCodexJobDecodesWorkspacePathForFolderBinding() throws {
+        let job = try decodeCodexJob("""
+        {
+          "id": "job-path",
+          "status": "succeeded",
+          "workspaceId": "dir-komal-private-ios-poc-vault",
+          "workspacePath": "/home/komal/Komal/private-ios-poc-vault",
+          "provider": "cursor"
+        }
+        """)
+        XCTAssertEqual(job.workspacePath, "/home/komal/Komal/private-ios-poc-vault")
+        XCTAssertEqual(
+            CodexThreadFeedItem(source: .pendingJob(job)).folderPath,
+            "/home/komal/Komal/private-ios-poc-vault"
+        )
+    }
+
     /// A client pointed at a closed local port: constructing view models never fires
     /// requests, and anything fired by mistake fails fast without leaving the machine.
     private func makeOfflineCodexClient() -> CodexClient {

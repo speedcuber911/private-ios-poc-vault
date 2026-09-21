@@ -315,6 +315,7 @@ final class RelayChatViewModel: ObservableObject {
     private var conversationRevision = UUID()
     private var currentThreadID: String?
     private var currentThreadProvider: CodexProvider?
+    private var currentThreadMode: RelayInteractionMode = .task
     /// Workspace the current thread belongs to. Resuming a session in a different
     /// workspace is rejected by the server ("session does not belong to workspace"), so
     /// we only resume when this matches the compose workspace.
@@ -466,6 +467,22 @@ final class RelayChatViewModel: ObservableObject {
 
     private func ensureSelectedChoiceValid() {
         let sections = pickerSections
+        if let provider = currentThreadProvider {
+            if let selectedChoice, selectedChoice.executionProvider == provider,
+               let refreshed = sections.allChoices.first(where: { $0.id == selectedChoice.id }) {
+                self.selectedChoice = refreshed
+                return
+            }
+            if let choice = Self.choiceMatchingThread(
+                from: models,
+                provider: provider,
+                mode: currentThreadMode,
+                model: selectedChoice?.model.id
+            ) {
+                selectChoice(choice)
+            }
+            return
+        }
         if let selectedChoice, let refreshed = sections.allChoices.first(where: { $0.id == selectedChoice.id }) {
             self.selectedChoice = refreshed
             return
@@ -505,9 +522,15 @@ final class RelayChatViewModel: ObservableObject {
             await refreshSkills()
             await refreshThreads()
             await refreshHandoffs()
-            errorMessage = nil
+            // Opening a thread races this bootstrap. Keep that thread's error
+            // and provider; do not reset to an empty root catalog default.
+            if currentThreadID == nil {
+                errorMessage = nil
+            }
         } catch {
-            errorMessage = error.localizedDescription
+            if currentThreadID == nil {
+                errorMessage = error.localizedDescription
+            }
         }
         #if DEBUG
         await runAutoDriveIfRequested()
@@ -1073,6 +1096,7 @@ final class RelayChatViewModel: ObservableObject {
         conversationRevision = UUID()
         currentThreadID = nil
         currentThreadProvider = nil
+        currentThreadMode = .task
         currentThreadWorkspaceID = nil
         currentThreadWorkspaceName = nil
         isLoadingThreadDetail = false
@@ -1123,19 +1147,16 @@ final class RelayChatViewModel: ObservableObject {
             guard conversationRevision == revision else { return }
             currentThreadID = detail.thread.sessionId
             currentThreadProvider = detail.thread.provider
+            currentThreadMode = detail.thread.mode
             currentThreadWorkspaceID = detail.thread.workspaceId
             currentThreadWorkspaceName = detail.thread.workspaceName
-            // Continuation keeps the thread's explicit mode in the selection.
-            let mode = detail.thread.mode
-            let threadModel = detail.thread.model
-            if let model = models.first(where: {
-                $0.provider == detail.thread.provider
-                    && $0.supports(mode)
-                    && (threadModel == nil || $0.id == threadModel || $0.taskModel == threadModel)
-            }) {
-                selectChoice(RelayModelChoice(model: model, mode: mode))
-            } else if let model = models.first(where: { $0.provider == detail.thread.provider && $0.supports(mode) }) {
-                selectChoice(RelayModelChoice(model: model, mode: mode))
+            if let choice = Self.choiceMatchingThread(
+                from: models,
+                provider: detail.thread.provider,
+                mode: detail.thread.mode,
+                model: detail.thread.model
+            ) {
+                selectChoice(choice)
             }
             var items = detail.messages.map { message in
                 RelayConversationItem(
@@ -1161,16 +1182,17 @@ final class RelayChatViewModel: ObservableObject {
     private func presentThreadSeed(_ thread: CodexThread) {
         currentThreadID = thread.sessionId
         currentThreadProvider = thread.provider
+        currentThreadMode = thread.mode
         currentThreadWorkspaceID = thread.workspaceId
         currentThreadWorkspaceName = thread.workspaceName
 
-        let mode = thread.mode
-        if let model = models.first(where: {
-            $0.provider == thread.provider
-                && $0.supports(mode)
-                && (thread.model == nil || $0.id == thread.model || $0.taskModel == thread.model)
-        }) ?? models.first(where: { $0.provider == thread.provider && $0.supports(mode) }) {
-            selectChoice(RelayModelChoice(model: model, mode: mode))
+        if let choice = Self.choiceMatchingThread(
+            from: models,
+            provider: thread.provider,
+            mode: thread.mode,
+            model: thread.model
+        ) {
+            selectChoice(choice)
         }
 
         var items: [RelayConversationItem] = []
@@ -1236,15 +1258,17 @@ final class RelayChatViewModel: ObservableObject {
     private func presentStandaloneJob(_ latest: CodexJob) {
         currentThreadID = latest.threadSessionId
         currentThreadProvider = latest.provider
+        currentThreadMode = .task
         currentThreadWorkspaceID = latest.workspaceId
         currentThreadWorkspaceName = latest.workspaceName
 
-        if let model = models.first(where: {
-            $0.provider == latest.provider
-                && $0.supports(.task)
-                && (latest.model == nil || $0.id == latest.model || $0.taskModel == latest.model)
-        }) ?? models.first(where: { $0.provider == latest.provider && $0.supports(.task) }) {
-            selectChoice(RelayModelChoice(model: model, mode: .task))
+        if let choice = Self.choiceMatchingThread(
+            from: models,
+            provider: latest.provider,
+            mode: .task,
+            model: latest.model
+        ) {
+            selectChoice(choice)
         }
 
         var items: [RelayConversationItem] = []
@@ -1403,6 +1427,25 @@ final class RelayChatViewModel: ObservableObject {
             return itemWorkspaceID == folderWorkspaceID
         }
         return isWorkspaceRoot && itemWorkspaceID == nil
+    }
+
+    /// Pick the catalog row that can actually continue this thread. Empty catalogs
+    /// stay unselected rather than falling back to a different harness.
+    nonisolated static func choiceMatchingThread(
+        from models: [CodexModelDescriptor],
+        provider: CodexProvider,
+        mode: RelayInteractionMode,
+        model: String?
+    ) -> RelayModelChoice? {
+        let choices = RelayModelDiscovery.sections(from: models).allChoices.filter {
+            $0.mode == mode && $0.executionProvider == provider
+        }
+        if let model, let exact = choices.first(where: {
+            $0.model.id == model || $0.model.taskModel == model
+        }) {
+            return exact
+        }
+        return choices.first
     }
 
     /// Which task runner executes a model's jobs. Cursor keeps its own runner; Azure

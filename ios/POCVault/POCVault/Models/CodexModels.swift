@@ -1372,6 +1372,19 @@ struct CodexThreadFeedItem: Hashable, Identifiable {
         }
     }
 
+    /// Folder to bind the chat to when opening this row from Sessions or Chats.
+    /// A workspace identity without a path still belongs to a folder; a path
+    /// without a workspace id is a legacy global chat and stays on the root.
+    var folderPath: String? {
+        guard workspaceID?.trimmedNonEmpty != nil else { return nil }
+        switch source {
+        case .thread(let thread):
+            return thread.cwd?.trimmedNonEmpty
+        case .pendingJob(let job):
+            return job.workspacePath?.trimmedNonEmpty
+        }
+    }
+
     var updatedAt: Date? {
         switch source {
         case .thread(let thread):
@@ -1557,6 +1570,7 @@ struct CodexJob: Decodable, Hashable, Identifiable {
     let provider: CodexProvider
     let workspaceId: String?
     let workspaceName: String?
+    let workspacePath: String?
     let status: CodexJobStatus
     let prompt: String?
     let createdAt: Date?
@@ -1597,6 +1611,9 @@ struct CodexJob: Decodable, Hashable, Identifiable {
         case workspace
         case workspaceId
         case workspaceName
+        case workspacePath
+        case path
+        case cwd
         case status
         case state
         case prompt
@@ -1667,6 +1684,10 @@ struct CodexJob: Decodable, Hashable, Identifiable {
             ?? workspace?.id
         self.workspaceName = (try container.decodeLooseStringIfPresent(forKey: .workspaceName))
             ?? workspace?.name
+        let explicitWorkspacePath = try container.decodeLooseStringIfPresent(forKey: .workspacePath)
+        let alternateWorkspacePath = try container.decodeLooseStringIfPresent(forKey: .path)
+        let jobCwd = try container.decodeLooseStringIfPresent(forKey: .cwd)
+        self.workspacePath = explicitWorkspacePath ?? workspace?.path ?? alternateWorkspacePath ?? jobCwd
         self.status = status ?? state ?? .unknown("unknown")
         self.prompt = try container.decodeLooseStringIfPresent(forKey: .prompt)
         self.createdAt = try container.decodeLossyDateIfPresent(forKey: .createdAt)

@@ -86,3 +86,17 @@ test("native Claude and Cursor transcripts appear in the same workspace session 
   assert.equal(cursorDetail.thread.provider, "cursor");
   assert.equal(cursorDetail.messages.at(-1).text, "cursor done");
 });
+
+test("Cursor chats in an unregistered nested folder appear in the unfiltered thread list", () => {
+  const nested = path.join(process.env.CODEX_WORKSPACE_BROWSE_ROOT, "sidecar");
+  fs.mkdirSync(nested, { recursive: true });
+  const nestedId = "77777777-aaaa-4bbb-8ccc-888888888888";
+  writeCursorSession(nested, nestedId, "Continue the sidecar work");
+
+  const sessions = listWorkspaceSessions({ limit: 50 });
+  const found = sessions.find((session) => session.id === nestedId);
+  assert.ok(found, "a Cursor chat whose folder was never selected still lists");
+  assert.equal(found.provider, "cursor");
+  assert.equal(found.cwd, nested);
+  assert.equal(found.workspaceId, "dir-sidecar");
+});
