@@ -735,7 +735,7 @@ async function makeCacheWritingCodex(tmpDir) {
       "test \"$NPM_CONFIG_AUDIT\" = false",
       "test \"$NPM_CONFIG_FUND\" = false",
       "test \"$NPM_CONFIG_PREFER_OFFLINE\" = true",
-      "mkdir -p \"$HOME/.npm/_cacache\" \"$HOME/.npm/_npx/tool\" \"$HOME/.npm/_logs\" \"$HOME/.bun/install/cache\" \"$NPM_CONFIG_CACHE/_npx/tool\" \"$NPM_CONFIG_CACHE/_logs\" \"$BUN_INSTALL_CACHE_DIR\" \"$CODEX_HOME/.tmp/plugin\"",
+      "mkdir -p \"$HOME/.npm/_cacache\" \"$HOME/.npm/_npx/tool\" \"$HOME/.npm/_logs\" \"$HOME/.bun/install/cache\" \"$NPM_CONFIG_CACHE/_npx/tool\" \"$NPM_CONFIG_CACHE/_logs\" \"$BUN_INSTALL_CACHE_DIR\" \"$CODEX_HOME/.tmp/plugin\" \"$CODEX_HOME/tmp/arg0/stale\"",
       "printf cache > \"$HOME/.npm/_cacache/blob\"",
       "printf npx > \"$HOME/.npm/_npx/tool/blob\"",
       "printf log > \"$HOME/.npm/_logs/debug.log\"",
@@ -745,6 +745,7 @@ async function makeCacheWritingCodex(tmpDir) {
       "printf log > \"$NPM_CONFIG_CACHE/_logs/debug.log\"",
       "printf bun > \"$BUN_INSTALL_CACHE_DIR/blob\"",
       "printf tmp > \"$CODEX_HOME/.tmp/plugin/blob\"",
+      "printf leftover > \"$CODEX_HOME/tmp/arg0/stale/blob\"",
       "if [ -n \"$out\" ]; then printf 'clean answer: %s\\n' \"$prompt\" > \"$out\"; fi",
       "exit 0",
       "",
@@ -2880,6 +2881,7 @@ localTest("retains package caches while pruning transient runner state", "inspec
     assert.equal(await pathExists(path.join(runHome, ".npm-cache", "_logs")), false);
     assert.equal(await fs.readFile(path.join(runHome, ".bun-cache", "blob"), "utf8"), "bun");
     assert.equal(await pathExists(path.join(codexHome, ".tmp")), false);
+    assert.equal(await pathExists(path.join(codexHome, "tmp", "arg0")), false);
   } finally {
     await server.stop();
   }

@@ -17,7 +17,7 @@ process.env.CODEX_WORKSPACE_BROWSE_ROOT = dir;
 process.env.CODEX_WORKSPACES = JSON.stringify([{ id: "scratch", name: "Scratch", path: workspace }]);
 process.env.RELAYD_CODEX_TRANSPORT = "app-server";
 
-const { buildJobPrompt, buildJobEnv } = await import("../src/jobs.mjs");
+const { buildJobPrompt, buildJobEnv, runtimeCacheTargets } = await import("../src/jobs.mjs");
 
 test("Codex app-server receives each selected skill once as a structured input", () => {
   const skill = { id: "review", name: "review", file: skillFile, kind: "skill" };
@@ -51,4 +51,18 @@ test("Claude keeps provider skills in its prompt and never receives Codex skill 
     skillInputs: [{ name: skill.name, path: skill.file, kind: skill.kind }],
   });
   assert.deepEqual(JSON.parse(env.RELAY_CODEX_SKILL_INPUTS), []);
+});
+
+test("job env prepares a private Codex arg0 temp dir for idle prune", () => {
+  const env = buildJobEnv({
+    id: "job-arg0",
+    provider: "codex",
+    workspacePath: workspace,
+    resultPath: path.join(dir, "answer-arg0.md"),
+  });
+  const arg0 = path.join(process.env.CODEX_HOME, "tmp", "arg0");
+  assert.equal(fs.existsSync(arg0), true);
+  assert.equal(fs.statSync(arg0).mode & 0o777, 0o700);
+  assert.equal(env.CODEX_HOME, process.env.CODEX_HOME);
+  assert.equal(runtimeCacheTargets().includes(arg0), true);
 });

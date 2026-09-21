@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { AppServerClient } from "./appserver-client.mjs";
 import { ApprovalStore } from "./approval-store.mjs";
+import { isCodexHarnessNoise } from "./codex-noise.mjs";
 
 const jobId = requiredEnv("RELAY_JOB_ID");
 const workspacePath = path.resolve(requiredEnv("RELAY_WORKSPACE_PATH"));
@@ -37,7 +38,10 @@ const client = new AppServerClient({
   experimental: false,
 });
 
-client.on("stderr", (line) => process.stderr.write(`${line}\n`));
+client.on("stderr", (line) => {
+  if (isCodexHarnessNoise(line)) return;
+  process.stderr.write(`${line}\n`);
+});
 client.on("protocolWarning", (line) => process.stderr.write(`[app-server] ${line}\n`));
 client.on("request", (message) => void handleServerRequest(message));
 client.on("notification", (message) => handleNotification(message));

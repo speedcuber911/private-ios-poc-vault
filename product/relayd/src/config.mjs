@@ -366,6 +366,18 @@ for (const dir of [runHome, codexHome]) {
   }
 }
 
+// Codex extracts helper binaries into `$CODEX_HOME/tmp/arg0` and janitors
+// leftover session dirs on every start. Creating that directory here, with
+// the runner's uid, stops the first spawn from warning "failed to clean up
+// stale arg0 temp dirs" merely because the parent did not exist.
+try {
+  const codexArg0TempDir = path.join(codexHome, "tmp", "arg0");
+  fs.mkdirSync(codexArg0TempDir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(codexArg0TempDir, 0o700);
+} catch {
+  // Same as above: operator-supplied CODEX_HOME may be unwritable.
+}
+
 // ---------------------------------------------------------------------------
 // Client-certificate subject allowlist (API.md §1.2).
 //

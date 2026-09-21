@@ -2438,11 +2438,16 @@ enum RelayRunLogParser {
                 continue
             }
             if trimmed.uppercased().hasPrefix(warningPrefix) {
-                flushProse()
-                flushStep()
                 let message = trimmed
                     .dropFirst(warningPrefix.count)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
+                // Codex janitor noise is not about the user's prompt. Don't
+                // split a live step or light up the collapsed run card.
+                if isHarnessNoise(message.isEmpty ? trimmed : message) {
+                    continue
+                }
+                flushProse()
+                flushStep()
                 blocks.append(RelayRunLogBlock(
                     id: nextID("warn"),
                     kind: .warning(message.isEmpty ? trimmed : message)
@@ -2488,5 +2493,19 @@ enum RelayRunLogParser {
             }
         }
         return nil
+    }
+
+    /// Codex writes these on every start when leftover `$CODEX_HOME/tmp/arg0`
+    /// dirs are locked or owned by another uid. They are not actionable from
+    /// the phone, and they used to show as a warning on the collapsed run card.
+    private static func isHarnessNoise(_ message: String) -> Bool {
+        let lower = message.lowercased()
+        if lower.contains("failed to clean up stale"), lower.contains("temp dirs") {
+            return true
+        }
+        if lower.contains("could not create path aliases") {
+            return true
+        }
+        return false
     }
 }

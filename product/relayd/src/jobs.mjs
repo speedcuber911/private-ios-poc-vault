@@ -26,6 +26,7 @@ import { prepareJobWorkdir, completeJobWorktree } from "./worktree.mjs";
 import { ApprovalStore } from "./approval-store.mjs";
 import { assertProviderReady, detectProviderVersion } from "./harness.mjs";
 import { validateConfiguredTaskSelection, validateRuntimeTaskSelection } from "./catalog.mjs";
+import { stripCodexHarnessNoise } from "./codex-noise.mjs";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const codexJobRunner = path.join(moduleDir, "codex-job-runner.mjs");
@@ -748,8 +749,10 @@ function startJob(job) {
   });
 
   child.stderr.on("data", (chunk) => {
-    stderr = appendBounded(stderr, chunk);
-    stderrStream.write(chunk, () => notifyJobStreamData(job.id));
+    const text = stripCodexHarnessNoise(chunk.toString("utf8"));
+    if (!text) return;
+    stderr = appendBounded(stderr, text);
+    stderrStream.write(text, () => notifyJobStreamData(job.id));
   });
 
   child.on("error", (error) => {
@@ -1435,15 +1438,28 @@ function pruneRuntimeCaches() {
 }
 
 
+const codexArg0TempDir = path.join(codexHome, "tmp", "arg0");
+
 // Package tarballs are reusable runtime infrastructure on a linked machine,
 // not per-job scratch. In particular, trial sandboxes may have intermittent
 // registry DNS/egress; deleting the cache before every task made a previously
 // installable project impossible to start on the next task. Ensure npm/bun can
 // write their configured caches, then retain package bytes across jobs.
+//
+// Codex also extracts helper binaries into `$CODEX_HOME/tmp/arg0`. If leftover
+// dirs there are unreadable, every job starts with
+// "WARNING: failed to clean up stale arg0 temp dirs" on stderr — which the
+// phone used to promote onto the collapsed run card. Create the directory
+// owned by the runner, and prune stale children when idle.
 function prepareRuntimePackageCaches() {
-  for (const [name, target] of [["npm", npmCacheDir], ["bun", bunCacheDir]]) {
+  for (const [name, target] of [
+    ["npm", npmCacheDir],
+    ["bun", bunCacheDir],
+    ["codex-arg0", codexArg0TempDir],
+  ]) {
     try {
       fs.mkdirSync(target, { recursive: true, mode: 0o700 });
+      if (name === "codex-arg0") fs.chmodSync(target, 0o700);
     } catch (error) {
       appendAudit("runtime_cache_prepare_failed", null, {
         cache: name,
@@ -1461,6 +1477,7 @@ function runtimeCacheTargets() {
     path.join(npmCacheDir, "_npx"),
     path.join(npmCacheDir, "_logs"),
     path.join(codexHome, ".tmp"),
+    codexArg0TempDir,
   ])];
 }
 

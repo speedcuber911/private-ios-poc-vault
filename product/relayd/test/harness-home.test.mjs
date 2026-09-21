@@ -51,6 +51,10 @@ test("CODEX_HOME is created when it does not exist", (t) => {
   assert.equal(cfg.codexHome, codexHome);
   assert.ok(fs.existsSync(codexHome), "codex refuses to start without this directory");
   assert.ok(fs.existsSync(runHome), "HOME is handed to the child too");
+  assert.ok(
+    fs.existsSync(path.join(codexHome, "tmp", "arg0")),
+    "Codex janitor needs a runner-owned arg0 temp root",
+  );
 });
 
 test("an explicitly set CODEX_HOME is created as well", (t) => {

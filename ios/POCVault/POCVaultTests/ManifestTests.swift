@@ -3419,7 +3419,7 @@ final class ManifestTests: XCTestCase {
         [relay-step] Running /bin/bash -lc "git status --short --branch"
         ## main...origin/main
         ?? artifacts/
-        WARNING: failed to clean up stale temp dirs · os error 13
+        WARNING: Codex sandbox could not access the workspace
         [relay-step] Running git fetch origin main --prune
         """
         let blocks = RelayRunLogParser.parse(raw)
@@ -3436,11 +3436,41 @@ final class ManifestTests: XCTestCase {
         guard case .warning(let warning) = blocks[2].kind else {
             return XCTFail("expected warning")
         }
-        XCTAssertTrue(warning.contains("stale temp dirs"))
+        XCTAssertTrue(warning.contains("sandbox could not access"))
         guard case .step(let fetch, _, _) = blocks[3].kind else {
             return XCTFail("expected fetch step")
         }
         XCTAssertEqual(fetch, "git fetch origin main --prune")
+    }
+
+    func testRelayRunLogParserDropsCodexArg0JanitorNoise() {
+        let raw = """
+        WARNING: failed to clean up stale arg0 temp dirs: Permission denied (os error 13)
+        WARNING: proceeding, even though we could not create PATH aliases: Permission denied (os error 13)
+        [relay-step] Running git status --short --branch
+        ## main...origin/main
+        WARNING: failed to clean up stale temp dirs · os error 13
+        ?? artifacts/
+        [relay-step] Running git fetch origin main --prune
+        WARNING: Codex sandbox could not access the workspace
+        """
+        let blocks = RelayRunLogParser.parse(raw)
+        XCTAssertEqual(blocks.count, 3)
+        guard case .step(let status, let output, _) = blocks[0].kind else {
+            return XCTFail("expected git status step")
+        }
+        XCTAssertEqual(status, "git status --short --branch")
+        XCTAssertTrue(output.contains("## main...origin/main"))
+        XCTAssertTrue(output.contains("?? artifacts/"))
+        XCTAssertFalse(output.lowercased().contains("temp dirs"))
+        guard case .step(let fetch, _, _) = blocks[1].kind else {
+            return XCTFail("expected fetch step")
+        }
+        XCTAssertEqual(fetch, "git fetch origin main --prune")
+        guard case .warning(let warning) = blocks[2].kind else {
+            return XCTFail("expected real sandbox warning")
+        }
+        XCTAssertTrue(warning.contains("sandbox could not access"))
     }
 
     func testRelayFullLogSheetFollowsViewModelAndStopsAtTerminalStatus() throws {
