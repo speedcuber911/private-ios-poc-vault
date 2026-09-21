@@ -2822,6 +2822,13 @@ localTest("saves job attachments and includes their paths in the Codex prompt", 
     assert.equal(created.attachments[0].filename, "Screen-Shot-2026.png");
     assert.equal(created.attachments[0].contentType, "image/png");
     assert.equal(created.attachments[0].bytes, 16);
+    assert.equal(created.attachments[0].kind, "image");
+    assert.equal(created.attachments[0].rawURL, `/v1/codex/jobs/${created.id}/attachments/0/raw`);
+
+    const raw = await fetch(`${server.baseUrl}${created.attachments[0].rawURL}`);
+    assert.equal(raw.status, 200);
+    assert.equal(raw.headers.get("content-type"), "image/png");
+    assert.equal(Buffer.from(await raw.arrayBuffer()).toString("utf8"), "fake image bytes");
 
     const job = await waitForJob(server, created.id);
 

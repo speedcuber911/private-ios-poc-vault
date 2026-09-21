@@ -1,5 +1,7 @@
 import AVFoundation
+import PhotosUI
 import SwiftUI
+import UniformTypeIdentifiers
 import UIKit
 
 private enum RelayChatStyle {
@@ -43,6 +45,7 @@ struct RelayChatView: View {
     @State private var threadsPreferLarge = false
     @State private var fullLogRequest: RelayFullLogRequest?
     @State private var artifactRequest: CodexJobArtifact?
+    @State private var attachmentRequest: RelayDisplayedAttachment?
     @State private var remotePreviewRequest: RelayRemotePreviewRequest?
     @State private var automaticallyOpenedPreviews: Set<String> = []
     @State private var modelPickerRequest = 0
@@ -70,6 +73,7 @@ struct RelayChatView: View {
                 if !showingThreads {
                     RelayComposer(
                         text: $viewModel.prompt,
+                        attachments: $viewModel.draftAttachments,
                         sections: viewModel.pickerSections,
                         selectedChoice: viewModel.selectedChoice,
                         modelPickerRequest: modelPickerRequest,
@@ -102,7 +106,9 @@ struct RelayChatView: View {
                         },
                         onConnectProvider: { provider in
                             providerLoginRequest = provider
-                        }
+                        },
+                        onAddAttachments: { viewModel.addDraftAttachments($0) },
+                        onRemoveAttachment: { viewModel.removeDraftAttachment(id: $0) }
                     )
                     .fixedSize(horizontal: false, vertical: true)
                 }
@@ -184,6 +190,12 @@ struct RelayChatView: View {
                     artifact: artifact,
                     client: client,
                     identityStore: identityStore
+                )
+            }
+            .fullScreenCover(item: $attachmentRequest) { attachment in
+                RelayAttachmentViewer(
+                    attachment: attachment,
+                    client: client
                 )
             }
             .fullScreenCover(item: $remotePreviewRequest) { request in
@@ -391,7 +403,9 @@ struct RelayChatView: View {
                                 .id(item.id)
                                 .transition(.move(edge: .bottom).combined(with: .opacity))
                             } else {
-                                RelayChatBubble(item: item)
+                                RelayChatBubble(item: item, client: client) { attachment in
+                                    attachmentRequest = attachment
+                                }
                                     .id(item.id)
                                     .transition(.move(edge: item.role == .user ? .trailing : .leading).combined(with: .opacity))
                             }
@@ -548,6 +562,7 @@ private struct RelayComposer: View {
     }
 
     @Binding var text: String
+    @Binding var attachments: [RelayDraftAttachment]
     let sections: RelayModelPickerSections
     let selectedChoice: RelayModelChoice?
     let modelPickerRequest: Int
@@ -574,6 +589,8 @@ private struct RelayComposer: View {
     let onStop: () -> Void
     /// Direct provider sign-in from this iPhone; nil hides the affordance.
     var onConnectProvider: ((CodexProvider) -> Void)? = nil
+    var onAddAttachments: ([RelayDraftAttachment]) -> Void = { _ in }
+    var onRemoveAttachment: (UUID) -> Void = { _ in }
     @State private var isFocused = false
     @State private var editorSelection = NSRange(location: 0, length: 0)
     @State private var editorHeight: CGFloat = 36
@@ -581,6 +598,11 @@ private struct RelayComposer: View {
     @State private var showingModelPicker = false
     @State private var showingPermissionPicker = false
     @State private var showingSkillPicker = false
+    @State private var showingAttachOptions = false
+    @State private var showingPhotoPicker = false
+    @State private var showingFileImporter = false
+    @State private var showingCamera = false
+    @State private var photoPickerItems: [PhotosPickerItem] = []
     @State private var skillSearch = ""
     @StateObject private var dictation = RelayStreamingTranscriber()
     /// Whatever the user had already typed when dictation started. Live transcript
@@ -805,6 +827,28 @@ private struct RelayComposer: View {
             .accessibilityIdentifier("relay-run-settings")
             .accessibilityLabel("Run settings, \(selectedSkillIDs.count) skills selected")
 
+            Button {
+                isFocused = false
+                showingAttachOptions = true
+            } label: {
+                Image(systemName: "paperclip")
+                    .font(AppTheme.uiFont(size: 18, weight: .medium))
+                    .foregroundStyle(attachments.isEmpty ? RelayChatStyle.secondary : AppTheme.accent)
+                    .frame(width: Layout.actionSize, height: Layout.actionSize)
+                    .overlay(alignment: .topTrailing) {
+                        if !attachments.isEmpty {
+                            Text("\(attachments.count)")
+                                .font(AppTheme.uiFont(size: 10, weight: .semibold))
+                                .foregroundStyle(AppTheme.accent)
+                                .padding(2)
+                        }
+                    }
+            }
+            .buttonStyle(.plain)
+            .disabled(isSending || isStreaming)
+            .accessibilityIdentifier("relay-attach")
+            .accessibilityLabel(attachments.isEmpty ? "Attach files or photos" : "Attach files, \(attachments.count) selected")
+
             // Hidden rather than disabled when the build has no STT credentials:
             // a control that can only ever fail is worse than no control.
             if AppConfiguration.supportsDictation {
@@ -902,6 +946,15 @@ private struct RelayComposer: View {
             VStack(spacing: 0) {
                 dictationBar
 
+                if !attachments.isEmpty {
+                    RelayDraftAttachmentStrip(
+                        attachments: attachments,
+                        onRemove: onRemoveAttachment
+                    )
+                    .padding(.horizontal, 4)
+                    .padding(.top, 4)
+                }
+
                 ZStack(alignment: .leading) {
                     if text.isEmpty {
                         Text("Message…")
@@ -953,6 +1006,44 @@ private struct RelayComposer: View {
         .sheet(isPresented: $showingModelPicker) { modelPickerSheet }
         .sheet(isPresented: $showingPermissionPicker) { permissionPickerSheet }
         .sheet(isPresented: $showingSkillPicker) { skillPickerSheet }
+        .confirmationDialog("Attach", isPresented: $showingAttachOptions, titleVisibility: .hidden) {
+            Button("Photo Library") { showingPhotoPicker = true }
+            if UIImagePickerController.isSourceTypeAvailable(.camera) {
+                Button("Take Photo") { showingCamera = true }
+            }
+            Button("Choose File") { showingFileImporter = true }
+            Button("Cancel", role: .cancel) {}
+        }
+        .photosPicker(
+            isPresented: $showingPhotoPicker,
+            selection: $photoPickerItems,
+            maxSelectionCount: max(1, RelayAttachmentLimits.maxCount - attachments.count),
+            matching: .any(of: [.images, .screenshots])
+        )
+        .onChange(of: photoPickerItems) { _, items in
+            guard !items.isEmpty else { return }
+            Task { await importPhotoPickerItems(items) }
+        }
+        .fileImporter(
+            isPresented: $showingFileImporter,
+            allowedContentTypes: [.item],
+            allowsMultipleSelection: true
+        ) { result in
+            importPickedFiles(result)
+        }
+        .fullScreenCover(isPresented: $showingCamera) {
+            RelayCameraPicker { image in
+                showingCamera = false
+                if let image, let attachment = RelayDraftAttachment.make(
+                    filename: "photo.jpg",
+                    data: image.jpegData(compressionQuality: 0.82) ?? Data(),
+                    contentType: "image/jpeg"
+                ) {
+                    onAddAttachments([attachment])
+                }
+            }
+            .ignoresSafeArea()
+        }
         .onChange(of: modelPickerRequest) { _, _ in
             showingModelPicker = true
         }
@@ -1422,7 +1513,7 @@ private struct RelayComposer: View {
     }
 
     private var canSend: Bool {
-        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        (!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
             && !isSending
             // Only LISTENING blocks the send. Once capture has stopped the words are
             // already in the field, and making someone wait out the finalize grace
@@ -1455,6 +1546,38 @@ private struct RelayComposer: View {
         guard !spoken.isEmpty else { return }
         let base = dictationPrefix.trimmingCharacters(in: .whitespacesAndNewlines)
         text = base.isEmpty ? spoken : "\(base)\n\n\(spoken)"
+    }
+
+    @MainActor
+    private func importPhotoPickerItems(_ items: [PhotosPickerItem]) async {
+        var imported: [RelayDraftAttachment] = []
+        for item in items {
+            guard let data = try? await item.loadTransferable(type: Data.self) else { continue }
+            let filename = item.itemIdentifier?.split(separator: "/").last.map(String.init) ?? "photo.jpg"
+            if let attachment = RelayDraftAttachment.make(filename: filename, data: data, contentType: nil) {
+                imported.append(attachment)
+            }
+        }
+        photoPickerItems = []
+        onAddAttachments(imported)
+    }
+
+    private func importPickedFiles(_ result: Result<[URL], Error>) {
+        guard case .success(let urls) = result else { return }
+        var imported: [RelayDraftAttachment] = []
+        for url in urls {
+            let accessed = url.startAccessingSecurityScopedResource()
+            defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+            guard let data = try? Data(contentsOf: url) else { continue }
+            if let attachment = RelayDraftAttachment.make(
+                filename: url.lastPathComponent,
+                data: data,
+                contentType: (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType?.preferredMIMEType
+            ) {
+                imported.append(attachment)
+            }
+        }
+        onAddAttachments(imported)
     }
 }
 
@@ -1558,9 +1681,11 @@ private struct RelayCommandTextEditor: UIViewRepresentable {
 
 private struct RelayChatBubble: View {
     let item: RelayConversationItem
+    let client: CodexClient
+    var onOpenAttachment: (RelayDisplayedAttachment) -> Void
     @State private var showCopied = false
 
-    private var showWaitingDots: Bool { item.isStreaming && item.text.isEmpty }
+    private var showWaitingDots: Bool { item.isStreaming && item.text.isEmpty && item.attachments.isEmpty }
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 8) {
@@ -1569,8 +1694,8 @@ private struct RelayChatBubble: View {
             Group {
                 if isUser {
                     messageColumn
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 11)
+                        .padding(.horizontal, item.attachments.isEmpty || !item.text.isEmpty ? 14 : 8)
+                        .padding(.vertical, item.attachments.isEmpty || !item.text.isEmpty ? 11 : 8)
                         .background(RelayChatStyle.surface)
                         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                 } else {
@@ -1590,7 +1715,7 @@ private struct RelayChatBubble: View {
     }
 
     private var messageColumn: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        VStack(alignment: isUser ? .trailing : .leading, spacing: 7) {
             if !isUser || showCopied {
                 HStack(spacing: 6) {
                     if !isUser {
@@ -1611,10 +1736,19 @@ private struct RelayChatBubble: View {
 
             }
 
+            if !item.attachments.isEmpty {
+                RelayMessageAttachmentStrip(
+                    attachments: item.attachments,
+                    client: client,
+                    alignment: isUser ? .trailing : .leading,
+                    onOpen: onOpenAttachment
+                )
+            }
+
             if showWaitingDots {
                 RelayTypingDots(tint: item.provider?.relayPresentation.accent ?? AppTheme.textTertiary)
                     .padding(.vertical, 2)
-            } else {
+            } else if !item.text.isEmpty {
                 RelayStreamingContent(
                     text: item.text,
                     isStreaming: item.isStreaming,
@@ -1655,6 +1789,278 @@ private struct RelayChatBubble: View {
     }
 
     private var isUser: Bool { item.role == .user }
+}
+
+private struct RelayDraftAttachmentStrip: View {
+    let attachments: [RelayDraftAttachment]
+    let onRemove: (UUID) -> Void
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(attachments) { attachment in
+                    RelayDraftAttachmentChip(attachment: attachment) {
+                        onRemove(attachment.id)
+                    }
+                }
+            }
+            .padding(.vertical, 4)
+        }
+        .accessibilityIdentifier("relay-draft-attachments")
+    }
+}
+
+private struct RelayDraftAttachmentChip: View {
+    let attachment: RelayDraftAttachment
+    let onRemove: () -> Void
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            if attachment.isImage, let image = UIImage(data: attachment.data) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 64, height: 64)
+                    .clipped()
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            } else {
+                VStack(alignment: .leading, spacing: 4) {
+                    Image(systemName: "doc")
+                        .font(.system(size: 16, weight: .semibold))
+                    Text(attachment.filename)
+                        .font(AppTheme.uiFont(size: 10, weight: .medium))
+                        .lineLimit(2)
+                }
+                .foregroundStyle(AppTheme.textPrimary)
+                .frame(width: 88, height: 64, alignment: .leading)
+                .padding(.horizontal, 8)
+                .background(AppTheme.bgCanvas)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+
+            Button(action: onRemove) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 16))
+                    .foregroundStyle(AppTheme.textPrimary, AppTheme.bgCanvas)
+            }
+            .buttonStyle(.plain)
+            .offset(x: 4, y: -4)
+            .accessibilityLabel("Remove \(attachment.filename)")
+        }
+    }
+}
+
+private struct RelayMessageAttachmentStrip: View {
+    let attachments: [RelayDisplayedAttachment]
+    let client: CodexClient
+    var alignment: HorizontalAlignment = .leading
+    let onOpen: (RelayDisplayedAttachment) -> Void
+
+    var body: some View {
+        VStack(alignment: alignment, spacing: 8) {
+            let images = attachments.filter { $0.kind == .image }
+            let files = attachments.filter { $0.kind != .image }
+            if !images.isEmpty {
+                HStack(spacing: 6) {
+                    ForEach(images) { attachment in
+                        RelayAttachmentThumb(attachment: attachment, client: client)
+                            .onTapGesture { onOpen(attachment) }
+                    }
+                }
+            }
+            ForEach(files) { attachment in
+                Button {
+                    onOpen(attachment)
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "doc")
+                            .font(.system(size: 13, weight: .semibold))
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(attachment.filename)
+                                .font(AppTheme.uiFont(size: 12, weight: .semibold))
+                                .lineLimit(1)
+                            if let bytes = attachment.byteCount {
+                                Text(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file))
+                                    .font(AppTheme.monoFont(size: 10))
+                                    .foregroundStyle(RelayChatStyle.secondary)
+                            }
+                        }
+                    }
+                    .foregroundStyle(AppTheme.textPrimary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .accessibilityIdentifier("relay-message-attachments")
+    }
+}
+
+private struct RelayAttachmentThumb: View {
+    let attachment: RelayDisplayedAttachment
+    let client: CodexClient
+    @State private var image: UIImage?
+    @State private var failed = false
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(AppTheme.bgCanvas)
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else if failed {
+                Image(systemName: "photo")
+                    .foregroundStyle(RelayChatStyle.secondary)
+            } else {
+                ProgressView().tint(AppTheme.accent).scaleEffect(0.7)
+            }
+        }
+        .frame(width: 132, height: 132)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .task(id: attachment.id) { await load() }
+    }
+
+    @MainActor
+    private func load() async {
+        if case .local(let data) = attachment.payload {
+            image = UIImage(data: data)
+            failed = image == nil
+            return
+        }
+        guard let url = attachment.remoteURL else {
+            failed = true
+            return
+        }
+        do {
+            let result = try await client.fetchArtifact(url)
+            image = UIImage(data: result.data)
+            failed = image == nil
+        } catch {
+            failed = true
+        }
+    }
+}
+
+private struct RelayAttachmentViewer: View {
+    let attachment: RelayDisplayedAttachment
+    let client: CodexClient
+    @Environment(\.dismiss) private var dismiss
+    @State private var image: UIImage?
+    @State private var errorMessage: String?
+    @State private var isLoading = false
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                AppTheme.canvasGradient.ignoresSafeArea()
+                content
+            }
+            .navigationTitle(attachment.filename)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Done") { dismiss() }
+                        .foregroundStyle(AppTheme.accent)
+                }
+            }
+            .task(id: attachment.id) { await load() }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if isLoading, image == nil, errorMessage == nil {
+            ProgressView().tint(AppTheme.accent)
+        } else if let image {
+            GeometryReader { proxy in
+                ScrollView([.horizontal, .vertical]) {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(minWidth: proxy.size.width, minHeight: proxy.size.height)
+                }
+            }
+        } else {
+            VStack(spacing: 10) {
+                Image(systemName: attachment.kind == .image ? "photo" : "doc")
+                    .font(.system(size: 28, weight: .medium))
+                    .foregroundStyle(AppTheme.accent)
+                Text(attachment.filename)
+                    .font(AppTheme.uiFont(size: 16, weight: .semibold))
+                    .foregroundStyle(AppTheme.textPrimary)
+                if let errorMessage {
+                    Text(errorMessage)
+                        .font(AppTheme.uiFont(size: 13))
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .multilineTextAlignment(.center)
+                }
+            }
+            .padding(32)
+        }
+    }
+
+    @MainActor
+    private func load() async {
+        if case .local(let data) = attachment.payload {
+            image = UIImage(data: data)
+            if image == nil { errorMessage = "Relay could not preview this file." }
+            return
+        }
+        guard let url = attachment.remoteURL else {
+            errorMessage = "This attachment is no longer available on the linked computer."
+            return
+        }
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            let result = try await client.fetchArtifact(url)
+            image = UIImage(data: result.data)
+            if image == nil {
+                errorMessage = "Relay received the file but could not preview it here."
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+}
+
+private struct RelayCameraPicker: UIViewControllerRepresentable {
+    var onCapture: (UIImage?) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onCapture: onCapture)
+    }
+
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let picker = UIImagePickerController()
+        picker.sourceType = .camera
+        picker.delegate = context.coordinator
+        picker.allowsEditing = false
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIImagePickerController, context: Context) {}
+
+    final class Coordinator: NSObject, UINavigationControllerDelegate, UIImagePickerControllerDelegate {
+        let onCapture: (UIImage?) -> Void
+
+        init(onCapture: @escaping (UIImage?) -> Void) {
+            self.onCapture = onCapture
+        }
+
+        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+            onCapture(nil)
+        }
+
+        func imagePickerController(
+            _ picker: UIImagePickerController,
+            didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
+        ) {
+            onCapture(info[.originalImage] as? UIImage)
+        }
+    }
 }
 
 /// Animated three-dot "thinking" indicator shown before the first token arrives.

@@ -730,9 +730,9 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         return candidate
     }
 
-    /// Job artifact URLs are server-authored capabilities. Keep them on the configured
-    /// Relay origin and on the exact artifact route so a compromised/malformed job cannot
-    /// turn the authenticated client or WebView into a fetcher for another host.
+    /// Authenticated binary URLs authored by relayd. Keep them on the configured
+    /// Relay origin and on the exact artifact/attachment routes so a compromised
+    /// or malformed payload cannot turn the client into a fetcher for another host.
     static func isTrustedArtifactURL(_ url: URL, baseURL: URL) -> Bool {
         guard
             url.scheme?.lowercased() == baseURL.scheme?.lowercased(),
@@ -747,14 +747,22 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         }
 
         let parts = url.pathComponents.filter { $0 != "/" }
-        return parts.count == 7
-            && parts[0] == "v1"
-            && parts[1] == "codex"
-            && parts[2] == "jobs"
-            && !parts[3].isEmpty
-            && parts[4] == "artifacts"
-            && !parts[5].isEmpty
-            && (parts[6] == "raw" || parts[6] == "preview")
+        guard parts.count == 7, parts[0] == "v1", parts[1] == "codex", !parts[3].isEmpty, !parts[5].isEmpty, parts[6] == "raw" || parts[6] == "preview" else {
+            return false
+        }
+        if parts[2] == "jobs", parts[4] == "artifacts" {
+            return true
+        }
+        if parts[6] != "raw" {
+            return false
+        }
+        if parts[2] == "jobs", parts[4] == "attachments" {
+            return true
+        }
+        if parts[2] == "threads", parts[4] == "attachments" {
+            return true
+        }
+        return false
     }
 
     private static func effectivePort(for url: URL) -> Int? {

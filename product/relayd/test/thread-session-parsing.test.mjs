@@ -72,6 +72,10 @@ test("session parsing ignores injected context and keeps the first real prompt i
   const messages = await readSessionMessages(file);
   assert.deepEqual(messages.map((entry) => entry.role), ["user", "assistant", "user", "assistant"]);
   assert.equal(messages[0].text, "Fix the session list and preserve the complete chat.");
+  assert.equal(messages[0].attachments.length, 1);
+  assert.equal(messages[0].attachments[0].filename, "screenshot.png");
+  assert.equal(messages[0].attachments[0].kind, "image");
+  assert.equal(messages[0].attachments[0].rawURL, null);
   assert.equal(messages[1].text, fullAnswer.trim(), "thread detail must not use the 240-character card limit");
   assert.equal(messages.at(-1).text, "Latest answer");
 });
@@ -264,4 +268,44 @@ test("pure Codex UI events do not become conversation titles", () => {
     userPromptSummary("<timestamp>Friday, Sep 18, 2026, 7:12 PM (UTC+5:30)</timestamp>\n<user_query>\nWake the machine\n</user_query>"),
     "Wake the machine",
   );
+});
+
+test("session parsing keeps attached images and serves workspace-readable files", async () => {
+  const workspaceDir = path.join(bootstrap, "workspaces", "repo");
+  const screenshot = path.join(workspaceDir, "capture.png");
+  const png = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+    "base64",
+  );
+  fs.mkdirSync(workspaceDir, { recursive: true });
+  fs.writeFileSync(screenshot, png);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-thread-attachments-"));
+  const file = path.join(dir, "rollout.jsonl");
+  const imageOnly = '<image name=[Image #1] path="' + screenshot + '">';
+  const withCaption = [
+    "Look at this screenshot",
+    `Attached files from the phone are saved on this runner. Use these local paths when inspecting them:`,
+    `1. capture.png (image/png, ${png.length} bytes): ${screenshot}`,
+  ].join("\n\n");
+  fs.writeFileSync(file, `${[
+    { type: "session_meta", payload: { id: SESSION_ID, cwd: workspaceDir } },
+    message("user", imageOnly, "2026-09-21T10:00:00.000Z"),
+    message("assistant", "I can see the image.", "2026-09-21T10:00:01.000Z"),
+    message("user", withCaption, "2026-09-21T10:00:02.000Z"),
+  ].map((line) => JSON.stringify(line)).join("\n")}\n`);
+
+  const messages = await readSessionMessages(file, { sessionId: SESSION_ID });
+  assert.equal(messages.length, 3);
+  assert.equal(messages[0].text, "");
+  assert.equal(messages[0].attachments.length, 1);
+  assert.equal(messages[0].attachments[0].filename, "capture.png");
+  assert.equal(messages[0].attachments[0].kind, "image");
+  assert.equal(
+    messages[0].attachments[0].rawURL,
+    `/v1/codex/threads/${SESSION_ID}/attachments/${messages[0].attachments[0].id}/raw`,
+  );
+  assert.equal(messages[2].text, "Look at this screenshot");
+  assert.equal(messages[2].attachments[0].filename, "capture.png");
+  assert.match(messages[2].attachments[0].rawURL, /\/v1\/codex\/threads\//);
 });

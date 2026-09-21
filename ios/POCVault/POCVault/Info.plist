@@ -70,7 +70,9 @@
 		</dict>
 	</dict>
 	<key>NSCameraUsageDescription</key>
-	<string>Relay uses the camera to scan the pairing code shown by relayd, and the sign-in code shown by the relay CLI.</string>
+	<string>Relay uses the camera to scan pairing and sign-in codes, and to attach photos to agent prompts.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Relay attaches photos from your library to agent prompts on the linked computer.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Relay uses the microphone to turn spoken Codex prompts into text.</string>
 	<key>POCVaultCodexBaseURL</key>

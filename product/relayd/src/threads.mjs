@@ -8,13 +8,13 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 
-import { runHome, codexHome, dataDir, threadSummaryCharacters, threadMessageCharacters, workspaceBrowseRoot, terminalStatuses, allowedThreadProviders, realpathOrResolve, pathWithinRoot } from "./config.mjs";
-import { isSafeJobId, cleanApiText } from "./util.mjs";
-import { isResumableSessionId, isKimiSessionId } from "./sessionid.mjs";
+import { runHome, codexHome, dataDir, attachmentsDir, threadSummaryCharacters, threadMessageCharacters, workspaceBrowseRoot, terminalStatuses, allowedThreadProviders, realpathOrResolve, pathWithinRoot } from "./config.mjs";
+import { isSafeJobId, cleanApiText, sendBytes, sendError } from "./util.mjs";
+import { isResumableSessionId, isKimiSessionId, isThreadSessionId } from "./sessionid.mjs";
 import { appendAudit } from "./audit.mjs";
 import { dynamicWorkspaces, workspaces, resolveWorkspaceById, browseWorkspaceForPath, cleanWorkspaceId, pathBelongsToRoot } from "./workspaces.mjs";
 import { listChatThreads, chatThreadDetailResponse, deleteChatThread } from "./chat.mjs";
-import { jobsState, jobs, activeChildren, responseShape, normalizeJobProvider, removePersistedJobFiles, removePathInsideRoot, jobThreadId, toJobResponse } from "./jobs.mjs";
+import { jobsState, jobs, activeChildren, responseShape, normalizeJobProvider, removePersistedJobFiles, removePathInsideRoot, jobThreadId, toJobResponse, attachmentKind } from "./jobs.mjs";
 
 function cleanThreadProviderFilter(value) {
   if (value === undefined || value === null || value === "") return null;
@@ -696,6 +696,22 @@ function threadFromSessionFile(sessionFile, {
 }
 
 async function threadDetailResponse(sessionId, { provider = null } = {}) {
+  const state = await loadThreadDetailState(sessionId, { provider });
+  if (!state) return null;
+  if (state.chatDetail) return state.chatDetail;
+  mergeJobAttachmentsIntoMessages(state.messages, state.thread.jobs, state.thread.sessionId || sessionId);
+  const sortedJobs = [...state.thread.jobs].sort((left, right) =>
+    compareIsoDesc(left.updatedAt || left.createdAt, right.updatedAt || right.createdAt),
+  );
+  return {
+    thread: threadSummary(state.thread),
+    messages: publicThreadMessages(state.messages),
+    jobs: await Promise.all(sortedJobs.map((job) => toJobResponse(job, responseShape("compact")))),
+  };
+}
+
+
+async function loadThreadDetailState(sessionId, { provider = null } = {}) {
   const sessionsDir = path.join(codexHome, "sessions");
   const sessionFile = findSessionFile(sessionsDir, sessionId);
   let thread = null;
@@ -715,7 +731,7 @@ async function threadDetailResponse(sessionId, { provider = null } = {}) {
         timestamp: meta.timestamp,
         updatedAt: stat.mtime.toISOString(),
       });
-      messages = await readSessionMessages(sessionFile);
+      messages = await readSessionMessages(sessionFile, { sessionId: meta.id });
     }
   }
 
@@ -733,7 +749,7 @@ async function threadDetailResponse(sessionId, { provider = null } = {}) {
         timestamp: claudeMeta.timestamp,
         updatedAt: stat.mtime.toISOString(),
       });
-      messages = await readSessionMessages(claudeFile);
+      messages = await readSessionMessages(claudeFile, { sessionId });
     }
   }
 
@@ -749,7 +765,7 @@ async function threadDetailResponse(sessionId, { provider = null } = {}) {
         timestamp: cursor.timestamp,
         updatedAt: cursor.updatedAt,
       });
-      if (cursor.file) messages = await readSessionMessages(cursor.file);
+      if (cursor.file) messages = await readSessionMessages(cursor.file, { sessionId });
     }
   }
 
@@ -781,18 +797,126 @@ async function threadDetailResponse(sessionId, { provider = null } = {}) {
   }
 
   if (!thread) {
-    return chatThreadDetailResponse(sessionId, { provider });
+    const chatDetail = chatThreadDetailResponse(sessionId, { provider });
+    if (!chatDetail) return null;
+    return { chatDetail };
   }
 
-  const sortedJobs = [...thread.jobs].sort((left, right) =>
-    compareIsoDesc(left.updatedAt || left.createdAt, right.updatedAt || right.createdAt),
-  );
+  return { thread, messages };
+}
 
-  return {
-    thread: threadSummary(thread),
-    messages,
-    jobs: await Promise.all(sortedJobs.map((job) => toJobResponse(job, responseShape("compact")))),
-  };
+
+function isSafeThreadAttachmentId(value) {
+  return typeof value === "string" && /^[a-f0-9]{16}$/.test(value);
+}
+
+function publicThreadMessages(messages) {
+  return (Array.isArray(messages) ? messages : []).map((message) => ({
+    role: message.role,
+    timestamp: message.timestamp || null,
+    text: message.text || "",
+    attachments: publicAttachments(message.attachments),
+  }));
+}
+
+function publicAttachments(attachments) {
+  return (Array.isArray(attachments) ? attachments : []).map((attachment) => ({
+    id: attachment.id,
+    filename: attachment.filename,
+    contentType: attachment.contentType,
+    bytes: attachment.bytes ?? null,
+    kind: attachment.kind || "file",
+    rawURL: attachment.rawURL || null,
+  }));
+}
+
+function mergeJobAttachmentsIntoMessages(messages, jobs, sessionId) {
+  const list = Array.isArray(messages) ? messages : [];
+  const sorted = [...(Array.isArray(jobs) ? jobs : [])].sort(
+    (left, right) => Date.parse(left.createdAt || 0) - Date.parse(right.createdAt || 0),
+  );
+  for (const job of sorted) {
+    const attachments = (Array.isArray(job.attachments) ? job.attachments : [])
+      .map((attachment, index) => jobAttachmentRecord(job, attachment, index, sessionId))
+      .filter(Boolean);
+    if (!attachments.length) continue;
+    const prompt = userPromptText(job.prompt) || String(job.prompt || "").trim();
+    const match = [...list].reverse().find((message) => (
+      message.role === "user" && (message.text || "") === prompt
+    ));
+    if (match) {
+      match.attachments = dedupeAttachments([...(match.attachments || []), ...attachments]);
+    } else {
+      list.push({
+        role: "user",
+        timestamp: job.createdAt || null,
+        text: prompt,
+        attachments,
+      });
+    }
+  }
+}
+
+function jobAttachmentRecord(job, attachment, index, sessionId) {
+  if (!attachment || typeof attachment !== "object") return null;
+  const filename = cleanApiText(attachment.filename || path.basename(attachment.path || "") || "attachment");
+  const contentType = cleanApiText(attachment.contentType || mimeFromFilename(filename));
+  const finalized = finalizeAttachments(sessionId || job.id, [{
+    filename,
+    contentType,
+    bytes: attachment.bytes,
+    path: attachment.path,
+  }])[0];
+  if (!finalized) return null;
+  finalized.rawURL = `/v1/codex/jobs/${job.id}/attachments/${index}/raw`;
+  finalized.readable = true;
+  return finalized;
+}
+
+function dedupeAttachments(attachments) {
+  const seen = new Set();
+  const out = [];
+  for (const attachment of attachments) {
+    const key = attachment.path || attachment.rawURL || attachment.id || attachment.filename;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(attachment);
+  }
+  return out;
+}
+
+async function serveThreadAttachment(res, sessionId, attachmentId, { provider = null } = {}) {
+  if (!isThreadSessionId(sessionId) || !isSafeThreadAttachmentId(attachmentId)) {
+    return sendError(res, 404, "attachment not found");
+  }
+  const state = await loadThreadDetailState(sessionId, { provider });
+  if (!state || state.chatDetail) return sendError(res, 404, "attachment not found");
+  mergeJobAttachmentsIntoMessages(state.messages, state.thread.jobs, state.thread.sessionId || sessionId);
+  const attachment = (state.messages || [])
+    .flatMap((message) => message.attachments || [])
+    .find((entry) => entry.id === attachmentId);
+  if (!attachment) return sendError(res, 404, "attachment not found");
+
+  let body = attachment.data || null;
+  if (!body && attachment.path) {
+    const resolved = tryResolveReadableAttachment(attachment.path);
+    if (!resolved) return sendError(res, 404, "attachment not found");
+    try {
+      body = fs.readFileSync(resolved.path);
+    } catch {
+      return sendError(res, 404, "attachment not found");
+    }
+  }
+  if (!body || !body.length) return sendError(res, 404, "attachment not found");
+
+  const filename = attachment.filename || "attachment.bin";
+  const contentType = attachment.contentType || mimeFromFilename(filename);
+  const kind = attachment.kind || attachmentKind(filename, contentType);
+  return sendBytes(res, 200, body, {
+    "content-type": contentType,
+    "content-disposition": `${kind === "image" ? "inline" : "attachment"}; filename="${String(filename).replace(/["\r\n\\]/g, "-")}"`,
+    "x-content-type-options": "nosniff",
+  });
 }
 
 
@@ -968,20 +1092,30 @@ function contentPartsText(content) {
 
 function parseTranscriptTurn(entry) {
   if (!entry || typeof entry !== "object") return null;
+
+  const take = (role, rawText, content, timestamp) => {
+    const attachments = extractTurnAttachments(rawText, content);
+    const cleaned = role === "user" ? userPromptText(rawText) : cleanThreadMessageText(rawText);
+    const text = cleaned || "";
+    if (!text && attachments.length === 0) return null;
+    return { role, text, timestamp: cleanSessionTimestamp(timestamp), attachments };
+  };
+
   if (entry.type === "response_item" && entry.payload?.type === "message") {
     const role = entry.payload.role;
     if (role !== "user" && role !== "assistant") return null;
-    return { role, text: messageText(entry.payload), timestamp: cleanSessionTimestamp(entry.timestamp) };
+    const content = Array.isArray(entry.payload.content) ? entry.payload.content : [];
+    return take(role, messageText(entry.payload), content, entry.timestamp);
   }
   if (entry.type === "user" || entry.type === "assistant") {
-    const text = contentPartsText(entry.message?.content ?? entry.message ?? entry.text);
-    if (!text) return null;
-    return { role: entry.type, text, timestamp: cleanSessionTimestamp(entry.timestamp) };
+    const content = entry.message?.content ?? entry.message ?? entry.content ?? entry.text;
+    const parts = Array.isArray(content) ? content : Array.isArray(content?.content) ? content.content : [];
+    return take(entry.type, contentPartsText(content), parts, entry.timestamp);
   }
   if (entry.role === "user" || entry.role === "assistant") {
-    const text = contentPartsText(entry.message?.content ?? entry.message ?? entry.text);
-    if (!text) return null;
-    return { role: entry.role, text, timestamp: cleanSessionTimestamp(entry.timestamp) };
+    const content = entry.message?.content ?? entry.message ?? entry.content ?? entry.text;
+    const parts = Array.isArray(content) ? content : [];
+    return take(entry.role, contentPartsText(content), parts, entry.timestamp);
   }
   return null;
 }
@@ -995,7 +1129,8 @@ function readSessionSummary(sessionFile) {
     try {
       const turn = parseTranscriptTurn(JSON.parse(line));
       if (turn?.role === "user" && !firstUserPrompt) {
-        firstUserPrompt = userPromptSummary(turn.text);
+        firstUserPrompt = userPromptSummary(turn.text)
+          || (turn.attachments?.[0]?.filename ? boundedThreadText(turn.attachments[0].filename) : null);
       }
     } catch {
       continue;
@@ -1018,8 +1153,9 @@ function readSessionSummary(sessionFile) {
 }
 
 
-async function readSessionMessages(sessionFile) {
+async function readSessionMessages(sessionFile, { sessionId = null } = {}) {
   const messages = [];
+  const id = sessionId || path.basename(sessionFile, path.extname(sessionFile));
   const input = fs.createReadStream(sessionFile, { encoding: "utf8" });
   const lines = readline.createInterface({ input, crlfDelay: Infinity });
   for await (const line of lines) {
@@ -1028,14 +1164,16 @@ async function readSessionMessages(sessionFile) {
       const turn = parseTranscriptTurn(JSON.parse(line));
       if (!turn) continue;
 
-      const cleanText = turn.role === "user" ? userPromptText(turn.text) : cleanThreadMessageText(turn.text);
-      const text = boundedThreadMessageText(cleanText);
-      if (!text) continue;
+      const cleanText = turn.role === "user" ? turn.text : cleanThreadMessageText(turn.text);
+      const text = boundedThreadMessageText(cleanText) || "";
+      const attachments = finalizeAttachments(id, turn.attachments);
+      if (!text && attachments.length === 0) continue;
 
       messages.push({
         role: turn.role,
         timestamp: turn.timestamp,
         text,
+        attachments,
       });
       if (messages.length > 120) messages.shift();
     } catch {
@@ -1043,6 +1181,250 @@ async function readSessionMessages(sessionFile) {
     }
   }
   return messages;
+}
+
+
+const IMAGE_TAG_RE = /<image\s+name=\[([^\]]+)\]\s+path="([^"]*)"\s*>/gi;
+const IMAGE_FILES_BLOCK_RE = /<image_files(?:\s[^>]*)?>([\s\S]*?)<\/image_files\s*>/gi;
+const PHONE_ATTACHMENT_MANIFEST_RE = /Attached files from the phone are saved on this runner\. Use these local paths when inspecting them:\n([\s\S]*)$/i;
+const FILES_MENTIONED_BLOCK_RE = /# Files mentioned by the user:\s*\n([\s\S]*?)(?:\n#{1,3}\s+My request:|$)/i;
+const FILE_MENTION_LINE_RE = /^#{1,3}\s+([^:\n]+):\s+(\S+)\s*$/gm;
+const PHONE_MANIFEST_LINE_RE = /^\s*\d+\.\s+(\S+)\s+\(([^,]+),\s*(\d+)\s*bytes\):\s+(\S+)\s*$/gm;
+const MIME_BY_EXTENSION = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".heic": "image/heic",
+  ".heif": "image/heif",
+  ".bmp": "image/bmp",
+  ".tif": "image/tiff",
+  ".tiff": "image/tiff",
+  ".pdf": "application/pdf",
+  ".txt": "text/plain",
+  ".md": "text/markdown",
+  ".json": "application/json",
+};
+
+function mimeFromFilename(filename) {
+  const ext = path.extname(String(filename || "")).toLowerCase();
+  return MIME_BY_EXTENSION[ext] || "application/octet-stream";
+}
+
+function extractTurnAttachments(rawText, content) {
+  const found = [];
+  const seen = new Set();
+  const add = (attachment) => {
+    if (!attachment) return;
+    const filename = cleanApiText(attachment.filename || (attachment.path ? path.basename(attachment.path) : "") || "attachment");
+    const key = attachment.path || (attachment.data ? `data:${filename}:${attachment.data.length}` : filename);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    found.push({
+      filename,
+      contentType: attachment.contentType || mimeFromFilename(filename),
+      bytes: Number.isFinite(attachment.bytes) ? attachment.bytes : (attachment.data ? attachment.data.length : null),
+      path: attachment.path || null,
+      data: attachment.data || null,
+    });
+  };
+
+  const parts = Array.isArray(content) ? content : [];
+  for (const part of parts) add(attachmentFromContentPart(part));
+
+  const text = String(rawText || "");
+  IMAGE_TAG_RE.lastIndex = 0;
+  let tagMatch;
+  while ((tagMatch = IMAGE_TAG_RE.exec(text))) {
+    const filePath = tagMatch[2];
+    add({
+      filename: filenameFromImageName(tagMatch[1], filePath),
+      path: filePath,
+      contentType: mimeFromFilename(filePath),
+    });
+  }
+
+  IMAGE_FILES_BLOCK_RE.lastIndex = 0;
+  let blockMatch;
+  while ((blockMatch = IMAGE_FILES_BLOCK_RE.exec(text))) {
+    for (const candidate of blockMatch[1].split(/\s+/)) {
+      const filePath = candidate.replace(/^["']|["']$/g, "").trim();
+      if (!filePath || !filePath.includes("/") && !filePath.includes(".")) continue;
+      if (filePath.startsWith("<") || filePath.startsWith("http")) continue;
+      add({ filename: path.basename(filePath), path: filePath, contentType: mimeFromFilename(filePath) });
+    }
+  }
+
+  const mentioned = FILES_MENTIONED_BLOCK_RE.exec(text);
+  if (mentioned) {
+    FILE_MENTION_LINE_RE.lastIndex = 0;
+    let lineMatch;
+    while ((lineMatch = FILE_MENTION_LINE_RE.exec(mentioned[1]))) {
+      add({
+        filename: path.basename(lineMatch[1].trim()) || path.basename(lineMatch[2]),
+        path: lineMatch[2],
+        contentType: mimeFromFilename(lineMatch[1] || lineMatch[2]),
+      });
+    }
+  }
+
+  const manifest = PHONE_ATTACHMENT_MANIFEST_RE.exec(text);
+  if (manifest) {
+    PHONE_MANIFEST_LINE_RE.lastIndex = 0;
+    let lineMatch;
+    while ((lineMatch = PHONE_MANIFEST_LINE_RE.exec(manifest[1]))) {
+      add({
+        filename: lineMatch[1],
+        contentType: lineMatch[2].trim(),
+        bytes: Number(lineMatch[3]),
+        path: lineMatch[4],
+      });
+    }
+  }
+
+  return found;
+}
+
+function filenameFromImageName(name, filePath) {
+  const cleaned = String(name || "").trim();
+  if (!cleaned || /^image\s*#?\d+$/i.test(cleaned)) {
+    return path.basename(filePath || "") || "image";
+  }
+  return cleaned;
+}
+
+function attachmentFromContentPart(part) {
+  if (!part || typeof part !== "object") return null;
+  const type = String(part.type || "").toLowerCase();
+  const looksLikeFile = type.includes("image") || type === "file" || type === "input_file" || type === "input_image";
+  const filePath = firstString(
+    part.path,
+    part.file_path,
+    part.filename && part.path,
+    part.source?.path,
+    part.source?.file_path,
+    typeof part.image_url === "string" && !part.image_url.startsWith("data:") ? part.image_url : null,
+    typeof part.image_url?.url === "string" && !part.image_url.url.startsWith("data:") ? part.image_url.url : null,
+    typeof part.url === "string" && !part.url.startsWith("data:") && !part.url.startsWith("http") ? part.url : null,
+  );
+  const data = decodeInlineImageData(part);
+  if (!looksLikeFile && !filePath && !data) return null;
+  if (!filePath && !data) return null;
+  const filename = firstString(
+    part.filename,
+    part.name,
+    filePath ? path.basename(filePath.replace(/^file:\/\//, "")) : null,
+    "image",
+  );
+  return {
+    filename,
+    contentType: firstString(part.contentType, part.media_type, part.source?.media_type, mimeFromFilename(filename)),
+    path: filePath ? filePath.replace(/^file:\/\//, "") : null,
+    data,
+    bytes: data ? data.length : null,
+  };
+}
+
+function firstString(...values) {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+function decodeInlineImageData(part) {
+  const candidates = [
+    part?.source?.data,
+    part?.data,
+    typeof part?.image_url === "string" ? part.image_url : null,
+    part?.image_url?.url,
+    part?.url,
+  ];
+  for (const value of candidates) {
+    if (typeof value !== "string" || !value) continue;
+    const dataUrl = /^data:[^;]+;base64,(.+)$/i.exec(value);
+    const encoded = dataUrl ? dataUrl[1] : (/^[A-Za-z0-9+/=\s]+$/.test(value) && value.length > 80 ? value : null);
+    if (!encoded) continue;
+    try {
+      const buffer = Buffer.from(encoded.replace(/\s+/g, ""), "base64");
+      if (buffer.length) return buffer;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+function finalizeAttachments(sessionId, attachments) {
+  return (Array.isArray(attachments) ? attachments : []).map((attachment) => {
+    const filename = cleanApiText(attachment.filename || (attachment.path ? path.basename(attachment.path) : "") || "attachment");
+    const contentType = attachment.contentType || mimeFromFilename(filename);
+    const kind = attachmentKind(filename, contentType);
+    let data = attachment.data && Buffer.isBuffer(attachment.data) && attachment.data.length ? attachment.data : null;
+    let filePath = typeof attachment.path === "string" && attachment.path.trim() ? attachment.path.trim() : null;
+    let bytes = Number.isFinite(attachment.bytes) ? attachment.bytes : (data ? data.length : null);
+    let readable = Boolean(data);
+    if (!readable && filePath) {
+      const resolved = tryResolveReadableAttachment(filePath);
+      if (resolved) {
+        filePath = resolved.path;
+        bytes = resolved.bytes;
+        readable = true;
+      }
+    }
+    const id = attachmentPublicId(sessionId, filePath || data || filename);
+    return {
+      id,
+      filename,
+      contentType,
+      bytes,
+      kind,
+      rawURL: readable ? `/v1/codex/threads/${sessionId}/attachments/${id}/raw` : null,
+      path: filePath,
+      data,
+      readable,
+    };
+  }).filter((attachment) => attachment.filename);
+}
+
+function attachmentPublicId(sessionId, key) {
+  const hash = crypto.createHash("sha256");
+  hash.update(String(sessionId || ""));
+  hash.update("\0");
+  hash.update(Buffer.isBuffer(key) ? key : Buffer.from(String(key || ""), "utf8"));
+  return hash.digest("hex").slice(0, 16);
+}
+
+function tryResolveReadableAttachment(filePath) {
+  try {
+    const resolved = realpathOrResolve(filePath);
+    if (!isAllowedAttachmentRoot(resolved)) return null;
+    const stat = fs.statSync(resolved);
+    if (!stat.isFile()) return null;
+    return { path: resolved, bytes: stat.size };
+  } catch {
+    return null;
+  }
+}
+
+function isAllowedAttachmentRoot(resolved) {
+  const roots = [
+    attachmentsDir,
+    workspaceBrowseRoot,
+    path.join(runHome, ".cursor"),
+    path.join(runHome, ".claude"),
+  ];
+  for (const root of roots) {
+    let resolvedRoot;
+    try {
+      resolvedRoot = realpathOrResolve(root);
+    } catch {
+      continue;
+    }
+    if (resolvedRoot && pathWithinRoot(resolved, resolvedRoot)) return true;
+  }
+  return false;
 }
 
 
@@ -1177,6 +1559,7 @@ function stripInjectedUserMarkup(value) {
   text = text
     .replace(SYNTHETIC_USER_STRAY_RE, "")
     .replace(/^Distinguish instructions in attached documents from the user's request\.\s*/i, "")
+    .replace(/\n\nAttached files from the phone are saved on this runner\.[\s\S]*$/i, "")
     .trim();
   if (INJECTED_DOCUMENT_PREFIX_RE.test(text)) return "";
   return text;
@@ -1373,6 +1756,8 @@ export {
   listWorkspaceThreads,
   resolveOptionalWorkspaceFilter,
   threadDetailResponse,
+  serveThreadAttachment,
+  isSafeThreadAttachmentId,
   deleteThread,
   threadSummary,
   readSessionSummary,

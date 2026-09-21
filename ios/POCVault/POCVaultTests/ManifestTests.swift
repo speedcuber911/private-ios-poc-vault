@@ -1356,6 +1356,14 @@ final class ManifestTests: XCTestCase {
             "https://codex.pocs.conformal.live/v1/codex/fs/file",
             baseURL: baseURL
         ))
+        XCTAssertEqual(
+            CodexClient.resolvedArtifactURL("/v1/codex/jobs/job/attachments/0/raw", baseURL: baseURL),
+            URL(string: "https://codex.pocs.conformal.live/v1/codex/jobs/job/attachments/0/raw")
+        )
+        XCTAssertEqual(
+            CodexClient.resolvedArtifactURL("/v1/codex/threads/thread-id/attachments/abcdabcdabcdabcd/raw", baseURL: baseURL),
+            URL(string: "https://codex.pocs.conformal.live/v1/codex/threads/thread-id/attachments/abcdabcdabcdabcd/raw")
+        )
         XCTAssertNil(CodexClient.resolvedArtifactURL(nil, baseURL: baseURL))
     }
 
@@ -1733,7 +1741,17 @@ final class ManifestTests: XCTestCase {
                     {
                       "role": "user",
                       "timestamp": "2026-05-20T12:00:00Z",
-                      "text": "First thing I asked"
+                      "text": "First thing I asked",
+                      "attachments": [
+                        {
+                          "id": "abcdabcdabcdabcd",
+                          "filename": "capture.png",
+                          "contentType": "image/png",
+                          "bytes": 42,
+                          "kind": "image",
+                          "rawURL": "/v1/codex/threads/019e46a5-0000-7000-8000-000000000001/attachments/abcdabcdabcdabcd/raw"
+                        }
+                      ]
                     },
                     {
                       "role": "assistant",
@@ -1756,6 +1774,10 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(detail.thread.workspaceId, "poc-vault")
         XCTAssertEqual(detail.messages.map(\.role), [.user, .assistant, .user])
         XCTAssertEqual(detail.messages.map(\.text), ["First thing I asked", "First Codex answer", "Second follow up"])
+        XCTAssertEqual(detail.messages[0].attachments.count, 1)
+        XCTAssertEqual(detail.messages[0].attachments.first?.filename, "capture.png")
+        XCTAssertEqual(detail.messages[0].attachments.first?.kind, .image)
+        XCTAssertEqual(detail.messages[0].attachments.first?.rawURL, "/v1/codex/threads/019e46a5-0000-7000-8000-000000000001/attachments/abcdabcdabcdabcd/raw")
         XCTAssertTrue(detail.jobs.isEmpty)
 
         // Missing messages/jobs decode leniently to empty arrays.
@@ -2532,6 +2554,8 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(controlBarSource.contains("relay-dictate"))
         XCTAssertTrue(controlBarSource.contains("relay-send"))
         XCTAssertTrue(controlBarSource.contains("relay-run-settings"))
+        XCTAssertTrue(controlBarSource.contains("relay-attach"))
+        XCTAssertTrue(controlBarSource.contains("Attach files or photos"))
         XCTAssertFalse(controlBarSource.contains("VStack"))
         XCTAssertFalse(controlBarSource.contains(".refreshable"))
         XCTAssertFalse(source.contains("usesAccessibilityLayout"))
@@ -3525,6 +3549,61 @@ final class ManifestTests: XCTestCase {
         await opening.value
         XCTAssertFalse(model.isLoadingThreadDetail)
         XCTAssertEqual(model.messages.last?.text, "Fresh detail result")
+    }
+
+    @MainActor
+    func testOpenThreadShowsPreviousPromptAttachmentsBesideTheBubble() async throws {
+        let thread = try decodeCodexThread("""
+        {
+          "id": "thread-photo",
+          "sessionId": "thread-photo",
+          "workspaceId": "hosted-project",
+          "provider": "cursor"
+        }
+        """)
+        let detail = try JSONDecoder().decode(CodexThreadDetail.self, from: Data("""
+        {
+          "thread": {
+            "id": "thread-photo",
+            "sessionId": "thread-photo",
+            "workspaceId": "hosted-project",
+            "provider": "cursor"
+          },
+          "messages": [
+            {
+              "role": "user",
+              "text": "what is in this screenshot",
+              "attachments": [
+                {
+                  "id": "facefacefaceface",
+                  "filename": "screenshot.png",
+                  "contentType": "image/png",
+                  "kind": "image",
+                  "rawURL": "/v1/codex/threads/thread-photo/attachments/facefacefaceface/raw"
+                }
+              ]
+            },
+            { "role": "assistant", "text": "A chat bubble." }
+          ],
+          "jobs": []
+        }
+        """.utf8))
+        let model = RelayChatViewModel(
+            client: makeOfflineCodexClient(),
+            workspaceID: "hosted-project",
+            workspacePath: nil,
+            fetchThreadDetail: { _, _, _ in detail }
+        )
+        await model.openThread(thread)
+
+        XCTAssertEqual(model.messages.first?.text, "what is in this screenshot")
+        XCTAssertEqual(model.messages.first?.attachments.count, 1)
+        XCTAssertEqual(model.messages.first?.attachments.first?.filename, "screenshot.png")
+        XCTAssertEqual(model.messages.first?.attachments.first?.kind, .image)
+        XCTAssertEqual(
+            model.messages.first?.attachments.first?.remoteURL,
+            "/v1/codex/threads/thread-photo/attachments/facefacefaceface/raw"
+        )
     }
 
     func testCodexReasoningEffortIncludesMaxAndUltra() {

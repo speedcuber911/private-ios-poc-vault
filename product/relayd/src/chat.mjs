@@ -748,6 +748,7 @@ function chatThreadDetailResponse(threadId, { provider = null } = {}) {
       role: message?.role === "assistant" ? "assistant" : message?.role === "user" ? "user" : "status",
       timestamp: cleanSessionTimestamp(message?.timestamp) || null,
       text: cleanApiText(message?.text || "").trim(),
+      attachments: [],
     })),
     jobs: [],
   };

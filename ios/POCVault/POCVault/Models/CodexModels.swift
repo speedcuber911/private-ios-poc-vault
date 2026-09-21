@@ -1274,6 +1274,7 @@ struct CodexThreadMessage: Decodable, Hashable, Identifiable {
     let role: CodexThreadMessageRole
     let timestamp: Date?
     let text: String
+    let attachments: [CodexThreadAttachment]
 
     enum CodingKeys: String, CodingKey {
         case role
@@ -1282,6 +1283,7 @@ struct CodexThreadMessage: Decodable, Hashable, Identifiable {
         case text
         case content
         case message
+        case attachments
     }
 
     init(from decoder: Decoder) throws {
@@ -1295,11 +1297,53 @@ struct CodexThreadMessage: Decodable, Hashable, Identifiable {
         self.timestamp = timestamp ?? createdAt
         let resolvedText = text ?? content ?? message ?? ""
         self.text = resolvedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.attachments = (try? container.decodeIfPresent([CodexThreadAttachment].self, forKey: .attachments)) ?? []
     }
 
     var id: String {
         let timestampValue = timestamp?.timeIntervalSince1970.description ?? "undated"
-        return "\(role.rawValue)-\(timestampValue)-\(text)"
+        let attachmentKey = attachments.map(\.id).joined(separator: ",")
+        return "\(role.rawValue)-\(timestampValue)-\(text)-\(attachmentKey)"
+    }
+}
+
+struct CodexThreadAttachment: Decodable, Hashable, Identifiable {
+    enum Kind: String, Hashable {
+        case image
+        case file
+    }
+
+    let id: String
+    let filename: String
+    let contentType: String?
+    let bytes: Int?
+    let kind: Kind
+    let rawURL: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case filename
+        case contentType
+        case bytes
+        case kind
+        case rawURL
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let filename = (try container.decodeLooseStringIfPresent(forKey: .filename)) ?? "attachment"
+        let contentType = try container.decodeLooseStringIfPresent(forKey: .contentType)
+        let kindValue = (try container.decodeLooseStringIfPresent(forKey: .kind))?.lowercased()
+        self.filename = filename
+        self.contentType = contentType
+        self.bytes = try container.decodeIntegerIfPresent(forKey: .bytes)
+        self.rawURL = try container.decodeLooseStringIfPresent(forKey: .rawURL)
+        self.id = (try container.decodeLooseStringIfPresent(forKey: .id)) ?? filename
+        if kindValue == "image" || (contentType?.lowercased().hasPrefix("image/") == true) {
+            self.kind = .image
+        } else {
+            self.kind = .file
+        }
     }
 }
 
@@ -1915,9 +1959,35 @@ struct CodexJobAttachmentReference: Decodable, Hashable, Identifiable {
     let contentType: String?
     let bytes: Int?
     let path: String?
+    let kind: CodexThreadAttachment.Kind
+    let rawURL: String?
+
+    enum CodingKeys: String, CodingKey {
+        case filename
+        case contentType
+        case bytes
+        case path
+        case kind
+        case rawURL
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.filename = (try container.decodeLooseStringIfPresent(forKey: .filename)) ?? "attachment"
+        self.contentType = try container.decodeLooseStringIfPresent(forKey: .contentType)
+        self.bytes = try container.decodeIntegerIfPresent(forKey: .bytes)
+        self.path = try container.decodeLooseStringIfPresent(forKey: .path)
+        self.rawURL = try container.decodeLooseStringIfPresent(forKey: .rawURL)
+        let kindValue = (try container.decodeLooseStringIfPresent(forKey: .kind))?.lowercased()
+        if kindValue == "image" || (contentType?.lowercased().hasPrefix("image/") == true) {
+            self.kind = .image
+        } else {
+            self.kind = .file
+        }
+    }
 
     var id: String {
-        path?.trimmedNonEmpty ?? filename
+        rawURL?.trimmedNonEmpty ?? path?.trimmedNonEmpty ?? filename
     }
 }
 

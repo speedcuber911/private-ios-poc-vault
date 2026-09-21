@@ -15,11 +15,11 @@ import { workspaces, workspaceList, pickerWorkspaceList, resolveWorkspaceById, p
 import { publicRuntimeModelCatalog } from "./catalog.mjs";
 import { fsListResponse, serveFsFile } from "./fsapi.mjs";
 import { listProviderSkills, publicSkill } from "./skills.mjs";
-import { cleanThreadProviderFilter, workspaceForJob, listWorkspaceSessions, listWorkspaceThreads, resolveOptionalWorkspaceFilter, threadDetailResponse, deleteThread } from "./threads.mjs";
+import { cleanThreadProviderFilter, workspaceForJob, listWorkspaceSessions, listWorkspaceThreads, resolveOptionalWorkspaceFilter, threadDetailResponse, serveThreadAttachment, isSafeThreadAttachmentId, deleteThread } from "./threads.mjs";
 import { handleChatRequest } from "./chat.mjs";
 import { isSafeArtifactId, serveJobArtifact } from "./artifacts.mjs";
 import { transcribeAudio, cleanAudioContentType, cleanAudioFilename } from "./transcribe.mjs";
-import { jobsState, jobs, activeChildren, responseShape, wantsFullLogs, enqueueJob, cleanJobProviderFilter, normalizeJobProvider, jobThreadId, cancelJob, streamJobEvents, toJobResponse } from "./jobs.mjs";
+import { jobsState, jobs, activeChildren, responseShape, wantsFullLogs, enqueueJob, cleanJobProviderFilter, normalizeJobProvider, jobThreadId, cancelJob, streamJobEvents, toJobResponse, serveJobAttachment, isSafeAttachmentIndex } from "./jobs.mjs";
 import { planSessionImports, importCodexSession, createSessionUpload, appendSessionUpload, completeSessionUpload } from "./session-sync.mjs";
 import { codexThreadUiHtml } from "./ui.mjs";
 import { handleAdditionRoutes } from "./additions.mjs";
@@ -380,6 +380,17 @@ async function routeRequest(req, res) {
     return sendJson(res, 200, { threads: listWorkspaceThreads({ workspaceId, provider, limit }) });
   }
 
+  const threadAttachmentMatch = url.pathname.match(/^\/v1\/codex\/threads\/([^/]+)\/attachments\/([^/]+)\/raw$/);
+  if (threadAttachmentMatch && req.method === "GET") {
+    const sessionId = decodeURIComponent(threadAttachmentMatch[1]);
+    const attachmentId = decodeURIComponent(threadAttachmentMatch[2]);
+    const provider = cleanThreadProviderFilter(url.searchParams.get("provider"));
+    if (!isThreadSessionId(sessionId) || !isSafeThreadAttachmentId(attachmentId)) {
+      return sendError(res, 404, "attachment not found");
+    }
+    return serveThreadAttachment(res, sessionId, attachmentId, { provider });
+  }
+
   const threadMatch = url.pathname.match(/^\/v1\/codex\/threads\/([^/]+)$/);
   if (threadMatch && req.method === "GET") {
     const sessionId = decodeURIComponent(threadMatch[1]);
@@ -430,6 +441,15 @@ async function routeRequest(req, res) {
     const body = await readBody(req);
     const job = await enqueueJob(body, auth.subject);
     return sendJson(res, 202, await toJobResponse(job, responseShape("preview")));
+  }
+
+  const jobAttachmentMatch = url.pathname.match(/^\/v1\/codex\/jobs\/([^/]+)\/attachments\/([^/]+)\/raw$/);
+  if (jobAttachmentMatch && req.method === "GET") {
+    const [, jobId, indexText] = jobAttachmentMatch;
+    if (!isSafeJobId(jobId) || !isSafeAttachmentIndex(indexText)) return sendError(res, 404, "attachment not found");
+    const job = jobs.get(jobId);
+    if (!job) return sendError(res, 404, "attachment not found");
+    return serveJobAttachment(res, job, indexText);
   }
 
   const artifactMatch = url.pathname.match(/^\/v1\/codex\/jobs\/([^/]+)\/artifacts\/([^/]+)\/(raw|preview)$/);

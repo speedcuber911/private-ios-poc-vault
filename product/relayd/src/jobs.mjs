@@ -8,8 +8,8 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { dataDir, jobsDir, logsDir, attachmentsDir, artifactsDir, approvalsDir, codexBin, claudeBin, cursorBin, kimiBin, runHome, codexHome, kimiHome, npmCacheDir, bunCacheDir, codexTransport, maxConcurrent, maxJobStreams, jobStreamHeartbeatMs, maxBodyBytes, maxJobAttachments, maxJobAttachmentBytes, maxJobAttachmentTotalBytes, maxOutputBytes, maxJobSkills, maxSkillPromptBytes, responseOutputBytes, listOutputBytes, maxTimeoutMs, defaultTimeoutMs, terminalStatuses, allowedReasoningEfforts, allowedJobProviders, allowedClaudePermissionModes, allowedCodexApprovalPolicies, allowedCodexSandboxes, claudeAwsProfile, claudeAwsRegion, claudeDefaultModel, cleanOptionalModel, normalizeClaudeModel, realpathOrResolve } from "./config.mjs";
-import { nowIso, durationMs, sendError, initSse, sendSse, isSafeJobId, headerValue, shapeTextPayload, prefixByBytes, cleanAssistantResult, cleanApiText, readTextFileBounded } from "./util.mjs";
+import { dataDir, jobsDir, logsDir, attachmentsDir, artifactsDir, approvalsDir, codexBin, claudeBin, cursorBin, kimiBin, runHome, codexHome, kimiHome, npmCacheDir, bunCacheDir, codexTransport, maxConcurrent, maxJobStreams, jobStreamHeartbeatMs, maxBodyBytes, maxJobAttachments, maxJobAttachmentBytes, maxJobAttachmentTotalBytes, maxOutputBytes, maxJobSkills, maxSkillPromptBytes, responseOutputBytes, listOutputBytes, maxTimeoutMs, defaultTimeoutMs, terminalStatuses, allowedReasoningEfforts, allowedJobProviders, allowedClaudePermissionModes, allowedCodexApprovalPolicies, allowedCodexSandboxes, claudeAwsProfile, claudeAwsRegion, claudeDefaultModel, cleanOptionalModel, normalizeClaudeModel, realpathOrResolve, pathWithinRoot } from "./config.mjs";
+import { nowIso, durationMs, sendError, sendBytes, initSse, sendSse, isSafeJobId, headerValue, shapeTextPayload, prefixByBytes, cleanAssistantResult, cleanApiText, readTextFileBounded } from "./util.mjs";
 import { appendAudit } from "./audit.mjs";
 import { resolveWorkspaceById, cleanWorkspaceId } from "./workspaces.mjs";
 import { listProviderSkills } from "./skills.mjs";
@@ -143,11 +143,12 @@ function createJob(body, certSubject, validatedTaskSelection = null) {
     throw Object.assign(new Error("request body must be a JSON object"), { status: 400 });
   }
 
-  if (typeof body.prompt !== "string" || body.prompt.trim().length === 0) {
+  if (body.prompt !== undefined && body.prompt !== null && typeof body.prompt !== "string") {
     throw Object.assign(new Error("prompt is required and must be a non-empty string"), { status: 400 });
   }
 
-  if (Buffer.byteLength(body.prompt, "utf8") > maxBodyBytes) {
+  const promptText = typeof body.prompt === "string" ? body.prompt.trim() : "";
+  if (Buffer.byteLength(promptText, "utf8") > maxBodyBytes) {
     throw Object.assign(new Error("prompt is too large"), { status: 413 });
   }
 
@@ -189,8 +190,12 @@ function createJob(body, certSubject, validatedTaskSelection = null) {
   const createdAt = nowIso();
   const timeoutMs = Math.min(Math.max(Math.trunc(requestedTimeout), 1000), maxTimeoutMs);
   const attachments = saveJobAttachments(id, body.attachments);
+  if (!promptText && attachments.length === 0) {
+    throw Object.assign(new Error("prompt is required and must be a non-empty string"), { status: 400 });
+  }
+  const prompt = promptText || "Please inspect the attached file(s).";
   const selectedSkills = cleanSelectedSkills(provider, body.skills, workspace.path);
-  const codexPrompt = buildJobPrompt(body.prompt, provider, selectedSkills, attachments);
+  const codexPrompt = buildJobPrompt(prompt, provider, selectedSkills, attachments);
   const permissionMode = provider === "claude"
     ? (cleanOptionalClaudePermissionMode(body.permissionMode) || "manual")
     : null;
@@ -208,7 +213,7 @@ function createJob(body, certSubject, validatedTaskSelection = null) {
     workspaceId: workspace.id,
     workspaceName: workspace.name,
     workspacePath: workspace.path,
-    prompt: body.prompt,
+    prompt,
     codexPrompt,
     skills: selectedSkills.map((skill) => skill.id),
     skillInputs: selectedSkills.map((skill) => ({ name: skill.name, path: skill.file, kind: skill.kind || "skill" })),
@@ -466,6 +471,62 @@ function cleanAttachmentContentType(value) {
     return raw;
   }
   return "application/octet-stream";
+}
+
+const IMAGE_ATTACHMENT_EXTENSIONS = new Set([
+  ".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".heif", ".bmp", ".tif", ".tiff",
+]);
+
+function attachmentKind(filename, contentType) {
+  const mime = cleanAttachmentContentType(contentType);
+  if (mime.startsWith("image/")) return "image";
+  const ext = path.extname(String(filename || "")).toLowerCase();
+  return IMAGE_ATTACHMENT_EXTENSIONS.has(ext) ? "image" : "file";
+}
+
+function isSafeAttachmentIndex(value) {
+  return typeof value === "string" && /^\d{1,2}$/.test(value);
+}
+
+function jobAttachmentPathRoot(jobId) {
+  return realpathOrResolve(path.join(attachmentsDir, jobId));
+}
+
+function attachmentDispositionFilename(filename) {
+  return String(filename || "attachment.bin").replace(/["\r\n\\]/g, "-");
+}
+
+function serveJobAttachment(res, job, indexText) {
+  if (!isSafeAttachmentIndex(indexText)) {
+    return sendError(res, 404, "attachment not found");
+  }
+  const attachments = Array.isArray(job.attachments) ? job.attachments : [];
+  const attachment = attachments[Number(indexText)];
+  if (!attachment || typeof attachment !== "object") {
+    return sendError(res, 404, "attachment not found");
+  }
+  const filePath = typeof attachment.path === "string" ? attachment.path : "";
+  if (!filePath) return sendError(res, 404, "attachment not found");
+  const resolved = realpathOrResolve(filePath);
+  if (!pathWithinRoot(resolved, jobAttachmentPathRoot(job.id))) {
+    return sendError(res, 404, "attachment not found");
+  }
+
+  let body;
+  try {
+    body = fs.readFileSync(resolved);
+  } catch {
+    return sendError(res, 404, "attachment not found");
+  }
+
+  const filename = cleanApiText(attachment.filename || path.basename(resolved) || "attachment.bin");
+  const contentType = cleanAttachmentContentType(attachment.contentType) || "application/octet-stream";
+  const kind = attachmentKind(filename, contentType);
+  return sendBytes(res, 200, body, {
+    "content-type": contentType,
+    "content-disposition": `${kind === "image" ? "inline" : "attachment"}; filename="${attachmentDispositionFilename(filename)}"`,
+    "x-content-type-options": "nosniff",
+  });
 }
 
 
@@ -1533,7 +1594,7 @@ async function toJobResponse(job, shape = responseShape("preview")) {
     workspaceName: workspace?.name || job.workspaceName,
     workspacePath: workspace?.path || job.workspacePath || null,
     prompt: job.prompt,
-    attachments: sanitizeAttachmentResponses(job.attachments),
+    attachments: sanitizeAttachmentResponses(job.attachments, job.id),
     artifacts: publicArtifactResponses(job),
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
@@ -1570,16 +1631,22 @@ async function toJobResponse(job, shape = responseShape("preview")) {
 }
 
 
-function sanitizeAttachmentResponses(attachments) {
+function sanitizeAttachmentResponses(attachments, jobId) {
   if (!Array.isArray(attachments)) return [];
   return attachments
     .filter((attachment) => attachment && typeof attachment === "object")
-    .map((attachment) => ({
-      filename: cleanApiText(attachment.filename || "attachment"),
-      contentType: cleanApiText(attachment.contentType || "application/octet-stream"),
-      bytes: Number.isFinite(attachment.bytes) ? attachment.bytes : null,
-      path: cleanApiText(attachment.path || ""),
-    }));
+    .map((attachment, index) => {
+      const filename = cleanApiText(attachment.filename || "attachment");
+      const contentType = cleanApiText(attachment.contentType || "application/octet-stream");
+      return {
+        filename,
+        contentType,
+        bytes: Number.isFinite(attachment.bytes) ? attachment.bytes : null,
+        path: cleanApiText(attachment.path || ""),
+        kind: attachmentKind(filename, contentType),
+        rawURL: jobId ? `/v1/codex/jobs/${jobId}/attachments/${index}/raw` : null,
+      };
+    });
 }
 
 
@@ -1665,4 +1732,7 @@ export {
   kimiSessionEntries,
   toJobResponse,
   sanitizeAttachmentResponses,
+  attachmentKind,
+  isSafeAttachmentIndex,
+  serveJobAttachment,
 };

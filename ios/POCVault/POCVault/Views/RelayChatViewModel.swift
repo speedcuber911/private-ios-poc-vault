@@ -1,10 +1,146 @@
 import Foundation
+import UIKit
 
 struct RelayUsage: Hashable {
     var inputTokens: Int?
     var outputTokens: Int?
 
     var isEmpty: Bool { inputTokens == nil && outputTokens == nil }
+}
+
+enum RelayAttachmentLimits {
+    static let maxCount = 6
+    static let maxBytes = 8 * 1024 * 1024
+    static let maxTotalBytes = 18 * 1024 * 1024
+}
+
+struct RelayDraftAttachment: Identifiable, Hashable {
+    let id: UUID
+    let filename: String
+    let contentType: String
+    let data: Data
+
+    var isImage: Bool { contentType.lowercased().hasPrefix("image/") }
+    var byteCount: Int { data.count }
+
+    var jobAttachment: CodexJobAttachment {
+        CodexJobAttachment(id: id, filename: filename, contentType: contentType, data: data)
+    }
+
+    var displayed: RelayDisplayedAttachment {
+        RelayDisplayedAttachment(
+            id: id.uuidString,
+            filename: filename,
+            contentType: contentType,
+            byteCount: byteCount,
+            kind: isImage ? .image : .file,
+            payload: .local(data)
+        )
+    }
+
+    static func make(filename: String, data: Data, contentType: String?) -> RelayDraftAttachment? {
+        guard !data.isEmpty else { return nil }
+        if let image = UIImage(data: data) {
+            let originalType = (contentType ?? "").lowercased()
+            let wantsPNG = originalType.contains("png") || filename.lowercased().hasSuffix(".png")
+            let encoded: Data
+            let type: String
+            let name: String
+            if wantsPNG, let png = image.pngData(), png.count <= RelayAttachmentLimits.maxBytes {
+                encoded = png
+                type = "image/png"
+                name = replacingPathExtension(filename, with: "png")
+            } else if let jpeg = jpegData(from: image, maxBytes: RelayAttachmentLimits.maxBytes) {
+                encoded = jpeg
+                type = "image/jpeg"
+                name = replacingPathExtension(filename, with: "jpg")
+            } else {
+                return nil
+            }
+            return RelayDraftAttachment(id: UUID(), filename: name, contentType: type, data: encoded)
+        }
+        let type = (contentType?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+            ? contentType!.trimmingCharacters(in: .whitespacesAndNewlines)
+            : mimeType(for: filename)
+        return RelayDraftAttachment(id: UUID(), filename: filename, contentType: type, data: data)
+    }
+
+    private static func jpegData(from image: UIImage, maxBytes: Int) -> Data? {
+        for quality in [0.82, 0.7, 0.55, 0.4, 0.28] as [CGFloat] {
+            if let data = image.jpegData(compressionQuality: quality), data.count <= maxBytes {
+                return data
+            }
+        }
+        return image.jpegData(compressionQuality: 0.2)
+    }
+
+    private static func replacingPathExtension(_ filename: String, with ext: String) -> String {
+        let base = URL(fileURLWithPath: filename).deletingPathExtension().lastPathComponent
+        let cleaned = base.trimmingCharacters(in: .whitespacesAndNewlines)
+        return "\(cleaned.isEmpty ? "photo" : cleaned).\(ext)"
+    }
+
+    private static func mimeType(for filename: String) -> String {
+        switch URL(fileURLWithPath: filename).pathExtension.lowercased() {
+        case "png": return "image/png"
+        case "jpg", "jpeg": return "image/jpeg"
+        case "gif": return "image/gif"
+        case "webp": return "image/webp"
+        case "heic": return "image/heic"
+        case "pdf": return "application/pdf"
+        case "txt": return "text/plain"
+        case "md": return "text/markdown"
+        case "json": return "application/json"
+        default: return "application/octet-stream"
+        }
+    }
+}
+
+struct RelayDisplayedAttachment: Identifiable, Hashable {
+    enum Kind: Hashable {
+        case image
+        case file
+    }
+
+    enum Payload: Hashable {
+        case local(Data)
+        case remote(String)
+        case unavailable
+    }
+
+    let id: String
+    let filename: String
+    let contentType: String
+    let byteCount: Int?
+    let kind: Kind
+    let payload: Payload
+
+    var remoteURL: String? {
+        if case .remote(let url) = payload { return url }
+        return nil
+    }
+
+    static func from(_ attachment: CodexThreadAttachment) -> RelayDisplayedAttachment {
+        RelayDisplayedAttachment(
+            id: attachment.id,
+            filename: attachment.filename,
+            contentType: attachment.contentType ?? "application/octet-stream",
+            byteCount: attachment.bytes,
+            kind: attachment.kind == .image ? .image : .file,
+            payload: attachment.rawURL?.trimmedNonEmpty.map { .remote($0) } ?? .unavailable
+        )
+    }
+
+    static func from(_ attachment: CodexJobAttachmentReference) -> RelayDisplayedAttachment {
+        RelayDisplayedAttachment(
+            id: attachment.id,
+            filename: attachment.filename,
+            contentType: attachment.contentType ?? "application/octet-stream",
+            byteCount: attachment.bytes,
+            kind: attachment.kind == .image ? .image : .file,
+            payload: attachment.rawURL?.trimmedNonEmpty.map { .remote($0) } ?? .unavailable
+        )
+    }
 }
 
 struct RelayConversationItem: Identifiable, Hashable {
@@ -29,6 +165,7 @@ struct RelayConversationItem: Identifiable, Hashable {
     var usage: RelayUsage?
     /// Wall-clock seconds the reply took, stamped when the stream completes.
     var elapsedSeconds: Double?
+    var attachments: [RelayDisplayedAttachment]
 
     init(
         id: String = UUID().uuidString,
@@ -41,7 +178,8 @@ struct RelayConversationItem: Identifiable, Hashable {
         canLoadFullLog: Bool = false,
         isStreaming: Bool = false,
         usage: RelayUsage? = nil,
-        elapsedSeconds: Double? = nil
+        elapsedSeconds: Double? = nil,
+        attachments: [RelayDisplayedAttachment] = []
     ) {
         self.id = id
         self.role = role
@@ -54,6 +192,7 @@ struct RelayConversationItem: Identifiable, Hashable {
         self.isStreaming = isStreaming
         self.usage = usage
         self.elapsedSeconds = elapsedSeconds
+        self.attachments = attachments
     }
 }
 
@@ -279,6 +418,7 @@ final class RelayChatViewModel: ObservableObject {
     /// why an approval read as a hang.
     @Published private(set) var pendingApprovals: [CodexApproval] = []
     @Published var prompt = ""
+    @Published var draftAttachments: [RelayDraftAttachment] = []
     @Published var errorMessage: String?
     /// Live stdout/stderr tail per active job id, fed by the job SSE stream. Cleared when
     /// the job reaches a terminal state.
@@ -756,6 +896,18 @@ final class RelayChatViewModel: ObservableObject {
             return
         }
         conversationRevision = UUID()
+        if !draftAttachments.isEmpty {
+            if currentThreadMode == .chat, currentThreadID != nil {
+                errorMessage = "This chat session cannot take files. Start a new conversation to attach images."
+                return
+            }
+            guard choice.model.supports(.task) else {
+                errorMessage = "This model cannot take attached files. Switch to an agent to send them."
+                return
+            }
+            await runTask(using: RelayModelChoice(model: choice.model, mode: .task))
+            return
+        }
         switch choice.mode {
         case .chat:
             await sendChat(using: choice)
@@ -955,7 +1107,8 @@ final class RelayChatViewModel: ObservableObject {
             return
         }
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !isSending else { return }
+        let outgoingAttachments = draftAttachments
+        guard (!text.isEmpty || !outgoingAttachments.isEmpty), !isSending else { return }
         isSending = true
         defer { isSending = false }
 
@@ -1005,16 +1158,24 @@ final class RelayChatViewModel: ObservableObject {
             return
         }
         prompt = ""
+        draftAttachments = []
         errorMessage = nil
 
         // Only resume the existing session if it's the same provider AND same workspace,
         // otherwise the server rejects it ("session does not belong to workspace").
         let resumeID = (currentThreadProvider == provider && currentThreadWorkspaceID == workspaceID) ? currentThreadID : nil
-        messages.append(RelayConversationItem(role: .user, text: text, provider: provider, modelLabel: model.label))
+        let requestPrompt = text.isEmpty ? "Please inspect the attached file(s)." : text
+        messages.append(RelayConversationItem(
+            role: .user,
+            text: text,
+            provider: provider,
+            modelLabel: model.label,
+            attachments: outgoingAttachments.map(\.displayed)
+        ))
         do {
             let created = try await client.createJob(CodexCreateJobRequest(
                 workspaceId: workspaceID,
-                prompt: text,
+                prompt: requestPrompt,
                 timeoutMs: 1_800_000,
                 model: Self.taskModelParameter(for: model),
                 reasoningEffort: effectiveEffort?.rawValue,
@@ -1023,6 +1184,7 @@ final class RelayChatViewModel: ObservableObject {
                 approvalPolicy: provider == .codex ? codexApprovalPolicy.rawValue : nil,
                 sandbox: provider == .codex ? codexSandbox.rawValue : nil,
                 skills: Array(selectedSkillIDsByProvider[provider] ?? []).sorted(),
+                attachments: outgoingAttachments.map(\.jobAttachment),
                 resumeSessionId: resumeID
             ))
             let job: CodexJob
@@ -1041,6 +1203,9 @@ final class RelayChatViewModel: ObservableObject {
         } catch {
             if prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 prompt = text
+            }
+            if draftAttachments.isEmpty {
+                draftAttachments = outgoingAttachments
             }
             await refreshHarnesses()
             errorMessage = error.localizedDescription
@@ -1102,7 +1267,35 @@ final class RelayChatViewModel: ObservableObject {
         isLoadingThreadDetail = false
         messages = []
         prompt = ""
+        draftAttachments = []
         errorMessage = nil
+    }
+
+    func addDraftAttachments(_ incoming: [RelayDraftAttachment]) {
+        guard !incoming.isEmpty else { return }
+        var next = draftAttachments
+        var total = next.reduce(0) { $0 + $1.byteCount }
+        for attachment in incoming {
+            if next.count >= RelayAttachmentLimits.maxCount {
+                errorMessage = "You can attach at most \(RelayAttachmentLimits.maxCount) files."
+                break
+            }
+            if attachment.byteCount > RelayAttachmentLimits.maxBytes {
+                errorMessage = "“\(attachment.filename)” is too large to attach."
+                continue
+            }
+            if total + attachment.byteCount > RelayAttachmentLimits.maxTotalBytes {
+                errorMessage = "Those files together are too large to attach."
+                break
+            }
+            next.append(attachment)
+            total += attachment.byteCount
+        }
+        draftAttachments = next
+    }
+
+    func removeDraftAttachment(id: UUID) {
+        draftAttachments.removeAll { $0.id == id }
     }
 
     /// A Mac-session index row is metadata, not a portable transcript. Starting from it
@@ -1164,7 +1357,8 @@ final class RelayChatViewModel: ObservableObject {
                     text: message.text,
                     timestamp: message.timestamp ?? detail.thread.updatedAt ?? Date(),
                     provider: detail.thread.provider,
-                    modelLabel: selectedChoice?.model.label
+                    modelLabel: selectedChoice?.model.label,
+                    attachments: message.attachments.map(RelayDisplayedAttachment.from)
                 )
             }
             for job in detail.jobs {
@@ -1278,7 +1472,17 @@ final class RelayChatViewModel: ObservableObject {
                 text: prompt,
                 timestamp: latest.createdAt ?? Date(),
                 provider: latest.provider,
-                modelLabel: latest.model
+                modelLabel: latest.model,
+                attachments: latest.attachments.map(RelayDisplayedAttachment.from)
+            ))
+        } else if !latest.attachments.isEmpty {
+            items.append(RelayConversationItem(
+                role: .user,
+                text: "",
+                timestamp: latest.createdAt ?? Date(),
+                provider: latest.provider,
+                modelLabel: latest.model,
+                attachments: latest.attachments.map(RelayDisplayedAttachment.from)
             ))
         }
         items.append(jobItem(latest))
