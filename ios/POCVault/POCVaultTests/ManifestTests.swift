@@ -2719,6 +2719,87 @@ final class ManifestTests: XCTestCase {
 
         XCTAssertEqual(entry.kind, .file)
         XCTAssertTrue(entry.readDenied)
+        XCTAssertFalse(entry.isHiddenFolder)
+    }
+
+    func testFileBrowserHidesDotFoldersUntilToggled() throws {
+        let aws = try decodeDirectoryEntry(
+            """
+            {"name":".aws","kind":"dir","path":"/home/komal/.aws"}
+            """
+        )
+        let cache = try decodeDirectoryEntry(
+            """
+            {"name":".cache","kind":"dir","path":"/home/komal/.cache"}
+            """
+        )
+        let env = try decodeDirectoryEntry(
+            """
+            {"name":".env","kind":"file","path":"/home/komal/poc-vault/.env"}
+            """
+        )
+        let desktop = try decodeDirectoryEntry(
+            """
+            {"name":"Desktop","kind":"dir","path":"/home/komal/Desktop"}
+            """
+        )
+        let readme = try decodeDirectoryEntry(
+            """
+            {"name":"readme.md","kind":"file","path":"/home/komal/readme.md"}
+            """
+        )
+
+        XCTAssertTrue(aws.isHiddenFolder)
+        XCTAssertTrue(cache.isHiddenFolder)
+        XCTAssertFalse(env.isHiddenFolder)
+        XCTAssertFalse(desktop.isHiddenFolder)
+        XCTAssertFalse(readme.isHiddenFolder)
+
+        let entries = [aws, cache, env, desktop, readme]
+        let hidden = FileBrowserViewModel.displayedEntries(
+            from: entries,
+            searchText: "",
+            showingHiddenFolders: false
+        )
+        XCTAssertEqual(hidden.map(\.displayName), [".env", "Desktop", "readme.md"])
+
+        let shown = FileBrowserViewModel.displayedEntries(
+            from: entries,
+            searchText: "",
+            showingHiddenFolders: true
+        )
+        XCTAssertEqual(shown.map(\.displayName), [".aws", ".cache", ".env", "Desktop", "readme.md"])
+
+        let filtered = FileBrowserViewModel.displayedEntries(
+            from: entries,
+            searchText: "desk",
+            showingHiddenFolders: false
+        )
+        XCTAssertEqual(filtered.map(\.displayName), ["Desktop"])
+
+        let hiddenSearch = FileBrowserViewModel.displayedEntries(
+            from: entries,
+            searchText: ".aws",
+            showingHiddenFolders: false
+        )
+        XCTAssertTrue(hiddenSearch.isEmpty)
+    }
+
+    func testFileBrowserShowsHiddenFolderToggleInExplorerChrome() throws {
+        let browser = try AppSourceFixture.load("POCVault/Browser/FileBrowserView.swift")
+        XCTAssertTrue(browser.contains("@AppStorage(\"relay.fileBrowser.showsHiddenFolders\")"))
+        XCTAssertTrue(browser.contains("showsHiddenFolders"))
+        XCTAssertTrue(browser.contains("hiddenFoldersToggle"))
+        XCTAssertTrue(browser.contains("relay-folder-show-hidden"))
+        XCTAssertTrue(browser.contains("Show hidden folders"))
+        XCTAssertTrue(browser.contains("Hide hidden folders"))
+        XCTAssertTrue(browser.contains("Toggle(\"Show hidden folders\""))
+        XCTAssertFalse(browser.contains("visibleEntries"))
+
+        let model = try AppSourceFixture.load("POCVault/Browser/FileBrowserViewModel.swift")
+        XCTAssertTrue(model.contains("showingHiddenFolders"))
+        XCTAssertTrue(model.contains("isHiddenFolder"))
+        XCTAssertTrue(model.contains("hiddenFolderCount"))
     }
 
     func testCodexDirectoryListingDecodesPaginationAndTruncation() throws {

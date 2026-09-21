@@ -34,6 +34,7 @@ struct FileBrowserView: View {
     @State private var newFolderName = ""
     @State private var selectedSection = FileBrowserSection.files
     @FocusState private var filterIsFocused: Bool
+    @AppStorage("relay.fileBrowser.showsHiddenFolders") private var showsHiddenFolders = false
 
     init(
         client: CodexClient,
@@ -193,50 +194,94 @@ struct FileBrowserView: View {
     }
 
     private var filterField: some View {
-        HStack(spacing: 9) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 14, weight: .medium))
-                .foregroundStyle(filterIsFocused ? AppTheme.textSecondary : AppTheme.textTertiary)
-            TextField(filterPrompt, text: $viewModel.searchText)
-                .font(AppTheme.uiFont(size: 15))
-                .foregroundStyle(AppTheme.textPrimary)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .focused($filterIsFocused)
-                .submitLabel(.done)
-                .onSubmit { filterIsFocused = false }
-            if !viewModel.searchText.isEmpty {
-                Button { viewModel.searchText = "" } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 15))
-                        .foregroundStyle(AppTheme.textTertiary)
-                        .frame(width: 32, height: 32)
+        HStack(spacing: 8) {
+            HStack(spacing: 9) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(filterIsFocused ? AppTheme.textSecondary : AppTheme.textTertiary)
+                TextField(filterPrompt, text: $viewModel.searchText)
+                    .font(AppTheme.uiFont(size: 15))
+                    .foregroundStyle(AppTheme.textPrimary)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .focused($filterIsFocused)
+                    .submitLabel(.done)
+                    .onSubmit { filterIsFocused = false }
+                if !viewModel.searchText.isEmpty {
+                    Button { viewModel.searchText = "" } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 15))
+                            .foregroundStyle(AppTheme.textTertiary)
+                            .frame(width: 32, height: 32)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Clear filter")
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Clear filter")
             }
-        }
-        .padding(.leading, 12)
-        .padding(.trailing, viewModel.searchText.isEmpty ? 12 : 4)
-        .frame(height: 40)
-        .background(AppTheme.textPrimary.opacity(0.045), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(filterIsFocused ? AppTheme.hairlineStrong : AppTheme.hairline, lineWidth: 1)
+            .padding(.leading, 12)
+            .padding(.trailing, viewModel.searchText.isEmpty ? 12 : 4)
+            .frame(height: 40)
+            .background(AppTheme.textPrimary.opacity(0.045), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(filterIsFocused ? AppTheme.hairlineStrong : AppTheme.hairline, lineWidth: 1)
+            }
+
+            if activeSection == .files {
+                hiddenFoldersToggle
+            }
         }
         .padding(.horizontal, 16)
         .padding(.top, 8)
         .padding(.bottom, 10)
     }
 
+    private var hiddenFoldersToggle: some View {
+        Button {
+            showsHiddenFolders.toggle()
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: showsHiddenFolders ? "eye" : "eye.slash")
+                    .font(.system(size: 12, weight: .semibold))
+                Text("Hidden")
+                    .font(AppTheme.uiFont(size: 12, weight: .semibold))
+            }
+            .foregroundStyle(showsHiddenFolders ? AppTheme.textPrimary : AppTheme.textTertiary)
+            .padding(.horizontal, 10)
+            .frame(height: 40)
+            .background(
+                AppTheme.textPrimary.opacity(showsHiddenFolders ? 0.10 : 0.045),
+                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(showsHiddenFolders ? AppTheme.hairlineStrong : AppTheme.hairline, lineWidth: 1)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(showsHiddenFolders ? "Hide hidden folders" : "Show hidden folders")
+        .accessibilityAddTraits(showsHiddenFolders ? [.isSelected] : [])
+        .accessibilityIdentifier("relay-folder-show-hidden")
+    }
+
     private var filterPrompt: String {
         activeSection == .chats ? "Search this folder’s chats" : "Filter this folder"
+    }
+
+    private var displayedEntries: [CodexWorkspaceDirectoryEntry] {
+        viewModel.displayedEntries(showingHiddenFolders: showsHiddenFolders)
+    }
+
+    private var hiddenFoldersCountLabel: String {
+        let count = viewModel.hiddenFolderCount
+        return count == 1 ? "1 hidden folder" : "\(count) hidden folders"
     }
 
     private func itemCount(for section: FileBrowserSection) -> Int? {
         switch section {
         case .files:
-            return viewModel.listing == nil ? nil : viewModel.entries.count
+            return viewModel.listing == nil ? nil : displayedEntries.count
         case .chats:
             guard !viewModel.isLoadingConversations else { return nil }
             return viewModel.conversations.isEmpty ? nil : viewModel.conversations.count
@@ -333,14 +378,15 @@ struct FileBrowserView: View {
                         .padding(.horizontal, 16)
                         .padding(.top, 14)
                 }
-                if viewModel.visibleEntries.isEmpty {
+                if displayedEntries.isEmpty {
                     if viewModel.isLoading {
                         ProgressView().tint(AppTheme.accent).padding(.top, 64)
                     } else if viewModel.errorMessage == nil {
                         emptyState
                     }
                 } else {
-                    ForEach(viewModel.visibleEntries) { entry in entryRow(entry) }
+                    ForEach(displayedEntries) { entry in entryRow(entry) }
+                    if showsHiddenFoldersFooter { hiddenFoldersRow }
                 }
                 if viewModel.showsTruncationBanner { truncationRow }
             }
@@ -385,23 +431,67 @@ struct FileBrowserView: View {
     }
 
     private var emptyState: some View {
-        VStack(spacing: 10) {
-            Image(systemName: viewModel.isShowingSearchResults ? "magnifyingglass" : "folder")
-                .font(.system(size: 27, weight: .regular))
-                .foregroundStyle(AppTheme.textTertiary)
-            Text(viewModel.isShowingSearchResults ? "No matches" : "Empty folder")
-                .font(AppTheme.uiFont(size: 17, weight: .medium))
-                .foregroundStyle(AppTheme.textPrimary)
-            Text(viewModel.isShowingSearchResults
-                 ? "Nothing here matches \u{201C}\(viewModel.searchText)\u{201D}."
-                 : "Create a folder or ask an agent to add files here.")
-                .font(AppTheme.uiFont(size: 13))
-                .foregroundStyle(AppTheme.textSecondary)
-                .multilineTextAlignment(.center)
+        Group {
+            if !viewModel.isShowingSearchResults && !showsHiddenFolders && viewModel.hiddenFolderCount > 0 {
+                Button { showsHiddenFolders = true } label: {
+                    VStack(spacing: 10) {
+                        Image(systemName: "eye.slash")
+                            .font(.system(size: 27, weight: .regular))
+                            .foregroundStyle(AppTheme.textTertiary)
+                        Text(hiddenFoldersCountLabel)
+                            .font(AppTheme.uiFont(size: 17, weight: .medium))
+                            .foregroundStyle(AppTheme.textPrimary)
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Show \(hiddenFoldersCountLabel)")
+                .accessibilityIdentifier("relay-folder-show-hidden-empty")
+            } else {
+                VStack(spacing: 10) {
+                    Image(systemName: viewModel.isShowingSearchResults ? "magnifyingglass" : "folder")
+                        .font(.system(size: 27, weight: .regular))
+                        .foregroundStyle(AppTheme.textTertiary)
+                    Text(viewModel.isShowingSearchResults ? "No matches" : "Empty folder")
+                        .font(AppTheme.uiFont(size: 17, weight: .medium))
+                        .foregroundStyle(AppTheme.textPrimary)
+                    Text(viewModel.isShowingSearchResults
+                         ? "Nothing here matches \u{201C}\(viewModel.searchText)\u{201D}."
+                         : "Create a folder or ask an agent to add files here.")
+                        .font(AppTheme.uiFont(size: 13))
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .multilineTextAlignment(.center)
+                }
+            }
         }
         .frame(maxWidth: .infinity)
         .padding(.horizontal, 32)
         .padding(.top, 72)
+    }
+
+    private var showsHiddenFoldersFooter: Bool {
+        !showsHiddenFolders
+            && !viewModel.isShowingSearchResults
+            && viewModel.hiddenFolderCount > 0
+    }
+
+    private var hiddenFoldersRow: some View {
+        Button { showsHiddenFolders = true } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "eye.slash")
+                    .font(.system(size: 12, weight: .medium))
+                Text(hiddenFoldersCountLabel)
+                    .font(AppTheme.uiFont(size: 12, weight: .medium))
+            }
+            .foregroundStyle(AppTheme.textSecondary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 16)
+        }
+        .buttonStyle(.plain)
+        .overlay(alignment: .top) {
+            Rectangle().fill(AppTheme.hairline).frame(height: 0.5)
+        }
+        .accessibilityLabel("Show \(hiddenFoldersCountLabel)")
+        .accessibilityIdentifier("relay-folder-show-hidden-footer")
     }
 
     private var truncationRow: some View {
@@ -471,6 +561,7 @@ struct FileBrowserView: View {
             } label: {
                 Label("New folder", systemImage: "folder.badge.plus")
             }
+            Toggle("Show hidden folders", isOn: $showsHiddenFolders)
             if isRoot {
                 Divider()
                 if let onOpenDiagnostics {

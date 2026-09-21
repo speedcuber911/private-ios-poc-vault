@@ -246,6 +246,12 @@ struct CodexWorkspaceDirectoryEntry: Decodable, Hashable, Identifiable {
         kind == .dir
     }
 
+    /// Unix-style hidden directory (`.git`, `.cache`, `.aws`). Dotfiles such as
+    /// `.env` stay visible so a project still shows its locked secrets.
+    var isHiddenFolder: Bool {
+        isDirectory && displayName.hasPrefix(".")
+    }
+
     /// Human-readable size for file rows ("1.2 MB"); nil for directories or unsized entries.
     var sizeLabel: String? {
         guard kind == .file, let size else { return nil }

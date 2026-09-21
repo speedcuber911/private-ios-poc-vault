@@ -48,9 +48,30 @@ final class FileBrowserViewModel: ObservableObject {
 
     var isShowingSearchResults: Bool { searchText.trimmedNonEmpty != nil }
 
-    var visibleEntries: [CodexWorkspaceDirectoryEntry] {
-        guard let query = searchText.trimmedNonEmpty?.lowercased() else { return entries }
-        return entries.filter { entry in
+    var hiddenFolderCount: Int {
+        entries.reduce(into: 0) { count, entry in
+            if entry.isHiddenFolder { count += 1 }
+        }
+    }
+
+    /// Local listing filter: hide dot-directories unless the explorer toggle is
+    /// on, then apply the compact name filter.
+    func displayedEntries(showingHiddenFolders: Bool) -> [CodexWorkspaceDirectoryEntry] {
+        Self.displayedEntries(
+            from: entries,
+            searchText: searchText,
+            showingHiddenFolders: showingHiddenFolders
+        )
+    }
+
+    nonisolated static func displayedEntries(
+        from entries: [CodexWorkspaceDirectoryEntry],
+        searchText: String,
+        showingHiddenFolders: Bool
+    ) -> [CodexWorkspaceDirectoryEntry] {
+        let unhidden = showingHiddenFolders ? entries : entries.filter { !$0.isHiddenFolder }
+        guard let query = searchText.trimmedNonEmpty?.lowercased() else { return unhidden }
+        return unhidden.filter { entry in
             entry.displayName.lowercased().contains(query)
                 || (entry.relativePath?.lowercased().contains(query) ?? false)
         }
