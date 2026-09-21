@@ -129,16 +129,6 @@ struct RelayMachineMonitorView: View {
                             .foregroundStyle(AppTheme.textSecondary)
                     }
                     if canControlPower {
-                        RelayMachinePowerSwitch(
-                            model: powerModel,
-                            onStarted: {
-                                if powerModel.status == .on {
-                                    await model.refresh(client: client)
-                                }
-                            },
-                            confirmStop: { showingStopPower = true },
-                            accessibilityIdentifier: "relay-usage-power"
-                        )
                         Button("Try again") {
                             Task { await model.refresh(client: client) }
                         }
@@ -332,9 +322,7 @@ struct RelayMachineMonitorView: View {
                 RelayMachinePowerSwitch(
                     model: powerModel,
                     onStarted: {
-                        if powerModel.status == .on {
-                            await model.refresh(client: client)
-                        }
+                        await waitForMachine()
                     },
                     confirmStop: { showingStopPower = true },
                     accessibilityIdentifier: "relay-usage-power"
@@ -497,6 +485,15 @@ struct RelayMachineMonitorView: View {
     }
 
     private var canControlPower: Bool { identityStore?.wakeCredential() != nil }
+
+    private func waitForMachine() async {
+        let deadline = Date().addingTimeInterval(60)
+        while Date() < deadline {
+            await model.refresh(client: client)
+            if model.stats != nil { return }
+            try? await Task.sleep(for: .seconds(2))
+        }
+    }
 
     private func loadLine(_ stats: RelayMachineStats) -> String {
         let loads = [stats.cpu.load1, stats.cpu.load5, stats.cpu.load15]

@@ -95,6 +95,8 @@ final class MachineMonitorTests: XCTestCase {
         XCTAssertTrue(source.contains("unsupportedInfo"))
         XCTAssertTrue(source.contains("powerInfo"))
         XCTAssertTrue(source.contains("RelayMachinePowerSwitch"))
+        XCTAssertEqual(source.components(separatedBy: "RelayMachinePowerSwitch(").count - 1, 1)
+        XCTAssertTrue(source.contains("waitForMachine()"))
         XCTAssertTrue(source.contains(".task(id: scenePhase)"))
         XCTAssertTrue(source.contains("await model.monitor(client: client)"))
         XCTAssertTrue(source.contains("client.streamMachineStats()"))
