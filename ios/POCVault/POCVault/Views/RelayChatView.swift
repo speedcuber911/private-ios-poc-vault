@@ -3017,8 +3017,11 @@ private struct RelayThreadDrawer: View {
             }
             .navigationBarTitleDisplayMode(.inline)
             .task {
-                await viewModel.refreshThreads()
                 await viewModel.refreshHandoffs()
+                while !Task.isCancelled {
+                    await viewModel.refreshThreads()
+                    try? await Task.sleep(for: .seconds(4))
+                }
             }
             .preferredColorScheme(.dark)
         }

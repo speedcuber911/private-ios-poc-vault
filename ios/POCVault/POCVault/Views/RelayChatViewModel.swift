@@ -1779,6 +1779,11 @@ final class RelayChatViewModel: ObservableObject {
     }
 
     private static func sortedJobs(_ jobs: [CodexJob]) -> [CodexJob] {
-        jobs.sorted { ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast) }
+        jobs.sorted { lhs, rhs in
+            if lhs.status.isActive != rhs.status.isActive { return lhs.status.isActive && !rhs.status.isActive }
+            let lhsDate = lhs.updatedAt ?? lhs.createdAt ?? .distantPast
+            let rhsDate = rhs.updatedAt ?? rhs.createdAt ?? .distantPast
+            return lhsDate > rhsDate
+        }
     }
 }

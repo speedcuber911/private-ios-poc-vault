@@ -462,9 +462,15 @@ final class FileViewerViewModel: ObservableObject {
     /// Loaded bytes staged as a real file in the sandbox tmp dir so ShareLink hands the
     /// share sheet a filename-preserving file URL.
     @Published private(set) var shareURL: URL?
+    /// Branch and this file's `+`/`−` counts. Updated while the viewer is open
+    /// so a save on the machine shows up without leaving the file.
+    @Published private(set) var gitStatus: RelayGitStatus?
 
     private var hasLoaded = false
     private var shareDirectoryURL: URL?
+    /// Last `modifiedAt#size` applied from git status. A later poll with a
+    /// different stamp reloads the bytes.
+    private var contentStamp: String?
 
     init(client: CodexClient, entry: CodexWorkspaceDirectoryEntry) {
         self.client = client
@@ -554,6 +560,57 @@ final class FileViewerViewModel: ObservableObject {
             }
             errorMessage = error.localizedDescription
         }
+    }
+
+    /// Poll this file's branch and diff counts, and reload the bytes when the
+    /// file's mtime or size changes underneath the viewer.
+    func watchGitStatus() async {
+        while !Task.isCancelled {
+            if await refreshGitStatus() { return }
+            try? await Task.sleep(for: .seconds(2))
+        }
+    }
+
+    /// True when polling should stop.
+    private func refreshGitStatus() async -> Bool {
+        do {
+            let status = try await client.fetchGitStatus(path: entry.path)
+            gitStatus = status.showsBar ? status : nil
+            // Wait until the first byte load finishes before remembering a stamp.
+            // Otherwise a save that lands during that load would look unchanged.
+            guard hasLoaded else { return false }
+            let stamp = status.contentStamp
+            if contentStamp == nil {
+                contentStamp = stamp
+                if shouldReloadForSizeMismatch(status) { await reloadAfterGitChange() }
+                return false
+            }
+            guard stamp != contentStamp else { return false }
+            let previousStamp = contentStamp
+            contentStamp = stamp
+            await reloadAfterGitChange()
+            if errorMessage != nil { contentStamp = previousStamp }
+            return false
+        } catch {
+            if isCancellation(error) { return true }
+            if (error as? CodexClientError)?.statusCode == 404 {
+                gitStatus = nil
+                return true
+            }
+            return false
+        }
+    }
+
+    /// The listing size and the loaded bytes disagree, and the whole file is
+    /// already in memory, so a save raced the first read.
+    private func shouldReloadForSizeMismatch(_ status: RelayGitStatus) -> Bool {
+        guard !hasMoreBytes, let size = status.size else { return false }
+        return Int64(data.count) != size
+    }
+
+    private func reloadAfterGitChange() async {
+        guard !isLoading, !isLoadingMore else { return }
+        await load()
     }
 
     /// Byte range for the next "Load more" request, continuing from the loaded bytes.
@@ -654,6 +711,7 @@ struct FileViewerView: View {
 
     @State private var wrapsText = true
     @State private var showsRawMarkdown = false
+    @Environment(\.scenePhase) private var scenePhase
 
     init(client: CodexClient, identityStore: ClientIdentityStore, entry: CodexWorkspaceDirectoryEntry) {
         _viewModel = StateObject(wrappedValue: FileViewerViewModel(client: client, entry: entry))
@@ -676,15 +734,36 @@ struct FileViewerView: View {
     // MARK: - Fetched kinds (text / markdown / image / binary)
 
     private var fetchedContent: some View {
-        ZStack {
-            AppTheme.canvasGradient.ignoresSafeArea()
-            content
+        VStack(spacing: 0) {
+            gitStatusBar
+            ZStack {
+                content
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .background(AppTheme.canvasGradient.ignoresSafeArea())
         .navigationTitle(viewModel.entry.displayName)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { toolbarContent }
+        .toolbarBackground(AppTheme.canvasBottom, for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
         .task {
             await viewModel.loadIfNeeded()
+        }
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            await viewModel.watchGitStatus()
+        }
+    }
+
+    @ViewBuilder
+    private var gitStatusBar: some View {
+        if let branch = viewModel.gitStatus?.branchLabel {
+            RelayGitStatusBar(
+                branch: branch,
+                added: viewModel.gitStatus?.added ?? 0,
+                deleted: viewModel.gitStatus?.deleted ?? 0
+            )
         }
     }
 
@@ -715,61 +794,24 @@ struct FileViewerView: View {
     }
 
     private func textContent(forceWrap: Bool) -> some View {
-        let shouldWrap = forceWrap || wrapsText
-        return Group {
-            if shouldWrap {
-                GeometryReader { proxy in
-                    ScrollView(.vertical) {
-                        scrollBody(wrapWidth: proxy.size.width)
-                    }
-                }
-            } else {
-                ScrollView([.horizontal, .vertical]) {
-                    scrollBody(wrapWidth: nil)
-                }
-            }
-        }
-        .scrollDismissesKeyboard(.interactively)
-    }
-
-    private func scrollBody(wrapWidth: CGFloat?) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
+        VStack(spacing: 0) {
             inlineErrorBanner
-            monoText(wrapWidth: wrapWidth)
-            statusRows
-        }
-        .frame(width: wrapWidth, alignment: .leading)
-    }
-
-    @ViewBuilder
-    private func monoText(wrapWidth: CGFloat?) -> some View {
-        if viewModel.textChunks.isEmpty {
-            Text("This file is empty.")
-                .font(AppTheme.monoFont(size: 12))
-                .foregroundStyle(AppTheme.textTertiary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(16)
-        } else {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(Array(viewModel.textChunks.enumerated()), id: \.offset) { _, chunk in
-                    Group {
-                        if viewModel.entry.fileCategory == .code {
-                            Text(RelayCodeSyntax.highlighted(chunk, fileName: viewModel.entry.displayName))
-                        } else {
-                            Text(chunk)
-                                .foregroundStyle(AppTheme.textPrimary)
-                        }
-                    }
-                        .font(AppTheme.monoFont(size: 12))
-                        .lineSpacing(2.5)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: wrapWidth == nil, vertical: true)
-                        .frame(maxWidth: wrapWidth == nil ? nil : .infinity, alignment: .leading)
-                }
+            if viewModel.text.isEmpty {
+                Text("This file is empty.")
+                    .font(AppTheme.monoFont(size: 12))
+                    .foregroundStyle(AppTheme.textTertiary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .padding(16)
+            } else {
+                RelayNumberedCodeView(
+                    text: viewModel.text,
+                    fileName: viewModel.entry.displayName,
+                    highlight: viewModel.entry.fileCategory == .code,
+                    wraps: forceWrap || wrapsText
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 16)
-            .frame(width: wrapWidth, alignment: .leading)
+            statusRows
         }
     }
 
@@ -1046,5 +1088,317 @@ private struct FileViewerErrorBanner: View {
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .stroke(AppTheme.statusError.opacity(0.3), lineWidth: 1)
             }
+    }
+}
+
+/// One quiet row under the folder path or the file title: branch, then the
+/// working-tree line counts. Zeros stay off the row so a clean file is just
+/// the branch, and the counts tick as saves land.
+struct RelayGitStatusBar: View {
+    let branch: String
+    let added: Int
+    let deleted: Int
+
+    private static let additionInk = Color(red: 0.62, green: 0.75, blue: 0.56)
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Image(systemName: "arrow.triangle.branch")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(AppTheme.textTertiary)
+                .padding(.trailing, 6)
+            Text(branch)
+                .font(AppTheme.monoFont(size: 11, weight: .medium))
+                .foregroundStyle(AppTheme.textSecondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 12)
+            HStack(spacing: 8) {
+                if added > 0 {
+                    Text("+\(added)")
+                        .foregroundStyle(Self.additionInk)
+                        .contentTransition(.numericText())
+                }
+                if deleted > 0 {
+                    Text("−\(deleted)")
+                        .foregroundStyle(AppTheme.statusError)
+                        .contentTransition(.numericText())
+                }
+            }
+            .font(AppTheme.monoFont(size: 11, weight: .medium))
+            .monospacedDigit()
+            .layoutPriority(1)
+        }
+        .padding(.horizontal, 16)
+        .frame(height: 28)
+        .background(AppTheme.canvasBottom)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(AppTheme.hairline).frame(height: 0.5)
+        }
+        .animation(.snappy(duration: 0.2), value: added)
+        .animation(.snappy(duration: 0.2), value: deleted)
+        .accessibilityElement(children: .ignore)
+        .accessibilityIdentifier("relay-git-status")
+        .accessibilityLabel(accessibilityText)
+    }
+
+    private var accessibilityText: String {
+        var parts = ["Branch \(branch)"]
+        if added > 0 { parts.append("\(added) lines added") }
+        if deleted > 0 { parts.append("\(deleted) lines removed") }
+        return parts.joined(separator: ", ")
+    }
+}
+
+/// Character indexes where each editor line begins. A trailing newline does
+/// not invent an extra line, matching the gutter in a typical editor.
+enum RelaySourceLineIndex {
+    static func starts(in text: String) -> [Int] {
+        guard !text.isEmpty else { return [] }
+        let ns = text as NSString
+        var starts: [Int] = []
+        var index = 0
+        while index < ns.length {
+            starts.append(index)
+            let range = ns.lineRange(for: NSRange(location: index, length: 0))
+            let next = NSMaxRange(range)
+            if next <= index { break }
+            index = next
+        }
+        return starts
+    }
+
+    static func lineNumber(containing character: Int, starts: [Int]) -> Int {
+        guard !starts.isEmpty else { return 0 }
+        var low = 0
+        var high = starts.count - 1
+        var found = 0
+        while low <= high {
+            let mid = (low + high) / 2
+            if starts[mid] <= character {
+                found = mid
+                low = mid + 1
+            } else {
+                high = mid - 1
+            }
+        }
+        return found
+    }
+
+    static func gutterWidth(lineCount: Int) -> CGFloat {
+        let digits = max(2, String(max(lineCount, 1)).count)
+        return CGFloat(digits) * 7.2 + 18
+    }
+}
+
+/// Read-only code surface: a pinned line-number gutter and a text view that
+/// keeps selection. The gutter stays put while the code scrolls sideways.
+struct RelayNumberedCodeView: UIViewRepresentable {
+    let text: String
+    let fileName: String
+    let highlight: Bool
+    let wraps: Bool
+
+    func makeUIView(context: Context) -> RelayCodeCanvasView {
+        let view = RelayCodeCanvasView()
+        view.apply(text: text, fileName: fileName, highlight: highlight, wraps: wraps)
+        return view
+    }
+
+    func updateUIView(_ view: RelayCodeCanvasView, context: Context) {
+        view.apply(text: text, fileName: fileName, highlight: highlight, wraps: wraps)
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: RelayCodeCanvasView, context: Context) -> CGSize? {
+        guard let width = proposal.width, let height = proposal.height, width.isFinite, height.isFinite else {
+            return nil
+        }
+        return CGSize(width: width, height: height)
+    }
+}
+
+final class RelayCodeCanvasView: UIView, UITextViewDelegate {
+    private let gutter = RelayCodeGutterView()
+    private let textView = UITextView(usingTextLayoutManager: false)
+    private var gutterWidthConstraint: NSLayoutConstraint?
+    private var lineStarts: [Int] = []
+    private var appliedText: String?
+    private var appliedFileName = ""
+    private var appliedHighlight = false
+    private var appliedWraps = true
+
+    private let codeFont = UIFont(name: "DMMono-Regular", size: 12) ?? UIFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+    private let gutterFont = UIFont(name: "DMMono-Regular", size: 11) ?? UIFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+    private let ink = UIColor(red: 237 / 255, green: 232 / 255, blue: 223 / 255, alpha: 1)
+    private let gutterInk = UIColor(red: 237 / 255, green: 232 / 255, blue: 223 / 255, alpha: 0.38)
+    private let hairline = UIColor(red: 237 / 255, green: 232 / 255, blue: 223 / 255, alpha: 0.10)
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+        gutter.canvas = self
+        gutter.backgroundColor = .clear
+        gutter.isUserInteractionEnabled = false
+        gutter.isAccessibilityElement = false
+        gutter.translatesAutoresizingMaskIntoConstraints = false
+
+        textView.backgroundColor = .clear
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.tintColor = UIColor(red: 212 / 255, green: 128 / 255, blue: 74 / 255, alpha: 1)
+        textView.textContainer.lineFragmentPadding = 0
+        textView.textContainerInset = UIEdgeInsets(top: 12, left: 12, bottom: 24, right: 16)
+        textView.contentInsetAdjustmentBehavior = .never
+        textView.indicatorStyle = .white
+        textView.alwaysBounceVertical = true
+        textView.autocorrectionType = .no
+        textView.autocapitalizationType = .none
+        textView.spellCheckingType = .no
+        textView.smartDashesType = .no
+        textView.smartQuotesType = .no
+        textView.smartInsertDeleteType = .no
+        textView.dataDetectorTypes = []
+        textView.adjustsFontForContentSizeCategory = false
+        textView.delegate = self
+        textView.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(gutter)
+        addSubview(textView)
+        let width = gutter.widthAnchor.constraint(equalToConstant: RelaySourceLineIndex.gutterWidth(lineCount: 1))
+        gutterWidthConstraint = width
+        NSLayoutConstraint.activate([
+            gutter.leadingAnchor.constraint(equalTo: leadingAnchor),
+            gutter.topAnchor.constraint(equalTo: topAnchor),
+            gutter.bottomAnchor.constraint(equalTo: bottomAnchor),
+            width,
+            textView.leadingAnchor.constraint(equalTo: gutter.trailingAnchor),
+            textView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            textView.topAnchor.constraint(equalTo: topAnchor),
+            textView.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+        setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        setContentHuggingPriority(.defaultLow, for: .vertical)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { nil }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        gutter.setNeedsDisplay()
+    }
+
+    func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        gutter.setNeedsDisplay()
+    }
+
+    func apply(text: String, fileName: String, highlight: Bool, wraps: Bool) {
+        if appliedText == text, appliedFileName == fileName, appliedHighlight == highlight, appliedWraps == wraps {
+            return
+        }
+        let offset = textView.contentOffset
+        let hadText = appliedText != nil
+        appliedText = text
+        appliedFileName = fileName
+        appliedHighlight = highlight
+        appliedWraps = wraps
+
+        configureWrap(wraps)
+        textView.attributedText = attributed(text: text, fileName: fileName, highlight: highlight, wraps: wraps)
+        lineStarts = RelaySourceLineIndex.starts(in: text)
+        gutterWidthConstraint?.constant = RelaySourceLineIndex.gutterWidth(lineCount: lineStarts.count)
+        if hadText {
+            textView.layoutIfNeeded()
+            let maxOffset = max(0, textView.contentSize.height - textView.bounds.height)
+            textView.setContentOffset(CGPoint(x: offset.x, y: min(offset.y, maxOffset)), animated: false)
+        }
+        gutter.setNeedsDisplay()
+    }
+
+    func drawGutter() {
+        guard gutter.bounds.height > 0, !lineStarts.isEmpty else { return }
+        let layoutManager = textView.layoutManager
+        let length = textView.textStorage.length
+        guard length > 0 else { return }
+        let container = textView.textContainer
+        let originY = textView.textContainerInset.top
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: gutterFont,
+            .foregroundColor: gutterInk,
+        ]
+        let lookupY = max(0, textView.contentOffset.y - originY)
+        var fraction: CGFloat = 0
+        let glyph = layoutManager.glyphIndex(
+            for: CGPoint(x: 1, y: lookupY),
+            in: container,
+            fractionOfDistanceThroughGlyph: &fraction
+        )
+        let character = min(layoutManager.characterIndexForGlyph(at: glyph), length - 1)
+        var line = RelaySourceLineIndex.lineNumber(containing: character, starts: lineStarts)
+
+        while line < lineStarts.count {
+            let charIndex = lineStarts[line]
+            if charIndex >= length { break }
+            let glyphIndex = layoutManager.glyphIndexForCharacter(at: charIndex)
+            let fragment = layoutManager.lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: nil)
+            let viewY = originY + fragment.minY - textView.contentOffset.y
+            if viewY > gutter.bounds.height { break }
+            if viewY + fragment.height >= 0 {
+                let label = "\(line + 1)" as NSString
+                let size = label.size(withAttributes: attributes)
+                label.draw(
+                    at: CGPoint(
+                        x: gutter.bounds.width - 10 - size.width,
+                        y: viewY + max(0, (fragment.height - size.height) / 2)
+                    ),
+                    withAttributes: attributes
+                )
+            }
+            line += 1
+        }
+
+        if let context = UIGraphicsGetCurrentContext() {
+            context.setFillColor(hairline.cgColor)
+            context.fill(CGRect(x: gutter.bounds.width - 0.5, y: 0, width: 0.5, height: gutter.bounds.height))
+        }
+    }
+
+    private func configureWrap(_ wraps: Bool) {
+        if wraps {
+            textView.textContainer.widthTracksTextView = true
+            textView.textContainer.lineBreakMode = .byWordWrapping
+        } else {
+            textView.textContainer.widthTracksTextView = false
+            textView.textContainer.lineBreakMode = .byClipping
+            textView.textContainer.size = CGSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        }
+        textView.alwaysBounceHorizontal = !wraps
+        textView.showsHorizontalScrollIndicator = !wraps
+    }
+
+    private func attributed(text: String, fileName: String, highlight: Bool, wraps: Bool) -> NSAttributedString {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 3
+        paragraph.lineBreakMode = wraps ? .byWordWrapping : .byClipping
+        let rangeAttributes: [NSAttributedString.Key: Any] = [
+            .font: codeFont,
+            .paragraphStyle: paragraph,
+        ]
+        if highlight {
+            let mutable = NSMutableAttributedString(RelayCodeSyntax.highlighted(text, fileName: fileName))
+            mutable.addAttributes(rangeAttributes, range: NSRange(location: 0, length: mutable.length))
+            return mutable
+        }
+        var plain = rangeAttributes
+        plain[.foregroundColor] = ink
+        return NSAttributedString(string: text, attributes: plain)
+    }
+}
+
+private final class RelayCodeGutterView: UIView {
+    weak var canvas: RelayCodeCanvasView?
+
+    override func draw(_ rect: CGRect) {
+        canvas?.drawGutter()
     }
 }

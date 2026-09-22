@@ -708,6 +708,13 @@ function removePathInsideRoot(target, rootDir) {
 }
 
 
+function compareJobsForList(left, right) {
+  const active = Number(!terminalStatuses.has(right.status)) - Number(!terminalStatuses.has(left.status));
+  if (active) return active;
+  return Date.parse(right.updatedAt || right.createdAt || 0) - Date.parse(left.updatedAt || left.createdAt || 0);
+}
+
+
 function jobThreadId(job) {
   const sessionId = job?.sessionId || job?.resumeSessionId;
   const valid = normalizeJobProvider(job?.provider) === "kimi"
@@ -1796,6 +1803,7 @@ export {
   boundedSkillBody,
   removePersistedJobFiles,
   removePathInsideRoot,
+  compareJobsForList,
   jobThreadId,
   cancelJob,
   processQueue,

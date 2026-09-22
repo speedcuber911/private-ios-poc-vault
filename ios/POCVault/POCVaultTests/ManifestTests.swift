@@ -1899,6 +1899,56 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(feed.last?.preview, "No session")
     }
 
+    func testCodexThreadFeedPinsRunningWorkAboveNewerIdleThreads() throws {
+        let running = try decodeCodexThread(
+            """
+            {
+              "id": "thread-running",
+              "sessionId": "thread-running",
+              "workspaceId": "scratch",
+              "updatedAt": "2026-05-21T07:00:00Z",
+              "lastJobStatus": "running",
+              "activeJobCount": 1,
+              "lastPrompt": "Still going",
+              "provider": "cursor"
+            }
+            """
+        )
+        let liveNative = try decodeCodexThread(
+            """
+            {
+              "id": "thread-live",
+              "sessionId": "thread-live",
+              "workspaceId": "scratch",
+              "updatedAt": "2026-05-21T06:00:00Z",
+              "live": true,
+              "lastPrompt": "Native session",
+              "provider": "codex"
+            }
+            """
+        )
+        let newerIdle = try decodeCodexThread(
+            """
+            {
+              "id": "thread-idle",
+              "sessionId": "thread-idle",
+              "workspaceId": "scratch",
+              "updatedAt": "2026-05-21T09:00:00Z",
+              "lastJobStatus": "succeeded",
+              "lastPrompt": "Already done",
+              "provider": "claude"
+            }
+            """
+        )
+
+        let feed = CodexThreadFeedItem.makeFeed(threads: [newerIdle, liveNative, running], jobs: [])
+
+        XCTAssertEqual(feed.map(\.sessionID), ["thread-running", "thread-live", "thread-idle"])
+        XCTAssertTrue(feed[0].isActive)
+        XCTAssertTrue(feed[1].isActive)
+        XCTAssertFalse(feed[2].isActive)
+    }
+
     func testCodexThreadFeedPreviewStripsMarkdownFormatting() throws {
         let thread = try decodeCodexThread(
             """
@@ -2679,6 +2729,9 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(source.contains("RelayConversationRow(item: item)"))
         let rowSource = try AppSourceFixture.load("POCVault/POCVaultApp.swift")
         XCTAssertTrue(rowSource.contains("item.workspaceLabel"))
+        XCTAssertTrue(rowSource.contains("RelayProviderMark(provider: item.provider"))
+        XCTAssertTrue(rowSource.contains("activityStamp"))
+        XCTAssertTrue(source.contains("try? await Task.sleep(for: .seconds(4))"))
         XCTAssertTrue(source.contains("await viewModel.openHistoryItem(item)"))
         XCTAssertTrue(source.contains("Text(\"Threads\")"))
         // The explanatory subtitle was dropped by the Editorial Ember copy rule; the
@@ -3276,6 +3329,49 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(chunks.count, 3)
         XCTAssertTrue(chunks.allSatisfy { $0.split(separator: "\n", omittingEmptySubsequences: false).count <= 400 })
         XCTAssertEqual(chunks.joined(separator: "\n"), text)
+    }
+
+    func testRelaySourceLineNumbersMatchEditorLines() {
+        XCTAssertEqual(RelaySourceLineIndex.starts(in: ""), [])
+        XCTAssertEqual(RelaySourceLineIndex.starts(in: "one"), [0])
+        XCTAssertEqual(RelaySourceLineIndex.starts(in: "one\n").count, 1)
+        XCTAssertEqual(RelaySourceLineIndex.starts(in: "one\ntwo\n").count, 2)
+        XCTAssertEqual(RelaySourceLineIndex.starts(in: "one\n\ntwo").count, 3)
+        XCTAssertEqual(RelaySourceLineIndex.starts(in: "\n").count, 1)
+
+        let starts = RelaySourceLineIndex.starts(in: "alpha\nbeta\n")
+        XCTAssertEqual(RelaySourceLineIndex.lineNumber(containing: 0, starts: starts), 0)
+        XCTAssertEqual(RelaySourceLineIndex.lineNumber(containing: starts[1], starts: starts), 1)
+        XCTAssertGreaterThan(RelaySourceLineIndex.gutterWidth(lineCount: 1000), RelaySourceLineIndex.gutterWidth(lineCount: 9))
+    }
+
+    func testRelayGitStatusDecodesBranchAndLiveCounts() throws {
+        let dirty = try JSONDecoder().decode(
+            RelayGitStatus.self,
+            from: Data(
+                """
+                {"git":true,"branch":"feature/status","detached":false,"added":12,"deleted":3,"binary":false,"size":40,"modifiedAt":"2026-09-22T12:00:00.000Z"}
+                """.utf8
+            )
+        )
+        XCTAssertTrue(dirty.showsBar)
+        XCTAssertEqual(dirty.branchLabel, "feature/status")
+        XCTAssertEqual(dirty.added, 12)
+        XCTAssertEqual(dirty.deleted, 3)
+        XCTAssertEqual(dirty.contentStamp, "2026-09-22T12:00:00.000Z#40")
+
+        let quiet = try JSONDecoder().decode(RelayGitStatus.self, from: Data(#"{"git":false}"#.utf8))
+        XCTAssertFalse(quiet.showsBar)
+        XCTAssertNil(quiet.contentStamp)
+        XCTAssertEqual(quiet.added, 0)
+
+        let viewer = try AppSourceFixture.load("POCVault/Browser/FileViewerView.swift")
+        let browser = try AppSourceFixture.load("POCVault/Browser/FileBrowserView.swift")
+        XCTAssertTrue(viewer.contains("RelayNumberedCodeView("))
+        XCTAssertTrue(viewer.contains("watchGitStatus()"))
+        XCTAssertTrue(viewer.contains("struct RelayGitStatusBar"))
+        XCTAssertTrue(browser.contains("RelayGitStatusBar("))
+        XCTAssertTrue(browser.contains("watchGitStatus()"))
     }
 
     @MainActor

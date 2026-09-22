@@ -493,6 +493,22 @@ Serving semantics (935–998):
   (else 413); returns the same sandboxed `srcdoc`+CSP wrapper as artifact
   previews (§1.17).
 
+**`GET /v1/codex/fs/git`** — branch and working-tree line counts for one jailed
+file or directory. Query: `path` (same jail rules as `fs/file` / `fs/list`;
+empty means the browse root). 200:
+
+```json
+{"git": true, "branch": "main", "detached": false, "added": 12, "deleted": 3,
+ "binary": false, "size": 1234, "modifiedAt": "2026-09-22T12:00:00.000Z"}
+```
+
+`size` and `modifiedAt` are present for files only, so a client can reload
+bytes when the file is saved without treating a quiet poll as an edit.
+`added` / `deleted` compare the work tree with `HEAD` and include untracked
+lines. A path that is not inside a repository returns `{"git": false}`.
+Read-denied files are 403, the same as `fs/file`. The response never includes
+paths, diffs, or git stderr. A stuck `git` is 503.
+
 ### 1.13 Sessions & threads
 
 **`POST /v1/codex/session-imports/plan`** — compares up to 500 repo-scoped
@@ -547,8 +563,9 @@ excluded. 200:
 
 **`GET /v1/codex/threads`** (1478–1483, `listWorkspaceThreads`
 3461–3512) — the inbox: task threads (sessions ∪ jobs grouped by session
-id) plus persisted chat threads, merged and sorted by `updatedAt` desc,
-sliced to `limit`. Same query params as sessions. Thread summary shape
+id) plus persisted chat threads. Live threads (`live` or `activeJobCount`)
+sort ahead of idle ones, then `updatedAt` desc, then the list is sliced
+to `limit`. Same query params as sessions. Thread summary shape
 (task: `threadSummary` 3852–3879; chat: `chatThreadSummary` 3786–3811):
 
 ```json
@@ -561,6 +578,7 @@ sliced to `limit`. Same query params as sessions. Thread summary shape
   "cwd": "/…",                        // null when no session file
   "timestamp": "…", "updatedAt": "…",
   "jobCount": 3, "activeJobCount": 0,
+  "live": false,                     // true while a job is non-terminal, or a native transcript was written in the last 3 minutes
   "lastJobId": "<uuid>", "lastJobStatus": "succeeded",
   "title": "…",                       // synced native title or stable first prompt
   "lastPrompt": "…",                  // ≤ CODEX_THREAD_SUMMARY_CHARACTERS, "…"-suffixed
@@ -636,8 +654,9 @@ exposed (gap; see Part 2 §2.8).
 
 **`GET /v1/codex/jobs`** (1516–1529) — query `workspaceId` (400 if
 unknown), `provider` (`codex|claude|cursor|kimi`), `limit` (default 50, clamp
-1–200). Newest-first, sliced; each entry is a **compact** job response
-(4 KiB text fields). No offset/cursor (ambiguity A2).
+1–200). Non-terminal jobs sort ahead of finished ones, then by `updatedAt`
+(falling back to `createdAt`), then the list is sliced. Each entry is a
+**compact** job response (4 KiB text fields). No offset/cursor (ambiguity A2).
 200 `{"jobs": [ …job responses… ]}`.
 
 **`POST /v1/codex/jobs`** (1531–1540, `createJob` 2329–2413) — request:

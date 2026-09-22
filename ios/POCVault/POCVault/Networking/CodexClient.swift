@@ -505,6 +505,17 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
     /// rendered by the authenticated web view (PDF/HTML) instead of fetched as bytes.
     /// Same `/v1/codex/fs/file` route as `fetchFile`; the web view supplies the client
     /// identity through its own certificate-challenge handler.
+    /// Branch and `+`/`−` line counts for a jailed file or folder
+    /// (`GET /v1/codex/fs/git`). An empty path asks about the browse root.
+    func fetchGitStatus(path: String?) async throws -> RelayGitStatus {
+        var queryItems: [URLQueryItem] = []
+        if let path = path?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty {
+            queryItems.append(URLQueryItem(name: "path", value: path))
+        }
+        let data = try await perform(path: "/v1/codex/fs/git", queryItems: queryItems)
+        return try decoder.decode(RelayGitStatus.self, from: data)
+    }
+
     func fileWebViewURL(path: String) -> URL? {
         let url = endpoint(
             path: "/v1/codex/fs/file",

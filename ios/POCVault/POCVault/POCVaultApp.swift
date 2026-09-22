@@ -1283,21 +1283,21 @@ struct RelayConversationRow: View {
                     .lineLimit(dynamicTypeSize.isAccessibilitySize ? 3 : 2)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 if !dynamicTypeSize.isAccessibilitySize, let updatedAt = item.updatedAt {
-                    Text(updatedAt, format: .dateTime.month(.abbreviated).day())
+                    Text(activityStamp(updatedAt))
                         .font(.custom("DMSans-9ptRegular", size: 12, relativeTo: .caption))
                         .foregroundStyle(AppTheme.textPrimary.opacity(0.6))
                         .fixedSize()
                 }
             }
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 8) {
-                    contextLabel
-                    if let attentionLabel { statusLabel(attentionLabel) }
-                }
-                VStack(alignment: .leading, spacing: 4) {
-                    contextLabel
-                    if let attentionLabel { statusLabel(attentionLabel) }
-                }
+            HStack(spacing: 8) {
+                providerTag
+                if let attentionLabel { statusLabel(attentionLabel) }
+                Text(item.workspaceLabel)
+                    .font(.custom("DMSans-9ptRegular", size: 13, relativeTo: .subheadline))
+                    .foregroundStyle(AppTheme.textPrimary.opacity(0.65))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .layoutPriority(-1)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1306,12 +1306,24 @@ struct RelayConversationRow: View {
         .accessibilityElement(children: .combine)
     }
 
-    private var contextLabel: some View {
-        Text("\(item.workspaceLabel) · \(item.provider.relayPresentation.title)")
-            .font(.custom("DMSans-9ptRegular", size: 13, relativeTo: .subheadline))
-            .foregroundStyle(AppTheme.textPrimary.opacity(0.65))
-            .lineLimit(1)
-            .truncationMode(.middle)
+    private var providerTag: some View {
+        HStack(spacing: 5) {
+            RelayProviderMark(provider: item.provider, size: 12)
+            Text(item.provider.relayPresentation.title)
+                .font(.custom("DMSans-9ptRegular", size: 12, relativeTo: .caption).weight(.medium))
+                .foregroundStyle(item.provider.relayPresentation.accent)
+                .lineLimit(1)
+        }
+        .fixedSize()
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(item.provider.relayPresentation.title)
+    }
+
+    private func activityStamp(_ date: Date) -> String {
+        if Calendar.current.isDateInToday(date) {
+            return date.formatted(date: .omitted, time: .shortened)
+        }
+        return date.formatted(.dateTime.month(.abbreviated).day())
     }
 
     private var attentionLabel: String? {

@@ -35,6 +35,7 @@ struct FileBrowserView: View {
     @State private var selectedSection = FileBrowserSection.files
     @FocusState private var filterIsFocused: Bool
     @AppStorage("relay.fileBrowser.showsHiddenFolders") private var showsHiddenFolders = false
+    @Environment(\.scenePhase) private var scenePhase
 
     init(
         client: CodexClient,
@@ -83,8 +84,16 @@ struct FileBrowserView: View {
             if activeSection == .chats { await viewModel.refreshConversations() }
         }
         .task { await viewModel.loadIfNeeded() }
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            await viewModel.watchGitStatus()
+        }
         .task(id: activeSection) {
-            if activeSection == .chats { await viewModel.refreshConversations() }
+            guard activeSection == .chats else { return }
+            while !Task.isCancelled {
+                await viewModel.refreshConversations()
+                try? await Task.sleep(for: .seconds(4))
+            }
         }
         .onChange(of: selectedSection) { _, _ in
             viewModel.searchText = ""
@@ -112,6 +121,13 @@ struct FileBrowserView: View {
     private var explorerControls: some View {
         VStack(spacing: 0) {
             pathBar
+            if let branch = viewModel.gitStatus?.branchLabel {
+                RelayGitStatusBar(
+                    branch: branch,
+                    added: viewModel.gitStatus?.added ?? 0,
+                    deleted: viewModel.gitStatus?.deleted ?? 0
+                )
+            }
             if !isRoot { sectionSwitcher }
             filterField
         }
