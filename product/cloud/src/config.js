@@ -167,6 +167,26 @@ export function loadConfig(env = process.env) {
     // General request body cap for JSON endpoints.
     jsonBodyMaxBytes: intFrom(env.JSON_BODY_MAX_BYTES, 32 * 1024),
 
+    // relayd release artifacts, which this host serves itself — there is no
+    // release bucket and no CDN in front of one. The directory is deliberately
+    // under /var/lib/relay-cloud (see deploy/install.sh) rather than inside
+    // /opt/relay-cloud/releases/<id>: an artifact must outlive the control
+    // plane deploy that happened to receive it, or every announcement already
+    // out in the fleet would point at a 404 the next time this service ships.
+    //
+    // The cap is orders of magnitude above the JSON one because this body is a
+    // tarball, not a document: today's relayd packs to well under a megabyte,
+    // and 64 MiB is headroom for it growing a bundled runtime rather than a
+    // number anything is expected to approach. readRaw buffers the whole body,
+    // so this is also the per-upload memory ceiling.
+    //
+    // The public https base URL an artifact is announced under is NOT a knob of
+    // its own: it is betterAuthBaseURL (BETTER_AUTH_URL, written by
+    // deploy/install.sh from RELAY_PUBLIC_BASE_URL). One public origin per
+    // deployment, and the one a node already reaches.
+    artifactDir: env.RELAY_ARTIFACT_DIR || "/var/lib/relay-cloud/artifacts",
+    artifactMaxBytes: intFrom(env.RELAY_ARTIFACT_MAX_BYTES, 64 * 1024 * 1024),
+
     // Cap on how long GET /v1/node/handoffs holds a long-poll open, in
     // seconds. Kept comfortably inside nginx's 300 s proxy_read_timeout
     // (deploy/relay-cloud.nginx.conf.template) and Node's 60 s default

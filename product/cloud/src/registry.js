@@ -329,6 +329,40 @@ function ensureDeviceApnsEnvironmentColumn(db) {
   }
 }
 
+// Non-destructive guard for existing databases that predate the release
+// subscription: nodes.channel, nodes.pending_version, and the store the
+// announcement itself lives in. Same idiom as ensureNodeEncColumn — a
+// database provisioned from an earlier schema gains these on open rather than
+// failing closed on first use — and db.js stays the canonical declaration.
+//
+// The nodes columns are guarded by the table existing at all, but the release
+// table is created unconditionally: it hangs off nothing, and a registry
+// opened over an old database must still be able to answer a poll with the
+// currently published release.
+function ensureRelaydReleaseSchema(db) {
+  const columns = db.prepare("PRAGMA table_info(nodes)").all();
+  if (columns.length > 0) {
+    const names = new Set(columns.map((column) => column.name));
+    if (!names.has("channel")) db.exec("ALTER TABLE nodes ADD COLUMN channel TEXT");
+    if (!names.has("pending_version")) {
+      db.exec("ALTER TABLE nodes ADD COLUMN pending_version TEXT");
+    }
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS relayd_releases (
+      channel      TEXT PRIMARY KEY,
+      version      TEXT NOT NULL,
+      url          TEXT NOT NULL,
+      sha256       TEXT NOT NULL,
+      sig          TEXT NOT NULL,
+      sig_alg      TEXT NOT NULL,
+      min_version  TEXT NOT NULL,
+      notes        TEXT,
+      published_at INTEGER NOT NULL
+    );
+  `);
+}
+
 export function createRegistry(db, { now = () => Date.now() } = {}) {
   ensureCliComputerSchema(db);
   ensureBrowserSessionsSchema(db);
@@ -341,6 +375,7 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
   ensureDeviceCodeMachineColumns(db);
   ensureDeviceApnsEnvironmentColumn(db);
   ensureDeviceTokenUniqueness(db);
+  ensureRelaydReleaseSchema(db);
 
   // ── accounts ────────────────────────────────────────────────────────────
   function createAccount({ id = randomUUID(), appleSub = null, email = null }) {
@@ -678,16 +713,30 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     return getNode(id);
   }
 
-  function touchNode(id, { version } = {}) {
+  // Presence, plus whatever the node chose to say about itself while it was
+  // here. Every field is patch semantics on purpose: an omitted key leaves the
+  // stored value alone, so the callers that pass nothing (a poll response, an
+  // event ingest) still record only last_seen, and an explicit null clears —
+  // which is how a node reports that it no longer has an update staged.
+  // Deciding which of those an incoming value counts as is the HTTP layer's
+  // job, not this function's; see server.js's heartbeat patch helpers.
+  function touchNode(id, { version, channel, pendingVersion } = {}) {
+    const sets = ["last_seen = ?"];
+    const values = [now()];
     if (version !== undefined) {
-      db.prepare("UPDATE nodes SET last_seen = ?, version = ? WHERE id = ?").run(
-        now(),
-        version,
-        id,
-      );
-    } else {
-      db.prepare("UPDATE nodes SET last_seen = ? WHERE id = ?").run(now(), id);
+      sets.push("version = ?");
+      values.push(version);
     }
+    if (channel !== undefined) {
+      sets.push("channel = ?");
+      values.push(channel);
+    }
+    if (pendingVersion !== undefined) {
+      sets.push("pending_version = ?");
+      values.push(pendingVersion);
+    }
+    values.push(id);
+    db.prepare(`UPDATE nodes SET ${sets.join(", ")} WHERE id = ?`).run(...values);
   }
 
   function adminListNodes() {
@@ -695,6 +744,45 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
       .prepare("SELECT * FROM nodes ORDER BY created_at")
       .all()
       .map(mapNode);
+  }
+
+  // ── relayd releases ─────────────────────────────────────────────────────
+
+  // Publishing REPLACES the channel's row rather than appending to a log. A
+  // node reconciles against the current announcement and nothing reads an
+  // earlier one, so keeping superseded rows would only force every read on
+  // the poll path to pick between them. Rolling back a bad release is
+  // therefore re-publishing the good one, and `relayd`'s own refusal to
+  // downgrade is what stops that from walking a fleet backwards.
+  //
+  // Nothing here validates the descriptor: the fields arrive canonicalised
+  // from the one route that can write them (POST /v1/admin/relayd-release),
+  // which is where the per-field refusals and their error codes live.
+  function publishRelaydRelease({
+    channel, version, url, sha256, sig, sigAlg, minVersion, notes = null,
+  }) {
+    db.prepare(
+      `INSERT INTO relayd_releases
+         (channel, version, url, sha256, sig, sig_alg, min_version, notes, published_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (channel) DO UPDATE SET
+         version = excluded.version,
+         url = excluded.url,
+         sha256 = excluded.sha256,
+         sig = excluded.sig,
+         sig_alg = excluded.sig_alg,
+         min_version = excluded.min_version,
+         notes = excluded.notes,
+         published_at = excluded.published_at`,
+    ).run(channel, version, url, sha256, sig, sigAlg, minVersion, notes ?? null, now());
+    return getRelaydRelease(channel);
+  }
+
+  function getRelaydRelease(channel) {
+    const row = db
+      .prepare("SELECT * FROM relayd_releases WHERE channel = ?")
+      .get(channel);
+    return row ? mapRelaydRelease(row) : null;
   }
 
   // ── App Store subscriptions ────────────────────────────────────────────
@@ -1790,6 +1878,8 @@ export function createRegistry(db, { now = () => Date.now() } = {}) {
     updateNode,
     touchNode,
     adminListNodes,
+    publishRelaydRelease,
+    getRelaydRelease,
     getAppleSubscriptionByAccount,
     getAppleSubscriptionByOriginalTransactionId,
     upsertAppleSubscription,
@@ -1907,8 +1997,27 @@ function mapNode(row) {
     // state: everything but handoff works.
     encPubkey: row.enc_pubkey ?? null,
     version: row.version,
+    // Null for every node that has never reported one. Callers deciding which
+    // release announcement a node gets must read null as `stable` — see the
+    // nodes table comment in db.js.
+    channel: row.channel ?? null,
+    pendingVersion: row.pending_version ?? null,
     lastSeen: row.last_seen == null ? null : Number(row.last_seen),
     createdAt: Number(row.created_at),
+  };
+}
+
+function mapRelaydRelease(row) {
+  return {
+    channel: row.channel,
+    version: row.version,
+    url: row.url,
+    sha256: row.sha256,
+    sigAlg: row.sig_alg,
+    sig: row.sig,
+    minVersion: row.min_version,
+    notes: row.notes ?? null,
+    publishedAt: Number(row.published_at),
   };
 }
 

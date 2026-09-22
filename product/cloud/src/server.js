@@ -15,6 +15,9 @@
 // authenticates relayed blobs — see pairing.js for the full rationale.
 
 import { createServer } from "node:http";
+import { createReadStream } from "node:fs";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { timingSafeEqual, randomBytes, createHash, randomUUID } from "node:crypto";
 import { signEd25519 } from "./jwt.js";
 import { serializeSignedCookie } from "better-call";
@@ -86,6 +89,328 @@ const SYNC_NOTICE_KINDS = new Set(["sync-auth", "session-index"]);
 // (base64url of 24 random bytes) and what pairing.js's AUTH_TOKEN_RE accepts
 // for the token derived from it.
 const SYNC_NOTICE_SECRET_RE = /^[A-Za-z0-9_-]{22,128}$/;
+
+// Rollout channels, for both halves of the release subscription: the channel a
+// node reports on heartbeat and the channel an announcement is published to.
+// Two channels and a per-machine pin are the entire rollout policy the spec
+// permits — no cohorts, no percentages — so this set is also the complete
+// vocabulary of nodes.channel. A node that has never reported one reads as
+// `stable`, which is why the default is named rather than written inline at
+// each of its three uses.
+const RELEASE_CHANNELS = new Set(["stable", "beta"]);
+const DEFAULT_RELEASE_CHANNEL = "stable";
+
+// One release, one spelling.
+//
+// A node decides whether to update by comparing the announced version against
+// the one it is running, and refuses to move backwards. So admitting both
+// "0.2.0" and "v0.2.0" is not cosmetic: whichever one is stored is the string
+// every node compares against, and the other becomes a version the fleet can
+// never agree it has reached. Surrounding whitespace and a leading `v` are
+// therefore canonicalised away rather than accepted verbatim, and leading
+// zeros are refused outright because "01.2.0" is a second spelling of a
+// version already spelled "1.2.0" — canonicalising those silently would let
+// one release be published twice under two labels an operator reads as
+// different.
+//
+// Deliberately narrower than semver: no prerelease, no build metadata. That
+// matches ops/release-relayd's own VERSION_RE (the only publisher) and keeps
+// the ordering question exactly three integers wide.
+const RELEASE_VERSION_RE = /^v?(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$/;
+
+function parseReleaseVersion(value) {
+  if (typeof value !== "string") return null;
+  const match = RELEASE_VERSION_RE.exec(value.trim());
+  if (!match) return null;
+  const order = match.slice(1, 4).map(Number);
+  return { canonical: order.join("."), order };
+}
+
+function releaseVersionAtMost(a, b) {
+  for (let i = 0; i < a.order.length; i += 1) {
+    if (a.order[i] !== b.order[i]) return a.order[i] < b.order[i];
+  }
+  return true;
+}
+
+// What a node may report as its own running or staged version.
+//
+// Wider than RELEASE_VERSION_RE on purpose: a machine may legitimately be
+// running something no release ever announced — a hand-installed build, a tree
+// between tags — and the whole point of the field is to make that visible
+// rather than to make it conform. Still bounded and charset-checked, because
+// the value is self-reported by the machine, stored, and read back by ops on
+// /v1/admin/nodes.
+//
+// A NUL byte fails the charset test, which matters beyond tidiness: node:sqlite
+// — like most C string storage — silently truncates a TEXT value at the first
+// NUL, so without this the string that passed validation would not be the
+// string that got stored. Same reasoning as HANDOFF_BRANCH_RE below.
+const NODE_VERSION_RE = /^[A-Za-z0-9][A-Za-z0-9.+_-]{0,63}$/;
+
+// How a heartbeat body is read. One rule, applied to every optional field it
+// may carry:
+//
+//   absent    → leave the stored value exactly as it was
+//   null      → clear it; this is how a node says "nothing is staged any more"
+//   valid     → store the canonical form
+//   malformed → ignore, i.e. leave the stored value alone
+//
+// Nothing in the body may turn a successful ping into a 4xx. relayd today
+// sends the literal `{}` (cloudclient.mjs) and must keep working untouched,
+// and a heartbeat is a presence ping first: refusing the request over one
+// unparseable field would take the machine's last_seen down with it and page
+// notify.sweepWatchdog for a machine that is plainly alive. The strictness
+// lives on the write instead — only a value matching the charset above is ever
+// stored — which is the same split parseNodeEncPubkey makes for a key it
+// cannot fix.
+function heartbeatVersionPatch(value) {
+  if (value === undefined || value === null) return value;
+  if (typeof value !== "string") return undefined;
+  const version = value.trim();
+  return NODE_VERSION_RE.test(version) ? version : undefined;
+}
+
+function heartbeatChannelPatch(value) {
+  if (value === undefined || value === null) return value;
+  return RELEASE_CHANNELS.has(value) ? value : undefined;
+}
+
+// Hex digest of the artifact, lowercase and exactly 32 bytes wide. Case is not
+// canonicalised but refused: the node compares this against a digest it
+// computes itself, and the publisher (ops/release-relayd) sends `digest.hex()`,
+// so admitting uppercase would only widen what can be stored.
+const RELEASE_SHA256_RE = /^[0-9a-f]{64}$/;
+const RELEASE_URL_MAX_BYTES = 512;
+const RELEASE_NOTES_MAX_LENGTH = 200;
+
+// Where the artifact lives. https only, and no embedded credentials: a node
+// fetches this URL unauthenticated, and the signature over the digest — not
+// the host — is what protects the bytes, so a URL carrying a secret is either
+// a mistake or a way to write one into every machine's logs. Re-hosting behind
+// a CDN is expected and needs no re-signing, which is exactly why there is
+// nothing to check here beyond the scheme.
+//
+// The stored value is the WHATWG-normalised form, so one artifact location is
+// one string rather than one per spelling of its host or path.
+function parseReleaseUrl(value) {
+  if (typeof value !== "string" || Buffer.byteLength(value) > RELEASE_URL_MAX_BYTES) return null;
+  let url;
+  try {
+    url = new URL(value.trim());
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "https:" || url.username || url.password) return null;
+  return url.href;
+}
+
+// Detached Ed25519 signature over the 32 raw digest bytes, in canonical
+// base64url — the same decode-and-re-encode rule nodeauth.js applies to a
+// request signature and parseNodeEncPubkey applies to a recipient key. Node's
+// base64url decoder is lenient: it accepts the standard `+/` alphabet, accepts
+// padding, silently skips every non-alphabet character, and ignores the four
+// unused bits in the final character of an 86-character (512-bit) payload. A
+// length check alone would therefore admit unlimited distinct spellings of one
+// signature, and store whichever one the publisher happened to send.
+// ops/release-relayd sends unpadded base64url, which is precisely what Buffer's
+// base64url encoder emits.
+function parseReleaseSignature(value) {
+  if (typeof value !== "string" || value.length === 0) return null;
+  const signature = Buffer.from(value, "base64url");
+  if (signature.length !== 64 || signature.toString("base64url") !== value) return null;
+  return value;
+}
+
+// A short human line, logged by the node and shown next to the version.
+// Absent and null are both "no notes" — ops/release-relayd sends `notes: null`
+// whenever --notes was not passed, so rejecting null would reject the ordinary
+// release. Control characters are refused rather than stripped: this string
+// lands in a node's audit log, where an embedded newline is how one record
+// becomes two. Returns undefined for "refuse this descriptor", which is
+// distinct from the null that means "no notes".
+function parseReleaseNotes(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") return undefined;
+  const notes = value.trim();
+  if (notes.length === 0) return null;
+  if (notes.length > RELEASE_NOTES_MAX_LENGTH) return undefined;
+  if (/[\u0000-\u001f\u007f]/.test(notes)) return undefined;
+  return notes;
+}
+
+// The published announcement, validated field by field because this is the one
+// write in the control plane that every machine in the fleet acts on.
+//
+// What the cloud cannot do is why the validation matters more than it looks:
+// the signing key is offline (ops/release-relayd signs on the operator's
+// laptop), so a bad row here can never make a node run code. It can, however,
+// point a whole channel at a URL, and a malformed digest or signature turns
+// "update available" into a download every machine fetches, fails to verify,
+// and deletes — for as long as the row stands.
+//
+// Every refusal carries its own code. The publisher is a script, not a person
+// reading a response body: one `invalid_release` for eight fields would leave
+// it guessing which one it got wrong.
+function parseRelaydReleaseDescriptor(body) {
+  if (!RELEASE_CHANNELS.has(body?.channel)) return { error: "invalid_channel" };
+  const version = parseReleaseVersion(body?.version);
+  if (!version) return { error: "invalid_version" };
+  const minVersion = parseReleaseVersion(body?.minVersion);
+  if (!minVersion) return { error: "invalid_min_version" };
+  // minVersion is the oldest version that may update DIRECTLY to this one, so
+  // a floor above the release's own version describes a release nothing may
+  // ever install: every machine is below it, and the intermediate they are
+  // told to step through is this release.
+  if (!releaseVersionAtMost(minVersion, version)) {
+    return { error: "min_version_above_version" };
+  }
+  const url = parseReleaseUrl(body?.url);
+  if (!url) return { error: "invalid_url" };
+  if (typeof body?.sha256 !== "string" || !RELEASE_SHA256_RE.test(body.sha256)) {
+    return { error: "invalid_sha256" };
+  }
+  if (body?.sigAlg !== "ed25519") return { error: "invalid_sig_alg" };
+  const sig = parseReleaseSignature(body?.sig);
+  if (!sig) return { error: "invalid_sig" };
+  const notes = parseReleaseNotes(body?.notes);
+  if (notes === undefined) return { error: "invalid_notes" };
+  return {
+    descriptor: {
+      channel: body.channel,
+      version: version.canonical,
+      url,
+      sha256: body.sha256,
+      sigAlg: "ed25519",
+      sig,
+      minVersion: minVersion.canonical,
+      notes,
+    },
+  };
+}
+
+// FROZEN WIRE FORMAT. The `release` object on GET /v1/node/handoffs, exactly as
+// the spec's normative wire additions define it. `publishedAt` is deliberately
+// not here: a node reconciles against the announcement itself, and nothing on
+// the machine may start depending on when a release was cut.
+//
+// `notes` is omitted rather than sent as null, for the same reason the whole
+// object is absent rather than null when nothing is published — an older relayd
+// ignores a field it does not know, but a null where it expects a string is
+// something it would have to special-case.
+function publicRelaydRelease(release) {
+  if (!release) return null;
+  return {
+    channel: release.channel,
+    version: release.version,
+    url: release.url,
+    sha256: release.sha256,
+    sigAlg: release.sigAlg,
+    sig: release.sig,
+    minVersion: release.minVersion,
+    ...(release.notes === null ? {} : { notes: release.notes }),
+  };
+}
+
+// ── relayd release artifacts ──────────────────────────────────────────────
+//
+// The control plane hosts the tarball itself. There is no release bucket: the
+// publisher's only two credentials are the offline signing key and the admin
+// token, and the machine a node downloads from is the one it already talks to.
+// That changes nothing about trust — the detached Ed25519 signature over the
+// digest is what protects the bytes, exactly as it did when the artifact sat
+// behind a public S3 URL — so hosting here buys one fewer service to configure,
+// not one more thing to trust.
+//
+// Everything below treats the filesystem as the store. There is no table: the
+// bytes and their path ARE the record, a digest is cheap to recompute, and a
+// row that could disagree with the file beside it is a failure mode worth not
+// having.
+
+// One version, one filename. The publisher names the tarball after the version
+// it built, so this is a check that two independent statements of the same fact
+// agree, not a naming convention the server invents. Deriving the name here and
+// comparing it — rather than sanitising whatever `filename` arrived — is also
+// why no request string ever reaches a path: the stored name is built from the
+// canonical version and nothing else.
+function relaydArtifactFilename(version) {
+  return `relayd-${version}.tar.gz`;
+}
+
+// Absolute path of one artifact, built only from the canonical version (three
+// integers and two dots — see RELEASE_VERSION_RE) and the filename derived from
+// it. Neither can contain a separator, a dot segment, or a NUL, so there is
+// nothing here for a traversal to work with. The containment assertion is
+// belt-and-braces against a future edit loosening one of those regexes: it
+// costs a string compare and turns a silent escape into a refusal.
+function relaydArtifactPath(config, version) {
+  const root = resolvePath(config.artifactDir);
+  const full = join(root, "relayd", version, relaydArtifactFilename(version));
+  if (resolvePath(full) !== full || !full.startsWith(`${root}/`)) return null;
+  return full;
+}
+
+// The absolute https URL a node will fetch, minted from the deployment's own
+// public base URL and NEVER from the request's Host header. This value is
+// returned to the publisher, signed into an announcement, and acted on by every
+// machine on the channel: a caller that could choose it by sending a header
+// would be choosing where the fleet downloads from.
+//
+// https is required rather than assumed. A deployment whose BETTER_AUTH_URL is
+// http (local dev, or an operator who never set it) cannot host artifacts at
+// all — POST /v1/admin/relayd-artifact answers 503 — because publishing under a
+// URL the release route itself refuses (parseReleaseUrl: https only) would
+// store bytes nothing could ever announce.
+function relaydArtifactUrl(config, version) {
+  const origin = originOnly(config.betterAuthBaseURL);
+  if (!origin.startsWith("https://")) return null;
+  return `${origin}/relayd/${version}/${relaydArtifactFilename(version)}`;
+}
+
+// Writes the artifact, or explains why it could not.
+//
+// IMMUTABLE, with one exception that matters more than the rule: identical
+// bytes are a success. The publisher is reproducible by construction (sorted
+// tar members, fixed mtimes, `builtAt` from the commit date), so re-running a
+// release that failed after the upload — a dropped announcement, a `--watch`
+// that timed out, an operator repeating the command — produces the same tarball
+// byte for byte. Refusing that would make the ordinary retry look like a
+// conflict. DIFFERENT bytes under a version already published is the thing
+// being prevented: a machine that downloads at a different moment than its
+// neighbour would otherwise get a different release wearing the same version,
+// and the signature over the old digest would fail on it.
+//
+// Atomic by temp-file-plus-rename so no reader can ever see a partial tarball
+// at the served path; the temp name carries a UUID so two uploads in flight
+// cannot scribble over each other's staging file. Two CONCURRENT uploads of
+// different bytes for one version are outside the model — there is one
+// publisher holding one admin token — and the existence check is what enforces
+// immutability for every sequential case.
+async function storeRelaydArtifact(filePath, bytes) {
+  try {
+    await mkdir(dirname(filePath), { recursive: true });
+  } catch {
+    return { error: "artifact_dir_unwritable" };
+  }
+  let existing = null;
+  try {
+    existing = await readFile(filePath);
+  } catch (err) {
+    if (err?.code !== "ENOENT") return { error: "artifact_unreadable" };
+  }
+  if (existing) {
+    return existing.equals(bytes) ? { ok: true } : { error: "artifact_exists" };
+  }
+  const staging = `${filePath}.${randomUUID()}.part`;
+  try {
+    await writeFile(staging, bytes, { flag: "wx" });
+    await rename(staging, filePath);
+  } catch {
+    await rm(staging, { force: true }).catch(() => {});
+    return { error: "artifact_write_failed" };
+  }
+  return { ok: true };
+}
 
 export function createApp({
   config,
@@ -588,14 +913,27 @@ export function createApp({
     }
 
     // ── node heartbeat + event ingest (signature-authed) ────────────────
-    // Signed presence ping. Updates last_seen only — no event row, no APNs.
-    // The watchdog in notify.sweepWatchdog uses that timestamp to page
-    // `node.unreachable` when a registered machine goes quiet.
+    // Signed presence ping. Updates last_seen, plus whatever build identity the
+    // node chose to report — no event row, no APNs. The watchdog in
+    // notify.sweepWatchdog uses that timestamp to page `node.unreachable` when
+    // a registered machine goes quiet.
+    //
+    // The body is optional in the strongest sense: relayd today sends the
+    // literal `{}`, an older relayd must keep working unchanged, and a body
+    // that is missing, empty, oversized or unparseable reads as "nothing to
+    // report" rather than as an error — readJson returns null for every one of
+    // those. See the heartbeat patch helpers above for why a malformed field is
+    // dropped instead of refused.
     if (method === "POST" && path === "/v1/node/heartbeat") {
       const pathWithQuery = `${path}${url.search}`;
       const verified = verifyNodeRequest(req, pathWithQuery, { registry, now, replayGuard: handoffReplayGuard });
       if (verified.error) return sendJson(res, 401, { error: "unauthorized" });
-      registry.touchNode(verified.node.id);
+      const body = await readJson(req, config.jsonBodyMaxBytes);
+      registry.touchNode(verified.node.id, {
+        version: heartbeatVersionPatch(body?.version),
+        channel: heartbeatChannelPatch(body?.channel),
+        pendingVersion: heartbeatVersionPatch(body?.pendingVersion),
+      });
       return sendJson(res, 200, { ok: true, lastSeen: now() });
     }
 
@@ -744,10 +1082,149 @@ export function createApp({
           kind: n.kind,
           name: n.name,
           version: n.version,
+          // Rollout state, read by ops/release-relayd under exactly these
+          // names while it watches a channel converge: `version` is what the
+          // machine is running, `pendingVersion` is an update it has staged but
+          // not applied, and a null `channel` means stable.
+          channel: n.channel,
+          pendingVersion: n.pendingVersion,
           lastSeen: n.lastSeen,
           createdAt: n.createdAt,
         })),
       });
+    }
+
+    // ── relayd release announcement (ops-authed) ────────────────────────
+    //
+    // The publisher is ops/release-relayd on the operator's laptop, and this
+    // route is the entire announcement: the control plane records "channel X is
+    // now version Y" and stores nothing else about rollout. Every machine then
+    // learns it on the long-poll it already holds open, pulls the artifact
+    // itself, verifies the signature against a public key baked in at install
+    // time, and picks its own moment to apply it.
+    //
+    // So this endpoint cannot run code on a machine and holds no key that could
+    // author a release. That is the property the offline signing key buys, and
+    // it is the reason an update channel does not make the control plane part of
+    // the path to using the product.
+    if (path === "/v1/admin/relayd-release") {
+      if (!bearerMatches(req, config.adminToken)) {
+        return sendJson(res, 401, { error: "unauthorized" });
+      }
+      if (method === "POST") {
+        const body = await readJson(req, config.jsonBodyMaxBytes);
+        const parsed = parseRelaydReleaseDescriptor(body);
+        if (parsed.error) return sendJson(res, 400, { error: parsed.error });
+        return sendJson(res, 200, { release: registry.publishRelaydRelease(parsed.descriptor) });
+      }
+      if (method === "GET") {
+        // An omitted channel reads as stable, matching what a node with no
+        // reported channel gets, so "what is published?" and "what would that
+        // machine be offered?" cannot answer differently by accident.
+        const channel = url.searchParams.get("channel") || DEFAULT_RELEASE_CHANNEL;
+        if (!RELEASE_CHANNELS.has(channel)) return sendJson(res, 400, { error: "invalid_channel" });
+        const release = registry.getRelaydRelease(channel);
+        if (!release) return sendJson(res, 404, { error: "no_release" });
+        return sendJson(res, 200, { release });
+      }
+    }
+
+    // ── relayd artifact upload (ops-authed) ─────────────────────────────
+    //
+    // The other half of publishing: the tarball itself, which this host now
+    // stores and serves. `ops/release-relayd` POSTs the raw gzip bytes here and
+    // announces the `url` this route hands back — it deliberately does not
+    // compose that URL itself, because the server is what knows where it serves
+    // from and a guessed URL would be signed into an announcement every machine
+    // acts on.
+    //
+    // The admin token authorizes publishing, not authorship: it can put bytes
+    // at a URL, and it cannot make a node run them. Only the offline signing
+    // key can do that, and it is not on this host.
+    if (method === "POST" && path === "/v1/admin/relayd-artifact") {
+      if (!bearerMatches(req, config.adminToken)) {
+        return sendJson(res, 401, { error: "unauthorized" });
+      }
+      const version = parseReleaseVersion(url.searchParams.get("version"));
+      if (!version) return sendJson(res, 400, { error: "invalid_version" });
+      // The publisher states the filename as well as the version, and the two
+      // must agree exactly. Nothing is derived from the value — it is compared
+      // against the name this server would have chosen — so a separator, a dot
+      // segment or any other traversal shape simply fails to match.
+      if (url.searchParams.get("filename") !== relaydArtifactFilename(version.canonical)) {
+        return sendJson(res, 400, { error: "invalid_filename" });
+      }
+      // Checked before a single byte is read: a deployment that cannot name a
+      // public https URL cannot announce what it would be storing, and holding
+      // 64 MiB to find that out helps nobody. See relaydArtifactUrl.
+      const artifactUrl = relaydArtifactUrl(config, version.canonical);
+      if (!artifactUrl) return sendJson(res, 503, { error: "artifact_hosting_unconfigured" });
+      const filePath = relaydArtifactPath(config, version.canonical);
+      if (!filePath) return sendJson(res, 500, { error: "artifact_path_rejected" });
+
+      const bytes = await readRaw(req, config.artifactMaxBytes);
+      if (bytes === null) return sendJson(res, 413, { error: "body_too_large" });
+      // An empty body would otherwise be stored, become immutable, and answer
+      // every node's download with zero bytes it cannot verify — a version
+      // permanently poisoned by a truncated upload.
+      if (bytes.length === 0) return sendJson(res, 400, { error: "empty_artifact" });
+
+      const stored = await storeRelaydArtifact(filePath, bytes);
+      if (stored.error === "artifact_exists") {
+        return sendJson(res, 409, { error: "artifact_exists" });
+      }
+      if (stored.error) return sendJson(res, 500, { error: stored.error });
+      return sendJson(res, 200, {
+        artifact: {
+          version: version.canonical,
+          filename: relaydArtifactFilename(version.canonical),
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+          bytes: bytes.length,
+          url: artifactUrl,
+        },
+      });
+    }
+
+    // ── relayd artifact download (PUBLIC, deliberately) ─────────────────
+    //
+    // A node fetches this before it holds anything it could authenticate with
+    // for the purpose, and there is nothing here to protect: the artifact is
+    // the same public release every machine gets, and what makes the bytes
+    // trustworthy is the detached Ed25519 signature over their digest, verified
+    // against a key baked in at install time. Not the transport, not the URL,
+    // and not an authorization header — any of which a compromised control
+    // plane would hold anyway.
+    //
+    // Every refusal is the same 404. This route is a static file server, not an
+    // API: an unknown version, a misspelled filename and a traversal attempt
+    // are all simply "no such artifact", and saying which is which would only
+    // describe the directory to whoever asked.
+    if (method === "GET" && seg.length === 3 && seg[0] === "relayd") {
+      const requested = decodePathSegments(seg.slice(1));
+      const version = requested ? parseReleaseVersion(requested[0]) : null;
+      // The canonical spelling is the ONLY spelling served. parseReleaseVersion
+      // accepts " v0.2.0 " and folds it to "0.2.0", which is right for a
+      // descriptor an operator typed and wrong for a cache key: one artifact
+      // answering on several URLs, each `immutable` for a year, is a caching
+      // surface nobody asked for. The announcement always carries the canonical
+      // form, so nothing legitimate ever requests another.
+      if (
+        !version ||
+        requested[0] !== version.canonical ||
+        requested[1] !== relaydArtifactFilename(version.canonical)
+      ) {
+        return sendJson(res, 404, { error: "not_found" });
+      }
+      const filePath = relaydArtifactPath(config, version.canonical);
+      if (!filePath) return sendJson(res, 404, { error: "not_found" });
+      let info;
+      try {
+        info = await stat(filePath);
+      } catch {
+        return sendJson(res, 404, { error: "not_found" });
+      }
+      if (!info.isFile()) return sendJson(res, 404, { error: "not_found" });
+      return sendArtifact(res, filePath, info.size);
     }
 
     // ── node handoff long-poll (signature-authed) ───────────────────────
@@ -803,6 +1280,25 @@ export function createApp({
         pendingNotices.map((notice) => notice.id), nodeId, config.handoffLeaseSec * 1000,
       );
       registry.touchNode(nodeId);
+      // The release announcement rides this response as AMBIENT STATE, on the
+      // `computerAccess` precedent rather than the `handoffs`/`notices` one:
+      // "stable is version X" is idempotent, identical for every node on the
+      // channel, and costs nothing to re-read, so it gets no row, no lease and
+      // no ack. Fanning a fact out as one leased notice per node would build a
+      // delivery queue for something a node can simply observe, and would drag
+      // a new notice kind through relayd's actionableNotices — which requires
+      // pairingId and secret on every notice and skips anything else.
+      //
+      // ABSENT, not null, when nothing is published for the channel: an older
+      // relayd ignores an unknown field, so both directions stay compatible. A
+      // node that never reported a channel is on stable.
+      //
+      // The channel is re-read rather than taken from `verified.node`, which was
+      // loaded before the wait: a heartbeat moving this machine to beta can land
+      // in the middle of a poll that parks for minutes, and answering it from
+      // the pre-wait row would hand back the other channel's release.
+      const channel = registry.getNode(nodeId)?.channel || DEFAULT_RELEASE_CHANNEL;
+      const release = publicRelaydRelease(registry.getRelaydRelease(channel));
       return sendJson(res, 200, {
         handoffs: leased.map(({ id, repo, branch, leaseToken }) => ({ id, repo, branch, lease: leaseToken })),
         notices: leasedNotices.map(({ id, pairingId, secret, leaseToken }) => ({
@@ -812,6 +1308,7 @@ export function createApp({
           allowed: !registry.isCliComputerAccessRevoked(verified.node.accountId),
           leaseSec: config.computerAccessLeaseSec,
         },
+        ...(release ? { release } : {}),
       });
     }
 
@@ -1413,6 +1910,46 @@ function sendBytes(res, status, buf, extraHeaders = {}) {
     ...extraHeaders,
   });
   res.end(buf);
+}
+
+// Streams a stored release artifact. The only response in this file that is
+// not `no-store`: an artifact at a given URL is one immutable tarball forever
+// — a new release is a new version and therefore a new path — so a year of
+// `immutable` caching is exactly true, and it is what lets a proxy or a CDN
+// absorb a fleet-wide rollout without this host serving the same bytes once per
+// machine.
+//
+// Streamed rather than buffered because the file can be tens of megabytes and
+// every machine on the channel asks for it at once; a read error mid-stream
+// destroys the socket, since the status line and content-length are already on
+// the wire and there is no honest way to turn a truncated body into an error.
+function sendArtifact(res, filePath, size) {
+  res.writeHead(200, {
+    ...baseHeaders(),
+    "content-type": "application/gzip",
+    "content-length": size,
+    "cache-control": "public, max-age=31536000, immutable",
+  });
+  const stream = createReadStream(filePath);
+  stream.on("error", () => res.destroy());
+  res.on("close", () => stream.destroy());
+  stream.pipe(res);
+}
+
+// Percent-decodes path segments, or null if any of them is malformed. The
+// caller validates what comes back; this only undoes the encoding, so that
+// `%2e%2e` is judged by the same rule as `..` rather than sailing past a check
+// that only ever saw the escaped spelling.
+function decodePathSegments(segments) {
+  const decoded = [];
+  for (const segment of segments) {
+    try {
+      decoded.push(decodeURIComponent(segment));
+    } catch {
+      return null;
+    }
+  }
+  return decoded;
 }
 
 function baseHeaders() {

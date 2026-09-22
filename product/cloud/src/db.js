@@ -49,7 +49,19 @@ CREATE TABLE IF NOT EXISTS nodes (
   name        TEXT,
   pubkey      TEXT NOT NULL,
   enc_pubkey  TEXT,
+  -- What this machine reports about its own relayd, on POST /v1/node/heartbeat.
+  -- All three are nullable and stay null for every client that does not report
+  -- them — the phone, and any relayd older than the release subscription — so
+  -- "which machines are stale" is answerable without becoming a requirement.
+  --   version         - the build actually running
+  --   channel         - 'stable' or 'beta'; NULL means stable, which is what
+  --                     makes a node that never reported one still get the
+  --                     stable announcement rather than none
+  --   pending_version - a staged update not yet applied, so a node stuck
+  --                     mid-update is visible instead of silent
   version     TEXT,
+  channel     TEXT,
+  pending_version TEXT,
   last_seen   INTEGER,
   created_at  INTEGER NOT NULL
 );
@@ -311,6 +323,32 @@ CREATE TABLE IF NOT EXISTS node_power (
   updated_at      INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_node_power_wake_hash ON node_power (wake_token_hash);
+
+-- The relayd release currently published per channel. One row per channel,
+-- replaced on publish: this is current state, not a history log, because a
+-- node reconciles against "what is announced now" and nothing ever reads a
+-- superseded announcement.
+--
+-- sig is a detached Ed25519 signature over the 32 raw bytes of sha256, made
+-- by a key that is deliberately NOT on this host (ops/release-relayd signs on
+-- the operator's laptop). So a compromised control plane can withhold an
+-- update, announce an old one, or point at a mirror; it cannot author code a
+-- node will execute, because it cannot produce a signature the public key
+-- baked into /opt/relayd will accept. Signing the digest rather than the URL
+-- is what lets the artifact be re-hosted or moved behind a CDN without
+-- re-signing. See
+-- docs/superpowers/specs/2026-09-21-relayd-release-subscription.md.
+CREATE TABLE IF NOT EXISTS relayd_releases (
+  channel      TEXT PRIMARY KEY,
+  version      TEXT NOT NULL,
+  url          TEXT NOT NULL,
+  sha256       TEXT NOT NULL,
+  sig          TEXT NOT NULL,
+  sig_alg      TEXT NOT NULL,
+  min_version  TEXT NOT NULL,
+  notes        TEXT,
+  published_at INTEGER NOT NULL
+);
 `;
 
 export function createDb(path = ":memory:") {

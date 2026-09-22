@@ -45,6 +45,7 @@ ExperimentalWarning on Node 22 is expected.
 | Method/Path | Auth | Notes |
 | --- | --- | --- |
 | `GET /healthz` | none | liveness |
+| `GET /relayd/<version>/relayd-<version>.tar.gz` | none | the release artifact itself; `application/gzip`, immutable caching. Public on purpose — see below |
 | `POST /api/auth/sign-up/email` | none | Better Auth email + username + password signup |
 | `POST /api/auth/sign-in/username` | none | Better Auth username/password sign-in |
 | `POST /api/auth/sign-in/social` | none | native Sign in with Apple identity token |
@@ -73,18 +74,127 @@ ExperimentalWarning on Node 22 is expected.
 | `POST/GET /v1/repos` | session | register a `owner/name` GitHub repo for handoffs, or list the account's |
 | `POST /v1/handoffs` | session | `{handoffId, repo, branch, nodeId}`; records the row the node will collect. 404 `unknown_repo` if the repo was never registered, `unknown_node` if the node is not the account's |
 | `GET /v1/handoffs?repo=` | session | the account's handoffs for one repo — this is what `relay status` reads |
-| `GET /v1/node/handoffs` | ed25519 request signature | node long-poll; leases pending rows and renews the short account-access decision consumed locally by relayd |
+| `GET /v1/node/handoffs` | ed25519 request signature | node long-poll; leases pending rows, renews the short account-access decision consumed locally by relayd, and carries the current `release` for the node's channel — see below |
 | `POST /v1/node/handoffs/ack` | ed25519 request signature | confirms a leased batch → `delivered` |
 | `POST /v1/node/handoffs/:id/ready` | ed25519 request signature | terminal success, set after the import completes |
 | `POST /v1/node/handoffs/:id/fail` | ed25519 request signature | terminal failure; `reason` must be one of a closed vocabulary |
 | `POST /v1/node-events` | ed25519 body signature | see below |
 | `GET /v1/tunnel/nodes/:nodeId` | `Bearer $BROKER_TOKEN` | broker authorization hook, see contract |
-| `GET /v1/admin/nodes` | `Bearer $ADMIN_TOKEN` | ops-only; response omits pubkeys |
+| `GET /v1/admin/nodes` | `Bearer $ADMIN_TOKEN` | ops-only; response omits pubkeys; carries `version`, `channel`, `pendingVersion` per node so a release can be watched converging |
+| `POST /v1/admin/relayd-release` | `Bearer $ADMIN_TOKEN` | publish the current release for one channel — see below |
+| `GET /v1/admin/relayd-release?channel=` | `Bearer $ADMIN_TOKEN` | the stored descriptor, or 404 `no_release`; channel defaults to `stable` |
+| `POST /v1/admin/relayd-artifact?version=&filename=` | `Bearer $ADMIN_TOKEN` | upload the raw tarball this host will serve; ≤64 MiB; immutable per version — see below |
 | `GET /v1/admin/accounts` | Better Auth admin session | paginated `{ accounts }` with nodes and entitlements; newest first; `limit` default 50 max 100 |
 
 All responses carry `cache-control: no-store` and
-`x-content-type-options: nosniff`. All body reads are bounded (JSON 32 KiB,
-events 16 KiB, pairing blobs 64 KiB) and oversize uploads get a clean 413.
+`x-content-type-options: nosniff` — with one deliberate exception, the release
+artifact download, which is `public, max-age=31536000, immutable`. All body
+reads are bounded (JSON 32 KiB, events 16 KiB, pairing blobs 64 KiB, release
+artifacts 64 MiB) and oversize uploads get a clean 413.
+
+### relayd release subscription
+
+`ops/release-relayd` builds and signs the tarball on the operator's laptop,
+uploads the bytes here, and `POST`s the descriptor here. **The artifact is
+hosted by this service, not in S3** — there is no release bucket, no CDN in
+front of one, and no AWS credential in the publish path. The control plane
+stores one row per channel — current state, not a history log — and every
+machine learns it on the long-poll it already holds open, then pulls and
+verifies the artifact itself. **No signing key lives on this host**, so a
+compromised control plane can withhold, delay or misdirect an update but cannot
+author one. See
+`docs/superpowers/specs/2026-09-21-relayd-release-subscription.md`.
+
+`POST /v1/admin/relayd-release` body:
+
+```json
+{
+  "channel": "stable",
+  "version": "0.2.0",
+  "url": "https://<release-host>/relayd/0.2.0/relayd-0.2.0.tar.gz",
+  "sha256": "<64 lowercase hex>",
+  "sigAlg": "ed25519",
+  "sig": "<canonical base64url, 64 bytes, over the 32 raw digest bytes>",
+  "minVersion": "0.1.0",
+  "notes": null
+}
+```
+
+Every field is refused with its own 400 code — `invalid_channel`,
+`invalid_version`, `invalid_min_version`, `min_version_above_version`,
+`invalid_url` (https only, no userinfo), `invalid_sha256`, `invalid_sig_alg`,
+`invalid_sig`, `invalid_notes` — because the publisher is a script, not a
+person reading a response body. Versions are canonicalised (`v0.2.0` →
+`0.2.0`); `notes` may be absent or `null`.
+
+The `200` body of `GET /v1/node/handoffs` grows one top-level `release` object
+with the same fields minus `publishedAt`, built from the release published for
+that node's channel (`nodes.channel`, `null` meaning `stable`). It is **absent,
+not null**, when nothing is published, and `notes` is likewise omitted rather
+than sent as null. This is ambient state on the `computerAccess` precedent: no
+row, no lease, no ack, and the `handoffs`/`notices` contracts are unchanged.
+
+#### Artifact hosting
+
+Publishing is two calls, in this order. First the bytes:
+
+```text
+POST /v1/admin/relayd-artifact?version=0.2.0&filename=relayd-0.2.0.tar.gz
+Authorization: Bearer <ADMIN_TOKEN>
+Content-Type: application/gzip
+<raw tarball bytes>
+
+200 → {"artifact": {"version": "0.2.0",
+                    "filename": "relayd-0.2.0.tar.gz",
+                    "sha256": "<64 lowercase hex of the stored bytes>",
+                    "bytes": 123456,
+                    "url": "https://api.<domain>/relayd/0.2.0/relayd-0.2.0.tar.gz"}}
+```
+
+Then `POST /v1/admin/relayd-release` with that `url`. The publisher announces
+the URL this route returned rather than composing one: the server is what knows
+where it serves from, and a guessed URL would be signed into an announcement
+every machine acts on. `url` is always built from `BETTER_AUTH_URL` and **never
+from the request's `Host` header**; a deployment whose `BETTER_AUTH_URL` is not
+an https origin answers `503 artifact_hosting_unconfigured` instead of storing
+bytes it could never announce.
+
+`filename` must be exactly `relayd-<version>.tar.gz` for the canonical version
+(`v0.2.0` → `0.2.0`, the same rule the release route applies). It is compared
+against the name this server derives, never used to build one, so no request
+string reaches a path. Refusals carry their own code: `invalid_version`,
+`invalid_filename`, `empty_artifact`, `413 body_too_large`.
+
+**A published version is immutable.** Re-uploading byte-identical bytes is
+`200` — the publisher is reproducible, so retrying a release that failed after
+the upload is ordinary — while different bytes under a version that already
+exists is `409 artifact_exists`. Bump the version instead.
+
+The download is `GET /relayd/<version>/relayd-<version>.tar.gz` and is
+**public, with no auth of any kind**. A node fetches it before it holds
+anything it could present, and what protects the bytes is the detached Ed25519
+signature over their digest, verified against a key baked in at install time —
+not the transport, not the URL. Only the canonical spelling is served, every
+refusal is an identical `404 not_found`, and there is no directory listing.
+
+Two knobs, both optional:
+
+| Env | Default | Notes |
+| --- | --- | --- |
+| `RELAY_ARTIFACT_DIR` | `/var/lib/relay-cloud/artifacts` | stored as `<dir>/relayd/<version>/<filename>`, written temp-file-plus-rename. Must be writable by `relaycloud` and must sit outside `/opt/relay-cloud/releases/<id>`, or a deploy would 404 every announcement already in the fleet. `deploy/install.sh` creates it |
+| `RELAY_ARTIFACT_MAX_BYTES` | `67108864` (64 MiB) | per-upload cap; also the per-upload memory ceiling, since the body is buffered before it is written |
+
+`POST /v1/node/heartbeat` accepts an optional body reporting what the machine
+is running:
+
+```json
+{ "version": "0.1.0", "channel": "stable", "pendingVersion": null }
+```
+
+All three are optional. A missing, empty or unparseable body updates `last_seen`
+exactly as before — relayd ships the literal `{}` — and a malformed field is
+ignored rather than refused, because a heartbeat must never fail over its body.
+An omitted field leaves the stored value alone; an explicit `null` clears it.
 
 ### Node events (`POST /v1/node-events`)
 
@@ -107,8 +217,8 @@ Push mapping (asserted in tests):
   **silent** background push (`apns-push-type: background`,
   `content-available: 1`).
 - `POST /v1/node/heartbeat` is a signed presence ping: it updates
-  `last_seen` and does not fan out. Three missed 2-minute heartbeats
-  become `node.unreachable`.
+  `last_seen` (plus the optional self-reported build identity below) and does
+  not fan out. Three missed 2-minute heartbeats become `node.unreachable`.
 
 Events are retained 7 days (`EVENT_RETENTION_DAYS`), swept every minute.
 
@@ -363,7 +473,11 @@ creates immutable `/opt/relay-cloud/releases/<release-id>` directories,
 generates first-install secrets on the host, installs the hardened
 `deploy/relay-cloud.service`, and rolls back the release symlink if health does
 not recover. The service runs as `relaycloud`, uses `UMask=0077`, writes only to
-`/var/lib/relay-cloud`, and reads `/etc/relay-cloud/env`.
+`/var/lib/relay-cloud`, and reads `/etc/relay-cloud/env`. It also creates
+`/var/lib/relay-cloud/artifacts`, where relayd release tarballs are stored and
+served from: that path is outside `releases/<release-id>` on purpose, so an
+artifact survives the next deploy of this service rather than 404ing every
+announcement already out in the fleet (see "Artifact hosting" above).
 
 Example direct invocation on a target host:
 

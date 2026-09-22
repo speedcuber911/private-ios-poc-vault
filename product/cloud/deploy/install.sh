@@ -101,6 +101,14 @@ install -d -m 0755 -o root -g root /opt/relay-cloud/releases
 previous_release="$(readlink -f /opt/relay-cloud/current 2>/dev/null || true)"
 ln -sfn "$release_dir" /opt/relay-cloud/current
 install -d -m 0750 -o relaycloud -g relaycloud /var/lib/relay-cloud
+# relayd release artifacts (RELAY_ARTIFACT_DIR). Under /var/lib/relay-cloud on
+# purpose: it is the one path the unit may write (ReadWritePaths) and the one
+# that survives a release flip. Inside /opt/relay-cloud/releases/<id> every
+# announcement already published to the fleet would 404 the next time this
+# service ships. Owned by the service user because the service both writes
+# (POST /v1/admin/relayd-artifact) and reads (GET /relayd/...) them; nothing
+# else on the host serves this path.
+install -d -m 0750 -o relaycloud -g relaycloud /var/lib/relay-cloud/artifacts
 install -d -m 0750 -o root -g relaycloud /etc/relay-cloud
 install -d -m 0750 -o root -g root /var/backups/relay-cloud
 

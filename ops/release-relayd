@@ -1,0 +1,598 @@
+#!/usr/bin/env python3
+"""Package, sign, publish and watch the rollout of a relayd release.
+
+One command on the operator's laptop is the whole release. It never contacts a
+machine: the artifact and the announcement both go to the control plane's public
+HTTPS API, and every paired node picks the release up on the long-poll it
+already holds open. No SSH, no SSM, no VPC access, and no S3 \u2014 the control
+plane hosts the artifact, so the admin token is the only credential in the
+publish path besides the signing key.
+
+The signing key stays on this laptop on purpose. A compromised control plane
+can withhold or misannounce a release; it cannot author one, because it cannot
+produce a signature nodes will accept. See
+docs/superpowers/specs/2026-09-21-relayd-release-subscription.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as dt
+import gzip
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+RELAYD_DIR = ROOT / "product" / "relayd"
+DEFAULT_CONFIG = Path("~/.poc-vault/secrets/config.env").expanduser()
+DEFAULT_KEY = Path("~/.poc-vault/secrets/signing/relayd-ed25519.key").expanduser()
+CHANNELS = ("stable", "beta")
+VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+# No floor by default. `minVersion` is the oldest version allowed to update
+# DIRECTLY to this one, so anything above 0.0.0 excludes every machine below it
+# — which is the point when a migration cannot be skipped, and a way to strand
+# the whole fleet when it is set by accident. It is opt-in for that reason.
+DEFAULT_MIN_VERSION = "0.0.0"
+
+# What ships. Anything not listed here is not part of a release, which is the
+# point: the runtime is src/ + bin/ + the package manifest, and dist/ rides
+# along so a machine can re-run its own installer.
+PAYLOAD = ("src", "bin", "dist", "package.json")
+
+# Written into the tarball and read back by src/version.mjs at runtime. A
+# release must be able to say what it is without git or the network.
+BUILD_INFO_NAME = "build-info.json"
+
+# Reproducibility is a property worth paying for on a signed artifact: anyone
+# holding the commit can rebuild and confirm the digest that was signed. It
+# costs three things — sorted members, a fixed mtime on every entry AND in the
+# gzip header, and a `builtAt` taken from the commit rather than the clock.
+TAR_MTIME = 0
+
+
+class ReleaseError(Exception):
+    """Raised when a release cannot be built, signed, or published."""
+
+
+def utc_now() -> str:
+    return (
+        dt.datetime.now(dt.timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def load_env_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.is_file():
+        return values
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = os.path.expandvars(
+            os.path.expanduser(value.strip().strip('"').strip("'"))
+        )
+    return values
+
+
+def setting(name: str, config: dict[str, str], default: str | None = None) -> str | None:
+    return os.environ.get(name) or config.get(name) or default
+
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def git_commit() -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return result.stdout.strip() or None
+
+
+def commit_timestamp() -> str:
+    """The commit's own date, not the wall clock, so the artifact is a function
+    of the tree. Falls back to now() only for a tree no commit describes, which
+    is exactly the case --allow-dirty exists to flag."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(ROOT), "show", "-s", "--format=%cI", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return utc_now()
+    stamp = result.stdout.strip()
+    if not stamp:
+        return utc_now()
+    return (
+        dt.datetime.fromisoformat(stamp)
+        .astimezone(dt.timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def working_tree_is_dirty() -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(ROOT), "status", "--porcelain", "--", str(RELAYD_DIR)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return bool(result.stdout.strip())
+
+
+def version_order(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
+
+
+def package_version() -> str:
+    manifest = json.loads((RELAYD_DIR / "package.json").read_text(encoding="utf-8"))
+    version = str(manifest.get("version") or "").strip()
+    if not VERSION_RE.fullmatch(version):
+        raise ReleaseError(
+            f"product/relayd/package.json has no usable version (found {version!r})"
+        )
+    return version
+
+
+# ── key handling (same accepted formats as ops/sign-manifest.py) ───────────
+
+
+def decode_raw_key(data: bytes) -> bytes | None:
+    text = b"".join(data.split()).decode("ascii", errors="ignore")
+    if not text:
+        return None
+    if len(text) in (64, 128) and all(ch in "0123456789abcdefABCDEF" for ch in text):
+        raw = bytes.fromhex(text)
+    else:
+        padded = text + "=" * (-len(text) % 4)
+        try:
+            raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+        except Exception:
+            try:
+                raw = base64.b64decode(padded.encode("ascii"))
+            except Exception:
+                return None
+    if len(raw) == 32:
+        return raw
+    if len(raw) == 64:
+        return raw[:32]
+    return None
+
+
+def load_private_key(path: Path) -> Any:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    data = path.read_bytes()
+    for loader in (serialization.load_pem_private_key, serialization.load_ssh_private_key):
+        try:
+            key = loader(data, password=None)
+        except Exception:
+            continue
+        if isinstance(key, ed25519.Ed25519PrivateKey):
+            return key
+        raise ReleaseError(f"{path} is not an Ed25519 private key")
+
+    raw = decode_raw_key(data)
+    if raw:
+        return ed25519.Ed25519PrivateKey.from_private_bytes(raw)
+    raise ReleaseError(
+        f"Could not parse {path}. Use PEM/OpenSSH Ed25519, raw 32-byte hex, or base64."
+    )
+
+
+def public_key_bytes(key: Any) -> bytes:
+    from cryptography.hazmat.primitives import serialization
+
+    return key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+
+
+# ── packaging ──────────────────────────────────────────────────────────────
+
+
+def build_tarball(version: str, destination: Path) -> Path:
+    for name in PAYLOAD:
+        if not (RELAYD_DIR / name).exists():
+            raise ReleaseError(f"missing release payload: product/relayd/{name}")
+
+    build_info = json.dumps(
+        {
+            "version": version,
+            "commit": git_commit(),
+            "builtAt": commit_timestamp(),
+        },
+        indent=2,
+        sort_keys=True,
+    ) + "\n"
+
+    artifact = destination / f"relayd-{version}.tar.gz"
+    members: list[tuple[Path, str]] = []
+    for name in PAYLOAD:
+        source = RELAYD_DIR / name
+        if source.is_file():
+            members.append((source, f"relayd-{version}/{name}"))
+            continue
+        for path in sorted(source.rglob("*")):
+            if any(part in {"node_modules", "__pycache__", ".DS_Store"} for part in path.parts):
+                continue
+            if path.is_dir():
+                continue
+            members.append((path, f"relayd-{version}/{path.relative_to(RELAYD_DIR)}"))
+
+    info_path = destination / BUILD_INFO_NAME
+    info_path.write_text(build_info, encoding="utf-8")
+    members.append((info_path, f"relayd-{version}/{BUILD_INFO_NAME}"))
+    members.sort(key=lambda entry: entry[1])
+
+    def normalise(entry: tarfile.TarInfo) -> tarfile.TarInfo:
+        entry.mtime = TAR_MTIME
+        entry.uid = 0
+        entry.gid = 0
+        entry.uname = ""
+        entry.gname = ""
+        # Preserve only the execute bit, and only where it already was: bin/relayd
+        # and dist/install.sh must stay runnable, everything else is data.
+        entry.mode = 0o755 if entry.mode & 0o100 else 0o644
+        return entry
+
+    # gzip stamps its own mtime into the header, which defeats a reproducible
+    # tar on its own, so the stream is wrapped explicitly with mtime=0.
+    with open(artifact, "wb") as raw:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
+            with tarfile.open(
+                fileobj=compressed, mode="w", format=tarfile.GNU_FORMAT
+            ) as tar:
+                for source, arcname in members:
+                    tar.add(source, arcname=arcname, filter=normalise, recursive=False)
+    return artifact
+
+
+# ── control plane ──────────────────────────────────────────────────────────
+
+
+def request_json(
+    url: str,
+    token: str,
+    method: str = "GET",
+    body: dict[str, Any] | None = None,
+    timeout: int = 30,
+) -> tuple[int, Any]:
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    request = urllib.request.Request(url, data=data, method=method)
+    request.add_header("authorization", f"Bearer {token}")
+    request.add_header("accept", "application/json")
+    if data is not None:
+        request.add_header("content-type", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, json.loads(response.read() or b"null")
+    except urllib.error.HTTPError as error:
+        payload: Any = None
+        try:
+            payload = json.loads(error.read() or b"null")
+        except Exception:
+            payload = None
+        return error.code, payload
+    except urllib.error.URLError as error:
+        raise ReleaseError(f"control plane unreachable: {error.reason}") from error
+
+
+def upload_artifact(
+    cloud_url: str, token: str, artifact: Path, version: str, digest: bytes
+) -> str:
+    """Hand the bytes to the control plane and get back the URL a node will
+    fetch. Returns that URL rather than composing one here: the server is what
+    knows where it serves from, and a URL guessed on this side would be signed
+    into an announcement every machine acts on."""
+    query = urllib.parse.urlencode({"version": version, "filename": artifact.name})
+    request = urllib.request.Request(
+        f"{cloud_url}/v1/admin/relayd-artifact?{query}",
+        data=artifact.read_bytes(),
+        method="POST",
+    )
+    request.add_header("authorization", f"Bearer {token}")
+    request.add_header("content-type", "application/gzip")
+    request.add_header("accept", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            payload = json.loads(response.read() or b"null")
+    except urllib.error.HTTPError as error:
+        detail: Any = None
+        try:
+            detail = json.loads(error.read() or b"null")
+        except Exception:
+            detail = None
+        if error.code == 401:
+            raise ReleaseError("control plane rejected the admin token") from error
+        if error.code == 409:
+            raise ReleaseError(
+                f"a different artifact is already published as {version}. "
+                "Releases are immutable; bump the version."
+            ) from error
+        raise ReleaseError(f"upload failed ({error.code}): {detail}") from error
+    except urllib.error.URLError as error:
+        raise ReleaseError(f"control plane unreachable: {error.reason}") from error
+
+    stored = (payload or {}).get("artifact") or {}
+    # The digest is what the signature covers, so a mismatch here means the
+    # bytes that arrived are not the bytes that were signed, and announcing
+    # them would hand every machine a download it will refuse.
+    if stored.get("sha256") != digest.hex():
+        raise ReleaseError(
+            "the control plane stored a different digest than was signed; nothing was announced"
+        )
+    url = stored.get("url")
+    if not isinstance(url, str) or not artifact_url_is_usable(url):
+        raise ReleaseError(f"the control plane returned no usable artifact url: {url!r}")
+    return url
+
+
+def artifact_url_is_usable(url: str) -> bool:
+    """https, or http to loopback. Deliberately the same rule relayd applies to
+    an announced URL, so a URL this script accepts cannot be one every machine
+    then refuses. Loopback is what makes an end-to-end run against a local
+    control plane possible."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme == "https":
+        return True
+    return parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+
+
+def publish(cloud_url: str, token: str, descriptor: dict[str, Any]) -> None:
+    status, payload = request_json(
+        f"{cloud_url}/v1/admin/relayd-release", token, method="POST", body=descriptor
+    )
+    if status == 401:
+        raise ReleaseError("control plane rejected the admin token")
+    if status not in (200, 201):
+        raise ReleaseError(f"publish failed ({status}): {payload}")
+
+
+def watch_rollout(
+    cloud_url: str, token: str, channel: str, version: str, timeout_sec: int
+) -> bool:
+    """Report convergence. Nodes apply on their own schedule, so this watches
+    rather than drives: a straggler is information, not a failure of the
+    publish."""
+    deadline = time.monotonic() + timeout_sec
+    reported: dict[str, str] = {}
+    while True:
+        status, payload = request_json(f"{cloud_url}/v1/admin/nodes", token)
+        if status != 200:
+            raise ReleaseError(f"could not read the node list ({status})")
+        nodes = [
+            node
+            for node in (payload or {}).get("nodes", [])
+            if (node.get("channel") or "stable") == channel
+        ]
+        if not nodes:
+            print(f"  no nodes on channel {channel} yet")
+            return True
+        for node in nodes:
+            name = node.get("name") or node.get("id") or "?"
+            current = node.get("version") or "unknown"
+            pending = node.get("pendingVersion")
+            state = current if not pending else f"{current} (staged {pending})"
+            if reported.get(name) != state:
+                mark = "done" if current == version else "...."
+                print(f"  [{mark}] {name}: {state}")
+                reported[name] = state
+        if all((node.get("version") or "") == version for node in nodes):
+            return True
+        if time.monotonic() >= deadline:
+            stale = [
+                node.get("name") or node.get("id")
+                for node in nodes
+                if (node.get("version") or "") != version
+            ]
+            print(f"  still waiting on: {', '.join(str(name) for name in stale)}")
+            return False
+        time.sleep(5)
+
+
+# ── main ───────────────────────────────────────────────────────────────────
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--version",
+        default=None,
+        help="Release version (default: product/relayd/package.json)",
+    )
+    parser.add_argument("--channel", choices=CHANNELS, default="stable")
+    parser.add_argument(
+        "--min-version",
+        default=DEFAULT_MIN_VERSION,
+        help=(
+            "Oldest version allowed to update directly to this one "
+            f"(default: {DEFAULT_MIN_VERSION}, i.e. no floor)"
+        ),
+    )
+    parser.add_argument("--notes", default=None, help="Short human line shown in logs")
+    parser.add_argument("--key", type=Path, default=DEFAULT_KEY)
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Keep the built artifact here instead of a temp directory",
+    )
+    parser.add_argument(
+        "--local-only",
+        action="store_true",
+        help="Build and sign only: no upload, no announcement. Safe dry run.",
+    )
+    parser.add_argument(
+        "--no-watch",
+        action="store_true",
+        help="Announce and exit without waiting for machines to converge",
+    )
+    parser.add_argument("--watch-timeout", type=int, default=300)
+    parser.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="Release even though product/relayd has uncommitted changes",
+    )
+    parser.add_argument(
+        "--print-public-key",
+        action="store_true",
+        help="Print the release public key (for provisioning a machine) and exit",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    config = load_env_file(args.config)
+    key_path = args.key.expanduser()
+
+    if not key_path.is_file():
+        print(
+            f"release-relayd: signing key not found: {key_path}\n"
+            "Generate one with:\n"
+            "  ssh-keygen -t ed25519 -N '' -f ~/.poc-vault/secrets/signing/relayd-ed25519.key",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        key = load_private_key(key_path)
+        public_key = public_key_bytes(key)
+
+        if args.print_public_key:
+            print(b64url(public_key))
+            return 0
+
+        version = args.version or package_version()
+        if not VERSION_RE.fullmatch(version):
+            raise ReleaseError(f"version must look like 1.2.3 (got {version!r})")
+        min_version = args.min_version
+        if not VERSION_RE.fullmatch(min_version):
+            raise ReleaseError(f"--min-version must look like 1.2.3 (got {min_version!r})")
+        if version_order(min_version) > version_order(version):
+            raise ReleaseError(
+                f"--min-version {min_version} is above the release itself ({version}), "
+                "which no machine could ever satisfy"
+            )
+
+        if working_tree_is_dirty() and not args.allow_dirty:
+            raise ReleaseError(
+                "product/relayd has uncommitted changes. Commit them, or pass --allow-dirty "
+                "to ship a tree that no commit describes."
+            )
+
+        with tempfile.TemporaryDirectory(prefix="relayd-release-") as tmp:
+            staging = Path(args.out).expanduser() if args.out else Path(tmp)
+            staging.mkdir(parents=True, exist_ok=True)
+            artifact = build_tarball(version, staging)
+            digest = hashlib.sha256(artifact.read_bytes()).digest()
+            signature = key.sign(digest)
+
+            print(f"relayd {version} ({args.channel})")
+            print(f"  artifact   {artifact.name} ({artifact.stat().st_size} bytes)")
+            print(f"  sha256     {digest.hex()}")
+            print(f"  key id     sha256:{b64url(hashlib.sha256(public_key).digest())}")
+
+            if args.local_only:
+                print("  local-only: nothing uploaded, nothing announced")
+                if args.out:
+                    print(f"  kept at    {artifact}")
+                return 0
+
+            cloud_url = (setting("RELAY_CLOUD_URL", config) or "").rstrip("/")
+            admin_token = setting("RELAY_ADMIN_TOKEN", config)
+            missing = [
+                name
+                for name, value in (
+                    ("RELAY_CLOUD_URL", cloud_url),
+                    ("RELAY_ADMIN_TOKEN", admin_token),
+                )
+                if not value
+            ]
+            if missing:
+                raise ReleaseError(
+                    "missing configuration: "
+                    + ", ".join(missing)
+                    + f" (set them in {args.config} or the environment)"
+                )
+
+            print(f"  uploading  {cloud_url}/v1/admin/relayd-artifact")
+            url = upload_artifact(cloud_url, admin_token, artifact, version, digest)
+            print(f"  hosted at  {url}")
+
+            publish(
+                cloud_url,
+                admin_token,
+                {
+                    "channel": args.channel,
+                    "version": version,
+                    "url": url,
+                    "sha256": digest.hex(),
+                    "sigAlg": "ed25519",
+                    "sig": b64url(signature),
+                    "minVersion": min_version,
+                    "notes": args.notes,
+                },
+            )
+            print(f"  announced  {cloud_url} channel {args.channel}")
+
+            if args.no_watch:
+                print("  machines will pick it up on their next poll")
+                return 0
+
+            print("  waiting for machines to converge")
+            converged = watch_rollout(
+                cloud_url, admin_token, args.channel, version, args.watch_timeout
+            )
+            if not converged:
+                print(
+                    "  the release is published; the machines above will apply it when "
+                    "they next go idle"
+                )
+            return 0
+    except ReleaseError as error:
+        print(f"release-relayd: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
