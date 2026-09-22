@@ -12,7 +12,8 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { identityPaths, readNodeId } from "./identity.mjs";
-import { writeFileAtomic, withFileLock } from "./config.mjs";
+import { writeFileAtomic, withFileLock, releaseChannel } from "./config.mjs";
+import { version as runningVersion } from "./version.mjs";
 
 const NODE_REQUEST_LABEL = "relay-node-req-v1";
 
@@ -100,6 +101,21 @@ function createCloudClient({
   // acknowledges notices and does nothing with them, which is what an older
   // daemon build would do anyway.
   onNotice = null,
+  // Invoked with the poll response's top-level `release` object, once per
+  // poll that carries a well-formed one (see dispatchRelease). Same
+  // optionality and the same never-throws contract as onNotice; unlike a
+  // notice there is no row, no lease and no ack, because a release
+  // announcement is ambient state rather than leased work.
+  onRelease = null,
+  // Reported on the heartbeat so the fleet can answer "which machines are
+  // stale". `channel` and the running `version` are facts about this build and
+  // this configuration; `pendingVersion` is a GETTER the update engine owns,
+  // because it changes underneath a long-lived client every time an update is
+  // staged or applied — passing a value here would pin whatever was true at
+  // construction, which for a daemon is "nothing is staged", forever.
+  channel = releaseChannel,
+  version = runningVersion,
+  pendingVersion = null,
 } = {}) {
   const paths = baseDir ? identityPaths(baseDir) : identityPaths();
   const nodeId = readNodeId(paths);
@@ -347,6 +363,85 @@ function createCloudClient({
     }
   }
 
+  // The poll response's `release` field (spec 2026-09-21, "Normative wire
+  // additions"), validated before anything downstream sees it.
+  //
+  // Validation is the whole job of this function: the release announcement is
+  // the first mechanism by which something OUTSIDE the user's machine can
+  // cause new code to run on it, so the shape that reaches the update engine
+  // must already be known-good rather than merely present. Everything that
+  // can be checked cheaply and locally is checked here — a digest that is not
+  // 64 hex characters, a URL that is not http(s), an algorithm that is not
+  // ed25519 — and anything malformed is dropped entirely rather than repaired.
+  // A partially-usable announcement is not a thing: the engine would have to
+  // re-derive the missing half, and that is how a "release" without a
+  // signature ends up being installed.
+  //
+  // `release` is ABSENT, not null, when no release is published for the
+  // channel, so a missing field is the normal case and not a fault. Unknown
+  // fields are ignored: the cloud may add some, and an older relayd already
+  // ignores this whole object.
+  //
+  // Returning null (rather than throwing) is what makes a malformed
+  // announcement inert: the poll goes on to return its handoffs exactly as
+  // before, which is the required behaviour from the spec's failure-mode
+  // table — "ignored, logged; poll continues to work for handoffs".
+  function actionableRelease(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const { channel: announcedChannel, version: announcedVersion, url, sha256, sigAlg, sig, minVersion, notes } = value;
+    if (typeof announcedChannel !== "string" || !/^[a-z]{1,16}$/.test(announcedChannel)) return null;
+    if (typeof announcedVersion !== "string" || !/^[A-Za-z0-9][A-Za-z0-9.+_-]{0,63}$/.test(announcedVersion)) return null;
+    // https, or http only to loopback. The signature over the digest is what
+    // protects the bytes, so plaintext would not let anyone substitute an
+    // artifact — but the control plane only ever publishes https, and the node
+    // is the last gate, so there is no reason for it to be the looser of the
+    // two. Loopback stays open for an offline mirror on the machine itself.
+    if (typeof url !== "string" || url.length > 2000) return null;
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(url);
+    } catch {
+      return null;
+    }
+    const loopback = parsedUrl.hostname === "127.0.0.1" || parsedUrl.hostname === "localhost" ||
+      parsedUrl.hostname === "[::1]" || parsedUrl.hostname === "::1";
+    if (parsedUrl.protocol !== "https:" && !(parsedUrl.protocol === "http:" && loopback)) return null;
+    if (typeof sha256 !== "string" || !/^[0-9a-fA-F]{64}$/.test(sha256)) return null;
+    // Frozen to one algorithm on purpose. An announcement that names an
+    // algorithm this node does not implement is not a forward-compatibility
+    // opportunity, it is an artifact this node cannot verify.
+    if (sigAlg !== "ed25519") return null;
+    if (typeof sig !== "string" || !/^[A-Za-z0-9+/_=-]{1,512}$/.test(sig)) return null;
+    if (minVersion !== undefined && minVersion !== null &&
+        (typeof minVersion !== "string" || !/^[A-Za-z0-9][A-Za-z0-9.+_-]{0,63}$/.test(minVersion))) return null;
+    if (notes !== undefined && notes !== null && typeof notes !== "string") return null;
+    return {
+      channel: announcedChannel,
+      version: announcedVersion,
+      url,
+      sha256: sha256.toLowerCase(),
+      sigAlg,
+      sig,
+      minVersion: typeof minVersion === "string" ? minVersion : null,
+      // Bounded: this is a human line from the control plane that ends up in
+      // an audit record and on the phone.
+      notes: typeof notes === "string" ? notes.slice(0, 200) : null,
+    };
+  }
+
+  // Same rule as dispatchNotices: a handler that throws must not take down the
+  // poll cycle or the handoffs parsed alongside it. There is nothing to ack —
+  // the announcement is state, so the next poll simply re-states it — which
+  // means a failed apply needs no redelivery machinery at all.
+  async function dispatchRelease(release) {
+    if (!onRelease || !release) return;
+    try {
+      await onRelease(release);
+    } catch {
+      /* the engine owns reporting its own failure; the loop goes on */
+    }
+  }
+
   async function pollHandoffs(waitSec) {
     const pathWithQuery = `/v1/node/handoffs?wait=${Number(waitSec) || 0}`;
     const res = await fetchImpl(`${base}${pathWithQuery}`, {
@@ -357,13 +452,18 @@ function createCloudClient({
     const json = await res.json();
     const handoffs = Array.isArray(json?.handoffs) ? json.handoffs : [];
     const notices = actionableNotices(json?.notices);
+    const release = actionableRelease(json?.release);
     // res.json() resolving is itself the evidence that matters — proof the
     // bytes crossed a live connection — so ack right here, before returning
     // descriptors to the caller, and before anything is done with them.
+    //
+    // `release` is deliberately absent from this call: there is no row to
+    // confirm and no lease to hold open.
     await ackDelivery({ acks: ackableFrom(handoffs), noticeAcks: ackableFrom(notices) });
     await dispatchNotices(notices);
+    await dispatchRelease(release);
     // Unchanged on purpose: handoff.mjs's import loop consumes this return
-    // value and knows nothing about notices.
+    // value and knows nothing about notices or releases.
     return handoffs;
   }
 
@@ -428,6 +528,26 @@ function createCloudClient({
     return result;
   }
 
+  // The staged-but-not-yet-applied version, or null. A getter that throws is
+  // the update engine's problem and must not cost this node its heartbeat —
+  // "the cloud has no idea this machine is alive" is a much worse outcome than
+  // "the cloud does not know what is staged on it".
+  function stagedVersion() {
+    if (typeof pendingVersion !== "function") return typeof pendingVersion === "string" ? pendingVersion : null;
+    try {
+      const value = pendingVersion();
+      return typeof value === "string" && value ? value : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // The body used to be the literal `{}`: the cloud had a `version` column on
+  // the node row that nothing ever filled, so "which machines are stale" had
+  // no answer and every update was done by hand. Additive and backward
+  // compatible in both directions — an older cloud ignores the fields, and
+  // `pendingVersion: null` is the honest answer for a node with nothing
+  // staged, which is why it is sent explicitly rather than omitted.
   async function heartbeat() {
     const pathWithQuery = "/v1/node/heartbeat";
     const res = await fetchImpl(`${base}${pathWithQuery}`, {
@@ -436,7 +556,7 @@ function createCloudClient({
         ...signedHeaders("POST", pathWithQuery),
         "content-type": "application/json",
       },
-      body: "{}",
+      body: JSON.stringify({ version, channel, pendingVersion: stagedVersion() }),
     });
     if (res.status !== 200) throw new Error(`cloud_heartbeat_${res.status}`);
     return res.json().catch(() => ({ ok: true }));

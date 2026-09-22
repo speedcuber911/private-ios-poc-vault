@@ -302,6 +302,65 @@ const tunnelBackoffMaxMs = Math.max(
 // cloud traffic somewhere its operator no longer expects.
 const cloudUrl = cleanOptionalUrlBase(process.env.RELAYD_CLOUD_URL || "", "RELAYD_CLOUD_URL");
 
+// ---------------------------------------------------------------------------
+// Release subscription and self-update (spec
+// docs/superpowers/specs/2026-09-21-relayd-release-subscription.md).
+//
+// The announcement rides the handoff long-poll that already exists, so none of
+// this adds a connection or a route. What it does add is the node's side of
+// the decision: which channel it subscribes to, whether it applies an
+// announcement by itself, where the staged/current release layout lives, and
+// which public key an artifact must verify against.
+
+// Two channels and nothing cleverer — the point is that `pariksj-dev` (live
+// direct-subscription providers) and a beta machine must not move together.
+const releaseChannel = parseEnumEnv("RELAYD_RELEASE_CHANNEL", "stable", ["stable", "beta"]);
+
+// DEVIATION FROM THE SPEC TEXT, DELIBERATE. The spec says auto-apply is
+// opt-in with `RELAYD_AUTO_UPDATE=1` and defaults OFF; the owner's decision on
+// 2026-09-21 is that it defaults ON and is switched off with
+// `RELAYD_AUTO_UPDATE=0`. The safety properties the spec actually argues for
+// are untouched by that flip: the artifact is verified against an offline
+// signing key before anything is unpacked, a downgrade is refused, a node
+// below `minVersion` refuses, the apply waits for the node to be idle, and a
+// build that fails its own health check is rolled back. What changes is only
+// who has to act for a fleet to stay current.
+const autoUpdate = parseBooleanEnv("RELAYD_AUTO_UPDATE", true);
+
+// Root of the `releases/<version>` + `current` symlink layout dist/install.sh
+// creates. NOT derived from this file's own location on purpose: a checkout
+// must not be able to talk itself into flipping a symlink over a developer's
+// working tree, so the path is the installed one unless an operator (or a
+// test) names another.
+const updateRoot = cleanOptionalFilePath(process.env.RELAYD_UPDATE_ROOT) || "/opt/relayd";
+
+// The release signing key's PUBLIC half, baked in at install time. A
+// compromised control plane can withhold, delay or misdirect an update; it
+// cannot author code a node will run, because it does not hold the private
+// half. Accepts a PEM SPKI key or a raw 32-byte Ed25519 key in hex or base64
+// (the same shapes ops/sign-manifest.py already deals with in this repo).
+const releasePublicKeyFile =
+  cleanOptionalFilePath(process.env.RELAYD_RELEASE_PUBKEY_FILE) || path.join(updateRoot, "release-pubkey.pem");
+
+// Staged version, pin, poisoned digests and the in-flight apply record. Under
+// CODEX_DATA_DIR rather than under updateRoot because this is mutable node
+// state, and because `releases/<version>` is meant to be immutable once
+// staged.
+const updateStateDir = path.join(dataDir, "updates");
+
+// How long an apply waits for the node to go idle before giving up and
+// staying staged for a later attempt. Fifteen minutes by default: long enough
+// to outlast an ordinary agent run, short enough that a node does not sit on a
+// staged release for a day because someone left a terminal open.
+const updateDrainWaitSec = parseIntegerEnv("RELAYD_UPDATE_DRAIN_WAIT_SEC", 900, 0, 24 * 60 * 60);
+
+// How long the post-restart health check waits for the node's own /healthz to
+// report the NEW version before the apply is treated as failed and rolled
+// back.
+const updateHealthWaitSec = parseIntegerEnv("RELAYD_UPDATE_HEALTH_WAIT_SEC", 90, 1, 600);
+
+const updateServiceName = cleanDisplayName(process.env.RELAYD_SERVICE_NAME || "relayd.service", "RELAYD_SERVICE_NAME", 128);
+
 // Optional EC2 power registration. Unset means "discover from IMDS, or skip".
 const powerEnabled = parseBooleanEnv("RELAYD_POWER", true);
 const powerInstanceId = (process.env.RELAYD_POWER_INSTANCE_ID || "").trim().toLowerCase() || null;
@@ -1146,6 +1205,14 @@ export {
   tunnelBackoffBaseMs,
   tunnelBackoffMaxMs,
   cloudUrl,
+  releaseChannel,
+  autoUpdate,
+  updateRoot,
+  releasePublicKeyFile,
+  updateStateDir,
+  updateDrainWaitSec,
+  updateHealthWaitSec,
+  updateServiceName,
   powerEnabled,
   powerInstanceId,
   powerRegion,

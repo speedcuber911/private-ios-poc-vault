@@ -1104,3 +1104,294 @@ test("reportHandoffReady never throws on a transport failure", async () => {
   const client = createCloudClient({ cloudUrl: "http://127.0.0.1:9", baseDir: node.baseDir });
   assert.equal(await client.reportHandoffReady("deadbeefcafef00d"), false);
 });
+
+// ---------------------------------------------------------------------------
+// Release subscription (spec 2026-09-21). Two additions, both on wire
+// surfaces that already existed:
+//
+//   * the heartbeat body, which was the literal `{}` — the cloud had a
+//     `version` column on the node row that nothing ever filled, so "which
+//     machines are stale" had no answer and every update was done by hand;
+//   * a top-level `release` field on the poll response, alongside
+//     `computerAccess`, carrying ambient state rather than leased work: no
+//     row, no lease, no ack, and no change to the notices contract.
+
+test("the heartbeat body reports the running version, the channel, and what is staged", async () => {
+  const node = freshNode();
+  const cloud = await startFakeCloud((res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  try {
+    const client = createCloudClient({
+      cloudUrl: cloud.url,
+      baseDir: node.baseDir,
+      version: "0.4.2",
+      channel: "beta",
+      pendingVersion: () => "0.5.0",
+    });
+    await client.heartbeat();
+    assert.deepEqual(JSON.parse(cloud.calls[0].raw.toString("utf8")), {
+      version: "0.4.2",
+      channel: "beta",
+      pendingVersion: "0.5.0",
+    });
+  } finally { await cloud.close(); }
+});
+
+// `pendingVersion` is a GETTER, not a value, because it changes underneath a
+// long-lived client every time an update is staged or applied — a value
+// captured at construction would say "nothing is staged" for the life of the
+// daemon, which is exactly the "stuck mid-update but silent" state it exists
+// to expose.
+test("pendingVersion is read per heartbeat, and a getter that throws costs the heartbeat nothing", async () => {
+  const node = freshNode();
+  const cloud = await startFakeCloud((res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  try {
+    let staged = null;
+    const client = createCloudClient({
+      cloudUrl: cloud.url, baseDir: node.baseDir, version: "0.1.0", pendingVersion: () => staged,
+    });
+    await client.heartbeat();
+    staged = "0.2.0";
+    await client.heartbeat();
+    const bodies = cloud.calls.map((call) => JSON.parse(call.raw.toString("utf8")));
+    assert.equal(bodies[0].pendingVersion, null, "nothing staged is reported explicitly, not omitted");
+    assert.equal(bodies[1].pendingVersion, "0.2.0");
+
+    // "The cloud has no idea this machine is alive" is a much worse outcome
+    // than "the cloud does not know what is staged on it".
+    const exploding = createCloudClient({
+      cloudUrl: cloud.url,
+      baseDir: node.baseDir,
+      version: "0.1.0",
+      pendingVersion: () => { throw new Error("simulated_update_engine_failure"); },
+    });
+    await exploding.heartbeat();
+    assert.equal(JSON.parse(cloud.calls.at(-1).raw.toString("utf8")).pendingVersion, null);
+  } finally { await cloud.close(); }
+});
+
+test("a well-formed release is handed to onRelease, with no ack and no change to the handoffs returned", async () => {
+  const node = freshNode();
+  const release = {
+    channel: "stable",
+    version: "0.2.0",
+    url: "https://releases.example/relayd/0.2.0/relayd-0.2.0.tar.gz",
+    sha256: "A".repeat(64),
+    sigAlg: "ed25519",
+    sig: "c2lnbmF0dXJl",
+    minVersion: "0.1.0",
+    notes: "faster threads",
+  };
+  const cloud = await startFakeCloud((res, call) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    if (call.method === "GET") {
+      res.end(JSON.stringify({
+        handoffs: [{ id: "abc123", repo: "me/relay", branch: "relay/handoff-x", lease: "lease-h" }],
+        release,
+      }));
+      return;
+    }
+    res.end(JSON.stringify({ acked: ["abc123"] }));
+  });
+  const seen = [];
+  try {
+    const client = createCloudClient({
+      cloudUrl: cloud.url, baseDir: node.baseDir, onRelease: async (value) => { seen.push(value); },
+    });
+    const handoffs = await client.pollHandoffs(20);
+
+    assert.deepEqual(handoffs, [{ id: "abc123", repo: "me/relay", branch: "relay/handoff-x", lease: "lease-h" }],
+      "the caller's view of a poll is unchanged: handoff descriptors only");
+    assert.equal(cloud.calls.length, 2, "one poll, one handoff ack — a release is state, so there is nothing to confirm");
+    assert.deepEqual(JSON.parse(cloud.calls[1].raw.toString("utf8")), { acks: [{ id: "abc123", lease: "lease-h" }] },
+      "the release must not appear in the ack body");
+
+    assert.equal(seen.length, 1);
+    assert.deepEqual(seen[0], { ...release, sha256: "a".repeat(64) },
+      "the digest is normalized to lower case so a comparison cannot fail on case alone");
+  } finally { await cloud.close(); }
+});
+
+// The one plaintext exception, pinned so it is not widened back into "http is
+// fine": a mirror on the machine itself is reachable over loopback, where
+// there is no network to intercept.
+test("a loopback http artifact url is accepted, unlike a plaintext url to anywhere else", async () => {
+  const node = freshNode();
+  const release = {
+    channel: "stable",
+    version: "0.2.0",
+    url: "http://127.0.0.1:9/relayd-0.2.0.tar.gz",
+    sha256: "a".repeat(64),
+    sigAlg: "ed25519",
+    sig: "c2lnbmF0dXJl",
+  };
+  const cloud = await startFakeCloud((res, call) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(call.method === "GET" ? { handoffs: [], release } : {}));
+  });
+  const seen = [];
+  try {
+    const client = createCloudClient({
+      cloudUrl: cloud.url, baseDir: node.baseDir, onRelease: async (value) => { seen.push(value); },
+    });
+    await client.pollHandoffs(0);
+    assert.equal(seen.length, 1, "loopback plaintext is the documented exception");
+    assert.equal(seen[0].url, release.url);
+  } finally { await cloud.close(); }
+});
+
+// The spec's failure-mode table: "`release` malformed or unknown fields ->
+// ignored, logged; poll continues to work for handoffs". This is the
+// announcement's only validation gate, and it is the first mechanism by which
+// something outside the user's machine can cause new code to run on it — so a
+// partially-usable announcement is not a thing. The engine must never be
+// handed a "release" it would have to repair.
+test("a malformed release is ignored entirely, and the poll still returns its handoffs", async () => {
+  const node = freshNode();
+  const wellFormed = {
+    channel: "stable",
+    version: "0.2.0",
+    url: "https://releases.example/relayd.tar.gz",
+    sha256: "a".repeat(64),
+    sigAlg: "ed25519",
+    sig: "c2ln",
+  };
+  const cases = [
+    ["not an object", "stable"],
+    ["an array", [wellFormed]],
+    ["null", null],
+    ["no version", { ...wellFormed, version: undefined }],
+    ["no channel", { ...wellFormed, channel: undefined }],
+    ["a version carrying a path separator", { ...wellFormed, version: "../../etc/passwd" }],
+    ["a non-http url", { ...wellFormed, url: "file:///etc/passwd" }],
+    // The control plane only ever publishes https, so the node has no reason
+    // to be the looser of the two gates. Loopback is the one exception, for a
+    // mirror running on the machine itself.
+    ["a plaintext url to somewhere else", { ...wellFormed, url: "http://releases.example/relayd.tar.gz" }],
+    ["a digest that is not 64 hex characters", { ...wellFormed, sha256: "deadbeef" }],
+    ["a digest with non-hex characters", { ...wellFormed, sha256: "z".repeat(64) }],
+    ["an algorithm this node cannot verify", { ...wellFormed, sigAlg: "rsa-pss" }],
+    ["no signature at all", { ...wellFormed, sig: undefined }],
+    ["a signature that is not base64", { ...wellFormed, sig: "not base64!!" }],
+    ["an unparseable minVersion", { ...wellFormed, minVersion: "../0.1.0" }],
+    ["notes that are not a string", { ...wellFormed, notes: { text: "nope" } }],
+  ];
+
+  for (const [label, release] of cases) {
+    const cloud = await startFakeCloud((res, call) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      if (call.method === "GET") {
+        res.end(JSON.stringify({
+          handoffs: [{ id: "abc123", repo: "me/relay", branch: "relay/handoff-x", lease: "lease-h" }],
+          notices: [{ id: "n1", pairingId: "p1", secret: "s1", lease: "l1" }],
+          release,
+        }));
+        return;
+      }
+      res.end(JSON.stringify({ acked: ["abc123"], noticesAcked: ["n1"] }));
+    });
+    const releases = [];
+    const notices = [];
+    try {
+      const client = createCloudClient({
+        cloudUrl: cloud.url,
+        baseDir: node.baseDir,
+        onRelease: async (value) => { releases.push(value); },
+        onNotice: async (value) => { notices.push(value.id); },
+      });
+      const handoffs = await client.pollHandoffs(5);
+
+      assert.deepEqual(releases, [], `${label}: must not reach the update engine`);
+      assert.deepEqual(handoffs, [{ id: "abc123", repo: "me/relay", branch: "relay/handoff-x", lease: "lease-h" }],
+        `${label}: handoff parsing must be unaffected`);
+      assert.deepEqual(notices, ["n1"], `${label}: the notices contract must be unaffected`);
+      assert.deepEqual(JSON.parse(cloud.calls[1].raw.toString("utf8")), {
+        acks: [{ id: "abc123", lease: "lease-h" }],
+        notices: [{ id: "n1", lease: "l1" }],
+      }, `${label}: the ack must be unaffected`);
+    } finally { await cloud.close(); }
+  }
+});
+
+// `release` is ABSENT, not null, when no release is published for the
+// channel, so a poll without one is the normal case and not a fault. An older
+// relayd ignores the field entirely, which is what makes this compatible in
+// both directions.
+test("a poll with no release field, and a client with no release handler, both behave exactly as before", async () => {
+  const node = freshNode();
+  const cloud = await startFakeCloud((res, call) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    if (call.method === "GET") {
+      res.end(JSON.stringify({
+        handoffs: [{ id: "abc123", repo: "me/relay", branch: "relay/handoff-x", lease: "lease-h" }],
+        release: {
+          channel: "stable",
+          version: "0.2.0",
+          url: "https://releases.example/relayd.tar.gz",
+          sha256: "a".repeat(64),
+          sigAlg: "ed25519",
+          sig: "c2ln",
+        },
+      }));
+      return;
+    }
+    res.end(JSON.stringify({ acked: ["abc123"] }));
+  });
+  try {
+    // No onRelease: a release in the response is simply dropped, which is how
+    // a daemon built before this spec behaves.
+    const unwired = createCloudClient({ cloudUrl: cloud.url, baseDir: node.baseDir });
+    assert.equal((await withHardTimeout(unwired.pollHandoffs(5), 2000, "poll with no release handler")).length, 1);
+  } finally { await cloud.close(); }
+
+  const empty = await startFakeCloud((res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ handoffs: [] }));
+  });
+  try {
+    const releases = [];
+    const client = createCloudClient({
+      cloudUrl: empty.url, baseDir: node.baseDir, onRelease: async (value) => { releases.push(value); },
+    });
+    assert.deepEqual(await client.pollHandoffs(5), []);
+    assert.deepEqual(releases, [], "an absent release must not be dispatched as null");
+    assert.equal(empty.calls.length, 1, "an empty poll must still not trigger an ack call");
+  } finally { await empty.close(); }
+});
+
+test("a release handler that throws neither fails the poll nor withholds the handoff ack", async () => {
+  const node = freshNode();
+  const cloud = await startFakeCloud((res, call) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    if (call.method === "GET") {
+      res.end(JSON.stringify({
+        handoffs: [{ id: "abc123", repo: "me/relay", branch: "relay/handoff-x", lease: "lease-h" }],
+        release: {
+          channel: "stable",
+          version: "0.2.0",
+          url: "https://releases.example/relayd.tar.gz",
+          sha256: "a".repeat(64),
+          sigAlg: "ed25519",
+          sig: "c2ln",
+        },
+      }));
+      return;
+    }
+    res.end(JSON.stringify({ acked: ["abc123"] }));
+  });
+  try {
+    const client = createCloudClient({
+      cloudUrl: cloud.url,
+      baseDir: node.baseDir,
+      onRelease: async () => { throw new Error("simulated_update_engine_explosion"); },
+    });
+    const handoffs = await withHardTimeout(client.pollHandoffs(5), 2000, "poll with an exploding release handler");
+    assert.equal(handoffs.length, 1, "a broken update path must never cost this node its handoffs");
+    assert.deepEqual(JSON.parse(cloud.calls[1].raw.toString("utf8")), { acks: [{ id: "abc123", lease: "lease-h" }] });
+  } finally { await cloud.close(); }
+});

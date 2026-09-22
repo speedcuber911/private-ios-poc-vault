@@ -32,6 +32,8 @@ import {
   cloudUrl,
   handoffEnabled,
   handoffPollWaitSec,
+  autoUpdate,
+  releaseChannel,
   dataDir,
   runHome,
   codexHome,
@@ -223,6 +225,45 @@ function startPairing() {
 
 startPairing();
 
+// --- self-update engine -----------------------------------------------------
+//
+// Built before the handoff loop because two different callers need it: the
+// poll's `onRelease` handler below, and the heartbeat, which reports
+// `pendingVersion` so a node stuck mid-update is visible rather than silent.
+//
+// It is created even with no RELAYD_CLOUD_URL, because `relayd update --file`
+// can stage a release on a machine that never calls out, and a node that was
+// left flipped-but-not-confirmed must still resolve that on its next boot —
+// which is what resumePendingApply does. Under systemd the restart inside an
+// apply kills the applying process, so this is where an apply is normally
+// completed or reversed.
+//
+// Best-effort, exactly like the loop below: a broken update path must never
+// take a healthy node (or its running jobs) offline.
+async function startUpdates() {
+  try {
+    const { createUpdateEngine } = await import("./update.mjs");
+    const engine = createUpdateEngine();
+    const resumed = await engine.resumePendingApply();
+    if (!resumed.skipped) {
+      console.log(
+        resumed.ok
+          ? `relayd: update to ${resumed.version} confirmed after restart`
+          : `relayd: update to ${resumed.version} failed its health check and was rolled back (${resumed.reason})`,
+      );
+    }
+    const staged = engine.pendingVersion();
+    if (staged) console.log(`relayd: release ${staged} is staged and waiting for an idle node`);
+    return engine;
+  } catch (error) {
+    console.error(`relayd: update engine unavailable — ${error?.message || String(error)}`);
+    appendAudit("update_engine_start_failed", null, { error: error?.message || String(error) });
+    return null;
+  }
+}
+
+const updateEngineReady = startUpdates();
+
 // --- handoff + credential-sync pickup loop ----------------------------------
 //
 // Long-polls the control plane for pending `relay handoff` pickups and, when
@@ -252,6 +293,7 @@ async function startHandoffPickup() {
     const { setHandoffCompletionHook, setJobNotificationHook } = await import("./jobs.mjs");
     const { installFromNotice } = await import("./syncauth.mjs");
     setHandoffCompletionHook(completeHandoffJob);
+    const updateEngine = await updateEngineReady;
     // `cloud` is referenced inside the handler, which only ever runs after
     // createCloudClient has returned and this binding is initialized.
     const cloud = createCloudClient({
@@ -267,8 +309,32 @@ async function startHandoffPickup() {
           // node's audit log and event feed.
           postEvent: (type) => cloud.postEvent(type),
         }),
+      // The poll response's ambient `release` field — no row, no lease, no
+      // ack. Wired exactly like onNotice above: cloudclient validates the
+      // shape and swallows a handler that throws, so a release the engine
+      // cannot act on costs this poll nothing.
+      //
+      // AUTO-APPLY IS ON BY DEFAULT (RELAYD_AUTO_UPDATE=0 switches it off).
+      // That is the owner's decision as of 2026-09-21 and it differs from the
+      // spec text, which says opt-in and default off; see the comment on
+      // `autoUpdate` in config.mjs. With it off the node still reports its
+      // version and still records what was announced, so `relayd update`
+      // applies it when the operator runs it.
+      //
+      // A null engine (the import above failed) leaves onRelease unwired,
+      // which is precisely how an older daemon behaves: the field is ignored.
+      //
+      // handleRelease returns as soon as it has decided; the apply itself runs
+      // detached, so the drain window cannot stall this poll or the handoffs
+      // and credential-sync notices that ride it.
+      onRelease: updateEngine ? (release) => updateEngine.handleRelease(release) : null,
+      // Reported on every heartbeat so "which machines are stale" and "which
+      // machine is stuck mid-update" become answerable. A getter, not a value:
+      // it changes underneath this long-lived client.
+      pendingVersion: updateEngine ? () => updateEngine.pendingVersion() : null,
     });
     setJobNotificationHook((type, job) => cloud.postEvent(type, { jobId: job.id }));
+    updateEngine?.setPostEvent((type) => cloud.postEvent(type));
     hostMonitor.setCloud({
       postEvent: (type) => cloud.postEvent(type),
       heartbeat: () => cloud.heartbeat(),
@@ -276,6 +342,10 @@ async function startHandoffPickup() {
     if (handoffEnabled) {
       startHandoffLoop({ cloud, waitSec: handoffPollWaitSec });
       console.log(`relayd: handoff + credential-sync loop and job notifications started against ${cloudUrl}`);
+      console.log(
+        `relayd: subscribed to the ${releaseChannel} release channel, auto-apply ${autoUpdate ? "on" : "off"}` +
+          `${updateEngine ? "" : " (engine unavailable — announcements are ignored)"}`,
+      );
     } else {
       console.log(`relayd: job notifications started against ${cloudUrl}; handoff pickup is disabled`);
     }

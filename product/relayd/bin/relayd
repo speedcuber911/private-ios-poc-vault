@@ -6,6 +6,10 @@
 //   status                    query the running daemon's /healthz
 //   devices list              list enrolled devices
 //   devices revoke <id|serial> [--force]
+//   update --check            print the running build and the announced release
+//   update --file <tarball>   apply a local signed artifact
+//   update --now              apply without waiting for the node to go idle
+//   update --pin <version> | --unpin
 //
 // Everything is stdlib-only. The CLI never prints secret material: pairing
 // codes/tokens are the one deliberate exception (they ARE the credential the
@@ -412,6 +416,13 @@ async function cmdStatus() {
     fail(`config error: ${error.message}`);
     return;
   }
+  // The build identity of THIS checkout/install, printed before the probe so
+  // it is available even when the daemon is not answering — which is exactly
+  // when someone is asking what is installed. The daemon's own version comes
+  // back inside the /healthz payload below; the two differ precisely when a
+  // `current` flip has happened and the service has not been restarted yet.
+  const { version, commit, builtAt } = await import("../src/version.mjs");
+  console.log(`relayd ${version}${commit ? ` (${commit.slice(0, 12)})` : ""}${builtAt ? ` built ${builtAt}` : ""}`);
   const url = `http://${config.host}:${config.port}/healthz`;
   const payload = await new Promise((resolve) => {
     const request = http.get(url, { timeout: 3000 }, (response) => {
@@ -430,6 +441,88 @@ async function cmdStatus() {
     process.exit(1);
   }
   console.log(payload);
+}
+
+// `relayd update` — the operator's half of the release subscription.
+//
+// --check is READ-ONLY and, importantly, does not poll the control plane
+// itself: pollHandoffs acks every handoff in the response it receives, so a
+// CLI poll would confirm delivery of work the daemon never imports. The
+// daemon records what it last heard, and this reads that back.
+//
+// --file applies a local artifact through exactly the same
+// verify/stage/drain/flip/verify/rollback path, with no cloud configured at
+// all. The signature check is not skipped for a local file.
+async function cmdUpdate(args) {
+  const flag = (name) => {
+    const index = args.findIndex((arg) => arg === `--${name}` || arg.startsWith(`--${name}=`));
+    if (index === -1) return undefined;
+    const arg = args[index];
+    return arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : args[index + 1];
+  };
+  const has = (name) => args.some((arg) => arg === `--${name}` || arg.startsWith(`--${name}=`));
+
+  const { createUpdateEngine } = await import("../src/update.mjs");
+  const engine = createUpdateEngine();
+
+  if (has("unpin")) {
+    const result = engine.unpin();
+    console.log(result.version ? `unpinned (was ${result.version})` : "not pinned");
+    return;
+  }
+
+  if (has("pin")) {
+    const value = flag("pin");
+    if (!value) fail("usage: relayd update --pin <version>");
+    const result = engine.pin(value);
+    if (!result.ok) fail(`--pin: ${result.reason}`);
+    console.log(`pinned to ${result.version} — announcements for any other version are ignored until \`relayd update --unpin\``);
+    return;
+  }
+
+  if (has("check") || args.length === 0) {
+    const status = engine.status();
+    const { version, commit, builtAt } = await import("../src/version.mjs");
+    console.log(`running:  ${version}${commit ? ` (${commit.slice(0, 12)})` : ""}${builtAt ? ` built ${builtAt}` : ""}`);
+    console.log(`channel:  ${status.channel}`);
+    console.log(`auto:     ${status.autoApply ? "on" : "off (RELAYD_AUTO_UPDATE=0)"}`);
+    console.log(`layout:   ${status.updateRoot}${status.currentLink ? ` (current -> ${status.currentLink})` : " (no current symlink)"}`);
+    console.log(`key:      ${status.publicKeyPresent ? status.publicKeyFile : `MISSING at ${status.publicKeyFile} — no artifact can be verified`}`);
+    if (status.pinnedVersion) console.log(`pinned:   ${status.pinnedVersion}`);
+    if (status.pendingVersion) console.log(`staged:   ${status.pendingVersion} (awaiting an idle node or a restart)`);
+    if (status.announced) {
+      const release = status.announced;
+      console.log(
+        `announced: ${release.channel}/${release.version} seen ${status.announcedSeenAt} — ${status.announcedDecision}` +
+          `${release.notes ? `\n           ${release.notes}` : ""}`,
+      );
+    } else {
+      console.log("announced: nothing yet (the daemon records a release the first time a poll carries one)");
+    }
+    for (const entry of status.poisoned.slice(-5)) {
+      console.log(`poisoned:  ${entry.version || entry.sha256} — ${entry.reason} at ${entry.at}`);
+    }
+    return;
+  }
+
+  if (has("file")) {
+    const file = flag("file");
+    if (!file) fail("usage: relayd update --file <tarball>");
+    const resolved = path.resolve(file);
+    if (!fs.existsSync(resolved)) fail(`no such artifact: ${resolved}`);
+    const result = await engine.applyLocalFile(resolved, { force: has("now") });
+    if (!result.ok) {
+      fail(`update failed: ${result.reason}${result.rolledBack ? " (rolled back to the previous release)" : ""}`);
+    }
+    if (result.restarted === false) {
+      console.log(`staged and flipped ${result.version}; no supervisor to restart (${result.mode}) — restart relayd to run it`);
+      return;
+    }
+    console.log(`updated to ${result.version}`);
+    return;
+  }
+
+  fail("usage: relayd update [--check] [--file <tarball>] [--now] [--pin <version>] [--unpin]");
 }
 
 async function cmdDevices(args) {
@@ -476,6 +569,11 @@ const usage = `usage: relayd <command>
   status                       query the running daemon
   devices list                 list enrolled devices
   devices revoke <id|serial>   revoke a device certificate [--force]
+  update [--check]             print the running build and the announced release
+  update --file <tarball>      apply a local signed artifact (no cloud needed)
+                               [--now] skips the wait for the node to go idle
+  update --pin <version>       hold this machine at a version
+  update --unpin               follow the channel again
 `;
 
 switch (command) {
@@ -493,6 +591,9 @@ switch (command) {
     break;
   case "devices":
     await cmdDevices(rest);
+    break;
+  case "update":
+    await cmdUpdate(rest);
     break;
   case undefined:
   case "help":

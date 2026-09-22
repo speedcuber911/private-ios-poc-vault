@@ -24,7 +24,11 @@ Type=simple
 User=relay
 Group=relay
 EnvironmentFile=/etc/relayd/relayd.env
-ExecStart=/opt/relayd/node/bin/node /opt/relayd/app/bin/relayd run
+# Through /opt/relayd/current, NEVER through a release directory by name: the
+# `current` symlink is what a self-update flips (src/update.mjs), so a unit
+# naming a version would keep running the old build after a successful update
+# and there would be nothing for the post-restart health check to observe.
+ExecStart=/opt/relayd/node/bin/node /opt/relayd/current/bin/relayd run
 Restart=on-failure
 RestartSec=3
 # relayd closes the tunnel and stops accepting on SIGTERM; bound the wait.

@@ -30,6 +30,7 @@ import { emitEvent } from "./events.mjs";
 import { createPreviewService } from "./previews.mjs";
 import { deviceTokenStore } from "./device-tokens.mjs";
 import { isRevokedSerial } from "./identity.mjs";
+import { version } from "./version.mjs";
 
 const approvalStore = new ApprovalStore(approvalsDir);
 const terminalService = createTerminalService({
@@ -496,13 +497,46 @@ async function routeRequest(req, res) {
 }
 
 
+// Terminal sessions whose shell is still alive. Counted for the drain check in
+// update.mjs, not for display: a restart kills the child shell whether or not
+// a phone happens to be streaming it at that instant, so "attached" here means
+// "the session still owns a process", which is the thing a restart would break
+// mid-sentence.
+//
+// terminals.mjs owns the sessions; this is the one place that can see the
+// service instance, so the count is derived here rather than by inventing a
+// counter somewhere else.
+function liveTerminalCount() {
+  let live = 0;
+  for (const session of terminalService.sessions.values()) {
+    if (session.status === "running" || session.status === "starting") live += 1;
+  }
+  return live;
+}
+
+// `version` (spec 2026-09-21): a node that cannot say what build it is running
+// is invisible to the fleet, and the iOS app currently infers "too old to
+// report usage" from a 404 instead of asking.
+//
+// NOTE: API.md §2.7 documents `GET /v1/meta` carrying a `version` field, and
+// that route does not exist. It is deliberately NOT implemented here — the
+// health routes are what `relayd status`, the update engine's post-restart
+// check and the fleet actually read, and adding a capability-negotiation route
+// is a separate piece of work with its own contract.
+//
+// `activeTerminals` rides along because the drain check is the one consumer
+// that may be running in a DIFFERENT process from the daemon (`relayd update
+// --file`), where an in-process counter tells it nothing. /healthz is already
+// the node's public introspection surface, so it is where the answer belongs.
 function healthPayload(authenticated) {
   return {
     ok: true,
     authenticated,
     requireMtls,
+    version,
     queueLength: jobsState.queuedJobIds.length,
     activeJobs: activeChildren.size,
+    activeTerminals: liveTerminalCount(),
     maxConcurrent,
     workspaceCount: workspaces.size,
   };
@@ -606,6 +640,7 @@ export {
   authorize,
   routeRequest,
   healthPayload,
+  liveTerminalCount,
   shouldProxyCodexRequest,
   proxyCodexRequest,
   readRawBody,

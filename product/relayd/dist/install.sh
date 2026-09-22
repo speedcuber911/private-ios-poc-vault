@@ -7,7 +7,8 @@
 #      system node is missing or too old
 #   3. runs as the human who invoked it (RELAYD_RUN_USER overrides; falls back
 #      to a `relay` system account), and seeds a workspace jail
-#   4. copies the relayd app to /opt/relayd/app
+#   4. copies the relayd app to /opt/relayd/releases/<version> and points
+#      /opt/relayd/current at it, then installs the release public key
 #   5. writes /etc/relayd/relayd.env (0640 root:relay) with safe defaults
 #   6. installs + enables the systemd unit
 #   7. prints the pairing code/link via `relayd pair`
@@ -29,7 +30,24 @@ set -euo pipefail
 
 NODE_VERSION="22.23.1"
 APP_SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_DIR="/opt/relayd/app"
+# The releases/<version> + `current` symlink layout (spec 2026-09-21).
+#
+# The old installer copied over the LIVE directory, /opt/relayd/app, which is
+# why there was never anything to roll back to: an upgrade destroyed the only
+# copy of the previous build as its first act. Each release now gets its own
+# immutable directory and `current` is what the systemd unit runs, so a flip is
+# one rename and a rollback is the same rename in reverse. relayd's own
+# self-update (src/update.mjs) expects exactly this shape, and a node installed
+# the old way cannot be updated by it at all — so fresh installs adopt it too,
+# not just upgrades.
+RELAYD_ROOT="/opt/relayd"
+RELEASES_DIR="$RELAYD_ROOT/releases"
+CURRENT_LINK="$RELAYD_ROOT/current"
+LEGACY_APP_DIR="$RELAYD_ROOT/app"
+# The public half of the OFFLINE release signing key. update.mjs verifies every
+# artifact against this before it unpacks anything, which is what stops a
+# compromised control plane from being able to author code a node will run.
+RELEASE_PUBKEY_DEST="$RELAYD_ROOT/release-pubkey.pem"
 NODE_DIR="/opt/relayd/node"
 DATA_DIR="/var/lib/relayd"
 JAIL_DIR="/srv/relay-workspaces"
@@ -235,14 +253,82 @@ chmod 0750 "$JAIL_DIR"
 
 # --- 4. app -----------------------------------------------------------------
 
+# Which version is being installed. build-info.json is written by the
+# packaging step and is the authoritative answer; a plain checkout has no such
+# file, so package.json's version is the fallback — the same order src/
+# version.mjs uses, deliberately, so the directory name and what the daemon
+# reports on /healthz can never disagree.
+read_app_version() {
+  "$NODE_DIR/bin/node" -e '
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const dir = process.argv[1];
+    const read = (file) => { try { return JSON.parse(fs.readFileSync(path.join(dir, file), "utf8")); } catch { return null; } };
+    const clean = (value) => (typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9.+_-]{0,63}$/.test(value.trim()) ? value.trim() : null);
+    const info = read("build-info.json");
+    const manifest = read("package.json");
+    process.stdout.write(clean(info && info.version) || clean(manifest && manifest.version) || "");
+  ' "$1"
+}
+
+APP_VERSION="$(read_app_version "$APP_SRC_DIR")"
+[ -n "$APP_VERSION" ] || die "cannot determine the relayd version from $APP_SRC_DIR (no usable build-info.json or package.json)"
+APP_DIR="$RELEASES_DIR/$APP_VERSION"
+
 log "installing app to $APP_DIR"
 mkdir -p "$APP_DIR"
-# Copy only what the daemon needs: sources, bin, package manifest.
+# Copy only what the daemon needs: sources, bin, package manifest, and the
+# generated build identity when the artifact carries one.
 rm -rf "$APP_DIR/src" "$APP_DIR/bin"
 cp -R "$APP_SRC_DIR/src" "$APP_DIR/src"
 cp -R "$APP_SRC_DIR/bin" "$APP_DIR/bin"
 cp "$APP_SRC_DIR/package.json" "$APP_DIR/package.json"
+if [ -f "$APP_SRC_DIR/build-info.json" ]; then
+  cp "$APP_SRC_DIR/build-info.json" "$APP_DIR/build-info.json"
+fi
 chmod 0755 "$APP_DIR/bin/relayd"
+
+# Point `current` at this release. Written as a temp symlink and renamed so a
+# reader — including a systemd unit starting at that exact moment — never sees
+# a `current` that does not exist. Re-running with the same version is a
+# no-op flip, which is what makes this idempotent.
+#
+# A pre-existing /opt/relayd/app from an older installer is deliberately LEFT
+# ALONE rather than deleted: it is the only copy of the build that is running
+# right now, and this script is not the place to remove the operator's way
+# back.
+if [ -e "$CURRENT_LINK" ] && [ ! -L "$CURRENT_LINK" ]; then
+  die "$CURRENT_LINK exists and is not a symlink; move it aside and re-run"
+fi
+CURRENT_TMP="$CURRENT_LINK.install.$$"
+ln -sfn "releases/$APP_VERSION" "$CURRENT_TMP"
+mv -Tf "$CURRENT_TMP" "$CURRENT_LINK"
+if [ -d "$LEGACY_APP_DIR" ]; then
+  log "note: the pre-$APP_VERSION copy at $LEGACY_APP_DIR is left in place; nothing runs from it once the unit restarts"
+fi
+
+# The release trust anchor. Sourced from the artifact (dist/release-pubkey.pem)
+# or from the environment, and NEVER overwritten once present: replacing it
+# silently would be replacing the one thing that decides which code this
+# machine will accept. Rotating it is a deliberate act — remove the file first.
+if [ -f "$RELEASE_PUBKEY_DEST" ]; then
+  log "release public key already installed at $RELEASE_PUBKEY_DEST — leaving it untouched"
+elif [ -n "${RELAYD_RELEASE_PUBKEY:-}" ]; then
+  log "installing release public key from RELAYD_RELEASE_PUBKEY"
+  printf '%s\n' "$RELAYD_RELEASE_PUBKEY" > "$RELEASE_PUBKEY_DEST"
+elif [ -n "${RELAYD_RELEASE_PUBKEY_SRC:-}" ] && [ -f "${RELAYD_RELEASE_PUBKEY_SRC:-}" ]; then
+  log "installing release public key from $RELAYD_RELEASE_PUBKEY_SRC"
+  cp "$RELAYD_RELEASE_PUBKEY_SRC" "$RELEASE_PUBKEY_DEST"
+elif [ -f "$APP_SRC_DIR/dist/release-pubkey.pem" ]; then
+  log "installing release public key from the artifact"
+  cp "$APP_SRC_DIR/dist/release-pubkey.pem" "$RELEASE_PUBKEY_DEST"
+else
+  log "WARNING: no release public key available, so $RELEASE_PUBKEY_DEST is absent."
+  log "WARNING: relayd will REFUSE every announced update until one is installed"
+  log "WARNING: (set RELAYD_RELEASE_PUBKEY or RELAYD_RELEASE_PUBKEY_SRC and re-run)."
+  log "WARNING: Everything else works; only self-update is unavailable."
+fi
+
 chown -R root:root /opt/relayd
 chmod -R a+rX /opt/relayd
 
@@ -342,6 +428,25 @@ if [ ! -f "$ENV_FILE" ]; then
     env_kv RELAYD_PAIRING_ENABLED true
     env_kv RELAYD_PAIRING_HOST 0.0.0.0
     env_kv RELAYD_PAIRING_PORT "$PAIRING_PORT"
+    printf '%s\n' \
+      '# Self-update (spec 2026-09-21). The control plane ANNOUNCES a version' \
+      '# on the long-poll this node already holds open; the node downloads the' \
+      '# artifact, verifies a detached Ed25519 signature against' \
+      "#     $RELEASE_PUBKEY_DEST" \
+      '# stages it under releases/<version>, waits until no job or terminal is' \
+      '# live, flips the `current` symlink, restarts, and rolls back if the' \
+      '# new build does not report itself healthy.' \
+      '#' \
+      '# The signing key is offline and is NOT on the control-plane host, so a' \
+      '# compromised control plane can withhold or delay an update but cannot' \
+      '# author code this machine will run.' \
+      '#' \
+      '# RELAYD_AUTO_UPDATE=0 keeps the version reporting and the announcement' \
+      '# but applies nothing until you run `relayd update`.' \
+      '# RELAYD_RELEASE_CHANNEL is stable or beta. Put the machine you cannot' \
+      '# afford to break on stable, and pin it with `relayd update --pin`.'
+    env_kv RELAYD_AUTO_UPDATE 1
+    env_kv RELAYD_RELEASE_CHANNEL stable
   } > "$ENV_TMP"
   chown "root:$RUN_USER" "$ENV_TMP"
   chmod 0640 "$ENV_TMP"
@@ -349,6 +454,21 @@ if [ ! -f "$ENV_FILE" ]; then
   trap - EXIT
 else
   log "$ENV_FILE exists — leaving it untouched"
+  # Except for keys that did not exist when it was written. An upgrade must not
+  # rewrite the operator's config, but a node upgraded into a build that has a
+  # release channel should say which channel it is on rather than leave it
+  # implicit — "which machines are on beta" is the question the whole
+  # subscription exists to make answerable. Append-if-absent only: an existing
+  # value, including one the operator changed, is never touched, which is what
+  # keeps re-running this idempotent.
+  for pair in "RELAYD_AUTO_UPDATE 1" "RELAYD_RELEASE_CHANNEL stable"; do
+    key="${pair%% *}"
+    value="${pair##* }"
+    if ! grep -qE "^[[:space:]]*(export[[:space:]]+)?$key=" "$ENV_FILE"; then
+      log "adding $key to $ENV_FILE (new in this version)"
+      env_kv "$key" "$value" >> "$ENV_FILE"
+    fi
+  done
   if env_file_needs_quoting "$ENV_FILE"; then
     log "WARNING: $ENV_FILE has unquoted values containing shell metacharacters."
     log "WARNING: systemd reads them fine, but sourcing the file in a shell will"
@@ -380,7 +500,11 @@ fi
 # The bundled runtime is NOT on the relay user's PATH and bin/relayd's shebang
 # resolves a bare `node`, so relayd must always be invoked as
 # `<node-dir>/bin/node <app-dir>/bin/relayd ...`, never as `bin/relayd` alone.
-PAIR_CMD="sudo sh -c 'set -a; . $ENV_FILE; set +a; HOME=/home/$RUN_USER PATH=$NODE_DIR/bin:\$PATH exec runuser --preserve-environment -u $RUN_USER -- $NODE_DIR/bin/node $APP_DIR/bin/relayd pair'"
+#
+# Invoked through `current` rather than through the release directory this run
+# happens to have created: that is what the unit runs, so it is what an
+# operator copying this line out of the log should run too.
+PAIR_CMD="sudo sh -c 'set -a; . $ENV_FILE; set +a; HOME=/home/$RUN_USER PATH=$NODE_DIR/bin:\$PATH exec runuser --preserve-environment -u $RUN_USER -- $NODE_DIR/bin/node $CURRENT_LINK/bin/relayd pair'"
 
 log "generating pairing code"
 pair_ok=0
@@ -391,7 +515,7 @@ if (
   export HOME="/home/$RUN_USER"
   export PATH="$NODE_DIR/bin:$PATH"
   runuser --preserve-environment -u "$RUN_USER" -- \
-    "$NODE_DIR/bin/node" "$APP_DIR/bin/relayd" pair
+    "$NODE_DIR/bin/node" "$CURRENT_LINK/bin/relayd" pair
 ); then
   pair_ok=1
 fi
@@ -411,7 +535,7 @@ pairing_reachability() {
     load_env_file "$ENV_FILE"
     export HOME="/home/$RUN_USER"
     export PATH="$NODE_DIR/bin:$PATH"
-    export RELAYD_CONFIG_URL="file://$APP_DIR/src/config.mjs"
+    export RELAYD_CONFIG_URL="file://$CURRENT_LINK/src/config.mjs"
     runuser --preserve-environment -u "$RUN_USER" -- \
       "$NODE_DIR/bin/node" --input-type=module -e \
       'const c = await import(process.env.RELAYD_CONFIG_URL);
