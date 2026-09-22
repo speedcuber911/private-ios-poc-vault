@@ -473,6 +473,9 @@ final class RelayChatViewModel: ObservableObject {
     private static let claudePermissionDefaultsKey = "relay.claude.permissionMode"
     private static let codexApprovalDefaultsKey = "relay.codex.approvalPolicy"
     private static let codexSandboxDefaultsKey = "relay.codex.sandbox"
+    /// Matches relayd's default `CODEX_MAX_TIMEOUT_MS`. Approvals already pause
+    /// this clock; the cap is only for a run that never finishes on its own.
+    static let taskTimeoutMs = 4 * 60 * 60 * 1000
 
     var isStreaming: Bool { streamingMessageID != nil }
 
@@ -1186,7 +1189,7 @@ final class RelayChatViewModel: ObservableObject {
             let created = try await client.createJob(CodexCreateJobRequest(
                 workspaceId: workspaceID,
                 prompt: requestPrompt,
-                timeoutMs: 1_800_000,
+                timeoutMs: Self.taskTimeoutMs,
                 model: Self.taskModelParameter(for: model),
                 reasoningEffort: effectiveEffort?.rawValue,
                 provider: provider,

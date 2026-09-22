@@ -200,7 +200,7 @@ All from env, parsed at 9–124. Contract-relevant defaults:
 | `CODEX_MAX_OUTPUT_BYTES` | 5 MiB | log capture + stream replay bound |
 | `CODEX_RESPONSE_OUTPUT_BYTES` | 64 KiB | per-field text in detail responses |
 | `CODEX_LIST_OUTPUT_BYTES` | 4 KiB | per-field text in list responses |
-| `CODEX_DEFAULT_TIMEOUT_MS` / `CODEX_MAX_TIMEOUT_MS` | 10 min / 30 min | job timeout default/clamp |
+| `CODEX_DEFAULT_TIMEOUT_MS` / `CODEX_MAX_TIMEOUT_MS` | 10 min / 4 hours | job timeout default/clamp |
 | `CODEX_MAX_JOB_ATTACHMENTS` / `_BYTES` / `_TOTAL_BYTES` | 6 / 8 MiB / 18 MiB | attachment caps (413) |
 | `CODEX_MAX_JOB_ARTIFACTS` / `CODEX_MAX_ARTIFACT_BYTES` / `_TOTAL_BYTES` | 12 / 1 MiB / 5 MiB | artifact extraction caps |
 | `CODEX_MAX_JOB_SKILLS` / `CODEX_MAX_SKILL_PROMPT_BYTES` | 6 / 20 KiB | skill selection/injection caps |
@@ -1450,7 +1450,7 @@ discoverable here so older/newer app+node pairs degrade gracefully.
   "limits": {
     "maxBodyBytes": 31457280, "maxJobAttachments": 6,
     "maxJobAttachmentBytes": 8388608, "maxJobAttachmentTotalBytes": 18874368,
-    "maxTimeoutMs": 1800000, "defaultTimeoutMs": 600000,
+    "maxTimeoutMs": 14400000, "defaultTimeoutMs": 600000,
     "maxFsReadBytes": 1048576, "maxFsFileBytes": 26214400,
     "maxFsListEntries": 500, "maxJobStreams": 8,
     "responseOutputBytes": 65536, "listOutputBytes": 4096

@@ -158,7 +158,9 @@ const listOutputBytes = Math.min(
   responseOutputBytes,
 );
 
-const maxTimeoutMs = parseIntegerEnv("CODEX_MAX_TIMEOUT_MS", 30 * 60 * 1000, 1000, 24 * 60 * 60 * 1000);
+// Phone agent runs (browser work, bookings, long reviews) routinely pass 30
+// minutes. The cap is a stuck-job safety net, not a "one sitting" budget.
+const maxTimeoutMs = parseIntegerEnv("CODEX_MAX_TIMEOUT_MS", 4 * 60 * 60 * 1000, 1000, 24 * 60 * 60 * 1000);
 
 const defaultTimeoutMs = Math.min(
   parseIntegerEnv("CODEX_DEFAULT_TIMEOUT_MS", 10 * 60 * 1000, 1000, 24 * 60 * 60 * 1000),

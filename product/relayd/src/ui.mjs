@@ -1301,7 +1301,7 @@ function codexThreadUiHtml() {
               workspaceId: thread.workspaceId,
               provider: thread.provider || "codex",
               prompt: prompt,
-              timeoutMs: 1800000,
+              timeoutMs: 4 * 60 * 60 * 1000,
               resumeSessionId: thread.sessionId
             })
           }).then(function (job) {

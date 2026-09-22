@@ -2701,6 +2701,10 @@ final class ManifestTests: XCTestCase {
         XCTAssertFalse(viewModelSource.contains("client.fetchThreads(provider: nil, workspaceID: nil, limit: 200)"))
     }
 
+    func testTaskJobsRequestAFourHourTimeout() {
+        XCTAssertEqual(RelayChatViewModel.taskTimeoutMs, 4 * 60 * 60 * 1000)
+    }
+
     func testTaskFollowUpResumesTheOnScreenSessionAfterCancel() throws {
         let cancelled = try decodeCodexJob(
             """

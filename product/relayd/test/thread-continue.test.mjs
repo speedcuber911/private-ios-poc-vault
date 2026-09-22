@@ -19,6 +19,11 @@ const {
   continueUnfinishedThreadPrompt,
   applyDiscoveredSessionId,
 } = await import("../src/jobs.mjs");
+const { maxTimeoutMs } = await import("../src/config.mjs");
+
+test("phone-length agent jobs may run for four hours before the stuck-job cap", () => {
+  assert.equal(maxTimeoutMs, 4 * 60 * 60 * 1000);
+});
 
 const sessionId = "019e46a5-0000-7000-8000-000000000001";
 
