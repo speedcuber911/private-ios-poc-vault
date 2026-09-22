@@ -652,16 +652,25 @@ struct RelayMachinePowerSwitch: View {
                 }
             }
             Spacer(minLength: 12)
-            if model.status.isBusy {
+            // Until the first read lands there is no position to show, so the
+            // switch is replaced by a spinner rather than starting at off and
+            // correcting itself a moment later.
+            if model.status.isResolved {
+                if model.status.isBusy {
+                    ProgressView()
+                }
+                Toggle("Power", isOn: binding)
+                    .labelsHidden()
+                    .tint(AppTheme.accent)
+                    .disabled(!model.status.canToggle)
+                    .accessibilityIdentifier(accessibilityIdentifier)
+            } else {
                 ProgressView()
+                    .accessibilityIdentifier(accessibilityIdentifier)
             }
-            Toggle("Power", isOn: binding)
-                .labelsHidden()
-                .tint(AppTheme.accent)
-                .disabled(!model.status.canToggle)
-                .accessibilityIdentifier(accessibilityIdentifier)
         }
         .accessibilityElement(children: .contain)
+        .animation(.default, value: model.status)
     }
 
     private var binding: Binding<Bool> {

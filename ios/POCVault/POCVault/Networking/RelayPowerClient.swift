@@ -152,6 +152,9 @@ final class RelayPowerClient: RelayMachinePowering {
 @MainActor
 final class RelayMachinePowerModel: ObservableObject {
     enum Status: Equatable {
+        /// No power state has been read yet. Distinct from `off` so the switch
+        /// never renders a guessed position it then has to correct.
+        case loading
         case unknown
         case unavailable
         case on
@@ -161,6 +164,7 @@ final class RelayMachinePowerModel: ObservableObject {
 
         var label: String {
             switch self {
+            case .loading: return "Checking"
             case .unknown: return "Unknown"
             case .unavailable: return "Unavailable"
             case .on: return "On"
@@ -178,28 +182,41 @@ final class RelayMachinePowerModel: ObservableObject {
             self == .on || self == .starting
         }
 
+        /// True once a real answer stands behind the position of the switch.
+        var isResolved: Bool {
+            self != .loading
+        }
+
         var canToggle: Bool {
             switch self {
-            case .unavailable, .starting, .stopping: return false
+            case .loading, .unavailable, .starting, .stopping: return false
             case .unknown, .on, .off: return true
             }
         }
 
         var switchDetail: String? {
             switch self {
+            case .loading: return "Checking…"
             case .starting: return "Starting…"
             case .stopping: return "Stopping…"
             case .unavailable: return "Unavailable"
-            case .unknown, .on, .off: return nil
+            case .unknown: return "Unknown"
+            case .on, .off: return nil
             }
         }
     }
 
-    @Published private(set) var status: Status = .unknown
+    @Published private(set) var status: Status = .loading
     @Published private(set) var notice: String?
 
     private var identityStore: ClientIdentityStore?
     private let powerClient: RelayMachinePowering
+    /// Bumped by every start and stop. Anything that began under an older
+    /// generation is stale and is thrown away, so a slow read can never move
+    /// the switch back to the state it held before the user acted.
+    private var generation = 0
+    private var isReading = false
+    private var isTransitioning = false
 
     init(powerClient: RelayMachinePowering? = nil) {
         self.powerClient = powerClient ?? RelayPowerClient(baseURL: AppConfiguration.authBaseURL)
@@ -211,18 +228,30 @@ final class RelayMachinePowerModel: ObservableObject {
         self.identityStore = identityStore
     }
 
+    /// A plain read. It yields to any start/stop that owns the switch, and to
+    /// another read already in flight, rather than competing with it.
     func refresh() async {
         guard let credential = identityStore?.wakeCredential() else {
             status = .unavailable
             return
         }
+        guard !isTransitioning, !isReading else { return }
+        isReading = true
+        let readGeneration = generation
+        defer { isReading = false }
         do {
-            apply(try await powerClient.state(nodeID: credential.nodeID, wakeToken: credential.token))
+            let state = try await powerClient.state(nodeID: credential.nodeID, wakeToken: credential.token)
+            guard readGeneration == generation else { return }
+            apply(state)
             notice = nil
         } catch let error as RelayMachinePowerError where error == .unconfigured || error == .unauthorized {
+            guard readGeneration == generation else { return }
             status = .unavailable
         } catch {
-            if status != .starting && status != .stopping {
+            guard readGeneration == generation else { return }
+            // A failed read is not evidence of a power state. Keep whatever we
+            // last knew and say what went wrong instead of flipping the switch.
+            if !status.isResolved {
                 status = .unknown
             }
             notice = error.localizedDescription
@@ -234,22 +263,34 @@ final class RelayMachinePowerModel: ObservableObject {
             status = .unavailable
             return
         }
+        generation += 1
+        let myGeneration = generation
         status = .starting
         notice = nil
+        isTransitioning = true
+        defer { isTransitioning = false }
         do {
             var state = try await powerClient.start(nodeID: credential.nodeID, wakeToken: credential.token)
             let deadline = Date().addingTimeInterval(90)
             while Date() < deadline {
-                apply(state)
-                if state.isRunning { return }
+                guard myGeneration == generation else { return }
+                // EC2 keeps reporting `stopped` for the first seconds of a
+                // start. Staying on `.starting` until it actually runs is what
+                // keeps the switch from snapping back to off and then on.
+                if state.isRunning {
+                    apply(state)
+                    return
+                }
                 try await Task.sleep(for: .seconds(2))
                 state = try await powerClient.state(nodeID: credential.nodeID, wakeToken: credential.token)
             }
+            guard myGeneration == generation else { return }
             apply(state)
             if !state.isRunning {
                 notice = RelayMachinePowerError.timeout.errorDescription
             }
         } catch {
+            guard myGeneration == generation else { return }
             status = .off
             notice = error.localizedDescription
         }
@@ -260,19 +301,30 @@ final class RelayMachinePowerModel: ObservableObject {
             status = .unavailable
             return
         }
+        generation += 1
+        let myGeneration = generation
         status = .stopping
         notice = nil
+        isTransitioning = true
+        defer { isTransitioning = false }
         do {
             var state = try await powerClient.stop(nodeID: credential.nodeID, wakeToken: credential.token)
-            let deadline = Date().addingTimeInterval(60)
+            let deadline = Date().addingTimeInterval(90)
             while Date() < deadline {
-                apply(state)
-                if state.isStopped { return }
+                guard myGeneration == generation else { return }
+                // `stopping` is still in motion; only a settled `stopped`
+                // ends the transition and turns the switch off.
+                if state.instanceState == "stopped" {
+                    apply(state)
+                    return
+                }
                 try await Task.sleep(for: .seconds(2))
                 state = try await powerClient.state(nodeID: credential.nodeID, wakeToken: credential.token)
             }
+            guard myGeneration == generation else { return }
             apply(state)
         } catch {
+            guard myGeneration == generation else { return }
             status = .on
             notice = error.localizedDescription
         }

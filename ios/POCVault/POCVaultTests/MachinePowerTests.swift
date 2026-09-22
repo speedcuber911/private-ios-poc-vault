@@ -96,12 +96,99 @@ final class MachinePowerTests: XCTestCase {
         XCTAssertNil(RelayMachinePowerModel.Status.on.switchDetail)
     }
 
+    func testLoadingIsNeitherOnNorOffAndCannotBeToggled() {
+        let loading = RelayMachinePowerModel.Status.loading
+        XCTAssertFalse(loading.isResolved)
+        XCTAssertFalse(loading.canToggle)
+        XCTAssertFalse(loading.isPowered)
+        XCTAssertEqual(loading.switchDetail, "Checking…")
+        XCTAssertTrue(RelayMachinePowerModel.Status.on.isResolved)
+        XCTAssertTrue(RelayMachinePowerModel.Status.off.isResolved)
+    }
+
+    @MainActor
+    func testSwitchStaysLoadingUntilTheFirstReadLands() async {
+        let store = ClientIdentityStore()
+        store.storeWakeToken("wake-secret-token", nodeID: "node-abc")
+        let fake = FakePowerClient(states: ["running"])
+        let model = RelayMachinePowerModel(powerClient: fake)
+        model.configure(identityStore: store)
+
+        XCTAssertEqual(model.status, .loading)
+        await model.refresh()
+        XCTAssertEqual(model.status, .on)
+    }
+
+    /// A read that fails says nothing about the machine, so the switch must
+    /// keep the position it earned instead of falling back to off.
+    @MainActor
+    func testFailedReadKeepsTheLastKnownPosition() async {
+        let store = ClientIdentityStore()
+        store.storeWakeToken("wake-secret-token", nodeID: "node-abc")
+        let fake = FakePowerClient(states: ["running"])
+        let model = RelayMachinePowerModel(powerClient: fake)
+        model.configure(identityStore: store)
+        await model.refresh()
+        XCTAssertEqual(model.status, .on)
+
+        fake.stateError = RelayMachinePowerError.timeout
+        await model.refresh()
+        XCTAssertEqual(model.status, .on)
+        XCTAssertNotNil(model.notice)
+    }
+
+    /// The glitch this guards: EC2 still answers `stopped` for a few seconds
+    /// after a start is accepted, and a read landing in that window used to
+    /// flip the switch off before the next poll turned it back on.
+    @MainActor
+    func testStaleReadDuringStartCannotFlipTheSwitchOff() async {
+        let store = ClientIdentityStore()
+        store.storeWakeToken("wake-secret-token", nodeID: "node-abc")
+        let fake = FakePowerClient(states: ["stopped", "running"])
+        fake.startState = "stopped"
+        let model = RelayMachinePowerModel(powerClient: fake)
+        model.configure(identityStore: store)
+
+        let starting = Task { await model.start() }
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(model.status, .starting)
+        await model.refresh()
+        XCTAssertEqual(model.status, .starting, "a concurrent read must not interrupt a start")
+        await starting.value
+        XCTAssertEqual(model.status, .on)
+    }
+
     private func urlSessionReturning(status: Int, body: String) -> URLSessionConfiguration {
         MockPowerURLProtocol.status = status
         MockPowerURLProtocol.body = Data(body.utf8)
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MockPowerURLProtocol.self]
         return configuration
+    }
+}
+
+private final class FakePowerClient: RelayMachinePowering, @unchecked Sendable {
+    private var states: [String]
+    var startState = "pending"
+    var stopState = "stopping"
+    var stateError: Error?
+
+    init(states: [String]) {
+        self.states = states
+    }
+
+    func start(nodeID: String, wakeToken: String) async throws -> RelayMachinePowerState {
+        RelayMachinePowerState(nodeID: nodeID, instanceID: "i-1", region: "ap-south-1", instanceState: startState)
+    }
+
+    func stop(nodeID: String, wakeToken: String) async throws -> RelayMachinePowerState {
+        RelayMachinePowerState(nodeID: nodeID, instanceID: "i-1", region: "ap-south-1", instanceState: stopState)
+    }
+
+    func state(nodeID: String, wakeToken: String) async throws -> RelayMachinePowerState {
+        if let stateError { throw stateError }
+        let next = states.count > 1 ? states.removeFirst() : (states.first ?? "running")
+        return RelayMachinePowerState(nodeID: nodeID, instanceID: "i-1", region: "ap-south-1", instanceState: next)
     }
 }
 

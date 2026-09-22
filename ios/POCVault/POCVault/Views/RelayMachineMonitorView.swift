@@ -115,11 +115,15 @@ struct RelayMachineMonitorView: View {
             } else if let errorMessage = model.errorMessage {
                 VStack(alignment: .leading, spacing: 20) {
                     statusHeader(
-                        status: powerModel.status == .off ? "Off" : "Unreachable",
-                        warn: true,
+                        status: unreachableStatusLabel,
+                        warn: !isPowerStatePending,
                         info: canControlPower ? Self.powerInfo : Self.usageInfo
                     )
-                    if powerModel.status != .off {
+                    if isPowerStatePending {
+                        Text("Checking whether this machine is powered on…")
+                            .font(AppTheme.uiFont(size: 16))
+                            .foregroundStyle(AppTheme.textSecondary)
+                    } else if powerModel.status != .off {
                         Text(errorMessage)
                             .font(AppTheme.uiFont(size: 16))
                             .foregroundStyle(AppTheme.statusError)
@@ -485,6 +489,18 @@ struct RelayMachineMonitorView: View {
     }
 
     private var canControlPower: Bool { identityStore?.wakeCredential() != nil }
+
+    /// Usage can fail because the machine is stopped or because it is simply
+    /// unreachable, and only the power read tells us which. Say nothing until
+    /// that read lands.
+    private var unreachableStatusLabel: String {
+        guard !isPowerStatePending else { return "Checking" }
+        return powerModel.status == .off ? "Off" : "Unreachable"
+    }
+
+    private var isPowerStatePending: Bool {
+        canControlPower && !powerModel.status.isResolved
+    }
 
     private func waitForMachine() async {
         let deadline = Date().addingTimeInterval(60)
