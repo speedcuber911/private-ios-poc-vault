@@ -809,7 +809,7 @@ final class RelayChatViewModel: ObservableObject {
                 adoptWorkspaceID(workspaceID)
                 currentThreadWorkspaceID = workspaceID
             }
-            currentThreadID = job.threadSessionId ?? job.sessionId ?? job.resumeSessionId
+            adoptThread(from: job)
             currentThreadProvider = job.provider
             currentThreadWorkspaceName = job.workspaceName ?? currentThreadWorkspaceName
             messages.append(jobItem(job))
@@ -1161,10 +1161,20 @@ final class RelayChatViewModel: ObservableObject {
         draftAttachments = []
         errorMessage = nil
 
-        // Only resume the existing session if it's the same provider AND same workspace,
-        // otherwise the server rejects it ("session does not belong to workspace").
-        let resumeID = (currentThreadProvider == provider && currentThreadWorkspaceID == workspaceID) ? currentThreadID : nil
-        let requestPrompt = text.isEmpty ? "Please inspect the attached file(s)." : text
+        // Resume this on-screen conversation. A brand-new Codex job has no
+        // session id until the runner writes one, so also look at jobs already
+        // shown here — otherwise "Go on" after a cancel starts a second thread.
+        let conversationJobs = messages.compactMap(\.job)
+        let resumeID = Self.resumeSessionID(
+            currentThreadID: currentThreadID,
+            currentThreadProvider: currentThreadProvider,
+            currentThreadWorkspaceID: currentThreadWorkspaceID,
+            provider: provider,
+            workspaceID: workspaceID,
+            conversationJobs: conversationJobs
+        )
+        let userPrompt = text.isEmpty ? "Please inspect the attached file(s)." : text
+        let requestPrompt = Self.followUpTaskPrompt(userText: userPrompt, conversationJobs: conversationJobs)
         messages.append(RelayConversationItem(
             role: .user,
             text: text,
@@ -1193,7 +1203,7 @@ final class RelayChatViewModel: ObservableObject {
             } else {
                 job = try await client.fetchJob(id: created.id)
             }
-            currentThreadID = job.threadSessionId ?? job.sessionId ?? job.resumeSessionId
+            adoptThread(from: job)
             currentThreadProvider = provider
             currentThreadWorkspaceID = job.workspaceId ?? workspaceID
             currentThreadWorkspaceName = job.workspaceName ?? currentThreadWorkspaceName ?? registeredWorkspaceName
@@ -1602,6 +1612,23 @@ final class RelayChatViewModel: ObservableObject {
         } else {
             jobs.insert(job, at: 0)
         }
+        adoptThread(from: job)
+    }
+
+    /// Keep the open conversation on one native session. Creating a Codex job
+    /// does not yet have a session id, so never write nil over a thread we
+    /// already have; adopt the id as soon as the job reports it.
+    private func adoptThread(from job: CodexJob) {
+        currentThreadID = Self.adoptedThreadID(currentThreadID: currentThreadID, job: job)
+        if currentThreadProvider == nil {
+            currentThreadProvider = job.provider
+        }
+        if currentThreadWorkspaceID == nil {
+            currentThreadWorkspaceID = job.workspaceId
+        }
+        if currentThreadWorkspaceName == nil {
+            currentThreadWorkspaceName = job.workspaceName
+        }
     }
 
     private func mergeUpdatedJobs() {
@@ -1672,6 +1699,64 @@ final class RelayChatViewModel: ObservableObject {
         // otherwise fall back to the chat id for dual-mode models, or the runner default.
         if let taskModel = model.taskModel, !taskModel.isEmpty { return taskModel }
         return model.supports(.chat) ? model.id : nil
+    }
+
+    /// Prefer the open thread, then the latest job already on screen. A follow-up
+    /// must not start a second Codex session just because the first job's id
+    /// arrived after create returned.
+    nonisolated static func resumeSessionID(
+        currentThreadID: String?,
+        currentThreadProvider: CodexProvider?,
+        currentThreadWorkspaceID: String?,
+        provider: CodexProvider,
+        workspaceID: String?,
+        conversationJobs: [CodexJob]
+    ) -> String? {
+        if let currentThreadID, !currentThreadID.isEmpty,
+           currentThreadProvider == provider,
+           currentThreadWorkspaceID == workspaceID {
+            return currentThreadID
+        }
+        for job in conversationJobs.reversed() {
+            guard job.provider == provider, job.workspaceId == workspaceID,
+                  let sessionID = job.threadSessionId else { continue }
+            return sessionID
+        }
+        return nil
+    }
+
+    /// Never replace an open thread with nil. A job that has not yet learned
+    /// its session id must leave the conversation where it is.
+    nonisolated static func adoptedThreadID(currentThreadID: String?, job: CodexJob) -> String? {
+        currentThreadID?.trimmedNonEmpty ?? job.threadSessionId
+    }
+
+    /// When this conversation's last run died before Codex persisted the turn,
+    /// "Go on" still has to carry the unfinished instruction.
+    nonisolated static func followUpTaskPrompt(userText: String, conversationJobs: [CodexJob]) -> String {
+        let text = userText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let last = conversationJobs.last, last.status.didEndBeforeSuccess else {
+            return text
+        }
+        var unfinished: [String] = []
+        for job in conversationJobs.reversed() {
+            if job.status.didFinishSuccessfully { break }
+            if let prompt = job.prompt?.trimmedNonEmpty {
+                unfinished.append(prompt)
+            }
+        }
+        unfinished.reverse()
+        let remaining = unfinished.filter { !$0.isEmpty && !text.contains($0) }
+        guard !remaining.isEmpty else { return text }
+        return """
+        Previous instruction in this thread (the last run stopped before it finished):
+
+        \(remaining.joined(separator: "\n\n"))
+
+        Continue that work. The user now says:
+
+        \(text)
+        """
     }
 
     /// New conversations inherit the open folder. Existing conversations always retain

@@ -969,6 +969,20 @@ enum CodexJobStatus: Hashable, Codable {
         }
     }
 
+    var didFinishSuccessfully: Bool {
+        if case .succeeded = self { return true }
+        return false
+    }
+
+    var didEndBeforeSuccess: Bool {
+        switch self {
+        case .failed, .canceled, .timeout:
+            return true
+        case .queued, .running, .waitingForApproval, .succeeded, .canceling, .unknown:
+            return false
+        }
+    }
+
     var needsAttention: Bool {
         switch self {
         case .waitingForApproval, .failed, .timeout:

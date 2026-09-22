@@ -6,6 +6,10 @@ export function isCodexHarnessNoise(line) {
   const text = String(line || "");
   if (/failed to clean up stale(?: arg0)? temp dirs/i.test(text)) return true;
   if (/could not create PATH aliases/i.test(text)) return true;
+  if (/could not find bubblewrap on PATH/i.test(text)) return true;
+  if (/will use the bundled bubblewrap/i.test(text)) return true;
+  if (/AuthRequired(?:Error)?/i.test(text) && /mcp\./i.test(text)) return true;
+  if (/worker quit with fatal/i.test(text) && /AuthRequired/i.test(text)) return true;
   return false;
 }
 

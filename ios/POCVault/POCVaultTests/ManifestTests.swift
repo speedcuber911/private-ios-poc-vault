@@ -2670,7 +2670,11 @@ final class ManifestTests: XCTestCase {
         let viewModelSource = try AppSourceFixture.load("POCVault/Views/RelayChatViewModel.swift")
 
         XCTAssertTrue(source.contains("ForEach(viewModel.historyItems)"))
-        XCTAssertTrue(source.contains("Section(\"This folder\")"))
+        // The sheet moved off `List`/`Section`, so the folder grouping is now a
+        // header Text. What the contract is about is that the grouping exists,
+        // is labeled, and reads as a heading — not which container draws it.
+        XCTAssertTrue(source.contains("Text(\"This folder\")"))
+        XCTAssertTrue(source.contains(".accessibilityAddTraits(.isHeader)"))
         XCTAssertFalse(source.contains("All conversations & invocations"))
         XCTAssertTrue(source.contains("RelayConversationRow(item: item)"))
         let rowSource = try AppSourceFixture.load("POCVault/POCVaultApp.swift")
@@ -2695,6 +2699,107 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(viewModelSource.contains("belongsToHistoryScope($0.workspaceId)"))
         XCTAssertTrue(viewModelSource.contains("workspaceID: workspaceID,"))
         XCTAssertFalse(viewModelSource.contains("client.fetchThreads(provider: nil, workspaceID: nil, limit: 200)"))
+    }
+
+    func testTaskFollowUpResumesTheOnScreenSessionAfterCancel() throws {
+        let cancelled = try decodeCodexJob(
+            """
+            {
+              "id": "job-cancelled",
+              "workspaceId": "scratch",
+              "provider": "codex",
+              "status": "cancelled",
+              "prompt": "finish the booking and send the QR screenshot",
+              "sessionId": "019e46a5-0000-7000-8000-000000000001"
+            }
+            """
+        )
+        let resumeID = RelayChatViewModel.resumeSessionID(
+            currentThreadID: nil,
+            currentThreadProvider: .codex,
+            currentThreadWorkspaceID: "scratch",
+            provider: .codex,
+            workspaceID: "scratch",
+            conversationJobs: [cancelled]
+        )
+        XCTAssertEqual(resumeID, "019e46a5-0000-7000-8000-000000000001")
+        XCTAssertEqual(
+            RelayChatViewModel.resumeSessionID(
+                currentThreadID: "019e46a5-0000-7000-8000-000000000099",
+                currentThreadProvider: .codex,
+                currentThreadWorkspaceID: "scratch",
+                provider: .codex,
+                workspaceID: "scratch",
+                conversationJobs: [cancelled]
+            ),
+            "019e46a5-0000-7000-8000-000000000099"
+        )
+        XCTAssertEqual(
+            RelayChatViewModel.adoptedThreadID(currentThreadID: "keep-this", job: cancelled),
+            "keep-this"
+        )
+        XCTAssertEqual(
+            RelayChatViewModel.adoptedThreadID(currentThreadID: nil, job: cancelled),
+            "019e46a5-0000-7000-8000-000000000001"
+        )
+
+        let fresh = try decodeCodexJob(
+            """
+            { "id": "job-fresh", "workspaceId": "scratch", "provider": "codex", "status": "running" }
+            """
+        )
+        XCTAssertNil(fresh.threadSessionId)
+        XCTAssertEqual(
+            RelayChatViewModel.adoptedThreadID(currentThreadID: "open-thread", job: fresh),
+            "open-thread"
+        )
+        XCTAssertNil(RelayChatViewModel.adoptedThreadID(currentThreadID: nil, job: fresh))
+    }
+
+    func testTaskFollowUpCarriesUnfinishedInstructionWhenThereIsNoSession() throws {
+        let cancelled = try decodeCodexJob(
+            """
+            {
+              "id": "job-cancelled",
+              "workspaceId": "scratch",
+              "provider": "codex",
+              "status": "cancelled",
+              "prompt": "finish the booking and send the QR screenshot"
+            }
+            """
+        )
+        let prompt = RelayChatViewModel.followUpTaskPrompt(
+            userText: "Go on",
+            conversationJobs: [cancelled]
+        )
+        XCTAssertTrue(prompt.contains("finish the booking and send the QR screenshot"))
+        XCTAssertTrue(prompt.contains("Go on"))
+        XCTAssertEqual(
+            RelayChatViewModel.followUpTaskPrompt(
+                userText: "keep going on the review",
+                conversationJobs: []
+            ),
+            "keep going on the review"
+        )
+
+        let succeeded = try decodeCodexJob(
+            """
+            {
+              "id": "job-ok",
+              "workspaceId": "scratch",
+              "provider": "codex",
+              "status": "succeeded",
+              "prompt": "review the diff"
+            }
+            """
+        )
+        XCTAssertEqual(
+            RelayChatViewModel.followUpTaskPrompt(
+                userText: "Go on",
+                conversationJobs: [succeeded]
+            ),
+            "Go on"
+        )
     }
 
     func testRelayHistoryContinuationStaysInFolderWorkspace() {

@@ -196,7 +196,8 @@ function createJob(body, certSubject, validatedTaskSelection = null) {
   }
   const prompt = promptText || "Please inspect the attached file(s).";
   const selectedSkills = cleanSelectedSkills(provider, body.skills, workspace.path);
-  const codexPrompt = buildJobPrompt(prompt, provider, selectedSkills, attachments);
+  const runnerPrompt = continueUnfinishedThreadPrompt(resumeSessionId, prompt);
+  const codexPrompt = buildJobPrompt(runnerPrompt, provider, selectedSkills, attachments);
   const permissionMode = provider === "claude"
     ? (cleanOptionalClaudePermissionMode(body.permissionMode) || "manual")
     : null;
@@ -567,6 +568,91 @@ function buildJobPrompt(prompt, provider, skills, attachments) {
 }
 
 
+const unfinishedJobStatuses = new Set(["failed", "cancelled", "timeout"]);
+
+// A cancelled or failed turn often never lands in the native Codex/Claude
+// session. Follow-ups like "Go on" then resume an older transcript and miss
+// the instruction the phone still shows. Keep that instruction on the runner
+// prompt only — job.prompt stays the user's words.
+function continueUnfinishedThreadPrompt(resumeSessionId, prompt, jobList = jobs.values()) {
+  if (!resumeSessionId || typeof prompt !== "string") return prompt;
+  const related = [...jobList]
+    .filter((job) => jobThreadId(job) === resumeSessionId)
+    .sort((left, right) => String(left.createdAt || "").localeCompare(String(right.createdAt || "")));
+  const latest = related[related.length - 1];
+  if (!latest || !unfinishedJobStatuses.has(latest.status)) return prompt;
+  const unfinished = [];
+  for (let index = related.length - 1; index >= 0; index -= 1) {
+    const job = related[index];
+    if (job.status === "succeeded") break;
+    if (!unfinishedJobStatuses.has(job.status)) continue;
+    const previous = typeof job.prompt === "string" ? job.prompt.trim() : "";
+    if (previous) unfinished.push(previous);
+  }
+  unfinished.reverse();
+  const remaining = unfinished.filter((previous) => previous && !prompt.includes(previous));
+  if (remaining.length === 0) return prompt;
+  return [
+    "Previous instruction in this thread (the last run stopped before it finished):",
+    ...remaining,
+    "Continue that work. The user now says:",
+    prompt,
+  ].join("\n\n");
+}
+
+
+function jobSessionIdPath(jobId) {
+  return path.join(logsDir, `${jobId}.session-id`);
+}
+
+
+function readAttachedSessionId(job) {
+  try {
+    return fs.readFileSync(jobSessionIdPath(job.id), "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
+
+function applyDiscoveredSessionId(job, sessionId) {
+  const clean = typeof sessionId === "string" ? sessionId.trim() : "";
+  if (!clean || job.sessionId === clean) return false;
+  const valid = normalizeJobProvider(job.provider) === "kimi"
+    ? isKimiSessionId(clean)
+    : isResumableSessionId(clean);
+  if (!valid) return false;
+  job.sessionId = clean;
+  return true;
+}
+
+
+function attachDiscoveredSessionId(job, sessionId) {
+  if (!applyDiscoveredSessionId(job, sessionId)) return false;
+  job.updatedAt = nowIso();
+  touchJob(job, "job_session_attached");
+  return true;
+}
+
+
+function watchJobSessionId(job, active) {
+  if (job.sessionId || (job.provider !== "codex" && job.provider !== "claude")) return;
+  const poll = () => {
+    if (active.finalized || job.sessionId) {
+      if (active.sessionIdTimer) {
+        clearInterval(active.sessionIdTimer);
+        active.sessionIdTimer = null;
+      }
+      return;
+    }
+    attachDiscoveredSessionId(job, readAttachedSessionId(job));
+  };
+  active.sessionIdTimer = setInterval(poll, 200);
+  active.sessionIdTimer.unref();
+  poll();
+}
+
+
 function boundedSkillBody(file) {
   let text;
   try {
@@ -785,6 +871,7 @@ function startJob(job) {
     appendAudit("job_stdin_write_failed", job, { error: error.message || String(error) });
   });
   child.stdin.end(job.codexPrompt || job.prompt);
+  watchJobSessionId(job, active);
 }
 
 
@@ -1334,6 +1421,10 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
   clearTimeout(active.timeoutTimer);
   clearTimeout(active.killTimer);
   clearInterval(active.approvalPollTimer);
+  if (active.sessionIdTimer) {
+    clearInterval(active.sessionIdTimer);
+    active.sessionIdTimer = null;
+  }
   approvalStore.cancelPendingForJob(job.id, "Job ended before this request was answered.");
   await Promise.all([finishStream(active.stdoutStream), finishStream(active.stderrStream)]);
   activeChildren.delete(job.id);
@@ -1700,6 +1791,8 @@ export {
   promptWithAttachments,
   promptWithSelectedSkills,
   buildJobPrompt,
+  continueUnfinishedThreadPrompt,
+  applyDiscoveredSessionId,
   boundedSkillBody,
   removePersistedJobFiles,
   removePathInsideRoot,
