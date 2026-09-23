@@ -563,40 +563,80 @@ final class FileViewerViewModel: ObservableObject {
     }
 
     /// Poll this file's branch and diff counts, and reload the bytes when the
-    /// file's mtime or size changes underneath the viewer.
+    /// file's mtime or size changes underneath the viewer. A daemon without the
+    /// git route still re-reads the bytes, so a save is not stuck on screen.
     func watchGitStatus() async {
+        var gitUnavailable = false
         while !Task.isCancelled {
-            if await refreshGitStatus() { return }
+            if gitUnavailable {
+                await reloadBytesIfChanged()
+            } else {
+                switch await refreshGitStatus() {
+                case .cancelled:
+                    return
+                case .unavailable:
+                    gitUnavailable = true
+                case .ok:
+                    break
+                }
+            }
             try? await Task.sleep(for: .seconds(2))
         }
     }
 
-    /// True when polling should stop.
-    private func refreshGitStatus() async -> Bool {
+    private enum GitPoll { case ok, unavailable, cancelled }
+
+    /// `.unavailable` when this daemon has no git route. `.cancelled` ends the watch.
+    private func refreshGitStatus() async -> GitPoll {
         do {
             let status = try await client.fetchGitStatus(path: entry.path)
-            gitStatus = status.showsBar ? status : nil
+            let next = status.showsBar ? status : nil
+            if gitStatus != next { gitStatus = next }
             // Wait until the first byte load finishes before remembering a stamp.
             // Otherwise a save that lands during that load would look unchanged.
-            guard hasLoaded else { return false }
+            guard hasLoaded else { return .ok }
             let stamp = status.contentStamp
             if contentStamp == nil {
                 contentStamp = stamp
-                if shouldReloadForSizeMismatch(status) { await reloadAfterGitChange() }
-                return false
+                if shouldReloadForSizeMismatch(status) { _ = await reloadBytesIfChanged() }
+                return .ok
             }
-            guard stamp != contentStamp else { return false }
+            guard stamp != contentStamp else { return .ok }
             let previousStamp = contentStamp
             contentStamp = stamp
-            await reloadAfterGitChange()
-            if errorMessage != nil { contentStamp = previousStamp }
-            return false
+            let applied = await reloadBytesIfChanged()
+            if !applied || errorMessage != nil { contentStamp = previousStamp }
+            return .ok
         } catch {
-            if isCancellation(error) { return true }
-            if (error as? CodexClientError)?.statusCode == 404 {
+            if isCancellation(error) { return .cancelled }
+            if (error as? CodexClientError)?.isGenericRouteNotFound == true {
                 gitStatus = nil
-                return true
+                return .unavailable
             }
+            return .ok
+        }
+    }
+
+    /// Re-read a file that still fits in one response. A "Load more" session is
+    /// left alone so a poll cannot throw away pages the user already fetched.
+    /// False when the read did not happen, so the caller can retry the stamp.
+    private func reloadBytesIfChanged() async -> Bool {
+        guard hasLoaded, !isLoading, !isLoadingMore, needsByteFetch else { return false }
+        guard data.count <= Self.loadMoreChunkByteCount else { return false }
+        do {
+            let result = try await client.fetchFile(path: entry.path)
+            guard result.data != data else { return true }
+            data = result.data
+            hasMoreBytes = Self.remainingBytesExist(
+                responseTruncated: result.truncated,
+                receivedByteCount: result.data.count,
+                loadedByteCount: result.data.count,
+                knownFileSize: nil
+            )
+            errorMessage = nil
+            applyDerivedContent()
+            return true
+        } catch {
             return false
         }
     }
@@ -606,11 +646,6 @@ final class FileViewerViewModel: ObservableObject {
     private func shouldReloadForSizeMismatch(_ status: RelayGitStatus) -> Bool {
         guard !hasMoreBytes, let size = status.size else { return false }
         return Int64(data.count) != size
-    }
-
-    private func reloadAfterGitChange() async {
-        guard !isLoading, !isLoadingMore else { return }
-        await load()
     }
 
     /// Byte range for the next "Load more" request, continuing from the loaded bytes.
@@ -807,7 +842,9 @@ struct FileViewerView: View {
                     text: viewModel.text,
                     fileName: viewModel.entry.displayName,
                     highlight: viewModel.entry.fileCategory == .code,
-                    wraps: forceWrap || wrapsText
+                    wraps: forceWrap || wrapsText,
+                    addedLines: viewModel.gitStatus?.addedLines ?? [],
+                    removedAt: viewModel.gitStatus?.removedAt ?? []
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -1112,21 +1149,21 @@ struct RelayGitStatusBar: View {
                 .foregroundStyle(AppTheme.textSecondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
+                .layoutPriority(-1)
             Spacer(minLength: 12)
             HStack(spacing: 8) {
                 if added > 0 {
                     Text("+\(added)")
                         .foregroundStyle(Self.additionInk)
-                        .contentTransition(.numericText())
                 }
                 if deleted > 0 {
                     Text("−\(deleted)")
                         .foregroundStyle(AppTheme.statusError)
-                        .contentTransition(.numericText())
                 }
             }
             .font(AppTheme.monoFont(size: 11, weight: .medium))
             .monospacedDigit()
+            .fixedSize(horizontal: true, vertical: false)
             .layoutPriority(1)
         }
         .padding(.horizontal, 16)
@@ -1135,8 +1172,6 @@ struct RelayGitStatusBar: View {
         .overlay(alignment: .bottom) {
             Rectangle().fill(AppTheme.hairline).frame(height: 0.5)
         }
-        .animation(.snappy(duration: 0.2), value: added)
-        .animation(.snappy(duration: 0.2), value: deleted)
         .accessibilityElement(children: .ignore)
         .accessibilityIdentifier("relay-git-status")
         .accessibilityLabel(accessibilityText)
@@ -1198,15 +1233,31 @@ struct RelayNumberedCodeView: UIViewRepresentable {
     let fileName: String
     let highlight: Bool
     let wraps: Bool
+    var addedLines: [[Int]] = []
+    var removedAt: [Int] = []
 
     func makeUIView(context: Context) -> RelayCodeCanvasView {
         let view = RelayCodeCanvasView()
-        view.apply(text: text, fileName: fileName, highlight: highlight, wraps: wraps)
+        view.apply(
+            text: text,
+            fileName: fileName,
+            highlight: highlight,
+            wraps: wraps,
+            addedLines: addedLines,
+            removedAt: removedAt
+        )
         return view
     }
 
     func updateUIView(_ view: RelayCodeCanvasView, context: Context) {
-        view.apply(text: text, fileName: fileName, highlight: highlight, wraps: wraps)
+        view.apply(
+            text: text,
+            fileName: fileName,
+            highlight: highlight,
+            wraps: wraps,
+            addedLines: addedLines,
+            removedAt: removedAt
+        )
     }
 
     func sizeThatFits(_ proposal: ProposedViewSize, uiView: RelayCodeCanvasView, context: Context) -> CGSize? {
@@ -1226,11 +1277,15 @@ final class RelayCodeCanvasView: UIView, UITextViewDelegate {
     private var appliedFileName = ""
     private var appliedHighlight = false
     private var appliedWraps = true
+    private var addedLines: [[Int]] = []
+    private var removedAt: [Int] = []
 
     private let codeFont = UIFont(name: "DMMono-Regular", size: 12) ?? UIFont.monospacedSystemFont(ofSize: 12, weight: .regular)
     private let gutterFont = UIFont(name: "DMMono-Regular", size: 11) ?? UIFont.monospacedSystemFont(ofSize: 11, weight: .regular)
     private let ink = UIColor(red: 237 / 255, green: 232 / 255, blue: 223 / 255, alpha: 1)
     private let gutterInk = UIColor(red: 237 / 255, green: 232 / 255, blue: 223 / 255, alpha: 0.38)
+    private let additionInk = UIColor(red: 0.62, green: 0.75, blue: 0.56, alpha: 1)
+    private let deletionInk = UIColor(red: 217 / 255, green: 119 / 255, blue: 107 / 255, alpha: 1)
     private let hairline = UIColor(red: 237 / 255, green: 232 / 255, blue: 223 / 255, alpha: 0.10)
 
     override init(frame: CGRect) {
@@ -1292,8 +1347,22 @@ final class RelayCodeCanvasView: UIView, UITextViewDelegate {
         gutter.setNeedsDisplay()
     }
 
-    func apply(text: String, fileName: String, highlight: Bool, wraps: Bool) {
+    func apply(
+        text: String,
+        fileName: String,
+        highlight: Bool,
+        wraps: Bool,
+        addedLines: [[Int]],
+        removedAt: [Int]
+    ) {
+        let marksChanged = self.addedLines != addedLines || self.removedAt != removedAt
+        self.addedLines = addedLines
+        self.removedAt = removedAt
         if appliedText == text, appliedFileName == fileName, appliedHighlight == highlight, appliedWraps == wraps {
+            if marksChanged {
+                updateGutterWidth()
+                gutter.setNeedsDisplay()
+            }
             return
         }
         let offset = textView.contentOffset
@@ -1306,7 +1375,7 @@ final class RelayCodeCanvasView: UIView, UITextViewDelegate {
         configureWrap(wraps)
         textView.attributedText = attributed(text: text, fileName: fileName, highlight: highlight, wraps: wraps)
         lineStarts = RelaySourceLineIndex.starts(in: text)
-        gutterWidthConstraint?.constant = RelaySourceLineIndex.gutterWidth(lineCount: lineStarts.count)
+        updateGutterWidth()
         if hadText {
             textView.layoutIfNeeded()
             let maxOffset = max(0, textView.contentSize.height - textView.bounds.height)
@@ -1315,9 +1384,15 @@ final class RelayCodeCanvasView: UIView, UITextViewDelegate {
         gutter.setNeedsDisplay()
     }
 
+    private func updateGutterWidth() {
+        let extra: CGFloat = removedAt.isEmpty ? 0 : 10
+        gutterWidthConstraint?.constant = RelaySourceLineIndex.gutterWidth(lineCount: lineStarts.count) + extra
+    }
+
     func drawGutter() {
         guard gutter.bounds.height > 0, !lineStarts.isEmpty else { return }
         let layoutManager = textView.layoutManager
+        layoutManager.ensureLayout(for: textView.textContainer)
         let length = textView.textStorage.length
         guard length > 0 else { return }
         let container = textView.textContainer
@@ -1344,15 +1419,28 @@ final class RelayCodeCanvasView: UIView, UITextViewDelegate {
             let viewY = originY + fragment.minY - textView.contentOffset.y
             if viewY > gutter.bounds.height { break }
             if viewY + fragment.height >= 0 {
-                let label = "\(line + 1)" as NSString
-                let size = label.size(withAttributes: attributes)
+                let lineNumber = line + 1
+                let added = marksAddedLine(lineNumber)
+                let removed = removedAt.contains(lineNumber)
+                var lineAttributes = attributes
+                if added { lineAttributes[.foregroundColor] = additionInk }
+                let label = "\(lineNumber)" as NSString
+                let size = label.size(withAttributes: lineAttributes)
+                let y = viewY + max(0, (fragment.height - size.height) / 2)
                 label.draw(
-                    at: CGPoint(
-                        x: gutter.bounds.width - 10 - size.width,
-                        y: viewY + max(0, (fragment.height - size.height) / 2)
-                    ),
-                    withAttributes: attributes
+                    at: CGPoint(x: gutter.bounds.width - 10 - size.width, y: y),
+                    withAttributes: lineAttributes
                 )
+                if removed {
+                    let mark = "−" as NSString
+                    var markAttributes = attributes
+                    markAttributes[.foregroundColor] = deletionInk
+                    let markSize = mark.size(withAttributes: markAttributes)
+                    mark.draw(
+                        at: CGPoint(x: 2, y: y + max(0, (size.height - markSize.height) / 2)),
+                        withAttributes: markAttributes
+                    )
+                }
             }
             line += 1
         }
@@ -1360,6 +1448,12 @@ final class RelayCodeCanvasView: UIView, UITextViewDelegate {
         if let context = UIGraphicsGetCurrentContext() {
             context.setFillColor(hairline.cgColor)
             context.fill(CGRect(x: gutter.bounds.width - 0.5, y: 0, width: 0.5, height: gutter.bounds.height))
+        }
+    }
+
+    private func marksAddedLine(_ line: Int) -> Bool {
+        addedLines.contains { span in
+            span.count == 2 && line >= span[0] && line <= span[1]
         }
     }
 

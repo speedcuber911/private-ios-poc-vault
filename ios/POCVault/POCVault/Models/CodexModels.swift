@@ -168,6 +168,10 @@ struct RelayGitStatus: Decodable, Equatable {
     let binary: Bool
     let size: Int64?
     let modifiedAt: String?
+    /// Inclusive 1-based ranges of added or replaced lines in the working tree.
+    let addedLines: [[Int]]
+    /// 1-based lines a pure deletion sits on, so the gutter can mark the gap.
+    let removedAt: [Int]
 
     var branchLabel: String? {
         guard git else { return nil }
@@ -177,14 +181,21 @@ struct RelayGitStatus: Decodable, Equatable {
     var showsBar: Bool { branchLabel != nil }
 
     /// Changes when the file's bytes change, so a poll can reload the viewer
-    /// without treating an unchanged tree as a new edit.
+    /// without treating an unchanged tree as a new edit. Present for a file
+    /// even when the folder is not a repository.
     var contentStamp: String? {
-        guard git, let modifiedAt = modifiedAt?.trimmedNonEmpty else { return nil }
+        guard let modifiedAt = modifiedAt?.trimmedNonEmpty else { return nil }
         return "\(modifiedAt)#\(size ?? -1)"
     }
 
+    func marksAddedLine(_ line: Int) -> Bool {
+        addedLines.contains { span in
+            span.count == 2 && line >= span[0] && line <= span[1]
+        }
+    }
+
     private enum CodingKeys: String, CodingKey {
-        case git, branch, detached, added, deleted, binary, size, modifiedAt
+        case git, branch, detached, added, deleted, binary, size, modifiedAt, addedLines, removedAt
     }
 
     init(from decoder: Decoder) throws {
@@ -197,6 +208,8 @@ struct RelayGitStatus: Decodable, Equatable {
         binary = try container.decodeIfPresent(Bool.self, forKey: .binary) ?? false
         size = try container.decodeIntegerIfPresent(forKey: .size).map(Int64.init)
         modifiedAt = try container.decodeIfPresent(String.self, forKey: .modifiedAt)
+        addedLines = try container.decodeIfPresent([[Int]].self, forKey: .addedLines) ?? []
+        removedAt = try container.decodeIfPresent([Int].self, forKey: .removedAt) ?? []
     }
 }
 

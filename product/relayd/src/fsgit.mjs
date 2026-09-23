@@ -13,7 +13,8 @@ import { workspaceBrowseRoot } from "./config.mjs";
 import { isReadDeniedName } from "./fsapi.mjs";
 import { resolveBrowsePath, resolvedPathWithinRoot } from "./workspaces.mjs";
 
-const gitTimeoutMs = 2500;
+const gitTimeoutMs = 8000;
+const markLineCap = 2000;
 const directoryUntrackedFileCap = 40;
 const directoryUntrackedByteCap = 128 * 1024;
 const fileUntrackedByteCap = 2 * 1024 * 1024;
@@ -56,7 +57,17 @@ function runGit(repo, args) {
   return new Promise((resolve) => {
     execFile(
       "git",
-      ["--no-optional-locks", "-C", repo, ...args],
+      [
+        // The checkout is already inside the jail. relayd often runs as a
+        // different user than the repo owner; without this, git refuses and
+        // the phone keeps a frozen file with no line counts. fsmonitor and
+        // external diff drivers stay off so a repo config cannot spawn anything.
+        "-c", "safe.directory=*",
+        "-c", "core.fsmonitor=",
+        "--no-optional-locks",
+        "-C", repo,
+        ...args,
+      ],
       {
         timeout: gitTimeoutMs,
         maxBuffer: 4 * 1024 * 1024,
@@ -70,13 +81,14 @@ function runGit(repo, args) {
       },
       (error, stdout) => {
         if (!error) {
-          resolve({ ok: true, stdout: stdout || "", timedOut: false });
+          resolve({ ok: true, stdout: stdout || "", timedOut: false, truncated: false });
           return;
         }
         resolve({
           ok: false,
           stdout: stdout || "",
           timedOut: Boolean(error.killed) || error.code === "ETIMEDOUT",
+          truncated: error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
         });
       },
     );
@@ -149,6 +161,67 @@ function textLineCount(filePath, size, maxBytes) {
   }
 }
 
+// Pathspecs are relative to the repo. An absolute path is not a pathspec git
+// will match once the work tree and the jail disagree about symlinks.
+function gitPathspec(repo, targetPath) {
+  const relative = path.relative(repo, targetPath);
+  if (!relative || relative === ".") return ".";
+  if (relative.startsWith("..") || path.isAbsolute(relative)) return ".";
+  return relative.split(path.sep).join("/");
+}
+
+// `git diff -U0` hunk headers only. Line ranges stay; the diff body does not
+// leave this process. A pure deletion records the new-file line it sits after.
+function summarizeFileDiff(stdout) {
+  let added = 0;
+  let deleted = 0;
+  let binary = false;
+  const addedLines = [];
+  const removedAt = [];
+  let marked = 0;
+  let marksOmitted = false;
+  for (const line of stdout.split("\n")) {
+    if (!line) continue;
+    if (line.startsWith("Binary files ")) {
+      binary = true;
+      continue;
+    }
+    if (line.startsWith("@@")) {
+      const match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+      if (!match) continue;
+      const oldCount = match[2] === undefined ? 1 : Number(match[2]);
+      const newStart = Number(match[3]);
+      const newCount = match[4] === undefined ? 1 : Number(match[4]);
+      if (!Number.isSafeInteger(newStart) || !Number.isSafeInteger(newCount) || !Number.isSafeInteger(oldCount)) {
+        continue;
+      }
+      const incoming = (newCount > 0 ? newCount : 0) + (newCount === 0 && oldCount > 0 ? 1 : 0);
+      if (marked + incoming > markLineCap) {
+        marksOmitted = true;
+        continue;
+      }
+      if (newCount > 0) {
+        addedLines.push([newStart, newStart + newCount - 1]);
+        marked += newCount;
+      } else if (oldCount > 0) {
+        removedAt.push(Math.max(newStart, 1));
+        marked += 1;
+      }
+      continue;
+    }
+    if (line.startsWith("+++") || line.startsWith("---")) continue;
+    if (line.startsWith("+")) added += 1;
+    else if (line.startsWith("-")) deleted += 1;
+  }
+  return {
+    added,
+    deleted,
+    binary,
+    addedLines: marksOmitted ? [] : addedLines,
+    removedAt: marksOmitted ? [] : removedAt,
+  };
+}
+
 function containedFile(repo, relativePath) {
   const absolute = path.resolve(repo, relativePath);
   let resolved;
@@ -189,9 +262,19 @@ async function branchName(repo) {
   return { branch: name.slice(0, 200), detached };
 }
 
+function withFileStamp(target, payload) {
+  if (target.kind !== "file") return payload;
+  return {
+    ...payload,
+    size: target.stat.size,
+    modifiedAt: target.stat.mtime.toISOString(),
+  };
+}
+
 // GET /v1/codex/fs/git?path=
 // `{ git:false }` when the path is not inside a repository. A file also carries
-// `size` and `modifiedAt` so a client can tell a quiet poll from a save.
+// `size` and `modifiedAt` so a client can tell a quiet poll from a save, and
+// `addedLines` / `removedAt` so the gutter can color the changed lines.
 export async function fsGitStatus(searchParams) {
   const target = resolveGitTarget(searchParams.get("path") ?? "");
   if (target.kind === "file" && isReadDeniedName(path.basename(target.path))) {
@@ -200,14 +283,54 @@ export async function fsGitStatus(searchParams) {
 
   const start = target.kind === "file" ? path.dirname(target.path) : target.path;
   const repo = findGitRoot(start);
-  if (!repo) return { git: false };
+  if (!repo) return withFileStamp(target, { git: false });
 
   const named = await branchName(repo);
-  if (!named) return { git: false };
+  if (!named) return withFileStamp(target, { git: false });
 
-  const diff = await runGit(repo, ["diff", "--numstat", "HEAD", "--", target.path]);
-  if (diff.timedOut) throw gitTimeout();
-  const numstat = diff.ok ? sumNumstat(diff.stdout) : { added: 0, deleted: 0, binary: false };
+  const spec = gitPathspec(repo, target.path);
+  let added = 0;
+  let deleted = 0;
+  let binary = false;
+  let addedLines = [];
+  let removedAt = [];
+
+  if (target.kind === "file") {
+    const diff = await runGit(repo, [
+      "diff", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", "HEAD", "--", spec,
+    ]);
+    if (diff.timedOut) throw gitTimeout();
+    const usableDiff = !diff.truncated && (diff.ok || diff.stdout.startsWith("diff --git"));
+    if (usableDiff) {
+      const summary = summarizeFileDiff(diff.stdout);
+      added = summary.added;
+      deleted = summary.deleted;
+      binary = summary.binary;
+      addedLines = summary.addedLines;
+      removedAt = summary.removedAt;
+    } else {
+      const numstat = await runGit(repo, [
+        "diff", "--numstat", "--no-ext-diff", "--no-textconv", "HEAD", "--", spec,
+      ]);
+      if (numstat.timedOut) throw gitTimeout();
+      if (numstat.ok) {
+        const summary = sumNumstat(numstat.stdout);
+        added = summary.added;
+        deleted = summary.deleted;
+        binary = summary.binary;
+      }
+    }
+  } else {
+    const diff = await runGit(repo, [
+      "diff", "--numstat", "--no-ext-diff", "--no-textconv", "HEAD", "--", spec,
+    ]);
+    if (diff.timedOut) throw gitTimeout();
+    if (diff.ok) {
+      const summary = sumNumstat(diff.stdout);
+      added = summary.added;
+      deleted = summary.deleted;
+    }
+  }
 
   const status = await runGit(repo, [
     "status",
@@ -215,20 +338,18 @@ export async function fsGitStatus(searchParams) {
     "-z",
     "--untracked-files=all",
     "--",
-    target.path,
+    spec,
   ]);
   if (status.timedOut) throw gitTimeout();
   const untracked = status.ok ? porcelainUntracked(status.stdout) : [];
-
-  let added = numstat.added;
-  let deleted = numstat.deleted;
-  let binary = target.kind === "file" && numstat.binary;
 
   if (target.kind === "file" && untracked.length > 0) {
     const counted = textLineCount(target.path, target.stat.size, fileUntrackedByteCap);
     added = counted.lines ?? 0;
     deleted = 0;
     binary = counted.binary;
+    addedLines = counted.lines > 0 ? [[1, counted.lines]] : [];
+    removedAt = [];
   } else if (target.kind === "dir") {
     let countedFiles = 0;
     for (const relative of untracked) {
@@ -251,8 +372,8 @@ export async function fsGitStatus(searchParams) {
     binary,
   };
   if (target.kind === "file") {
-    payload.size = target.stat.size;
-    payload.modifiedAt = target.stat.mtime.toISOString();
+    payload.addedLines = addedLines;
+    payload.removedAt = removedAt;
   }
-  return payload;
+  return withFileStamp(target, payload);
 }

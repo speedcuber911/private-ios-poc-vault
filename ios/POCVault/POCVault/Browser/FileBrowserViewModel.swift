@@ -123,28 +123,57 @@ final class FileBrowserViewModel: ObservableObject {
         await load()
     }
 
-    /// Poll the folder's branch and diff counts while the explorer is on screen.
-    /// Returns once the view goes away or the daemon has no such route.
+    /// Poll the folder's branch, diff counts, and listing while the explorer is
+    /// on screen. A daemon without `/v1/codex/fs/git` still refreshes the files.
     func watchGitStatus() async {
+        var gitUnavailable = false
         while !Task.isCancelled {
-            if await refreshGitStatus() { return }
+            if !gitUnavailable {
+                switch await refreshGitStatus() {
+                case .cancelled:
+                    return
+                case .unavailable:
+                    gitUnavailable = true
+                case .ok:
+                    break
+                }
+            }
+            await refreshListingQuietly()
             try? await Task.sleep(for: .seconds(2))
         }
     }
 
-    /// True when polling should stop (the route is missing, or this task was cancelled).
-    private func refreshGitStatus() async -> Bool {
+    private enum GitPoll { case ok, unavailable, cancelled }
+
+    /// `.unavailable` when this daemon has no git route. `.cancelled` ends the watch.
+    private func refreshGitStatus() async -> GitPoll {
         do {
             let status = try await client.fetchGitStatus(path: path)
-            gitStatus = status.showsBar ? status : nil
-            return false
+            let next = status.showsBar ? status : nil
+            if gitStatus != next { gitStatus = next }
+            return .ok
         } catch {
-            if isCancellation(error) { return true }
-            if (error as? CodexClientError)?.statusCode == 404 {
+            if isCancellation(error) { return .cancelled }
+            if (error as? CodexClientError)?.isGenericRouteNotFound == true {
                 gitStatus = nil
-                return true
+                return .unavailable
             }
-            return false
+            return .ok
+        }
+    }
+
+    /// Replace the open page when the machine's files change, without flashing
+    /// the loading state or dropping a page the user already asked for.
+    private func refreshListingQuietly() async {
+        guard !isLoading, !isLoadingMore else { return }
+        let limit = min(500, max(Self.pageSize, entries.count))
+        do {
+            let loaded = try await client.fetchDirectory(path: path, offset: 0, limit: limit)
+            guard loaded.entries != entries else { return }
+            listing = loaded
+            entries = loaded.entries
+        } catch {
+            return
         }
     }
 

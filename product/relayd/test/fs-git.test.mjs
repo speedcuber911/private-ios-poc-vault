@@ -64,6 +64,8 @@ test("file counts follow the working tree, and a non-repo stays quiet", async ()
   const added = await fsGitStatus(params("app/main.swift"));
   assert.equal(added.added, 1);
   assert.equal(added.deleted, 0);
+  assert.deepEqual(added.addedLines, [[4, 4]]);
+  assert.deepEqual(added.removedAt, []);
   assert.notEqual(added.modifiedAt, clean.modifiedAt);
 
   fs.writeFileSync(path.join(repo, "main.swift"), "one\nfour\n");
@@ -75,6 +77,7 @@ test("file counts follow the working tree, and a non-repo stays quiet", async ()
   const untracked = await fsGitStatus(params("app/new.swift"));
   assert.equal(untracked.added, 2);
   assert.equal(untracked.deleted, 0);
+  assert.deepEqual(untracked.addedLines, [[1, 2]]);
   assert.equal(untracked.branch, "feature/status");
 
   const folder = await fsGitStatus(params("app"));
@@ -84,9 +87,18 @@ test("file counts follow the working tree, and a non-repo stays quiet", async ()
   assert.equal(folder.size, undefined);
   assert.equal(folder.modifiedAt, undefined);
 
+  fs.writeFileSync(path.join(repo, "main.swift"), "one\nthree\n");
+  const removed = await fsGitStatus(params("app/main.swift"));
+  assert.equal(removed.added, 0);
+  assert.equal(removed.deleted, 1);
+  assert.deepEqual(removed.removedAt, [1]);
+  assert.deepEqual(removed.addedLines, []);
+
   fs.writeFileSync(path.join(plain, "note.txt"), "hello\n");
   const outside = await fsGitStatus(params("plain/note.txt"));
-  assert.deepEqual(outside, { git: false });
+  assert.equal(outside.git, false);
+  assert.equal(outside.size, Buffer.byteLength("hello\n"));
+  assert.equal(typeof outside.modifiedAt, "string");
 });
 
 test("secret files and jail escapes are refused", async () => {

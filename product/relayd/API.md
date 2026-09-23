@@ -499,15 +499,19 @@ empty means the browse root). 200:
 
 ```json
 {"git": true, "branch": "main", "detached": false, "added": 12, "deleted": 3,
- "binary": false, "size": 1234, "modifiedAt": "2026-09-22T12:00:00.000Z"}
+ "binary": false, "size": 1234, "modifiedAt": "2026-09-22T12:00:00.000Z",
+ "addedLines": [[10, 12]], "removedAt": [40]}
 ```
 
-`size` and `modifiedAt` are present for files only, so a client can reload
-bytes when the file is saved without treating a quiet poll as an edit.
-`added` / `deleted` compare the work tree with `HEAD` and include untracked
-lines. A path that is not inside a repository returns `{"git": false}`.
-Read-denied files are 403, the same as `fs/file`. The response never includes
-paths, diffs, or git stderr. A stuck `git` is 503.
+`size` and `modifiedAt` are present for files only, including a file that
+is not inside a repository, so a client can reload bytes when the file is
+saved without treating a quiet poll as an edit. `added` / `deleted` compare
+the work tree with `HEAD` and include untracked lines. A file also returns
+`addedLines` (`[[start, end], ...]`, 1-based, inclusive) and `removedAt`
+(1-based new-file lines a deletion sits on). Those are line numbers only;
+the response never includes paths, diff bodies, or git stderr. A path that
+is not inside a repository returns `{"git": false}` plus the file stamp.
+Read-denied files are 403, the same as `fs/file`. A stuck `git` is 503.
 
 ### 1.13 Sessions & threads
 
