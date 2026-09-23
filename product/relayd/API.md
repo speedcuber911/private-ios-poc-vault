@@ -578,7 +578,7 @@ to `limit`. Same query params as sessions. Thread summary shape
   "cwd": "/…",                        // null when no session file
   "timestamp": "…", "updatedAt": "…",
   "jobCount": 3, "activeJobCount": 0,
-  "live": false,                     // true while a job is non-terminal, or a native transcript was written in the last 3 minutes
+  "live": false,                     // true while a job is non-terminal, or a native transcript was written in the last 3 minutes and is newer than any finished Relay job
   "lastJobId": "<uuid>", "lastJobStatus": "succeeded",
   "title": "…",                       // synced native title or stable first prompt
   "lastPrompt": "…",                  // ≤ CODEX_THREAD_SUMMARY_CHARACTERS, "…"-suffixed

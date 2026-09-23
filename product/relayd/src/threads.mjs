@@ -1077,6 +1077,9 @@ function deleteThread(sessionId, { workspaceId = null, provider = null, certSubj
 }
 
 
+const NATIVE_LIVE_WINDOW_MS = 3 * 60 * 1000;
+const NATIVE_CONTINUATION_SLACK_MS = 15 * 1000;
+
 function threadSummary(thread) {
   const sortedJobs = [...thread.jobs].sort((left, right) =>
     compareIsoDesc(left.updatedAt || left.createdAt, right.updatedAt || right.createdAt),
@@ -1085,11 +1088,15 @@ function threadSummary(thread) {
   const activeJobCount = sortedJobs.filter((job) => !terminalStatuses.has(job.status)).length;
   const title = summaryText(thread.title) || thread.summary?.firstUserPrompt || summaryText(lastJob?.prompt) || null;
   const updatedMs = Date.parse(thread.updatedAt || "");
-  // A native session has no Relay job until it finishes. A transcript touched in
-  // the last few minutes is the running one; a just-finished session drops the
-  // flag once the file goes quiet.
-  const fresh = Number.isFinite(updatedMs) && Date.now() - updatedMs < 3 * 60 * 1000;
-  const live = activeJobCount > 0 || (fresh && !lastJob);
+  // A transcript touched in the last few minutes is a session running on the
+  // machine. Relay jobs already count through activeJobCount; a native resume
+  // of an older finished job still counts when the transcript moves again
+  // after that job. The slack keeps the final flush of a Relay job from
+  // looking like a new run.
+  const fresh = Number.isFinite(updatedMs) && Date.now() - updatedMs < NATIVE_LIVE_WINDOW_MS;
+  const lastJobMs = Date.parse(lastJob?.updatedAt || lastJob?.createdAt || "");
+  const continuedNatively = !lastJob || (Number.isFinite(lastJobMs) && updatedMs - lastJobMs > NATIVE_CONTINUATION_SLACK_MS);
+  const live = activeJobCount > 0 || (fresh && continuedNatively);
 
   return {
     id: thread.id,

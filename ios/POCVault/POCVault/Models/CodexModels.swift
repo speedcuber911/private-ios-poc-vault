@@ -1558,6 +1558,24 @@ struct CodexThreadFeedItem: Hashable, Identifiable {
         }
     }
 
+    /// Status chip for a row. A native Codex, Claude Code, or Cursor session has
+    /// no Relay job status while it is running on the machine, and a resumed
+    /// session can still carry the previous job's terminal status.
+    var activityLabel: String? {
+        if isActive {
+            if let status, status.isActive {
+                return status.label
+            }
+            return "Running"
+        }
+        switch status {
+        case .failed, .timeout:
+            return status?.label
+        default:
+            return nil
+        }
+    }
+
     static func makeFeed(threads: [CodexThread], jobs: [CodexJob], workspaceID: String? = nil) -> [CodexThreadFeedItem] {
         let visibleThreads = threads.filter {
             !$0.isSmokeTest && matchesWorkspace($0.workspaceId, selectedWorkspaceID: workspaceID)

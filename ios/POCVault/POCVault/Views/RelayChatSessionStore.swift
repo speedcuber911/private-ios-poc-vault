@@ -45,6 +45,14 @@ final class RelayChatSessionStore: ObservableObject {
     private var observedActiveJobIDs: Set<String> = []
     private var observedActiveThreadIDs: Set<String> = []
     private var notifiedCompletionKeys: Set<String> = []
+    private var lastDiscoveryAt = Date.distantPast
+    /// While nothing looks active yet, still look often enough that a session
+    /// started on the machine is noticed and then followed at the 2s cadence.
+    private static let idleDiscoveryInterval: TimeInterval = 8
+
+    /// Publishes the monitor's jobs and threads to Chats. The list used to update
+    /// only when the tab was reopened, so work started on the machine stayed hidden.
+    var onActivitySnapshot: (([CodexJob], [CodexThread]) -> Void)?
 
     init(
         client: CodexClient,
@@ -194,23 +202,25 @@ final class RelayChatSessionStore: ObservableObject {
             await viewModel.refreshActiveWorkIfNeeded()
         }
 
-        if force {
-            await refreshCompletionFeed()
-            return
-        }
-        guard CodexAgentMonitorPolicy.shouldRefresh(
+        let discoveryDue = Date().timeIntervalSince(lastDiscoveryAt) >= Self.idleDiscoveryInterval
+        let active = CodexAgentMonitorPolicy.shouldRefresh(
             hasActiveJobs: hasActiveSessionWork,
             observedActiveJobCount: observedActiveJobIDs.count,
             observedActiveThreadCount: observedActiveThreadIDs.count
-        ) else { return }
-        await completionNotifier.prepareForNotifications()
+        )
+        guard force || active || discoveryDue else { return }
+        lastDiscoveryAt = Date()
+        if !force {
+            await completionNotifier.prepareForNotifications()
+        }
         await refreshCompletionFeed()
     }
 
     private func refreshCompletionFeed() async {
         do {
-            let jobs = try await client.fetchJobs(provider: nil, workspaceID: nil, limit: 20)
-            let threads = try await client.fetchThreads(provider: nil, workspaceID: nil, limit: 50)
+            let jobs = try await client.fetchJobs(provider: nil, workspaceID: nil, limit: 30)
+            let threads = try await client.fetchThreads(provider: nil, workspaceID: nil, limit: 200)
+            onActivitySnapshot?(jobs, threads)
             await handleCompletionCandidates(jobs: jobs, threads: threads)
         } catch {
             // Offline/transient failures just skip a beat; the next tick retries.

@@ -1947,6 +1947,45 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(feed[0].isActive)
         XCTAssertTrue(feed[1].isActive)
         XCTAssertFalse(feed[2].isActive)
+        XCTAssertEqual(feed[0].activityLabel, "Running")
+        XCTAssertEqual(feed[1].activityLabel, "Running")
+        XCTAssertNil(feed[2].activityLabel)
+    }
+
+    func testNativeLiveThreadStaysLabeledRunningWhenItsLastRelayJobFinished() throws {
+        let resumed = try decodeCodexThread(
+            """
+            {
+              "id": "thread-resumed",
+              "sessionId": "thread-resumed",
+              "workspaceId": "scratch",
+              "updatedAt": "2026-05-21T08:00:00Z",
+              "live": true,
+              "lastJobStatus": "succeeded",
+              "lastPrompt": "Continued on the machine",
+              "provider": "claude"
+            }
+            """
+        )
+        let failed = try decodeCodexThread(
+            """
+            {
+              "id": "thread-failed",
+              "sessionId": "thread-failed",
+              "workspaceId": "scratch",
+              "updatedAt": "2026-05-21T07:00:00Z",
+              "lastJobStatus": "failed",
+              "lastPrompt": "Broke",
+              "provider": "codex"
+            }
+            """
+        )
+
+        let feed = CodexThreadFeedItem.makeFeed(threads: [failed, resumed], jobs: [])
+
+        XCTAssertEqual(feed.map(\.sessionID), ["thread-resumed", "thread-failed"])
+        XCTAssertEqual(feed[0].activityLabel, "Running")
+        XCTAssertEqual(feed[1].activityLabel, "Failed")
     }
 
     func testCodexThreadFeedPreviewStripsMarkdownFormatting() throws {

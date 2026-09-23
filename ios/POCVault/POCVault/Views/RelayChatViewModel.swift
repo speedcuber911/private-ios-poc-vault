@@ -384,6 +384,10 @@ final class RelayChatViewModel: ObservableObject {
     /// True while `openThread` has seeded identity from the feed item and is still
     /// waiting on `fetchThreadDetail`. Cleared when detail lands or the request fails.
     @Published private(set) var isLoadingThreadDetail = false
+    /// Session id of a native Codex, Claude Code, or Cursor run the open chat is
+    /// following. Nil when the open thread is idle.
+    @Published private(set) var watchedSessionID: String?
+    private var nativeWatchQuietSince: Date?
     @Published private(set) var cancellingJobIDs: Set<String> = []
     /// The explicit model+mode selection. Never inferred from `supports(.task)`; the mode
     /// travels with the choice from the picker section it was tapped in.
@@ -470,6 +474,10 @@ final class RelayChatViewModel: ObservableObject {
     private var jobStreamTasks: [String: Task<Void, Never>] = [:]
 
     private static let liveTailCharacterCap = 12_000
+    /// Keep following a native transcript through long tool calls. The list drops
+    /// the Running pin after a few quiet minutes; an open chat waits longer so a
+    /// thinking pause does not freeze the transcript.
+    private static let nativeWatchQuietLimit: TimeInterval = 15 * 60
     private static let claudePermissionDefaultsKey = "relay.claude.permissionMode"
     private static let codexApprovalDefaultsKey = "relay.codex.approvalPolicy"
     private static let codexSandboxDefaultsKey = "relay.codex.sandbox"
@@ -1278,6 +1286,8 @@ final class RelayChatViewModel: ObservableObject {
         currentThreadWorkspaceID = nil
         currentThreadWorkspaceName = nil
         isLoadingThreadDetail = false
+        watchedSessionID = nil
+        nativeWatchQuietSince = nil
         messages = []
         prompt = ""
         draftAttachments = []
@@ -1364,22 +1374,13 @@ final class RelayChatViewModel: ObservableObject {
             ) {
                 selectChoice(choice)
             }
-            var items = detail.messages.map { message in
-                RelayConversationItem(
-                    role: message.role == .user ? .user : message.role == .assistant ? .assistant : .status,
-                    text: message.text,
-                    timestamp: message.timestamp ?? detail.thread.updatedAt ?? Date(),
-                    provider: detail.thread.provider,
-                    modelLabel: selectedChoice?.model.label,
-                    attachments: message.attachments.map(RelayDisplayedAttachment.from)
-                )
-            }
+            let items = conversationItems(from: detail)
             for job in detail.jobs {
-                items.append(jobItem(job))
                 attachJobStream(to: job)
             }
-            messages = items.sorted { $0.timestamp < $1.timestamp }
+            messages = items
             errorMessage = nil
+            beginNativeWatch(detail.thread)
         } catch {
             guard conversationRevision == revision else { return }
             errorMessage = error.localizedDescription
@@ -1432,6 +1433,76 @@ final class RelayChatViewModel: ObservableObject {
         }
         messages = items
         errorMessage = nil
+        beginNativeWatch(thread)
+    }
+
+    /// Follow a session that is running on the machine. Relay jobs already stream;
+    /// a native transcript only moves when we re-read it. Opening an idle thread
+    /// stops a watch left over from the previous conversation.
+    private func beginNativeWatch(_ thread: CodexThread) {
+        if thread.hasActiveJobs {
+            if watchedSessionID != thread.sessionId {
+                nativeWatchQuietSince = nil
+                watchedSessionID = thread.sessionId
+            }
+            return
+        }
+        if currentThreadID == thread.sessionId {
+            watchedSessionID = nil
+            nativeWatchQuietSince = nil
+        }
+    }
+
+    /// One poll of the open native transcript. Stops after the file has been
+    /// quiet for `nativeWatchQuietLimit`, which covers a long tool call without
+    /// following an idle thread forever.
+    func refreshWatchedThreadIfNeeded() async {
+        guard let sessionID = watchedSessionID, sessionID == currentThreadID else { return }
+        guard !isSending, !isLoadingThreadDetail, !hasActiveConversationJob else { return }
+        guard let provider = currentThreadProvider else { return }
+        let revision = conversationRevision
+        guard let detail = try? await fetchThreadDetail(sessionID, workspaceID, provider) else { return }
+        guard conversationRevision == revision, currentThreadID == sessionID, !isSending else { return }
+
+        let items = conversationItems(from: detail)
+        let previous = messages.map(transcriptSignature)
+        let next = items.map(transcriptSignature)
+        if previous != next, !items.isEmpty || messages.isEmpty {
+            messages = items
+            nativeWatchQuietSince = nil
+            for job in detail.jobs where job.status.isActive {
+                attachJobStream(to: job)
+            }
+        }
+        if detail.thread.hasActiveJobs {
+            nativeWatchQuietSince = nil
+        } else if nativeWatchQuietSince == nil {
+            nativeWatchQuietSince = Date()
+        } else if Date().timeIntervalSince(nativeWatchQuietSince ?? .distantPast) >= Self.nativeWatchQuietLimit {
+            watchedSessionID = nil
+            nativeWatchQuietSince = nil
+        }
+    }
+
+    private func conversationItems(from detail: CodexThreadDetail) -> [RelayConversationItem] {
+        var items = detail.messages.enumerated().map { index, message in
+            let role: RelayConversationItem.Role = message.role == .user ? .user : message.role == .assistant ? .assistant : .status
+            return RelayConversationItem(
+                id: "turn:\(detail.thread.sessionId):\(index):\(role)",
+                role: role,
+                text: message.text,
+                timestamp: message.timestamp ?? detail.thread.updatedAt ?? Date(),
+                provider: detail.thread.provider,
+                modelLabel: selectedChoice?.model.label,
+                attachments: message.attachments.map(RelayDisplayedAttachment.from)
+            )
+        }
+        items.append(contentsOf: detail.jobs.map(jobItem))
+        return items.sorted { $0.timestamp < $1.timestamp }
+    }
+
+    private func transcriptSignature(_ item: RelayConversationItem) -> String {
+        "\(item.id)\u{0}\(item.text)\u{0}\(item.job?.status.label ?? "")\u{0}\(item.attachments.count)"
     }
 
     /// Open either a resumable thread or a standalone invocation from the unified
@@ -1593,6 +1664,7 @@ final class RelayChatViewModel: ObservableObject {
 
     private func jobItem(_ job: CodexJob) -> RelayConversationItem {
         RelayConversationItem(
+            id: job.id,
             role: .job,
             text: job.displayOutput ?? job.errorMessage ?? job.status.label,
             timestamp: job.createdAt ?? Date(),

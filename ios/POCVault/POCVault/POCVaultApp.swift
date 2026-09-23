@@ -35,7 +35,8 @@ struct POCVaultApp: App {
 
         _identityStore = StateObject(wrappedValue: identityStore)
         _nodeStore = StateObject(wrappedValue: nodeStore)
-        _chatSessionStore = StateObject(wrappedValue: RelayChatSessionStore(
+        let statusFeedViewModel = StatusFeedViewModel(client: codexClient)
+        let chatSessionStore = RelayChatSessionStore(
             client: codexClient,
             completionNotifier: {
 #if targetEnvironment(simulator)
@@ -44,8 +45,12 @@ struct POCVaultApp: App {
                 CodexLocalNotificationService()
 #endif
             }()
-        ))
-        _statusFeedViewModel = StateObject(wrappedValue: StatusFeedViewModel(client: codexClient))
+        )
+        chatSessionStore.onActivitySnapshot = { jobs, threads in
+            statusFeedViewModel.apply(jobs: jobs, threads: threads)
+        }
+        _chatSessionStore = StateObject(wrappedValue: chatSessionStore)
+        _statusFeedViewModel = StateObject(wrappedValue: statusFeedViewModel)
         _accountStore = StateObject(wrappedValue: accountStore)
         _computerLinkStore = StateObject(wrappedValue: RelayComputerLinkStore(
             client: RelayAuthClient(baseURL: AppConfiguration.authBaseURL)
@@ -333,10 +338,16 @@ struct POCVaultRootView: View {
             await chatSessionStore.monitorActiveWorkWhileAppIsOpen()
         }
         .task(id: selectedRootTab) {
-            // Sessions is a live view, not a one-time snapshot. Refresh every time the
-            // user returns so work started after the tab's first load appears immediately.
+            // Sessions is a live view, not a one-time snapshot. Refresh on entry, then
+            // keep polling so a Codex, Claude Code, or Cursor session started on the
+            // machine shows up while this tab is open.
             guard selectedRootTab == .sessions else { return }
             await statusFeedViewModel.refresh()
+            while !Task.isCancelled, selectedRootTab == .sessions {
+                try? await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled, selectedRootTab == .sessions else { return }
+                await statusFeedViewModel.refresh(showingProgress: false)
+            }
         }
         #if DEBUG
         .task {
@@ -794,11 +805,11 @@ final class StatusFeedViewModel: ObservableObject {
         CodexThreadFeedItem.makeFeed(threads: threads, jobs: jobs)
     }
 
-    func refresh() async {
-        isRefreshing = true
-        defer { isRefreshing = false }
+    func refresh(showingProgress: Bool = true) async {
+        if showingProgress { isRefreshing = true }
+        defer { if showingProgress { isRefreshing = false } }
         do {
-            async let threadRequest = client.fetchThreads(provider: nil, workspaceID: nil, limit: 80)
+            async let threadRequest = client.fetchThreads(provider: nil, workspaceID: nil, limit: 200)
             async let jobRequest = client.fetchJobs(provider: nil, workspaceID: nil, limit: 30)
             async let approvalRequest = client.fetchPendingApprovalsIfSupported()
             threads = try await threadRequest
@@ -809,6 +820,14 @@ final class StatusFeedViewModel: ObservableObject {
             guard !isCancellation(error) else { return }
             errorMessage = error.localizedDescription
         }
+    }
+
+    /// Background monitor snapshot. Keeps Chats current without flashing the
+    /// loading spinner the pull-to-refresh path uses.
+    func apply(jobs: [CodexJob], threads: [CodexThread]) {
+        self.jobs = jobs
+        self.threads = threads
+        errorMessage = nil
     }
 
     func reportRoutingMiss(_ message: String) {
@@ -1291,7 +1310,7 @@ struct RelayConversationRow: View {
             }
             HStack(spacing: 8) {
                 providerTag
-                if let attentionLabel { statusLabel(attentionLabel) }
+                if let attentionLabel = item.activityLabel { statusLabel(attentionLabel) }
                 Text(item.workspaceLabel)
                     .font(.custom("DMSans-9ptRegular", size: 13, relativeTo: .subheadline))
                     .foregroundStyle(AppTheme.textPrimary.opacity(0.65))
@@ -1324,16 +1343,6 @@ struct RelayConversationRow: View {
             return date.formatted(date: .omitted, time: .shortened)
         }
         return date.formatted(.dateTime.month(.abbreviated).day())
-    }
-
-    private var attentionLabel: String? {
-        guard let status = item.status else { return item.isActive ? "Running" : nil }
-        switch status {
-        case .queued, .running, .waitingForApproval, .canceling, .failed, .timeout:
-            return status.label
-        case .succeeded, .canceled, .unknown:
-            return nil
-        }
     }
 
     private func statusLabel(_ text: String) -> some View {

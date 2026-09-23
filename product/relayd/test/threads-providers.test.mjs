@@ -21,6 +21,7 @@ const {
   listWorkspaceSessions,
   listWorkspaceThreads,
   threadDetailResponse,
+  threadSummary,
   cursorWorkspaceHash,
 } = await import("../src/threads.mjs");
 const { compareJobsForList } = await import("../src/jobs.mjs");
@@ -158,6 +159,48 @@ test("a live Cursor transcript in a hashed project folder stays visible and fres
   const detail = await threadDetailResponse(hashedOnlyId, { provider: "cursor" });
   assert.equal(detail.thread.cwd, canonicalRoot);
   assert.equal(detail.messages[0].text, "Hashed folder only");
+});
+
+test("a native transcript resumed after an older Relay job stays live", () => {
+  const now = Date.now();
+  const summary = threadSummary({
+    id: CLAUDE_ID,
+    provider: "claude",
+    workspaceId: "repo",
+    workspaceName: "Repo",
+    updatedAt: new Date(now).toISOString(),
+    hasSessionFile: true,
+    jobs: [{
+      id: "job-old",
+      status: "succeeded",
+      prompt: "earlier from the phone",
+      createdAt: new Date(now - 30 * 60 * 1000).toISOString(),
+      updatedAt: new Date(now - 20 * 60 * 1000).toISOString(),
+    }],
+  });
+  assert.equal(summary.live, true);
+  assert.equal(summary.activeJobCount, 0);
+  assert.equal(summary.provider, "claude");
+});
+
+test("a transcript flushed with a just-finished Relay job is not live", () => {
+  const now = new Date().toISOString();
+  const summary = threadSummary({
+    id: CURSOR_ID,
+    provider: "cursor",
+    workspaceId: "repo",
+    workspaceName: "Repo",
+    updatedAt: now,
+    jobs: [{
+      id: "job-done",
+      status: "succeeded",
+      prompt: "finished on the phone",
+      createdAt: now,
+      updatedAt: now,
+    }],
+  });
+  assert.equal(summary.live, false);
+  assert.equal(summary.lastJobStatus, "succeeded");
 });
 
 test("job lists keep an older running job ahead of newer finished jobs", () => {

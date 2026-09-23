@@ -122,6 +122,15 @@ struct RelayChatView: View {
                     modelPickerRequest += 1
                 }
             }
+            .task(id: viewModel.watchedSessionID) {
+                guard viewModel.watchedSessionID != nil else { return }
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(2))
+                    if Task.isCancelled { return }
+                    await viewModel.refreshWatchedThreadIfNeeded()
+                    if viewModel.watchedSessionID == nil { return }
+                }
+            }
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active {
                     Task { await viewModel.refreshModels() }
