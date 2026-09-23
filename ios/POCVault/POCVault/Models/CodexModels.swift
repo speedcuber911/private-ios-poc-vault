@@ -156,6 +156,50 @@ struct CodexWorkspaceDirectoryListing: Decodable, Hashable {
     }
 }
 
+/// Branch and working-tree line counts from `GET /v1/codex/fs/git`.
+/// Absent fields stay quiet: an older daemon, or a folder that is not a
+/// repository, simply does not draw the status row.
+struct RelayGitStatus: Decodable, Equatable {
+    let git: Bool
+    let branch: String?
+    let detached: Bool
+    let added: Int
+    let deleted: Int
+    let binary: Bool
+    let size: Int64?
+    let modifiedAt: String?
+
+    var branchLabel: String? {
+        guard git else { return nil }
+        return branch?.trimmedNonEmpty
+    }
+
+    var showsBar: Bool { branchLabel != nil }
+
+    /// Changes when the file's bytes change, so a poll can reload the viewer
+    /// without treating an unchanged tree as a new edit.
+    var contentStamp: String? {
+        guard git, let modifiedAt = modifiedAt?.trimmedNonEmpty else { return nil }
+        return "\(modifiedAt)#\(size ?? -1)"
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case git, branch, detached, added, deleted, binary, size, modifiedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        git = try container.decodeIfPresent(Bool.self, forKey: .git) ?? false
+        branch = try container.decodeIfPresent(String.self, forKey: .branch)?.trimmedNonEmpty
+        detached = try container.decodeIfPresent(Bool.self, forKey: .detached) ?? false
+        added = try container.decodeIntegerIfPresent(forKey: .added) ?? 0
+        deleted = try container.decodeIntegerIfPresent(forKey: .deleted) ?? 0
+        binary = try container.decodeIfPresent(Bool.self, forKey: .binary) ?? false
+        size = try container.decodeIntegerIfPresent(forKey: .size).map(Int64.init)
+        modifiedAt = try container.decodeIfPresent(String.self, forKey: .modifiedAt)
+    }
+}
+
 /// Coarse viewer routing for file entries, inferred from the server MIME hint plus the
 /// filename extension. Drives the per-type glyph and (later) the read-only file viewer.
 enum CodexFileCategory: String, Hashable {
@@ -1058,6 +1102,7 @@ struct CodexThread: Decodable, Hashable, Identifiable {
     let model: String?
     let jobCount: Int
     let activeJobCount: Int
+    let live: Bool
     let lastJobId: String?
     let lastJobStatus: CodexJobStatus?
     let lastPrompt: String?
@@ -1082,6 +1127,7 @@ struct CodexThread: Decodable, Hashable, Identifiable {
         case model
         case jobCount
         case activeJobCount
+        case live
         case lastJobId
         case lastJobStatus
         case lastPrompt
@@ -1120,6 +1166,7 @@ struct CodexThread: Decodable, Hashable, Identifiable {
         self.model = try container.decodeLooseStringIfPresent(forKey: .model)
         self.jobCount = (try container.decodeIntegerIfPresent(forKey: .jobCount)) ?? 0
         self.activeJobCount = (try container.decodeIntegerIfPresent(forKey: .activeJobCount)) ?? 0
+        self.live = (try container.decodeIfPresent(Bool.self, forKey: .live)) ?? false
         self.lastJobId = try container.decodeLooseStringIfPresent(forKey: .lastJobId)
         self.lastJobStatus = try container.decodeIfPresent(CodexJobStatus.self, forKey: .lastJobStatus)
         self.lastPrompt = try container.decodeLooseStringIfPresent(forKey: .lastPrompt)
@@ -1163,7 +1210,7 @@ struct CodexThread: Decodable, Hashable, Identifiable {
     }
 
     var hasActiveJobs: Bool {
-        activeJobCount > 0 || lastJobStatus?.isActive == true
+        live || activeJobCount > 0 || lastJobStatus?.isActive == true
     }
 
     static func threadTitle(from value: String?) -> String? {
@@ -1533,8 +1580,9 @@ struct CodexThreadFeedItem: Hashable, Identifiable {
             }
             .map { CodexThreadFeedItem(source: .pendingJob($0)) }
 
-        return (standaloneJobItems + threadItems).sorted {
-            ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast)
+        return (standaloneJobItems + threadItems).sorted { lhs, rhs in
+            if lhs.isActive != rhs.isActive { return lhs.isActive && !rhs.isActive }
+            return (lhs.updatedAt ?? .distantPast) > (rhs.updatedAt ?? .distantPast)
         }
     }
 

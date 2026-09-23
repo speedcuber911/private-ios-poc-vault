@@ -34,6 +34,9 @@ final class FileBrowserViewModel: ObservableObject {
     /// Bound to the explorer's compact filter field.
     @Published var searchText = ""
     @Published private(set) var isResolvingWorkspace = false
+    /// Branch and working-tree counts for this folder. Nil outside a repository
+    /// and on a daemon that does not serve `/v1/codex/fs/git` yet.
+    @Published private(set) var gitStatus: RelayGitStatus?
 
     init(client: CodexClient, path: String? = nil) {
         self.client = client
@@ -118,6 +121,31 @@ final class FileBrowserViewModel: ObservableObject {
 
     func refresh() async {
         await load()
+    }
+
+    /// Poll the folder's branch and diff counts while the explorer is on screen.
+    /// Returns once the view goes away or the daemon has no such route.
+    func watchGitStatus() async {
+        while !Task.isCancelled {
+            if await refreshGitStatus() { return }
+            try? await Task.sleep(for: .seconds(2))
+        }
+    }
+
+    /// True when polling should stop (the route is missing, or this task was cancelled).
+    private func refreshGitStatus() async -> Bool {
+        do {
+            let status = try await client.fetchGitStatus(path: path)
+            gitStatus = status.showsBar ? status : nil
+            return false
+        } catch {
+            if isCancellation(error) { return true }
+            if (error as? CodexClientError)?.statusCode == 404 {
+                gitStatus = nil
+                return true
+            }
+            return false
+        }
     }
 
     /// The daemon includes saved CLI transcripts as well as runs started by Relay.

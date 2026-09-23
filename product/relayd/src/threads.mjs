@@ -127,6 +127,73 @@ function cursorProjectSlug(cwd) {
   return String(cwd).replace(/^\/+/, "").replace(/\//g, "-");
 }
 
+function cursorSlugCandidates(workspace) {
+  return [...new Set([
+    cursorProjectSlug(workspace.path),
+    cursorProjectSlug(realpathOrResolve(workspace.path)),
+  ])];
+}
+
+function cursorTranscriptUpdatedAt(file, directoryStat) {
+  if (!file) return directoryStat.mtime.toISOString();
+  try {
+    const stat = fs.statSync(file);
+    if (stat.isFile() && stat.mtimeMs > directoryStat.mtimeMs) return stat.mtime.toISOString();
+  } catch {
+    // The chat folder still has a usable timestamp when the transcript leaf is missing.
+  }
+  return directoryStat.mtime.toISOString();
+}
+
+function cursorLoggedWorkspacePath(projectDir) {
+  let fd;
+  try {
+    fd = fs.openSync(path.join(projectDir, "worker.log"), "r");
+    const buf = Buffer.alloc(65536);
+    const read = fs.readSync(fd, buf, 0, buf.length, 0);
+    const match = buf.subarray(0, read).toString("utf8").match(/workspacePath=([^\s\0]+)/);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+function workspaceForCursorProjectName(projectName, projectDir) {
+  let matched = null;
+  for (const workspace of [...workspaces.values(), ...dynamicWorkspaces.values()]) {
+    if (!cursorSlugCandidates(workspace).includes(projectName)) continue;
+    if (!matched || workspace.path.length > matched.path.length) matched = workspace;
+  }
+  if (matched) return matched;
+  // Cursor truncates long paths and appends a short hash. The folder name is
+  // then no longer the workspace slug, so the log's workspacePath is the link.
+  const hashed = /^(.+)-[0-9a-f]{6,8}$/.exec(projectName);
+  if (!hashed || hashed[1].length < 20) return null;
+  const logged = cursorLoggedWorkspacePath(projectDir);
+  if (!logged) return null;
+  return workspaceForPath(logged);
+}
+
+function cursorProjectDirsForWorkspace(workspace) {
+  const projectsRoot = path.join(runHome, ".cursor", "projects");
+  let entries = [];
+  try {
+    entries = fs.readdirSync(projectsRoot, { withFileTypes: true });
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    return [];
+  }
+  const dirs = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const projectDir = path.join(projectsRoot, entry.name);
+    if (workspaceForCursorProjectName(entry.name, projectDir)?.id === workspace.id) dirs.push(projectDir);
+  }
+  return dirs;
+}
+
 function readJsonObject(filePath) {
   try {
     const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
@@ -192,12 +259,7 @@ function findCursorProjectTranscript(sessionId) {
   }
   if (!newest) return null;
 
-  let matchedWorkspace = null;
-  for (const workspace of [...workspaces.values(), ...dynamicWorkspaces.values()]) {
-    if (cursorProjectSlug(workspace.path) === newest.slug || cursorProjectSlug(realpathOrResolve(workspace.path)) === newest.slug) {
-      if (!matchedWorkspace || workspace.path.length > matchedWorkspace.path.length) matchedWorkspace = workspace;
-    }
-  }
+  const matchedWorkspace = workspaceForCursorProjectName(newest.slug, path.join(projectsRoot, newest.slug));
   return {
     id: sessionId,
     cwd: matchedWorkspace?.path || null,
@@ -312,19 +374,20 @@ function listCursorSessionsForWorkspace(workspace) {
       } catch {
         continue;
       }
+      const file = cursorTranscriptInDir(sessionDir, entry.name);
       found.set(entry.name, {
         id: entry.name,
         provider: "cursor",
         cwd: meta.cwd,
         timestamp: meta.timestamp,
-        updatedAt: stat.mtime.toISOString(),
-        file: cursorTranscriptInDir(sessionDir, entry.name),
+        updatedAt: cursorTranscriptUpdatedAt(file, stat),
+        file,
       });
     }
   }
 
-  for (const slug of [cursorProjectSlug(workspace.path), cursorProjectSlug(realpathOrResolve(workspace.path))]) {
-    const transcriptsDir = path.join(runHome, ".cursor", "projects", slug, "agent-transcripts");
+  for (const projectDir of cursorProjectDirsForWorkspace(workspace)) {
+    const transcriptsDir = path.join(projectDir, "agent-transcripts");
     let names = [];
     try {
       names = fs.readdirSync(transcriptsDir, { withFileTypes: true });
@@ -334,17 +397,6 @@ function listCursorSessionsForWorkspace(workspace) {
     }
     for (const entry of names) {
       if (!entry.isDirectory() || !isResumableSessionId(entry.name)) continue;
-      if (found.has(entry.name)) {
-        if (!found.get(entry.name).file) {
-          const nested = path.join(transcriptsDir, entry.name, `${entry.name}.jsonl`);
-          try {
-            if (fs.statSync(nested).isFile()) found.get(entry.name).file = nested;
-          } catch {
-            // keep the chat metadata even when the nested transcript is missing
-          }
-        }
-        continue;
-      }
       const file = path.join(transcriptsDir, entry.name, `${entry.name}.jsonl`);
       let stat;
       try {
@@ -353,6 +405,13 @@ function listCursorSessionsForWorkspace(workspace) {
         continue;
       }
       if (!stat.isFile()) continue;
+      const existing = found.get(entry.name);
+      if (existing) {
+        if (!existing.file) existing.file = file;
+        const updatedAt = stat.mtime.toISOString();
+        if (Date.parse(updatedAt) > Date.parse(existing.updatedAt || 0)) existing.updatedAt = updatedAt;
+        continue;
+      }
       found.set(entry.name, {
         id: entry.name,
         provider: "cursor",
@@ -654,7 +713,11 @@ function listWorkspaceThreads({ workspaceId, provider = null, limit }) {
   return [...threadMap.values()]
     .map(threadSummary)
     .concat(listChatThreads({ provider, workspace: selectedWorkspace, limit: 200 }))
-    .sort((left, right) => compareIsoDesc(left.updatedAt, right.updatedAt))
+    .sort((left, right) => {
+      const liveDelta = Number(Boolean(right.live || right.activeJobCount)) - Number(Boolean(left.live || left.activeJobCount));
+      if (liveDelta) return liveDelta;
+      return compareIsoDesc(left.updatedAt, right.updatedAt);
+    })
     .slice(0, limit);
 }
 
@@ -1021,6 +1084,12 @@ function threadSummary(thread) {
   const lastJob = sortedJobs[0] || null;
   const activeJobCount = sortedJobs.filter((job) => !terminalStatuses.has(job.status)).length;
   const title = summaryText(thread.title) || thread.summary?.firstUserPrompt || summaryText(lastJob?.prompt) || null;
+  const updatedMs = Date.parse(thread.updatedAt || "");
+  // A native session has no Relay job until it finishes. A transcript touched in
+  // the last few minutes is the running one; a just-finished session drops the
+  // flag once the file goes quiet.
+  const fresh = Number.isFinite(updatedMs) && Date.now() - updatedMs < 3 * 60 * 1000;
+  const live = activeJobCount > 0 || (fresh && !lastJob);
 
   return {
     id: thread.id,
@@ -1034,6 +1103,7 @@ function threadSummary(thread) {
     updatedAt: thread.updatedAt || thread.timestamp || null,
     jobCount: sortedJobs.length,
     activeJobCount,
+    live,
     lastJobId: lastJob?.id || null,
     lastJobStatus: lastJob?.status || null,
     title,

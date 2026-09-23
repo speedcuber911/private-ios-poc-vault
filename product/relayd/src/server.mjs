@@ -14,12 +14,13 @@ import { isThreadSessionId } from "./sessionid.mjs";
 import { workspaces, workspaceList, pickerWorkspaceList, resolveWorkspaceById, publicWorkspace, workspaceDirectoryResponse, selectWorkspaceDirectory, createWorkspaceDirectory } from "./workspaces.mjs";
 import { publicRuntimeModelCatalog } from "./catalog.mjs";
 import { fsListResponse, serveFsFile } from "./fsapi.mjs";
+import { fsGitStatus } from "./fsgit.mjs";
 import { listProviderSkills, publicSkill } from "./skills.mjs";
 import { cleanThreadProviderFilter, workspaceForJob, listWorkspaceSessions, listWorkspaceThreads, resolveOptionalWorkspaceFilter, threadDetailResponse, serveThreadAttachment, isSafeThreadAttachmentId, deleteThread } from "./threads.mjs";
 import { handleChatRequest } from "./chat.mjs";
 import { isSafeArtifactId, serveJobArtifact } from "./artifacts.mjs";
 import { transcribeAudio, cleanAudioContentType, cleanAudioFilename } from "./transcribe.mjs";
-import { jobsState, jobs, activeChildren, responseShape, wantsFullLogs, enqueueJob, cleanJobProviderFilter, normalizeJobProvider, jobThreadId, cancelJob, streamJobEvents, toJobResponse, serveJobAttachment, isSafeAttachmentIndex } from "./jobs.mjs";
+import { jobsState, jobs, activeChildren, responseShape, wantsFullLogs, enqueueJob, cleanJobProviderFilter, normalizeJobProvider, compareJobsForList, jobThreadId, cancelJob, streamJobEvents, toJobResponse, serveJobAttachment, isSafeAttachmentIndex } from "./jobs.mjs";
 import { planSessionImports, importCodexSession, createSessionUpload, appendSessionUpload, completeSessionUpload } from "./session-sync.mjs";
 import { codexThreadUiHtml } from "./ui.mjs";
 import { handleAdditionRoutes } from "./additions.mjs";
@@ -295,6 +296,10 @@ async function routeRequest(req, res) {
     return serveFsFile(req, res, url.searchParams);
   }
 
+  if (req.method === "GET" && url.pathname === "/v1/codex/fs/git") {
+    return sendJson(res, 200, await fsGitStatus(url.searchParams));
+  }
+
   if (req.method === "POST" && url.pathname === "/v1/codex/workspaces/select") {
     const body = await readBody(req);
     return sendJson(res, 200, publicWorkspace(selectWorkspaceDirectory(body)));
@@ -431,7 +436,7 @@ async function routeRequest(req, res) {
     const selectedJobs = [...jobs.values()]
       .filter((job) => !provider || normalizeJobProvider(job.provider) === provider)
       .filter((job) => !selectedWorkspace || workspaceForJob(job)?.id === selectedWorkspace.id)
-      .sort((left, right) => Date.parse(right.createdAt || 0) - Date.parse(left.createdAt || 0))
+      .sort(compareJobsForList)
       .slice(0, limit);
     return sendJson(res, 200, {
       jobs: await Promise.all(selectedJobs.map((job) => toJobResponse(job, responseShape("compact")))),
