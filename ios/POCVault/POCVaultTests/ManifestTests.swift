@@ -3350,7 +3350,7 @@ final class ManifestTests: XCTestCase {
             RelayGitStatus.self,
             from: Data(
                 """
-                {"git":true,"branch":"feature/status","detached":false,"added":12,"deleted":3,"binary":false,"size":40,"modifiedAt":"2026-09-22T12:00:00.000Z"}
+                {"git":true,"branch":"feature/status","detached":false,"added":12,"deleted":3,"binary":false,"size":40,"modifiedAt":"2026-09-22T12:00:00.000Z","addedLines":[[4,6]],"removedAt":[9]}
                 """.utf8
             )
         )
@@ -3359,6 +3359,10 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(dirty.added, 12)
         XCTAssertEqual(dirty.deleted, 3)
         XCTAssertEqual(dirty.contentStamp, "2026-09-22T12:00:00.000Z#40")
+        XCTAssertTrue(dirty.marksAddedLine(4))
+        XCTAssertTrue(dirty.marksAddedLine(6))
+        XCTAssertFalse(dirty.marksAddedLine(3))
+        XCTAssertEqual(dirty.removedAt, [9])
 
         let quiet = try JSONDecoder().decode(RelayGitStatus.self, from: Data(#"{"git":false}"#.utf8))
         XCTAssertFalse(quiet.showsBar)
