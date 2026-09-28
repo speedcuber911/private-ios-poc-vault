@@ -727,6 +727,12 @@ export function createApp({
         const result = await power.mutate(authed.row, seg[3]);
         return sendJson(res, result.status, result.body);
       }
+      if (method === "POST" && seg.length === 4 && seg[3] === "resize") {
+        const body = await readJson(req, config.jsonBodyMaxBytes);
+        if (!body || typeof body !== "object") return sendJson(res, 400, { error: "invalid_resize" });
+        const result = await power.requestResize(authed.row, body);
+        return sendJson(res, result.status, result.body);
+      }
     }
 
     // ── auth ────────────────────────────────────────────────────────────
@@ -1880,7 +1886,7 @@ export function createApp({
   // handoffWaiters is exposed for test observability only (leak/cap/release
   // assertions — see the Task 8 review, I-1/I-2) — not a public API.
   return {
-    server, registry, auth, pairing, notify, runSweeps, db, config,
+    server, registry, auth, pairing, notify, power, runSweeps, db, config,
     handoffWaiters, power,
   };
 }

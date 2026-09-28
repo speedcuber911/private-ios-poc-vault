@@ -148,6 +148,9 @@ struct RelayMachineMonitorView: View {
                             .font(AppTheme.uiFont(size: 15))
                             .foregroundStyle(AppTheme.statusError)
                     }
+                    if canControlPower {
+                        RelayMachineSizeControl(model: powerModel)
+                    }
                 }
                 .padding(22)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -187,6 +190,9 @@ struct RelayMachineMonitorView: View {
                 await powerModel.refresh()
             }
             await model.monitor(client: client)
+        }
+        .task(id: powerModel.resize?.stage) {
+            await powerModel.waitForResize()
         }
         .confirmationDialog(
             "Stop \(machineName)?",
@@ -331,6 +337,7 @@ struct RelayMachineMonitorView: View {
                     confirmStop: { showingStopPower = true },
                     accessibilityIdentifier: "relay-usage-power"
                 )
+                RelayMachineSizeControl(model: powerModel)
             }
         }
     }

@@ -20,6 +20,23 @@ const TS_MAX_AGE_MS = 10 * 60 * 1000;
 const TS_MAX_SKEW_MS = 2 * 60 * 1000;
 const MUTATE_MIN_INTERVAL_MS = 15_000;
 const MUTATE_MAX_PER_HOUR = 20;
+const ACTIVE_RESIZE_STAGES = ["requested", "waiting_stop", "modifying", "waiting_start", "waiting_running", "recovering", "recovery_wait"];
+
+// Keep the control to sizes in the current EC2 family. AWS still makes the
+// final compatibility and regional-capacity decision for the specific VM.
+export function resizeOptions(instanceType) {
+  const [family, size] = String(instanceType || "").split(".");
+  if (!family || !size) return [];
+  let sizes;
+  if (/^t(?:2|3|3a|4g)$/.test(family)) {
+    sizes = ["nano", "micro", "small", "medium", "large", "xlarge", "2xlarge"];
+  } else if (/^[mcr][5-9](?:[a-z]*)$/.test(family)) {
+    sizes = ["large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge", "24xlarge"];
+  } else {
+    return [];
+  }
+  return sizes.includes(size) ? sizes.map((entry) => `${family}.${entry}`) : [];
+}
 
 function sha256Hex(value) {
   return createHash("sha256").update(String(value), "utf8").digest("hex");
@@ -68,6 +85,7 @@ export function createPower({
 
   const lastMutateAt = new Map();
   const mutateHits = new Map();
+  const advancing = new Set();
 
   function get(nodeId) {
     return db.prepare("SELECT * FROM node_power WHERE node_id = ?").get(nodeId) || null;
@@ -98,6 +116,29 @@ export function createPower({
 
   function configured() {
     return allowlist.size > 0 && client != null;
+  }
+
+  function resizeRow(nodeId) {
+    return db.prepare("SELECT * FROM node_resize WHERE node_id = ?").get(nodeId) || null;
+  }
+
+  function publicResize(nodeId) {
+    const row = resizeRow(nodeId);
+    return row ? {
+      targetType: row.target_type,
+      originalType: row.original_type,
+      stage: row.stage,
+      error: row.error,
+    } : null;
+  }
+
+  function setResizeStage(nodeId, stage, error = null) {
+    db.prepare("UPDATE node_resize SET stage = ?, error = ?, updated_at = ? WHERE node_id = ?")
+      .run(stage, error, now(), nodeId);
+  }
+
+  function resizeActive(nodeId) {
+    return ACTIVE_RESIZE_STAGES.includes(resizeRow(nodeId)?.stage);
   }
 
   function authorizeWake(req, nodeId) {
@@ -193,7 +234,8 @@ export function createPower({
   }
 
   async function mutate(row, action) {
-    if (!configured()) return { status: 503, body: { error: "power_unconfigured" } };
+    if (!configured() || !allowlist.has(row.instance_id)) return { status: 503, body: { error: "power_unconfigured" } };
+    if (resizeActive(row.node_id)) return { status: 409, body: { error: "resize_in_progress" } };
     if (!allowMutate(row.node_id, now())) {
       return { status: 429, body: { error: "rate_limited" } };
     }
@@ -219,7 +261,7 @@ export function createPower({
   }
 
   async function describe(row) {
-    if (!configured()) return { status: 503, body: { error: "power_unconfigured" } };
+    if (!configured() || !allowlist.has(row.instance_id)) return { status: 503, body: { error: "power_unconfigured" } };
     try {
       const result = await client.describeInstances({ instanceIds: [row.instance_id] });
       const instance = result.instances?.[0];
@@ -227,12 +269,146 @@ export function createPower({
         status: 200,
         body: {
           ok: true,
-          power: publicPower(row, { instanceState: instance?.state || "unknown" }),
+          power: publicPower(row, {
+            instanceState: instance?.state || "unknown",
+            instanceType: instance?.instanceType || null,
+            resizeOptions: resizeOptions(instance?.instanceType),
+            resize: publicResize(row.node_id),
+          }),
         },
       };
     } catch (error) {
       log(`power aws describe failed for ${row.node_id}: ${error?.message || error}`);
       return { status: 502, body: { error: "power_aws_failed" } };
+    }
+  }
+
+  async function requestResize(row, { targetType, expectedType } = {}) {
+    if (!configured() || !allowlist.has(row.instance_id)) return { status: 503, body: { error: "power_unconfigured" } };
+    if (resizeActive(row.node_id)) return { status: 409, body: { error: "resize_in_progress" } };
+    if (typeof targetType !== "string" || typeof expectedType !== "string") {
+      return { status: 400, body: { error: "invalid_resize" } };
+    }
+    try {
+      const instance = (await client.describeInstances({ instanceIds: [row.instance_id] })).instances?.[0];
+      if (!instance?.instanceType || !["running", "stopped"].includes(instance.state)) {
+        return { status: 409, body: { error: "instance_not_ready" } };
+      }
+      if (instance.instanceType !== expectedType) {
+        return { status: 409, body: { error: "instance_type_changed" } };
+      }
+      if (targetType === expectedType || !resizeOptions(expectedType).includes(targetType)) {
+        return { status: 400, body: { error: "invalid_resize" } };
+      }
+      if (!allowMutate(row.node_id, now())) {
+        return { status: 429, body: { error: "rate_limited" } };
+      }
+      db.prepare(`INSERT INTO node_resize (node_id, target_type, original_type, stage, was_running, error, started_at, updated_at)
+        VALUES (?, ?, ?, 'requested', ?, NULL, ?, ?)
+        ON CONFLICT(node_id) DO UPDATE SET target_type = excluded.target_type,
+          original_type = excluded.original_type, stage = 'requested',
+          was_running = excluded.was_running, error = NULL,
+          started_at = excluded.started_at, updated_at = excluded.updated_at`)
+        .run(row.node_id, targetType, expectedType, instance.state === "running" ? 1 : 0, now(), now());
+      return { status: 202, body: { ok: true, power: publicPower(row, {
+        instanceState: instance.state, instanceType: instance.instanceType,
+        resizeOptions: resizeOptions(instance.instanceType), resize: publicResize(row.node_id),
+      }) } };
+    } catch (error) {
+      log(`power aws resize request failed for ${row.node_id}: ${error?.message || error}`);
+      return { status: 502, body: { error: "power_aws_failed" } };
+    }
+  }
+
+  async function advanceResize(job) {
+    const node = get(job.node_id);
+    if (!node || !allowlist.has(node.instance_id)) return;
+    const instance = (await client.describeInstances({ instanceIds: [node.instance_id] })).instances?.[0];
+    if (!instance) throw new Error("instance_missing");
+    if (now() - job.started_at > 15 * 60_000) {
+      setResizeStage(job.node_id, "failed", "resize_timeout");
+      return;
+    }
+    const id = node.instance_id;
+    if (job.stage === "requested") {
+      if (instance.state === "running") {
+        setResizeStage(job.node_id, "waiting_stop");
+        await client.stopInstances({ instanceIds: [id] });
+      } else if (instance.state === "stopped") {
+        setResizeStage(job.node_id, "modifying");
+      }
+      return;
+    }
+    if (job.stage === "waiting_stop") {
+      if (instance.state === "stopped") setResizeStage(job.node_id, "modifying");
+      else if (instance.state === "running" && now() - job.updated_at >= 15_000) {
+        setResizeStage(job.node_id, "waiting_stop");
+        await client.stopInstances({ instanceIds: [id] });
+      }
+      return;
+    }
+    if (job.stage === "modifying") {
+      if (instance.instanceType !== job.target_type) {
+        if (instance.state !== "stopped") return;
+        await client.modifyInstanceType({ instanceId: id, instanceType: job.target_type });
+      }
+      setResizeStage(job.node_id, job.was_running ? "waiting_start" : "complete");
+      return;
+    }
+    if (job.stage === "waiting_start") {
+      if (instance.state === "running") {
+        setResizeStage(job.node_id, "complete");
+      } else if (instance.state === "stopped") {
+        setResizeStage(job.node_id, "waiting_running");
+        await client.startInstances({ instanceIds: [id] });
+      }
+      return;
+    }
+    if (job.stage === "waiting_running") {
+      if (instance.state === "running") setResizeStage(job.node_id, "complete");
+      else if (instance.state === "stopped" && now() - job.updated_at >= 15_000) {
+        setResizeStage(job.node_id, "waiting_running");
+        await client.startInstances({ instanceIds: [id] });
+      }
+      return;
+    }
+    if (job.stage === "recovering") {
+      if (instance.state === "running") setResizeStage(job.node_id, "failed", job.error);
+      else if (instance.state === "stopped") {
+        setResizeStage(job.node_id, "recovery_wait", job.error);
+        await client.startInstances({ instanceIds: [id] });
+      }
+      return;
+    }
+    if (job.stage === "recovery_wait") {
+      if (instance.state === "running") setResizeStage(job.node_id, "failed", job.error);
+      else if (instance.state === "stopped" && now() - job.updated_at >= 15_000) {
+        setResizeStage(job.node_id, "recovery_wait", job.error);
+        await client.startInstances({ instanceIds: [id] });
+      }
+    }
+  }
+
+  async function advanceResizes() {
+    if (!configured()) return;
+    const jobs = db.prepare(`SELECT * FROM node_resize WHERE stage IN (${ACTIVE_RESIZE_STAGES.map(() => "?").join(",")})`)
+      .all(...ACTIVE_RESIZE_STAGES);
+    for (const job of jobs) {
+      if (advancing.has(job.node_id)) continue;
+      advancing.add(job.node_id);
+      try {
+        await advanceResize(job);
+      } catch (error) {
+        log(`power aws resize failed for ${job.node_id}: ${error?.message || error}`);
+        const current = resizeRow(job.node_id);
+        if (current?.stage === "modifying" && current.was_running) {
+          setResizeStage(job.node_id, "recovering", "resize_failed");
+        } else {
+          setResizeStage(job.node_id, "failed", "resize_failed");
+        }
+      } finally {
+        advancing.delete(job.node_id);
+      }
     }
   }
 
@@ -242,6 +418,8 @@ export function createPower({
     authorizeWake,
     mutate,
     describe,
+    requestResize,
+    advanceResizes,
     get,
     getByTokenHash,
   };

@@ -106,6 +106,18 @@ const sweeper = setInterval(() => {
 }, SWEEP_INTERVAL_MS);
 sweeper.unref();
 
+// Resize progress is held in SQLite, so this resumes after a cloud restart
+// even if the phone has gone away during the EC2 stop/start cycle.
+const resizeWorker = setInterval(() => {
+  void app.power.advanceResizes().catch((err) => {
+    console.error(`resize worker failed: ${err?.message}`);
+  });
+}, 5_000);
+resizeWorker.unref();
+void app.power.advanceResizes().catch((err) => {
+  console.error(`resize recovery failed: ${err?.message}`);
+});
+
 app.server.listen(config.port, config.host, () => {
   console.log(`relay-cloud listening on ${config.host}:${config.port}`);
 });

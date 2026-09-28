@@ -1,4 +1,4 @@
-// Minimal EC2 Query client for Start/Stop/Describe. Three actions, SigV4,
+// Minimal EC2 Query client for Start/Stop/Describe/Modify. SigV4,
 // no SDK. Injectable fetch + credentials so tests never touch AWS.
 //
 // Live credentials: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / optional
@@ -83,8 +83,10 @@ function parseInstanceStates(xml) {
   for (const block of blocks) {
     const id = /<instanceId>\s*(i-[0-9a-f]+)\s*<\/instanceId>/i.exec(block);
     const state = /<(?:currentState|instanceState)>[\s\S]*?<name>\s*([a-z-]+)\s*<\/name>/i.exec(block);
+    const instanceType = /<instanceType>\s*([a-z0-9.]+)\s*<\/instanceType>/i.exec(block);
     if (id) {
-      instances.push({ instanceId: id[1].toLowerCase(), state: state ? state[1] : "unknown" });
+      instances.push({ instanceId: id[1].toLowerCase(), state: state ? state[1] : "unknown",
+        ...(instanceType ? { instanceType: instanceType[1].toLowerCase() } : {}) });
     }
   }
   return instances;
@@ -165,10 +167,10 @@ export function createEc2Client({
 } = {}) {
   if (!region) throw new TypeError("createEc2Client requires region");
 
-  async function call(action, instanceIds) {
+  async function call(action, instanceIds, extraParams = {}) {
     const creds = credentials || (await envOrImdsCredentials(fetchImpl));
     const host = `ec2.${region}.amazonaws.com`;
-    const payload = canonicalQuery(instanceParams(action, instanceIds));
+    const payload = canonicalQuery({ ...instanceParams(action, instanceIds), ...extraParams });
     const headers = {
       host,
       "content-type": "application/x-www-form-urlencoded; charset=utf-8",
@@ -199,6 +201,9 @@ export function createEc2Client({
       const code = /<Code>([^<]+)<\/Code>/.exec(text)?.[1] || `http_${res.status}`;
       throw Object.assign(new Error(`ec2_${code}`), { status: res.status, body: text });
     }
+    if (/<return>\s*false\s*<\/return>/i.test(text)) {
+      throw new Error(`ec2_${action}_rejected`);
+    }
     return { instances: parseInstanceStates(text) };
   }
 
@@ -206,6 +211,12 @@ export function createEc2Client({
     startInstances: ({ instanceIds }) => call("StartInstances", instanceIds),
     stopInstances: ({ instanceIds }) => call("StopInstances", instanceIds),
     describeInstances: ({ instanceIds }) => call("DescribeInstances", instanceIds),
+    modifyInstanceType: async ({ instanceId, instanceType }) => {
+      await call("ModifyInstanceAttribute", [], {
+        InstanceId: instanceId,
+        "InstanceType.Value": instanceType,
+      });
+    },
   };
 }
 

@@ -349,6 +349,19 @@ CREATE TABLE IF NOT EXISTS relayd_releases (
   notes        TEXT,
   published_at INTEGER NOT NULL
 );
+
+-- One durable resize operation per registered node. The cloud resumes these
+-- after a restart so the phone need not stay open during an EC2 stop/start.
+CREATE TABLE IF NOT EXISTS node_resize (
+  node_id       TEXT PRIMARY KEY REFERENCES node_power(node_id) ON DELETE CASCADE,
+  target_type   TEXT NOT NULL,
+  original_type TEXT NOT NULL,
+  stage         TEXT NOT NULL,
+  was_running   INTEGER NOT NULL,
+  error         TEXT,
+  started_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
 `;
 
 export function createDb(path = ":memory:") {

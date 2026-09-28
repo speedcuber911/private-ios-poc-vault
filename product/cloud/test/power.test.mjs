@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { hashWakeToken } from "../src/power.js";
-import { parseInstanceStates } from "../src/ec2.js";
+import { createEc2Client, parseInstanceStates } from "../src/ec2.js";
+import { createDb } from "../src/db.js";
 import { startTestApp, api, makeNodeIdentity } from "./helpers.mjs";
 
 const INSTANCE = "i-0123456789abcdef0";
@@ -13,9 +14,11 @@ const WAKE_HASH = hashWakeToken(WAKE);
 function makeFakeEc2() {
   const calls = [];
   const states = new Map();
+  const types = new Map();
   return {
     calls,
     states,
+    types,
     async startInstances({ instanceIds }) {
       calls.push(["start", [...instanceIds]]);
       return {
@@ -41,8 +44,15 @@ function makeFakeEc2() {
         instances: instanceIds.map((instanceId) => ({
           instanceId,
           state: states.get(instanceId) || "stopped",
+          instanceType: types.get(instanceId) || "t3.medium",
         })),
       };
+    },
+    async modifyInstanceType({ instanceId, instanceType }) {
+      calls.push(["modify", instanceId, instanceType]);
+      if (this.failModify) throw new Error("incompatible_type");
+      if (states.get(instanceId) !== "stopped") throw new Error("must_be_stopped");
+      types.set(instanceId, instanceType);
     },
   };
 }
@@ -56,6 +66,7 @@ async function startPowerApp(overrides = {}) {
     },
     ec2,
     clock: overrides.clock,
+    db: overrides.db,
   });
   t.ec2 = ec2;
   return t;
@@ -262,6 +273,114 @@ test("mutating twice inside the minimum interval is rate-limited", async () => {
   }
 });
 
+test("paired phone reads the EC2 type and requests a durable same-series resize", async () => {
+  const t = await startPowerApp();
+  const identity = makeNodeIdentity();
+  const path = "/v1/power/node-aabbccddeeff0011";
+  const headers = { authorization: `Bearer ${WAKE}` };
+  try {
+    assert.equal((await register(t, identity)).status, 201);
+    t.ec2.states.set(INSTANCE, "running");
+    const initial = await api(t.baseUrl, "GET", path, { headers });
+    assert.equal(initial.json.power.instanceType, "t3.medium");
+    assert.ok(initial.json.power.resizeOptions.includes("t3.large"));
+
+    assert.equal((await api(t.baseUrl, "POST", `${path}/resize`, {
+      body: { expectedType: "t3.medium", targetType: "t3.large" },
+    })).status, 401);
+    assert.equal((await api(t.baseUrl, "POST", `${path}/resize`, {
+      headers, body: { expectedType: "t3.medium", targetType: "m5.large" },
+    })).status, 400);
+    assert.equal((await api(t.baseUrl, "POST", `${path}/resize`, {
+      headers, body: { expectedType: "t3.small", targetType: "t3.large" },
+    })).json.error, "instance_type_changed");
+
+    const accepted = await api(t.baseUrl, "POST", `${path}/resize`, {
+      headers, body: { expectedType: "t3.medium", targetType: "t3.large" },
+    });
+    assert.equal(accepted.status, 202);
+    assert.equal(accepted.json.power.resize.stage, "requested");
+    assert.equal((await api(t.baseUrl, "POST", `${path}/stop`, { headers })).status, 409);
+
+    await t.app.power.advanceResizes();
+    assert.deepEqual(t.ec2.calls.find((call) => call[0] === "stop"), ["stop", [INSTANCE]]);
+    t.ec2.states.set(INSTANCE, "stopped");
+    await t.app.power.advanceResizes();
+    await t.app.power.advanceResizes();
+    assert.deepEqual(t.ec2.calls.find((call) => call[0] === "modify"), ["modify", INSTANCE, "t3.large"]);
+    await t.app.power.advanceResizes();
+    assert.deepEqual(t.ec2.calls.find((call) => call[0] === "start"), ["start", [INSTANCE]]);
+    t.ec2.states.set(INSTANCE, "running");
+    await t.app.power.advanceResizes();
+    const done = await api(t.baseUrl, "GET", path, { headers });
+    assert.equal(done.json.power.instanceType, "t3.large");
+    assert.equal(done.json.power.resize.stage, "complete");
+  } finally {
+    await t.close();
+  }
+});
+
+test("a rejected type change restarts a previously running machine", async () => {
+  const t = await startPowerApp();
+  const headers = { authorization: `Bearer ${WAKE}` };
+  const path = "/v1/power/node-aabbccddeeff0011";
+  try {
+    assert.equal((await register(t, makeNodeIdentity())).status, 201);
+    t.ec2.states.set(INSTANCE, "running");
+    t.ec2.failModify = true;
+    assert.equal((await api(t.baseUrl, "POST", `${path}/resize`, {
+      headers, body: { expectedType: "t3.medium", targetType: "t3.large" },
+    })).status, 202);
+    await t.app.power.advanceResizes();
+    t.ec2.states.set(INSTANCE, "stopped");
+    await t.app.power.advanceResizes();
+    await t.app.power.advanceResizes();
+    assert.equal((await api(t.baseUrl, "GET", path, { headers })).json.power.resize.stage, "recovering");
+    await t.app.power.advanceResizes();
+    assert.equal(t.ec2.calls.some((call) => call[0] === "start"), true);
+    t.ec2.states.set(INSTANCE, "running");
+    await t.app.power.advanceResizes();
+    const result = await api(t.baseUrl, "GET", path, { headers });
+    assert.equal(result.json.power.instanceType, "t3.medium");
+    assert.equal(result.json.power.resize.stage, "failed");
+  } finally {
+    await t.close();
+  }
+});
+
+test("a cloud restart resumes a resize after the instance has stopped", async () => {
+  const db = createDb(":memory:");
+  const ec2 = makeFakeEc2();
+  const first = await startPowerApp({ db, ec2 });
+  const path = "/v1/power/node-aabbccddeeff0011";
+  const headers = { authorization: `Bearer ${WAKE}` };
+  try {
+    assert.equal((await register(first, makeNodeIdentity())).status, 201);
+    ec2.states.set(INSTANCE, "running");
+    assert.equal((await api(first.baseUrl, "POST", `${path}/resize`, {
+      headers, body: { expectedType: "t3.medium", targetType: "t3.large" },
+    })).status, 202);
+    await first.app.power.advanceResizes();
+  } finally {
+    await first.close();
+  }
+
+  ec2.states.set(INSTANCE, "stopped");
+  const second = await startPowerApp({ db, ec2 });
+  try {
+    await second.app.power.advanceResizes();
+    await second.app.power.advanceResizes();
+    await second.app.power.advanceResizes();
+    ec2.states.set(INSTANCE, "running");
+    await second.app.power.advanceResizes();
+    const result = await api(second.baseUrl, "GET", path, { headers });
+    assert.equal(result.json.power.instanceType, "t3.large");
+    assert.equal(result.json.power.resize.stage, "complete");
+  } finally {
+    await second.close();
+  }
+});
+
 test("EC2 XML instance states parse from StartInstances and DescribeInstances shapes", () => {
   const started = parseInstanceStates(`
     <StartInstancesResponse>
@@ -281,11 +400,29 @@ test("EC2 XML instance states parse from StartInstances and DescribeInstances sh
           <instancesSet>
             <item>
               <instanceId>i-0123456789abcdef0</instanceId>
+              <instanceType>t3.medium</instanceType>
               <instanceState><code>16</code><name>running</name></instanceState>
             </item>
           </instancesSet>
         </item>
       </reservationSet>
     </DescribeInstancesResponse>`);
-  assert.deepEqual(described, [{ instanceId: INSTANCE, state: "running" }]);
+  assert.deepEqual(described, [{ instanceId: INSTANCE, state: "running", instanceType: "t3.medium" }]);
+});
+
+test("EC2 type change signs the exact ModifyInstanceAttribute query", async () => {
+  let body;
+  const client = createEc2Client({
+    region: "ap-south-1",
+    credentials: { accessKeyId: "test", secretAccessKey: "test" },
+    fetchImpl: async (_url, init) => {
+      body = new URLSearchParams(init.body);
+      return { ok: true, status: 200, text: async () => "<ModifyInstanceAttributeResponse><return>true</return></ModifyInstanceAttributeResponse>" };
+    },
+  });
+  await client.modifyInstanceType({ instanceId: INSTANCE, instanceType: "m7i.4xlarge" });
+  assert.equal(body.get("Action"), "ModifyInstanceAttribute");
+  assert.equal(body.get("InstanceId"), INSTANCE);
+  assert.equal(body.get("InstanceType.Value"), "m7i.4xlarge");
+  assert.equal(body.get("InstanceId.1"), null);
 });

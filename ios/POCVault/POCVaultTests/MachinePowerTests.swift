@@ -158,6 +158,36 @@ final class MachinePowerTests: XCTestCase {
         XCTAssertEqual(model.status, .on)
     }
 
+    func testInstanceTypeAndResizeUseThePairingCredential() async throws {
+        let client = RelayPowerClient(
+            baseURL: URL(string: "https://relay.example")!,
+            session: URLSession(configuration: urlSessionReturning(
+                status: 200,
+                body: #"{"ok":true,"power":{"nodeId":"node-abc","instanceState":"running","instanceType":"t3.medium","resizeOptions":["t3.small","t3.medium","t3.large"]}}"#
+            ))
+        )
+        let state = try await client.state(nodeID: "node-abc", wakeToken: "pairing-wake-token")
+        XCTAssertEqual(state.instanceType, "t3.medium")
+        XCTAssertEqual(state.resizeOptions, ["t3.small", "t3.medium", "t3.large"])
+
+        MockPowerURLProtocol.status = 202
+        MockPowerURLProtocol.body = Data(#"{"ok":true,"power":{"nodeId":"node-abc","instanceState":"running","instanceType":"t3.medium","resize":{"targetType":"t3.large","stage":"requested"}}}"#.utf8)
+        let accepted = try await client.resize(nodeID: "node-abc", wakeToken: "pairing-wake-token",
+                                               from: "t3.medium", to: "t3.large")
+        XCTAssertEqual(accepted.resize?.targetType, "t3.large")
+        XCTAssertEqual(accepted.resize?.stage, "requested")
+        XCTAssertEqual(MockPowerURLProtocol.lastRequest?.url?.path, "/v1/power/node-abc/resize")
+        XCTAssertEqual(MockPowerURLProtocol.lastRequest?.httpMethod, "POST")
+        XCTAssertEqual(MockPowerURLProtocol.lastRequest?.value(forHTTPHeaderField: "Authorization"),
+                       "Bearer pairing-wake-token")
+        if let body = MockPowerURLProtocol.lastBody,
+           let payload = try JSONSerialization.jsonObject(with: body) as? [String: String] {
+            XCTAssertEqual(payload, ["expectedType": "t3.medium", "targetType": "t3.large"])
+        } else {
+            XCTFail("Expected JSON resize request body")
+        }
+    }
+
     private func urlSessionReturning(status: Int, body: String) -> URLSessionConfiguration {
         MockPowerURLProtocol.status = status
         MockPowerURLProtocol.body = Data(body.utf8)
@@ -190,16 +220,39 @@ private final class FakePowerClient: RelayMachinePowering, @unchecked Sendable {
         let next = states.count > 1 ? states.removeFirst() : (states.first ?? "running")
         return RelayMachinePowerState(nodeID: nodeID, instanceID: "i-1", region: "ap-south-1", instanceState: next)
     }
+
+    func resize(nodeID: String, wakeToken: String, from: String, to: String) async throws -> RelayMachinePowerState {
+        throw RelayMachinePowerError.invalidSize
+    }
 }
 
 private final class MockPowerURLProtocol: URLProtocol {
     static var status = 200
     static var body = Data()
+    static var lastRequest: URLRequest?
+    static var lastBody: Data?
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
+        Self.lastRequest = request
+        if let body = request.httpBody {
+            Self.lastBody = body
+        } else if let stream = request.httpBodyStream {
+            stream.open()
+            defer { stream.close() }
+            var bytes = [UInt8](repeating: 0, count: 4096)
+            var collected = Data()
+            while stream.hasBytesAvailable {
+                let count = stream.read(&bytes, maxLength: bytes.count)
+                if count <= 0 { break }
+                collected.append(contentsOf: bytes.prefix(count))
+            }
+            Self.lastBody = collected
+        } else {
+            Self.lastBody = nil
+        }
         let response = HTTPURLResponse(
             url: request.url!,
             statusCode: Self.status,

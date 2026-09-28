@@ -1,10 +1,20 @@
 import Foundation
 
 struct RelayMachinePowerState: Equatable {
+    struct Resize: Equatable {
+        var targetType: String
+        var stage: String
+        var error: String?
+        var isActive: Bool { !["complete", "failed"].contains(stage) }
+    }
+
     var nodeID: String
     var instanceID: String?
     var region: String?
     var instanceState: String?
+    var instanceType: String? = nil
+    var resizeOptions: [String] = []
+    var resize: Resize? = nil
 
     var isRunning: Bool { instanceState == "running" }
     var isStopped: Bool {
@@ -24,6 +34,9 @@ enum RelayMachinePowerError: Error, Equatable, LocalizedError {
     case awsFailed
     case httpFailure(Int)
     case timeout
+    case resizeConflict
+    case staleType
+    case invalidSize
 
     var errorDescription: String? {
         switch self {
@@ -41,6 +54,12 @@ enum RelayMachinePowerError: Error, Equatable, LocalizedError {
             return "Machine power request failed (\(status))."
         case .timeout:
             return "The machine did not come up in time."
+        case .resizeConflict:
+            return "This machine is busy. Refresh its size and try again."
+        case .staleType:
+            return "The machine size changed. Refresh and choose again."
+        case .invalidSize:
+            return "That size is not available in this machine series."
         }
     }
 }
@@ -49,6 +68,7 @@ protocol RelayMachinePowering: AnyObject {
     func start(nodeID: String, wakeToken: String) async throws -> RelayMachinePowerState
     func stop(nodeID: String, wakeToken: String) async throws -> RelayMachinePowerState
     func state(nodeID: String, wakeToken: String) async throws -> RelayMachinePowerState
+    func resize(nodeID: String, wakeToken: String, from: String, to: String) async throws -> RelayMachinePowerState
 }
 
 /// Talks to the control plane's power routes. No Relay account: the wake
@@ -76,6 +96,12 @@ final class RelayPowerClient: RelayMachinePowering {
         try await send(path: "/v1/power/\(Self.pathComponent(nodeID))", method: "GET", wakeToken: wakeToken, nodeID: nodeID)
     }
 
+    func resize(nodeID: String, wakeToken: String, from: String, to: String) async throws -> RelayMachinePowerState {
+        try await send(path: "/v1/power/\(Self.pathComponent(nodeID))/resize", method: "POST",
+                       wakeToken: wakeToken, nodeID: nodeID,
+                       body: ["expectedType": from, "targetType": to])
+    }
+
     static func isMachineUnreachable(_ error: Error) -> Bool {
         let nsError = error as NSError
         guard nsError.domain == NSURLErrorDomain else { return false }
@@ -91,7 +117,8 @@ final class RelayPowerClient: RelayMachinePowering {
         }
     }
 
-    private func send(path: String, method: String, wakeToken: String, nodeID: String) async throws -> RelayMachinePowerState {
+    private func send(path: String, method: String, wakeToken: String, nodeID: String,
+                      body: [String: String]? = nil) async throws -> RelayMachinePowerState {
         let root = baseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let normalized = path.hasPrefix("/") ? path : "/\(path)"
         guard let url = URL(string: "\(root)\(normalized)") else {
@@ -102,6 +129,10 @@ final class RelayPowerClient: RelayMachinePowering {
         request.timeoutInterval = 20
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("Bearer \(wakeToken)", forHTTPHeaderField: "Authorization")
+        if let body {
+            request.httpBody = try JSONEncoder().encode(body)
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
         let data: Data
         let response: URLResponse
         do {
@@ -113,7 +144,7 @@ final class RelayPowerClient: RelayMachinePowering {
             throw RelayMachinePowerError.invalidEndpoint
         }
         switch http.statusCode {
-        case 200, 201:
+        case 200, 201, 202:
             break
         case 401:
             throw RelayMachinePowerError.unauthorized
@@ -123,6 +154,11 @@ final class RelayPowerClient: RelayMachinePowering {
             throw RelayMachinePowerError.awsFailed
         case 503:
             throw RelayMachinePowerError.unconfigured
+        case 400:
+            throw RelayMachinePowerError.invalidSize
+        case 409:
+            let code = (try? JSONDecoder().decode([String: String].self, from: data))?["error"]
+            throw code == "instance_type_changed" ? RelayMachinePowerError.staleType : .resizeConflict
         default:
             throw RelayMachinePowerError.httpFailure(http.statusCode)
         }
@@ -132,6 +168,14 @@ final class RelayPowerClient: RelayMachinePowering {
                 var instanceId: String?
                 var region: String?
                 var instanceState: String?
+                var instanceType: String?
+                var resizeOptions: [String]?
+                struct Resize: Decodable {
+                    var targetType: String
+                    var stage: String
+                    var error: String?
+                }
+                var resize: Resize?
             }
             var power: Power?
         }
@@ -140,7 +184,12 @@ final class RelayPowerClient: RelayMachinePowering {
             nodeID: envelope.power?.nodeId ?? nodeID,
             instanceID: envelope.power?.instanceId,
             region: envelope.power?.region,
-            instanceState: envelope.power?.instanceState
+            instanceState: envelope.power?.instanceState,
+            instanceType: envelope.power?.instanceType,
+            resizeOptions: envelope.power?.resizeOptions ?? [],
+            resize: envelope.power?.resize.map {
+                RelayMachinePowerState.Resize(targetType: $0.targetType, stage: $0.stage, error: $0.error)
+            }
         )
     }
 
@@ -208,6 +257,10 @@ final class RelayMachinePowerModel: ObservableObject {
 
     @Published private(set) var status: Status = .loading
     @Published private(set) var notice: String?
+    @Published private(set) var instanceType: String?
+    @Published private(set) var resizeOptions: [String] = []
+    @Published private(set) var resize: RelayMachinePowerState.Resize?
+    @Published private(set) var isSubmittingResize = false
 
     private var identityStore: ClientIdentityStore?
     private let powerClient: RelayMachinePowering
@@ -243,7 +296,7 @@ final class RelayMachinePowerModel: ObservableObject {
             let state = try await powerClient.state(nodeID: credential.nodeID, wakeToken: credential.token)
             guard readGeneration == generation else { return }
             apply(state)
-            notice = nil
+            if resize?.stage != "failed" { notice = nil }
         } catch let error as RelayMachinePowerError where error == .unconfigured || error == .unauthorized {
             guard readGeneration == generation else { return }
             status = .unavailable
@@ -258,7 +311,32 @@ final class RelayMachinePowerModel: ObservableObject {
         }
     }
 
+    func requestResize(to target: String) async {
+        guard let credential = identityStore?.wakeCredential(), let current = instanceType,
+              resizeOptions.contains(target), target != current else { return }
+        guard !isSubmittingResize && !isTransitioning && resize?.isActive != true else { return }
+        generation += 1
+        isSubmittingResize = true
+        defer { isSubmittingResize = false }
+        notice = nil
+        do {
+            apply(try await powerClient.resize(nodeID: credential.nodeID, wakeToken: credential.token,
+                                               from: current, to: target))
+        } catch {
+            await refresh()
+            notice = error.localizedDescription
+        }
+    }
+
+    func waitForResize() async {
+        while resize?.isActive == true && !Task.isCancelled {
+            do { try await Task.sleep(for: .seconds(5)) } catch { return }
+            await refresh()
+        }
+    }
+
     func start() async {
+        guard !isSubmittingResize && resize?.isActive != true else { return }
         guard let credential = identityStore?.wakeCredential() else {
             status = .unavailable
             return
@@ -297,6 +375,7 @@ final class RelayMachinePowerModel: ObservableObject {
     }
 
     func stop() async {
+        guard !isSubmittingResize && resize?.isActive != true else { return }
         guard let credential = identityStore?.wakeCredential() else {
             status = .unavailable
             return
@@ -331,6 +410,12 @@ final class RelayMachinePowerModel: ObservableObject {
     }
 
     private func apply(_ state: RelayMachinePowerState) {
+        instanceType = state.instanceType ?? instanceType
+        resizeOptions = state.resizeOptions.isEmpty ? resizeOptions : state.resizeOptions
+        resize = state.resize
+        if state.resize?.stage == "failed" {
+            notice = "Size change failed. Check the machine's power and try again."
+        }
         if state.isRunning {
             status = .on
         } else if state.isStarting {

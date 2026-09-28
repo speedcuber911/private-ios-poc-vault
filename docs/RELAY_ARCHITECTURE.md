@@ -312,14 +312,22 @@ control plane will touch. The phone receives `wakeToken` at pairing (or later
 via `GET /v1/power/credential` on the node) and, when the worker is
 unreachable, calls `POST /v1/power/:nodeId/start` with that bearer. After AWS
 reports `running` the phone talks to the machine the way it already did.
+`GET /v1/power/:nodeId` also returns the current EC2 instance type and sizes
+in its family. `POST /v1/power/:nodeId/resize` accepts `{expectedType,
+targetType}` from the paired phone. The cloud persists the operation and
+stops, changes, and restarts the worker (or leaves it stopped if it was already
+stopped); the phone need not remain open. A size change interrupts running
+work and may change the hourly EC2 cost. AWS makes the final compatibility and
+capacity decision. The app asks for confirmation before submitting it.
 
 Sign-in is not required. Compromising the control plane can boot or halt an
 allowlisted instance; it still cannot mint the pairing bearer or read jobs.
 
 Operator env on `poc-ec2`: `RELAY_POWER_INSTANCE_ALLOWLIST`, optional
 `RELAY_POWER_ENROLL_TOKEN`, `RELAY_POWER_AWS_REGION`. The instance role needs
-`ec2:StartInstances` / `StopInstances` / `DescribeInstances` on those instance
-ARNs. On the worker: `RELAYD_CLOUD_URL`, optional `RELAYD_POWER_INSTANCE_ID`
+`ec2:StartInstances` / `StopInstances` / `DescribeInstances` /
+`ModifyInstanceAttribute` on those instance ARNs, ideally restricted to the
+`instanceType` attribute. On the worker: `RELAYD_CLOUD_URL`, optional `RELAYD_POWER_INSTANCE_ID`
 (else IMDS), optional `RELAYD_POWER_ENROLL_TOKEN`.
 
 ## Known gaps

@@ -360,6 +360,9 @@ struct AccountSettingsView: View {
                 powerModel.configure(identityStore: identityStore)
                 await powerModel.refresh()
             }
+            .task(id: powerModel.resize?.stage) {
+                await powerModel.waitForResize()
+            }
         }
         .preferredColorScheme(.dark)
     }
@@ -409,6 +412,7 @@ struct AccountSettingsView: View {
                             confirmStop: { showingStopPower = true },
                             accessibilityIdentifier: "relay-settings-power"
                         )
+                        RelayMachineSizeControl(model: powerModel)
                         if let notice = powerModel.notice {
                             Text(notice)
                                 .font(AppTheme.uiFont(size: 13))
@@ -662,7 +666,7 @@ struct RelayMachinePowerSwitch: View {
                 Toggle("Power", isOn: binding)
                     .labelsHidden()
                     .tint(AppTheme.accent)
-                    .disabled(!model.status.canToggle)
+                    .disabled(!model.status.canToggle || model.isSubmittingResize || model.resize?.isActive == true)
                     .accessibilityIdentifier(accessibilityIdentifier)
             } else {
                 ProgressView()
@@ -690,5 +694,100 @@ struct RelayMachinePowerSwitch: View {
                 }
             }
         )
+    }
+}
+
+struct RelayMachineSizeControl: View {
+    @ObservedObject var model: RelayMachinePowerModel
+    @State private var selectedIndex = 0
+    @State private var showingConfirmation = false
+
+    private var options: [String] { model.resizeOptions }
+    private var selectedType: String? {
+        options.indices.contains(selectedIndex) ? options[selectedIndex] : nil
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Instance type")
+                    .font(AppTheme.uiFont(size: 17))
+                    .foregroundStyle(AppTheme.textPrimary)
+                Spacer()
+                Text(model.instanceType ?? "Unavailable")
+                    .font(AppTheme.monoFont(size: 14))
+                    .foregroundStyle(AppTheme.textSecondary)
+                    .accessibilityIdentifier("relay-instance-type")
+            }
+
+            if model.isSubmittingResize {
+                HStack(spacing: 8) {
+                    ProgressView()
+                    Text("Requesting size change…")
+                        .font(AppTheme.uiFont(size: 13))
+                        .foregroundStyle(AppTheme.textSecondary)
+                }
+            } else if let resize = model.resize, resize.isActive {
+                HStack(spacing: 8) {
+                    ProgressView()
+                    Text("Changing to \(resize.targetType) · \(stageText(resize.stage))")
+                        .font(AppTheme.uiFont(size: 13))
+                        .foregroundStyle(AppTheme.textSecondary)
+                }
+            } else if options.count > 1 {
+                HStack {
+                    Text(options.first ?? "")
+                    Spacer()
+                    Text(selectedType ?? "")
+                    Spacer()
+                    Text(options.last ?? "")
+                }
+                .font(AppTheme.monoFont(size: 12))
+                .foregroundStyle(AppTheme.textTertiary)
+                Slider(value: Binding(
+                    get: { Double(selectedIndex) },
+                    set: { selectedIndex = Int($0.rounded()) }
+                ), in: 0...Double(options.count - 1), step: 1)
+                .accessibilityLabel("Machine size")
+                .accessibilityValue(selectedType ?? "")
+                .accessibilityIdentifier("relay-instance-size-slider")
+                Button("Change to \(selectedType ?? "")") {
+                    showingConfirmation = true
+                }
+                .buttonStyle(RelayOutlineButtonStyle())
+                .disabled(selectedType == model.instanceType || model.isSubmittingResize)
+            }
+        }
+        .onAppear(perform: syncSelection)
+        .onChange(of: model.instanceType) { _, _ in syncSelection() }
+        .onChange(of: model.resizeOptions) { _, _ in syncSelection() }
+        .confirmationDialog(
+            "Change machine to \(selectedType ?? "this size")?",
+            isPresented: $showingConfirmation,
+            titleVisibility: .visible
+        ) {
+            if let target = selectedType, target != model.instanceType {
+                Button("Stop, resize and restart") {
+                    Task { await model.requestResize(to: target) }
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Running agent work will be interrupted. The machine will stop and restart; the new size may cost more or less.")
+        }
+    }
+
+    private func syncSelection() {
+        selectedIndex = options.firstIndex(of: model.instanceType ?? "") ?? 0
+    }
+
+    private func stageText(_ stage: String) -> String {
+        switch stage {
+        case "requested", "waiting_stop": return "stopping"
+        case "modifying": return "changing size"
+        case "waiting_start", "waiting_running": return "starting"
+        case "recovering", "recovery_wait": return "restoring power"
+        default: return "working"
+        }
     }
 }
