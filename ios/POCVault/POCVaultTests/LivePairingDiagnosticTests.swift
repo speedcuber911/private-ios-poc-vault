@@ -35,8 +35,15 @@ final class LivePairingDiagnosticTests: XCTestCase {
         return (trimmed?.isEmpty == false) ? trimmed : nil
     }
 
+    private func requireLink() throws -> String {
+        guard let link else {
+            throw XCTSkip("Write a fresh `relayd pair` link to \(Self.invitePath) to run this live diagnostic")
+        }
+        return link
+    }
+
     func testLiveInviteParses() throws {
-        let link = try XCTUnwrap(self.link, "write a fresh `relayd pair` link to /private/tmp/relay-pair-link.txt to run this")
+        let link = try requireLink()
         let invite = try RelayPairingInvite.parse(link)
         print("DIAG parsed: node=\(invite.nodeID) pair=\(invite.pairEndpoint) api=\(invite.apiBaseURL) pin=\(invite.caFingerprint)")
         XCTAssertFalse(invite.caFingerprint.isEmpty)
@@ -44,7 +51,7 @@ final class LivePairingDiagnosticTests: XCTestCase {
 
     /// The decisive one: does iOS complete the exchange?
     func testLivePairingExchange() async throws {
-        let link = try XCTUnwrap(self.link, "write a fresh `relayd pair` link to /private/tmp/relay-pair-link.txt to run this")
+        let link = try requireLink()
         let invite = try RelayPairingInvite.parse(link)
 
         // Before the app's own client runs, ask Security.framework directly what
@@ -71,7 +78,7 @@ final class LivePairingDiagnosticTests: XCTestCase {
     /// question is whether accepting the trust UNMODIFIED works where our
     /// anchor-pinned version does not.
     func testTrustVariants() async throws {
-        let link = try XCTUnwrap(self.link, "write a fresh `relayd pair` link to /private/tmp/relay-pair-link.txt to run this")
+        let link = try requireLink()
         let invite = try RelayPairingInvite.parse(link)
 
         for variant in [TrustVariant.acceptAnything, .pinnedAnchorsOnly, .pinnedNoAnchorRestriction] {
