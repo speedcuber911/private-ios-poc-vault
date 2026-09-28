@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { hashWakeToken } from "../src/power.js";
+import { instancePricing } from "../src/instance-pricing.js";
 import { createEc2Client, parseInstanceStates } from "../src/ec2.js";
 import { createDb } from "../src/db.js";
 import { startTestApp, api, makeNodeIdentity } from "./helpers.mjs";
@@ -315,6 +316,55 @@ test("paired phone reads the EC2 type and requests a durable same-series resize"
     const done = await api(t.baseUrl, "GET", path, { headers });
     assert.equal(done.json.power.instanceType, "t3.large");
     assert.equal(done.json.power.resize.stage, "complete");
+  } finally {
+    await t.close();
+  }
+});
+
+test("Mumbai m7i compute estimates use the 730-hour monthly basis", () => {
+  const pricing = instancePricing("ap-south-1", ["m7i.large", "m7i.2xlarge", "m7i.4xlarge"]);
+  assert.equal(pricing.currency, "USD");
+  assert.equal(pricing.basis, "linux-on-demand");
+  assert.equal(pricing.hoursPerMonth, 730);
+  assert.equal(pricing.hourlyUSD["m7i.2xlarge"], 0.4242);
+  assert.equal(pricing.hourlyUSD["m7i.2xlarge"] * pricing.hoursPerMonth, 309.666);
+  assert.equal(pricing.hourlyUSD["m7i.4xlarge"], 0.8484);
+  assert.equal(pricing.checkedAt, "2026-09-28");
+});
+
+test("unpriced regions and families return no compute estimate", () => {
+  assert.equal(instancePricing("us-east-1", ["m7i.2xlarge"]), null);
+  assert.equal(instancePricing("ap-south-1", ["t3.medium"]), null);
+  assert.equal(instancePricing("ap-south-1", ["m7i.2xlarge", "m7i.metal"]), null);
+  assert.equal(instancePricing("ap-south-1", []), null);
+});
+
+test("the authenticated machine route includes current and candidate m7i prices", async () => {
+  const t = await startPowerApp();
+  const path = "/v1/power/node-aabbccddeeff0011";
+  const headers = { authorization: `Bearer ${WAKE}` };
+  try {
+    assert.equal((await register(t, makeNodeIdentity())).status, 201);
+    t.ec2.types.set(INSTANCE, "m7i.2xlarge");
+    t.ec2.states.set(INSTANCE, "running");
+
+    const denied = await api(t.baseUrl, "GET", path);
+    assert.equal(denied.status, 401);
+
+    const described = await api(t.baseUrl, "GET", path, { headers });
+    assert.equal(described.status, 200);
+    assert.equal(described.json.power.instanceType, "m7i.2xlarge");
+    assert.equal(described.json.power.pricing.hourlyUSD["m7i.2xlarge"], 0.4242);
+    assert.equal(described.json.power.pricing.hourlyUSD["m7i.4xlarge"], 0.8484);
+    assert.equal(described.json.power.pricing.hoursPerMonth, 730);
+    assert.deepEqual(Object.keys(described.json.power.pricing.hourlyUSD), described.json.power.resizeOptions);
+
+    const accepted = await api(t.baseUrl, "POST", `${path}/resize`, {
+      headers, body: { expectedType: "m7i.2xlarge", targetType: "m7i.4xlarge" },
+    });
+    assert.equal(accepted.status, 202);
+    assert.equal(accepted.json.power.pricing.hourlyUSD["m7i.4xlarge"], 0.8484);
+    assert.equal(accepted.json.power.resize.wasRunning, true);
   } finally {
     await t.close();
   }

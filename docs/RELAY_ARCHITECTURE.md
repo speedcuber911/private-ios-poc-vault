@@ -313,12 +313,20 @@ via `GET /v1/power/credential` on the node) and, when the worker is
 unreachable, calls `POST /v1/power/:nodeId/start` with that bearer. After AWS
 reports `running` the phone talks to the machine the way it already did.
 `GET /v1/power/:nodeId` also returns the current EC2 instance type and sizes
-in its family. `POST /v1/power/:nodeId/resize` accepts `{expectedType,
+in its family. For `m7i` in `ap-south-1`, it also returns `pricing` with USD
+Linux On-Demand compute rates for every offered size, a 730-hour month basis,
+and the date the rates were checked. These static rates came from the AWS Price
+List `GetProducts` API on 2026-09-28. A displayed monthly amount assumes the
+instance runs for all 730 hours; it is an estimate of EC2 compute only and
+excludes EBS, data transfer, taxes, discounts, and other charges. Pricing for
+other regions or families is `null` until their rates are sourced. Operators
+should refresh the server-side rate table when AWS rates change.
+`POST /v1/power/:nodeId/resize` accepts `{expectedType,
 targetType}` from the paired phone. The cloud persists the operation and
 stops, changes, and restarts the worker (or leaves it stopped if it was already
 stopped); the phone need not remain open. A size change interrupts running
-work and may change the hourly EC2 cost. AWS makes the final compatibility and
-capacity decision. The app asks for confirmation before submitting it.
+work. AWS makes the final compatibility and capacity decision. The app asks
+for confirmation before submitting it.
 
 Sign-in is not required. Compromising the control plane can boot or halt an
 allowlisted instance; it still cannot mint the pairing bearer or read jobs.

@@ -12,6 +12,7 @@ import { createHash, timingSafeEqual, verify as cryptoVerify } from "node:crypto
 import { parseNodePubkey } from "./notify.js";
 import { EC2_INSTANCE_ID_RE } from "./config.js";
 import { createEc2Client } from "./ec2.js";
+import { instancePricing } from "./instance-pricing.js";
 
 const NODE_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 const REGION_RE = /^[a-z]{2}-[a-z]+-\d+$/;
@@ -129,6 +130,7 @@ export function createPower({
       originalType: row.original_type,
       stage: row.stage,
       error: row.error,
+      wasRunning: Boolean(row.was_running),
     } : null;
   }
 
@@ -265,6 +267,7 @@ export function createPower({
     try {
       const result = await client.describeInstances({ instanceIds: [row.instance_id] });
       const instance = result.instances?.[0];
+      const options = resizeOptions(instance?.instanceType);
       return {
         status: 200,
         body: {
@@ -272,7 +275,8 @@ export function createPower({
           power: publicPower(row, {
             instanceState: instance?.state || "unknown",
             instanceType: instance?.instanceType || null,
-            resizeOptions: resizeOptions(instance?.instanceType),
+            resizeOptions: options,
+            pricing: instancePricing(row.region, options),
             resize: publicResize(row.node_id),
           }),
         },
@@ -310,9 +314,11 @@ export function createPower({
           was_running = excluded.was_running, error = NULL,
           started_at = excluded.started_at, updated_at = excluded.updated_at`)
         .run(row.node_id, targetType, expectedType, instance.state === "running" ? 1 : 0, now(), now());
+      const options = resizeOptions(instance.instanceType);
       return { status: 202, body: { ok: true, power: publicPower(row, {
         instanceState: instance.state, instanceType: instance.instanceType,
-        resizeOptions: resizeOptions(instance.instanceType), resize: publicResize(row.node_id),
+        resizeOptions: options, pricing: instancePricing(row.region, options),
+        resize: publicResize(row.node_id),
       }) } };
     } catch (error) {
       log(`power aws resize request failed for ${row.node_id}: ${error?.message || error}`);

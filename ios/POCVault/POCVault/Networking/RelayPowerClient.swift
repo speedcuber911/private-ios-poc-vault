@@ -5,7 +5,20 @@ struct RelayMachinePowerState: Equatable {
         var targetType: String
         var stage: String
         var error: String?
+        var wasRunning: Bool? = nil
         var isActive: Bool { !["complete", "failed"].contains(stage) }
+    }
+
+    struct Pricing: Equatable {
+        var currency: String
+        var hoursPerMonth: Int
+        var checkedAt: String
+        var hourlyUSD: [String: Double]
+
+        func hourly(for instanceType: String) -> Double? { hourlyUSD[instanceType] }
+        func monthly(for instanceType: String) -> Double? {
+            hourly(for: instanceType).map { $0 * Double(hoursPerMonth) }
+        }
     }
 
     var nodeID: String
@@ -15,6 +28,7 @@ struct RelayMachinePowerState: Equatable {
     var instanceType: String? = nil
     var resizeOptions: [String] = []
     var resize: Resize? = nil
+    var pricing: Pricing? = nil
 
     var isRunning: Bool { instanceState == "running" }
     var isStopped: Bool {
@@ -170,10 +184,18 @@ final class RelayPowerClient: RelayMachinePowering {
                 var instanceState: String?
                 var instanceType: String?
                 var resizeOptions: [String]?
+                struct Pricing: Decodable {
+                    var currency: String
+                    var hoursPerMonth: Int
+                    var checkedAt: String
+                    var hourlyUSD: [String: Double]
+                }
+                var pricing: Pricing?
                 struct Resize: Decodable {
                     var targetType: String
                     var stage: String
                     var error: String?
+                    var wasRunning: Bool?
                 }
                 var resize: Resize?
             }
@@ -188,7 +210,12 @@ final class RelayPowerClient: RelayMachinePowering {
             instanceType: envelope.power?.instanceType,
             resizeOptions: envelope.power?.resizeOptions ?? [],
             resize: envelope.power?.resize.map {
-                RelayMachinePowerState.Resize(targetType: $0.targetType, stage: $0.stage, error: $0.error)
+                RelayMachinePowerState.Resize(targetType: $0.targetType, stage: $0.stage,
+                                              error: $0.error, wasRunning: $0.wasRunning)
+            },
+            pricing: envelope.power?.pricing.map {
+                RelayMachinePowerState.Pricing(currency: $0.currency, hoursPerMonth: $0.hoursPerMonth,
+                                               checkedAt: $0.checkedAt, hourlyUSD: $0.hourlyUSD)
             }
         )
     }
@@ -260,7 +287,9 @@ final class RelayMachinePowerModel: ObservableObject {
     @Published private(set) var instanceType: String?
     @Published private(set) var resizeOptions: [String] = []
     @Published private(set) var resize: RelayMachinePowerState.Resize?
+    @Published private(set) var pricing: RelayMachinePowerState.Pricing?
     @Published private(set) var isSubmittingResize = false
+    @Published private(set) var requestedResizeType: String?
 
     private var identityStore: ClientIdentityStore?
     private let powerClient: RelayMachinePowering
@@ -316,8 +345,12 @@ final class RelayMachinePowerModel: ObservableObject {
               resizeOptions.contains(target), target != current else { return }
         guard !isSubmittingResize && !isTransitioning && resize?.isActive != true else { return }
         generation += 1
+        requestedResizeType = target
         isSubmittingResize = true
-        defer { isSubmittingResize = false }
+        defer {
+            isSubmittingResize = false
+            requestedResizeType = nil
+        }
         notice = nil
         do {
             apply(try await powerClient.resize(nodeID: credential.nodeID, wakeToken: credential.token,
@@ -413,6 +446,10 @@ final class RelayMachinePowerModel: ObservableObject {
         instanceType = state.instanceType ?? instanceType
         resizeOptions = state.resizeOptions.isEmpty ? resizeOptions : state.resizeOptions
         resize = state.resize
+        // A full describe carries the current type. Clear an old quote when
+        // this type or region has no supported price; start/stop replies omit
+        // the type and should retain the last quote until the next read.
+        if state.instanceType != nil { pricing = state.pricing }
         if state.resize?.stage == "failed" {
             notice = "Size change failed. Check the machine's power and try again."
         }

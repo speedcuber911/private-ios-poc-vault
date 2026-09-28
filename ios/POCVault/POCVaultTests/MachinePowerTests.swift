@@ -188,6 +188,24 @@ final class MachinePowerTests: XCTestCase {
         }
     }
 
+    func testPowerClientReadsMonthlyComputeEstimateAndResizeProgress() async throws {
+        let client = RelayPowerClient(
+            baseURL: URL(string: "https://relay.example")!,
+            session: URLSession(configuration: urlSessionReturning(
+                status: 200,
+                body: #"{"ok":true,"power":{"nodeId":"node-abc","region":"ap-south-1","instanceState":"running","instanceType":"m7i.2xlarge","resizeOptions":["m7i.large","m7i.2xlarge","m7i.4xlarge"],"pricing":{"currency":"USD","hoursPerMonth":730,"checkedAt":"2026-09-28","hourlyUSD":{"m7i.large":0.10605,"m7i.2xlarge":0.4242,"m7i.4xlarge":0.8484}},"resize":{"targetType":"m7i.4xlarge","stage":"waiting_stop","wasRunning":true}}}"#
+            ))
+        )
+
+        let state = try await client.state(nodeID: "node-abc", wakeToken: "pairing-wake-token")
+        XCTAssertEqual(state.pricing?.hourly(for: "m7i.2xlarge"), 0.4242)
+        XCTAssertEqual(state.pricing?.monthly(for: "m7i.2xlarge") ?? 0, 309.666, accuracy: 0.0001)
+        XCTAssertEqual(state.pricing?.monthly(for: "m7i.4xlarge") ?? 0, 619.332, accuracy: 0.0001)
+        XCTAssertNil(state.pricing?.monthly(for: "m7i.8xlarge"))
+        XCTAssertEqual(state.resize?.stage, "waiting_stop")
+        XCTAssertEqual(state.resize?.wasRunning, true)
+    }
+
     private func urlSessionReturning(status: Int, body: String) -> URLSessionConfiguration {
         MockPowerURLProtocol.status = status
         MockPowerURLProtocol.body = Data(body.utf8)

@@ -206,6 +206,7 @@ struct RelayMachineMonitorView: View {
         } message: {
             Text("Runs stop. Pairing stays on disk. Start it again from this phone when you need it.")
         }
+        .modifier(RelayResizeProgressPresenter(model: powerModel))
         .preferredColorScheme(.dark)
     }
 

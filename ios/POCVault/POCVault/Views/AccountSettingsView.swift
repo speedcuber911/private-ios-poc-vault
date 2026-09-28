@@ -363,6 +363,7 @@ struct AccountSettingsView: View {
             .task(id: powerModel.resize?.stage) {
                 await powerModel.waitForResize()
             }
+            .modifier(RelayResizeProgressPresenter(model: powerModel))
         }
         .preferredColorScheme(.dark)
     }
@@ -706,9 +707,19 @@ struct RelayMachineSizeControl: View {
     private var selectedType: String? {
         options.indices.contains(selectedIndex) ? options[selectedIndex] : nil
     }
+    private var currentHourly: Double? {
+        model.instanceType.flatMap { model.pricing?.hourly(for: $0) }
+    }
+    private var currentMonthly: Double? {
+        model.instanceType.flatMap { model.pricing?.monthly(for: $0) }
+    }
+    private var selectedMonthly: Double? {
+        selectedType.flatMap { model.pricing?.monthly(for: $0) }
+    }
+    private var hoursPerMonth: Int { model.pricing?.hoursPerMonth ?? 730 }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline) {
                 Text("Instance type")
                     .font(AppTheme.uiFont(size: 17))
@@ -718,6 +729,28 @@ struct RelayMachineSizeControl: View {
                     .font(AppTheme.monoFont(size: 14))
                     .foregroundStyle(AppTheme.textSecondary)
                     .accessibilityIdentifier("relay-instance-type")
+            }
+
+            if let currentHourly, let currentMonthly {
+                HStack(alignment: .firstTextBaseline, spacing: 7) {
+                    Text(monthlyPrice(currentMonthly))
+                        .font(AppTheme.serifFont(size: 22))
+                        .foregroundStyle(AppTheme.textPrimary)
+                    Text("/ month")
+                        .font(AppTheme.uiFont(size: 13))
+                        .foregroundStyle(AppTheme.textSecondary)
+                    Spacer(minLength: 8)
+                    Text("\(hourlyPrice(currentHourly))/hr")
+                        .font(AppTheme.monoFont(size: 12))
+                        .foregroundStyle(AppTheme.textSecondary)
+                }
+                Text("EC2 compute · \(hoursPerMonth) running hours/month")
+                    .font(AppTheme.uiFont(size: 12))
+                    .foregroundStyle(AppTheme.textTertiary)
+            } else if model.instanceType != nil {
+                Text("Compute price unavailable for this series and region")
+                    .font(AppTheme.uiFont(size: 12))
+                    .foregroundStyle(AppTheme.textTertiary)
             }
 
             if model.isSubmittingResize {
@@ -738,8 +771,6 @@ struct RelayMachineSizeControl: View {
                 HStack {
                     Text(options.first ?? "")
                     Spacer()
-                    Text(selectedType ?? "")
-                    Spacer()
                     Text(options.last ?? "")
                 }
                 .font(AppTheme.monoFont(size: 12))
@@ -751,11 +782,45 @@ struct RelayMachineSizeControl: View {
                 .accessibilityLabel("Machine size")
                 .accessibilityValue(selectedType ?? "")
                 .accessibilityIdentifier("relay-instance-size-slider")
-                Button("Change to \(selectedType ?? "")") {
-                    showingConfirmation = true
+
+                if let selectedType, selectedType != model.instanceType {
+                    HStack(alignment: .firstTextBaseline, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(selectedType)
+                                .font(AppTheme.uiFont(size: 16, weight: .medium))
+                                .foregroundStyle(AppTheme.textPrimary)
+                            if let selectedMonthly {
+                                Text("\(monthlyPrice(selectedMonthly)) / month")
+                                    .font(AppTheme.uiFont(size: 13))
+                                    .foregroundStyle(AppTheme.textSecondary)
+                            } else {
+                                Text("Price temporarily unavailable")
+                                    .font(AppTheme.uiFont(size: 13))
+                                    .foregroundStyle(AppTheme.textSecondary)
+                            }
+                        }
+                        Spacer(minLength: 6)
+                        if let currentMonthly, let selectedMonthly {
+                            Text(monthlyDifference(selectedMonthly - currentMonthly))
+                                .font(AppTheme.monoFont(size: 12, weight: .medium))
+                                .foregroundStyle(AppTheme.accent)
+                        }
+                    }
+                    .padding(.vertical, 3)
+
+                    Button("Change to \(selectedType)") {
+                        showingConfirmation = true
+                    }
+                    .buttonStyle(RelayOutlineButtonStyle())
+                    .disabled(model.isSubmittingResize)
                 }
-                .buttonStyle(RelayOutlineButtonStyle())
-                .disabled(selectedType == model.instanceType || model.isSubmittingResize)
+
+                if model.pricing != nil {
+                    Text("AWS Linux On-Demand estimate · storage, data and tax are extra")
+                        .font(AppTheme.uiFont(size: 11))
+                        .foregroundStyle(AppTheme.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
         .onAppear(perform: syncSelection)
@@ -767,18 +832,50 @@ struct RelayMachineSizeControl: View {
             titleVisibility: .visible
         ) {
             if let target = selectedType, target != model.instanceType {
-                Button("Stop, resize and restart") {
+                Button(model.status == .off ? "Change size" : "Stop and change size") {
                     Task { await model.requestResize(to: target) }
                 }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Running agent work will be interrupted. The machine will stop and restart; the new size may cost more or less.")
+            Text(confirmationDetail)
         }
     }
 
     private func syncSelection() {
         selectedIndex = options.firstIndex(of: model.instanceType ?? "") ?? 0
+    }
+
+    private var confirmationDetail: String {
+        let interruption = model.status == .off
+            ? "The machine will remain stopped after the change."
+            : "Running agent work will be interrupted while the machine stops and restarts."
+        guard let currentMonthly, let selectedMonthly else {
+            return "\(interruption) The compute price is temporarily unavailable."
+        }
+        return "\(interruption) EC2 compute at \(hoursPerMonth) running hours: \(monthlyPrice(currentMonthly)) → \(monthlyPrice(selectedMonthly)) per month (\(monthlyDifference(selectedMonthly - currentMonthly))). Storage and taxes are extra."
+    }
+
+    private func monthlyPrice(_ value: Double) -> String {
+        price(value, minimumDigits: 2, maximumDigits: 2)
+    }
+
+    private func hourlyPrice(_ value: Double) -> String {
+        price(value, minimumDigits: 2, maximumDigits: 5)
+    }
+
+    private func price(_ value: Double, minimumDigits: Int, maximumDigits: Int) -> String {
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.numberStyle = .currency
+        formatter.currencyCode = "USD"
+        formatter.minimumFractionDigits = minimumDigits
+        formatter.maximumFractionDigits = maximumDigits
+        return formatter.string(from: NSNumber(value: value)) ?? "$\(value)"
+    }
+
+    private func monthlyDifference(_ value: Double) -> String {
+        "\(value >= 0 ? "+" : "−")\(monthlyPrice(abs(value)))/mo"
     }
 
     private func stageText(_ stage: String) -> String {
@@ -788,6 +885,145 @@ struct RelayMachineSizeControl: View {
         case "waiting_start", "waiting_running": return "starting"
         case "recovering", "recovery_wait": return "restoring power"
         default: return "working"
+        }
+    }
+}
+
+struct RelayResizeProgressPresenter: ViewModifier {
+    @ObservedObject var model: RelayMachinePowerModel
+    @State private var isPresented = false
+
+    func body(content: Content) -> some View {
+        content
+            .fullScreenCover(isPresented: $isPresented) {
+                RelayMachineResizeProgressView(model: model)
+                    .interactiveDismissDisabled()
+                    .presentationBackground(.ultraThinMaterial)
+            }
+            .onAppear(perform: syncPresentation)
+            .onChange(of: model.isSubmittingResize) { _, _ in syncPresentation() }
+            .onChange(of: model.resize?.stage) { _, _ in syncPresentation() }
+    }
+
+    private func syncPresentation() {
+        isPresented = model.isSubmittingResize || model.resize?.isActive == true
+    }
+}
+
+private struct RelayMachineResizeProgressView: View {
+    @ObservedObject var model: RelayMachinePowerModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isAnimating = false
+
+    private var stage: String { model.resize?.stage ?? "requested" }
+    private var target: String { model.resize?.targetType ?? model.requestedResizeType ?? "new size" }
+    private var wasRunning: Bool { model.resize?.wasRunning != false }
+    private var isRecovering: Bool { stage == "recovering" || stage == "recovery_wait" }
+    private var steps: [String] {
+        if !wasRunning { return ["Preparing change", "Changing instance type"] }
+        return ["Stopping machine", "Changing instance type", "Starting machine", "Waiting for machine"]
+    }
+    private var activeStep: Int {
+        if !wasRunning { return stage == "modifying" ? 1 : 0 }
+        switch stage {
+        case "modifying": return 1
+        case "waiting_start", "recovering": return 2
+        case "waiting_running", "recovery_wait": return 3
+        default: return 0
+        }
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.56).ignoresSafeArea()
+            VStack(alignment: .leading, spacing: 0) {
+                RelayCapsLabel(text: "Relay · Machine", color: AppTheme.accent, size: 11)
+                Spacer(minLength: 28)
+
+                ZStack {
+                    Circle()
+                        .stroke(AppTheme.accent.opacity(0.17), lineWidth: 2)
+                    Circle()
+                        .trim(from: 0.06, to: 0.31)
+                        .stroke(AppTheme.accent, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                        .rotationEffect(.degrees(isAnimating ? 360 : 0))
+                        .animation(reduceMotion ? nil : .linear(duration: 1.8).repeatForever(autoreverses: false), value: isAnimating)
+                    Image(systemName: "server.rack")
+                        .font(.system(size: 28, weight: .light))
+                        .foregroundStyle(AppTheme.textPrimary)
+                }
+                .frame(width: 94, height: 94)
+                .accessibilityHidden(true)
+
+                Text(stageTitle)
+                    .font(AppTheme.serifFont(size: 32))
+                    .foregroundStyle(AppTheme.textPrimary)
+                    .padding(.top, 30)
+                Text(isRecovering
+                     ? "The size change hit a problem. Relay is bringing your machine back."
+                     : "Moving to \(target). Your machine will be unavailable during this change.")
+                    .font(AppTheme.uiFont(size: 16))
+                    .foregroundStyle(AppTheme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 9)
+
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(steps.indices, id: \.self) { index in
+                        HStack(spacing: 17) {
+                            ZStack {
+                                Circle()
+                                    .stroke(index == activeStep ? AppTheme.accent : AppTheme.hairlineStrong, lineWidth: 1.5)
+                                    .frame(width: 28, height: 28)
+                                if index < activeStep {
+                                    Image(systemName: "checkmark")
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .foregroundStyle(AppTheme.textSecondary)
+                                } else if index == activeStep {
+                                    Circle()
+                                        .fill(AppTheme.accent)
+                                        .frame(width: 7, height: 7)
+                                }
+                            }
+                            Text(isRecovering && index == activeStep ? "Restoring power" : steps[index])
+                                .font(AppTheme.uiFont(size: 16, weight: index == activeStep ? .medium : .regular))
+                                .foregroundStyle(index == activeStep ? AppTheme.textPrimary : AppTheme.textTertiary)
+                            Spacer()
+                        }
+                        .frame(height: 56)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityAddTraits(index == activeStep ? .updatesFrequently : [])
+                    }
+                }
+                .padding(.top, 31)
+
+                Spacer(minLength: 28)
+                Text("This usually takes a few minutes. Relay is checking the machine as it changes.")
+                    .font(AppTheme.uiFont(size: 13))
+                    .foregroundStyle(AppTheme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.horizontal, 32)
+            .padding(.top, 36)
+            .padding(.bottom, 38)
+            .frame(maxWidth: 480, maxHeight: .infinity, alignment: .leading)
+        }
+        .tint(AppTheme.accent)
+        .preferredColorScheme(.dark)
+        .task(id: model.resize?.stage) {
+            await model.waitForResize()
+        }
+        .onAppear { isAnimating = true }
+    }
+
+    private var stageTitle: String {
+        if model.isSubmittingResize { return "Preparing size change" }
+        switch stage {
+        case "requested", "waiting_stop": return wasRunning ? "Stopping machine" : "Preparing machine"
+        case "modifying": return "Changing instance type"
+        case "waiting_start": return "Starting machine"
+        case "waiting_running": return "Waiting for machine"
+        case "recovering", "recovery_wait": return "Restoring machine power"
+        default: return "Changing machine size"
         }
     }
 }
