@@ -173,6 +173,25 @@ enum CodexDiagnostics {
     }
 }
 
+/// A latency budget for one list request that must not hold a screen.
+///
+/// Every existing call passes none and keeps the client's defaults: a 45-second
+/// request timeout and, when the machine looks unreachable, the wake cycle
+/// (power on, wait for AWS, wait for `/healthz` — up to two and a half
+/// minutes). A list that polls every few seconds wants neither: a machine that
+/// has gone quiet should fail that call in seconds so the screen can say so,
+/// and a poll should never be what powers a machine on.
+struct CodexRequestBudget: Equatable {
+    /// Seconds the request may sit idle before URLSession fails it.
+    var timeout: TimeInterval
+    /// Whether an unreachable machine starts the wake cycle before the call
+    /// gives up.
+    var allowsMachineWake: Bool
+
+    /// Background list polls (the Chats list and the completion monitor).
+    static let listPoll = CodexRequestBudget(timeout: 12, allowsMachineWake: false)
+}
+
 final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
     /// The node this client talks to. Mutable so adopting a trial machine can
     /// repoint every store that already holds this client (chat, status feed,
@@ -543,7 +562,14 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         return try decoder.decode(CodexWorkspace.self, from: data)
     }
 
-    func fetchJobs(provider: CodexProvider? = nil, workspaceID: String? = nil, limit: Int = 50) async throws -> [CodexJob] {
+    /// `budget` is for list polls that must not hold a screen (Chats); nil keeps
+    /// the client defaults every other caller relies on.
+    func fetchJobs(
+        provider: CodexProvider? = nil,
+        workspaceID: String? = nil,
+        limit: Int = 50,
+        budget: CodexRequestBudget? = nil
+    ) async throws -> [CodexJob] {
         var queryItems = [
             URLQueryItem(name: "limit", value: String(limit))
         ]
@@ -552,11 +578,23 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         }
         appendProvider(provider, to: &queryItems)
 
-        let data = try await perform(path: "/v1/codex/jobs", queryItems: queryItems)
+        let data = try await perform(
+            path: "/v1/codex/jobs",
+            queryItems: queryItems,
+            timeout: budget?.timeout,
+            allowWake: budget?.allowsMachineWake ?? true
+        )
         return try decoder.decode(CodexListEnvelope<CodexJob>.self, from: data).values
     }
 
-    func fetchThreads(provider: CodexProvider? = nil, workspaceID: String? = nil, limit: Int = 50) async throws -> [CodexThread] {
+    /// `budget` is for list polls that must not hold a screen (Chats); nil keeps
+    /// the client defaults every other caller relies on.
+    func fetchThreads(
+        provider: CodexProvider? = nil,
+        workspaceID: String? = nil,
+        limit: Int = 50,
+        budget: CodexRequestBudget? = nil
+    ) async throws -> [CodexThread] {
         var queryItems = [
             URLQueryItem(name: "limit", value: String(limit))
         ]
@@ -565,7 +603,12 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         }
         appendProvider(provider, to: &queryItems)
 
-        let data = try await perform(path: "/v1/codex/threads", queryItems: queryItems)
+        let data = try await perform(
+            path: "/v1/codex/threads",
+            queryItems: queryItems,
+            timeout: budget?.timeout,
+            allowWake: budget?.allowsMachineWake ?? true
+        )
         return try decoder.decode(CodexListEnvelope<CodexThread>.self, from: data).values
     }
 
@@ -610,20 +653,29 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         return try decoder.decode(CodexCreateJobResponse.self, from: responseData)
     }
 
-    func fetchApprovals(jobID: String? = nil, pendingOnly: Bool = false) async throws -> [CodexApproval] {
+    func fetchApprovals(
+        jobID: String? = nil,
+        pendingOnly: Bool = false,
+        budget: CodexRequestBudget? = nil
+    ) async throws -> [CodexApproval] {
         var query: [URLQueryItem] = []
         if let jobID { query.append(URLQueryItem(name: "jobId", value: jobID)) }
         if pendingOnly { query.append(URLQueryItem(name: "status", value: "pending")) }
-        let data = try await perform(path: "/v1/codex/approvals", queryItems: query)
+        let data = try await perform(
+            path: "/v1/codex/approvals",
+            queryItems: query,
+            timeout: budget?.timeout,
+            allowWake: budget?.allowsMachineWake ?? true
+        )
         return try decoder.decode(CodexListEnvelope<CodexApproval>.self, from: data).values
     }
 
     /// Approval inboxes were added after the first Relay job API. An older linked
     /// computer answers its route fallback with a generic 404; that means there is
     /// no inbox to show, not that loading the otherwise-valid Sessions screen failed.
-    func fetchPendingApprovalsIfSupported() async throws -> [CodexApproval] {
+    func fetchPendingApprovalsIfSupported(budget: CodexRequestBudget? = nil) async throws -> [CodexApproval] {
         do {
-            return try await fetchApprovals(pendingOnly: true)
+            return try await fetchApprovals(pendingOnly: true, budget: budget)
         } catch let error as CodexClientError where error.isGenericRouteNotFound {
             return []
         }
@@ -1173,6 +1225,7 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         contentType: String = "application/json",
         additionalHeaders: [String: String] = [:],
         cachePolicy: URLRequest.CachePolicy? = nil,
+        timeout: TimeInterval? = nil,
         allowWake: Bool = true
     ) async throws -> Data {
         try await performWithResponse(
@@ -1183,6 +1236,7 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
             contentType: contentType,
             additionalHeaders: additionalHeaders,
             cachePolicy: cachePolicy,
+            timeout: timeout,
             allowWake: allowWake
         ).data
     }
@@ -1198,6 +1252,7 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         accept: String = "application/json",
         additionalHeaders: [String: String] = [:],
         cachePolicy: URLRequest.CachePolicy? = nil,
+        timeout: TimeInterval? = nil,
         allowWake: Bool = true
     ) async throws -> (data: Data, response: HTTPURLResponse) {
         let url = endpoint(path: path, queryItems: queryItems)
@@ -1215,7 +1270,7 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         var request = URLRequest(url: url)
         applyDeviceToken(to: &request, url: url)
         request.httpMethod = method
-        request.timeoutInterval = 45
+        request.timeoutInterval = timeout ?? 45
         if let cachePolicy {
             request.cachePolicy = cachePolicy
         }

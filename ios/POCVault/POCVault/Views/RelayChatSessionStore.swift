@@ -24,7 +24,9 @@ struct RelayChatLaunch: Identifiable {
 ///   active job are pinned and skipped by eviction.
 /// - Owns the app-wide ~2 s monitor loop that replaces the old per-tab monitors, and
 ///   feeds `CodexCompletionNotifying` so job/thread completion notifications keep firing
-///   now that the console view models have been deleted.
+///   now that the console view models have been deleted. The app-wide jobs and threads it
+///   watches come from the Chats feed (`activityFeed`), which is the one owner of those
+///   requests; the monitor never issues its own copy.
 @MainActor
 final class RelayChatSessionStore: ObservableObject {
     nonisolated static let defaultCapacity = 6
@@ -33,6 +35,9 @@ final class RelayChatSessionStore: ObservableObject {
 
     private let client: CodexClient
     private let completionNotifier: CodexCompletionNotifying
+    /// Source of the app-wide jobs and threads the completion monitor watches. Nil
+    /// leaves only the per-chat refresh running (tests, previews).
+    private let activityFeed: RelayActivityFeedProviding?
     /// Injectable so eviction tests can pin arbitrary view models; the default pins any
     /// VM with a live chat stream or an active job in its conversation.
     private let isPinned: @MainActor (RelayChatViewModel) -> Bool
@@ -47,16 +52,18 @@ final class RelayChatSessionStore: ObservableObject {
     private var notifiedCompletionKeys: Set<String> = []
     private var lastDiscoveryAt = Date.distantPast
     /// While nothing looks active yet, still look often enough that a session
-    /// started on the machine is noticed and then followed at the 2s cadence.
+    /// started on the machine is noticed and then followed.
     private static let idleDiscoveryInterval: TimeInterval = 8
-
-    /// Publishes the monitor's jobs and threads to Chats. The list used to update
-    /// only when the tab was reopened, so work started on the machine stayed hidden.
-    var onActivitySnapshot: (([CodexJob], [CodexThread]) -> Void)?
+    /// How old an answer from the Chats feed the monitor accepts before asking it
+    /// to refresh. With the 2 s tick this caps app-wide list traffic at roughly one
+    /// jobs+threads round trip every 4 s while work is active, and lets a Chats
+    /// poll that just landed stand in for the monitor's own.
+    nonisolated static let activityFeedMaxAge: TimeInterval = 3
 
     init(
         client: CodexClient,
         completionNotifier: CodexCompletionNotifying = CodexNoopCompletionNotifier(),
+        activityFeed: RelayActivityFeedProviding? = nil,
         capacity: Int = RelayChatSessionStore.defaultCapacity,
         isPinned: @escaping @MainActor (RelayChatViewModel) -> Bool = { viewModel in
             viewModel.isStreaming || viewModel.hasActiveConversationJob
@@ -64,6 +71,7 @@ final class RelayChatSessionStore: ObservableObject {
     ) {
         self.client = client
         self.completionNotifier = completionNotifier
+        self.activityFeed = activityFeed
         self.capacity = max(1, capacity)
         self.isPinned = isPinned
     }
@@ -181,9 +189,9 @@ final class RelayChatSessionStore: ObservableObject {
     /// Single app-open monitor loop (replaces the console view models' per-provider
     /// monitors and the Task tab's visibility-tied polling). Every ~2 s it lets each
     /// cached VM refresh its active job cards, and — while any work is observed active —
-    /// polls jobs/threads app-wide so completion notifications fire even when no chat
-    /// cover is on screen. Started from the root `.task`, guarded by
-    /// `CodexAgentMonitorPolicy.shouldStartAppMonitor`.
+    /// reads app-wide jobs/threads through the Chats feed so completion notifications
+    /// fire even when no chat cover is on screen. Started from the root `.task`, guarded
+    /// by `CodexAgentMonitorPolicy.shouldStartAppMonitor`.
     func monitorActiveWorkWhileAppIsOpen() async {
         await pollOnce(force: true)
         while !Task.isCancelled {
@@ -216,15 +224,15 @@ final class RelayChatSessionStore: ObservableObject {
         await refreshCompletionFeed()
     }
 
+    /// The Chats feed owns the app-wide jobs and threads requests. Reading through it
+    /// means a Chats poll and a monitor tick never fetch the same 200 threads twice, and
+    /// what the monitor sees is exactly what the list shows.
     private func refreshCompletionFeed() async {
-        do {
-            let jobs = try await client.fetchJobs(provider: nil, workspaceID: nil, limit: 30)
-            let threads = try await client.fetchThreads(provider: nil, workspaceID: nil, limit: 200)
-            onActivitySnapshot?(jobs, threads)
-            await handleCompletionCandidates(jobs: jobs, threads: threads)
-        } catch {
+        guard let snapshot = await activityFeed?.activitySnapshot(maxAge: Self.activityFeedMaxAge) else {
             // Offline/transient failures just skip a beat; the next tick retries.
+            return
         }
+        await handleCompletionCandidates(jobs: snapshot.jobs, threads: snapshot.threads)
     }
 
     private func handleCompletionCandidates(jobs: [CodexJob], threads: [CodexThread]) async {

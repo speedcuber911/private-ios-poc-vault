@@ -80,8 +80,7 @@ struct FileBrowserView: View {
         .toolbarBackground(AppTheme.canvasBottom, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
         .refreshable {
-            await viewModel.refresh()
-            if activeSection == .chats { await viewModel.refreshConversations() }
+            await viewModel.refresh(includingConversations: activeSection == .chats)
         }
         .task { await viewModel.loadIfNeeded() }
         .task(id: scenePhase) {
@@ -89,10 +88,11 @@ struct FileBrowserView: View {
             await viewModel.watchGitStatus()
         }
         .task(id: activeSection) {
+            viewModel.isListingVisible = activeSection == .files
             guard activeSection == .chats else { return }
             while !Task.isCancelled {
                 await viewModel.refreshConversations()
-                try? await Task.sleep(for: .seconds(4))
+                try? await Task.sleep(for: FileBrowserViewModel.conversationPollInterval)
             }
         }
         .onChange(of: selectedSection) { _, _ in
@@ -299,8 +299,7 @@ struct FileBrowserView: View {
         case .files:
             return viewModel.listing == nil ? nil : displayedEntries.count
         case .chats:
-            guard !viewModel.isLoadingConversations else { return nil }
-            return viewModel.conversations.isEmpty ? nil : viewModel.conversations.count
+            return viewModel.conversationCount
         }
     }
 
@@ -325,7 +324,9 @@ struct FileBrowserView: View {
     private var conversationList: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
-                if let error = viewModel.conversationError ?? viewModel.errorMessage {
+                // An error sits above whatever this folder last showed; it never
+                // replaces a list that already loaded.
+                if let error = conversationListError {
                     FileBrowserErrorBanner(text: error)
                         .padding(.horizontal, 16)
                         .padding(.top, 14)
@@ -339,44 +340,55 @@ struct FileBrowserView: View {
                     .foregroundStyle(AppTheme.statusError)
                     .padding(.horizontal, 18)
                     .padding(.top, 10)
-                } else if viewModel.isLoading || viewModel.isResolvingWorkspace || viewModel.isLoadingConversations {
+                }
+                if viewModel.showsConversationSpinner {
                     ProgressView("Loading chats…")
                         .tint(AppTheme.accent)
                         .frame(maxWidth: .infinity)
                         .padding(.top, 64)
-                } else if filteredConversations.isEmpty {
-                    VStack(spacing: 10) {
-                        Image(systemName: viewModel.searchText.isEmpty ? "bubble.left" : "magnifyingglass")
-                            .font(.system(size: 26, weight: .regular))
-                            .foregroundStyle(AppTheme.textTertiary)
-                        Text(viewModel.searchText.isEmpty ? "No chats in this folder" : "No matching chats")
-                            .font(AppTheme.uiFont(size: 17, weight: .medium))
-                            .foregroundStyle(AppTheme.textPrimary)
-                        if viewModel.searchText.isEmpty {
-                            Button("Start a chat") {
-                                onOpenChat(viewModel.path, viewModel.workspace?.id)
+                } else if viewModel.hasLoadedConversations {
+                    if !filteredConversations.isEmpty {
+                        ForEach(filteredConversations) { item in
+                            Button { onOpenConversation(item) } label: {
+                                RelayConversationRow(item: item).padding(.horizontal, 18)
                             }
-                            .font(AppTheme.uiFont(size: 14, weight: .semibold))
-                            .foregroundStyle(AppTheme.accentBright)
-                            .padding(.top, 2)
+                            .buttonStyle(FileBrowserRowButtonStyle())
                         }
-                    }
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, 28)
-                    .padding(.top, 58)
-                } else {
-                    ForEach(filteredConversations) { item in
-                        Button { onOpenConversation(item) } label: {
-                            RelayConversationRow(item: item).padding(.horizontal, 18)
-                        }
-                        .buttonStyle(FileBrowserRowButtonStyle())
+                    } else if conversationListError == nil {
+                        conversationEmptyState
                     }
                 }
             }
             .padding(.bottom, 20)
         }
         .scrollDismissesKeyboard(.interactively)
+    }
+
+    private var conversationListError: String? {
+        viewModel.conversationError ?? viewModel.errorMessage
+    }
+
+    private var conversationEmptyState: some View {
+        VStack(spacing: 10) {
+            Image(systemName: viewModel.searchText.isEmpty ? "bubble.left" : "magnifyingglass")
+                .font(.system(size: 26, weight: .regular))
+                .foregroundStyle(AppTheme.textTertiary)
+            Text(viewModel.searchText.isEmpty ? "No chats in this folder" : "No matching chats")
+                .font(AppTheme.uiFont(size: 17, weight: .medium))
+                .foregroundStyle(AppTheme.textPrimary)
+            if viewModel.searchText.isEmpty {
+                Button("Start a chat") {
+                    onOpenChat(viewModel.path, viewModel.workspace?.id)
+                }
+                .font(AppTheme.uiFont(size: 14, weight: .semibold))
+                .foregroundStyle(AppTheme.accentBright)
+                .padding(.top, 2)
+            }
+        }
+        .multilineTextAlignment(.center)
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 28)
+        .padding(.top, 58)
     }
 
     private var filteredConversations: [CodexThreadFeedItem] {
@@ -395,7 +407,7 @@ struct FileBrowserView: View {
                         .padding(.top, 14)
                 }
                 if displayedEntries.isEmpty {
-                    if viewModel.isLoading {
+                    if viewModel.showsListingSpinner {
                         ProgressView().tint(AppTheme.accent).padding(.top, 64)
                     } else if viewModel.errorMessage == nil {
                         emptyState

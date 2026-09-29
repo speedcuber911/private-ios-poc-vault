@@ -35,6 +35,8 @@ struct POCVaultApp: App {
 
         _identityStore = StateObject(wrappedValue: identityStore)
         _nodeStore = StateObject(wrappedValue: nodeStore)
+        // Seeds synchronously from this machine's saved Chats snapshot, so the
+        // list paints on the first frame of a cold launch.
         let statusFeedViewModel = StatusFeedViewModel(client: codexClient)
         let chatSessionStore = RelayChatSessionStore(
             client: codexClient,
@@ -44,11 +46,11 @@ struct POCVaultApp: App {
 #else
                 CodexLocalNotificationService()
 #endif
-            }()
+            }(),
+            // The Chats feed is the one owner of the app-wide jobs/threads
+            // requests; the completion monitor reads through it.
+            activityFeed: statusFeedViewModel
         )
-        chatSessionStore.onActivitySnapshot = { jobs, threads in
-            statusFeedViewModel.apply(jobs: jobs, threads: threads)
-        }
         _chatSessionStore = StateObject(wrappedValue: chatSessionStore)
         _statusFeedViewModel = StateObject(wrappedValue: statusFeedViewModel)
         _accountStore = StateObject(wrappedValue: accountStore)
@@ -67,6 +69,13 @@ struct POCVaultApp: App {
             // per body evaluation leaked a URLSession every time SwiftUI re-ran it.
             .onChange(of: nodeStore.effectiveBaseURL, initial: true) { _, newBaseURL in
                 codexClient.retarget(baseURL: newBaseURL)
+                statusFeedViewModel.switchMachine(to: newBaseURL)
+            }
+            // A machine unpaired from this phone (or replaced by another
+            // pairing) takes its saved Chats list with it.
+            .onChange(of: nodeStore.pairedNode?.apiBaseURL) { previousURL, currentURL in
+                guard let previousURL, previousURL != currentURL else { return }
+                statusFeedViewModel.forgetSnapshot(for: previousURL)
             }
             .task {
                 await accountStore.restore()
@@ -178,6 +187,13 @@ private enum RelayRootTab: Hashable {
     case previews
     case sessions
     case settings
+}
+
+/// When the Chats list is on screen, and so worth polling.
+private struct RelayChatsPolling: Equatable {
+    let tab: RelayRootTab
+    let sceneIsActive: Bool
+    let chatIsOpen: Bool
 }
 
 private struct RelayTerminalLaunch: Identifiable {
@@ -337,17 +353,19 @@ struct POCVaultRootView: View {
             guard !foldersAreHiddenAfterComputerDisconnect, shouldStartAgentMonitor else { return }
             await chatSessionStore.monitorActiveWorkWhileAppIsOpen()
         }
-        .task(id: selectedRootTab) {
-            // Sessions is a live view, not a one-time snapshot. Refresh on entry, then
+        .task(id: RelayChatsPolling(
+            tab: selectedRootTab,
+            sceneIsActive: scenePhase == .active,
+            chatIsOpen: chatLaunch != nil
+        )) {
+            // Chats is a live view, not a one-time snapshot. Refresh on entry, then
             // keep polling so a Codex, Claude Code, or Cursor session started on the
-            // machine shows up while this tab is open.
+            // machine shows up — but only while the list is actually on screen: its
+            // tab selected, the app active, and no chat covering it. Leaving any of
+            // those cancels this task and the poll with it.
             guard selectedRootTab == .sessions else { return }
-            await statusFeedViewModel.refresh()
-            while !Task.isCancelled, selectedRootTab == .sessions {
-                try? await Task.sleep(for: .seconds(2))
-                guard !Task.isCancelled, selectedRootTab == .sessions else { return }
-                await statusFeedViewModel.refresh(showingProgress: false)
-            }
+            guard scenePhase == .active, chatLaunch == nil else { return }
+            await statusFeedViewModel.pollWhileVisible()
         }
         #if DEBUG
         .task {
@@ -785,66 +803,8 @@ struct RelayProviderBadge: View {
     }
 }
 
-/// Lightweight app-wide activity feed for the Status sheet: fetches recent threads and
-/// jobs across every provider/workspace, replacing the retired console view models'
-/// `threadFeedItems`.
-@MainActor
-final class StatusFeedViewModel: ObservableObject {
-    @Published private(set) var threads: [CodexThread] = []
-    @Published private(set) var jobs: [CodexJob] = []
-    @Published private(set) var approvals: [CodexApproval] = []
-    @Published private(set) var isRefreshing = false
-    @Published private(set) var errorMessage: String?
-
-    private let client: CodexClient
-    init(client: CodexClient) {
-        self.client = client
-    }
-
-    var feedItems: [CodexThreadFeedItem] {
-        CodexThreadFeedItem.makeFeed(threads: threads, jobs: jobs)
-    }
-
-    func refresh(showingProgress: Bool = true) async {
-        if showingProgress { isRefreshing = true }
-        defer { if showingProgress { isRefreshing = false } }
-        do {
-            async let threadRequest = client.fetchThreads(provider: nil, workspaceID: nil, limit: 200)
-            async let jobRequest = client.fetchJobs(provider: nil, workspaceID: nil, limit: 30)
-            async let approvalRequest = client.fetchPendingApprovalsIfSupported()
-            threads = try await threadRequest
-            jobs = try await jobRequest
-            approvals = try await approvalRequest
-            errorMessage = nil
-        } catch {
-            guard !isCancellation(error) else { return }
-            errorMessage = error.localizedDescription
-        }
-    }
-
-    /// Background monitor snapshot. Keeps Chats current without flashing the
-    /// loading spinner the pull-to-refresh path uses.
-    func apply(jobs: [CodexJob], threads: [CodexThread]) {
-        self.jobs = jobs
-        self.threads = threads
-        errorMessage = nil
-    }
-
-    func reportRoutingMiss(_ message: String) {
-        errorMessage = message
-    }
-
-    func decide(_ approval: CodexApproval, _ decision: CodexApprovalDecision) async {
-        do {
-            _ = try await client.decideApproval(id: approval.id, decision: decision)
-            approvals.removeAll { $0.id == approval.id }
-            await refresh()
-        } catch {
-            guard !isCancellation(error) else { return }
-            errorMessage = error.localizedDescription
-        }
-    }
-}
+// StatusFeedViewModel — the Chats list's owner, snapshot seeding and
+// merge-as-arrives refresh — lives in Views/RelayChatsFeedModel.swift.
 
 private struct CodexStatusView: View {
     @ObservedObject var feedViewModel: StatusFeedViewModel
@@ -873,6 +833,12 @@ private struct CodexStatusView: View {
                             .padding(18)
                     }
 
+                    // A refresh that fails with rows on screen keeps the rows;
+                    // the only sign is this word.
+                    if feedViewModel.isListStale {
+                        staleListStatus
+                    }
+
                     if !displayedApprovals.isEmpty {
                         sectionHeading("Needs your attention")
                         ForEach(displayedApprovals) { approval in
@@ -889,7 +855,9 @@ private struct CodexStatusView: View {
                     }
 
                     if displayedItems.isEmpty {
-                        if feedViewModel.isRefreshing && feedViewModel.feedItems.isEmpty {
+                        // Only when nothing is cached and the first answer is
+                        // still pending; a refresh never swaps rows for this.
+                        if feedViewModel.isAwaitingFirstList {
                             ProgressView("Loading chats…")
                                 .frame(maxWidth: .infinity)
                                 .padding(.top, 64)
@@ -998,6 +966,29 @@ private struct CodexStatusView: View {
             .padding(.top, 20)
             .padding(.bottom, 6)
             .accessibilityAddTraits(.isHeader)
+    }
+
+    /// Typographic, never a dot (Editorial Ember rule 5): the warning word, then
+    /// how old the rows on screen are.
+    private var staleListStatus: some View {
+        HStack(spacing: 8) {
+            RelayCapsLabel(text: "Not updated", color: AppTheme.statusWarn)
+            if let asOf = feedViewModel.staleListAsOf {
+                RelayCapsLabel(text: staleStamp(asOf))
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 18)
+        .padding(.top, 12)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("relay-chats-not-updated")
+    }
+
+    private func staleStamp(_ date: Date) -> String {
+        if Calendar.current.isDateInToday(date) {
+            return date.formatted(date: .omitted, time: .shortened)
+        }
+        return date.formatted(.dateTime.month(.abbreviated).day())
     }
 
     private var emptyState: some View {

@@ -788,7 +788,10 @@ final class ManifestTests: XCTestCase {
 
         // Sessions must not keep the empty snapshot it may have loaded before the user
         // started work. Returning to the tab always reloads the app-wide thread feed.
-        XCTAssertTrue(source.contains(".task(id: selectedRootTab)"))
+        // The poll is keyed on the tab AND the scene phase and chat cover, so it also
+        // stops while the app is backgrounded or a chat covers the list.
+        XCTAssertTrue(source.contains(".task(id: RelayChatsPolling("))
+        XCTAssertTrue(source.contains("tab: selectedRootTab,"))
         XCTAssertTrue(source.contains("guard selectedRootTab == .sessions else { return }"))
         XCTAssertTrue(source.contains("await statusFeedViewModel.refresh()"))
         XCTAssertFalse(source.contains("bootstrapIfNeeded"))
