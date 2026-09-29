@@ -1296,7 +1296,7 @@ struct RelayConversationRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(alignment: .firstTextBaseline, spacing: 12) {
-                Text(item.title)
+                Text(CodexInlineMarkdown.title(item.title))
                     .font(.custom("DMSans-9ptRegular", size: 16, relativeTo: .body).weight(.medium))
                     .foregroundStyle(AppTheme.textPrimary)
                     .lineLimit(dynamicTypeSize.isAccessibilitySize ? 3 : 2)

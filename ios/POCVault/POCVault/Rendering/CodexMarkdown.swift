@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 
 struct CodexMarkdownProseBlock: Hashable {
     enum Kind: Hashable {
@@ -366,6 +367,34 @@ enum CodexMarkdownParser {
 }
 
 enum CodexInlineMarkdown {
+    /// A one-line list title from a prompt: inline code in DM Mono, emphasis
+    /// kept, links inert (the whole row is the tap target), and whitespace
+    /// collapsed. Titles arrive truncated, which can cut a code span in half,
+    /// so an unmatched backtick is dropped rather than shown raw.
+    static func title(_ value: String, codeSize: CGFloat = 15) -> AttributedString {
+        var text = value
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
+        if text.filter({ $0 == "`" }).count % 2 == 1,
+           let last = text.lastIndex(of: "`") {
+            text.remove(at: last)
+        }
+        let options = AttributedString.MarkdownParsingOptions(
+            interpretedSyntax: .inlineOnlyPreservingWhitespace
+        )
+        var attributed = (try? AttributedString(markdown: text, options: options))
+            ?? AttributedString(text)
+        for run in attributed.runs {
+            if run.link != nil {
+                attributed[run.range].link = nil
+            }
+            if run.inlinePresentationIntent?.contains(.code) == true {
+                attributed[run.range].font = AppTheme.monoFont(size: codeSize)
+            }
+        }
+        return attributed
+    }
+
     private static let linkDetector = try? NSDataDetector(
         types: NSTextCheckingResult.CheckingType.link.rawValue
     )

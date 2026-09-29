@@ -1384,6 +1384,19 @@ final class ManifestTests: XCTestCase {
         )
     }
 
+    func testConversationTitleRendersInlineCodeAndDropsCutBacktick() {
+        let title = CodexInlineMarkdown.title("You are lane L3 `ts-workspace` of the\nteam build. Work only in `~/Shi…")
+        XCTAssertEqual(String(title.characters), "You are lane L3 ts-workspace of the team build. Work only in ~/Shi…")
+        let codeRuns = title.runs.filter { $0.inlinePresentationIntent?.contains(.code) == true }
+        XCTAssertEqual(codeRuns.count, 1)
+        XCTAssertEqual(String(title[codeRuns[0].range].characters), "ts-workspace")
+        XCTAssertNotNil(codeRuns[0].font)
+
+        let linked = CodexInlineMarkdown.title("See [the docs](https://example.com)")
+        XCTAssertEqual(String(linked.characters), "See the docs")
+        XCTAssertTrue(linked.runs.allSatisfy { $0.link == nil })
+    }
+
     func testCodexInlineMarkdownMakesBareLocalhostURLTappable() {
         let bareURL = URL(string: "http://localhost:3000/lab")!
         let attributed = CodexInlineMarkdown.attributed(
