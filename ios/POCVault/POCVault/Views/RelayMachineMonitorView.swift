@@ -161,9 +161,6 @@ struct RelayMachineMonitorView: View {
                             .font(AppTheme.uiFont(size: 15))
                             .foregroundStyle(AppTheme.statusError)
                     }
-                    if canControlPower {
-                        RelayMachineSizeControl(model: powerModel)
-                    }
                 }
                 .padding(22)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -219,6 +216,9 @@ struct RelayMachineMonitorView: View {
         } message: {
             Text("Runs stop. Pairing stays on disk. Start it again from this phone when you need it.")
         }
+        .sheet(isPresented: $showingResize) {
+            resizeSheet
+        }
         .modifier(RelayResizeProgressPresenter(model: powerModel))
         .preferredColorScheme(.dark)
     }
@@ -251,9 +251,6 @@ struct RelayMachineMonitorView: View {
             .padding(.horizontal, 16)
             .padding(.top, 10)
             .padding(.bottom, 36)
-        }
-        .sheet(isPresented: $showingResize) {
-            resizeSheet
         }
     }
 
@@ -637,7 +634,9 @@ struct RelayMachineMonitorView: View {
                 .foregroundStyle(AppTheme.textSecondary)
             if canControlPower {
                 powerSwitch(showsLabel: true)
-                RelayMachineSizeControl(model: powerModel)
+                if let instanceType = powerModel.instanceType {
+                    instanceRow(instanceType)
+                }
             }
         }
     }
