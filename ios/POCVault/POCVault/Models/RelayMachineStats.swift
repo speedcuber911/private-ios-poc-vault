@@ -18,6 +18,23 @@ struct RelayMachineStats: Decodable, Equatable {
         let load1: Double?
         let load5: Double?
         let load15: Double?
+        /// Each core's busy percentage over the last sample. Older daemons omit it.
+        var cores: [Double?]? = nil
+        /// The last few readings per core. Only the opening snapshot carries
+        /// it; live samples send `cores` and the phone appends them.
+        var coreHistory: [[Double?]]? = nil
+    }
+
+    /// One of the busiest processes. Linux daemons only; `name` is the
+    /// kernel task name, never the command line.
+    struct Process: Decodable, Equatable, Identifiable {
+        let pid: Int
+        let name: String
+        let cpuPercent: Double?
+        let memBytes: Int64?
+        var history: [Double?]? = nil
+
+        var id: Int { pid }
     }
 
     struct Memory: Decodable, Equatable {
@@ -122,6 +139,7 @@ struct RelayMachineStats: Decodable, Equatable {
     let io: IO?
     let alerts: [Alert]
     let history: [Sample]
+    var processes: [Process]? = nil
 
     var firingAlerts: [Alert] {
         alerts.filter { $0.state == .firing }
@@ -166,7 +184,11 @@ struct RelayMachineStats: Decodable, Equatable {
 
     /// Applies an incremental SSE sample without making the daemon resend or
     /// the phone re-decode the complete chart history for every live sample.
-    func mergingLiveSample(_ next: RelayMachineStats, historyLimit: Int = 720) -> RelayMachineStats {
+    func mergingLiveSample(
+        _ next: RelayMachineStats,
+        historyLimit: Int = 720,
+        coreHistoryLimit: Int = 30
+    ) -> RelayMachineStats {
         var mergedHistory = history
         for sample in next.history {
             if let timestamp = sample.ts,
@@ -181,18 +203,34 @@ struct RelayMachineStats: Decodable, Equatable {
             mergedHistory.removeFirst(mergedHistory.count - historyLimit)
         }
 
+        var cpu = next.cpu
+        if cpu.coreHistory == nil, let cores = cpu.cores {
+            var series = self.cpu.coreHistory ?? []
+            if series.count != cores.count {
+                series = cores.map { _ in [] }
+            }
+            for (index, value) in cores.enumerated() {
+                series[index].append(value)
+                if series[index].count > coreHistoryLimit {
+                    series[index].removeFirst(series[index].count - coreHistoryLimit)
+                }
+            }
+            cpu.coreHistory = series
+        }
+
         return RelayMachineStats(
             ok: next.ok,
             sampledAt: next.sampledAt,
             host: next.host,
-            cpu: next.cpu,
+            cpu: cpu,
             memory: next.memory,
             disk: next.disk,
             jobs: next.jobs,
             network: next.network,
             io: next.io,
             alerts: next.alerts,
-            history: mergedHistory
+            history: mergedHistory,
+            processes: next.processes
         )
     }
 
@@ -240,6 +278,23 @@ struct RelayMachineStats: Decodable, Equatable {
     static func bytesText(_ value: Int64?) -> String? {
         guard let value else { return nil }
         return ByteCountFormatter.string(fromByteCount: value, countStyle: .file)
+    }
+
+    /// btop-style compact size: "476M", "1.3G".
+    static func shortBytesText(_ value: Int64?) -> String {
+        guard let value, value >= 0 else { return "—" }
+        let mebibytes = Double(value) / 1_048_576
+        if mebibytes < 1 { return String(format: "%.0fK", Double(value) / 1024) }
+        if mebibytes < 1024 { return String(format: "%.0fM", mebibytes) }
+        let gibibytes = mebibytes / 1024
+        return gibibytes < 100 ? String(format: "%.1fG", gibibytes) : String(format: "%.0fG", gibibytes)
+    }
+
+    /// Compact rate for narrow columns: "12K/s", "1.2M/s".
+    static func shortRateText(_ bytesPerSec: Double?) -> String {
+        guard let bytesPerSec, bytesPerSec >= 0, bytesPerSec.isFinite else { return "—" }
+        if bytesPerSec < 1_048_576 { return String(format: "%.0fK/s", bytesPerSec / 1024) }
+        return String(format: "%.1fM/s", bytesPerSec / 1_048_576)
     }
 
     static func uptimeText(_ seconds: Int?) -> String? {

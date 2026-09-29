@@ -14,6 +14,14 @@ const DEFAULT_FRESH_MS = 2_000;
 const DEFAULT_HEARTBEAT_MS = 120_000;
 const DEFAULT_HISTORY = 720;
 const DEFAULT_COOLDOWN_MS = 30 * 60 * 1000;
+const CORE_HISTORY = 30;
+const PROCESS_HISTORY = 12;
+const PROCESS_TRACKED = 10;
+const PROCESS_PUBLIC = 5;
+// Linux fixes USER_HZ at 100 and x86_64/arm64 kernels use 4 KiB pages; both
+// only scale the numbers, so a rare exotic kernel shows skewed, not wrong, rows.
+const LINUX_CLK_TCK = 100;
+const LINUX_PAGE_BYTES = 4096;
 const DISK_FREE_FLOOR_BYTES = 1_000_000_000;
 const DISK_FREE_FLOOR_MIN_TOTAL = 2_000_000_000;
 
@@ -49,6 +57,15 @@ export function cpuTimesFromCpus(cpus) {
     total += slice;
   }
   return { idle, total };
+}
+
+export function coreTimesFromCpus(cpus) {
+  return (Array.isArray(cpus) ? cpus : []).map((cpu) => cpuTimesFromCpus([cpu]));
+}
+
+export function corePercents(prev, next) {
+  if (!Array.isArray(prev) || !Array.isArray(next) || !next.length || prev.length !== next.length) return null;
+  return next.map((times, index) => cpuPercent(prev[index], times));
 }
 
 export function cpuPercent(prev, next) {
@@ -152,6 +169,65 @@ export function ioRate(prev, next, elapsedSec, key) {
   return Math.round(delta / elapsedSec);
 }
 
+// /proc/<pid>/stat: "pid (comm) state ppid …". comm may itself contain spaces
+// and parentheses, so split on the LAST ")". Only comm (the kernel's 15-byte
+// task name) ever leaves the machine — never cmdline, whose arguments can
+// carry tokens and paths.
+export function parseProcStat(text) {
+  const value = String(text || "");
+  const open = value.indexOf("(");
+  const close = value.lastIndexOf(")");
+  if (open < 0 || close < open) return null;
+  const fields = value.slice(close + 1).trim().split(/\s+/);
+  const utime = Number(fields[11]);
+  const stime = Number(fields[12]);
+  const rssPages = Number(fields[21]);
+  if (![utime, stime, rssPages].every(Number.isFinite)) return null;
+  return { name: value.slice(open + 1, close), ticks: utime + stime, rssPages };
+}
+
+function readLinuxProcesses() {
+  let entries;
+  try {
+    entries = fs.readdirSync("/proc");
+  } catch {
+    return null;
+  }
+  const processes = new Map();
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      const parsed = parseProcStat(fs.readFileSync(`/proc/${entry}/stat`, "utf8"));
+      if (parsed) processes.set(Number(entry), parsed);
+    } catch {
+      /* the process exited between readdir and read */
+    }
+  }
+  return processes;
+}
+
+// Busiest processes between two /proc reads, as a share of the whole machine
+// (so the column adds up to the total CPU figure, like btop's default view).
+export function topProcesses(prev, next, elapsedSec, cpuCount, limit = PROCESS_TRACKED) {
+  if (!(prev instanceof Map) || !(next instanceof Map)) return null;
+  if (!(elapsedSec > 0) || !(cpuCount > 0)) return null;
+  const rows = [];
+  for (const [pid, proc] of next) {
+    const before = prev.get(pid);
+    if (!before || before.name !== proc.name) continue;
+    const delta = proc.ticks - before.ticks;
+    if (!Number.isFinite(delta) || delta < 0) continue;
+    rows.push({
+      pid,
+      name: proc.name,
+      cpu: (delta / LINUX_CLK_TCK / elapsedSec / cpuCount) * 100,
+      memBytes: proc.rssPages * LINUX_PAGE_BYTES,
+    });
+  }
+  rows.sort((a, b) => b.cpu - a.cpu || b.memBytes - a.memBytes || a.pid - b.pid);
+  return rows.slice(0, limit).map(({ cpu, ...row }) => ({ ...row, cpuPercent: round1(cpu) }));
+}
+
 function readLinuxIOCounters() {
   try {
     return {
@@ -167,10 +243,14 @@ export function collectHostSample({
   diskPath = "/",
   prevCpu = null,
   prevIO = null,
+  prevCores = null,
+  prevProcesses = null,
   elapsedSec = null,
 } = {}) {
   const cpus = os.cpus();
   const times = cpuTimesFromCpus(cpus);
+  const coreTimes = coreTimesFromCpus(cpus);
+  const processCounters = process.platform === "linux" ? readLinuxProcesses() : null;
   const memory = readMemory();
   const disk = readDisk(diskPath);
   const load = os.loadavg();
@@ -181,6 +261,10 @@ export function collectHostSample({
     cpuTimes: times,
     cpuPercent: cpuPercent(prevCpu, times),
     cpuCount: cpus.length,
+    coreTimes,
+    corePercents: corePercents(prevCores, coreTimes),
+    processCounters,
+    processes: topProcesses(prevProcesses, processCounters, elapsedSec, cpus.length),
     memory,
     disk,
     load1: load[0],
@@ -307,14 +391,39 @@ export function createHostMonitor({
   let cloud = null;
   let prevCpu = null;
   let prevIO = null;
+  let prevCores = null;
+  let prevProcesses = null;
   let prevSampleMs = null;
   let lastSnapshot = null;
   const history = [];
+  let coreHistory = [];
+  const processHistory = new Map();
   const alerts = {
     cpu: emptyAlertState(),
     memory: emptyAlertState(),
     disk: emptyAlertState(),
   };
+
+  // Keeps a short CPU series for each process that has recently been among
+  // the busiest, so a row arriving in the top five already has a sparkline.
+  function trackProcesses(rows) {
+    if (!Array.isArray(rows)) return null;
+    const seen = new Set();
+    for (const row of rows) {
+      const series = processHistory.get(row.pid) || [];
+      series.push(row.cpuPercent);
+      if (series.length > PROCESS_HISTORY) series.shift();
+      processHistory.set(row.pid, series);
+      seen.add(row.pid);
+    }
+    for (const pid of processHistory.keys()) {
+      if (!seen.has(pid)) processHistory.delete(pid);
+    }
+    return rows.slice(0, PROCESS_PUBLIC).map((row) => ({
+      ...row,
+      history: (processHistory.get(row.pid) || []).slice(),
+    }));
+  }
 
   function setCloud(next) {
     cloud = next && typeof next === "object" ? next : null;
@@ -332,9 +441,11 @@ export function createHostMonitor({
     const t = now();
     const sampledAt = new Date(t).toISOString();
     const elapsedSec = prevSampleMs == null ? null : (t - prevSampleMs) / 1000;
-    const raw = collect({ diskPath, prevCpu, prevIO, elapsedSec }) || {};
+    const raw = collect({ diskPath, prevCpu, prevIO, prevCores, prevProcesses, elapsedSec }) || {};
     if (raw.cpuTimes) prevCpu = raw.cpuTimes;
     if (raw.ioCounters) prevIO = raw.ioCounters;
+    if (raw.coreTimes) prevCores = raw.coreTimes;
+    if (raw.processCounters) prevProcesses = raw.processCounters;
     prevSampleMs = t;
     let jobs = { active: 0, queued: 0 };
     try {
@@ -343,6 +454,17 @@ export function createHostMonitor({
       /* job counts are decorative; a reader fault must not freeze samples */
     }
     const snapshot = toPublic(raw, sampledAt, jobs);
+    const cores = Array.isArray(raw.corePercents) ? raw.corePercents : null;
+    if (cores) {
+      if (coreHistory.length !== cores.length) coreHistory = cores.map(() => []);
+      cores.forEach((value, index) => {
+        coreHistory[index].push(value);
+        if (coreHistory[index].length > CORE_HISTORY) coreHistory[index].shift();
+      });
+    }
+    snapshot.cpu.cores = cores;
+    snapshot.cpu.coreHistory = cores ? coreHistory.map((series) => series.slice()) : null;
+    snapshot.processes = trackProcesses(raw.processes);
     lastSnapshot = snapshot;
     history.push({
       ts: sampledAt,
@@ -397,7 +519,15 @@ export function createHostMonitor({
         ok: false,
         sampledAt: new Date(now()).toISOString(),
         host: { hostname: null, platform: null, arch: null, uptimeSec: null },
-        cpu: { usedPercent: null, count: null, load1: null, load5: null, load15: null },
+        cpu: {
+          usedPercent: null,
+          count: null,
+          load1: null,
+          load5: null,
+          load15: null,
+          cores: null,
+          coreHistory: null,
+        },
         memory: { usedPercent: null, usedBytes: null, totalBytes: null, availableBytes: null },
         disk: { usedPercent: null, usedBytes: null, totalBytes: null, freeBytes: null, path: null },
         jobs: { active: 0, queued: 0 },
@@ -408,6 +538,7 @@ export function createHostMonitor({
           readOpsPerSec: null,
           writeOpsPerSec: null,
         },
+        processes: null,
         alerts: publicAlerts(),
         history: [],
       };
@@ -528,8 +659,12 @@ export function streamHostStats(req, res, {
       return;
     }
     lastSampledAt = next.sampledAt;
+    // Per-core series ride only on the opening snapshot, like `history`: the
+    // phone appends each sample's `cpu.cores` itself.
+    const { coreHistory: _coreHistory, ...cpu } = next.cpu || {};
     write("sample", {
       ...next,
+      cpu,
       history: Array.isArray(next.history) ? next.history.slice(-1) : [],
     });
   }, intervalMs);

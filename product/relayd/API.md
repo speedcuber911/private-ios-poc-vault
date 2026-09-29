@@ -948,12 +948,19 @@ does not stay pinned to the first snapshot if the interval hiccups.
   "ok": true,
   "sampledAt": "2026-09-19T10:00:00.000Z",
   "host": { "hostname": "box-1", "platform": "linux", "arch": "x64", "uptimeSec": 86400 },
-  "cpu": { "usedPercent": 12.4, "count": 4, "load1": 0.3, "load5": 0.4, "load15": 0.5 },
+  "cpu": {
+    "usedPercent": 12.4, "count": 4, "load1": 0.3, "load5": 0.4, "load15": 0.5,
+    "cores": [31.0, 12.5, 4.1, 2.0],
+    "coreHistory": [[28.2, 31.0], [10.9, 12.5], [3.3, 4.1], [1.0, 2.0]]
+  },
   "memory": { "usedPercent": 41.2, "usedBytes": 1, "totalBytes": 2, "availableBytes": 1 },
   "disk": { "usedPercent": 67.0, "usedBytes": 1, "totalBytes": 2, "freeBytes": 1, "path": "/" },
   "jobs": { "active": 0, "queued": 0 },
   "network": { "rxBytesPerSec": 1200, "txBytesPerSec": 300 },
   "io": { "readBytesPerSec": 4096, "writeBytesPerSec": 512, "readOpsPerSec": 2, "writeOpsPerSec": 1 },
+  "processes": [
+    { "pid": 4121, "name": "claude", "cpuPercent": 18.2, "memBytes": 499122176, "history": [15.1, 18.2] }
+  ],
   "alerts": [{ "kind": "cpu", "state": "ok" }],
   "history": [{
     "ts": "…Z",
@@ -973,12 +980,21 @@ History is bounded (override `RELAYD_HOST_HISTORY`; default 720, about
 Network and disk I/O rates are Linux `/proc` counters; other platforms
 leave those fields null.
 
+`cpu.cores` is each core's busy percentage over the last sample interval
+(`null` on the very first reading); `cpu.coreHistory` holds the last 30 of
+those per core. `processes` is the five busiest processes by share of the
+whole machine, read from Linux `/proc/<pid>/stat`, each with its last 12 CPU
+readings. Only the kernel task name (`comm`, at most 15 bytes) is reported —
+never the command line, whose arguments can carry tokens or paths. Non-Linux
+hosts, and the first reading on Linux, send `processes: null`.
+
 #### `GET /v1/machine/stats/stream` — live host usage (SSE)
 
 The Usage screen opens this authenticated stream only while it is visible and
 the iOS app is active. The first `snapshot` event has the same payload as
 `GET /v1/machine/stats`, including bounded history. Each later `sample` event
-contains the current fields plus only the newest history point, keeping stream
+contains the current fields plus only the newest history point, and omits
+`cpu.coreHistory` (the phone appends each sample's `cpu.cores`), keeping stream
 bandwidth and phone-side JSON/chart work constant over time. A comment
 heartbeat is sent when there is no newer sample.
 

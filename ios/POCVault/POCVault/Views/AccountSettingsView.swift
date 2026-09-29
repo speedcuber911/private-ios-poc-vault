@@ -198,7 +198,6 @@ struct AccountSettingsView: View {
                 Section("About") {
                     LabeledContent("App", value: "Relay")
                     LabeledContent("Version", value: versionText)
-                    LabeledContent("Authentication", value: "Better Auth")
                     Link("Privacy Policy", destination: URL(string: "https://app.openrelay.sh/privacy")!)
                     Link("Terms of Use", destination: URL(string: "https://app.openrelay.sh/terms")!)
                     Link("Support", destination: URL(string: "https://app.openrelay.sh/support")!)
@@ -641,22 +640,23 @@ struct RelayMachinePowerSwitch: View {
     var onStarted: (() async -> Void)? = nil
     var confirmStop: () -> Void
     var accessibilityIdentifier: String
+    /// Usage's compact header sets this false: the switch sits beside the
+    /// machine name, so only the transient detail (Starting…) stays visible.
+    var showsLabel = true
 
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Power")
-                    .font(AppTheme.uiFont(size: 17))
-                    .foregroundStyle(AppTheme.textPrimary)
-                if let detail = model.status.switchDetail {
-                    Text(detail)
-                        .font(AppTheme.uiFont(size: 13))
-                        .foregroundStyle(
-                            model.status == .unavailable ? AppTheme.statusError : AppTheme.textTertiary
-                        )
+            if showsLabel {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Power")
+                        .font(AppTheme.uiFont(size: 17))
+                        .foregroundStyle(AppTheme.textPrimary)
+                    detailText
                 }
+                Spacer(minLength: 12)
+            } else {
+                detailText
             }
-            Spacer(minLength: 12)
             // Until the first read lands there is no position to show, so the
             // switch is replaced by a spinner rather than starting at off and
             // correcting itself a moment later.
@@ -676,6 +676,17 @@ struct RelayMachinePowerSwitch: View {
         }
         .accessibilityElement(children: .contain)
         .animation(.default, value: model.status)
+    }
+
+    @ViewBuilder
+    private var detailText: some View {
+        if let detail = model.status.switchDetail {
+            Text(detail)
+                .font(AppTheme.uiFont(size: 13))
+                .foregroundStyle(
+                    model.status == .unavailable ? AppTheme.statusError : AppTheme.textTertiary
+                )
+        }
     }
 
     private var binding: Binding<Bool> {

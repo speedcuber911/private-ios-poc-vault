@@ -13,6 +13,10 @@ import {
   ioRate,
   streamHostStats,
   METRICS,
+  coreTimesFromCpus,
+  corePercents,
+  parseProcStat,
+  topProcesses,
 } from "../src/hoststats.mjs";
 
 test("cpu percent is the idle-complement of a times delta", () => {
@@ -240,4 +244,109 @@ docker0: 9999 1 0 0 0 0 0 0 9999 1 0 0 0 0 0 0
   assert.equal(disk.writeBytes, 92 * 512);
   assert.equal(ioRate({ rxBytes: 1000 }, { rxBytes: 4000 }, 2, "rxBytes"), 1500);
   assert.equal(ioRate(null, { rxBytes: 4000 }, 2, "rxBytes"), null);
+});
+
+test("per-core percents pair each core's times delta", () => {
+  const before = coreTimesFromCpus([
+    { times: { user: 10, idle: 90, sys: 0 } },
+    { times: { user: 50, idle: 50, sys: 0 } },
+  ]);
+  const after = coreTimesFromCpus([
+    { times: { user: 60, idle: 140, sys: 0 } },
+    { times: { user: 140, idle: 60, sys: 0 } },
+  ]);
+  assert.deepEqual(corePercents(before, after), [50, 90]);
+  assert.equal(corePercents(null, after), null);
+  assert.equal(corePercents(before, after.slice(0, 1)), null);
+});
+
+test("proc stat parser survives spaces and parens in comm", () => {
+  const tail = "S 1 1 1 0 -1 4194560 100 0 0 0 250 50 0 0 20 0 8 0 100 123456789 2048";
+  assert.deepEqual(parseProcStat(`4121 (claude) ${tail}`), { name: "claude", ticks: 300, rssPages: 2048 });
+  assert.equal(parseProcStat(`77 (tmux: server (1)) ${tail}`).name, "tmux: server (1)");
+  assert.equal(parseProcStat("garbage"), null);
+});
+
+test("top processes rank by machine share and skip reused pids", () => {
+  const prev = new Map([
+    [1, { name: "relayd", ticks: 1000, rssPages: 10 }],
+    [2, { name: "claude", ticks: 500, rssPages: 100 }],
+    [3, { name: "old", ticks: 10, rssPages: 1 }],
+  ]);
+  const next = new Map([
+    [1, { name: "relayd", ticks: 1020, rssPages: 10 }],
+    [2, { name: "claude", ticks: 900, rssPages: 100 }],
+    [3, { name: "reused", ticks: 9000, rssPages: 1 }],
+    [4, { name: "new", ticks: 5, rssPages: 1 }],
+  ]);
+  // 400 ticks over 2 s on 4 cores = 2 core-seconds/s of 4 = 50% of the machine.
+  const rows = topProcesses(prev, next, 2, 4);
+  assert.deepEqual(rows.map((row) => row.name), ["claude", "relayd"]);
+  assert.equal(rows[0].cpuPercent, 50);
+  assert.equal(rows[0].memBytes, 100 * 4096);
+  assert.equal(rows[1].cpuPercent, 2.5);
+  assert.equal(topProcesses(null, next, 2, 4), null);
+  assert.equal(topProcesses(prev, next, 0, 4), null);
+});
+
+test("snapshot carries per-core series and process sparklines; stream strips core history", () => {
+  let t = 1_000;
+  let step = 0;
+  const monitor = createHostMonitor({
+    now: () => t,
+    sampleMs: 15_000,
+    freshMs: 2_000,
+    collect: () => {
+      step += 1;
+      return {
+        cpuTimes: { idle: step, total: step * 2 },
+        cpuPercent: 20,
+        cpuCount: 2,
+        corePercents: [10 * step, 5],
+        processes: [
+          { pid: 9, name: "claude", cpuPercent: step, memBytes: 4096 },
+          { pid: 7, name: "relayd", cpuPercent: 1, memBytes: 2048 },
+        ],
+        memory: { usedBytes: 20, totalBytes: 100, availableBytes: 80 },
+        disk: { usedBytes: 30, totalBytes: 100, freeBytes: 70, path: "/" },
+        load1: 0.2,
+        load5: 0.2,
+        load15: 0.2,
+        uptimeSec: 10,
+        hostname: "box-1",
+        platform: "linux",
+        arch: "x64",
+      };
+    },
+    setIntervalFn: () => ({ unref() {} }),
+    clearIntervalFn: () => {},
+  });
+  t += 5_000;
+  const snap = monitor.snapshot();
+  assert.deepEqual(snap.cpu.cores, [20, 5]);
+  assert.deepEqual(snap.cpu.coreHistory, [[10, 20], [5, 5]]);
+  assert.deepEqual(snap.processes[0].history, [1, 2]);
+  assert.equal(snap.processes[1].name, "relayd");
+
+  const req = new EventEmitter();
+  const res = new EventEmitter();
+  const writes = [];
+  res.writeHead = () => {};
+  res.write = (chunk) => { writes.push(chunk); return true; };
+  let tick;
+  streamHostStats(req, res, {
+    monitor,
+    setIntervalFn: (callback) => { tick = callback; return { unref() {} }; },
+    clearIntervalFn: () => {},
+  });
+  const opening = JSON.parse(writes[0].match(/data: (.*)\n\n/s)[1]);
+  assert.deepEqual(opening.cpu.coreHistory, [[10, 20], [5, 5]]);
+  t += 2_000;
+  tick();
+  const sample = JSON.parse(writes.at(-1).match(/data: (.*)\n\n/s)[1]);
+  assert.deepEqual(sample.cpu.cores, [30, 5]);
+  assert.equal(sample.cpu.coreHistory, undefined);
+  assert.deepEqual(sample.processes[0].history, [1, 2, 3]);
+  req.emit("close");
+  monitor.stop();
 });

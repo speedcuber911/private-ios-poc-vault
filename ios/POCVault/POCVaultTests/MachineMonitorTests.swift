@@ -128,4 +128,56 @@ final class MachineMonitorTests: XCTestCase {
         XCTAssertEqual(stats.firingAlerts.first?.kind, .unknown)
         XCTAssertEqual(stats.summaryLine, "Usage")
     }
+
+    func testDecodesPerCoreAndProcessesAndAppendsLiveCores() throws {
+        let snapshotJSON = """
+        {
+          "ok": true,
+          "sampledAt": "2026-09-29T10:00:00.000Z",
+          "host": { "hostname": "box-1" },
+          "cpu": { "usedPercent": 20, "count": 2, "cores": [30.0, 10.0], "coreHistory": [[25.0, 30.0], [8.0, 10.0]] },
+          "memory": {},
+          "disk": {},
+          "jobs": { "active": 0, "queued": 0 },
+          "processes": [
+            { "pid": 4121, "name": "claude", "cpuPercent": 18.2, "memBytes": 499122176, "history": [15.1, 18.2] }
+          ],
+          "alerts": [],
+          "history": []
+        }
+        """.data(using: .utf8)!
+        let sampleJSON = """
+        {
+          "ok": true,
+          "sampledAt": "2026-09-29T10:00:02.000Z",
+          "host": { "hostname": "box-1" },
+          "cpu": { "usedPercent": 22, "count": 2, "cores": [40.0, 4.0] },
+          "memory": {},
+          "disk": {},
+          "jobs": { "active": 0, "queued": 0 },
+          "alerts": [],
+          "history": []
+        }
+        """.data(using: .utf8)!
+
+        let snapshot = try JSONDecoder().decode(RelayMachineStats.self, from: snapshotJSON)
+        XCTAssertEqual(snapshot.cpu.cores, [30, 10])
+        XCTAssertEqual(snapshot.processes?.first?.name, "claude")
+        XCTAssertEqual(snapshot.processes?.first?.history, [15.1, 18.2])
+        XCTAssertEqual(RelayMachineStats.shortBytesText(499_122_176), "476M")
+        XCTAssertEqual(RelayMachineStats.shortRateText(12 * 1024), "12K/s")
+
+        let sample = try JSONDecoder().decode(RelayMachineStats.self, from: sampleJSON)
+        let merged = snapshot.mergingLiveSample(sample, coreHistoryLimit: 2)
+        XCTAssertEqual(merged.cpu.cores, [40, 4])
+        XCTAssertEqual(merged.cpu.coreHistory, [[30, 40], [10, 4]])
+        XCTAssertNil(merged.processes, "an older daemon's sample hides the process table")
+
+        let legacy = try JSONDecoder().decode(
+            RelayMachineStats.self,
+            from: #"{"ok":true,"host":{},"cpu":{},"memory":{},"disk":{},"jobs":{"active":0,"queued":0},"alerts":[],"history":[]}"#.data(using: .utf8)!
+        )
+        XCTAssertNil(legacy.cpu.cores)
+        XCTAssertNil(legacy.processes)
+    }
 }
