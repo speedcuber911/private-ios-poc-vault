@@ -96,20 +96,43 @@ function findClaudeSessionFile(sessionId) {
 // workspace. (The Codex branch of the same function rewrites `payload.cwd` in
 // the rollout's session_meta line, which is what readSessionMeta below reads.)
 function readClaudeSessionMeta(sessionFile) {
-  for (const line of readSessionLines(sessionFile)) {
-    if (!line.trim()) continue;
+  return readClaudeSessionMetaWithStat(sessionFile, fs.statSync(sessionFile));
+}
+
+// Same window readSessionLines(file) reads: the whole file up to 1 MiB, else
+// its last MiB minus the partial first line.
+function readClaudeSessionMetaWithStat(sessionFile, stat) {
+  const meta = scanSessionLines(sessionFile, tailScanWindow(stat), (line) => {
+    if (!line.trim()) return undefined;
     let entry;
     try {
       entry = JSON.parse(line);
     } catch {
-      continue;
+      return undefined;
     }
     const cwd = entry?.cwd;
     if (typeof cwd === "string" && cwd.length > 0 && !/[\0\r\n]/.test(cwd)) {
       return { cwd, provider: "claude", timestamp: cleanSessionTimestamp(entry.timestamp) };
     }
-  }
-  return null;
+    return undefined;
+  });
+  return meta ?? null;
+}
+
+function headScanWindow(stat) {
+  // readSessionLines(file, { fromEnd: false }): a file larger than the window
+  // loses its cut-off last line.
+  return stat.size <= SESSION_SCAN_BYTES
+    ? { start: 0, end: stat.size, keepTrailing: true }
+    : { start: 0, end: SESSION_SCAN_BYTES, keepTrailing: false };
+}
+
+function tailScanWindow(stat) {
+  // readSessionLines(file, { fromEnd: true }): a file larger than the window
+  // loses its cut-off first line.
+  return stat.size <= SESSION_SCAN_BYTES
+    ? { start: 0, end: stat.size, keepTrailing: true }
+    : { start: stat.size - SESSION_SCAN_BYTES, end: stat.size, dropFirst: true, keepTrailing: true };
 }
 
 
@@ -160,12 +183,30 @@ function cursorLoggedWorkspacePath(projectDir) {
   }
 }
 
-function workspaceForCursorProjectName(projectName, projectDir) {
-  let matched = null;
+// Cursor project-folder slug -> workspace, longest path winning and the
+// earlier workspace winning a tie, exactly as a scan of the registry picks.
+//
+// Built once per listing rather than once per project folder: computing the
+// slugs means a realpath of every workspace path, and with a browse root of
+// "/" every session cwd the machine has ever seen is a workspace — most of
+// them long deleted, so each realpath threw ENOENT and captured a stack. Done
+// per folder, per workspace, that was ~11M throwing realpath calls for one
+// `GET /v1/codex/threads` on a real machine (193 folders x ~238 workspaces x
+// ~238), which pinned relayd's only thread and starved every other route.
+function cursorSlugIndex() {
+  const index = new Map();
   for (const workspace of [...workspaces.values(), ...dynamicWorkspaces.values()]) {
-    if (!cursorSlugCandidates(workspace).includes(projectName)) continue;
-    if (!matched || workspace.path.length > matched.path.length) matched = workspace;
+    for (const slug of cursorSlugCandidates(workspace)) {
+      const current = index.get(slug);
+      if (!current || workspace.path.length > current.path.length) index.set(slug, workspace);
+    }
   }
+  index.registrySize = workspaces.size + dynamicWorkspaces.size;
+  return index;
+}
+
+function workspaceForCursorProjectName(projectName, projectDir, slugIndex = cursorSlugIndex()) {
+  const matched = slugIndex.get(projectName) || null;
   if (matched) return matched;
   // Cursor truncates long paths and appends a short hash. The folder name is
   // then no longer the workspace slug, so the log's workspacePath is the link.
@@ -176,7 +217,10 @@ function workspaceForCursorProjectName(projectName, projectDir) {
   return workspaceForPath(logged);
 }
 
-function cursorProjectDirsForWorkspace(workspace) {
+// Cursor project folders that belong to any of `targets` (id -> workspace),
+// in directory order, each paired with its workspace. Every folder name is
+// matched against the workspace registry once, not once per target.
+function cursorProjectDirsForWorkspaces(targets) {
   const projectsRoot = path.join(runHome, ".cursor", "projects");
   let entries = [];
   try {
@@ -186,10 +230,16 @@ function cursorProjectDirsForWorkspace(workspace) {
     return [];
   }
   const dirs = [];
+  let slugIndex = cursorSlugIndex();
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
+    // A hashed folder name resolves through workspaceForPath, which can add a
+    // workspace; later folders must then see it, as a fresh scan would.
+    if (slugIndex.registrySize !== workspaces.size + dynamicWorkspaces.size) slugIndex = cursorSlugIndex();
     const projectDir = path.join(projectsRoot, entry.name);
-    if (workspaceForCursorProjectName(entry.name, projectDir)?.id === workspace.id) dirs.push(projectDir);
+    const owner = workspaceForCursorProjectName(entry.name, projectDir, slugIndex);
+    const workspace = owner ? targets.get(owner.id) : null;
+    if (workspace) dirs.push({ projectDir, workspace });
   }
   return dirs;
 }
@@ -316,7 +366,7 @@ function findCursorSessionMeta(sessionId) {
   return { cwd: session.cwd, provider: "cursor", timestamp: session.timestamp };
 }
 
-function materializeCursorChatWorkspaces() {
+function materializeCursorChatWorkspaces(workspaceForCwd = workspaceForSessionCwd) {
   const chatsRoot = path.join(runHome, ".cursor", "chats");
   let buckets = [];
   try {
@@ -337,14 +387,36 @@ function materializeCursorChatWorkspaces() {
     for (const entry of names) {
       if (!entry.isDirectory() || !isResumableSessionId(entry.name)) continue;
       const meta = readCursorMeta(path.join(chatsRoot, bucket.name, entry.name));
-      if (meta?.cwd) workspaceForSessionCwd(meta.cwd);
+      if (meta?.cwd) workspaceForCwd(meta.cwd);
     }
   }
 }
 
 
 function listCursorSessionsForWorkspace(workspace) {
-  const found = new Map();
+  return listCursorSessionsForWorkspaces([workspace]).get(workspace.id) || [];
+}
+
+// Cursor sessions for several workspaces, grouped by workspace id, from ONE
+// walk of ~/.cursor. Each workspace's list is identical to what a separate
+// per-workspace walk returns (chat folders first, then project transcripts,
+// both in directory order).
+function listCursorSessionsForWorkspaces(workspaceList, workspaceForCwd = workspaceForSessionCwd) {
+  const targets = new Map();
+  for (const workspace of workspaceList) {
+    if (workspace && !targets.has(workspace.id)) targets.set(workspace.id, workspace);
+  }
+  const groups = new Map();
+  const groupFor = (id) => {
+    let found = groups.get(id);
+    if (!found) {
+      found = new Map();
+      groups.set(id, found);
+    }
+    return found;
+  };
+  if (targets.size === 0) return new Map();
+
   const chatsRoot = path.join(runHome, ".cursor", "chats");
   let buckets = [];
   try {
@@ -366,8 +438,8 @@ function listCursorSessionsForWorkspace(workspace) {
       const sessionDir = path.join(chatsRoot, bucket.name, entry.name);
       const meta = readCursorMeta(sessionDir);
       if (!meta) continue;
-      const sessionWorkspace = workspaceForSessionCwd(meta.cwd);
-      if (!sessionWorkspace || sessionWorkspace.id !== workspace.id) continue;
+      const sessionWorkspace = workspaceForCwd(meta.cwd);
+      if (!sessionWorkspace || !targets.has(sessionWorkspace.id)) continue;
       let stat;
       try {
         stat = fs.statSync(sessionDir);
@@ -375,7 +447,7 @@ function listCursorSessionsForWorkspace(workspace) {
         continue;
       }
       const file = cursorTranscriptInDir(sessionDir, entry.name);
-      found.set(entry.name, {
+      groupFor(sessionWorkspace.id).set(entry.name, {
         id: entry.name,
         provider: "cursor",
         cwd: meta.cwd,
@@ -386,7 +458,8 @@ function listCursorSessionsForWorkspace(workspace) {
     }
   }
 
-  for (const projectDir of cursorProjectDirsForWorkspace(workspace)) {
+  for (const { projectDir, workspace } of cursorProjectDirsForWorkspaces(targets)) {
+    const found = groupFor(workspace.id);
     const transcriptsDir = path.join(projectDir, "agent-transcripts");
     let names = [];
     try {
@@ -423,7 +496,9 @@ function listCursorSessionsForWorkspace(workspace) {
     }
   }
 
-  return [...found.values()];
+  const result = new Map();
+  for (const [id, found] of groups) result.set(id, [...found.values()]);
+  return result;
 }
 
 
@@ -487,18 +562,122 @@ function workspaceForPath(value) {
 }
 
 
+// Every line-reading helper below looks at, at most, this many bytes of one
+// end of a transcript. Rollouts routinely pass 100 MiB.
+const SESSION_SCAN_BYTES = 1024 * 1024;
+const SESSION_SCAN_CHUNK_BYTES = 64 * 1024;
+
+// Visits the newline-separated lines of `file` within [start, end), in order,
+// reading 64 KiB at a time and stopping as soon as `visit` returns anything
+// other than undefined (which is then returned).
+//
+// Listing used to read a full MiB from each end of every transcript on the
+// machine and JSON-parse all of it, on every request, although the answer
+// (the session_meta header, the first prompt, one reply) is nearly always in
+// the first few lines it looks at. That was over a gigabyte of synchronous
+// reads per `GET /v1/codex/threads` on a real machine, which held the event
+// loop long enough that the phone's folder listings queued behind it.
+//
+// `dropFirst` discards everything up to the first newline (a read that starts
+// mid-line). `keepTrailing` visits a final segment with no newline after it.
+// The window, first-line drop and trailing-line rule reproduce exactly what
+// the old read-then-split code saw, so results are unchanged.
+function scanSessionLines(file, { start = 0, end, dropFirst = false, keepTrailing = true }, visit) {
+  const fd = fs.openSync(file, "r");
+  try {
+    let position = start;
+    let pending = [];
+    let dropping = dropFirst;
+    while (position < end) {
+      const length = Math.min(SESSION_SCAN_CHUNK_BYTES, end - position);
+      const chunk = Buffer.allocUnsafe(length);
+      const read = fs.readSync(fd, chunk, 0, length, position);
+      if (read <= 0) break;
+      position += read;
+      const data = read < length ? chunk.subarray(0, read) : chunk;
+      let offset = 0;
+      let newline;
+      while ((newline = data.indexOf(10, offset)) !== -1) {
+        const piece = data.subarray(offset, newline);
+        offset = newline + 1;
+        const line = pending.length ? Buffer.concat([...pending, piece]) : piece;
+        pending = [];
+        if (dropping) {
+          dropping = false;
+          continue;
+        }
+        const result = visit(line.toString("utf8"));
+        if (result !== undefined) return result;
+      }
+      if (offset < data.length) pending.push(data.subarray(offset));
+    }
+    if (keepTrailing && !dropping && pending.length) {
+      return visit(Buffer.concat(pending).toString("utf8"));
+    }
+    return undefined;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Transcripts only ever grow, so an unchanged (size, mtime) pair means the
+// header, first prompt and reply read from it last time still stand. Keyed
+// by path; a file that changes simply gets a fresh entry.
+const sessionFileCache = new Map();
+const SESSION_FILE_CACHE_LIMIT = 20_000;
+
+function statSessionFile(file) {
+  try {
+    return fs.statSync(file);
+  } catch {
+    return null;
+  }
+}
+
+function sessionFileCacheEntry(file, stat) {
+  let entry = sessionFileCache.get(file);
+  if (entry && entry.size === stat.size && entry.mtimeMs === stat.mtimeMs) return entry;
+  entry = { size: stat.size, mtimeMs: stat.mtimeMs };
+  sessionFileCache.delete(file);
+  sessionFileCache.set(file, entry);
+  if (sessionFileCache.size > SESSION_FILE_CACHE_LIMIT) {
+    sessionFileCache.delete(sessionFileCache.keys().next().value);
+  }
+  return entry;
+}
+
+function cachedSessionMeta(file, stat) {
+  const entry = sessionFileCacheEntry(file, stat);
+  if (!("meta" in entry)) entry.meta = readSessionMetaWithStat(file, stat, null);
+  return entry.meta;
+}
+
+function cachedClaudeSessionMeta(file, stat) {
+  const entry = sessionFileCacheEntry(file, stat);
+  if (!("claudeMeta" in entry)) entry.claudeMeta = readClaudeSessionMetaWithStat(file, stat);
+  return entry.claudeMeta;
+}
+
+function cachedSessionSummary(file, stat = statSessionFile(file)) {
+  if (!stat) return readSessionSummary(file);
+  const entry = sessionFileCacheEntry(file, stat);
+  if (!("summary" in entry)) entry.summary = readSessionSummaryWithStat(file, stat);
+  return entry.summary;
+}
+
 function readSessionMeta(sessionFile, expectedSessionId = null) {
+  const stat = fs.statSync(sessionFile);
+  if (!expectedSessionId) return cachedSessionMeta(sessionFile, stat);
+  return readSessionMetaWithStat(sessionFile, stat, expectedSessionId);
+}
+
+function readSessionMetaWithStat(sessionFile, stat, expectedSessionId) {
   // session_meta is written at the beginning of a native Codex rollout. Read
   // a bounded prefix so listing a workspace cannot allocate every byte of a
   // long-running 100+ MiB conversation merely to learn its id and cwd.
-  const stat = fs.statSync(sessionFile);
-  const maxBytes = Math.min(stat.size, 1024 * 1024);
-  const buffer = Buffer.alloc(maxBytes);
-  const fd = fs.openSync(sessionFile, "r");
-  try { fs.readSync(fd, buffer, 0, maxBytes, 0); } finally { fs.closeSync(fd); }
-  const lines = buffer.toString("utf8").split("\n");
-  for (const line of lines) {
-    if (!line.trim()) continue;
+  const end = Math.min(stat.size, SESSION_SCAN_BYTES);
+  const meta = scanSessionLines(sessionFile, { start: 0, end, keepTrailing: true }, (line) => {
+    if (!line.trim()) return undefined;
     try {
       const entry = JSON.parse(line);
       if (entry?.type === "session_meta" && (!expectedSessionId || entry.payload?.id === expectedSessionId)) {
@@ -520,11 +699,11 @@ function readSessionMeta(sessionFile, expectedSessionId = null) {
         }
       }
     } catch {
-      continue;
+      return undefined;
     }
-  }
-
-  return null;
+    return undefined;
+  });
+  return meta ?? null;
 }
 
 
@@ -533,7 +712,25 @@ function cleanSessionTimestamp(value) {
 }
 
 
-function recordDiscoveredSession(sessionMap, {
+// One listing asks for the same few hundred cwds over and over (every
+// transcript, then every Cursor chat twice). Resolving one means a realpath,
+// which throws for a cwd that no longer exists, so answer each cwd once per
+// listing. Safe within a listing: a cwd always resolves to the same workspace
+// once the first lookup has registered it.
+function memoizedWorkspaceForCwd() {
+  const memo = new Map();
+  return (cwd) => {
+    if (memo.has(cwd)) return memo.get(cwd);
+    const workspace = workspaceForSessionCwd(cwd);
+    memo.set(cwd, workspace);
+    return workspace;
+  };
+}
+
+// `summaryFiles` remembers which transcript backs each session id so the
+// (comparatively costly) summary is read only for sessions that survive the
+// sort and limit, instead of for every transcript on the machine.
+function recordDiscoveredSession(sessionMap, summaryFiles, {
   id,
   sessionProvider,
   workspace,
@@ -541,7 +738,7 @@ function recordDiscoveredSession(sessionMap, {
   timestamp,
   updatedAt,
   file,
-  includeSummary,
+  stat = null,
   syncedTitles,
 }) {
   const session = {
@@ -554,7 +751,8 @@ function recordDiscoveredSession(sessionMap, {
     updatedAt,
     title: syncedTitles.get(`${workspace.id}:${id}`) || null,
   };
-  if (includeSummary && file) session.summary = readSessionSummary(file);
+  if (file) summaryFiles.set(id, { file, stat });
+  else summaryFiles.delete(id);
   sessionMap.set(id, session);
 }
 
@@ -563,16 +761,19 @@ function listWorkspaceSessions({ workspaceId, provider = null, limit, includeSum
   const syncedTitles = readSyncedSessionTitles();
 
   const sessionMap = new Map();
+  const summaryFiles = new Map();
+  const workspaceForCwd = memoizedWorkspaceForCwd();
   for (const file of walkSessionFiles(path.join(codexHome, "sessions"))) {
-    const meta = readSessionMeta(file);
+    const stat = statSessionFile(file);
+    if (!stat) continue;
+    const meta = cachedSessionMeta(file, stat);
     if (!meta) continue;
-    const workspace = workspaceForSessionCwd(meta.cwd);
+    const workspace = workspaceForCwd(meta.cwd);
     if (!workspace) continue;
     const sessionProvider = normalizeJobProvider(meta.provider);
     if (provider && sessionProvider !== provider) continue;
     if (selectedWorkspace && workspace.id !== selectedWorkspace.id) continue;
-    const stat = fs.statSync(file);
-    recordDiscoveredSession(sessionMap, {
+    recordDiscoveredSession(sessionMap, summaryFiles, {
       id: meta.id,
       sessionProvider,
       workspace,
@@ -580,7 +781,7 @@ function listWorkspaceSessions({ workspaceId, provider = null, limit, includeSum
       timestamp: meta.timestamp,
       updatedAt: stat.mtime.toISOString(),
       file,
-      includeSummary,
+      stat,
       syncedTitles,
     });
   }
@@ -589,13 +790,14 @@ function listWorkspaceSessions({ workspaceId, provider = null, limit, includeSum
     for (const file of walkSessionFiles(path.join(runHome, ".claude", "projects"))) {
       const id = path.basename(file, ".jsonl");
       if (!isResumableSessionId(id)) continue;
-      const meta = readClaudeSessionMeta(file);
+      const stat = statSessionFile(file);
+      if (!stat) continue;
+      const meta = cachedClaudeSessionMeta(file, stat);
       if (!meta) continue;
-      const workspace = workspaceForSessionCwd(meta.cwd);
+      const workspace = workspaceForCwd(meta.cwd);
       if (!workspace) continue;
       if (selectedWorkspace && workspace.id !== selectedWorkspace.id) continue;
-      const stat = fs.statSync(file);
-      recordDiscoveredSession(sessionMap, {
+      recordDiscoveredSession(sessionMap, summaryFiles, {
         id,
         sessionProvider: "claude",
         workspace,
@@ -603,20 +805,24 @@ function listWorkspaceSessions({ workspaceId, provider = null, limit, includeSum
         timestamp: meta.timestamp,
         updatedAt: stat.mtime.toISOString(),
         file,
-        includeSummary,
+        stat,
         syncedTitles,
       });
     }
   }
 
   if (!provider || provider === "cursor") {
-    if (!selectedWorkspace) materializeCursorChatWorkspaces();
+    if (!selectedWorkspace) materializeCursorChatWorkspaces(workspaceForCwd);
     const cursorWorkspaces = selectedWorkspace
       ? [selectedWorkspace]
       : [...workspaces.values(), ...dynamicWorkspaces.values()];
+    // One pass over Cursor's folders for every workspace at once. Asking per
+    // workspace re-read every chat's meta.json once for each workspace the
+    // machine knows, and with a browse root of "/" every session cwd is one.
+    const cursorSessions = listCursorSessionsForWorkspaces(cursorWorkspaces, workspaceForCwd);
     for (const workspace of cursorWorkspaces) {
-      for (const session of listCursorSessionsForWorkspace(workspace)) {
-        recordDiscoveredSession(sessionMap, {
+      for (const session of cursorSessions.get(workspace.id) || []) {
+        recordDiscoveredSession(sessionMap, summaryFiles, {
           id: session.id,
           sessionProvider: "cursor",
           workspace,
@@ -624,7 +830,6 @@ function listWorkspaceSessions({ workspaceId, provider = null, limit, includeSum
           timestamp: session.timestamp,
           updatedAt: session.updatedAt,
           file: session.file,
-          includeSummary,
           syncedTitles,
         });
       }
@@ -658,9 +863,16 @@ function listWorkspaceSessions({ workspaceId, provider = null, limit, includeSum
     });
   }
 
-  return [...sessionMap.values()]
+  const listed = [...sessionMap.values()]
     .sort((left, right) => Date.parse(right.updatedAt || 0) - Date.parse(left.updatedAt || 0))
     .slice(0, limit);
+  if (includeSummary) {
+    for (const session of listed) {
+      const source = summaryFiles.get(session.id);
+      if (source) session.summary = cachedSessionSummary(source.file, source.stat || undefined);
+    }
+  }
+  return listed;
 }
 
 
@@ -1198,33 +1410,37 @@ function parseTranscriptTurn(entry) {
 }
 
 function readSessionSummary(sessionFile) {
-  let firstUserPrompt = null;
-  let lastAssistantAnswer = null;
+  return readSessionSummaryWithStat(sessionFile, fs.statSync(sessionFile));
+}
 
-  for (const line of readSessionLines(sessionFile, { fromEnd: false })) {
-    if (!line.trim()) continue;
+// Stops at the first user prompt that yields a title, then at the first reply
+// in the tail window — the same answers the old parse-every-line loops gave.
+function readSessionSummaryWithStat(sessionFile, stat) {
+  const firstUserPrompt = scanSessionLines(sessionFile, headScanWindow(stat), (line) => {
+    if (!line.trim()) return undefined;
     try {
       const turn = parseTranscriptTurn(JSON.parse(line));
-      if (turn?.role === "user" && !firstUserPrompt) {
-        firstUserPrompt = userPromptSummary(turn.text)
-          || (turn.attachments?.[0]?.filename ? boundedThreadText(turn.attachments[0].filename) : null);
-      }
+      if (turn?.role !== "user") return undefined;
+      const prompt = userPromptSummary(turn.text)
+        || (turn.attachments?.[0]?.filename ? boundedThreadText(turn.attachments[0].filename) : null);
+      return prompt || undefined;
     } catch {
-      continue;
+      return undefined;
     }
-  }
+  }) ?? null;
 
-  for (const line of readSessionLines(sessionFile, { fromEnd: true })) {
-    if (!line.trim()) continue;
+  const lastAssistantAnswer = scanSessionLines(sessionFile, tailScanWindow(stat), (line) => {
+    if (!line.trim()) return undefined;
     try {
       const turn = parseTranscriptTurn(JSON.parse(line));
-      if (turn?.role !== "assistant") continue;
-      lastAssistantAnswer = boundedThreadText(turn.text);
-      break;
+      if (turn?.role !== "assistant") return undefined;
+      // `null` is a real answer here (a reply with no usable text), and it
+      // still ends the search exactly as the old `break` did.
+      return { answer: boundedThreadText(turn.text) };
     } catch {
-      continue;
+      return undefined;
     }
-  }
+  })?.answer ?? null;
 
   return { firstUserPrompt, lastAssistantAnswer };
 }
