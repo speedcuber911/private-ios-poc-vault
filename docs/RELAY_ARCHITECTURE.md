@@ -334,8 +334,11 @@ allowlisted instance; it still cannot mint the pairing bearer or read jobs.
 Operator env on `poc-ec2`: `RELAY_POWER_INSTANCE_ALLOWLIST`, optional
 `RELAY_POWER_ENROLL_TOKEN`, `RELAY_POWER_AWS_REGION`. The instance role needs
 `ec2:StartInstances` / `StopInstances` / `DescribeInstances` /
-`ModifyInstanceAttribute` on those instance ARNs, ideally restricted to the
-`instanceType` attribute. On the worker: `RELAYD_CLOUD_URL`, optional `RELAYD_POWER_INSTANCE_ID`
+`ModifyInstanceAttribute` on those instance ARNs. Each worker needs its own
+resize grant, restricted to its current family using `ec2:Attribute/InstanceType`;
+start/stop permission alone does not permit resizing. M4 workers offer the six
+valid M4 sizes, including `m4.10xlarge`.
+On the worker: `RELAYD_CLOUD_URL`, optional `RELAYD_POWER_INSTANCE_ID`
 (else IMDS), optional `RELAYD_POWER_ENROLL_TOKEN`.
 
 ## Known gaps

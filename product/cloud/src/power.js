@@ -34,6 +34,8 @@ export function resizeOptions(instanceType) {
   let sizes;
   if (/^t(?:2|3|3a|4g)$/.test(family)) {
     sizes = ["nano", "micro", "small", "medium", "large", "xlarge", "2xlarge"];
+  } else if (family === "m4") {
+    sizes = ["large", "xlarge", "2xlarge", "4xlarge", "10xlarge", "16xlarge"];
   } else if (/^[mcr][5-9](?:[a-z]*)$/.test(family)) {
     sizes = ["large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge", "24xlarge"];
   } else {

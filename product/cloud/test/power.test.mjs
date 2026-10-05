@@ -329,6 +329,48 @@ test("paired phone reads the EC2 type and requests a durable same-series resize"
   }
 });
 
+test("paired M4 worker exposes real same-series sizes and resizes while stopped", async () => {
+  const t = await startPowerApp();
+  const path = "/v1/power/node-aabbccddeeff0011";
+  const headers = { authorization: `Bearer ${WAKE}` };
+  try {
+    assert.equal((await register(t, makeNodeIdentity())).status, 201);
+    t.ec2.types.set(INSTANCE, "m4.large");
+    t.ec2.states.set(INSTANCE, "stopped");
+
+    const initial = await api(t.baseUrl, "GET", path, { headers });
+    assert.equal(initial.status, 200);
+    assert.deepEqual(initial.json.power.resizeOptions, [
+      "m4.large", "m4.xlarge", "m4.2xlarge", "m4.4xlarge", "m4.10xlarge", "m4.16xlarge",
+    ]);
+
+    for (const targetType of ["m4.8xlarge", "m4.12xlarge", "m7i.xlarge"]) {
+      const invalid = await api(t.baseUrl, "POST", `${path}/resize`, {
+        headers, body: { expectedType: "m4.large", targetType },
+      });
+      assert.equal(invalid.status, 400);
+      assert.equal(invalid.json.error, "invalid_resize");
+    }
+
+    const accepted = await api(t.baseUrl, "POST", `${path}/resize`, {
+      headers, body: { expectedType: "m4.large", targetType: "m4.xlarge" },
+    });
+    assert.equal(accepted.status, 202);
+    assert.equal(accepted.json.power.resize.wasRunning, false);
+    await t.app.power.advanceResizes();
+    await t.app.power.advanceResizes();
+
+    const done = await api(t.baseUrl, "GET", path, { headers });
+    assert.equal(done.json.power.instanceType, "m4.xlarge");
+    assert.equal(done.json.power.instanceState, "stopped");
+    assert.equal(done.json.power.resize.stage, "complete");
+    assert.deepEqual(t.ec2.calls.find((call) => call[0] === "modify"), ["modify", INSTANCE, "m4.xlarge"]);
+    assert.ok(!t.ec2.calls.some((call) => call[0] === "start" || call[0] === "stop"));
+  } finally {
+    await t.close();
+  }
+});
+
 test("paired phone reads and switches idle auto-stop through the instance tag", async () => {
   const t = await startPowerApp();
   const identity = makeNodeIdentity();
