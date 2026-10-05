@@ -362,6 +362,33 @@ CREATE TABLE IF NOT EXISTS node_resize (
   started_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL
 );
+
+-- Phones that asked to hear about one machine's power, authorised by the
+-- pairing wake token. A re-pair that rotates the token deletes them, so only
+-- phones holding the current token are told anything. See
+-- docs/superpowers/specs/2026-10-05-machine-power-notifications.md.
+CREATE TABLE IF NOT EXISTS node_power_devices (
+  node_id          TEXT NOT NULL REFERENCES node_power(node_id) ON DELETE CASCADE,
+  apns_token       TEXT NOT NULL,
+  apns_environment TEXT,
+  created_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL,
+  PRIMARY KEY (node_id, apns_token)
+);
+
+-- What the power watcher last saw per machine, so a cloud restart neither
+-- re-announces a change nor forgets one is pending.
+--   stop_requested_at    - a stop came through Relay; its stop stays silent
+--   awaiting_ready_since - the machine is booting; the next relayd
+--                          registration (or a 5-minute fallback) announces it
+CREATE TABLE IF NOT EXISTS node_power_watch (
+  node_id              TEXT PRIMARY KEY REFERENCES node_power(node_id) ON DELETE CASCADE,
+  state                TEXT NOT NULL,
+  name                 TEXT,
+  observed_at          INTEGER NOT NULL,
+  stop_requested_at    INTEGER,
+  awaiting_ready_since INTEGER
+);
 `;
 
 export function createDb(path = ":memory:") {

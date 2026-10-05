@@ -554,7 +554,7 @@ export function createApp({
   // per instance, like handoffWaiters, so tests don't leak claimed
   // (nodeId, ts, signature) triples across app instances.
   const handoffReplayGuard = createReplayGuard();
-  const power = createPower({ db, config, now, ec2, replayGuard: handoffReplayGuard, log });
+  const power = createPower({ db, config, now, ec2, apns, replayGuard: handoffReplayGuard, log });
 
   // Per-account sliding window for POST /v1/auth/device/inspect. Mirrors the
   // spirit of the per-IP live-code ceiling on /device/start, but inspect is
@@ -737,6 +737,14 @@ export function createApp({
         const body = await readJson(req, config.jsonBodyMaxBytes);
         if (!body || typeof body !== "object") return sendJson(res, 400, { error: "invalid_autostop" });
         const result = await power.setAutoStop(authed.row, body);
+        return sendJson(res, result.status, result.body);
+      }
+      if ((method === "PUT" || method === "DELETE") && seg.length === 4 && seg[3] === "push") {
+        const body = await readJson(req, config.jsonBodyMaxBytes);
+        if (!body || typeof body !== "object") return sendJson(res, 400, { error: "invalid_apns_token" });
+        const result = method === "PUT"
+          ? power.subscribePush(authed.row, body)
+          : power.unsubscribePush(authed.row, body);
         return sendJson(res, result.status, result.body);
       }
     }

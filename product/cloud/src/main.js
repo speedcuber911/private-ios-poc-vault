@@ -118,6 +118,16 @@ void app.power.advanceResizes().catch((err) => {
   console.error(`resize recovery failed: ${err?.message}`);
 });
 
+// Watches paired machines' EC2 state and pushes when one is paused or stops
+// outside Relay. The last observation is in SQLite, so a restart neither
+// re-announces nor loses a pending "ready".
+const powerWatcher = setInterval(() => {
+  void app.power.watchPower().catch((err) => {
+    console.error(`power watcher failed: ${err?.message}`);
+  });
+}, 30_000);
+powerWatcher.unref();
+
 app.server.listen(config.port, config.host, () => {
   console.log(`relay-cloud listening on ${config.host}:${config.port}`);
 });

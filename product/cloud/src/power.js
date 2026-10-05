@@ -13,6 +13,7 @@ import { parseNodePubkey } from "./notify.js";
 import { EC2_INSTANCE_ID_RE } from "./config.js";
 import { createEc2Client } from "./ec2.js";
 import { instancePricing } from "./instance-pricing.js";
+import { apnsCollapseId, APNS_OUTCOME } from "./apns.js";
 
 const NODE_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 const REGION_RE = /^[a-z]{2}-[a-z]+-\d+$/;
@@ -25,6 +26,52 @@ const ACTIVE_RESIZE_STAGES = ["requested", "waiting_stop", "modifying", "waiting
 // Read by the dev-ec2-idle-autostop Lambda in the same account, which stops
 // the machine after an idle hour unless this tag is "false". Absent = on.
 export const AUTO_STOP_TAG = "AutoStopEnabled";
+
+// Power notifications: see
+// docs/superpowers/specs/2026-10-05-machine-power-notifications.md.
+const UP_STATES = new Set(["pending", "running"]);
+// An observation older than this means the cloud was not watching; the next
+// one only records, because a banner about an old change is noise.
+const WATCH_STALE_MS = 10 * 60_000;
+// A stop requested through Relay stays silent for this long.
+const STOP_REQUEST_QUIET_MS = 10 * 60_000;
+// The idle Lambda tags AutoStoppedAt right after StopInstances.
+const AUTO_STOP_TAG_FRESH_MS = 30 * 60_000;
+// Running this long with no relayd registration still gets a banner.
+const READY_FALLBACK_MS = 5 * 60_000;
+const READY_WAIT_MAX_MS = 20 * 60_000;
+const PUSH_DEVICES_MAX = 10;
+const APNS_TOKEN_RE = /^[0-9a-f]{64,200}$/;
+const MACHINE_NAME_MAX = 40;
+
+// The EC2 Name tag, made safe for a lock screen. This is the one stored
+// string a power banner hands to Apple.
+function machineName(tags) {
+  const clean = String(tags?.Name ?? "").replace(/\p{C}/gu, "").trim();
+  if (!clean) return null;
+  return clean.length > MACHINE_NAME_MAX ? `${clean.slice(0, MACHINE_NAME_MAX - 1)}…` : clean;
+}
+
+function idleFor(minutes) {
+  if (!Number.isSafeInteger(minutes) || minutes <= 0) return "Idle";
+  if (minutes === 60) return "Idle for an hour";
+  if (minutes % 60 === 0) return `Idle for ${minutes / 60} hours`;
+  return `Idle for ${minutes} minutes`;
+}
+
+function stoppedBanner(tags, name, nowMs) {
+  const label = name || "Your machine";
+  const stoppedAt = Date.parse(tags?.AutoStoppedAt ?? "");
+  const age = nowMs - stoppedAt;
+  if (Number.isFinite(stoppedAt) && age >= -60_000 && age <= AUTO_STOP_TAG_FRESH_MS) {
+    const minutes = Number(/^idle-(\d+)min$/.exec(tags?.AutoStopReason ?? "")?.[1]);
+    return {
+      title: `${label} paused`,
+      body: `${idleFor(minutes)}, so it stopped to save cost. Start it from Relay when you need it.`,
+    };
+  }
+  return { title: `${label} stopped`, body: "It was stopped outside Relay." };
+}
 
 // Keep the control to sizes in the current EC2 family. AWS still makes the
 // final compatibility and regional-capacity decision for the specific VM.
@@ -81,6 +128,7 @@ export function createPower({
   config,
   now = () => Date.now(),
   ec2 = null,
+  apns = null,
   replayGuard,
   log = (msg) => console.warn(msg),
 } = {}) {
@@ -92,6 +140,7 @@ export function createPower({
   const lastMutateAt = new Map();
   const mutateHits = new Map();
   const advancing = new Set();
+  const pushesInFlight = new Set();
 
   function get(nodeId) {
     return db.prepare("SELECT * FROM node_power WHERE node_id = ?").get(nodeId) || null;
@@ -230,6 +279,12 @@ export function createPower({
       db.prepare(
         "UPDATE node_power SET instance_id = ?, region = ?, wake_token_hash = ?, updated_at = ? WHERE node_id = ?",
       ).run(instanceId, region, wakeTokenHash, nowMs, nodeId);
+      // A re-pair rotated the wake token: phones subscribed with the old one
+      // must stop hearing about this machine.
+      if (existing.wake_token_hash !== wakeTokenHash) {
+        db.prepare("DELETE FROM node_power_devices WHERE node_id = ?").run(nodeId);
+      }
+      announceReady(nodeId);
       return { status: 200, body: { ok: true, power: publicPower(get(nodeId)) } };
     }
 
@@ -251,6 +306,8 @@ export function createPower({
         ? await client.stopInstances({ instanceIds: [row.instance_id] })
         : await client.startInstances({ instanceIds: [row.instance_id] });
       const instance = result.instances?.[0];
+      if (action === "stop") markStopRequested(row.node_id);
+      else markAwaitingReady(row.node_id, instance?.state || "pending");
       return {
         status: 200,
         body: {
@@ -442,6 +499,175 @@ export function createPower({
     }
   }
 
+  // ── power notifications ───────────────────────────────────────────────
+
+  function subscribePush(row, { apnsToken, apnsEnvironment } = {}) {
+    if (!configured() || !allowlist.has(row.instance_id)) return { status: 503, body: { error: "power_unconfigured" } };
+    const token = typeof apnsToken === "string" ? apnsToken.trim().toLowerCase() : "";
+    if (!APNS_TOKEN_RE.test(token)) return { status: 400, body: { error: "invalid_apns_token" } };
+    const environment = apnsEnvironment === "production" || apnsEnvironment === "development"
+      ? apnsEnvironment
+      : null;
+    const nowMs = now();
+    db.prepare(`INSERT INTO node_power_devices (node_id, apns_token, apns_environment, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(node_id, apns_token) DO UPDATE SET apns_environment = excluded.apns_environment,
+        updated_at = excluded.updated_at`)
+      .run(row.node_id, token, environment, nowMs, nowMs);
+    db.prepare(`DELETE FROM node_power_devices WHERE node_id = ? AND apns_token NOT IN (
+        SELECT apns_token FROM node_power_devices WHERE node_id = ? ORDER BY updated_at DESC LIMIT ?)`)
+      .run(row.node_id, row.node_id, PUSH_DEVICES_MAX);
+    return { status: 200, body: { ok: true } };
+  }
+
+  function unsubscribePush(row, { apnsToken } = {}) {
+    const token = typeof apnsToken === "string" ? apnsToken.trim().toLowerCase() : "";
+    if (!APNS_TOKEN_RE.test(token)) return { status: 400, body: { error: "invalid_apns_token" } };
+    db.prepare("DELETE FROM node_power_devices WHERE node_id = ? AND apns_token = ?").run(row.node_id, token);
+    return { status: 200, body: { ok: true } };
+  }
+
+  function watchRow(nodeId) {
+    return db.prepare("SELECT * FROM node_power_watch WHERE node_id = ?").get(nodeId) || null;
+  }
+
+  function markStopRequested(nodeId) {
+    db.prepare(`INSERT INTO node_power_watch (node_id, state, observed_at, stop_requested_at)
+      VALUES (?, 'stopping', ?, ?)
+      ON CONFLICT(node_id) DO UPDATE SET stop_requested_at = excluded.stop_requested_at,
+        awaiting_ready_since = NULL`)
+      .run(nodeId, now(), now());
+  }
+
+  function markAwaitingReady(nodeId, state) {
+    db.prepare(`INSERT INTO node_power_watch (node_id, state, observed_at, awaiting_ready_since)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(node_id) DO UPDATE SET stop_requested_at = NULL,
+        awaiting_ready_since = COALESCE(node_power_watch.awaiting_ready_since, excluded.awaiting_ready_since)`)
+      .run(nodeId, state, now(), now());
+  }
+
+  // relayd registers on every start. After a start (or while the watcher
+  // still believes the machine is stopped) that registration means Relay
+  // itself is up; a relayd restart on a running machine stays silent.
+  function announceReady(nodeId) {
+    const watch = watchRow(nodeId);
+    if (!watch) return;
+    const nowMs = now();
+    const awaiting = watch.awaiting_ready_since != null && nowMs - watch.awaiting_ready_since <= READY_WAIT_MAX_MS;
+    const seenDown = !UP_STATES.has(watch.state) && nowMs - watch.observed_at <= WATCH_STALE_MS;
+    if (!awaiting && !seenDown) return;
+    db.prepare(`UPDATE node_power_watch SET state = 'running', stop_requested_at = NULL,
+      awaiting_ready_since = NULL WHERE node_id = ?`).run(nodeId);
+    const resize = resizeRow(nodeId);
+    const resized = resize && ["waiting_start", "waiting_running", "complete"].includes(resize.stage)
+      && nowMs - resize.started_at <= READY_WAIT_MAX_MS
+      ? resize.target_type
+      : null;
+    sendPowerPush(nodeId, "power.ready", {
+      title: `${watch.name || "Your machine"} is ready`,
+      body: resized ? `Now running as ${resized}. Relay is connected.` : "Relay is connected.",
+    });
+  }
+
+  function observe(row, instance) {
+    const nodeId = row.node_id;
+    const state = instance.state;
+    const name = machineName(instance.tags);
+    const prev = watchRow(nodeId);
+    const nowMs = now();
+    const record = (stopRequestedAt, awaitingSince) => {
+      db.prepare(`INSERT INTO node_power_watch
+          (node_id, state, name, observed_at, stop_requested_at, awaiting_ready_since)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(node_id) DO UPDATE SET state = excluded.state, name = excluded.name,
+          observed_at = excluded.observed_at, stop_requested_at = excluded.stop_requested_at,
+          awaiting_ready_since = excluded.awaiting_ready_since`)
+        .run(nodeId, state, name, nowMs, stopRequestedAt, awaitingSince);
+    };
+    if (!prev || nowMs - prev.observed_at > WATCH_STALE_MS) {
+      record(null, null);
+      return;
+    }
+    let stopRequestedAt = prev.stop_requested_at != null && nowMs - prev.stop_requested_at <= STOP_REQUEST_QUIET_MS
+      ? prev.stop_requested_at
+      : null;
+    let awaitingSince = prev.awaiting_ready_since != null && nowMs - prev.awaiting_ready_since <= READY_WAIT_MAX_MS
+      ? prev.awaiting_ready_since
+      : null;
+    let push = null;
+    if (state === "stopped" && prev.state !== "stopped") {
+      // Announced at `stopped`, not `stopping`: by then the Lambda's
+      // AutoStoppedAt tag is reliably visible.
+      if (["running", "pending", "stopping"].includes(prev.state) && !resizeActive(nodeId) && !stopRequestedAt) {
+        push = { type: "power.stopped", banner: stoppedBanner(instance.tags, name, nowMs) };
+      }
+      stopRequestedAt = null;
+      awaitingSince = null;
+    } else if (UP_STATES.has(state) && !UP_STATES.has(prev.state)) {
+      awaitingSince = awaitingSince ?? nowMs;
+      stopRequestedAt = null;
+    } else if (state === "running" && awaitingSince != null && nowMs - awaitingSince >= READY_FALLBACK_MS) {
+      push = {
+        type: "power.ready",
+        banner: { title: `${name || "Your machine"} is on`, body: "It's running, but Relay hasn't connected yet." },
+      };
+      awaitingSince = null;
+    }
+    // Persisted before the push goes out: one transition, at most one push.
+    record(stopRequestedAt, awaitingSince);
+    if (push) sendPowerPush(nodeId, push.type, push.banner);
+  }
+
+  async function watchPower() {
+    if (!configured()) return;
+    const rows = db.prepare("SELECT * FROM node_power").all().filter((row) => allowlist.has(row.instance_id));
+    if (rows.length === 0) return;
+    const result = await client.describeInstances({ instanceIds: rows.map((row) => row.instance_id) });
+    const byId = new Map((result.instances || []).map((instance) => [instance.instanceId, instance]));
+    for (const row of rows) {
+      const instance = byId.get(row.instance_id);
+      if (instance) observe(row, instance);
+    }
+  }
+
+  function sendPowerPush(nodeId, type, banner) {
+    if (!apns) return;
+    const devices = db.prepare("SELECT apns_token, apns_environment FROM node_power_devices WHERE node_id = ?")
+      .all(nodeId);
+    if (devices.length === 0) return;
+    const payload = { nodeId, jobId: null, type, ts: now(), seq: 0 };
+    const category = type === "power.ready" ? "RELAY_POWER_READY" : "RELAY_POWER_STOPPED";
+    const job = (async () => {
+      const tally = {};
+      for (const device of devices) {
+        const result = await apns.send({
+          deviceToken: device.apns_token,
+          kind: "mutable",
+          category,
+          payload,
+          // One per machine: the newest power banner replaces the last one.
+          collapseId: apnsCollapseId(nodeId, "power", "mutable"),
+          banner,
+          apnsEnvironment: device.apns_environment,
+        });
+        tally[result.outcome] = (tally[result.outcome] ?? 0) + 1;
+        if (result.outcome === APNS_OUTCOME.UNREGISTERED) {
+          db.prepare("DELETE FROM node_power_devices WHERE node_id = ? AND apns_token = ?")
+            .run(nodeId, device.apns_token);
+        }
+      }
+      // Outcome mix only — never a token.
+      log(`power push ${type}: devices=${devices.length} ${Object.entries(tally).map(([key, count]) => `${key}=${count}`).join(" ")}`);
+    })().catch((error) => log(`power push ${type} failed: ${error?.message || error}`));
+    pushesInFlight.add(job);
+    job.finally(() => pushesInFlight.delete(job));
+  }
+
+  async function drainPushes() {
+    while (pushesInFlight.size > 0) await Promise.all([...pushesInFlight]);
+  }
+
   return {
     configured,
     register,
@@ -451,6 +677,10 @@ export function createPower({
     setAutoStop,
     requestResize,
     advanceResizes,
+    subscribePush,
+    unsubscribePush,
+    watchPower,
+    drainPushes,
     get,
     getByTokenHash,
   };

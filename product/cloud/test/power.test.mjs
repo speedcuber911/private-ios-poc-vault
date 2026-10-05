@@ -635,3 +635,267 @@ test("DescribeInstances tags stay with their own instance despite nested items",
     { instanceId: OTHER_INSTANCE, state: "stopped", instanceType: "m4.large", tags: {} },
   ]);
 });
+
+// ── power notifications ─────────────────────────────────────────────────────
+// docs/superpowers/specs/2026-10-05-machine-power-notifications.md
+
+const NODE = "node-aabbccddeeff0011";
+const PHONE = "ab".repeat(32);
+const WAKE_HEADERS = { authorization: `Bearer ${WAKE}` };
+
+function powerPushes(t) {
+  return t.apnsTransport.requests.filter((request) => String(request.body.relay?.type).startsWith("power."));
+}
+
+// A registered machine named pariksj-dev, one subscribed phone, and a first
+// watcher observation already recorded in `state`.
+async function watchedMachine(state = "running") {
+  const t = await startPowerApp();
+  const identity = makeNodeIdentity();
+  assert.equal((await register(t, identity, { ts: t.clock.t })).status, 201);
+  const subscribed = await api(t.baseUrl, "PUT", `/v1/power/${NODE}/push`, {
+    headers: WAKE_HEADERS, body: { apnsToken: PHONE, apnsEnvironment: "production" },
+  });
+  assert.equal(subscribed.status, 200);
+  t.ec2.tags.set(INSTANCE, { Name: "pariksj-dev" });
+  t.ec2.states.set(INSTANCE, state);
+  await t.app.power.watchPower();
+  t.identity = identity;
+  t.tick = async (ms = 30_000) => {
+    t.clock.t += ms;
+    await t.app.power.watchPower();
+    await t.app.power.drainPushes();
+  };
+  return t;
+}
+
+test("a phone subscribes to its machine's power pushes with the wake token alone", async () => {
+  const t = await startPowerApp();
+  try {
+    assert.equal((await register(t, makeNodeIdentity(), { ts: t.clock.t })).status, 201);
+    const path = `/v1/power/${NODE}/push`;
+    assert.equal((await api(t.baseUrl, "PUT", path, { body: { apnsToken: PHONE } })).status, 401);
+    assert.equal((await api(t.baseUrl, "PUT", path, {
+      headers: { authorization: "Bearer not-the-wake-token-at-all" }, body: { apnsToken: PHONE },
+    })).status, 401);
+    const invalid = await api(t.baseUrl, "PUT", path, { headers: WAKE_HEADERS, body: { apnsToken: "not hex" } });
+    assert.equal(invalid.status, 400);
+    assert.equal(invalid.json.error, "invalid_apns_token");
+
+    assert.equal((await api(t.baseUrl, "PUT", path, {
+      headers: WAKE_HEADERS, body: { apnsToken: PHONE.toUpperCase(), apnsEnvironment: "development" },
+    })).status, 200);
+    const rows = t.app.db.prepare("SELECT * FROM node_power_devices").all();
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].apns_token, PHONE);
+    assert.equal(rows[0].apns_environment, "development");
+
+    assert.equal((await api(t.baseUrl, "DELETE", path, { headers: WAKE_HEADERS, body: { apnsToken: PHONE } })).status, 200);
+    assert.equal(t.app.db.prepare("SELECT count(*) AS c FROM node_power_devices").get().c, 0);
+  } finally {
+    await t.close();
+  }
+});
+
+test("a machine keeps at most ten subscribed phones, dropping the stalest", async () => {
+  const t = await startPowerApp();
+  try {
+    assert.equal((await register(t, makeNodeIdentity(), { ts: t.clock.t })).status, 201);
+    for (let index = 0; index < 11; index += 1) {
+      t.clock.t += 1_000;
+      assert.equal((await api(t.baseUrl, "PUT", `/v1/power/${NODE}/push`, {
+        headers: WAKE_HEADERS, body: { apnsToken: index.toString(16).padStart(2, "0").repeat(32) },
+      })).status, 200);
+    }
+    const tokens = t.app.db.prepare("SELECT apns_token FROM node_power_devices").all().map((row) => row.apns_token);
+    assert.equal(tokens.length, 10);
+    assert.ok(!tokens.includes("00".repeat(32)));
+  } finally {
+    await t.close();
+  }
+});
+
+test("the idle Lambda's pause pushes once, naming the machine and the idle window", async () => {
+  const t = await watchedMachine("running");
+  try {
+    assert.equal(powerPushes(t).length, 0, "the first observation only records");
+
+    t.ec2.states.set(INSTANCE, "stopping");
+    await t.tick();
+    assert.equal(powerPushes(t).length, 0, "announced at stopped, not stopping");
+
+    t.ec2.tags.set(INSTANCE, {
+      Name: "pariksj-dev",
+      AutoStoppedAt: new Date(t.clock.t).toISOString().replace("Z", "123+00:00"),
+      AutoStopReason: "idle-60min",
+    });
+    t.ec2.states.set(INSTANCE, "stopped");
+    await t.tick();
+    const [push] = powerPushes(t);
+    assert.equal(powerPushes(t).length, 1);
+    assert.equal(push.path, `/3/device/${PHONE}`);
+    assert.equal(push.host, "api.push.apple.com");
+    assert.deepEqual(push.body.aps.alert, {
+      title: "pariksj-dev paused",
+      body: "Idle for an hour, so it stopped to save cost. Start it from Relay when you need it.",
+    });
+    assert.equal(push.body.aps.category, "RELAY_POWER_STOPPED");
+    assert.deepEqual(push.body.relay, { nodeId: NODE, jobId: null, type: "power.stopped", ts: t.clock.t, seq: 0 });
+
+    await t.tick();
+    assert.equal(powerPushes(t).length, 1, "one transition, one push");
+  } finally {
+    await t.close();
+  }
+});
+
+test("a stop outside Relay says so; a stop through Relay stays silent", async () => {
+  const t = await watchedMachine("running");
+  try {
+    t.ec2.states.set(INSTANCE, "stopped");
+    await t.tick();
+    assert.equal(powerPushes(t).length, 1);
+    assert.deepEqual(powerPushes(t)[0].body.aps.alert, {
+      title: "pariksj-dev stopped",
+      body: "It was stopped outside Relay.",
+    });
+
+    t.ec2.states.set(INSTANCE, "running");
+    await t.tick();
+    t.clock.t += 16_000;
+    assert.equal((await api(t.baseUrl, "POST", `/v1/power/${NODE}/stop`, { headers: WAKE_HEADERS })).status, 200);
+    await t.tick();
+    t.ec2.states.set(INSTANCE, "stopped");
+    await t.tick();
+    assert.equal(powerPushes(t).length, 1, "the phone that asked already knows");
+  } finally {
+    await t.close();
+  }
+});
+
+test("a start from Relay is announced when relayd registers, and a relayd restart is not", async () => {
+  const t = await watchedMachine("stopped");
+  try {
+    assert.equal((await api(t.baseUrl, "POST", `/v1/power/${NODE}/start`, { headers: WAKE_HEADERS })).status, 200);
+    await t.tick();
+    t.ec2.states.set(INSTANCE, "running");
+    await t.tick();
+    assert.equal(powerPushes(t).length, 0, "EC2 running is not Relay ready");
+
+    assert.equal((await register(t, t.identity, { ts: t.clock.t })).status, 200);
+    await t.app.power.drainPushes();
+    assert.equal(powerPushes(t).length, 1);
+    assert.deepEqual(powerPushes(t)[0].body.aps.alert, { title: "pariksj-dev is ready", body: "Relay is connected." });
+    assert.equal(powerPushes(t)[0].body.aps.category, "RELAY_POWER_READY");
+    assert.equal(powerPushes(t)[0].body.relay.type, "power.ready");
+
+    t.clock.t += 60_000;
+    assert.equal((await register(t, t.identity, { ts: t.clock.t })).status, 200);
+    await t.tick(READY_FALLBACK_TEST_MS);
+    assert.equal(powerPushes(t).length, 1);
+  } finally {
+    await t.close();
+  }
+});
+
+test("a machine started outside Relay is announced when relayd beats the watcher to it", async () => {
+  const t = await watchedMachine("stopped");
+  try {
+    t.clock.t += 20_000;
+    assert.equal((await register(t, t.identity, { ts: t.clock.t })).status, 200);
+    await t.app.power.drainPushes();
+    assert.equal(powerPushes(t).length, 1);
+    assert.equal(powerPushes(t)[0].body.aps.alert.title, "pariksj-dev is ready");
+    t.ec2.states.set(INSTANCE, "running");
+    await t.tick();
+    assert.equal(powerPushes(t).length, 1);
+  } finally {
+    await t.close();
+  }
+});
+
+const READY_FALLBACK_TEST_MS = 5 * 60_000;
+
+test("a machine running five minutes without relayd still gets a banner", async () => {
+  const t = await watchedMachine("stopped");
+  try {
+    t.ec2.states.set(INSTANCE, "running");
+    await t.tick();
+    await t.tick(READY_FALLBACK_TEST_MS - 60_000);
+    assert.equal(powerPushes(t).length, 0);
+    await t.tick(60_000);
+    assert.equal(powerPushes(t).length, 1);
+    assert.deepEqual(powerPushes(t)[0].body.aps.alert, {
+      title: "pariksj-dev is on",
+      body: "It's running, but Relay hasn't connected yet.",
+    });
+    await t.tick();
+    assert.equal(powerPushes(t).length, 1);
+  } finally {
+    await t.close();
+  }
+});
+
+test("a resize never says stopped, and ends with one ready naming the new size", async () => {
+  const t = await watchedMachine("running");
+  try {
+    t.ec2.types.set(INSTANCE, "m8a.large");
+    assert.equal((await api(t.baseUrl, "POST", `/v1/power/${NODE}/resize`, {
+      headers: WAKE_HEADERS, body: { expectedType: "m8a.large", targetType: "m8a.xlarge" },
+    })).status, 202);
+    await t.app.power.advanceResizes();
+    await t.tick();
+    t.ec2.states.set(INSTANCE, "stopped");
+    await t.tick();
+    await t.app.power.advanceResizes();
+    await t.app.power.advanceResizes();
+    await t.app.power.advanceResizes();
+    await t.tick();
+    t.ec2.states.set(INSTANCE, "running");
+    await t.tick();
+    await t.app.power.advanceResizes();
+    assert.equal(powerPushes(t).length, 0);
+
+    assert.equal((await register(t, t.identity, { ts: t.clock.t })).status, 200);
+    await t.app.power.drainPushes();
+    assert.equal(powerPushes(t).length, 1);
+    assert.deepEqual(powerPushes(t)[0].body.aps.alert, {
+      title: "pariksj-dev is ready",
+      body: "Now running as m8a.xlarge. Relay is connected.",
+    });
+  } finally {
+    await t.close();
+  }
+});
+
+test("an observation after the cloud was away only records", async () => {
+  const t = await watchedMachine("running");
+  try {
+    t.ec2.states.set(INSTANCE, "stopped");
+    await t.tick(11 * 60_000);
+    assert.equal(powerPushes(t).length, 0);
+  } finally {
+    await t.close();
+  }
+});
+
+test("re-pairing drops the old phones, and Apple's 410 drops a dead token", async () => {
+  const t = await watchedMachine("running");
+  try {
+    t.apnsTransport.respondWith({ status: 410, body: JSON.stringify({ reason: "Unregistered" }) });
+    t.ec2.states.set(INSTANCE, "stopped");
+    await t.tick();
+    assert.equal(powerPushes(t).length, 1);
+    assert.equal(t.app.db.prepare("SELECT count(*) AS c FROM node_power_devices").get().c, 0);
+
+    assert.equal((await api(t.baseUrl, "PUT", `/v1/power/${NODE}/push`, {
+      headers: WAKE_HEADERS, body: { apnsToken: PHONE },
+    })).status, 200);
+    t.clock.t += 1_000;
+    const rotated = await register(t, t.identity, { ts: t.clock.t, wakeTokenHash: hashWakeToken("b".repeat(64)) });
+    assert.equal(rotated.status, 200);
+    assert.equal(t.app.db.prepare("SELECT count(*) AS c FROM node_power_devices").get().c, 0);
+  } finally {
+    await t.close();
+  }
+});

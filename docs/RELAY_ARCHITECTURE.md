@@ -80,7 +80,8 @@ running it from source.
    you already have onto that machine. Moving credentials is the reason the CLI
    still exists.
 
-Sign in only when you want laptop handoff, push notifications, or `relay login`.
+Sign in only when you want laptop handoff, run notifications, or `relay login`.
+A paired machine's power notifications need no account (see Machine power).
 
 ### relayd terminates its own TLS
 
@@ -331,12 +332,32 @@ for confirmation before submitting it.
 Sign-in is not required. Compromising the control plane can boot or halt an
 allowlisted instance; it still cannot mint the pairing bearer or read jobs.
 
+**Power notifications.** A paired phone subscribes its APNs token with
+`PUT /v1/power/:nodeId/push` (wake token as bearer; `DELETE` on unpair; a
+re-pair that rotates the token drops every subscriber). Every 30 s the control
+plane reads the registered instances' EC2 state and keeps the last observation
+in `node_power_watch`. A machine reaching `stopped` pushes "paused" (the
+idle Lambda's fresh `AutoStoppedAt` tag) or "stopped outside Relay"; stops
+requested through Relay and stops inside a resize stay silent. After a start,
+relayd's boot-time registration pushes "ready", with a fallback banner if
+relayd has not registered 5 minutes after `running`. The banner names the
+machine by its EC2 `Name` tag. See
+`docs/superpowers/specs/2026-10-05-machine-power-notifications.md`.
+
+The idle auto-stop itself is the `dev-ec2-idle-autostop` Lambda
+(`product/cloud/deploy/idle-autostop/`): every 15 minutes it stops a machine
+whose last hour stayed under 5% CPU and 10 MB of network per 5 minutes, unless
+the machine's `AutoStopEnabled` tag is `false`.
+
 Operator env on `poc-ec2`: `RELAY_POWER_INSTANCE_ALLOWLIST`, optional
 `RELAY_POWER_ENROLL_TOKEN`, `RELAY_POWER_AWS_REGION`. The instance role needs
 `ec2:StartInstances` / `StopInstances` / `DescribeInstances` /
-`ModifyInstanceAttribute` on those instance ARNs. Each worker needs its own
-resize grant, restricted to its current family using `ec2:Attribute/InstanceType`;
-start/stop permission alone does not permit resizing. M4 workers offer the six
+`ModifyInstanceAttribute` on those instance ARNs. Resizing needs its own grant,
+restricted with `ec2:Attribute/InstanceType` (inline policy
+`relay-machine-resize`, not versioned here; as of 2026-10-05 it allows m7i and
+m8a large–24xlarge on both workers). Moving a worker to a new family needs that
+policy and `src/instance-pricing.js` updated, or the app shows no prices and its
+resizes fail. Start/stop permission alone does not permit resizing. M4 workers offer the six
 valid M4 sizes, including `m4.10xlarge`.
 On the worker: `RELAYD_CLOUD_URL`, optional `RELAYD_POWER_INSTANCE_ID`
 (else IMDS), optional `RELAYD_POWER_ENROLL_TOKEN`.
