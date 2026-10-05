@@ -8,9 +8,11 @@ INSTANCE_IDS = os.environ.get(
     "TARGET_INSTANCE_IDS", "i-0364bb0f31f506e7c,i-05863951ad0263c8e"
 ).split(",")
 CPU_THRESHOLD_PERCENT = float(os.environ.get("CPU_THRESHOLD_PERCENT", "5"))
-# bytes per 5-minute period, summed across NetworkIn + NetworkOut
+# bytes per 5-minute period, summed across NetworkIn + NetworkOut. Unattended
+# background traffic on these boxes reaches ~4.6 MB per period, while real
+# sessions start around 7 MB, so 2 MB kept them awake all day.
 NETWORK_THRESHOLD_BYTES_PER_PERIOD = float(
-    os.environ.get("NETWORK_THRESHOLD_BYTES_PER_PERIOD", "2000000")
+    os.environ.get("NETWORK_THRESHOLD_BYTES_PER_PERIOD", "10000000")
 )
 IDLE_WINDOW_MINUTES = int(os.environ.get("IDLE_WINDOW_MINUTES", "120"))
 PERIOD_SECONDS = 300
