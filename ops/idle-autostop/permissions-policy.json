@@ -1,0 +1,36 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:ap-south-1:507121383669:log-group:/aws/lambda/dev-ec2-idle-autostop*"
+    },
+    {
+      "Sid": "ReadOnlyDescribeAndMetrics",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances",
+        "cloudwatch:GetMetricData"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "StopAndTagOnlyTheseTwoDevBoxes",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:StopInstances",
+        "ec2:CreateTags"
+      ],
+      "Resource": [
+        "arn:aws:ec2:ap-south-1:507121383669:instance/i-0364bb0f31f506e7c",
+        "arn:aws:ec2:ap-south-1:507121383669:instance/i-05863951ad0263c8e"
+      ]
+    }
+  ]
+}
