@@ -206,6 +206,59 @@ final class MachinePowerTests: XCTestCase {
         XCTAssertEqual(state.resize?.wasRunning, true)
     }
 
+    func testAutoStopReadsAndWritesThroughThePairingCredential() async throws {
+        let client = RelayPowerClient(
+            baseURL: URL(string: "https://relay.example")!,
+            session: URLSession(configuration: urlSessionReturning(
+                status: 200,
+                body: #"{"ok":true,"power":{"nodeId":"node-abc","instanceState":"running","autoStopEnabled":true}}"#
+            ))
+        )
+        let read = try await client.state(nodeID: "node-abc", wakeToken: "pairing-wake-token")
+        XCTAssertEqual(read.autoStopEnabled, true)
+
+        MockPowerURLProtocol.body = Data(#"{"ok":true,"power":{"nodeId":"node-abc","instanceState":"running"}}"#.utf8)
+        let older = try await client.state(nodeID: "node-abc", wakeToken: "pairing-wake-token")
+        XCTAssertNil(older.autoStopEnabled, "a control plane without auto-stop must not invent a value")
+
+        MockPowerURLProtocol.body = Data(#"{"ok":true,"power":{"nodeId":"node-abc","autoStopEnabled":false}}"#.utf8)
+        let saved = try await client.setAutoStop(nodeID: "node-abc", wakeToken: "pairing-wake-token", enabled: false)
+        XCTAssertEqual(saved.autoStopEnabled, false)
+        XCTAssertEqual(MockPowerURLProtocol.lastRequest?.url?.path, "/v1/power/node-abc/autostop")
+        XCTAssertEqual(MockPowerURLProtocol.lastRequest?.httpMethod, "POST")
+        XCTAssertEqual(MockPowerURLProtocol.lastRequest?.value(forHTTPHeaderField: "Authorization"),
+                       "Bearer pairing-wake-token")
+        let body = try XCTUnwrap(MockPowerURLProtocol.lastBody)
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: body) as? [String: Bool], ["enabled": false])
+    }
+
+    @MainActor
+    func testAutoStopSwitchRevertsOnFailureAndIgnoresLaggingTagReads() async {
+        let store = ClientIdentityStore()
+        store.storeWakeToken("wake-secret-token", nodeID: "node-abc")
+        let fake = FakePowerClient(states: ["running"])
+        fake.autoStop = true
+        let model = RelayMachinePowerModel(powerClient: fake)
+        model.configure(identityStore: store)
+        await model.refresh()
+        XCTAssertEqual(model.autoStopEnabled, true)
+
+        fake.autoStopError = RelayMachinePowerError.rateLimited
+        await model.setAutoStop(false)
+        XCTAssertEqual(model.autoStopEnabled, true)
+        XCTAssertFalse(model.isSavingAutoStop)
+        XCTAssertNotNil(model.notice)
+
+        fake.autoStopError = nil
+        await model.setAutoStop(false)
+        XCTAssertEqual(model.autoStopEnabled, false)
+        XCTAssertEqual(fake.autoStopWrites, [false, false])
+
+        // The fake still reports the old tag, as EC2 can just after a write.
+        await model.refresh()
+        XCTAssertEqual(model.autoStopEnabled, false)
+    }
+
     private func urlSessionReturning(status: Int, body: String) -> URLSessionConfiguration {
         MockPowerURLProtocol.status = status
         MockPowerURLProtocol.body = Data(body.utf8)
@@ -220,6 +273,9 @@ private final class FakePowerClient: RelayMachinePowering, @unchecked Sendable {
     var startState = "pending"
     var stopState = "stopping"
     var stateError: Error?
+    var autoStop: Bool?
+    var autoStopError: Error?
+    private(set) var autoStopWrites: [Bool] = []
 
     init(states: [String]) {
         self.states = states
@@ -236,11 +292,18 @@ private final class FakePowerClient: RelayMachinePowering, @unchecked Sendable {
     func state(nodeID: String, wakeToken: String) async throws -> RelayMachinePowerState {
         if let stateError { throw stateError }
         let next = states.count > 1 ? states.removeFirst() : (states.first ?? "running")
-        return RelayMachinePowerState(nodeID: nodeID, instanceID: "i-1", region: "ap-south-1", instanceState: next)
+        return RelayMachinePowerState(nodeID: nodeID, instanceID: "i-1", region: "ap-south-1", instanceState: next,
+                                      autoStopEnabled: autoStop)
     }
 
     func resize(nodeID: String, wakeToken: String, from: String, to: String) async throws -> RelayMachinePowerState {
         throw RelayMachinePowerError.invalidSize
+    }
+
+    func setAutoStop(nodeID: String, wakeToken: String, enabled: Bool) async throws -> RelayMachinePowerState {
+        autoStopWrites.append(enabled)
+        if let autoStopError { throw autoStopError }
+        return RelayMachinePowerState(nodeID: nodeID, instanceID: "i-1", region: "ap-south-1", autoStopEnabled: enabled)
     }
 }
 

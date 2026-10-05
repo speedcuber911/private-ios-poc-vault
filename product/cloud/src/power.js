@@ -22,6 +22,9 @@ const TS_MAX_SKEW_MS = 2 * 60 * 1000;
 const MUTATE_MIN_INTERVAL_MS = 15_000;
 const MUTATE_MAX_PER_HOUR = 20;
 const ACTIVE_RESIZE_STAGES = ["requested", "waiting_stop", "modifying", "waiting_start", "waiting_running", "recovering", "recovery_wait"];
+// Read by the dev-ec2-idle-autostop Lambda in the same account, which stops
+// the machine after two idle hours unless this tag is "false". Absent = on.
+export const AUTO_STOP_TAG = "AutoStopEnabled";
 
 // Keep the control to sizes in the current EC2 family. AWS still makes the
 // final compatibility and regional-capacity decision for the specific VM.
@@ -278,11 +281,30 @@ export function createPower({
             resizeOptions: options,
             pricing: instancePricing(row.region, options),
             resize: publicResize(row.node_id),
+            autoStopEnabled: instance?.tags?.[AUTO_STOP_TAG] !== "false",
           }),
         },
       };
     } catch (error) {
       log(`power aws describe failed for ${row.node_id}: ${error?.message || error}`);
+      return { status: 502, body: { error: "power_aws_failed" } };
+    }
+  }
+
+  async function setAutoStop(row, { enabled } = {}) {
+    if (!configured() || !allowlist.has(row.instance_id)) return { status: 503, body: { error: "power_unconfigured" } };
+    if (typeof enabled !== "boolean") return { status: 400, body: { error: "invalid_autostop" } };
+    if (!allowMutate(`autostop:${row.node_id}`, now())) {
+      return { status: 429, body: { error: "rate_limited" } };
+    }
+    try {
+      await client.createTags({
+        instanceId: row.instance_id,
+        tags: { [AUTO_STOP_TAG]: enabled ? "true" : "false" },
+      });
+      return { status: 200, body: { ok: true, power: publicPower(row, { autoStopEnabled: enabled }) } };
+    } catch (error) {
+      log(`power aws autostop failed for ${row.node_id}: ${error?.message || error}`);
       return { status: 502, body: { error: "power_aws_failed" } };
     }
   }
@@ -424,6 +446,7 @@ export function createPower({
     authorizeWake,
     mutate,
     describe,
+    setAutoStop,
     requestResize,
     advanceResizes,
     get,

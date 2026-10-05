@@ -1,4 +1,4 @@
-// Minimal EC2 Query client for Start/Stop/Describe/Modify. SigV4,
+// Minimal EC2 Query client for Start/Stop/Describe/Modify/CreateTags. SigV4,
 // no SDK. Injectable fetch + credentials so tests never touch AWS.
 //
 // Live credentials: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / optional
@@ -92,6 +92,26 @@ function parseInstanceStates(xml) {
   return instances;
 }
 
+// Splitting on <item> (as above) separates an instance from its own tagSet,
+// so tags are attributed by position instead: everything between one
+// <instanceId> and the next belongs to the first.
+function parseInstanceTags(xml) {
+  const text = String(xml);
+  const marks = [...text.matchAll(/<instanceId>\s*(i-[0-9a-f]+)\s*<\/instanceId>/gi)];
+  const tags = {};
+  marks.forEach((mark, index) => {
+    const end = index + 1 < marks.length ? marks[index + 1].index : text.length;
+    const set = /<tagSet>([\s\S]*?)<\/tagSet>/i.exec(text.slice(mark.index, end));
+    const id = mark[1].toLowerCase();
+    tags[id] = tags[id] || {};
+    if (!set) return;
+    for (const item of set[1].matchAll(/<key>([^<]*)<\/key>\s*<value>([^<]*)<\/value>/gi)) {
+      tags[id][item[1]] = item[2];
+    }
+  });
+  return tags;
+}
+
 async function fetchText(fetchImpl, url, init, timeoutMs) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
@@ -167,7 +187,7 @@ export function createEc2Client({
 } = {}) {
   if (!region) throw new TypeError("createEc2Client requires region");
 
-  async function call(action, instanceIds, extraParams = {}) {
+  async function request(action, instanceIds, extraParams = {}) {
     const creds = credentials || (await envOrImdsCredentials(fetchImpl));
     const host = `ec2.${region}.amazonaws.com`;
     const payload = canonicalQuery({ ...instanceParams(action, instanceIds), ...extraParams });
@@ -204,20 +224,41 @@ export function createEc2Client({
     if (/<return>\s*false\s*<\/return>/i.test(text)) {
       throw new Error(`ec2_${action}_rejected`);
     }
-    return { instances: parseInstanceStates(text) };
+    return text;
+  }
+
+  async function call(action, instanceIds, extraParams = {}) {
+    return { instances: parseInstanceStates(await request(action, instanceIds, extraParams)) };
   }
 
   return {
     startInstances: ({ instanceIds }) => call("StartInstances", instanceIds),
     stopInstances: ({ instanceIds }) => call("StopInstances", instanceIds),
-    describeInstances: ({ instanceIds }) => call("DescribeInstances", instanceIds),
+    describeInstances: async ({ instanceIds }) => {
+      const text = await request("DescribeInstances", instanceIds);
+      const tags = parseInstanceTags(text);
+      return {
+        instances: parseInstanceStates(text).map((instance) => ({
+          ...instance,
+          tags: tags[instance.instanceId] || {},
+        })),
+      };
+    },
     modifyInstanceType: async ({ instanceId, instanceType }) => {
       await call("ModifyInstanceAttribute", [], {
         InstanceId: instanceId,
         "InstanceType.Value": instanceType,
       });
     },
+    createTags: async ({ instanceId, tags }) => {
+      const params = { "ResourceId.1": instanceId };
+      Object.entries(tags).forEach(([key, value], index) => {
+        params[`Tag.${index + 1}.Key`] = key;
+        params[`Tag.${index + 1}.Value`] = value;
+      });
+      await request("CreateTags", [], params);
+    },
   };
 }
 
-export { parseInstanceStates, amzDate };
+export { parseInstanceStates, parseInstanceTags, amzDate };

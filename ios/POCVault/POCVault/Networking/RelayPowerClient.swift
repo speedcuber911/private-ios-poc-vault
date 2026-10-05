@@ -29,6 +29,8 @@ struct RelayMachinePowerState: Equatable {
     var resizeOptions: [String] = []
     var resize: Resize? = nil
     var pricing: Pricing? = nil
+    /// Nil when the control plane predates idle auto-stop.
+    var autoStopEnabled: Bool? = nil
 
     var isRunning: Bool { instanceState == "running" }
     var isStopped: Bool {
@@ -83,6 +85,7 @@ protocol RelayMachinePowering: AnyObject {
     func stop(nodeID: String, wakeToken: String) async throws -> RelayMachinePowerState
     func state(nodeID: String, wakeToken: String) async throws -> RelayMachinePowerState
     func resize(nodeID: String, wakeToken: String, from: String, to: String) async throws -> RelayMachinePowerState
+    func setAutoStop(nodeID: String, wakeToken: String, enabled: Bool) async throws -> RelayMachinePowerState
 }
 
 /// Talks to the control plane's power routes. No Relay account: the wake
@@ -116,6 +119,12 @@ final class RelayPowerClient: RelayMachinePowering {
                        body: ["expectedType": from, "targetType": to])
     }
 
+    func setAutoStop(nodeID: String, wakeToken: String, enabled: Bool) async throws -> RelayMachinePowerState {
+        try await send(path: "/v1/power/\(Self.pathComponent(nodeID))/autostop", method: "POST",
+                       wakeToken: wakeToken, nodeID: nodeID,
+                       body: ["enabled": enabled])
+    }
+
     static func isMachineUnreachable(_ error: Error) -> Bool {
         let nsError = error as NSError
         guard nsError.domain == NSURLErrorDomain else { return false }
@@ -132,7 +141,7 @@ final class RelayPowerClient: RelayMachinePowering {
     }
 
     private func send(path: String, method: String, wakeToken: String, nodeID: String,
-                      body: [String: String]? = nil) async throws -> RelayMachinePowerState {
+                      body: (any Encodable)? = nil) async throws -> RelayMachinePowerState {
         let root = baseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let normalized = path.hasPrefix("/") ? path : "/\(path)"
         guard let url = URL(string: "\(root)\(normalized)") else {
@@ -198,6 +207,7 @@ final class RelayPowerClient: RelayMachinePowering {
                     var wasRunning: Bool?
                 }
                 var resize: Resize?
+                var autoStopEnabled: Bool?
             }
             var power: Power?
         }
@@ -216,7 +226,8 @@ final class RelayPowerClient: RelayMachinePowering {
             pricing: envelope.power?.pricing.map {
                 RelayMachinePowerState.Pricing(currency: $0.currency, hoursPerMonth: $0.hoursPerMonth,
                                                checkedAt: $0.checkedAt, hourlyUSD: $0.hourlyUSD)
-            }
+            },
+            autoStopEnabled: envelope.power?.autoStopEnabled
         )
     }
 
@@ -290,6 +301,14 @@ final class RelayMachinePowerModel: ObservableObject {
     @Published private(set) var pricing: RelayMachinePowerState.Pricing?
     @Published private(set) var isSubmittingResize = false
     @Published private(set) var requestedResizeType: String?
+    @Published private(set) var autoStopEnabled: Bool?
+    @Published private(set) var isSavingAutoStop = false
+
+    /// EC2 tag reads are eventually consistent: a describe in the first
+    /// seconds after a write can still carry the old value. Reads landing in
+    /// this window after a save must not move the auto-stop switch back.
+    static let autoStopTagLag: TimeInterval = 30
+    private var autoStopSavedAt: Date?
 
     private var identityStore: ClientIdentityStore?
     private let powerClient: RelayMachinePowering
@@ -358,6 +377,30 @@ final class RelayMachinePowerModel: ObservableObject {
         } catch {
             await refresh()
             notice = error.localizedDescription
+        }
+    }
+
+    func setAutoStop(_ enabled: Bool) async {
+        guard let credential = identityStore?.wakeCredential(), !isSavingAutoStop,
+              let previous = autoStopEnabled, previous != enabled else { return }
+        autoStopEnabled = enabled
+        isSavingAutoStop = true
+        notice = nil
+        do {
+            let state = try await powerClient.setAutoStop(nodeID: credential.nodeID, wakeToken: credential.token,
+                                                          enabled: enabled)
+            autoStopEnabled = state.autoStopEnabled ?? enabled
+            autoStopSavedAt = Date()
+            isSavingAutoStop = false
+        } catch {
+            autoStopEnabled = previous
+            autoStopSavedAt = nil
+            isSavingAutoStop = false
+            // A lost reply does not mean a lost write; read the tag back.
+            await refresh()
+            notice = (error as? RelayMachinePowerError) == .rateLimited
+                ? "Auto-stop changed a moment ago. Try again in a few seconds."
+                : error.localizedDescription
         }
     }
 
@@ -450,6 +493,10 @@ final class RelayMachinePowerModel: ObservableObject {
         // this type or region has no supported price; start/stop replies omit
         // the type and should retain the last quote until the next read.
         if state.instanceType != nil { pricing = state.pricing }
+        if let value = state.autoStopEnabled, !isSavingAutoStop,
+           Date().timeIntervalSince(autoStopSavedAt ?? .distantPast) >= Self.autoStopTagLag {
+            autoStopEnabled = value
+        }
         if state.resize?.stage == "failed" {
             notice = "Size change failed. Check the machine's power and try again."
         }

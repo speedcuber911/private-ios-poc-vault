@@ -413,6 +413,7 @@ struct AccountSettingsView: View {
                             accessibilityIdentifier: "relay-settings-power"
                         )
                         RelayMachineSizeControl(model: powerModel)
+                        RelayMachineAutoStopToggle(model: powerModel)
                         if let notice = powerModel.notice {
                             Text(notice)
                                 .font(AppTheme.uiFont(size: 13))
@@ -706,6 +707,47 @@ struct RelayMachinePowerSwitch: View {
                 }
             }
         )
+    }
+}
+
+/// Hidden until the control plane reports a value, so an older control plane
+/// never shows a switch it cannot honour.
+struct RelayMachineAutoStopToggle: View {
+    @ObservedObject var model: RelayMachinePowerModel
+
+    var body: some View {
+        if model.autoStopEnabled != nil || !model.status.isResolved {
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Auto-stop when idle")
+                        .font(AppTheme.uiFont(size: 17))
+                        .foregroundStyle(AppTheme.textPrimary)
+                    Text(model.autoStopEnabled == false
+                         ? "Stays on until you stop it."
+                         : "Stops after 2 hours of low CPU and network.")
+                        .font(AppTheme.uiFont(size: 13))
+                        .foregroundStyle(AppTheme.textTertiary)
+                }
+                Spacer(minLength: 12)
+                if model.autoStopEnabled != nil {
+                    if model.isSavingAutoStop {
+                        ProgressView()
+                    }
+                    Toggle("Auto-stop when idle", isOn: Binding(
+                        get: { model.autoStopEnabled ?? false },
+                        set: { enabled in Task { await model.setAutoStop(enabled) } }
+                    ))
+                    .labelsHidden()
+                    .tint(AppTheme.accent)
+                    .disabled(model.isSavingAutoStop)
+                    .accessibilityIdentifier("relay-settings-autostop")
+                } else {
+                    ProgressView()
+                        .accessibilityIdentifier("relay-settings-autostop")
+                }
+            }
+            .accessibilityElement(children: .contain)
+        }
     }
 }
 

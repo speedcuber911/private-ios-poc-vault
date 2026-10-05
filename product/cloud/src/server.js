@@ -733,6 +733,12 @@ export function createApp({
         const result = await power.requestResize(authed.row, body);
         return sendJson(res, result.status, result.body);
       }
+      if (method === "POST" && seg.length === 4 && seg[3] === "autostop") {
+        const body = await readJson(req, config.jsonBodyMaxBytes);
+        if (!body || typeof body !== "object") return sendJson(res, 400, { error: "invalid_autostop" });
+        const result = await power.setAutoStop(authed.row, body);
+        return sendJson(res, result.status, result.body);
+      }
     }
 
     // ── auth ────────────────────────────────────────────────────────────

@@ -3,7 +3,7 @@ import { test } from "node:test";
 
 import { hashWakeToken } from "../src/power.js";
 import { instancePricing } from "../src/instance-pricing.js";
-import { createEc2Client, parseInstanceStates } from "../src/ec2.js";
+import { createEc2Client, parseInstanceStates, parseInstanceTags } from "../src/ec2.js";
 import { createDb } from "../src/db.js";
 import { startTestApp, api, makeNodeIdentity } from "./helpers.mjs";
 
@@ -16,10 +16,12 @@ function makeFakeEc2() {
   const calls = [];
   const states = new Map();
   const types = new Map();
+  const tags = new Map();
   return {
     calls,
     states,
     types,
+    tags,
     async startInstances({ instanceIds }) {
       calls.push(["start", [...instanceIds]]);
       return {
@@ -46,8 +48,14 @@ function makeFakeEc2() {
           instanceId,
           state: states.get(instanceId) || "stopped",
           instanceType: types.get(instanceId) || "t3.medium",
+          tags: { ...(tags.get(instanceId) || {}) },
         })),
       };
+    },
+    async createTags({ instanceId, tags: next }) {
+      calls.push(["tags", instanceId, { ...next }]);
+      if (this.failTags) throw new Error("UnauthorizedOperation");
+      tags.set(instanceId, { ...(tags.get(instanceId) || {}), ...next });
     },
     async modifyInstanceType({ instanceId, instanceType }) {
       calls.push(["modify", instanceId, instanceType]);
@@ -321,6 +329,46 @@ test("paired phone reads the EC2 type and requests a durable same-series resize"
   }
 });
 
+test("paired phone reads and switches idle auto-stop through the instance tag", async () => {
+  const t = await startPowerApp();
+  const identity = makeNodeIdentity();
+  const path = "/v1/power/node-aabbccddeeff0011";
+  const headers = { authorization: `Bearer ${WAKE}` };
+  try {
+    assert.equal((await register(t, identity)).status, 201);
+    const initial = await api(t.baseUrl, "GET", path, { headers });
+    assert.equal(initial.json.power.autoStopEnabled, true, "no tag means auto-stop is on");
+
+    assert.equal((await api(t.baseUrl, "POST", `${path}/autostop`, { body: { enabled: false } })).status, 401);
+    assert.equal((await api(t.baseUrl, "POST", `${path}/autostop`, { headers, body: { enabled: "no" } })).status, 400);
+    assert.equal(t.ec2.calls.some((call) => call[0] === "tags"), false);
+
+    const off = await api(t.baseUrl, "POST", `${path}/autostop`, { headers, body: { enabled: false } });
+    assert.equal(off.status, 200);
+    assert.equal(off.json.power.autoStopEnabled, false);
+    assert.deepEqual(t.ec2.calls.find((call) => call[0] === "tags"), ["tags", INSTANCE, { AutoStopEnabled: "false" }]);
+    assert.equal((await api(t.baseUrl, "GET", path, { headers })).json.power.autoStopEnabled, false);
+
+    const tooSoon = await api(t.baseUrl, "POST", `${path}/autostop`, { headers, body: { enabled: true } });
+    assert.equal(tooSoon.status, 429);
+    assert.equal((await api(t.baseUrl, "POST", `${path}/start`, { headers })).status, 200,
+      "the auto-stop limiter must not block power");
+
+    t.clock.t += 16_000;
+    const on = await api(t.baseUrl, "POST", `${path}/autostop`, { headers, body: { enabled: true } });
+    assert.equal(on.status, 200);
+    assert.equal((await api(t.baseUrl, "GET", path, { headers })).json.power.autoStopEnabled, true);
+
+    t.clock.t += 16_000;
+    t.ec2.failTags = true;
+    const failed = await api(t.baseUrl, "POST", `${path}/autostop`, { headers, body: { enabled: false } });
+    assert.equal(failed.status, 502);
+    assert.equal(failed.json.error, "power_aws_failed");
+  } finally {
+    await t.close();
+  }
+});
+
 test("Mumbai m7i compute estimates use the 730-hour monthly basis", () => {
   const pricing = instancePricing("ap-south-1", ["m7i.large", "m7i.2xlarge", "m7i.4xlarge"]);
   assert.equal(pricing.currency, "USD");
@@ -475,4 +523,65 @@ test("EC2 type change signs the exact ModifyInstanceAttribute query", async () =
   assert.equal(body.get("InstanceId"), INSTANCE);
   assert.equal(body.get("InstanceType.Value"), "m7i.4xlarge");
   assert.equal(body.get("InstanceId.1"), null);
+});
+
+test("EC2 auto-stop tag signs the exact CreateTags query", async () => {
+  let body;
+  const client = createEc2Client({
+    region: "ap-south-1",
+    credentials: { accessKeyId: "test", secretAccessKey: "test" },
+    fetchImpl: async (_url, init) => {
+      body = new URLSearchParams(init.body);
+      return { ok: true, status: 200, text: async () => "<CreateTagsResponse><return>true</return></CreateTagsResponse>" };
+    },
+  });
+  await client.createTags({ instanceId: INSTANCE, tags: { AutoStopEnabled: "false" } });
+  assert.equal(body.get("Action"), "CreateTags");
+  assert.equal(body.get("ResourceId.1"), INSTANCE);
+  assert.equal(body.get("Tag.1.Key"), "AutoStopEnabled");
+  assert.equal(body.get("Tag.1.Value"), "false");
+  assert.equal(body.get("InstanceId.1"), null);
+});
+
+test("DescribeInstances tags stay with their own instance despite nested items", async () => {
+  const xml = `
+    <DescribeInstancesResponse>
+      <reservationSet>
+        <item>
+          <instancesSet>
+            <item>
+              <instanceId>i-0123456789abcdef0</instanceId>
+              <instanceState><code>16</code><name>running</name></instanceState>
+              <instanceType>m7i.xlarge</instanceType>
+              <groupSet><item><groupId>sg-1</groupId></item></groupSet>
+              <tagSet>
+                <item><key>Name</key><value>pariksj-dev</value></item>
+                <item><key>Empty</key><value/></item>
+                <item><key>AutoStopEnabled</key><value>false</value></item>
+              </tagSet>
+            </item>
+            <item>
+              <instanceId>i-0fedcba9876543210</instanceId>
+              <instanceState><code>80</code><name>stopped</name></instanceState>
+              <instanceType>m4.large</instanceType>
+            </item>
+          </instancesSet>
+        </item>
+      </reservationSet>
+    </DescribeInstancesResponse>`;
+  assert.deepEqual(parseInstanceTags(xml), {
+    [INSTANCE]: { Name: "pariksj-dev", AutoStopEnabled: "false" },
+    [OTHER_INSTANCE]: {},
+  });
+
+  const client = createEc2Client({
+    region: "ap-south-1",
+    credentials: { accessKeyId: "test", secretAccessKey: "test" },
+    fetchImpl: async () => ({ ok: true, status: 200, text: async () => xml }),
+  });
+  const described = await client.describeInstances({ instanceIds: [INSTANCE, OTHER_INSTANCE] });
+  assert.deepEqual(described.instances, [
+    { instanceId: INSTANCE, state: "running", instanceType: "m7i.xlarge", tags: { Name: "pariksj-dev", AutoStopEnabled: "false" } },
+    { instanceId: OTHER_INSTANCE, state: "stopped", instanceType: "m4.large", tags: {} },
+  ]);
 });
