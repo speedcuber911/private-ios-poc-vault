@@ -14,7 +14,7 @@ CPU_THRESHOLD_PERCENT = float(os.environ.get("CPU_THRESHOLD_PERCENT", "5"))
 NETWORK_THRESHOLD_BYTES_PER_PERIOD = float(
     os.environ.get("NETWORK_THRESHOLD_BYTES_PER_PERIOD", "10000000")
 )
-IDLE_WINDOW_MINUTES = int(os.environ.get("IDLE_WINDOW_MINUTES", "120"))
+IDLE_WINDOW_MINUTES = int(os.environ.get("IDLE_WINDOW_MINUTES", "60"))
 PERIOD_SECONDS = 300
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
 # Set from the Relay app's machine settings; absent means auto-stop is on.

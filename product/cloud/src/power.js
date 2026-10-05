@@ -23,7 +23,7 @@ const MUTATE_MIN_INTERVAL_MS = 15_000;
 const MUTATE_MAX_PER_HOUR = 20;
 const ACTIVE_RESIZE_STAGES = ["requested", "waiting_stop", "modifying", "waiting_start", "waiting_running", "recovering", "recovery_wait"];
 // Read by the dev-ec2-idle-autostop Lambda in the same account, which stops
-// the machine after two idle hours unless this tag is "false". Absent = on.
+// the machine after an idle hour unless this tag is "false". Absent = on.
 export const AUTO_STOP_TAG = "AutoStopEnabled";
 
 // Keep the control to sizes in the current EC2 family. AWS still makes the

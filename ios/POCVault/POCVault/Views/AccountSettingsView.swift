@@ -724,7 +724,7 @@ struct RelayMachineAutoStopToggle: View {
                         .foregroundStyle(AppTheme.textPrimary)
                     Text(model.autoStopEnabled == false
                          ? "Stays on until you stop it."
-                         : "Stops after 2 hours of low CPU and network.")
+                         : "Stops after an hour of low CPU and network.")
                         .font(AppTheme.uiFont(size: 13))
                         .foregroundStyle(AppTheme.textTertiary)
                 }
