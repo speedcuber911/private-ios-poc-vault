@@ -473,6 +473,13 @@ final class ClientIdentityStore: ObservableObject {
         return token
     }
 
+    /// Told when a wake credential lands, so the push service can subscribe the
+    /// phone to that machine's power notifications without waiting for a relaunch.
+    var onWakeCredentialStored: (() -> Void)?
+    /// Told just before an unpair or account purge drops the wake credential:
+    /// the last moment the phone can still unsubscribe from that machine.
+    var onWakeCredentialDiscarding: ((_ nodeID: String, _ token: String) -> Void)?
+
     /// Stores the control-plane wake token for `nodeID`. Distinct from the
     /// data-path device bearer: poc-ec2 may learn this hash, never the token
     /// used to talk to the machine once it is up.
@@ -485,6 +492,7 @@ final class ClientIdentityStore: ObservableObject {
             material.wakeNodeID = node
         }
         CodexDiagnostics.log("identity_wake_token_stored", fields: ["nodeId": node])
+        onWakeCredentialStored?()
     }
 
     /// The wake credential for starting this machine from the control plane.
@@ -514,6 +522,9 @@ final class ClientIdentityStore: ObservableObject {
     /// authenticate to it. A BYO identity the user imported themselves is
     /// deliberately left in place.
     func discardPairedMaterial() {
+        if let credential = wakeCredential() {
+            onWakeCredentialDiscarding?(credential.nodeID, credential.token)
+        }
         if hasPairedIdentity {
             try? deleteStoredIdentity()
         }

@@ -57,7 +57,11 @@ struct POCVaultApp: App {
         _computerLinkStore = StateObject(wrappedValue: RelayComputerLinkStore(
             client: RelayAuthClient(baseURL: AppConfiguration.authBaseURL)
         ))
-        _pushService = StateObject(wrappedValue: RelayPushService(accountStore: accountStore, codexClient: codexClient))
+        _pushService = StateObject(wrappedValue: RelayPushService(
+            accountStore: accountStore,
+            codexClient: codexClient,
+            identityStore: identityStore
+        ))
         self.codexClient = codexClient
         self.authClient = authClient
     }
@@ -276,16 +280,17 @@ struct POCVaultRootView: View {
         .task {
             identityStore.importIdentityFromSetupEnvironmentIfNeeded()
         }
-        // Push registration needs a session: the cloud device route is
-        // session-authed. This view now exists while signed out too, so it is
-        // keyed on the account and simply does nothing until there is one.
-        .task(id: accountStore.user?.id) {
+        // Two independent reasons to register for pushes: an account (the
+        // session-authed device route, for handoffs and runs) or a paired
+        // machine (its power pushes, authorised by the pairing wake token, so
+        // no sign-up). Keyed on both, so pairing or signing in re-runs it.
+        .task(id: PushRegistrationTrigger(userID: accountStore.user?.id, nodeID: nodeStore.pairedNode?.nodeID)) {
 #if targetEnvironment(simulator)
             // Simulator previews use local fixtures and should not interrupt UI
             // review with a notification permission prompt.
             return
 #else
-            guard accountStore.currentSessionToken != nil else { return }
+            guard accountStore.currentSessionToken != nil || nodeStore.pairedNode != nil else { return }
             RelayAppDelegate.pushService = pushService
             pushService.registerForPushNotifications()
             await pushService.registerPendingDeviceTokenIfNeeded()

@@ -513,3 +513,24 @@ final class RelayMachinePowerModel: ObservableObject {
         }
     }
 }
+
+/// Signs a phone up for one machine's power pushes (paused, ready), with the
+/// pairing wake token as the only credential.
+protocol RelayPowerPushSubscribing: AnyObject {
+    func subscribePush(nodeID: String, wakeToken: String, apnsToken: String, environment: String) async throws
+    func unsubscribePush(nodeID: String, wakeToken: String, apnsToken: String) async throws
+}
+
+extension RelayPowerClient: RelayPowerPushSubscribing {
+    func subscribePush(nodeID: String, wakeToken: String, apnsToken: String, environment: String) async throws {
+        _ = try await send(path: "/v1/power/\(Self.pathComponent(nodeID))/push", method: "PUT",
+                           wakeToken: wakeToken, nodeID: nodeID,
+                           body: ["apnsToken": apnsToken, "apnsEnvironment": environment])
+    }
+
+    func unsubscribePush(nodeID: String, wakeToken: String, apnsToken: String) async throws {
+        _ = try await send(path: "/v1/power/\(Self.pathComponent(nodeID))/push", method: "DELETE",
+                           wakeToken: wakeToken, nodeID: nodeID,
+                           body: ["apnsToken": apnsToken])
+    }
+}

@@ -259,6 +259,77 @@ final class MachinePowerTests: XCTestCase {
         XCTAssertEqual(model.autoStopEnabled, false)
     }
 
+    // MARK: - Power notifications
+
+    func testPowerPushSubscriptionUsesThePairingCredentialAlone() async throws {
+        let client = RelayPowerClient(
+            baseURL: URL(string: "https://relay.example")!,
+            session: URLSession(configuration: urlSessionReturning(status: 200, body: #"{"ok":true}"#))
+        )
+        try await client.subscribePush(nodeID: "node-abc", wakeToken: "pairing-wake-token",
+                                       apnsToken: "abcd", environment: "production")
+        XCTAssertEqual(MockPowerURLProtocol.lastRequest?.url?.path, "/v1/power/node-abc/push")
+        XCTAssertEqual(MockPowerURLProtocol.lastRequest?.httpMethod, "PUT")
+        XCTAssertEqual(MockPowerURLProtocol.lastRequest?.value(forHTTPHeaderField: "Authorization"),
+                       "Bearer pairing-wake-token")
+        let body = try XCTUnwrap(MockPowerURLProtocol.lastBody)
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: body) as? [String: String],
+                       ["apnsToken": "abcd", "apnsEnvironment": "production"])
+
+        try await client.unsubscribePush(nodeID: "node-abc", wakeToken: "pairing-wake-token", apnsToken: "abcd")
+        XCTAssertEqual(MockPowerURLProtocol.lastRequest?.httpMethod, "DELETE")
+        let removed = try XCTUnwrap(MockPowerURLProtocol.lastBody)
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: removed) as? [String: String], ["apnsToken": "abcd"])
+    }
+
+    func testPowerPushesOpenTheMachineScreen() {
+        for type in ["power.stopped", "power.ready"] {
+            XCTAssertEqual(
+                RelayPushService.route(from: ["relay": ["nodeId": "node-abc", "type": type]]),
+                .machine(nodeID: "node-abc")
+            )
+        }
+    }
+
+    @MainActor
+    func testPushServiceSubscribesThePairedMachineWithoutAnAccount() async throws {
+        let suite = "power-push-tests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let identityStore = ClientIdentityStore(defaults: defaults)
+        let authClient = RelayAuthClient(baseURL: try XCTUnwrap(URL(string: "https://cloud.test")))
+        let accountStore = RelayAccountStore(client: authClient, identityStore: identityStore, defaults: defaults)
+        XCTAssertNil(accountStore.currentSessionToken)
+        let recorder = PowerPushRecorder()
+        let service = RelayPushService(
+            accountStore: accountStore,
+            codexClient: CodexClient(baseURL: try XCTUnwrap(URL(string: "https://node.test")), identityStore: identityStore),
+            identityStore: identityStore,
+            powerPush: recorder,
+            authBaseURL: try XCTUnwrap(URL(string: "https://cloud.test"))
+        )
+
+        await service.handleDeviceToken(Data([0xab, 0xcd]))
+        XCTAssertTrue(recorder.subscribed.isEmpty, "nothing to subscribe to before pairing")
+
+        identityStore.storeWakeToken("wake-1", nodeID: "node-abc")
+        await service.registerPendingDeviceTokenIfNeeded()
+        await service.registerPendingDeviceTokenIfNeeded()
+        XCTAssertEqual(recorder.subscribed.count, 1, "unchanged credentials are not re-sent")
+        XCTAssertEqual(recorder.subscribed.first?.nodeID, "node-abc")
+        XCTAssertEqual(recorder.subscribed.first?.wakeToken, "wake-1")
+        XCTAssertEqual(recorder.subscribed.first?.apnsToken, "abcd")
+
+        identityStore.storeWakeToken("wake-2", nodeID: "node-abc")
+        await service.registerPendingDeviceTokenIfNeeded()
+        XCTAssertEqual(recorder.subscribed.count, 2, "a re-pair's new wake token subscribes again")
+
+        identityStore.discardPairedMaterial()
+        for _ in 0..<50 where recorder.unsubscribed.isEmpty { await Task.yield() }
+        XCTAssertEqual(recorder.unsubscribed.first?.wakeToken, "wake-2")
+        XCTAssertEqual(recorder.unsubscribed.first?.apnsToken, "abcd")
+    }
+
     private func urlSessionReturning(status: Int, body: String) -> URLSessionConfiguration {
         MockPowerURLProtocol.status = status
         MockPowerURLProtocol.body = Data(body.utf8)
@@ -346,4 +417,22 @@ private final class MockPowerURLProtocol: URLProtocol {
     }
 
     override func stopLoading() {}
+}
+
+private final class PowerPushRecorder: RelayPowerPushSubscribing {
+    struct Call: Equatable {
+        var nodeID: String
+        var wakeToken: String
+        var apnsToken: String
+    }
+    var subscribed: [Call] = []
+    var unsubscribed: [Call] = []
+
+    func subscribePush(nodeID: String, wakeToken: String, apnsToken: String, environment: String) async throws {
+        subscribed.append(Call(nodeID: nodeID, wakeToken: wakeToken, apnsToken: apnsToken))
+    }
+
+    func unsubscribePush(nodeID: String, wakeToken: String, apnsToken: String) async throws {
+        unsubscribed.append(Call(nodeID: nodeID, wakeToken: wakeToken, apnsToken: apnsToken))
+    }
 }

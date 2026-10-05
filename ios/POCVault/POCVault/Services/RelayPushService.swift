@@ -36,22 +36,41 @@ final class RelayPushService: NSObject, ObservableObject, UNUserNotificationCent
     private let authBaseURL: URL
     private let session: URLSession
     private let codexClient: CodexClient
+    private let identityStore: ClientIdentityStore?
+    private let powerPush: RelayPowerPushSubscribing
     /// The token iOS handed us before an account session existed. Registration
     /// needs a bearer token, and the token only arrives once per launch, so it
     /// is held here until sign-in makes the call possible.
     private var pendingDeviceToken: Data?
+    /// The latest APNs token, kept for the paired machine's power pushes,
+    /// which need no account and so never wait on `pendingDeviceToken`.
+    private var deviceToken: Data?
+    /// node | wake token | APNs token of the last successful power
+    /// subscription. A re-pair rotates the wake token, which the server
+    /// answers by dropping every subscriber, so the key includes it.
+    private var powerSubscriptionKey: String?
 
     init(
         accountStore: RelayAccountStore,
         codexClient: CodexClient,
+        identityStore: ClientIdentityStore? = nil,
+        powerPush: RelayPowerPushSubscribing = RelayPowerClient(baseURL: AppConfiguration.authBaseURL),
         authBaseURL: URL = AppConfiguration.authBaseURL,
         session: URLSession = .shared
     ) {
         self.accountStore = accountStore
         self.codexClient = codexClient
+        self.identityStore = identityStore
+        self.powerPush = powerPush
         self.authBaseURL = authBaseURL
         self.session = session
         super.init()
+        identityStore?.onWakeCredentialStored = { [weak self] in
+            Task { @MainActor in await self?.wakeCredentialStored() }
+        }
+        identityStore?.onWakeCredentialDiscarding = { [weak self] nodeID, token in
+            Task { @MainActor in await self?.unsubscribeFromMachinePower(nodeID: nodeID, wakeToken: token) }
+        }
     }
 
     /// Ask once, then register with APNs. Declining is a normal outcome: the app
@@ -86,6 +105,8 @@ final class RelayPushService: NSObject, ObservableObject, UNUserNotificationCent
     /// Registers this device's APNs token with the cloud so the account's pushes
     /// reach it. The token is device-scoped and carries no account data.
     func handleDeviceToken(_ token: Data) async {
+        deviceToken = token
+        await subscribeToMachinePower()
         pendingDeviceToken = token
         guard let sessionToken = accountStore.currentSessionToken else {
             CodexDiagnostics.log("push_register_deferred")
@@ -119,8 +140,53 @@ final class RelayPushService: NSObject, ObservableObject, UNUserNotificationCent
     /// Retry a registration that could not run because no account session existed
     /// when APNs delivered the token. Safe to call on every foreground.
     func registerPendingDeviceTokenIfNeeded() async {
+        await subscribeToMachinePower()
         guard !isRegistered, let token = pendingDeviceToken else { return }
         await handleDeviceToken(token)
+    }
+
+    /// Signs this phone up for the paired machine's power pushes: paused when
+    /// idle, stopped outside Relay, ready after a start. The wake token from
+    /// pairing is the credential, so it works signed out. Idempotent on the
+    /// server; skipped here when nothing changed since the last success.
+    func subscribeToMachinePower() async {
+        guard let token = deviceToken, let credential = identityStore?.wakeCredential() else { return }
+        let apnsToken = Self.hexToken(from: token)
+        let key = "\(credential.nodeID)|\(credential.token)|\(apnsToken)"
+        guard key != powerSubscriptionKey else { return }
+        do {
+            try await powerPush.subscribePush(nodeID: credential.nodeID, wakeToken: credential.token,
+                                              apnsToken: apnsToken, environment: Self.apnsEnvironment)
+            powerSubscriptionKey = key
+            CodexDiagnostics.log("power_push_subscribed", fields: ["nodeId": credential.nodeID])
+        } catch {
+            CodexDiagnostics.log("power_push_subscribe_failed", fields: ["error": String(describing: error)])
+        }
+    }
+
+    /// Best effort, on unpair: the wake token is about to be discarded, and a
+    /// phone that no longer holds it must stop hearing about that machine.
+    func unsubscribeFromMachinePower(nodeID: String, wakeToken: String) async {
+        powerSubscriptionKey = nil
+        guard let token = deviceToken else { return }
+        try? await powerPush.unsubscribePush(nodeID: nodeID, wakeToken: wakeToken,
+                                             apnsToken: Self.hexToken(from: token))
+    }
+
+    /// A wake credential can land after launch (pairing, or the lazy
+    /// /v1/power/credential fetch). Subscribe now if APNs already gave us a
+    /// token; otherwise ask for one, and the token callback subscribes.
+    private func wakeCredentialStored() async {
+#if targetEnvironment(simulator)
+        return
+#else
+        if deviceToken == nil {
+            RelayAppDelegate.pushService = self
+            registerForPushNotifications()
+        } else {
+            await subscribeToMachinePower()
+        }
+#endif
     }
 
     func clearPendingRoute() { pendingRoute = nil }
@@ -170,7 +236,8 @@ final class RelayPushService: NSObject, ObservableObject, UNUserNotificationCent
         if type.hasPrefix("job."), let jobID = (relay["jobId"] as? String)?.trimmedNonEmpty {
             return .job(nodeID: nodeID, jobID: jobID)
         }
-        if type == "node.pressure" || type == "node.unreachable" || type == "node.recovered" {
+        if type == "node.pressure" || type == "node.unreachable" || type == "node.recovered"
+            || type.hasPrefix("power.") {
             return .machine(nodeID: nodeID)
         }
         return .none
@@ -221,4 +288,11 @@ final class RelayAppDelegate: NSObject, UIApplicationDelegate {
     ) {
         CodexDiagnostics.log("push_token_failed", fields: ["error": String(describing: error)])
     }
+}
+
+/// What push registration is keyed on: an account session, a paired machine,
+/// or both.
+struct PushRegistrationTrigger: Equatable {
+    var userID: String?
+    var nodeID: String?
 }
