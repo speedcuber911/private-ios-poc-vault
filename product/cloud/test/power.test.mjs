@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { hashWakeToken } from "../src/power.js";
+import { hashWakeToken, resizeOptions } from "../src/power.js";
 import { instancePricing } from "../src/instance-pricing.js";
 import { createEc2Client, parseInstanceStates, parseInstanceTags } from "../src/ec2.js";
 import { createDb } from "../src/db.js";
@@ -419,7 +419,15 @@ test("Mumbai m7i compute estimates use the 730-hour monthly basis", () => {
   assert.equal(pricing.hourlyUSD["m7i.2xlarge"], 0.4242);
   assert.equal(pricing.hourlyUSD["m7i.2xlarge"] * pricing.hoursPerMonth, 309.666);
   assert.equal(pricing.hourlyUSD["m7i.4xlarge"], 0.8484);
-  assert.equal(pricing.checkedAt, "2026-09-28");
+  assert.equal(pricing.checkedAt, "2026-10-05");
+});
+
+test("Mumbai m8a estimates cover every size the resize control offers", () => {
+  const options = resizeOptions("m8a.large");
+  const pricing = instancePricing("ap-south-1", options);
+  assert.deepEqual(Object.keys(pricing.hourlyUSD), options);
+  assert.equal(pricing.hourlyUSD["m8a.large"], 0.12806);
+  assert.equal(pricing.hourlyUSD["m8a.xlarge"], 0.25612);
 });
 
 test("unpriced regions and families return no compute estimate", () => {
