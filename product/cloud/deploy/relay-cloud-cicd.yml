@@ -134,6 +134,12 @@ Resources:
                   - ssm:GetCommandInvocation
                   - ssm:ListCommandInvocations
                 Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lambda:GetFunctionConfiguration
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:dev-ec2-idle-autostop
 
   TargetReadPolicy:
     Type: AWS::IAM::Policy

@@ -23,6 +23,7 @@ tar \
   --exclude='./node_modules' \
   --exclude='./relay-cloud.sqlite*' \
   --exclude='./deploy/__pycache__' \
+  --exclude='./deploy/idle-autostop' \
   -czf "$archive" .
 aws s3 cp "$archive" "$object_uri" --only-show-errors
 

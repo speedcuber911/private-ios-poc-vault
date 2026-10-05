@@ -137,6 +137,7 @@ CodeCommit main update
   -> SSM AWS-RunShellScript on poc-ec2
   -> immutable install/restart/rollback gate
   -> local and public /healthz checks
+  -> dev-ec2-idle-autostop Lambda code and settings (deploy/idle-autostop)
 ```
 
 The pipeline deploys the exact CodeCommit SHA as the release directory name.
