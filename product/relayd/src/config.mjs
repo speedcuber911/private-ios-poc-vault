@@ -55,29 +55,37 @@ const auditPath = path.join(dataDir, "audit.jsonl");
 //   4. the conventional location again, so the ENOENT names the expected
 //      place rather than something empty.
 //
-// Resolved once at import: this is a handful of existsSync calls on a fixed
-// PATH, and the answer cannot change under a running daemon.
-function resolveOnPath(name) {
-  const entries = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+// A candidate counts only if it can actually be run. A version manager can
+// leave a `claude` on PATH that exists but is not executable (an npm global
+// whose native binary lost its mode bit, a dangling link); taking the first
+// name that merely exists made every job die with `spawn … EACCES` while a
+// working install sat two PATH entries later.
+//
+// Resolved once at import: this is a handful of stat calls on a fixed PATH,
+// and the answer cannot change under a running daemon.
+function isRunnableFile(candidate) {
+  try {
+    fs.accessSync(candidate, fs.constants.X_OK);
+    return fs.statSync(candidate).isFile();
+  } catch {
+    // Missing, unreadable, a directory, or not executable: not a harness.
+    return false;
+  }
+}
+
+function resolveOnPath(name, searchPath = process.env.PATH || "") {
+  const entries = searchPath.split(path.delimiter).filter(Boolean);
   for (const dir of entries) {
     const candidate = path.join(dir, name);
-    try {
-      if (fs.existsSync(candidate)) return candidate;
-    } catch {
-      // An unreadable PATH entry is not this function's problem — keep looking.
-    }
+    if (isRunnableFile(candidate)) return candidate;
   }
   return null;
 }
 
-function resolveHarnessBin(explicit, name, conventional) {
+function resolveHarnessBin(explicit, name, conventional, searchPath = process.env.PATH || "") {
   if (explicit) return explicit;
-  try {
-    if (fs.existsSync(conventional)) return conventional;
-  } catch {
-    // fall through to the PATH scan
-  }
-  return resolveOnPath(name) || conventional;
+  if (isRunnableFile(conventional)) return conventional;
+  return resolveOnPath(name, searchPath) || conventional;
 }
 
 const codexBin = resolveHarnessBin(process.env.CODEX_BIN, "codex", "/usr/bin/codex");
@@ -1091,6 +1099,7 @@ function pathWithinRoot(candidate, root) {
 
 
 export {
+  resolveHarnessBin,
   host,
   port,
   requireMtls,
