@@ -1295,6 +1295,13 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
                     // failing it is what lets the caller reconnect.
                     request.timeoutInterval = 90
                     request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                    if let lastEventID = Self.jobStreamLastEventID(
+                        stdoutOffset: stdoutOffset,
+                        stderrOffset: stderrOffset,
+                        timeline: timeline
+                    ) {
+                        request.setValue(lastEventID, forHTTPHeaderField: "Last-Event-ID")
+                    }
 
                     let (bytes, response) = try await streamSession.bytes(for: request)
                     guard let http = response as? HTTPURLResponse else {
@@ -1341,6 +1348,15 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    /// The `Last-Event-ID` a resuming job stream sends: relayd's
+    /// `<stdoutOffset>:<stderrOffset>:<seq>`, which it prefers to the query
+    /// offsets. Nil on a first connection, which names no offsets at all. The
+    /// query parameters are still sent, for a machine that only reads those.
+    static func jobStreamLastEventID(stdoutOffset: Int64?, stderrOffset: Int64?, timeline: Int?) -> String? {
+        guard stdoutOffset != nil || stderrOffset != nil else { return nil }
+        return "\(max(0, stdoutOffset ?? 0)):\(max(0, stderrOffset ?? 0)):\(max(0, timeline ?? 0))"
     }
 
     private static func errorMessage(from bytes: URLSession.AsyncBytes) async throws -> String? {

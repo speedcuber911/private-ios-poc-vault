@@ -1754,12 +1754,14 @@ final class RelayChatViewModel: ObservableObject {
         }
         if !pendingChatDeltas.isEmpty {
             var next = messages
+            var changed = false
             for (id, delta) in pendingChatDeltas {
                 guard let index = next.firstIndex(where: { $0.id == id }) else { continue }
                 next[index].text += delta
+                changed = true
             }
             pendingChatDeltas.removeAll()
-            messages = next
+            if changed { messages = next }
         }
     }
 

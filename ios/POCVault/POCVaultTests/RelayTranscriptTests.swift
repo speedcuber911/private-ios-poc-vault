@@ -465,6 +465,52 @@ final class RelayChatLiveDataTests: XCTestCase {
         XCTAssertTrue(decoder.finish().isEmpty)
     }
 
+    func testAResumingJobStreamNamesItsOffsetsTheWayTheDaemonPrefers() {
+        XCTAssertNil(CodexClient.jobStreamLastEventID(stdoutOffset: nil, stderrOffset: nil, timeline: 0), "a first connection names nothing")
+        XCTAssertEqual(CodexClient.jobStreamLastEventID(stdoutOffset: 1340, stderrOffset: 0, timeline: 143), "1340:0:143")
+        XCTAssertEqual(CodexClient.jobStreamLastEventID(stdoutOffset: 7, stderrOffset: nil, timeline: nil), "7:0:0")
+    }
+
+    func testTheRealDaemonsTimelineShapesReduceCleanly() throws {
+        // A step's first event is bare; summary and input follow, input whole
+        // each time. Read and search steps can carry an exit code. Reasoning
+        // has no text. Usage carries fields this build does not know.
+        let lines = [
+            #"{"type":"step","id":"r1","kind":"reasoning","status":"running","startedAt":"2026-10-06T07:00:00.000Z"}"#,
+            #"{"type":"step","id":"r1","status":"done","endedAt":"2026-10-06T07:00:00.200Z"}"#,
+            #"{"type":"step","id":"s1","kind":"read","status":"running"}"#,
+            #"{"type":"step","id":"s1","summary":"pricing.ts","input":{"command":"sed -n 1,40p pricing.ts","path":"pricing.ts"}}"#,
+            #"{"type":"step","id":"s1","status":"failed","exitCode":2,"output":"sed: no such file","input":{"command":"sed -n 1,40p pricing.ts","path":"pricing.ts"}}"#,
+            #"{"type":"step","id":"s2","kind":"command","status":"done","exitCode":0}"#,
+            #"{"type":"usage","inputTokens":10,"outputTokens":4,"cachedInputTokens":6,"reasoningOutputTokens":1,"totalTokens":14}"#
+        ]
+        var timeline = RelayTimeline()
+        for line in lines {
+            timeline.apply(try JSONDecoder().decode(RelayTimelineEvent.self, from: Data(line.utf8)))
+        }
+        XCTAssertEqual(timeline.cursor, 7)
+        XCTAssertEqual(timeline.step("s1")?.displaySummary, "pricing.ts")
+        XCTAssertEqual(timeline.step("s1")?.input.command, "sed -n 1,40p pricing.ts")
+        XCTAssertEqual(timeline.step("s1")?.exitCode, 2)
+        XCTAssertEqual(timeline.step("r1")?.output, "")
+        XCTAssertEqual(timeline.usage?.outputTokens, 4)
+
+        let block = try XCTUnwrap(timeline.blocks.first)
+        let steps = timeline.steps(in: block)
+        XCTAssertEqual(RelayTimeline.summary(of: steps), "Thought, read a file, ran a command", "a failed step still counts under its kind")
+        XCTAssertEqual(RelayTimeline.failedCount(in: steps), 1)
+        XCTAssertEqual(timeline.failedCount(in: block), 1)
+
+        // Thinking that took no measurable time is "Thought", never "Thought for 0s".
+        let thinking = steps.filter { $0.kind == .reasoning }
+        XCTAssertEqual(RelayTimeline.summary(of: thinking), "Thought")
+        var instant = RelayTimeline()
+        let at = Date(timeIntervalSince1970: 1_000)
+        instant.apply(.step(RelayStepPatch(id: "r", kind: .reasoning, status: .done, startedAt: at, endedAt: at)))
+        instant.apply(.step(RelayStepPatch(id: "r2", kind: .reasoning, status: .done)))
+        XCTAssertEqual(RelayTimeline.summary(of: instant.steps(in: instant.blocks[0])), "Thought")
+    }
+
     func testTheLineSplitterKeepsBlankLinesWhichURLSessionLinesDrops() {
         var splitter = CodexSSELineSplitter()
         var lines: [String] = []
@@ -565,6 +611,31 @@ final class RelayChatLiveDataTests: XCTestCase {
         model.resumeLiveWork()
         try await waitUntil("the stream is re-attached") { script.streamCalls.count == attempts + 1 }
         XCTAssertEqual(script.streamCalls.last?.timeline, 3)
+    }
+
+    func testReturningToTheForegroundRestartsTheStreamFromWhatIsHeld() async throws {
+        let script = LiveScript()
+        let running = try runningJob()
+        script.onStream = { index, stream in
+            guard index == 0 else { return }
+            stream.yield(.stdout(offset: 0, text: "building\n"))
+            stream.yield(LiveScript.timeline(1, LiveScript.step("s1", "running")))
+        }
+        let model = makeModel(script, detail: { _ in running })
+        try await openRunningJob(script, model: model, job: running)
+        try await waitUntil("the first events land") { model.timelines["job-1"]?.cursor == 1 }
+
+        // The connection looks open, but the phone has been asleep.
+        model.resumeLiveWork(restartingStreams: true)
+        try await waitUntil("a second connection opens") { script.streamCalls.count == 2 }
+        XCTAssertEqual(script.streamCalls[1], .init(stdoutOffset: 9, stderrOffset: 0, timeline: 1))
+        try await waitUntil("the stale connection is closed") { script.endedStreams == 1 }
+        XCTAssertEqual(model.liveJobTails["job-1"], "building\n", "what was already shown stays")
+
+        // Becoming active without having been backgrounded leaves a live stream alone.
+        model.resumeLiveWork()
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(script.streamCalls.count, 2)
     }
 
     func testAMachineWithoutTimelinesStaysOnTheLegacyPathQuietly() async throws {
@@ -1041,6 +1112,28 @@ final class RelayChatLiveDataTests: XCTestCase {
         XCTAssertTrue(answer.text.hasSuffix("t200 "), "nothing is lost to batching")
         XCTAssertEqual(answer.usage?.outputTokens, 200)
         XCTAssertLessThanOrEqual(publishes, 12, "200 tokens must not be 200 redraws")
+    }
+
+    func testAChatAnswerStillStreamingDoesNotBindTheConversationThatReplacedIt() async throws {
+        let script = LiveScript()
+        var held: AsyncThrowingStream<CodexChatEvent, Error>.Continuation?
+        script.chat = { _ in AsyncThrowingStream { held = $0 } }
+        let model = makeModel(script, detail: { _ in throw CancellationError() }, workspaceID: nil)
+        model.selectChoice(RelayModelChoice(model: try chatModel(), mode: .chat))
+        model.prompt = "Hi"
+        let sending = Task { await model.sendCurrentPrompt() }
+        try await waitUntil("the chat stream opens") { held != nil }
+
+        model.startNewConversation()
+        held?.yield(.meta(threadId: "old-chat", model: "gpt", provider: "azure"))
+        held?.yield(.delta("late words"))
+        held?.finish()
+        await sending.value
+
+        XCTAssertTrue(model.messages.isEmpty)
+        XCTAssertNil(model.currentSessionProvider)
+        XCTAssertFalse(model.isStreaming)
+        XCTAssertFalse(model.isSending)
     }
 
     func testStoppingAnEmptyChatTurnLeavesNoPlaceholderAnswer() async throws {

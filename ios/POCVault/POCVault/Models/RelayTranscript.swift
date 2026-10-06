@@ -616,12 +616,28 @@ extension RelayTimeline {
         guard !kinds.isEmpty else { return "" }
 
         if kinds == [.reasoning] {
+            // Reasoning steps often carry no text and no measurable time; a
+            // run of them that rounds to nothing is just "Thought".
             let seconds = steps.compactMap { $0.duration(now: now) }.reduce(0, +)
-            return seconds >= 1 ? "Thought for \(RelayStepClock.short(seconds))" : "Thought"
+            return seconds.rounded() >= 1 ? "Thought for \(RelayStepClock.short(seconds))" : "Thought"
         }
 
         let sentence = kinds.map { $0.phrase(count: counts[$0] ?? 1) }.joined(separator: ", ")
         return sentence.prefix(1).uppercased() + sentence.dropFirst()
+    }
+}
+
+extension RelayTimeline {
+    /// How many of these steps did not succeed. `summary(of:)` counts a failed
+    /// step under its kind like any other ("ran 3 commands"); this is the
+    /// number a row can add beside it.
+    static func failedCount(in steps: [RelayStep]) -> Int {
+        steps.filter { $0.status == .failed }.count
+    }
+
+    /// The same for one activity block of this timeline.
+    func failedCount(in block: RelayTimelineBlock) -> Int {
+        Self.failedCount(in: steps(in: block))
     }
 }
 
