@@ -264,6 +264,25 @@ struct RelayTimelinePage: Decodable, Hashable {
     }
 }
 
+/// The `steps` and `trailingSteps` arrays of thread history. One entry this
+/// build cannot read is skipped; it does not cost the turn its other steps.
+struct RelayHistorySteps: Decodable, Hashable {
+    let steps: [RelayStepPatch]
+
+    private struct Entry: Decodable {
+        let patch: RelayStepPatch?
+
+        init(from decoder: Decoder) throws {
+            patch = try? RelayStepPatch(from: decoder)
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        let entries = (try? decoder.singleValueContainer().decode([Entry].self)) ?? []
+        steps = entries.compactMap(\.patch)
+    }
+}
+
 enum RelayTimelineDate {
     private static let fractional: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
@@ -337,6 +356,24 @@ struct RelayTimeline: Hashable {
         for patch in historySteps {
             merge(patch)
         }
+    }
+
+    /// Thread history, where every step is a finished record: one that names no
+    /// status ran to completion, and one still marked running in a thread that
+    /// is no longer working was interrupted.
+    init(historySteps: [RelayStepPatch], threadIsActive: Bool) {
+        for var patch in historySteps {
+            if patch.status == nil { patch.status = .done }
+            merge(patch)
+        }
+        if !threadIsActive {
+            settle(as: .cancelled)
+        }
+    }
+
+    /// True while any step, nested or not, is still in flight.
+    var hasRunningSteps: Bool {
+        order.contains { steps[$0]?.status == .running }
     }
 
     var isEmpty: Bool { blocks.isEmpty && order.isEmpty }
@@ -579,12 +616,28 @@ extension RelayTimeline {
         guard !kinds.isEmpty else { return "" }
 
         if kinds == [.reasoning] {
+            // Reasoning steps often carry no text and no measurable time; a
+            // run of them that rounds to nothing is just "Thought".
             let seconds = steps.compactMap { $0.duration(now: now) }.reduce(0, +)
-            return seconds >= 1 ? "Thought for \(RelayStepClock.short(seconds))" : "Thought"
+            return seconds.rounded() >= 1 ? "Thought for \(RelayStepClock.short(seconds))" : "Thought"
         }
 
         let sentence = kinds.map { $0.phrase(count: counts[$0] ?? 1) }.joined(separator: ", ")
         return sentence.prefix(1).uppercased() + sentence.dropFirst()
+    }
+}
+
+extension RelayTimeline {
+    /// How many of these steps did not succeed. `summary(of:)` counts a failed
+    /// step under its kind like any other ("ran 3 commands"); this is the
+    /// number a row can add beside it.
+    static func failedCount(in steps: [RelayStep]) -> Int {
+        steps.filter { $0.status == .failed }.count
+    }
+
+    /// The same for one activity block of this timeline.
+    func failedCount(in block: RelayTimelineBlock) -> Int {
+        Self.failedCount(in: steps(in: block))
     }
 }
 
