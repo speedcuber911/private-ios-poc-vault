@@ -25,6 +25,33 @@ _SIM_PREVIEW_TOKEN = "s" * 43
 _SIM_LIVE_PREVIEW = (ROOT / "ops" / "fixtures" / "launch-checklist.html").read_bytes()
 
 
+class SimJob:
+    """One submitted job: who asked for what, and its scripted timeline. The
+    timeline advances on its own thread, like a real job, so a stream can drop
+    and re-attach with `timeline=<n>` without restarting the run."""
+
+    def __init__(self, id: str):
+        self.id = id
+        self.provider = "codex"
+        self.model: str | None = None
+        self.prompt = "Inspect the workspace."
+        self.tick = 0
+        self.created_at = "2026-05-23T13:34:00Z"
+        self.started_at = "2026-05-23T13:34:02Z"
+        self.completed_at: str | None = None
+        self.timeline: list[dict] = []
+        # The prose of the timeline as a stdout log, the way relayd keeps one:
+        # what SIM_TIMELINE_STDOUT=1 streams, from a byte offset.
+        self.stdout = bytearray()
+        self.timeline_enabled = False
+        self.timeline_done = True
+        self.final_status = "succeeded"
+        self.generation = 0
+        # SIM_TIMELINE_APPROVAL=1: the run parks at its first command.
+        self.waiting_for_approval = False
+        self.approval: dict | None = None
+
+
 class SimulatorVaultServer(ThreadingHTTPServer):
     def __init__(self, server_address: tuple[str, int], handler_class: type[BaseHTTPRequestHandler]):
         super().__init__(server_address, handler_class)
@@ -35,21 +62,12 @@ class SimulatorVaultServer(ThreadingHTTPServer):
         self.terminals: dict[str, dict] = {}
         self.dynamic_workspaces: dict[str, dict] = {}
         self.terminal_counter = 0
-        self.active_job_provider = "codex"
-        self.active_job_model: str | None = None
-        self.active_job_prompt = "Inspect the workspace."
-        self.active_job_tick = 0
-        # The scripted timeline of the job submitted last (see sim_timeline_script).
-        # It advances on its own thread, like a real job, so a stream can drop and
-        # re-attach with `timeline=<n>` without restarting the run.
-        self.active_job_timeline: list[dict] = []
-        # The prose of that timeline as a stdout log, the way relayd keeps one:
-        # what SIM_TIMELINE_STDOUT=1 streams, from a byte offset.
-        self.active_job_stdout = bytearray()
-        self.active_job_timeline_enabled = False
-        self.active_job_timeline_done = True
-        self.active_job_final_status = "succeeded"
-        self.active_job_generation = 0
+        # Every submitted job gets its own id (`sim-job-<n>`) and its own state,
+        # like a real machine. `sim-job-running` stays as an alias for the
+        # latest one, for hooks and scripts that predate per-job ids.
+        self.sim_jobs: dict[str, SimJob] = {}
+        self.sim_job_counter = 0
+        self.active_job = SimJob("sim-job-running")
         self.handoff_job_id: str | None = None
         self.fixture_lock = threading.Lock()
 
@@ -141,19 +159,24 @@ class Handler(BaseHTTPRequestHandler):
             model = body.get("model")
             prompt = body.get("prompt")
             with self.server.fixture_lock:
-                self.server.active_job_provider = provider
-                self.server.active_job_model = str(model) if isinstance(model, str) and model else None
-                self.server.active_job_prompt = str(prompt) if isinstance(prompt, str) and prompt else "Inspect the workspace."
-                self.server.active_job_tick = 0
-            start_sim_timeline(self.server)
+                self.server.sim_job_counter += 1
+                job = SimJob(f"sim-job-{self.server.sim_job_counter}")
+                job.provider = provider
+                job.model = str(model) if isinstance(model, str) and model else None
+                job.prompt = str(prompt) if isinstance(prompt, str) and prompt else "Inspect the workspace."
+                # Supersede the previous run: one scripted job at a time.
+                self.server.active_job.generation += 1
+                self.server.sim_jobs[job.id] = job
+                self.server.active_job = job
+            start_sim_timeline(self.server, job)
             self.send_json({
-                "id": "sim-job-running",
-                "job": self.active_job_fixture(status="running", result=None),
+                "id": job.id,
+                "job": sim_job_payload(self.server, job),
             })
             return
         if path == "/v1/codex/previews":
             body = self.read_json_body()
-            if body.get("jobId") not in {"sim-job-linear", "sim-job-running", "sim-job-handoff"}:
+            if body.get("jobId") not in {"sim-job-linear", "sim-job-handoff"} and sim_job_for(self.server, str(body.get("jobId") or "")) is None:
                 self.send_json_error(404, "job not found")
                 return
             if not simulator_preview_source_is_valid(body.get("url")):
@@ -165,22 +188,42 @@ class Handler(BaseHTTPRequestHandler):
                 "expiresAt": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(timespec="seconds").replace("+00:00", "Z"),
             }, status=201)
             return
-        if path == "/v1/codex/jobs/sim-job-running/cancel":
+        cancel_match = re.fullmatch(r"/v1/codex/jobs/([^/]+)/cancel", path)
+        if cancel_match and sim_job_for(self.server, cancel_match.group(1)) is not None:
+            job = sim_job_for(self.server, cancel_match.group(1))
             with self.server.fixture_lock:
-                self.server.active_job_generation += 1
-                self.server.active_job_final_status = "canceled"
-                self.server.active_job_timeline_done = True
-            self.send_json(self.active_job_fixture(status="canceled", result="Simulator job canceled."))
+                if not job.timeline_done or not job.timeline_enabled:
+                    job.generation += 1
+                    job.final_status = "canceled"
+                    job.timeline_done = True
+                    job.waiting_for_approval = False
+                    job.completed_at = sim_now_iso()
+            payload = sim_job_payload(self.server, job)
+            if not job.timeline_enabled:
+                payload.update({"status": "canceled", "result": "Simulator job canceled.", "artifacts": []})
+            self.send_json(payload)
             return
         approval_match = re.fullmatch(r"/v1/codex/approvals/([^/]+)/decision", path)
         if approval_match:
-            if approval_match.group(1) != "sim-approval-shell":
+            scripted = sim_job_for_approval(self.server, approval_match.group(1))
+            if approval_match.group(1) != "sim-approval-shell" and scripted is None:
                 self.send_json_error(404, "approval was not found")
                 return
             body = self.read_json_body()
             decision = str(body.get("decision") or "")
             if decision not in {"accept", "acceptForSession", "decline", "cancel"}:
                 self.send_json_error(400, "decision is invalid")
+                return
+            if scripted is not None:
+                with self.server.fixture_lock:
+                    scripted.approval["status"] = "resolved"
+                    scripted.approval["resolution"] = {
+                        "decision": decision,
+                        "decidedAt": sim_now_iso(),
+                        "message": body.get("message"),
+                    }
+                    scripted.waiting_for_approval = False
+                self.send_json({"approval": dict(scripted.approval)})
                 return
             with self.server.fixture_lock:
                 self.server.approval_pending = False
@@ -307,12 +350,14 @@ class Handler(BaseHTTPRequestHandler):
             params = parse_qs(query)
             approval = codex_fixture_approval(self.server)
             approvals = [approval]
+            with self.server.fixture_lock:
+                approvals += [dict(job.approval) for job in self.server.sim_jobs.values() if job.approval]
             job_id = params.get("jobId", [""])[0]
             status = params.get("status", [""])[0]
-            if job_id and job_id != approval["jobId"]:
-                approvals = []
-            if status and status != approval["status"]:
-                approvals = []
+            if job_id:
+                approvals = [item for item in approvals if item["jobId"] == job_id]
+            if status:
+                approvals = [item for item in approvals if item["status"] == status]
             self.send_json({"approvals": approvals})
             return
         if path == "/v1/codex/workspaces":
@@ -380,20 +425,21 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/codex/jobs/sim-job-handoff":
             self.send_json(codex_fixture_handoff_job())
             return
-        if path == "/v1/codex/jobs/sim-job-running":
-            self.send_json(codex_fixture_running_job_tick(self.server))
-            return
-        if path == "/v1/codex/jobs/sim-job-running/stream":
-            self.serve_codex_job_stream(parse_qs(query))
-            return
-        if path == "/v1/codex/jobs/sim-job-running/timeline":
-            self.send_json(sim_timeline_page(self.server, parse_qs(query)))
+        job_match = re.fullmatch(r"/v1/codex/jobs/([^/]+)(/stream|/timeline)?", path)
+        scripted = sim_job_for(self.server, job_match.group(1)) if job_match else None
+        if scripted is not None:
+            if job_match.group(2) == "/stream":
+                self.serve_codex_job_stream(scripted, parse_qs(query))
+            elif job_match.group(2) == "/timeline":
+                self.send_json(sim_timeline_page(self.server, scripted, parse_qs(query)))
+            else:
+                self.send_json(codex_fixture_running_job_tick(self.server, scripted))
             return
         if path == "/v1/codex/jobs/sim-job-approval":
             self.send_json(codex_fixture_approval_job(self.server))
             return
         artifact_match = re.fullmatch(
-            r"/v1/codex/jobs/(sim-job-linear|sim-job-running|sim-job-handoff)/artifacts/(artifact-001|artifact-002)/(raw|preview)",
+            r"/v1/codex/jobs/(sim-job-linear|sim-job-running|sim-job-\d+|sim-job-handoff)/artifacts/(artifact-001|artifact-002)/(raw|preview)",
             path,
         )
         if artifact_match:
@@ -452,7 +498,7 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
 
-    def serve_codex_job_stream(self, query: dict | None = None) -> None:
+    def serve_codex_job_stream(self, job: "SimJob", query: dict | None = None) -> None:
         """Canned live-job SSE fixture mirroring /v1/codex/jobs/<id>/stream:
         status snapshot, stdout replay/live events with real byte offsets,
         heartbeat comments, then a terminal done event. A client that sends
@@ -470,48 +516,49 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode("utf-8"))
             self.wfile.flush()
 
-        with self.server.fixture_lock:
-            provider = self.server.active_job_provider
-            model = self.server.active_job_model
-            prompt = self.server.active_job_prompt
+        def emit_status(status: str) -> None:
+            emit("status", {
+                "id": job.id,
+                "status": status,
+                "provider": job.provider,
+                "workspaceId": "poc-vault",
+                "createdAt": job.created_at,
+                "startedAt": job.started_at,
+                "finishedAt": None,
+                "updatedAt": sim_now_iso(),
+                "exitCode": None,
+                "timedOut": False,
+                "error": None,
+            })
 
-        emit("status", {
-            "id": "sim-job-running",
-            "status": "running",
-            "provider": provider,
-            "model": model,
-            "workspaceId": "poc-vault",
-            "createdAt": "2026-05-23T13:34:00Z",
-            "startedAt": "2026-05-23T13:34:02Z",
-            "finishedAt": None,
-            "updatedAt": "2026-05-23T13:34:02Z",
-            "exitCode": None,
-            "timedOut": False,
-            "error": None,
-        })
-        timeline_cursor = sim_timeline_cursor(self.server, query)
+        emit_status(sim_job_status(self.server, job) if job.timeline_enabled else "running")
+        timeline_cursor = sim_timeline_cursor(self.server, job, query)
         if timeline_cursor is not None:
             opened = time.monotonic()
-            stdout_offset = bounded_int(((query or {}).get("stdoutOffset") or ["0"])[0], 0, 0, 1 << 40)
-            stderr_offset = bounded_int(((query or {}).get("stderrOffset") or ["0"])[0], 0, 0, 1 << 40)
+            # A resuming client names its offsets in the query or, like the real
+            # daemon accepts, in Last-Event-ID ("<stdout>:<stderr>:<seq>").
+            offsets = {key: (query or {}).get(key, [None])[0] for key in ("stdoutOffset", "stderrOffset")}
+            resume = re.fullmatch(r"(\d{1,15}):(\d{1,15}):(\d{1,15})", (self.headers.get("Last-Event-ID") or "").strip())
+            if resume:
+                offsets = {"stdoutOffset": resume.group(1), "stderrOffset": resume.group(2)}
+            stdout_offset = bounded_int(offsets["stdoutOffset"] or "0", 0, 0, 1 << 40)
             # One line per connection, so a re-attach can be read off the log:
             # what the client said it already held, and how the connection ended.
             sim_log(
-                "job-stream open "
-                f"stdoutOffset={stdout_offset if 'stdoutOffset' in (query or {}) else '-'} "
-                f"stderrOffset={stderr_offset if 'stderrOffset' in (query or {}) else '-'} "
-                f"timeline={timeline_cursor}"
+                f"job-stream open job={job.id} "
+                f"stdoutOffset={offsets['stdoutOffset'] or '-'} "
+                f"stderrOffset={offsets['stderrOffset'] or '-'} "
+                f"timeline={timeline_cursor} "
+                f"lastEventId={(self.headers.get('Last-Event-ID') or '-')}"
             )
             outcome = "client-gone"
             self.sim_stream_sent = 0
             try:
-                outcome = self.stream_sim_timeline(
-                    emit, timeline_cursor, provider, model, prompt, stdout_offset
-                )
+                outcome = self.stream_sim_timeline(job, emit, emit_status, timeline_cursor, stdout_offset)
             except (BrokenPipeError, ConnectionResetError):
                 pass
             sim_log(
-                f"job-stream close reason={outcome} timelineEventsSent={self.sim_stream_sent} "
+                f"job-stream close job={job.id} reason={outcome} timelineEventsSent={self.sim_stream_sent} "
                 f"through={timeline_cursor + self.sim_stream_sent} "
                 f"seconds={time.monotonic() - opened:.1f}"
             )
@@ -528,22 +575,14 @@ class Handler(BaseHTTPRequestHandler):
             "done",
             codex_fixture_job(
                 status="succeeded",
-                id="sim-job-running",
-                provider=provider,
-                model=model,
-                prompt=prompt,
+                id=job.id,
+                provider=job.provider,
+                model=job.model,
+                prompt=job.prompt,
             ),
         )
 
-    def stream_sim_timeline(
-        self,
-        emit,
-        cursor: int,
-        provider: str,
-        model: str | None,
-        prompt: str,
-        stdout_offset: int = 0,
-    ) -> str:
+    def stream_sim_timeline(self, job: "SimJob", emit, emit_status, cursor: int, stdout_offset: int = 0) -> str:
         """Tail the scripted timeline from `cursor` until the run ends, then send
         `done`. Timeline messages carry no SSE id, as on a real machine.
 
@@ -555,12 +594,12 @@ class Handler(BaseHTTPRequestHandler):
         mirror_stdout = os.environ.get("SIM_TIMELINE_STDOUT", "0") == "1"
         sent = 0
         self.sim_stream_sent = 0
+        last_status = sim_job_status(self.server, job)
         while True:
             with self.server.fixture_lock:
-                pending = list(self.server.active_job_timeline[cursor:])
-                finished = self.server.active_job_timeline_done
-                final_status = self.server.active_job_final_status
-                stdout = bytes(self.server.active_job_stdout[stdout_offset:]) if mirror_stdout else b""
+                pending = list(job.timeline[cursor:])
+                finished = job.timeline_done
+                stdout = bytes(job.stdout[stdout_offset:]) if mirror_stdout else b""
             if stdout:
                 emit("stdout", {"offset": stdout_offset, "text": stdout.decode("utf-8", errors="replace")})
                 stdout_offset += len(stdout)
@@ -574,34 +613,21 @@ class Handler(BaseHTTPRequestHandler):
                     return "dropped"
             if finished and not pending:
                 break
+            status = sim_job_status(self.server, job)
+            if status != last_status and status in {"running", "waiting_for_approval"}:
+                # A state transition, as the real stream reports one.
+                last_status = status
+                emit_status(status)
             if not pending:
                 self.wfile.write(b": heartbeat\n\n")
                 self.wfile.flush()
                 time.sleep(0.1)
-        job = codex_fixture_job(
-            status=final_status,
-            result=_SIM_TIMELINE_ANSWER if final_status == "succeeded" else "Simulator job canceled.",
-            id="sim-job-running",
-            provider=provider,
-            model=model,
-            prompt=prompt,
-        )
-        job["timelineEvents"] = cursor
-        emit("done", job)
+        payload = sim_job_payload(self.server, job)
+        payload["timelineEvents"] = cursor
+        emit("done", payload)
         if mirror_stdout:
-            sim_log(f"job-stream done stdoutBytes={stdout_offset} timelineEvents={cursor}")
+            sim_log(f"job-stream done job={job.id} stdoutBytes={stdout_offset} timelineEvents={cursor}")
         return "done"
-
-    def active_job_fixture(self, status: str, result: str | None) -> dict:
-        with self.server.fixture_lock:
-            return codex_fixture_job(
-                status=status,
-                result=result,
-                id="sim-job-running",
-                provider=self.server.active_job_provider,
-                model=self.server.active_job_model,
-                prompt=self.server.active_job_prompt,
-            )
 
     def serve_codex_chat_fixture(self) -> None:
         body = self.read_json_body()
@@ -1923,22 +1949,36 @@ def sim_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def start_sim_timeline(server: SimulatorVaultServer) -> None:
+def start_sim_timeline(server: SimulatorVaultServer, job: SimJob) -> None:
     enabled = os.environ.get("SIM_TIMELINE", "1") != "0"
+    asks_approval = os.environ.get("SIM_TIMELINE_APPROVAL", "0") == "1"
+    now = sim_now_iso()
     with server.fixture_lock:
-        server.active_job_generation += 1
-        generation = server.active_job_generation
-        server.active_job_timeline = []
-        server.active_job_stdout = bytearray()
-        server.active_job_timeline_enabled = enabled
-        server.active_job_timeline_done = not enabled
-        server.active_job_final_status = "succeeded"
+        job.generation += 1
+        generation = job.generation
+        job.timeline = []
+        job.stdout = bytearray()
+        job.timeline_enabled = enabled
+        job.timeline_done = not enabled
+        job.final_status = "succeeded"
+        # Real times, so a duration counted from them is a real duration.
+        job.created_at = now
+        job.started_at = now
+        job.completed_at = None
     if not enabled:
         return
     delay = float(os.environ.get("SIM_JOB_STREAM_DELAY", "0.35"))
 
+    def finish(status: str) -> None:
+        with server.fixture_lock:
+            if job.generation == generation:
+                job.final_status = status
+                job.timeline_done = True
+                job.completed_at = sim_now_iso()
+
     def run() -> None:
         started: set[str] = set()
+        asked = False
         for pause, event in sim_timeline_script():
             if delay > 0 and pause > 0:
                 time.sleep(delay * pause)
@@ -1951,40 +1991,127 @@ def start_sim_timeline(server: SimulatorVaultServer) -> None:
                 if event.get("status") in {"done", "failed", "cancelled"}:
                     event.setdefault("endedAt", now)
             with server.fixture_lock:
-                if server.active_job_generation != generation:
+                if job.generation != generation:
                     return
-                server.active_job_timeline.append(event)
+                job.timeline.append(event)
                 if event.get("type") == "text":
-                    server.active_job_stdout += str(event.get("delta") or "").encode("utf-8")
-        with server.fixture_lock:
-            if server.active_job_generation == generation:
-                server.active_job_timeline_done = True
+                    job.stdout += str(event.get("delta") or "").encode("utf-8")
+            is_first_command = event.get("type") == "step" and event.get("kind") == "command" and not asked
+            if asks_approval and is_first_command:
+                asked = True
+                command = (event.get("input") or {}).get("command") or "npm test"
+                with server.fixture_lock:
+                    job.approval = {
+                        "id": f"sim-approval-{job.id}",
+                        "jobId": job.id,
+                        "provider": job.provider,
+                        "kind": "tool",
+                        "title": "Run a command",
+                        "reason": "The agent needs permission before it can run this command.",
+                        "command": command,
+                        "cwd": "/srv/codex-workspaces/poc-vault",
+                        "toolName": "Bash",
+                        "createdAt": sim_now_iso(),
+                        "status": "pending",
+                        "availableDecisions": ["accept", "acceptForSession", "decline", "cancel"],
+                        "resolution": None,
+                    }
+                    job.waiting_for_approval = True
+                # Parked, like the real runner, until the phone decides.
+                while True:
+                    with server.fixture_lock:
+                        if job.generation != generation:
+                            return
+                        if not job.waiting_for_approval:
+                            decision = ((job.approval or {}).get("resolution") or {}).get("decision")
+                            break
+                    time.sleep(0.1)
+                if decision in {"decline", "cancel"}:
+                    with server.fixture_lock:
+                        job.timeline.append({
+                            "type": "step", "id": event["id"], "status": "cancelled",
+                            "endedAt": sim_now_iso(), "error": "Declined on the phone.",
+                        })
+                    finish("canceled")
+                    return
+        finish("succeeded")
 
     threading.Thread(target=run, daemon=True).start()
 
 
-def sim_timeline_cursor(server: SimulatorVaultServer, query: dict | None) -> int | None:
+def sim_job_for(server: SimulatorVaultServer, job_id: str) -> SimJob | None:
+    """A submitted job by id; `sim-job-running` is the latest one."""
+    with server.fixture_lock:
+        if job_id == "sim-job-running":
+            return server.active_job
+        return server.sim_jobs.get(job_id)
+
+
+def sim_job_for_approval(server: SimulatorVaultServer, approval_id: str) -> SimJob | None:
+    with server.fixture_lock:
+        for job in server.sim_jobs.values():
+            if job.approval and job.approval["id"] == approval_id:
+                return job
+    return None
+
+
+def sim_job_status(server: SimulatorVaultServer, job: SimJob) -> str:
+    with server.fixture_lock:
+        if not job.timeline_done:
+            return "waiting_for_approval" if job.waiting_for_approval else "running"
+        return job.final_status
+
+
+def sim_job_payload(server: SimulatorVaultServer, job: SimJob) -> dict:
+    """The job object of a scripted run. Its status comes from the script's own
+    state and nothing else: it is `running` until the last event is out."""
+    status = sim_job_status(server, job) if job.timeline_enabled else "running"
+    if status == "succeeded":
+        result: str | None = _SIM_TIMELINE_ANSWER
+    elif status in {"running", "waiting_for_approval"}:
+        result = None
+    else:
+        result = "Simulator job canceled."
+    payload = codex_fixture_job(
+        status=status,
+        result=result,
+        id=job.id,
+        provider=job.provider,
+        model=job.model,
+        prompt=job.prompt,
+    )
+    with server.fixture_lock:
+        payload["createdAt"] = job.created_at
+        payload["startedAt"] = job.started_at
+        payload["completedAt"] = job.completed_at
+        payload["updatedAt"] = job.completed_at or sim_now_iso()
+        if job.timeline_enabled and job.timeline:
+            payload["timelineEvents"] = len(job.timeline)
+    return payload
+
+
+def sim_timeline_cursor(server: SimulatorVaultServer, job: SimJob, query: dict | None) -> int | None:
     """The client's timeline cursor, or None when it did not ask for a timeline
     or this run has none (then the stream is the legacy one, unchanged)."""
     values = (query or {}).get("timeline")
     if not values:
         return None
     with server.fixture_lock:
-        if not server.active_job_timeline_enabled:
+        if not job.timeline_enabled:
             return None
     return bounded_int(values[0], 0, 0, 1_000_000)
 
 
-def sim_timeline_page(server: SimulatorVaultServer, query: dict) -> dict:
+def sim_timeline_page(server: SimulatorVaultServer, job: SimJob, query: dict) -> dict:
     since = bounded_int((query.get("since") or ["0"])[0], 0, 0, 1_000_000)
     with server.fixture_lock:
-        events = list(server.active_job_timeline)
-        finished = server.active_job_timeline_done
+        events = list(job.timeline)
+        finished = job.timeline_done
     since = min(since, len(events))
     page = events[since:since + 2000]
     next_cursor = since + len(page)
     return {
-        "jobId": "sim-job-running",
+        "jobId": job.id,
         "events": [{"seq": since + index + 1, "event": event} for index, event in enumerate(page)],
         "next": next_cursor,
         "complete": finished and next_cursor == len(events),
@@ -2000,61 +2127,40 @@ _SIM_JOB_STAGES = [
 ]
 
 
-def codex_fixture_running_job_tick(server: SimulatorVaultServer) -> dict:
-    with server.fixture_lock:
-        timeline_enabled = server.active_job_timeline_enabled
-        timeline_done = server.active_job_timeline_done
-        timeline_count = len(server.active_job_timeline)
-        final_status = server.active_job_final_status
-    if timeline_enabled:
+def codex_fixture_running_job_tick(server: SimulatorVaultServer, job: SimJob) -> dict:
+    if job.timeline_enabled:
         # A scripted run ends when its timeline does, not after N polls, so the
         # poll and the stream never disagree about whether the job is over.
-        with server.fixture_lock:
-            provider = server.active_job_provider
-            model = server.active_job_model
-            prompt = server.active_job_prompt
-        if not timeline_done:
-            status, result = "running", None
-        elif final_status == "succeeded":
-            status, result = "succeeded", _SIM_TIMELINE_ANSWER
-        else:
-            status, result = final_status, "Simulator job canceled."
-        job = codex_fixture_job(
-            status=status,
-            result=result,
-            id="sim-job-running",
-            provider=provider,
-            model=model,
-            prompt=prompt,
-        )
-        job["timelineEvents"] = timeline_count
-        return job
+        return sim_job_payload(server, job)
     with server.fixture_lock:
-        n = server.active_job_tick
-        server.active_job_tick = n + 1
-        provider = server.active_job_provider
-        model = server.active_job_model
-        prompt = server.active_job_prompt
+        n = job.tick
+        job.tick = n + 1
+        final_status = job.final_status
+    stamps = {"createdAt": job.created_at, "startedAt": job.started_at}
+    if final_status == "canceled":
+        return {**codex_fixture_job(status="canceled", result="Simulator job canceled.", id=job.id,
+                                    provider=job.provider, model=job.model, prompt=job.prompt), **stamps}
     if n < len(_SIM_JOB_STAGES):
         status, log = _SIM_JOB_STAGES[n]
-        return codex_fixture_job(
+        return {**codex_fixture_job(
             status="running",
             result=log,
-            id="sim-job-running",
-            provider=provider,
-            model=model,
-            prompt=prompt,
-        )
+            id=job.id,
+            provider=job.provider,
+            model=job.model,
+            prompt=job.prompt,
+        ), **stamps}
     # After the running stages, complete the job (same id so the card updates in place).
     with server.fixture_lock:
-        server.active_job_tick = 0  # reset for the next submitted job
-    return codex_fixture_job(
+        if job.completed_at is None:
+            job.completed_at = sim_now_iso()
+    return {**codex_fixture_job(
         status="succeeded",
-        id="sim-job-running",
-        provider=provider,
-        model=model,
-        prompt=prompt,
-    )
+        id=job.id,
+        provider=job.provider,
+        model=job.model,
+        prompt=job.prompt,
+    ), **stamps, "completedAt": job.completed_at, "updatedAt": job.completed_at}
 
 
 def codex_fixture_approval_job(server: SimulatorVaultServer) -> dict:
@@ -2143,7 +2249,7 @@ def codex_fixture_job(
         "artifacts": artifacts,
         "resultTruncated": False,
         "logsIncluded": "compact",
-        "sessionId": f"sim-{provider}-running-thread" if id == "sim-job-running" else "sim-thread-linear",
+        "sessionId": f"sim-{provider}-running-thread" if re.fullmatch(r"sim-job-(running|\d+)", id or "") else "sim-thread-linear",
         "createdAt": "2026-05-23T13:34:00Z",
         "startedAt": "2026-05-23T13:34:02Z",
         "completedAt": None if status == "running" else "2026-05-23T13:35:30Z",
