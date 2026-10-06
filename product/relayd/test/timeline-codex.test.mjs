@@ -64,7 +64,7 @@ const at = { startedAtMs: 1791271900000, completedAtMs: 1791271901500 };
 const started = (item) => ({ method: "item/started", params: { item, threadId: "th", turnId: "tu", startedAtMs: at.startedAtMs } });
 const completed = (item) => ({ method: "item/completed", params: { item, threadId: "th", turnId: "tu", completedAtMs: at.completedAtMs } });
 
-test("a real run maps to prose, a listing, a read and an edit, in order", () => {
+test("a real run maps to prose, a command, a read and an edit, in order", () => {
   const events = replay(fixture("codex-appserver-edit.ndjson"));
   const { order, steps, texts, usage } = reduce(events);
   assert.deepEqual(order.map((entry) => entry.split(":")[0]), ["text", "step", "step", "step", "text"]);
@@ -73,12 +73,13 @@ test("a real run maps to prose, a listing, a read and an edit, in order", () => 
   assert.deepEqual(
     { kind: first.kind, title: first.title, status: first.status, exitCode: first.exitCode, output: first.output, input: first.input },
     {
-      // Codex parsed this as one `ls`, so it is a listing of the working directory.
-      kind: "search", title: "Search", status: "done", exitCode: 0, output: "hello-relay\nnotes.txt\n",
+      // Codex parsed only the `ls` half of this, so it stays a plain command: a
+      // row that says "Search" must not hide whatever else the shell line did.
+      kind: "command", title: "Bash", status: "done", exitCode: 0, output: "hello-relay\nnotes.txt\n",
       input: { command: "echo hello-relay && ls", cwd: "/work/scratch" },
     },
   );
-  assert.equal(first.summary, "scratch");
+  assert.equal(first.summary, "echo hello-relay && ls");
   assert.equal(first.startedAt, "2026-10-06T07:31:48.249Z");
   assert.equal(first.endedAt, "2026-10-06T07:31:48.250Z");
   assert.deepEqual(
@@ -455,7 +456,7 @@ test("a real rollout yields each action once, grouped before the message that fo
   const [first, second, edit] = groups[1];
   assert.deepEqual(
     { kind: first.kind, title: first.title, status: first.status, exitCode: first.exitCode, output: first.output, input: first.input },
-    { kind: "search", title: "Search", status: "done", exitCode: 0, output: "hello-relay\nnotes.txt\n", input: { command: "echo hello-relay && ls", cwd: "/work/scratch" } },
+    { kind: "command", title: "Bash", status: "done", exitCode: 0, output: "hello-relay\nnotes.txt\n", input: { command: "echo hello-relay && ls", cwd: "/work/scratch" } },
   );
   assert.equal(first.startedAt, "2026-10-06T07:31:48.249Z");
   assert.deepEqual(

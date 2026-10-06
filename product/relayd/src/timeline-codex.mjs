@@ -139,9 +139,15 @@ function stepStatus(value, fallback) {
 // Codex runs everything through a shell, but it also parses each command. When
 // it read the command as exactly one read, search or listing, the step takes
 // that kind, so a run reads "Read 2 files, ran a search" and not "Ran 3 commands".
-function commandAction(actions, cwd) {
+//
+// Only when that one action IS the whole command. `rm -rf build && ls` also
+// parses to a single listing, and a row that says "Search" must not hide what
+// else ran: anything Codex parsed only part of stays a plain command.
+function commandAction(actions, cwd, command) {
   if (!Array.isArray(actions) || actions.length !== 1) return null;
   const action = actions[0] || {};
+  const squash = (text) => String(text ?? "").replace(/\s+/g, " ").trim();
+  if (!nonEmpty(action.command) || squash(action.command) !== squash(command)) return null;
   if (action.type === "read") {
     const file = nonEmpty(action.path) ? action.path : nonEmpty(action.name) ? action.name : "";
     return { kind: "read", title: "Read", summary: action.name || baseName(file) || "a file", input: file ? { path: file } : {} };
@@ -293,7 +299,7 @@ export function describeCodexItem(item) {
       return null;
     case "commandExecution": {
       const command = displayCommand(item.command);
-      const action = commandAction(item.commandActions, item.cwd);
+      const action = commandAction(item.commandActions, item.cwd, command);
       const input = { ...(action ? action.input : {}), command };
       if (nonEmpty(item.cwd)) input.cwd = item.cwd;
       const exitCode = Number.isInteger(item.exitCode) ? item.exitCode : undefined;
