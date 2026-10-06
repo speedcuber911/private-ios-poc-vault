@@ -131,10 +131,20 @@ final class MachinePowerTests: XCTestCase {
         await model.refresh()
         XCTAssertEqual(model.status, .on)
 
+        // One failed read is routine (the first request after foregrounding
+        // often dies on a closed socket) and is retried, so it stays quiet.
         fake.stateError = RelayMachinePowerError.timeout
         await model.refresh()
         XCTAssertEqual(model.status, .on)
+        XCTAssertNil(model.notice)
+
+        await model.refresh()
+        XCTAssertEqual(model.status, .on)
         XCTAssertNotNil(model.notice)
+
+        fake.stateError = nil
+        await model.refresh()
+        XCTAssertNil(model.notice, "a read that lands clears what the failed ones said")
     }
 
     /// The glitch this guards: EC2 still answers `stopped` for a few seconds
@@ -156,6 +166,203 @@ final class MachinePowerTests: XCTestCase {
         XCTAssertEqual(model.status, .starting, "a concurrent read must not interrupt a start")
         await starting.value
         XCTAssertEqual(model.status, .on)
+    }
+
+    // MARK: - Staying in sync with a machine that moves on its own
+
+    /// The machine is started and stopped behind the app's back (idle
+    /// auto-stop, a node request's auto-wake, another phone). A read on appear
+    /// that lands on `pending` used to leave the switch on "Starting…" for
+    /// good, because nothing read again.
+    @MainActor
+    func testWatchFollowsAMachineItDidNotStart() async {
+        let (model, _) = makeModel(states: ["pending", "pending", "running"])
+
+        let watching = Task { await model.watch() }
+        defer { watching.cancel() }
+        await waitUntil { model.status == .starting }
+        XCTAssertEqual(model.status, .starting)
+        await waitUntil { model.status == .on }
+        XCTAssertEqual(model.status, .on)
+    }
+
+    @MainActor
+    func testWatchRetriesAReadThatFailed() async {
+        let (model, fake) = makeModel(states: ["stopped"])
+        fake.stateFailures = 2
+
+        let watching = Task { await model.watch() }
+        defer { watching.cancel() }
+        await waitUntil { model.status == .off }
+        XCTAssertEqual(model.status, .off)
+        XCTAssertNil(model.notice)
+    }
+
+    /// A refused start is not evidence the machine is off. The usual cause is
+    /// the 15 s rate limit after a node request's auto-wake already started it.
+    @MainActor
+    func testRefusedStartReadsTheMachineInsteadOfGuessingOff() async {
+        let (model, fake) = makeModel(states: ["stopped", "pending", "running"])
+        await model.refresh()
+        XCTAssertEqual(model.status, .off)
+
+        fake.startError = RelayMachinePowerError.rateLimited
+        await model.start()
+        XCTAssertEqual(model.status, .on)
+        XCTAssertNil(model.notice, "the machine is doing what the tap asked for")
+    }
+
+    @MainActor
+    func testRefusedStartOnAStoppedMachineSaysSoAndStaysOff() async {
+        let (model, fake) = makeModel(states: ["stopped"])
+        await model.refresh()
+
+        fake.startError = RelayMachinePowerError.awsFailed
+        await model.start()
+        XCTAssertEqual(model.status, .off)
+        XCTAssertEqual(model.notice, RelayMachinePowerError.awsFailed.errorDescription)
+
+        // The complaint outlives the reads that follow it, until the machine moves.
+        await model.refresh()
+        XCTAssertNotNil(model.notice)
+    }
+
+    /// A stop whose reply was lost may still have been carried out. Claiming
+    /// On here is how a stopped machine came to be shown as running.
+    @MainActor
+    func testStopWithALostReplyDoesNotClaimTheMachineIsOn() async {
+        let (model, fake) = makeModel(states: ["running", "stopping", "stopped"])
+        await model.refresh()
+        XCTAssertEqual(model.status, .on)
+
+        fake.stopError = RelayMachinePowerError.invalidEndpoint
+        await model.stop()
+        XCTAssertEqual(model.status, .off)
+        XCTAssertNil(model.notice)
+    }
+
+    @MainActor
+    func testOneFailedPollDoesNotAbortAStart() async {
+        let (model, fake) = makeModel(states: ["pending", "running"])
+        fake.stateFailures = 1
+
+        await model.start()
+        XCTAssertEqual(model.status, .on)
+        XCTAssertNil(model.notice)
+    }
+
+    @MainActor
+    func testStopHoldsStoppingUntilTheMachineHasStopped() async {
+        let (model, _) = makeModel(states: ["running", "stopping", "stopped"])
+        await model.refresh()
+
+        let stopping = Task { await model.stop() }
+        await waitUntil { model.status == .stopping }
+        XCTAssertEqual(model.status, .stopping)
+        await stopping.value
+        XCTAssertEqual(model.status, .off)
+    }
+
+    /// Any node request to a stopped machine starts it, and EC2 goes on
+    /// answering `stopped` for the first seconds. The switch must not read
+    /// that as Off for a machine the app is bringing up.
+    @MainActor
+    func testAutoWakeIsNotReadAsOff() async {
+        let (model, fake) = makeModel(states: ["stopped"])
+        await model.refresh()
+        XCTAssertEqual(model.status, .off)
+
+        model.machineWakeBegan()
+        await waitUntil { model.status == .starting }
+        XCTAssertEqual(model.status, .starting)
+
+        fake.replaceStates(["running"])
+        model.machineWakeEnded()
+        await waitUntil { model.status == .on }
+        XCTAssertEqual(model.status, .on)
+    }
+
+    @MainActor
+    func testAFailedAutoWakeFallsBackToWhatEC2Says() async {
+        let (model, _) = makeModel(states: ["stopped"])
+        await model.refresh()
+
+        model.machineWakeBegan()
+        await waitUntil { model.status == .starting }
+        model.machineWakeEnded()
+        await waitUntil { model.status == .off }
+        XCTAssertEqual(model.status, .off)
+    }
+
+    @MainActor
+    func testPairingAnotherMachineDropsTheLastOnesState() async {
+        let store = ClientIdentityStore()
+        store.storeWakeToken("wake-secret-token", nodeID: "node-abc")
+        let fake = FakePowerClient(states: ["running"])
+        fake.stateError = nil
+        let model = RelayMachinePowerModel(powerClient: fake, settleInterval: .milliseconds(5),
+                                           steadyInterval: .milliseconds(20))
+        model.configure(identityStore: store)
+        await model.refresh()
+        XCTAssertEqual(model.status, .on)
+
+        store.storeWakeToken("other-wake-token", nodeID: "node-xyz")
+        fake.stateError = RelayMachinePowerError.timeout
+        await model.refresh()
+        XCTAssertEqual(model.status, .unknown, "the first machine's On is not carried over")
+        XCTAssertEqual(fake.lastNodeID, "node-xyz")
+    }
+
+    /// One model, owned by the app. Two screens each holding their own was
+    /// how Settings and Usage came to disagree about the same machine.
+    func testSettingsAndUsageShareOnePowerModel() throws {
+        let app = try AppSourceFixture.load("POCVault/POCVaultApp.swift")
+        let settings = try AppSourceFixture.load("POCVault/Views/AccountSettingsView.swift")
+        let usage = try AppSourceFixture.load("POCVault/Views/RelayMachineMonitorView.swift")
+        XCTAssertEqual(app.components(separatedBy: "RelayMachinePowerModel()").count - 1, 1)
+        XCTAssertFalse(settings.contains("RelayMachinePowerModel()"))
+        XCTAssertFalse(usage.contains("RelayMachinePowerModel()"))
+        XCTAssertTrue(settings.contains("await powerModel.watch()"))
+        XCTAssertTrue(usage.contains("await powerModel.watch()"))
+        XCTAssertTrue(app.contains("codexClient.onMachineWake"))
+    }
+
+    /// The switch only displays. A two-way binding let a tap move it before
+    /// the model agreed, and it was then pulled back.
+    func testPowerSwitchIsDrawnFromTheModelAlone() throws {
+        let settings = try AppSourceFixture.load("POCVault/Views/AccountSettingsView.swift")
+        XCTAssertTrue(settings.contains("Toggle(\"Power\", isOn: .constant(model.status.isPowered))"))
+        XCTAssertTrue(settings.contains(".allowsHitTesting(false)"))
+        XCTAssertTrue(settings.contains("Button(action: requestToggle)"))
+    }
+
+    /// Screens that report on the machine must not be what powers it on:
+    /// opening Settings used to start a stopped machine under an Off switch.
+    func testStatusScreensDoNotWakeTheMachine() throws {
+        let client = try AppSourceFixture.load("POCVault/Networking/CodexClient.swift")
+        let settings = try AppSourceFixture.load("POCVault/Views/AccountSettingsView.swift")
+        XCTAssertTrue(settings.contains("fetchHarnesses(budget: .statusRead)"))
+        XCTAssertFalse(CodexRequestBudget.statusRead.allowsMachineWake)
+        let stats = try XCTUnwrap(client.range(of: "path: \"/v1/machine/stats\","))
+        XCTAssertTrue(client[stats.upperBound...].prefix(160).contains("allowWake: false"))
+    }
+
+    @MainActor
+    private func makeModel(states: [String]) -> (RelayMachinePowerModel, FakePowerClient) {
+        let store = ClientIdentityStore()
+        store.storeWakeToken("wake-secret-token", nodeID: "node-abc")
+        let fake = FakePowerClient(states: states)
+        let model = RelayMachinePowerModel(powerClient: fake, settleInterval: .milliseconds(5),
+                                           steadyInterval: .milliseconds(20))
+        model.configure(identityStore: store)
+        return (model, fake)
+    }
+
+    @MainActor
+    private func waitUntil(_ condition: () -> Bool) async {
+        for _ in 0..<400 where !condition() {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
     }
 
     func testInstanceTypeAndResizeUseThePairingCredential() async throws {
@@ -344,6 +551,11 @@ private final class FakePowerClient: RelayMachinePowering, @unchecked Sendable {
     var startState = "pending"
     var stopState = "stopping"
     var stateError: Error?
+    /// Reads that fail before the next one is allowed through.
+    var stateFailures = 0
+    var startError: Error?
+    var stopError: Error?
+    private(set) var lastNodeID: String?
     var autoStop: Bool?
     var autoStopError: Error?
     private(set) var autoStopWrites: [Bool] = []
@@ -352,16 +564,27 @@ private final class FakePowerClient: RelayMachinePowering, @unchecked Sendable {
         self.states = states
     }
 
+    func replaceStates(_ next: [String]) {
+        states = next
+    }
+
     func start(nodeID: String, wakeToken: String) async throws -> RelayMachinePowerState {
-        RelayMachinePowerState(nodeID: nodeID, instanceID: "i-1", region: "ap-south-1", instanceState: startState)
+        if let startError { throw startError }
+        return RelayMachinePowerState(nodeID: nodeID, instanceID: "i-1", region: "ap-south-1", instanceState: startState)
     }
 
     func stop(nodeID: String, wakeToken: String) async throws -> RelayMachinePowerState {
-        RelayMachinePowerState(nodeID: nodeID, instanceID: "i-1", region: "ap-south-1", instanceState: stopState)
+        if let stopError { throw stopError }
+        return RelayMachinePowerState(nodeID: nodeID, instanceID: "i-1", region: "ap-south-1", instanceState: stopState)
     }
 
     func state(nodeID: String, wakeToken: String) async throws -> RelayMachinePowerState {
+        lastNodeID = nodeID
         if let stateError { throw stateError }
+        if stateFailures > 0 {
+            stateFailures -= 1
+            throw RelayMachinePowerError.invalidEndpoint
+        }
         let next = states.count > 1 ? states.removeFirst() : (states.first ?? "running")
         return RelayMachinePowerState(nodeID: nodeID, instanceID: "i-1", region: "ap-south-1", instanceState: next,
                                       autoStopEnabled: autoStop)

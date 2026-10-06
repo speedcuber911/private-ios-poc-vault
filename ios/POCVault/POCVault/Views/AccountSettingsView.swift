@@ -7,8 +7,12 @@ struct AccountSettingsView: View {
     @ObservedObject var computerLinkStore: RelayComputerLinkStore
     let codexClient: CodexClient
     let authClient: RelayAuthClient
+    /// The app's one power model, shared with Usage, so the two screens can
+    /// never disagree about whether the machine is on.
+    @ObservedObject var powerModel: RelayMachinePowerModel
     var showsDismissButton = true
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
 
     @State private var showingDeleteConfirmation = false
     @State private var deletionPassword = ""
@@ -28,7 +32,6 @@ struct AccountSettingsView: View {
     @State private var harnessError: String?
     @State private var providerLoginRequest: CodexProvider?
     @State private var showingStopPower = false
-    @StateObject private var powerModel = RelayMachinePowerModel()
 
     var body: some View {
         NavigationStack {
@@ -155,7 +158,7 @@ struct AccountSettingsView: View {
                     }
                 }
 
-                if nodeStore.hasMachine {
+                if nodeStore.hasMachine && !(harnesses.isEmpty && isMachineKnownDown) {
                     Section {
                         if isLoadingHarnesses && harnesses.isEmpty {
                             HStack(spacing: 10) {
@@ -182,7 +185,7 @@ struct AccountSettingsView: View {
                             }
                         }
 
-                        if let harnessError {
+                        if let harnessError, !isMachineKnownDown {
                             Label(harnessError, systemImage: "exclamationmark.triangle.fill")
                                 .foregroundStyle(AppTheme.statusError)
 
@@ -342,8 +345,11 @@ struct AccountSettingsView: View {
             .task {
                 await loadLinkedComputer()
             }
-            .task(id: nodeStore.hasMachine) {
-                guard nodeStore.hasMachine else { return }
+            // Waits for the first power read, and reloads when the machine
+            // comes up: a stopped machine is not asked, and is never powered
+            // on just to fill this section.
+            .task(id: AgentsLoadTrigger(hasMachine: nodeStore.hasMachine, machine: agentsMachineState)) {
+                guard nodeStore.hasMachine, agentsMachineState == .reachable else { return }
                 await loadHarnesses()
             }
             .task(id: computerLinkStore.computer?.id) {
@@ -356,8 +362,11 @@ struct AccountSettingsView: View {
                 }
             }
             .task(id: identityStore.wakeCredential()?.nodeID) {
-                powerModel.configure(identityStore: identityStore)
                 await powerModel.refresh()
+            }
+            .task(id: scenePhase) {
+                guard scenePhase == .active else { return }
+                await powerModel.watch()
             }
             .task(id: powerModel.resize?.stage) {
                 await powerModel.waitForResize()
@@ -427,6 +436,7 @@ struct AccountSettingsView: View {
                     RelayMachineMonitorView(
                         client: codexClient,
                         identityStore: identityStore,
+                        powerModel: powerModel,
                         machineName: node.nodeName
                     )
                 } label: {
@@ -474,6 +484,7 @@ struct AccountSettingsView: View {
                     RelayMachineMonitorView(
                         client: codexClient,
                         identityStore: identityStore,
+                        powerModel: powerModel,
                         machineName: "Linked computer"
                     )
                 } label: {
@@ -533,14 +544,31 @@ struct AccountSettingsView: View {
         machineNotice = nil
     }
 
+    /// Whether the machine is worth asking about its agents. Without power
+    /// control there is nothing to go on, so it is simply asked.
+    private var agentsMachineState: AgentsLoadTrigger.Machine {
+        guard powerModel.canControl else { return .reachable }
+        switch powerModel.status {
+        case .loading: return .checking
+        case .off, .starting, .stopping: return .down
+        case .unknown, .unavailable, .on: return .reachable
+        }
+    }
+
+    /// EC2 says the machine is stopped or in motion, so a node request that
+    /// fails is not news and the agents section has nothing to add.
+    private var isMachineKnownDown: Bool { agentsMachineState == .down }
+
     private func loadHarnesses() async {
-        guard nodeStore.hasMachine else { return }
+        guard nodeStore.hasMachine, !isMachineKnownDown else { return }
         isLoadingHarnesses = true
         harnessError = nil
         defer { isLoadingHarnesses = false }
         do {
-            harnesses = try await codexClient.fetchHarnesses()
+            harnesses = try await codexClient.fetchHarnesses(budget: .statusRead)
         } catch {
+            // A load replaced by a newer one is not a failure to report.
+            guard !Task.isCancelled else { return }
             harnessError = "Relay couldn't check the agents on your machine."
         }
     }
@@ -636,6 +664,14 @@ struct AccountSettingsView: View {
     }()
 }
 
+/// What the coding-agents list is loaded against: a machine, and what EC2
+/// says about it.
+private struct AgentsLoadTrigger: Equatable {
+    enum Machine { case checking, down, reachable }
+    var hasMachine: Bool
+    var machine: Machine
+}
+
 struct RelayMachinePowerSwitch: View {
     @ObservedObject var model: RelayMachinePowerModel
     var onStarted: (() async -> Void)? = nil
@@ -658,22 +694,10 @@ struct RelayMachinePowerSwitch: View {
             } else {
                 detailText
             }
-            // Until the first read lands there is no position to show, so the
-            // switch is replaced by a spinner rather than starting at off and
-            // correcting itself a moment later.
-            if model.status.isResolved {
-                if model.status.isBusy {
-                    ProgressView()
-                }
-                Toggle("Power", isOn: binding)
-                    .labelsHidden()
-                    .tint(AppTheme.accent)
-                    .disabled(!model.status.canToggle || model.isSubmittingResize || model.resize?.isActive == true)
-                    .accessibilityIdentifier(accessibilityIdentifier)
-            } else {
+            if model.status.isBusy {
                 ProgressView()
-                    .accessibilityIdentifier(accessibilityIdentifier)
             }
+            powerControl
         }
         .accessibilityElement(children: .contain)
         .animation(.default, value: model.status)
@@ -690,23 +714,58 @@ struct RelayMachinePowerSwitch: View {
         }
     }
 
-    private var binding: Binding<Bool> {
-        Binding(
-            get: { model.status.isPowered },
-            set: { on in
-                guard !model.status.isBusy else { return }
-                if on {
-                    Task {
-                        await model.start()
-                        if model.status == .on {
-                            await onStarted?()
-                        }
+    private var canToggle: Bool {
+        model.status.canToggle && !model.isSubmittingResize && model.resize?.isActive != true
+    }
+
+    /// The switch shows where the machine is, never where a tap would like it
+    /// to be. A two-way Toggle moves the moment it is touched and is pulled
+    /// back when the model disagrees (a stop waiting on its confirmation, a
+    /// start that was refused), which read as the switch glitching. So the
+    /// Toggle here only displays, and a tap is a request.
+    ///
+    /// Until the first read lands there is no position to show: the switch
+    /// keeps its footprint and a spinner stands in for it, rather than
+    /// starting at off and correcting itself a moment later.
+    private var powerControl: some View {
+        Toggle("Power", isOn: .constant(model.status.isPowered))
+            .labelsHidden()
+            .tint(AppTheme.accent)
+            .allowsHitTesting(false)
+            .opacity(model.status.isResolved ? 1 : 0)
+            .overlay {
+                if model.status.isResolved {
+                    Button(action: requestToggle) {
+                        Color.clear.contentShape(Rectangle())
                     }
-                } else if model.status == .on {
-                    confirmStop()
+                    .buttonStyle(.plain)
+                } else {
+                    ProgressView()
                 }
             }
-        )
+            .disabled(!canToggle)
+            .accessibilityRepresentation {
+                Toggle("Power", isOn: Binding(
+                    get: { model.status.isPowered },
+                    set: { _ in requestToggle() }
+                ))
+                .disabled(!canToggle)
+            }
+            .accessibilityIdentifier(accessibilityIdentifier)
+    }
+
+    private func requestToggle() {
+        guard canToggle else { return }
+        if model.status == .on {
+            confirmStop()
+        } else {
+            Task {
+                await model.start()
+                if model.status == .on {
+                    await onStarted?()
+                }
+            }
+        }
     }
 }
 
