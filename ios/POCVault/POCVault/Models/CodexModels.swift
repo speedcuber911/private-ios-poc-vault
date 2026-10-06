@@ -785,8 +785,10 @@ enum RelayCodexSandbox: String, CaseIterable, Identifiable, Codable {
     case workspace = "workspace-write"
     case fullAccess = "danger-full-access"
 
-    /// Today's runner behaviour, and what a job gets when nothing is chosen.
-    static let `default` = RelayCodexSandbox.workspace
+    /// What a job gets when nothing is chosen. Full access, by the owner's
+    /// decision: the workspace level keeps `.git` read-only and blocks the
+    /// network, so Codex could not pull, commit or push from the phone.
+    static let `default` = RelayCodexSandbox.fullAccess
 
     var id: String { rawValue }
 

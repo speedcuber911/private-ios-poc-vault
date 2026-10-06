@@ -744,8 +744,9 @@ final class ManifestTests: XCTestCase {
             RelayCodexSandbox.allCases.map(\.rawValue),
             ["read-only", "workspace-write", "danger-full-access"]
         )
-        // Today's runner behaviour stays the default; full access is never implicit.
-        XCTAssertEqual(RelayCodexSandbox.default, .workspace)
+        // Full access is the default, so git and network work from the phone;
+        // the narrower levels are still there to pick.
+        XCTAssertEqual(RelayCodexSandbox.default, .fullAccess)
         XCTAssertTrue(RelayCodexSandbox.fullAccess.isUnsandboxed)
         XCTAssertFalse(RelayCodexSandbox.workspace.isUnsandboxed)
         XCTAssertFalse(RelayCodexSandbox.readOnly.isUnsandboxed)
