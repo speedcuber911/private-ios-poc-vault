@@ -399,7 +399,30 @@ enum CodexInlineMarkdown {
         types: NSTextCheckingResult.CheckingType.link.rawValue
     )
 
+    private final class CachedAttributed {
+        let value: AttributedString
+        init(_ value: AttributedString) { self.value = value }
+    }
+
+    /// Inline markdown and link detection are the expensive part of drawing a
+    /// paragraph, and a transcript asks for the same paragraphs on every body
+    /// pass. Keyed by the paragraph, so only the one still streaming misses.
+    private static let attributedCache: NSCache<NSString, CachedAttributed> = {
+        let cache = NSCache<NSString, CachedAttributed>()
+        cache.countLimit = 800
+        cache.totalCostLimit = 1_000_000
+        return cache
+    }()
+
     static func attributed(_ value: String) -> AttributedString {
+        let key = value as NSString
+        if let cached = attributedCache.object(forKey: key) { return cached.value }
+        let parsed = parseAttributed(value)
+        attributedCache.setObject(CachedAttributed(parsed), forKey: key, cost: key.length)
+        return parsed
+    }
+
+    private static func parseAttributed(_ value: String) -> AttributedString {
         let options = AttributedString.MarkdownParsingOptions(
             interpretedSyntax: .inlineOnlyPreservingWhitespace
         )
