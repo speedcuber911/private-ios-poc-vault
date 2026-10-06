@@ -159,43 +159,7 @@ struct AccountSettingsView: View {
                 }
 
                 if nodeStore.hasMachine && !(harnesses.isEmpty && isMachineKnownDown) {
-                    Section {
-                        if isLoadingHarnesses && harnesses.isEmpty {
-                            HStack(spacing: 10) {
-                                ProgressView()
-                                Text("Checking agents on your machine…")
-                                    .foregroundStyle(AppTheme.textSecondary)
-                            }
-                        }
-
-                        ForEach(harnesses.filter(\.installed)) { harness in
-                            HStack(spacing: 10) {
-                                RelayProviderMark(provider: harness.provider, size: 16)
-                                Text(harness.provider.displayName)
-                                Spacer()
-                                if harness.loggedIn == true {
-                                    Text("Connected")
-                                        .foregroundStyle(AppTheme.textSecondary)
-                                } else {
-                                    Button(harness.loggedIn == false ? "Sign in" : "Check sign-in") {
-                                        providerLoginRequest = harness.provider
-                                    }
-                                    .accessibilityIdentifier("relay-agent-sign-in-\(harness.provider.rawValue)")
-                                }
-                            }
-                        }
-
-                        if let harnessError, !isMachineKnownDown {
-                            Label(harnessError, systemImage: "exclamationmark.triangle.fill")
-                                .foregroundStyle(AppTheme.statusError)
-
-                            Button("Try again") {
-                                Task { await loadHarnesses() }
-                            }
-                        }
-                    } header: {
-                        RelayFormHeader("Coding agents", info: agentsFooter)
-                    }
+                    codingAgentsSection
                 }
 
                 Section("About") {
@@ -374,6 +338,46 @@ struct AccountSettingsView: View {
             .modifier(RelayResizeProgressPresenter(model: powerModel))
         }
         .preferredColorScheme(.dark)
+    }
+
+    private var codingAgentsSection: some View {
+        Section {
+            if isLoadingHarnesses && harnesses.isEmpty {
+                HStack(spacing: 10) {
+                    ProgressView()
+                    Text("Checking agents on your machine…")
+                        .foregroundStyle(AppTheme.textSecondary)
+                }
+            }
+
+            ForEach(harnesses.filter(\.installed)) { harness in
+                HStack(spacing: 10) {
+                    RelayProviderMark(provider: harness.provider, size: 16)
+                    Text(harness.provider.displayName)
+                    Spacer()
+                    if harness.loggedIn == true {
+                        Text("Connected")
+                            .foregroundStyle(AppTheme.textSecondary)
+                    } else {
+                        Button(harness.loggedIn == false ? "Sign in" : "Check sign-in") {
+                            providerLoginRequest = harness.provider
+                        }
+                        .accessibilityIdentifier("relay-agent-sign-in-\(harness.provider.rawValue)")
+                    }
+                }
+            }
+
+            if let harnessError, !isMachineKnownDown {
+                Label(harnessError, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(AppTheme.statusError)
+
+                Button("Try again") {
+                    Task { await loadHarnesses() }
+                }
+            }
+        } header: {
+            RelayFormHeader("Coding agents", info: agentsFooter)
+        }
     }
 
     private var computerFooter: String {
