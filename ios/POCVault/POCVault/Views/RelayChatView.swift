@@ -54,6 +54,8 @@ struct RelayChatView: View {
     @State private var aiDataConsentRequest: RelayAIDataConsentRequest?
     @State private var automaticallyPresentedConsentProviders: Set<CodexProvider> = []
     @State private var providerLoginRequest: CodexProvider?
+    @State private var activityRequest: RelayActivityRequest?
+    @StateObject private var scroller = RelayTranscriptScroller()
 
     var body: some View {
         NavigationStack {
@@ -62,6 +64,20 @@ struct RelayChatView: View {
 
                 VStack(spacing: 0) {
                     topBar
+                        .background(AppTheme.bgCanvas.ignoresSafeArea(edges: .top))
+                        // The transcript scrolls under an opaque header and
+                        // fades out below it instead of colliding with the title.
+                        .overlay(alignment: .bottom) {
+                            LinearGradient(
+                                colors: [AppTheme.bgCanvas, AppTheme.bgCanvas.opacity(0)],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                            .frame(height: Self.headerFade)
+                            .offset(y: Self.headerFade)
+                            .allowsHitTesting(false)
+                        }
+                        .zIndex(1)
                         .simultaneousGesture(keyboardDismissTap)
                     messageList
                         .layoutPriority(1)
@@ -177,6 +193,9 @@ struct RelayChatView: View {
             .sheet(item: $fullLogRequest) { request in
                 RelayFullLogSheet(jobID: request.jobID, viewModel: viewModel)
             }
+            .sheet(item: $activityRequest) { request in
+                RelayActivitySheet(request: request, viewModel: viewModel)
+            }
             .sheet(item: $aiDataConsentRequest) { request in
                 RelayAIDataConsentSheet(
                     provider: request.provider,
@@ -186,7 +205,7 @@ struct RelayChatView: View {
                         RelayAIDataConsentStore.grantConsent(for: request.provider)
                         aiDataConsentRequest = nil
                         if request.purpose == .sendPrompt {
-                            Task { await viewModel.sendCurrentPrompt() }
+                            sendPrompt()
                         }
                     },
                     onCancel: {
@@ -314,13 +333,20 @@ struct RelayChatView: View {
 
     private func requestPromptSend() {
         guard let provider = viewModel.selectedChoice?.model.provider else {
-            Task { await viewModel.sendCurrentPrompt() }
+            sendPrompt()
             return
         }
         guard RelayAIDataConsentStore.hasConsent(for: provider) else {
             presentAIDataConsent(for: provider, purpose: .sendPrompt)
             return
         }
+        sendPrompt()
+    }
+
+    /// Sending always returns the reader to the end of the transcript, where
+    /// their message and its answer appear.
+    private func sendPrompt() {
+        scroller.jumpToLatest()
         Task { await viewModel.sendCurrentPrompt() }
     }
 
@@ -370,108 +396,155 @@ struct RelayChatView: View {
     }
 
     private var messageList: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 24) {
-                    if let error = viewModel.errorMessage {
-                        RelayStatusBanner(text: error)
-                    }
-
-                    if viewModel.isLoadingThreadDetail {
-                        ProgressView("Loading conversation…")
-                            .tint(AppTheme.accent)
-                            .foregroundStyle(AppTheme.textSecondary)
-                            .frame(maxWidth: .infinity, minHeight: 120)
-                    }
-
-                    if viewModel.messages.isEmpty && !viewModel.isSending && !viewModel.isLoadingThreadDetail {
-                        RelayEmptyConversation(choice: viewModel.selectedChoice)
-                    } else {
-                        ForEach(viewModel.messages) { item in
-                            if let job = item.job {
-                                RelayJobCard(
-                                    job: job,
-                                    client: client,
-                                    liveTail: viewModel.liveJobTails[job.id],
-                                    isCancelling: viewModel.cancellingJobIDs.contains(job.id),
-                                    onCancel: {
-                                        Task { await viewModel.cancel(job: job) }
-                                    },
-                                    onFullLog: {
-                                        fullLogRequest = RelayFullLogRequest(jobID: job.id)
-                                    },
-                                    onArtifact: { artifact in
-                                        artifactRequest = artifact
-                                    },
-                                    onLoopbackURL: { url in
-                                        remotePreviewRequest = RelayRemotePreviewRequest(
-                                            jobID: job.id,
-                                            sourceURL: url
-                                        )
-                                    }
-                                )
-                                .id(item.id)
-                                .transition(.move(edge: .bottom).combined(with: .opacity))
-                            } else {
-                                RelayChatBubble(item: item, client: client) { attachment in
-                                    attachmentRequest = attachment
-                                }
-                                    .id(item.id)
-                                    .transition(.move(edge: item.role == .user ? .trailing : .leading).combined(with: .opacity))
-                            }
-                        }
-                    }
-                    // An approval belongs where the run stalled, not in another tab.
-                    // It sits at the tail because that is where the transcript stops
-                    // until it is answered.
-                    ForEach(viewModel.pendingApprovals) { approval in
-                        RelayApprovalCard(approval: approval) { decision in
-                            Task { await viewModel.decideApproval(approval, decision) }
-                        }
-                        .id(approval.id)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                        .accessibilityIdentifier("relay-chat-approval")
-                    }
-
-                    Color.clear.frame(height: 1).id(Self.bottomAnchor)
+        let continuing = RelayTranscriptLayout.continuationIDs(in: viewModel.messages)
+        return ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                if let error = viewModel.errorMessage {
+                    RelayStatusBanner(text: error)
+                        .padding(.top, Self.turnSpacing)
                 }
-                .padding(.horizontal, 18)
-                .padding(.top, 22)
-                .padding(.bottom, 20)
+
+                if viewModel.isLoadingThreadDetail {
+                    ProgressView("Loading conversation…")
+                        .tint(AppTheme.accent)
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .frame(maxWidth: .infinity, minHeight: 120)
+                        .padding(.top, Self.turnSpacing)
+                }
+
+                if viewModel.messages.isEmpty && !viewModel.isSending && !viewModel.isLoadingThreadDetail {
+                    RelayEmptyConversation(choice: viewModel.selectedChoice)
+                        .padding(.top, Self.turnSpacing)
+                } else {
+                    ForEach(viewModel.messages) { item in
+                        let continues = continuing.contains(item.id)
+                        transcriptRow(item, showsByline: !continues)
+                            .id(item.id)
+                            .padding(.top, continues ? Self.blockSpacing : Self.turnSpacing)
+                    }
+                }
+                // An approval belongs where the run stalled, not in another tab.
+                // It sits at the tail because that is where the transcript stops
+                // until it is answered.
+                ForEach(viewModel.pendingApprovals) { approval in
+                    RelayApprovalCard(approval: approval) { decision in
+                        Task { await viewModel.decideApproval(approval, decision) }
+                    }
+                    .id(approval.id)
+                    .padding(.top, Self.blockSpacing)
+                    .accessibilityIdentifier("relay-chat-approval")
+                }
             }
-            .refreshable {
-                await viewModel.refreshThreads()
+            .padding(.horizontal, 16)
+            .padding(.bottom, 16)
+            .background { RelayScrollViewFinder(scroller: scroller) }
+        }
+        .refreshable {
+            await viewModel.refreshThreads()
+        }
+        .scrollDismissesKeyboard(.interactively)
+        .scrollBounceBehavior(.basedOnSize)
+        // Following is driven by the scroll view's own geometry (see
+        // RelayTranscriptScroller), so nothing here scrolls on a model change:
+        // a streamed token or a finishing job moves the list only for a reader
+        // who is already at the end.
+        .background {
+            GeometryReader { proxy in
+                Color.clear
+                    .onChange(of: proxy.size) { _, _ in scroller.viewportChanged() }
+                    .onChange(of: proxy.safeAreaInsets.bottom) { _, _ in scroller.viewportChanged() }
             }
-            .scrollDismissesKeyboard(.interactively)
-            .scrollBounceBehavior(.basedOnSize)
-            .animation(.spring(response: 0.36, dampingFraction: 0.82), value: viewModel.messages.count)
-            .onChange(of: viewModel.messages.count) { _, _ in scrollToBottom(proxy) }
-            .onChange(of: viewModel.pendingApprovals.count) { _, _ in scrollToBottom(proxy) }
-            .onChange(of: streamingTextLength) { _, _ in scrollToBottom(proxy, animated: false) }
-            // Task completion updates an existing message rather than appending one.
-            // Follow that height change so newly-added artifacts do not land beneath
-            // the pinned composer while the scroll position stays on the old log tail.
-            .onChange(of: completedResultContentVersion) { _, _ in
-                scrollToBottom(proxy, animated: false)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidChangeFrameNotification)) { _ in
+            scroller.viewportChanged()
+        }
+        // A different conversation (a thread opened, a new chat) starts at its
+        // end with no visible scroll.
+        .onChange(of: viewModel.messages.first?.id) { _, _ in scroller.land() }
+        .overlay(alignment: .bottom) {
+            if !scroller.isAtBottom {
+                RelayJumpToLatestButton { scroller.jumpToLatest() }
+                    .transition(.opacity.combined(with: .scale(scale: 0.85)))
             }
-            .overlay(alignment: .bottomTrailing) { scrollToBottomButton(proxy) }
+        }
+        .animation(.easeOut(duration: 0.18), value: scroller.isAtBottom)
+    }
+
+    @ViewBuilder
+    private func transcriptRow(_ item: RelayConversationItem, showsByline: Bool) -> some View {
+        if let job = item.job {
+            if let timeline = viewModel.timeline(forJobID: job.id) {
+                RelayJobTurn(
+                    job: job,
+                    timeline: timeline,
+                    client: client,
+                    hidesAnswer: item.hidesJobAnswer,
+                    showsByline: showsByline,
+                    isCancelling: viewModel.cancellingJobIDs.contains(job.id),
+                    onCancel: {
+                        Task { await viewModel.cancel(job: job) }
+                    },
+                    onFullLog: {
+                        fullLogRequest = RelayFullLogRequest(jobID: job.id)
+                    },
+                    onArtifact: { artifact in
+                        artifactRequest = artifact
+                    },
+                    onLoopbackURL: { url in
+                        remotePreviewRequest = RelayRemotePreviewRequest(jobID: job.id, sourceURL: url)
+                    },
+                    onOpenBlock: { blockID in
+                        activityRequest = RelayActivityRequest(source: .job(job.id), root: .block(blockID))
+                    },
+                    onOpenStep: { stepID in
+                        activityRequest = RelayActivityRequest(source: .job(job.id), root: .step(stepID))
+                    }
+                )
+                .equatable()
+            } else {
+                // A machine that sends no timeline keeps the card.
+                RelayJobCard(
+                    job: job,
+                    client: client,
+                    liveTail: viewModel.liveJobTails[job.id],
+                    hidesAnswer: item.hidesJobAnswer,
+                    isCancelling: viewModel.cancellingJobIDs.contains(job.id),
+                    onCancel: {
+                        Task { await viewModel.cancel(job: job) }
+                    },
+                    onFullLog: {
+                        fullLogRequest = RelayFullLogRequest(jobID: job.id)
+                    },
+                    onArtifact: { artifact in
+                        artifactRequest = artifact
+                    },
+                    onLoopbackURL: { url in
+                        remotePreviewRequest = RelayRemotePreviewRequest(
+                            jobID: job.id,
+                            sourceURL: url
+                        )
+                    }
+                )
+            }
+        } else {
+            RelayChatBubble(
+                item: item,
+                client: client,
+                showsByline: showsByline,
+                onOpenAttachment: { attachment in
+                    attachmentRequest = attachment
+                },
+                onOpenActivity: { blockID in
+                    activityRequest = RelayActivityRequest(source: .message(item.id), root: .block(blockID))
+                }
+            )
+            .equatable()
         }
     }
 
-    /// Total length of the streaming assistant message; changing this drives auto-follow scroll.
-    private var streamingTextLength: Int {
-        guard let id = viewModel.streamingMessageID,
-              let item = viewModel.messages.first(where: { $0.id == id }) else { return 0 }
-        return item.text.count
-    }
-
-    private var completedResultContentVersion: Int {
-        viewModel.messages.reduce(into: 0) { version, item in
-            guard let job = item.job, !job.status.isActive else { return }
-            version &+= job.displayOutput?.count ?? 0
-            version &+= job.artifacts.count &* 100_000
-        }
-    }
+    private static let turnSpacing: CGFloat = 24
+    private static let blockSpacing: CGFloat = 8
+    private static let headerFade: CGFloat = 12
 
     private var automaticPreviewCandidate: RelayAutomaticPreviewCandidate? {
         guard automaticallyOpensPreviews else { return nil }
@@ -513,35 +586,6 @@ struct RelayChatView: View {
             sourceURL: candidate.sourceURL
         )
     }
-
-    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
-        if animated {
-            withAnimation(.easeOut(duration: 0.22)) { proxy.scrollTo(Self.bottomAnchor, anchor: .bottom) }
-        } else {
-            proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
-        }
-    }
-
-    @ViewBuilder private func scrollToBottomButton(_ proxy: ScrollViewProxy) -> some View {
-        if viewModel.isStreaming {
-            Button {
-                scrollToBottom(proxy)
-            } label: {
-                Image(systemName: "arrow.down")
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundStyle(AppTheme.textPrimary)
-                    .frame(width: 38, height: 38)
-                    .background(AppTheme.canvasTop, in: Circle())
-                    .overlay { Circle().stroke(AppTheme.hairline, lineWidth: 0.6) }
-            }
-            .buttonStyle(.plain)
-            .padding(.trailing, 16)
-            .padding(.bottom, 8)
-            .transition(.scale.combined(with: .opacity))
-        }
-    }
-
-    private static let bottomAnchor = "relay-bottom-anchor"
 }
 
 private struct RelayComposerCommand: Identifiable {
@@ -1460,13 +1504,22 @@ private struct RelayCommandTextEditor: UIViewRepresentable {
     }
 }
 
-private struct RelayChatBubble: View {
+private struct RelayChatBubble: View, Equatable {
     let item: RelayConversationItem
     let client: CodexClient
+    /// False when this message continues the agent's turn above it.
+    var showsByline = true
     var onOpenAttachment: (RelayDisplayedAttachment) -> Void
+    /// Thread history: opens the steps the agent took before this message.
+    var onOpenActivity: (String) -> Void = { _ in }
     @State private var showCopied = false
 
-    private var showWaitingDots: Bool { item.isStreaming && item.text.isEmpty && item.attachments.isEmpty }
+    /// A message that did not change is skipped while another one streams.
+    static func == (lhs: RelayChatBubble, rhs: RelayChatBubble) -> Bool {
+        lhs.item == rhs.item && lhs.showsByline == rhs.showsByline
+    }
+
+    private var isWaitingForFirstToken: Bool { item.isStreaming && item.text.isEmpty && item.attachments.isEmpty }
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 8) {
@@ -1497,24 +1550,30 @@ private struct RelayChatBubble: View {
 
     private var messageColumn: some View {
         VStack(alignment: isUser ? .trailing : .leading, spacing: 7) {
-            if !isUser || showCopied {
+            if (!isUser && showsByline) || showCopied {
                 HStack(spacing: 6) {
-                    if !isUser {
-                        if let provider = item.provider {
-                            RelayProviderMark(provider: provider, size: 14)
-                            Text(provider.relayPresentation.title)
-                                .font(RelayChatStyle.labelFont.weight(.medium))
-                                .foregroundStyle(RelayChatStyle.secondary)
-                        } else {
-                            Text("Relay").font(RelayChatStyle.labelFont)
-                        }
+                    if !isUser && showsByline {
+                        RelayTurnByline(provider: item.provider)
                     }
                     if showCopied {
                         RelayCapsLabel(text: "Copied", color: AppTheme.textSecondary, size: 9)
                             .transition(.opacity)
                     }
                 }
+            }
 
+            // The steps the agent took before it wrote this message.
+            if let timeline = item.historyTimeline {
+                ForEach(timeline.blocks) { block in
+                    let steps = timeline.steps(in: block)
+                    if !steps.isEmpty {
+                        RelayActivityRow(
+                            summary: RelayTimeline.summary(of: steps),
+                            failedCount: steps.filter { $0.status == .failed }.count,
+                            action: { onOpenActivity(block.id) }
+                        )
+                    }
+                }
             }
 
             if !item.attachments.isEmpty {
@@ -1526,9 +1585,8 @@ private struct RelayChatBubble: View {
                 )
             }
 
-            if showWaitingDots {
-                RelayTypingDots(tint: item.provider?.relayPresentation.accent ?? AppTheme.textTertiary)
-                    .padding(.vertical, 2)
+            if isWaitingForFirstToken {
+                RelayLiveRowLabel(word: "Thinking", since: item.timestamp)
             } else if !item.text.isEmpty {
                 RelayStreamingContent(
                     text: item.text,
@@ -1844,35 +1902,6 @@ private struct RelayCameraPicker: UIViewControllerRepresentable {
     }
 }
 
-/// Animated three-dot "thinking" indicator shown before the first token arrives.
-private struct RelayTypingDots: View {
-    var tint: Color = AppTheme.textTertiary
-    @State private var phase = 0.0
-
-    var body: some View {
-        HStack(spacing: 5) {
-            ForEach(0..<3, id: \.self) { i in
-                Circle()
-                    .fill(tint)
-                    .frame(width: 5, height: 5)
-                    .scaleEffect(scale(for: i))
-                    .opacity(0.5 + 0.5 * scale(for: i))
-            }
-        }
-        .onAppear {
-            withAnimation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true)) {
-                phase = 1.0
-            }
-        }
-    }
-
-    private func scale(for index: Int) -> Double {
-        let offset = Double(index) * 0.22
-        let v = sin((phase + offset) * .pi)
-        return 0.7 + 0.45 * abs(v)
-    }
-}
-
 /// Renders streamed assistant text with a blinking caret appended while streaming.
 private struct RelayStreamingContent: View {
     let text: String
@@ -1903,11 +1932,120 @@ private struct RelayStreamingContent: View {
 // Rendering/RelayMarkdownViews.swift (revamp I3) so the file viewer shares the chat's
 // markdown rendering. Call sites here are unchanged.
 
+/// A job's turn drawn from its timeline: prose and activity rows in the order
+/// they happened, what is still in flight, then the outputs and the run footer.
+/// Equatable so a turn that did not change is skipped while another streams.
+private struct RelayJobTurn: View, Equatable {
+    let job: CodexJob
+    let timeline: RelayTimeline
+    let client: CodexClient
+    /// The transcript already shows this job's answer as its own turn, so only
+    /// the outputs and the footer are drawn.
+    let hidesAnswer: Bool
+    let showsByline: Bool
+    let isCancelling: Bool
+    let onCancel: () -> Void
+    let onFullLog: () -> Void
+    let onArtifact: (CodexJobArtifact) -> Void
+    let onLoopbackURL: (URL) -> Void
+    let onOpenBlock: (String) -> Void
+    let onOpenStep: (String) -> Void
+
+    static func == (lhs: RelayJobTurn, rhs: RelayJobTurn) -> Bool {
+        lhs.job == rhs.job
+            && lhs.timeline == rhs.timeline
+            && lhs.hidesAnswer == rhs.hidesAnswer
+            && lhs.showsByline == rhs.showsByline
+            && lhs.isCancelling == rhs.isCancelling
+    }
+
+    private var isWaiting: Bool { job.status == .waitingForApproval }
+
+    private var idleWord: String {
+        switch job.status {
+        case .queued: return "Queued"
+        case .waitingForApproval: return "Waiting"
+        case .canceling: return "Stopping"
+        default: return "Working"
+        }
+    }
+
+    /// A finished job whose machine wrote its answer outside the timeline.
+    private var fallbackAnswer: String? {
+        guard !job.status.isActive, timeline.proseText.isEmpty else { return nil }
+        return job.displayOutput?.trimmedNonEmpty
+    }
+
+    private var previewSourceURL: URL? {
+        guard !job.status.isActive else { return nil }
+        return RelayOutputURLPolicy.loopbackURLs(in: job.displayOutput ?? timeline.proseText).first
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if !hidesAnswer {
+                if showsByline {
+                    RelayTurnByline(provider: job.provider)
+                        .padding(.bottom, 4)
+                }
+                RelayTimelineBlocks(
+                    timeline: timeline,
+                    isActive: job.status.isActive,
+                    idleWord: idleWord,
+                    idleSince: job.startedAt ?? job.createdAt,
+                    idleColor: isWaiting ? AppTheme.statusWarn : AppTheme.accentBright,
+                    isWaiting: isWaiting,
+                    onOpenLoopbackURL: onLoopbackURL,
+                    onOpenBlock: onOpenBlock,
+                    onOpenStep: onOpenStep
+                )
+                .contextMenu {
+                    Button {
+                        UIPasteboard.general.string = timeline.proseText
+                    } label: { Label("Copy", systemImage: "doc.on.doc") }
+                }
+                if let fallbackAnswer {
+                    RelayTurnProse(text: fallbackAnswer, onOpenLoopbackURL: onLoopbackURL)
+                        .equatable()
+                }
+                if job.status == .failed || job.status == .timeout,
+                   let error = job.errorMessage?.trimmedNonEmpty {
+                    Text(error)
+                        .font(RelayChatStyle.labelFont)
+                        .foregroundStyle(AppTheme.statusError)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+            }
+
+            if let previewSourceURL {
+                RelayAppPreviewNotice { onLoopbackURL(previewSourceURL) }
+            }
+            if !job.artifacts.isEmpty {
+                RelayJobArtifacts(artifacts: job.artifacts, client: client, onOpen: onArtifact)
+                    .padding(.top, 4)
+            }
+
+            RelayTurnFooter(job: job, isCancelling: isCancelling, onFullLog: onFullLog, onCancel: onCancel)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("relay-job-turn")
+        .onChange(of: job.status.isActive) { _, isActive in
+            if !isActive {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            }
+        }
+    }
+}
+
 private struct RelayJobCard: View {
     let job: CodexJob
     let client: CodexClient
     /// Live output falls back to the poll-fetched snapshot when SSE is unavailable.
     let liveTail: String?
+    /// The transcript already shows this job's answer as its own turn.
+    var hidesAnswer = false
     let isCancelling: Bool
     let onCancel: () -> Void
     let onFullLog: () -> Void
@@ -1975,12 +2113,14 @@ private struct RelayJobCard: View {
 
             if !job.status.isActive,
                let text = job.displayOutput?.trimmedNonEmpty {
-                RelayMarkdownText(
-                    text: relaySharedContract.displayTextHidingLocalPreviewURLs(value: text),
-                    userAligned: false,
-                    onOpenLoopbackURL: onLoopbackURL,
-                    bodyFont: RelayChatStyle.bodyFont
-                )
+                if !hidesAnswer {
+                    RelayMarkdownText(
+                        text: relaySharedContract.displayTextHidingLocalPreviewURLs(value: text),
+                        userAligned: false,
+                        onOpenLoopbackURL: onLoopbackURL,
+                        bodyFont: RelayChatStyle.bodyFont
+                    )
+                }
                 if let sourceURL = RelayOutputURLPolicy.loopbackURLs(in: text).first {
                     RelayAppPreviewNotice { onLoopbackURL(sourceURL) }
                 }

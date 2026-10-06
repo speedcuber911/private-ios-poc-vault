@@ -7,9 +7,9 @@ import SwiftUI
 /// copy would drift, and the two surfaces disagreeing about what a command was
 /// asking for is exactly the kind of thing nobody notices until it matters.
 ///
-/// Approve carries the provider's own accent rather than ember: on this card the
-/// decision belongs to the agent that asked, and ember stays earned for the
-/// screen's own primary action.
+/// Approve is the one ember action on the card and Deny the quiet outline, at
+/// equal width: the two answers weigh the same and neither is a system-tinted
+/// button. Status is the caps word, not a stripe or a badge.
 struct RelayApprovalCard: View {
     let approval: CodexApproval
     /// Absent in the chat transcript: the run is already open in front of you,
@@ -19,48 +19,64 @@ struct RelayApprovalCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                RelayProviderBadge(provider: approval.provider, style: .capsule, size: 9)
-                Spacer()
-                RelayCapsLabel(text: "Needs approval", color: AppTheme.statusWarn, size: 9)
+            HStack(spacing: 8) {
+                RelayCapsLabel(text: "Needs approval", color: AppTheme.statusWarn, size: 10)
+                Spacer(minLength: 8)
+                if let onOpen {
+                    Button(action: onOpen) {
+                        HStack(spacing: 6) {
+                            RelayProviderMark(provider: approval.provider, size: 13)
+                            Text("Open")
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 9, weight: .semibold))
+                        }
+                        .font(AppTheme.uiFont(size: 13))
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.vertical, -12)
+                }
             }
-            Label(approval.title, systemImage: "checkmark.shield")
+            Text(approval.title)
                 .font(AppTheme.uiFont(size: 15, weight: .semibold))
                 .foregroundStyle(AppTheme.textPrimary)
+                .fixedSize(horizontal: false, vertical: true)
             if let command = approval.command?.trimmedNonEmpty {
                 Text(command)
                     .font(AppTheme.monoFont(size: 12))
-                    .foregroundStyle(AppTheme.textSecondary)
-                    .lineLimit(4)
+                    .foregroundStyle(AppTheme.textPrimary)
+                    .lineSpacing(2)
+                    .lineLimit(6)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+                    .background(
+                        AppTheme.textPrimary.opacity(0.05),
+                        in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    )
             }
             if let reason = approval.reason?.trimmedNonEmpty {
                 Text(reason)
-                    .font(AppTheme.uiFont(size: 12))
+                    .font(AppTheme.uiFont(size: 13))
                     .foregroundStyle(AppTheme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 Button("Deny") { onDecision(.decline) }
-                    .buttonStyle(.bordered)
-                if let onOpen {
-                    Button("Open", action: onOpen)
-                        .buttonStyle(.bordered)
-                }
-                Spacer()
+                    .buttonStyle(RelayOutlineButtonStyle())
                 Button("Approve") { onDecision(.accept) }
-                    .buttonStyle(.borderedProminent)
-                    .tint(approval.provider.relayPresentation.accent)
+                    .buttonStyle(RelayPrimaryButtonStyle())
             }
+            .padding(.top, 4)
         }
-        .padding(14)
-        .background(AppTheme.canvasTop)
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(approval.provider.relayPresentation.accent.opacity(0.4), lineWidth: 1))
-        .overlay(alignment: .leading) {
-            RoundedRectangle(cornerRadius: 2)
-                .fill(approval.provider.relayPresentation.accent)
-                .frame(width: 3)
-                .padding(.vertical, 12)
+        .padding(16)
+        .background(AppTheme.canvasTop, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(AppTheme.hairline, lineWidth: 1)
         }
-        .clipShape(RoundedRectangle(cornerRadius: 14))
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(approval.provider.relayPresentation.title) approval request")
     }
