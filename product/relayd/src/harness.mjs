@@ -15,6 +15,7 @@ import { codexBin, claudeBin, cursorBin, kimiBin, runHome, codexHome, kimiHome, 
 import { nowIso, cleanApiText, suffixByBytes } from "./util.mjs";
 import { appendAudit } from "./audit.mjs";
 import { emitEvent } from "./events.mjs";
+import { providerBinary, providerEnv, providerHelp, parseClaudeEffortLevels, claudeEffortLevels } from "./provider-help.mjs";
 
 const opLogTailBytes = 8 * 1024;
 
@@ -40,7 +41,6 @@ const defaultLoginCallbackPorts = { codex: 1455 };
 
 const providerVersionCache = new Map();
 const providerVersionCacheMs = 5 * 60 * 1000;
-const providerHelpCache = new Map();
 
 // Static capability flags per provider adapter (extraction judgment call —
 // mirrors what the job engine supports today).
@@ -91,13 +91,6 @@ const providerCapabilities = {
   },
 };
 
-function providerBinary(provider) {
-  if (provider === "claude") return claudeBin;
-  if (provider === "cursor") return cursorBin;
-  if (provider === "kimi") return kimiBin;
-  return codexBin;
-}
-
 function cleanHarnessProvider(value) {
   const normalized = String(value || "").trim().toLowerCase();
   if (!allowedJobProviders.has(normalized)) {
@@ -124,30 +117,6 @@ function authStatusArgsFor(provider) {
   if (provider === "claude") return ["auth", "status", "--json"];
   if (provider === "cursor") return ["status", "--format", "json"];
   return ["login", "status"];
-}
-
-// Every readiness probe must see the same home and credential boundary as a
-// real job. A successful login in the operator's account is irrelevant when
-// the isolated Relay runner cannot read it.
-function providerEnv(provider) {
-  const env = {
-    ...process.env,
-    HOME: runHome,
-    CODEX_HOME: codexHome,
-    KIMI_CODE_HOME: kimiHome,
-  };
-  if (provider === "claude" || provider === "cursor" || provider === "kimi") {
-    delete env.AWS_ACCESS_KEY_ID;
-    delete env.AWS_SECRET_ACCESS_KEY;
-    delete env.AWS_SESSION_TOKEN;
-    delete env.AWS_PROFILE;
-    delete env.AWS_DEFAULT_PROFILE;
-    delete env.AWS_REGION;
-    delete env.AWS_DEFAULT_REGION;
-    delete env.CLAUDE_CODE_USE_BEDROCK;
-    delete env.CLAUDE_AWS_PROFILE;
-  }
-  return env;
 }
 
 function detectKimiAuth() {
@@ -238,23 +207,6 @@ function detectProviderVersion(provider) {
   } catch {}
   providerVersionCache.set(provider, { bin, version, expiresAt: Date.now() + providerVersionCacheMs });
   return version;
-}
-
-function providerHelp(provider) {
-  const bin = providerBinary(provider);
-  const cached = providerHelpCache.get(provider);
-  if (cached && cached.bin === bin && cached.expiresAt > Date.now()) return cached.text;
-  let help = "";
-  try {
-    help = cleanApiText(execFileSync(bin, ["--help"], {
-      encoding: "utf8",
-      timeout: 10000,
-      env: providerEnv(provider),
-      cwd: runHome,
-    }));
-  } catch {}
-  providerHelpCache.set(provider, { bin, text: help, expiresAt: Date.now() + providerVersionCacheMs });
-  return help;
 }
 
 function providerTaskControls(provider) {
@@ -733,6 +685,8 @@ export {
   detectHarness,
   detectProviderVersion,
   providerTaskControls,
+  parseClaudeEffortLevels,
+  claudeEffortLevels,
   listHarnesses,
   assertProviderReady,
   redactSecrets,

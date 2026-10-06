@@ -85,6 +85,16 @@ test("max and ultra survive catalog discovery allowlists", () => {
   );
 });
 
+test("Claude Code effort levels are read from the installed CLI, not written longer", () => {
+  // The four default Claude rows keep the three-level fallback in source; the
+  // served catalog swaps in what `claude --help` lists (claude-efforts.test.mjs).
+  const claudeRows = catalogSource.match(/provider: "claude",\n\s+modes: \["task"\],\n(?:\s+taskModel: "[a-z]+",\n)?\s+effortLevels: \[[^\]]*\]/g) || [];
+  assert.equal(claudeRows.length, 4);
+  for (const row of claudeRows) assert.match(row, /effortLevels: \["low", "medium", "high"\]$/);
+  assert.match(catalogSource, /return withInstalledClaudeEfforts\(/);
+  assert.match(catalogSource, /import \{ claudeEffortLevels \} from "\.\/provider-help\.mjs";/);
+});
+
 test("waitForDecision times out with an approval-named error", async () => {
   const approvals = fs.mkdtempSync(path.join(os.tmpdir(), "relay-approval-timeout-"));
   const store = new ApprovalStore(approvals);

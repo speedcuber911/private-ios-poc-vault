@@ -9,6 +9,7 @@ import path from "node:path";
 
 import { allowedThreadProviders, bedrockRegion, cleanDisplayName, cleanOptionalEndpoint, cleanOptionalFilePath, cleanEnvironmentVariableName, cleanOptionalAwsProfile, codexBin, cursorBin, kimiBin, codexHome, runHome, workspaceBrowseRoot } from "./config.mjs";
 import { AppServerClient } from "./appserver-client.mjs";
+import { claudeEffortLevels } from "./provider-help.mjs";
 
 const CURSOR_FALLBACK_MODELS = [
   { id: "auto", label: "Auto" },
@@ -98,6 +99,9 @@ function defaultModelCatalog() {
       taskModel: "gpt-5.6-luna",
       effortLevels: ["low", "medium", "high", "xhigh", "max", "ultra"],
     },
+    // Claude Code's effortLevels below are the FALLBACK. The served catalog
+    // replaces them with what the installed CLI's help lists
+    // (withInstalledClaudeEfforts), which is where xhigh and max come from.
     {
       id: "claude-code",
       label: "Claude Code",
@@ -291,9 +295,34 @@ async function publicRuntimeModelCatalog() {
   const withCursor = runtimeCursorModelsCache.models
     ? mergeRuntimeCursorModels(configured, runtimeCursorModelsCache.models)
     : configured;
-  return runtimeCodexModelsCache.models
-    ? mergeRuntimeCodexModels(withCursor, runtimeCodexModelsCache.models)
-    : withCursor;
+  return withInstalledClaudeEfforts(
+    runtimeCodexModelsCache.models
+      ? mergeRuntimeCodexModels(withCursor, runtimeCodexModelsCache.models)
+      : withCursor,
+  );
+}
+
+// Claude Code rows offer the effort levels the INSTALLED CLI accepts, read from
+// its own help (provider-help.mjs caches that). The list written on a row is only the
+// fallback for a CLI whose help cannot be read or parsed: a longer static list
+// would offer an older CLI a level it rejects, and the job would fail.
+//
+// The CLI takes every level it lists on every model (haiku, sonnet and opus
+// were each run with xhigh or max on 2.1.280 and none refused), so the same
+// list goes on every row. A row with no effort levels at all stays that way:
+// that is how a configured catalog says "no effort choice here".
+//
+// Both the catalog the phone reads and job validation come through
+// publicRuntimeModelCatalog, so what is offered is exactly what is accepted.
+function withInstalledClaudeEfforts(catalog, readLevels = claudeEffortLevels) {
+  const offersEffort = (entry) =>
+    entry.provider === "claude"
+    && Array.isArray(entry.modes) && entry.modes.includes("task")
+    && Array.isArray(entry.effortLevels) && entry.effortLevels.length > 0;
+  if (!catalog.some(offersEffort)) return catalog;
+  const levels = readLevels();
+  if (!Array.isArray(levels) || levels.length === 0) return catalog;
+  return catalog.map((entry) => (offersEffort(entry) ? { ...entry, effortLevels: [...levels] } : entry));
 }
 
 async function refreshRuntimeCodexModels() {
@@ -633,6 +662,7 @@ export {
   cleanRequiredModelId,
   publicModelCatalog,
   publicRuntimeModelCatalog,
+  withInstalledClaudeEfforts,
   runtimeCodexDescriptor,
   runtimeCursorDescriptor,
   parseCursorModelList,

@@ -14,7 +14,8 @@ routes as the job's logs.
   `dontAsk`, or `auto`). Current runners normalize `default` to `manual`.
 - Codex and Claude jobs accept catalog-advertised `model` and `reasoningEffort` values.
   Relay rejects provider/model/control mismatches instead of silently dropping fields;
-  Claude effort is passed as `--effort` only when the installed CLI advertises it.
+  Claude effort is passed as `--effort` only when the installed CLI advertises it,
+  and the levels on Claude Code rows are the ones that CLI's `--help` lists.
 - Started jobs expose a sanitized `execution` receipt containing the provider, transport,
   binary/version, normalized model, effort, permission/approval policy, sandbox, and skill ids.
 - `GET /v1/codex/approvals?status=pending&jobId=<id>` lists blocked runtime requests.
@@ -243,7 +244,7 @@ catch maps unknown errors to 500 (6633–6638).
 
 | Status | Used for (representative messages) |
 |---|---|
-| 400 | validation: `request body must be a JSON object`, `prompt is required and must be a non-empty string`, `workspaceId is not registered`, `workspace path must stay inside the workspace root`, `path must stay inside the workspace root`, `offset must be a non-negative integer`, `stream offset must be a non-negative integer`, `invalid JSON body`, `provider must be codex, claude, or cursor`, `reasoningEffort must be low, medium, high, or xhigh`, `session not found in runner CODEX_HOME`, `session provider does not match requested provider`, `session does not belong to workspace`, `chat thread workspace does not match requested workspaceId`, `preview is only available for HTML and SVG files` |
+| 400 | validation: `request body must be a JSON object`, `prompt is required and must be a non-empty string`, `workspaceId is not registered`, `workspace path must stay inside the workspace root`, `path must stay inside the workspace root`, `offset must be a non-negative integer`, `stream offset must be a non-negative integer`, `invalid JSON body`, `provider must be codex, claude, or cursor`, `reasoningEffort must be low, medium, high, xhigh, max, or ultra`, `session not found in runner CODEX_HOME`, `session provider does not match requested provider`, `session does not belong to workspace`, `chat thread workspace does not match requested workspaceId`, `preview is only available for HTML and SVG files` |
 | 401 | `client certificate is required` |
 | 403 | `client certificate subject is not allowed`, `file matches the read denylist` |
 | 404 | `not found`, `job not found`, `thread not found`, `artifact not found`, `artifact preview not available`, `workspace directory was not found`, `file was not found` |
@@ -309,6 +310,17 @@ the machine contract but frozen as an existing route.
   "effortLevels": ["low","medium","high"]                      // optional
 }
 ```
+
+**Claude Code effort levels come from the installed CLI.** On every
+`provider: "claude"` task row that offers effort, `effortLevels` is replaced
+with the list in `claude --help` (the parenthesised list after
+`--effort <level>`, e.g. `low, medium, high, xhigh, max`), filtered to
+`low|medium|high|xhigh|max|ultra` in that order and cached with the rest of the
+help for five minutes. When the help cannot be read, has no `--effort`, or has
+no list relayd recognises, the row keeps the levels written in the catalog
+(`low, medium, high` by default). A row configured with no effort levels keeps
+none. `POST /jobs` validates `reasoningEffort` against this same served
+catalog, so a level is accepted exactly when it is advertised.
 
 **Credential-bearing catalog fields are stripped** before serialization:
 `azureBaseURL`, `azureApiKeyFile`, `azureApiKeyEnv`, `bedrockRegion`
@@ -705,7 +717,9 @@ then probes the selected provider under the same isolated `HOME`/`CODEX_HOME`
 used by the runner. A
 missing binary or confirmed signed-out session returns **503** with the
 provider-specific recovery action. Claude effort additionally requires the exact
-installed CLI's `--help` output to advertise `--effort`.
+installed CLI's `--help` output to advertise `--effort`, and the level must be
+one that help lists (see the model catalog above); otherwise **400**
+`reasoningEffort <level> is not supported by claude model <model>`.
 
 Provider invocation (contract-relevant): prompt is delivered on **stdin**
 for codex/claude, as an argv for cursor/kimi. Codex app-server jobs send `model`,
