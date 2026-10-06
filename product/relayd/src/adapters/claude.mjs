@@ -10,8 +10,14 @@ import { fileURLToPath } from "node:url";
 
 const permissionServer = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "claude-permission-mcp.mjs");
 
-function buildClaudeArgs(job) {
+// `stream` is the transport the Claude runner drives (claude-job-runner.mjs):
+// the same invocation, emitting one JSON line per event instead of the final
+// text. `print` is the invocation relayd has always made, unchanged.
+const claudeStreamFlags = ["--output-format", "stream-json", "--verbose", "--include-partial-messages"];
+
+function buildClaudeArgs(job, { transport = "print" } = {}) {
   const args = ["--print"];
+  if (transport === "stream") args.push(...claudeStreamFlags);
   if (job.model) args.push("--model", job.model);
   if (job.reasoningEffort) args.push("--effort", job.reasoningEffort);
   args.push("--permission-mode", job.permissionMode || "manual");
@@ -35,4 +41,5 @@ function buildClaudeArgs(job) {
 
 export {
   buildClaudeArgs,
+  claudeStreamFlags,
 };

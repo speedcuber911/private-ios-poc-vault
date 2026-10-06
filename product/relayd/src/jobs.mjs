@@ -27,9 +27,24 @@ import { ApprovalStore } from "./approval-store.mjs";
 import { assertProviderReady, detectProviderVersion } from "./harness.mjs";
 import { validateConfiguredTaskSelection, validateRuntimeTaskSelection } from "./catalog.mjs";
 import { stripCodexHarnessNoise } from "./codex-noise.mjs";
+import { readTimeline, createTimelineTail, cleanTimelineStrings } from "./timeline.mjs";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const codexJobRunner = path.join(moduleDir, "codex-job-runner.mjs");
+const claudeJobRunner = path.join(moduleDir, "claude-job-runner.mjs");
+
+// How Claude Code jobs run. `stream` (default) wraps the CLI in
+// claude-job-runner.mjs, which reads its stream-json output and records a
+// timeline. `print` is the plain `claude --print` relayd has always run: no
+// timeline, the answer taken from stdout.
+const claudeTransport = (() => {
+  const raw = String(process.env.RELAYD_CLAUDE_TRANSPORT || "").trim().toLowerCase();
+  if (!raw) return "stream";
+  if (raw === "stream" || raw === "print") return raw;
+  throw new Error("RELAYD_CLAUDE_TRANSPORT must be one of: stream, print");
+})();
+
+const timelinePollMs = 120;
 const approvalStore = new ApprovalStore(approvalsDir);
 
 const jobsState = { queuedJobIds: [] };
@@ -76,6 +91,7 @@ function loadPersistedJobs() {
         job.timedOut = false;
         job.result = null;
         job.error = "service restarted while job was running";
+        sealJobTimelineCount(job);
         persistJob(job);
         appendAudit("stale_running_marked_failed", job);
       }
@@ -104,6 +120,86 @@ function ensureLogPaths(job) {
 
 function jobPath(id) {
   return path.join(jobsDir, `${id}.json`);
+}
+
+
+// Where the Claude stream runner leaves the reason a run failed, so the reason
+// survives however much the job logged before it.
+function jobErrorPath(job) {
+  return path.join(logsDir, `${job.id}.error.txt`);
+}
+
+
+function jobTimelinePath(job) {
+  return path.join(logsDir, `${job.id}.timeline.ndjson`);
+}
+
+// Newline counts of timeline files that are still growing, so a job list does
+// not re-read every running job's whole timeline on each poll.
+const timelineCountCache = new Map();
+
+function countTimelineLines(job) {
+  const file = jobTimelinePath(job);
+  let size = 0;
+  try {
+    size = fs.statSync(file).size;
+  } catch {
+    timelineCountCache.delete(job.id);
+    return 0;
+  }
+  let cached = timelineCountCache.get(job.id);
+  if (!cached || cached.size > size) cached = { size: 0, count: 0 };
+  if (cached.size < size) {
+    let fd;
+    try {
+      fd = fs.openSync(file, "r");
+      const buffer = Buffer.allocUnsafe(Math.min(256 * 1024, size - cached.size));
+      let position = cached.size;
+      let count = cached.count;
+      while (position < size) {
+        const read = fs.readSync(fd, buffer, 0, Math.min(buffer.length, size - position), position);
+        if (read <= 0) break;
+        for (let index = 0; index < read; index += 1) if (buffer[index] === 10) count += 1;
+        position += read;
+      }
+      cached = { size: position, count };
+    } catch {
+      return cached.count;
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+    }
+    timelineCountCache.set(job.id, cached);
+  }
+  return cached.count;
+}
+
+// The number of timeline events a job has. A finished job carries the count on
+// its record, so it survives a restart without touching the file.
+function jobTimelineEventCount(job) {
+  if (terminalStatuses.has(job.status) && Number.isInteger(job.timelineEvents)) return job.timelineEvents;
+  return countTimelineLines(job);
+}
+
+
+function sealJobTimelineCount(job) {
+  job.timelineEvents = countTimelineLines(job);
+  timelineCountCache.delete(job.id);
+}
+
+// GET /v1/codex/jobs/<id>/timeline?since=<n> — one page of a job's timeline.
+
+function jobTimelinePage(job, searchParams) {
+  const since = cleanStreamOffset(searchParams.get("since"));
+  // Read the status first: a job that finishes mid-read must not be reported
+  // complete with events still unread.
+  const terminal = terminalStatuses.has(job.status);
+  const page = readTimeline(jobTimelinePath(job), { since });
+  return {
+    jobId: job.id,
+    events: page.events.map((entry) => ({ seq: entry.seq, event: cleanTimelineStrings(entry.event) })),
+    next: page.next,
+    complete: terminal && page.next >= page.total,
+  };
 }
 
 
@@ -673,6 +769,8 @@ function removePersistedJobFiles(job) {
     job.stdoutPath,
     job.stderrPath,
     job.resultPath,
+    jobTimelinePath(job),
+    jobErrorPath(job),
     path.join(attachmentsDir, job.id),
     path.join(artifactsDir, job.id),
   ];
@@ -686,6 +784,7 @@ function removePersistedJobFiles(job) {
   for (const target of paths) {
     removePathInsideRoot(target, dataDir);
   }
+  timelineCountCache.delete(job.id);
 }
 
 
@@ -778,6 +877,9 @@ function startJob(job) {
   job.error = null;
   job.timedOut = false;
   job.execution = buildExecutionReceipt(job);
+  // Recorded on the job so a later restart with a different setting still
+  // reads this run's answer from where this run wrote it.
+  job.claudeTransport = job.provider === "claude" ? claudeTransport : null;
   // W2-MODULES worktree handoff v0: when enabled and the workspace is a git
   // repo inside the jail, the job runs in a dedicated git worktree on branch
   // relay/<job-id-prefix>. No-op (null) when disabled — the default.
@@ -883,7 +985,12 @@ function startJob(job) {
 
 
 function buildJobArgs(job) {
-  if (job.provider === "claude") return buildClaudeArgs(job);
+  if (job.provider === "claude") {
+    // The runner takes the claude argv as its own; the binary comes by env.
+    return claudeTransport === "stream"
+      ? [claudeJobRunner, ...buildClaudeArgs(job, { transport: "stream" })]
+      : buildClaudeArgs(job);
+  }
   if (job.provider === "cursor") return buildCursorArgs(job);
   if (job.provider === "kimi") return buildKimiArgs(job);
   return codexTransport === "app-server" ? [codexJobRunner] : buildCodexArgs(job);
@@ -891,7 +998,7 @@ function buildJobArgs(job) {
 
 
 function jobBinary(provider) {
-  if (provider === "claude") return claudeBin;
+  if (provider === "claude") return claudeTransport === "stream" ? process.execPath : claudeBin;
   if (provider === "cursor") return cursorBin;
   if (provider === "kimi") return kimiBin;
   return codexTransport === "app-server" ? process.execPath : codexBin;
@@ -931,6 +1038,9 @@ function buildJobEnv(job) {
     RELAY_RESULT_PATH: job.resultPath,
     RELAY_SESSION_RESULT_PATH: path.join(logsDir, `${job.id}.session-id`),
     RELAY_APPROVAL_DIR: approvalsDir,
+    RELAY_TIMELINE_PATH: jobTimelinePath(job),
+    RELAY_ERROR_PATH: jobErrorPath(job),
+    RELAY_CLAUDE_BIN: claudeBin,
     RELAY_CODEX_BIN: codexBin,
     RELAY_CODEX_APPROVAL_POLICY: job.approvalPolicy || "on-request",
     RELAY_CODEX_SANDBOX: job.sandbox || "workspace-write",
@@ -1231,6 +1341,9 @@ async function streamJobEvents(req, res, job, searchParams) {
   const resume = parseJobStreamLastEventId(req);
   const stdoutOffset = resume ? resume.stdoutOffset : cleanStreamOffset(searchParams.get("stdoutOffset"));
   const stderrOffset = resume ? resume.stderrOffset : cleanStreamOffset(searchParams.get("stderrOffset"));
+  // `timeline=<n>` opts this stream into timeline events after the n the
+  // client already holds. Absent, the stream is exactly the legacy one.
+  const timelineSince = searchParams.has("timeline") ? cleanStreamOffset(searchParams.get("timeline")) : null;
   if (!tryAcquireStreamSlot()) {
     return sendError(res, 503, "too many concurrent job streams");
   }
@@ -1245,6 +1358,9 @@ async function streamJobEvents(req, res, job, searchParams) {
     repump: false,
     finishing: false,
     heartbeatTimer: null,
+    timeline: timelineSince === null ? null : createTimelineTail(jobTimelinePath(job), { since: timelineSince }),
+    timelineTimer: null,
+    pumpPromise: null,
     channels: [
       makeStreamChannel("stdout", job.stdoutPath, stdoutOffset),
       makeStreamChannel("stderr", job.stderrPath, stderrOffset),
@@ -1271,6 +1387,13 @@ async function streamJobEvents(req, res, job, searchParams) {
     void pumpJobStream(subscriber);
   }, jobStreamHeartbeatMs);
   subscriber.heartbeatTimer.unref();
+
+  if (subscriber.timeline) {
+    // The runner appends to the timeline file itself, so nothing in this
+    // process hears about a new event; look for them on a short timer.
+    subscriber.timelineTimer = setInterval(() => void pumpJobStream(subscriber), timelinePollMs);
+    subscriber.timelineTimer.unref();
+  }
 
   req.on("close", () => closeJobStream(subscriber));
 
@@ -1301,22 +1424,47 @@ function boundStreamReplayStart(subscriber) {
 }
 
 
-async function pumpJobStream(subscriber) {
-  if (subscriber.closed) return;
+function pumpJobStream(subscriber) {
+  if (subscriber.closed) return Promise.resolve();
   if (subscriber.pumping) {
+    // The pump in flight goes round again, and its promise settles only once
+    // that pass is done, so a caller that awaits sees everything written
+    // before it asked.
     subscriber.repump = true;
-    return;
+    return subscriber.pumpPromise || Promise.resolve();
   }
   subscriber.pumping = true;
-  try {
-    do {
-      subscriber.repump = false;
-      for (const channel of subscriber.channels) {
-        await drainStreamChannel(subscriber, channel);
-      }
-    } while (subscriber.repump && !subscriber.closed);
-  } finally {
-    subscriber.pumping = false;
+  subscriber.pumpPromise = (async () => {
+    try {
+      do {
+        subscriber.repump = false;
+        for (const channel of subscriber.channels) {
+          await drainStreamChannel(subscriber, channel);
+        }
+        drainStreamTimeline(subscriber);
+      } while (subscriber.repump && !subscriber.closed);
+    } finally {
+      subscriber.pumping = false;
+      subscriber.pumpPromise = null;
+    }
+  })();
+  return subscriber.pumpPromise;
+}
+
+// Sends the timeline events appended since the last drain. These messages
+// carry no `id:` line and do not advance the stream's event counter, so
+// Last-Event-ID keeps describing the log channels alone.
+
+function drainStreamTimeline(subscriber) {
+  if (!subscriber.timeline || subscriber.closed) return;
+  for (const entry of subscriber.timeline.read()) {
+    if (subscriber.closed) return;
+    try {
+      sendSse(subscriber.res, "timeline", { seq: entry.seq, event: cleanTimelineStrings(entry.event) });
+    } catch {
+      closeJobStream(subscriber);
+      return;
+    }
   }
 }
 
@@ -1380,6 +1528,7 @@ function closeJobStream(subscriber, { end = false } = {}) {
   if (subscriber.closed) return;
   subscriber.closed = true;
   clearInterval(subscriber.heartbeatTimer);
+  clearInterval(subscriber.timelineTimer);
   const subscribers = jobStreamSubscribers.get(subscriber.job.id);
   if (subscribers) {
     subscribers.delete(subscriber);
@@ -1438,7 +1587,14 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
 
   const finishedAt = nowIso();
   const stderrText = cleanApiText(stderr).trim();
-  const stdoutResultProvider = job.provider === "claude" || job.provider === "cursor" || job.provider === "kimi";
+  // A Claude job run through the stream runner keeps prose on stdout for old
+  // phones and writes its final answer to the result file, like Codex.
+  const claudeStream = job.provider === "claude" && job.claudeTransport === "stream";
+  const stdoutResultProvider = !claudeStream
+    && (job.provider === "claude" || job.provider === "cursor" || job.provider === "kimi");
+  const runnerError = claudeStream
+    ? cleanApiText(await readTextFileBounded(jobErrorPath(job), 16 * 1024).catch(() => "")).trim()
+    : "";
   const resultText = stdoutResultProvider
     ? await readTextFileBounded(job.stdoutPath, maxOutputBytes)
     : await readTextFileBounded(job.resultPath, maxOutputBytes);
@@ -1474,7 +1630,7 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
     job.status = "failed";
     job.result = null;
     job.error = spawnError.message;
-  } else if (code === 0 && stdoutResultProvider && !cleanResult) {
+  } else if (code === 0 && (stdoutResultProvider || claudeStream) && !cleanResult) {
     job.status = "failed";
     job.result = null;
     job.artifacts = [];
@@ -1495,7 +1651,8 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
     job.result = null;
     job.artifacts = [];
     job.error =
-      stderrText ||
+      runnerError ||
+      (claudeStream ? withoutRelayStepLines(stderrText) : stderrText) ||
       failedOutputText ||
       `${job.provider} exited with code ${code}${signal ? ` and signal ${signal}` : ""}`;
   }
@@ -1505,6 +1662,7 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
   // off or the job did not run in a worktree.
   await completeJobWorktree(job);
   await handoffCompletionHook(job).catch(() => null);
+  sealJobTimelineCount(job);
 
   touchJob(job, "job_finished", { code, signal });
   const notificationType = job.status === "succeeded" ? "job.completed" : "job.failed";
@@ -1512,6 +1670,18 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
   pruneRuntimeCachesIfIdle();
   scheduleRuntimeCachePrune();
   processQueue();
+}
+
+
+// The stream runner's stderr interleaves `[relay-step]` progress lines with
+// whatever the CLI itself printed. Only the latter explains a failure.
+function withoutRelayStepLines(text) {
+  return String(text || "")
+    .split("\n")
+    .filter((line) => !line.startsWith("[relay-step] "))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 
@@ -1701,9 +1871,14 @@ async function toJobResponse(job, shape = responseShape("preview")) {
     }),
   ]);
 
+  const timelineEvents = jobTimelineEventCount(job);
+
   return {
     id: job.id,
     status,
+    // Present only when the job has a timeline, so a job without one reads
+    // exactly as it always has.
+    ...(timelineEvents > 0 ? { timelineEvents } : {}),
     provider: normalizeJobProvider(job.provider),
     workspaceId: workspace?.id || job.workspaceId,
     workspaceName: workspace?.name || job.workspaceName,
@@ -1776,6 +1951,9 @@ export {
   loadPersistedJobs,
   ensureLogPaths,
   jobPath,
+  jobTimelinePath,
+  jobTimelinePage,
+  claudeTransport,
   persistJob,
   responseShape,
   wantsFullLogs,

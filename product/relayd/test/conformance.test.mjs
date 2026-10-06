@@ -353,6 +353,10 @@ async function startServer(env) {
       RELAYD_DIRECT_TLS: "false",  // plain HTTP: these assertions are about the router, not TLS
       CODEX_API_PORT: String(port),
       RELAYD_CODEX_TRANSPORT: "exec",
+      // The Claude assertions here pin the plain `claude --print` invocation
+      // and its text-on-stdout fakes. The stream transport (the default) has
+      // its own suite: claude-stream.test.mjs.
+      RELAYD_CLAUDE_TRANSPORT: "print",
       // freePort() reserves ONE port. These daemons do not exercise pairing,
       // so they bind exactly one listener — no second, unreserved socket that
       // could land on the port a neighbouring test was just handed.
