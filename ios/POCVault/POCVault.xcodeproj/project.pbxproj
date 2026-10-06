@@ -73,6 +73,12 @@
 		2000000000000000000000F2 /* FileBrowserCacheTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1000000000000000000000F2 /* FileBrowserCacheTests.swift */; };
 		200000000000000000000083 /* RelayPowerClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000083 /* RelayPowerClient.swift */; };
 		200000000000000000000084 /* MachinePowerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000084 /* MachinePowerTests.swift */; };
+		200000000000000000000090 /* RelayComposerSheets.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000090 /* RelayComposerSheets.swift */; };
+		200000000000000000000091 /* RelayTranscript.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000091 /* RelayTranscript.swift */; };
+		200000000000000000000092 /* RelayTranscriptViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000092 /* RelayTranscriptViews.swift */; };
+		200000000000000000000093 /* RelayActivitySheets.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000093 /* RelayActivitySheets.swift */; };
+		200000000000000000000094 /* RelayComposerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000094 /* RelayComposerTests.swift */; };
+		200000000000000000000095 /* RelayTranscriptTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000095 /* RelayTranscriptTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -157,6 +163,12 @@
 		1000000000000000000000F2 /* FileBrowserCacheTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileBrowserCacheTests.swift; sourceTree = "<group>"; };
 		100000000000000000000083 /* RelayPowerClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayPowerClient.swift; sourceTree = "<group>"; };
 		100000000000000000000084 /* MachinePowerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MachinePowerTests.swift; sourceTree = "<group>"; };
+		100000000000000000000090 /* RelayComposerSheets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayComposerSheets.swift; sourceTree = "<group>"; };
+		100000000000000000000091 /* RelayTranscript.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayTranscript.swift; sourceTree = "<group>"; };
+		100000000000000000000092 /* RelayTranscriptViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayTranscriptViews.swift; sourceTree = "<group>"; };
+		100000000000000000000093 /* RelayActivitySheets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayActivitySheets.swift; sourceTree = "<group>"; };
+		100000000000000000000094 /* RelayComposerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayComposerTests.swift; sourceTree = "<group>"; };
+		100000000000000000000095 /* RelayTranscriptTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayTranscriptTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -229,6 +241,8 @@
 				100000000000000000000082 /* MachineMonitorTests.swift */,
 				100000000000000000000084 /* MachinePowerTests.swift */,
 				1000000000000000000000F2 /* FileBrowserCacheTests.swift */,
+				100000000000000000000094 /* RelayComposerTests.swift */,
+				100000000000000000000095 /* RelayTranscriptTests.swift */,
 			);
 			path = POCVaultTests;
 			sourceTree = "<group>";
@@ -251,6 +265,7 @@
 				100000000000000000000060 /* RelayHandoff.swift */,
 				100000000000000000000080 /* RelayMachineStats.swift */,
 				1000000000000000000000C1 /* RelayChatsFeedSnapshot.swift */,
+				100000000000000000000091 /* RelayTranscript.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -307,6 +322,9 @@
 				100000000000000000000076 /* NodePairingModel.swift */,
 				100000000000000000000077 /* NodePairingView.swift */,
 				100000000000000000000081 /* RelayMachineMonitorView.swift */,
+				100000000000000000000090 /* RelayComposerSheets.swift */,
+				100000000000000000000092 /* RelayTranscriptViews.swift */,
+				100000000000000000000093 /* RelayActivitySheets.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -531,6 +549,10 @@
 				200000000000000000000077 /* NodePairingView.swift in Sources */,
 				200000000000000000000080 /* RelayMachineStats.swift in Sources */,
 				200000000000000000000081 /* RelayMachineMonitorView.swift in Sources */,
+				200000000000000000000090 /* RelayComposerSheets.swift in Sources */,
+				200000000000000000000091 /* RelayTranscript.swift in Sources */,
+				200000000000000000000092 /* RelayTranscriptViews.swift in Sources */,
+				200000000000000000000093 /* RelayActivitySheets.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -549,6 +571,8 @@
 				200000000000000000000079 /* LivePairingDiagnosticTests.swift in Sources */,
 				200000000000000000000082 /* MachineMonitorTests.swift in Sources */,
 				200000000000000000000084 /* MachinePowerTests.swift in Sources */,
+				200000000000000000000094 /* RelayComposerTests.swift in Sources */,
+				200000000000000000000095 /* RelayTranscriptTests.swift in Sources */,
 				2000000000000000000000F2 /* FileBrowserCacheTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
