@@ -779,36 +779,35 @@ private struct RelayComposer: View {
     }
 
     /// Selected skills sit with the attachments, above the words they apply to, each
-    /// one removable where it is shown.
+    /// one removable where it is shown. They wrap; they never scroll sideways.
     private var skillChips: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                ForEach(selectedSkills) { skill in
-                    Button {
-                        onToggleSkill(skill)
-                    } label: {
-                        HStack(spacing: 6) {
-                            Text("/\(skill.name)")
-                                .font(AppTheme.monoFont(size: 12, weight: .medium))
-                                .foregroundStyle(AppTheme.textPrimary)
-                                .lineLimit(1)
-                            Image(systemName: "xmark")
-                                .font(.system(size: 9, weight: .bold))
-                                .foregroundStyle(RelayChatStyle.secondary)
-                        }
-                        .padding(.leading, 11)
-                        .padding(.trailing, 10)
-                        .frame(height: 30)
-                        .background(RelayComposerPalette.quietFill, in: Capsule())
-                        .frame(height: 36)
-                        .contentShape(Rectangle())
+        RelayFlowLayout(spacing: 6, lineSpacing: 0) {
+            ForEach(selectedSkills) { skill in
+                Button {
+                    onToggleSkill(skill)
+                } label: {
+                    HStack(spacing: 6) {
+                        Text("/\(skill.name)")
+                            .font(AppTheme.monoFont(size: 12, weight: .medium))
+                            .foregroundStyle(AppTheme.textPrimary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(RelayChatStyle.secondary)
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Remove skill \(skill.name)")
+                    .padding(.leading, 11)
+                    .padding(.trailing, 10)
+                    .frame(height: 30)
+                    .background(RelayComposerPalette.quietFill, in: Capsule())
+                    .frame(height: 36)
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Remove skill \(skill.name)")
             }
-            .padding(.horizontal, 6)
         }
+        .padding(.horizontal, 6)
         .accessibilityIdentifier("relay-draft-skills")
     }
 
@@ -1173,6 +1172,8 @@ private struct RelayComposer: View {
                                     Text(command.command)
                                         .font(AppTheme.monoFont(size: 12, weight: .medium))
                                         .foregroundStyle(provider?.relayPresentation.accent ?? AppTheme.accent)
+                                        .lineLimit(2)
+                                        .truncationMode(.middle)
                                         .frame(width: 112, alignment: .leading)
 
                                     VStack(alignment: .leading, spacing: 3) {
@@ -1635,16 +1636,15 @@ private struct RelayDraftAttachmentStrip: View {
     let onRemove: (UUID) -> Void
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(attachments) { attachment in
-                    RelayDraftAttachmentChip(attachment: attachment) {
-                        onRemove(attachment.id)
-                    }
+        // Wraps onto further lines: nothing in the composer scrolls sideways.
+        RelayFlowLayout(spacing: 8, lineSpacing: 8) {
+            ForEach(attachments) { attachment in
+                RelayDraftAttachmentChip(attachment: attachment) {
+                    onRemove(attachment.id)
                 }
             }
-            .padding(.vertical, 4)
         }
+        .padding(.vertical, 4)
         .accessibilityIdentifier("relay-draft-attachments")
     }
 }

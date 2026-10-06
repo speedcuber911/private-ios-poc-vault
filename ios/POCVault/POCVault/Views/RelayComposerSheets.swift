@@ -82,15 +82,33 @@ enum RelayModelSheetTab: Hashable, Identifiable {
         for sections: RelayModelPickerSections,
         selectedChoice: RelayModelChoice?
     ) -> RelayModelSheetTab? {
-        if let selectedChoice {
-            if let group = sections.agents.first(where: { $0.choices.contains(selectedChoice) }) {
-                return .agent(group.provider)
-            }
-            if sections.chatModels.contains(selectedChoice) {
-                return .chat
-            }
+        owner(of: selectedChoice, in: sections) ?? tabs(for: sections).first
+    }
+
+    /// The tab whose list holds this choice; nil when the catalog does not have it.
+    static func owner(
+        of choice: RelayModelChoice?,
+        in sections: RelayModelPickerSections
+    ) -> RelayModelSheetTab? {
+        guard let choice else { return nil }
+        if let group = sections.agents.first(where: { $0.choices.contains(choice) }) {
+            return .agent(group.provider)
         }
-        return tabs(for: sections).first
+        return sections.chatModels.contains(choice) ? .chat : nil
+    }
+
+    /// Effort belongs to the selected model. While the sheet is showing some other
+    /// agent's list, the row would be reporting a setting that list does not have.
+    static func showsEffort(
+        visibleTab: RelayModelSheetTab?,
+        sections: RelayModelPickerSections,
+        selectedChoice: RelayModelChoice?,
+        threadProvider: CodexProvider?
+    ) -> Bool {
+        // Inside a thread every list on the page is the thread's own harness.
+        if threadProvider != nil { return true }
+        guard let visibleTab else { return false }
+        return visibleTab == owner(of: selectedChoice, in: sections)
     }
 
     func choices(in sections: RelayModelPickerSections) -> [RelayModelChoice] {
@@ -199,6 +217,35 @@ enum RelayComposerLogic {
         return Array(repeating: 0, count: max(0, count - live.count)) + live
     }
 
+    /// Where wrapping chips land: left to right, onto a new line when the next one
+    /// would pass the trailing edge. Nothing is ever placed wider than `maxWidth`,
+    /// so a row of chips can grow taller but never scroll sideways.
+    static func flowFrames(
+        sizes: [CGSize],
+        maxWidth: CGFloat,
+        spacing: CGFloat,
+        lineSpacing: CGFloat
+    ) -> (frames: [CGRect], size: CGSize) {
+        var frames: [CGRect] = []
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var lineHeight: CGFloat = 0
+        var widest: CGFloat = 0
+        for size in sizes {
+            let width = min(size.width, maxWidth)
+            if x > 0, x + width > maxWidth {
+                x = 0
+                y += lineHeight + lineSpacing
+                lineHeight = 0
+            }
+            frames.append(CGRect(x: x, y: y, width: width, height: size.height))
+            widest = max(widest, x + width)
+            x += width + spacing
+            lineHeight = max(lineHeight, size.height)
+        }
+        return (frames, CGSize(width: widest, height: y + lineHeight))
+    }
+
     static let sheetMaxScreenFraction: CGFloat = 0.7
 
     /// A sheet is as tall as its content up to about 70% of the screen; past that the
@@ -226,6 +273,45 @@ struct RelayQuietCircleLabel: View {
             .background(RelayComposerPalette.quietFill, in: Circle())
             .frame(width: 44, height: 44)
             .contentShape(Rectangle())
+    }
+}
+
+/// Chips that wrap onto further lines instead of scrolling sideways.
+struct RelayFlowLayout: Layout {
+    var spacing: CGFloat = 8
+    var lineSpacing: CGFloat = 8
+
+    private func arrange(_ subviews: Subviews, maxWidth: CGFloat) -> (frames: [CGRect], size: CGSize) {
+        let sizes = subviews.map { subview -> CGSize in
+            let ideal = subview.sizeThatFits(.unspecified)
+            guard ideal.width > maxWidth else { return ideal }
+            return subview.sizeThatFits(ProposedViewSize(width: maxWidth, height: nil))
+        }
+        return RelayComposerLogic.flowFrames(
+            sizes: sizes,
+            maxWidth: maxWidth,
+            spacing: spacing,
+            lineSpacing: lineSpacing
+        )
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        let arranged = arrange(subviews, maxWidth: maxWidth)
+        return CGSize(
+            width: maxWidth.isFinite ? maxWidth : arranged.size.width,
+            height: arranged.size.height
+        )
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let arranged = arrange(subviews, maxWidth: bounds.width)
+        for (subview, frame) in zip(subviews, arranged.frames) {
+            subview.place(
+                at: CGPoint(x: bounds.minX + frame.minX, y: bounds.minY + frame.minY),
+                proposal: ProposedViewSize(width: frame.width, height: frame.height)
+            )
+        }
     }
 }
 
@@ -464,6 +550,8 @@ struct RelayModelSheet: View {
     let onClose: () -> Void
 
     var startPage: RelayModelSheetPage = .model
+    /// The agent tab to open on instead of the one that owns the selection.
+    var startTab: RelayModelSheetTab? = nil
 
     @State private var shownPage: RelayModelSheetPage?
     @State private var pickedTab: RelayModelSheetTab?
@@ -474,6 +562,7 @@ struct RelayModelSheet: View {
 
     private var tab: RelayModelSheetTab? {
         if let pickedTab, tabs.contains(pickedTab) { return pickedTab }
+        if let startTab, tabs.contains(startTab) { return startTab }
         return RelayModelSheetTab.initial(for: visibleSections, selectedChoice: selectedChoice)
     }
 
@@ -516,7 +605,8 @@ struct RelayModelSheet: View {
                 }
             }
 
-            if let effortLabel = RelayComposerLogic.effortLabel(efforts: efforts, selected: selectedEffort) {
+            if showsEffort,
+               let effortLabel = RelayComposerLogic.effortLabel(efforts: efforts, selected: selectedEffort) {
                 RelaySheetGroup {
                     RelaySheetValueRow(title: "Effort", value: effortLabel) {
                         withAnimation(.easeOut(duration: 0.22)) { shownPage = .effort }
@@ -528,63 +618,113 @@ struct RelayModelSheet: View {
         }
     }
 
+    private var showsEffort: Bool {
+        RelayModelSheetTab.showsEffort(
+            visibleTab: tab,
+            sections: visibleSections,
+            selectedChoice: selectedChoice,
+            threadProvider: threadProvider
+        )
+    }
+
+    /// Every agent is on screen at once and nothing scrolls sideways: one row of
+    /// pills when they fit the sheet, otherwise a three-column grid of names.
     private var agentPills: some View {
-        ScrollViewReader { proxy in
+        ViewThatFits(in: .horizontal) {
             agentPillRow
-                // The selected agent may sit past the trailing edge on a long catalog.
-                .onAppear {
-                    if let tab { proxy.scrollTo(tab.id, anchor: .center) }
-                }
+            agentGrid
         }
     }
 
+    private func agentButton<Label: View>(
+        _ candidate: RelayModelSheetTab,
+        @ViewBuilder label: () -> Label
+    ) -> some View {
+        Button {
+            pickedTab = candidate
+        } label: {
+            label()
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(candidate == tab ? .isSelected : [])
+        .accessibilityIdentifier("relay-model-agent-\(candidate.id)")
+    }
+
     private var agentPillRow: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(tabs) { candidate in
-                    let isSelected = candidate == tab
-                    Button {
-                        pickedTab = candidate
-                    } label: {
-                        HStack(spacing: 7) {
-                            switch candidate {
-                            case .agent(let provider):
-                                RelayComposerProviderMark(
-                                    provider: provider,
-                                    size: 14,
-                                    color: isSelected ? AppTheme.textPrimary : RelayChatStyle.secondary
-                                )
-                            case .chat:
-                                Image(systemName: "bubble.left")
-                                    .font(.system(size: 12, weight: .semibold))
-                            }
-                            Text(candidate.title)
-                                .font(AppTheme.uiFont(size: 14, weight: .medium))
-                                .lineLimit(1)
+        HStack(spacing: 8) {
+            ForEach(tabs) { candidate in
+                let isSelected = candidate == tab
+                agentButton(candidate) {
+                    HStack(spacing: 7) {
+                        switch candidate {
+                        case .agent(let provider):
+                            RelayComposerProviderMark(
+                                provider: provider,
+                                size: 14,
+                                color: isSelected ? AppTheme.textPrimary : RelayChatStyle.secondary
+                            )
+                        case .chat:
+                            Image(systemName: "bubble.left")
+                                .font(.system(size: 12, weight: .semibold))
                         }
-                        .foregroundStyle(isSelected ? AppTheme.textPrimary : RelayChatStyle.secondary)
-                        .padding(.leading, 12)
-                        .padding(.trailing, 14)
-                        .frame(height: 36)
-                        .background {
-                            if isSelected {
-                                Capsule().fill(RelayComposerPalette.selectedPillFill)
-                            } else {
-                                Capsule().strokeBorder(AppTheme.hairlineStrong, lineWidth: 1)
-                            }
-                        }
-                        .frame(height: 44)
-                        .contentShape(Rectangle())
+                        Text(candidate.title)
+                            .font(AppTheme.uiFont(size: 14, weight: .medium))
+                            .lineLimit(1)
+                            .fixedSize()
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityAddTraits(isSelected ? .isSelected : [])
-                    .accessibilityIdentifier("relay-model-agent-\(candidate.id)")
-                    .id(candidate.id)
+                    .foregroundStyle(isSelected ? AppTheme.textPrimary : RelayChatStyle.secondary)
+                    .padding(.leading, 12)
+                    .padding(.trailing, 14)
+                    .frame(height: 36)
+                    .background {
+                        if isSelected {
+                            Capsule().fill(RelayComposerPalette.selectedPillFill)
+                        } else {
+                            Capsule().strokeBorder(AppTheme.hairlineStrong, lineWidth: 1)
+                        }
+                    }
+                    .frame(height: 44)
+                    .contentShape(Rectangle())
                 }
             }
-            .padding(.horizontal, 16)
         }
+        .padding(.horizontal, 16)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.bottom, 10)
+    }
+
+    /// Too many agents for one row: equal cells, names only, all visible.
+    private var agentGrid: some View {
+        LazyVGrid(
+            columns: Array(repeating: GridItem(.flexible(minimum: 0), spacing: 8), count: 3),
+            spacing: 8
+        ) {
+            ForEach(tabs) { candidate in
+                let isSelected = candidate == tab
+                agentButton(candidate) {
+                    Text(candidate.title)
+                        .font(AppTheme.uiFont(size: 14, weight: isSelected ? .semibold : .medium))
+                        .foregroundStyle(isSelected ? AppTheme.textPrimary : RelayChatStyle.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .padding(.horizontal, 8)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 44)
+                        .background {
+                            let cell = RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            if isSelected {
+                                cell.fill(RelayComposerPalette.selectedPillFill)
+                            } else {
+                                cell.strokeBorder(AppTheme.hairlineStrong, lineWidth: 1)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 4)
+        .padding(.bottom, 16)
     }
 
     private func groupLabel(_ title: String) -> some View {
