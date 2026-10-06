@@ -4,14 +4,15 @@ import SwiftUI
 import UniformTypeIdentifiers
 import UIKit
 
-private enum RelayChatStyle {
+/// Shared by the chat screen, the composer sheets and the transcript rows.
+enum RelayChatStyle {
     static let secondary = AppTheme.textPrimary.opacity(0.72)
     static let surface = AppTheme.textPrimary.opacity(0.06)
     static let bodyFont = Font.custom("DMSans-9ptRegular", size: 16, relativeTo: .body)
     static let labelFont = Font.custom("DMSans-9ptRegular", size: 13, relativeTo: .subheadline)
 }
 
-private extension View {
+extension View {
     func relayHiddenListRow() -> some View {
         self
             .listRowSeparator(.hidden)
