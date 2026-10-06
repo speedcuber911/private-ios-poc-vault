@@ -64,7 +64,7 @@ const at = { startedAtMs: 1791271900000, completedAtMs: 1791271901500 };
 const started = (item) => ({ method: "item/started", params: { item, threadId: "th", turnId: "tu", startedAtMs: at.startedAtMs } });
 const completed = (item) => ({ method: "item/completed", params: { item, threadId: "th", turnId: "tu", completedAtMs: at.completedAtMs } });
 
-test("a real run maps to prose, two commands and an edit, in order", () => {
+test("a real run maps to prose, a listing, a read and an edit, in order", () => {
   const events = replay(fixture("codex-appserver-edit.ndjson"));
   const { order, steps, texts, usage } = reduce(events);
   assert.deepEqual(order.map((entry) => entry.split(":")[0]), ["text", "step", "step", "step", "text"]);
@@ -73,14 +73,18 @@ test("a real run maps to prose, two commands and an edit, in order", () => {
   assert.deepEqual(
     { kind: first.kind, title: first.title, status: first.status, exitCode: first.exitCode, output: first.output, input: first.input },
     {
-      kind: "command", title: "Bash", status: "done", exitCode: 0, output: "hello-relay\nnotes.txt\n",
+      // Codex parsed this as one `ls`, so it is a listing of the working directory.
+      kind: "search", title: "Search", status: "done", exitCode: 0, output: "hello-relay\nnotes.txt\n",
       input: { command: "echo hello-relay && ls", cwd: "/work/scratch" },
     },
   );
+  assert.equal(first.summary, "scratch");
   assert.equal(first.startedAt, "2026-10-06T07:31:48.249Z");
   assert.equal(first.endedAt, "2026-10-06T07:31:48.250Z");
-  assert.equal(second.summary, "Read notes.txt");
-  assert.equal(second.input.command, "cat notes.txt");
+  assert.deepEqual(
+    { kind: second.kind, title: second.title, summary: second.summary, input: second.input, exitCode: second.exitCode },
+    { kind: "read", title: "Read", summary: "notes.txt", input: { path: "/work/scratch/notes.txt", command: "cat notes.txt", cwd: "/work/scratch" }, exitCode: 0 },
+  );
   assert.equal(second.output, "status: draft\nowner: relay\n");
   assert.deepEqual(
     { kind: edit.kind, title: edit.title, summary: edit.summary, status: edit.status, input: edit.input },
@@ -163,7 +167,7 @@ test("an approval with no announced item creates the step, and accepting leaves 
   assert.equal(file.events[0].kind, "edit");
   // The item arriving afterwards fills in the paths rather than opening a second step.
   const [filled] = mapper.push(started({ type: "fileChange", id: "f1", status: "inProgress", changes: [{ path: "/w/a.txt", kind: { type: "add" }, diff: "hello\n" }] }));
-  assert.deepEqual(filled, { type: "step", id: "f1", summary: "a.txt", input: { path: "/w/a.txt", diff: "+hello\n" } });
+  assert.deepEqual(filled, { type: "step", id: "f1", kind: "write", title: "Write", summary: "a.txt", input: { path: "/w/a.txt", diff: "+hello\n" } });
 });
 
 test("file changes: an added file is a write, several files share one step", () => {
@@ -248,6 +252,59 @@ test("web searches, MCP calls, plans, agents and unknown items all become steps"
   assert.deepEqual({ title: compaction.title, status: compaction.status }, { title: "Context Compaction", status: "done" });
   const [image] = mapper.push(completed({ type: "imageView", id: "i1", path: "/w/shot.png" }));
   assert.deepEqual({ kind: image.kind, summary: image.summary, input: image.input }, { kind: "read", summary: "shot.png", input: { path: "/w/shot.png" } });
+});
+
+test("Codex's parse of a command picks the step kind, and an empty search is not a failure", () => {
+  const mapper = createCodexNotificationMapper();
+  const run = (id, script, commandActions, end) => {
+    const item = { type: "commandExecution", id, command: `/bin/zsh -lc '${script}'`, cwd: "/w/app", status: "inProgress", commandActions };
+    const [opened] = mapper.push(started(item));
+    const [closed] = mapper.push(completed({ ...item, ...end }));
+    return { ...opened, ...closed };
+  };
+  const ok = { status: "completed", exitCode: 0 };
+
+  const read = run("k1", "sed -n 1,40p src/pricing.ts", [{ type: "read", command: "sed -n 1,40p src/pricing.ts", name: "pricing.ts", path: "/w/app/src/pricing.ts" }], { ...ok, aggregatedOutput: "export {}\n" });
+  assert.deepEqual(
+    { kind: read.kind, title: read.title, summary: read.summary, input: read.input, status: read.status, output: read.output },
+    { kind: "read", title: "Read", summary: "pricing.ts", input: { path: "/w/app/src/pricing.ts", command: "sed -n 1,40p src/pricing.ts", cwd: "/w/app" }, status: "done", output: "export {}\n" },
+  );
+
+  const search = run("k2", "rg roundPrice src", [{ type: "search", command: "rg roundPrice src", query: "roundPrice", path: "src" }], { ...ok, aggregatedOutput: "src/a.ts:1:roundPrice\n" });
+  assert.deepEqual(
+    { kind: search.kind, title: search.title, summary: search.summary, input: search.input, output: search.output },
+    { kind: "search", title: "Search", summary: "roundPrice", input: { pattern: "roundPrice", path: "src", command: "rg roundPrice src", cwd: "/w/app" }, output: "src/a.ts:1:roundPrice\n" },
+  );
+  const pathless = run("k3", "rg TODO", [{ type: "search", command: "rg TODO", query: "TODO", path: null }], { ...ok, aggregatedOutput: "" });
+  assert.deepEqual(pathless.input, { pattern: "TODO", command: "rg TODO", cwd: "/w/app" });
+
+  const listing = run("k4", "ls src", [{ type: "listFiles", command: "ls src", path: "src" }], { ...ok, aggregatedOutput: "a.ts\n" });
+  assert.deepEqual({ kind: listing.kind, title: listing.title, summary: listing.summary, input: listing.input }, { kind: "search", title: "Search", summary: "src", input: { path: "src", command: "ls src", cwd: "/w/app" } });
+  const here = run("k5", "ls", [{ type: "listFiles", command: "ls", path: null }], { ...ok, aggregatedOutput: "a\n" });
+  assert.deepEqual({ kind: here.kind, summary: here.summary }, { kind: "search", summary: "app" });
+
+  // More than one action, or one Codex could not classify, stays a command.
+  const two = run("k6", "cat a && rg b", [{ type: "read", command: "cat a", name: "a", path: "/w/app/a" }, { type: "search", command: "rg b", query: "b", path: null }], ok);
+  assert.deepEqual({ kind: two.kind, title: two.title, summary: two.summary }, { kind: "command", title: "Bash", summary: "cat a && rg b" });
+  const unknown = run("k7", "npm test", [{ type: "unknown", command: "npm test" }], ok);
+  assert.equal(unknown.kind, "command");
+  assert.equal(run("k8", "npm test", [], ok).kind, "command");
+
+  // No matches: exit 1 and nothing printed. Done, with the exit code kept.
+  const none = run("k9", "rg nothing", [{ type: "search", command: "rg nothing", query: "nothing", path: null }], { status: "failed", exitCode: 1, aggregatedOutput: null });
+  assert.deepEqual({ status: none.status, exitCode: none.exitCode }, { status: "done", exitCode: 1 });
+  const emptyListing = run("k10", "rg --files -g x", [{ type: "listFiles", command: "rg --files -g x", path: null }], { status: "failed", exitCode: 1, aggregatedOutput: "" });
+  assert.deepEqual({ status: emptyListing.status, exitCode: emptyListing.exitCode }, { status: "done", exitCode: 1 });
+  // Real failures stay failed: a higher exit code, or anything printed.
+  const broken = run("k11", "rg '('", [{ type: "search", command: "rg '('", query: "(", path: null }], { status: "failed", exitCode: 2, aggregatedOutput: null });
+  assert.deepEqual({ status: broken.status, exitCode: broken.exitCode }, { status: "failed", exitCode: 2 });
+  const noisy = run("k12", "grep x missing", [{ type: "search", command: "grep x missing", query: "x", path: "missing" }], { status: "failed", exitCode: 1, aggregatedOutput: "grep: missing: No such file\n" });
+  assert.equal(noisy.status, "failed");
+  // The rule is for searches only: a read or a command that exits 1 failed.
+  const badRead = run("k13", "cat gone", [{ type: "read", command: "cat gone", name: "gone", path: "/w/app/gone" }], { status: "failed", exitCode: 1, aggregatedOutput: null });
+  assert.deepEqual({ kind: badRead.kind, status: badRead.status }, { kind: "read", status: "failed" });
+  const badCommand = run("k14", "false", [{ type: "unknown", command: "false" }], { status: "failed", exitCode: 1, aggregatedOutput: null });
+  assert.equal(badCommand.status, "failed");
 });
 
 test("reasoning streams as deltas, keeps parts apart and never mixes summary with raw text", () => {
@@ -398,10 +455,13 @@ test("a real rollout yields each action once, grouped before the message that fo
   const [first, second, edit] = groups[1];
   assert.deepEqual(
     { kind: first.kind, title: first.title, status: first.status, exitCode: first.exitCode, output: first.output, input: first.input },
-    { kind: "command", title: "Bash", status: "done", exitCode: 0, output: "hello-relay\nnotes.txt\n", input: { command: "echo hello-relay && ls", cwd: "/work/scratch" } },
+    { kind: "search", title: "Search", status: "done", exitCode: 0, output: "hello-relay\nnotes.txt\n", input: { command: "echo hello-relay && ls", cwd: "/work/scratch" } },
   );
   assert.equal(first.startedAt, "2026-10-06T07:31:48.249Z");
-  assert.equal(second.summary, "Read notes.txt");
+  assert.deepEqual(
+    { kind: second.kind, title: second.title, summary: second.summary, input: second.input, output: second.output },
+    { kind: "read", title: "Read", summary: "notes.txt", input: { path: "notes.txt", command: "cat notes.txt", cwd: "/work/scratch" }, output: "status: draft\nowner: relay\n" },
+  );
   assert.deepEqual(
     { kind: edit.kind, summary: edit.summary, status: edit.status, input: edit.input },
     { kind: "edit", summary: "notes.txt", status: "done", input: { path: "/work/scratch/notes.txt", diff: "@@ -1,2 +1,2 @@\n-status: draft\n+status: final\n owner: relay\n" } },
@@ -423,6 +483,40 @@ test("a real rollout with a declined command and a failed one", () => {
   assert.deepEqual({ exitCode: steps[3].exitCode, command: steps[3].input.command }, { exitCode: 1, command: "false" });
   // The empty reasoning item in this rollout is not a step.
   assert.ok(steps.every((step) => step.kind !== "reasoning"));
+});
+
+test("history takes the step kind from parsed_cmd, and an empty search is not a failure", () => {
+  const executed = (id, script, parsed_cmd, end) => line("event_msg", {
+    type: "item_completed",
+    item: { type: "CommandExecution", id, command: ["/bin/zsh", "-lc", script], cwd: "file:///w/app", parsed_cmd, status: "completed", exit_code: 0, aggregated_output: "", ...end },
+    started_at_ms: 1791271900000,
+    completed_at_ms: 1791271901500,
+  });
+  const { trailing } = collect([
+    executed("h1", "cat src/pricing.ts", [{ type: "read", cmd: "cat src/pricing.ts", name: "pricing.ts", path: "src/pricing.ts" }], { aggregated_output: "export {}\n" }),
+    executed("h2", "rg roundPrice src", [{ type: "search", cmd: "rg roundPrice src", query: "roundPrice", path: "src" }], { aggregated_output: "src/a.ts:1\n" }),
+    executed("h3", "ls src", [{ type: "list_files", cmd: "ls src", path: "src" }], { aggregated_output: "a.ts\n" }),
+    executed("h4", "cat a && rg b", [{ type: "read", cmd: "cat a", name: "a", path: "a" }, { type: "search", cmd: "rg b", query: "b", path: null }], {}),
+    executed("h5", "rg nothing", [{ type: "search", cmd: "rg nothing", query: "nothing", path: null }], { status: "failed", exit_code: 1 }),
+    executed("h6", "rg '('", [{ type: "search", cmd: "rg '('", query: "(", path: null }], { status: "failed", exit_code: 2 }),
+    executed("h7", "grep x missing", [{ type: "search", cmd: "grep x missing", query: "x", path: "missing" }], { status: "failed", exit_code: 1, aggregated_output: "grep: missing: No such file\n" }),
+    executed("h8", "false", [{ type: "unknown", cmd: "false" }], { status: "failed", exit_code: 1 }),
+  ]);
+  const [read, search, listing, two, none, broken, noisy, plain] = trailing;
+  assert.deepEqual(
+    { kind: read.kind, title: read.title, summary: read.summary, input: read.input, output: read.output },
+    { kind: "read", title: "Read", summary: "pricing.ts", input: { path: "src/pricing.ts", command: "cat src/pricing.ts", cwd: "/w/app" }, output: "export {}\n" },
+  );
+  assert.deepEqual(
+    { kind: search.kind, title: search.title, summary: search.summary, input: search.input },
+    { kind: "search", title: "Search", summary: "roundPrice", input: { pattern: "roundPrice", path: "src", command: "rg roundPrice src", cwd: "/w/app" } },
+  );
+  assert.deepEqual({ kind: listing.kind, summary: listing.summary, path: listing.input.path }, { kind: "search", summary: "src", path: "src" });
+  assert.deepEqual({ kind: two.kind, title: two.title }, { kind: "command", title: "Bash" });
+  assert.deepEqual({ kind: none.kind, status: none.status, exitCode: none.exitCode }, { kind: "search", status: "done", exitCode: 1 });
+  assert.deepEqual({ status: broken.status, exitCode: broken.exitCode }, { status: "failed", exitCode: 2 });
+  assert.deepEqual({ status: noisy.status, exitCode: noisy.exitCode }, { status: "failed", exitCode: 1 });
+  assert.deepEqual({ kind: plain.kind, status: plain.status, exitCode: plain.exitCode }, { kind: "command", status: "failed", exitCode: 1 });
 });
 
 // The shapes below are the older rollout dialects (codex-cli 0.142 to 0.147),

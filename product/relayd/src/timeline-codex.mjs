@@ -136,18 +136,27 @@ function stepStatus(value, fallback) {
   }
 }
 
-// What a command is doing, when Codex parsed the whole command as one action.
-function commandDescription(actions, command) {
-  if (!Array.isArray(actions) || actions.length !== 1) return "";
+// Codex runs everything through a shell, but it also parses each command. When
+// it read the command as exactly one read, search or listing, the step takes
+// that kind, so a run reads "Read 2 files, ran a search" and not "Ran 3 commands".
+function commandAction(actions, cwd) {
+  if (!Array.isArray(actions) || actions.length !== 1) return null;
   const action = actions[0] || {};
-  if (action.command !== command) return "";
-  if (action.type === "read") return `Read ${action.name || baseName(action.path) || "a file"}`;
-  if (action.type === "listFiles") return `List ${action.path || "files"}`;
-  if (action.type === "search") {
-    return ["Search", action.query ? `for ${action.query}` : "", action.path ? `in ${action.path}` : ""]
-      .filter(Boolean).join(" ");
+  if (action.type === "read") {
+    const file = nonEmpty(action.path) ? action.path : nonEmpty(action.name) ? action.name : "";
+    return { kind: "read", title: "Read", summary: action.name || baseName(file) || "a file", input: file ? { path: file } : {} };
   }
-  return "";
+  if (action.type === "search") {
+    const input = {};
+    if (nonEmpty(action.query)) input.pattern = action.query;
+    if (nonEmpty(action.path)) input.path = action.path;
+    return { kind: "search", title: "Search", summary: action.query || action.path || "files", input };
+  }
+  if (action.type === "listFiles") {
+    const directory = nonEmpty(action.path) ? action.path : "";
+    return { kind: "search", title: "Search", summary: directory || baseName(cwd) || "files", input: directory ? { path: directory } : {} };
+  }
+  return null;
 }
 
 function changeDiff(change) {
@@ -284,18 +293,22 @@ export function describeCodexItem(item) {
       return null;
     case "commandExecution": {
       const command = displayCommand(item.command);
-      const description = commandDescription(item.commandActions, command);
-      const input = { command };
-      if (description) input.description = description;
+      const action = commandAction(item.commandActions, item.cwd);
+      const input = { ...(action ? action.input : {}), command };
       if (nonEmpty(item.cwd)) input.cwd = item.cwd;
+      const exitCode = Number.isInteger(item.exitCode) ? item.exitCode : undefined;
+      const output = typeof item.aggregatedOutput === "string" ? item.aggregatedOutput : undefined;
+      let status = stepStatus(item.status);
+      // rg and grep exit 1 for "no matches". That is an answer, not a failure.
+      if (action?.kind === "search" && status === "failed" && exitCode === 1 && !output) status = "done";
       return {
-        kind: "command",
-        title: "Bash",
-        summary: description || firstLine(command) || "command",
+        kind: action ? action.kind : "command",
+        title: action ? action.title : "Bash",
+        summary: action ? action.summary : firstLine(command) || "command",
         input,
-        status: stepStatus(item.status),
-        exitCode: Number.isInteger(item.exitCode) ? item.exitCode : undefined,
-        output: typeof item.aggregatedOutput === "string" ? item.aggregatedOutput : undefined,
+        status,
+        exitCode,
+        output,
         error: item.status === "declined" ? "Declined" : undefined,
       };
     }
@@ -420,6 +433,7 @@ export function createCodexNotificationMapper({ now = () => Date.now() } = {}) {
     const input = described.input && Object.keys(described.input).length ? described.input : undefined;
     steps.set(id, {
       closed: false,
+      kind: described.kind,
       sent: { summary: described.summary || "", input: jsonText(input) },
       source: "",
     });
@@ -490,6 +504,11 @@ export function createCodexNotificationMapper({ now = () => Date.now() } = {}) {
       if (state.closed) return [];
       const input = described.input && Object.keys(described.input).length ? described.input : undefined;
       const fields = { id: item.id };
+      if (described.kind !== state.kind) {
+        fields.kind = described.kind;
+        fields.title = described.title;
+        state.kind = described.kind;
+      }
       if (described.summary && described.summary !== state.sent.summary) fields.summary = described.summary;
       if (input && jsonText(input) !== state.sent.input) fields.input = input;
       if (Object.keys(fields).length === 1) return [];
