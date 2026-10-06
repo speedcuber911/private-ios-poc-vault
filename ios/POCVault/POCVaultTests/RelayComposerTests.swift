@@ -169,6 +169,83 @@ final class RelayComposerTests: XCTestCase {
         XCTAssertTrue(shows(.agent(.codex), sol, thread: .codex))
     }
 
+    // MARK: Picking a model keeps the sheet open
+
+    /// Claude Code offers what its CLI lists; Cursor has no effort at all.
+    private static let effortCatalogJSON = """
+    [
+      {"id":"codex-default","label":"Codex","provider":"codex","modes":["task"],"effortLevels":["low","medium","high","xhigh"]},
+      {"id":"claude-default","label":"Claude Code","provider":"claude","modes":["task"],"effortLevels":["low","medium","high","xhigh","max"]},
+      {"id":"claude-opus","label":"Claude Opus 5.5","provider":"claude","modes":["task"],"taskModel":"opus","effortLevels":["low","medium","high","xhigh","max"]},
+      {"id":"cursor-composer","label":"Composer","provider":"cursor","modes":["task"],"effortLevels":[]}
+    ]
+    """
+
+    private func efforts(of choice: RelayModelChoice) -> [CodexReasoningEffort] {
+        choice.model.effortLevels.compactMap { CodexReasoningEffort(rawValue: $0.lowercased()) }
+    }
+
+    /// The row's own action: the model is selected and nothing asks the sheet to
+    /// close. It used to call `onClose()` too, so effort needed a second visit.
+    func testPickingAModelSelectsItAndLeavesTheSheetOpen() throws {
+        let catalog = try sections(Self.effortCatalogJSON)
+        let codex = try choice("codex-default", in: catalog)
+        let opus = try choice("claude-opus", in: catalog)
+        let cursor = try choice("cursor-composer", in: catalog)
+        var picked: [RelayModelChoice] = []
+        var closes = 0
+        var pickedEfforts: [CodexReasoningEffort] = []
+        let sheet = RelayModelSheet(
+            visibleSections: catalog,
+            selectedChoice: codex,
+            threadProvider: nil,
+            efforts: efforts(of: codex),
+            selectedEffort: .high,
+            onPickChoice: { picked.append($0) },
+            onPickEffort: { pickedEfforts.append($0) },
+            onClose: { closes += 1 }
+        )
+
+        sheet.pick(opus)
+        XCTAssertEqual(picked, [opus])
+        XCTAssertEqual(closes, 0)
+        // The same for a model with no effort levels: no special case closes it.
+        sheet.pick(cursor)
+        XCTAssertEqual(picked, [opus, cursor])
+        XCTAssertEqual(closes, 0)
+        XCTAssertTrue(pickedEfforts.isEmpty)
+    }
+
+    /// New chat, sheet open on Codex's selection, user switches to the Claude Code
+    /// tab and picks a model there: that tab now owns the selection, so the Effort
+    /// row is due immediately, with that model's levels.
+    func testEffortRowFollowsAPickOnAnotherAgentsTab() throws {
+        let catalog = try sections(Self.effortCatalogJSON)
+        let codex = try choice("codex-default", in: catalog)
+        let opus = try choice("claude-opus", in: catalog)
+        let cursor = try choice("cursor-composer", in: catalog)
+        func effortRow(on tab: RelayModelSheetTab, selected: RelayModelChoice) -> String? {
+            guard RelayModelSheetTab.showsEffort(
+                visibleTab: tab, sections: catalog, selectedChoice: selected, threadProvider: nil
+            ) else { return nil }
+            let levels = efforts(of: selected)
+            // What RelayChatViewModel.effectiveEffort resolves to after a pick.
+            return RelayComposerLogic.effortLabel(
+                efforts: levels,
+                selected: levels.contains(.high) ? .high : levels.first
+            )
+        }
+
+        XCTAssertEqual(effortRow(on: .agent(.codex), selected: codex), "High")
+        // Browsing Claude Code's list before picking: not Codex's effort to show.
+        XCTAssertNil(effortRow(on: .agent(.claude), selected: codex))
+        // Picked on that tab: the row is there on the same visit.
+        XCTAssertEqual(effortRow(on: .agent(.claude), selected: opus), "High")
+        XCTAssertEqual(efforts(of: opus), [.low, .medium, .high, .xhigh, .max])
+        // A model with no effort levels has no row, and the sheet is no different.
+        XCTAssertNil(effortRow(on: .agent(.cursor), selected: cursor))
+    }
+
     func testChipsWrapInsteadOfRunningPastTheEdge() {
         let chip = CGSize(width: 100, height: 30)
         let flow = RelayComposerLogic.flowFrames(
@@ -466,8 +543,199 @@ final class RelayComposerTests: XCTestCase {
         try render(presented(agentSheet(five, selected: sol)), size: screen, to: output, name: "presented-model-five", settle: 1.5)
         try render(presented(agentSheet(three, selected: try choice("claude-opus", in: three))), size: screen, to: output, name: "presented-model-three", settle: 1.5)
         try render(presented(modelSheet(thread: .claude, page: .effort)), size: screen, to: output, name: "presented-effort", settle: 1.5)
+        // Just after picking Opus on the Claude Code tab of a five-agent catalog:
+        // the check and the Effort row are both there, sheet still up.
+        let fiveOpus = try choice("claude-opus", in: five)
+        try render(
+            presented(agentSheet(five, selected: fiveOpus, tab: .agent(.claude))),
+            size: screen, to: output, name: "presented-model-after-pick", settle: 1.5
+        )
         try render(presented(addSheet(.root, provider: .claude)), size: screen, to: output, name: "presented-add", settle: 1.5)
         try render(presented(addSheet(.skills, provider: .claude)), size: screen, to: output, name: "presented-skills", settle: 1.5)
+    }
+
+    // MARK: Driven sheet (opt-in, with the snapshots)
+
+    /// What the composer and view model do around the sheet, reduced to state the
+    /// test can read back.
+    @MainActor
+    private final class ModelSheetProbe: ObservableObject {
+        @Published var selected: RelayModelChoice?
+        @Published var effort: CodexReasoningEffort?
+        @Published var presented = true
+
+        var efforts: [CodexReasoningEffort] {
+            (selected?.model.effortLevels ?? []).compactMap { CodexReasoningEffort(rawValue: $0.lowercased()) }
+        }
+
+        var effectiveEffort: CodexReasoningEffort? {
+            if let effort, efforts.contains(effort) { return effort }
+            return efforts.contains(.high) ? .high : efforts.first
+        }
+    }
+
+    private struct DrivenModelSheetHost: View {
+        let sections: RelayModelPickerSections
+        @ObservedObject var probe: ModelSheetProbe
+
+        var body: some View {
+            AppTheme.bgCanvas
+                .ignoresSafeArea()
+                .sheet(isPresented: $probe.presented) {
+                    RelayModelSheet(
+                        visibleSections: sections,
+                        selectedChoice: probe.selected,
+                        threadProvider: nil,
+                        efforts: probe.efforts,
+                        selectedEffort: probe.effectiveEffort,
+                        onPickChoice: { probe.selected = $0; probe.effort = nil },
+                        onPickEffort: { probe.effort = $0 },
+                        onClose: { probe.presented = false }
+                    )
+                }
+        }
+    }
+
+    /// Presents the real sheet and works it the way a finger would, through each
+    /// control's accessibility activation: open on Codex, switch to the Claude Code
+    /// tab, pick a model there, open Effort, pick Max. Runs with the snapshots
+    /// (same opt-in) and writes a PNG per step.
+    @MainActor
+    func testDrivenModelSheetStaysOpenAndShowsEffortAfterAPick() throws {
+        guard let directory = ProcessInfo.processInfo.environment["RELAY_COMPOSER_SNAPSHOT_DIR"],
+              !directory.isEmpty else {
+            throw XCTSkip("Set RELAY_COMPOSER_SNAPSHOT_DIR to drive the model sheet")
+        }
+        let output = URL(fileURLWithPath: directory, isDirectory: true)
+        try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+
+        // SwiftUI builds its accessibility tree only once something asks for it.
+        // This is the switch UI automation flips; test-only, simulator-only.
+        if let library = dlopen("/usr/lib/libAccessibility.dylib", RTLD_NOW),
+           let symbol = dlsym(library, "_AXSSetAutomationEnabled") {
+            unsafeBitCast(symbol, to: (@convention(c) (Int32) -> Void).self)(1)
+        }
+
+        let catalog = try sections(Self.effortCatalogJSON)
+        let opus = try choice("claude-opus", in: catalog)
+        let probe = ModelSheetProbe()
+        probe.selected = try choice("codex-default", in: catalog)
+
+        let size = CGSize(width: 402, height: 874)
+        let host = UIHostingController(
+            rootView: DrivenModelSheetHost(sections: catalog, probe: probe).environment(\.colorScheme, .dark)
+        )
+        host.overrideUserInterfaceStyle = .dark
+        let scene = try XCTUnwrap(
+            UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first,
+            "Driving the sheet needs the test host app's window scene"
+        )
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(origin: .zero, size: size)
+        window.windowLevel = .alert + 1
+        window.rootViewController = host
+        window.isHidden = false
+        defer {
+            host.dismiss(animated: false)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+            window.isHidden = true
+            window.rootViewController = nil
+            window.windowScene = nil
+        }
+
+        func settle(_ seconds: TimeInterval = 1.0) {
+            RunLoop.main.run(until: Date().addingTimeInterval(seconds))
+        }
+        func sheetView() throws -> UIView {
+            try XCTUnwrap(host.presentedViewController?.view, "The Model sheet is not presented")
+        }
+        func sheetHeight() throws -> CGFloat {
+            let view = try sheetView()
+            return window.bounds.height - view.convert(view.bounds, to: window).minY
+        }
+        func element(_ matches: (String) -> Bool) throws -> NSObject? {
+            Self.accessibilityElement(in: try sheetView(), where: matches)
+        }
+        func activate(_ name: String, _ matches: (String) -> Bool) throws {
+            let found = try XCTUnwrap(try element(matches), "No control labelled \(name) in the sheet")
+            XCTAssertTrue(found.accessibilityActivate(), "\(name) did not respond")
+            settle()
+        }
+        func snapshot(_ name: String) throws {
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 3
+            let image = UIGraphicsImageRenderer(size: size, format: format).image { _ in
+                window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+            }
+            try XCTUnwrap(image.pngData()).write(to: output.appendingPathComponent("\(name).png"))
+        }
+
+        settle(1.5)
+        try snapshot("driven-1-open-on-codex")
+        XCTAssertNotNil(try element { $0 == "Effort, High" })
+
+        // Another agent's tab: its list, and no Effort row, because the selection
+        // is still Codex's.
+        try activate("Claude Code") { $0 == "Claude Code" }
+        try snapshot("driven-2-claude-code-tab")
+        XCTAssertNil(try element { $0.hasPrefix("Effort") })
+        let heightBeforePick = try sheetHeight()
+
+        // Pick a model there: selected, sheet still up, Effort under the list.
+        try activate("Opus") { $0.contains("Opus") }
+        XCTAssertEqual(probe.selected, opus)
+        XCTAssertTrue(probe.presented)
+        XCTAssertNotNil(host.presentedViewController)
+        XCTAssertNotNil(try element { $0 == "Effort, High" })
+        try snapshot("driven-3-picked-opus")
+        XCTAssertGreaterThan(try sheetHeight(), heightBeforePick + 40, "The sheet did not grow for the Effort row")
+
+        // The Effort page lists every level the model advertises.
+        try activate("Effort") { $0 == "Effort, High" }
+        try snapshot("driven-4-effort-page")
+        for level in ["Low", "Medium", "High", "XHigh", "Max"] {
+            XCTAssertNotNil(try element { $0 == level }, "\(level) is not on the Effort page")
+        }
+
+        // Picking one returns to the Model page; the sheet is still open.
+        try activate("Max") { $0 == "Max" }
+        XCTAssertEqual(probe.effort, .max)
+        XCTAssertTrue(probe.presented)
+        XCTAssertNotNil(try element { $0 == "Effort, Max" })
+        try snapshot("driven-5-effort-max")
+
+        // A model with no effort levels: no row, same sheet.
+        try activate("Cursor") { $0 == "Cursor" }
+        try activate("Cursor's only model") { $0 == "Default" }
+        XCTAssertEqual(probe.selected, try choice("cursor-composer", in: catalog))
+        XCTAssertTrue(probe.presented)
+        XCTAssertNil(try element { $0.hasPrefix("Effort") })
+        try snapshot("driven-6-no-effort-model")
+
+        // And the close circle still closes it.
+        try activate("Close") { $0 == "Close" }
+        XCTAssertFalse(probe.presented)
+    }
+
+    private static func accessibilityElement(
+        in root: NSObject,
+        where matches: (String) -> Bool,
+        depth: Int = 0
+    ) -> NSObject? {
+        guard depth < 60 else { return nil }
+        if root.isAccessibilityElement, let label = root.accessibilityLabel, matches(label) { return root }
+        var children: [NSObject] = (root.accessibilityElements ?? []).compactMap { $0 as? NSObject }
+        if children.isEmpty {
+            let count = root.accessibilityElementCount()
+            if count != NSNotFound, count > 0 {
+                children = (0..<count).compactMap { root.accessibilityElement(at: $0) as? NSObject }
+            }
+        }
+        if let view = root as? UIView { children += view.subviews }
+        for child in children {
+            if let found = accessibilityElement(in: child, where: matches, depth: depth + 1) { return found }
+        }
+        return nil
     }
 
     @MainActor

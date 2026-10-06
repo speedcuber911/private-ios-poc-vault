@@ -99,6 +99,8 @@ enum RelayModelSheetTab: Hashable, Identifiable {
 
     /// Effort belongs to the selected model. While the sheet is showing some other
     /// agent's list, the row would be reporting a setting that list does not have.
+    /// Picking a model on that list makes its tab the owner, and because a pick
+    /// leaves the sheet open the row appears there and then.
     static func showsEffort(
         visibleTab: RelayModelSheetTab?,
         sections: RelayModelPickerSections,
@@ -516,6 +518,8 @@ struct RelaySheetValueRow: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(title), \(value)")
         .accessibilityAddTraits(.isButton)
+        // Collapsing the children drops the button's own activation, so name it.
+        .accessibilityAction(.default, action)
     }
 }
 
@@ -614,8 +618,17 @@ struct RelayModelSheet: View {
                     .accessibilityIdentifier("relay-effort-chip")
                 }
                 .padding(.top, 12)
+                .transition(.opacity)
             }
         }
+    }
+
+    /// A tap on a model row. It selects the model and leaves the sheet open, so the
+    /// Effort row for that model is on screen at once instead of on a second visit.
+    /// The sheet closes by its close circle, a drag down or a tap outside. Animated
+    /// so the check, the Effort row and the fitted height move together.
+    func pick(_ choice: RelayModelChoice) {
+        withAnimation(.easeOut(duration: 0.22)) { onPickChoice(choice) }
     }
 
     private var showsEffort: Bool {
@@ -742,8 +755,7 @@ struct RelayModelSheet: View {
                     title: tab.rowTitle(for: choice),
                     selected: choice == selectedChoice
                 ) {
-                    onPickChoice(choice)
-                    onClose()
+                    pick(choice)
                 }
                 if choice.id != choices.last?.id {
                     RelaySheetDivider()
