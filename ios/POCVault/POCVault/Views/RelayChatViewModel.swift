@@ -166,6 +166,12 @@ struct RelayConversationItem: Identifiable, Hashable {
     /// Wall-clock seconds the reply took, stamped when the stream completes.
     var elapsedSeconds: Double?
     var attachments: [RelayDisplayedAttachment]
+    /// Thread history: the steps the agent took before it wrote this message.
+    /// Live jobs keep theirs in `RelayChatViewModel.timelines` instead.
+    var historyTimeline: RelayTimeline?
+    /// The transcript already shows this job's answer as its own turn, so the
+    /// job row carries only what that turn does not: outputs and the run receipt.
+    var hidesJobAnswer: Bool
 
     init(
         id: String = UUID().uuidString,
@@ -179,7 +185,9 @@ struct RelayConversationItem: Identifiable, Hashable {
         isStreaming: Bool = false,
         usage: RelayUsage? = nil,
         elapsedSeconds: Double? = nil,
-        attachments: [RelayDisplayedAttachment] = []
+        attachments: [RelayDisplayedAttachment] = [],
+        historyTimeline: RelayTimeline? = nil,
+        hidesJobAnswer: Bool = false
     ) {
         self.id = id
         self.role = role
@@ -193,6 +201,8 @@ struct RelayConversationItem: Identifiable, Hashable {
         self.usage = usage
         self.elapsedSeconds = elapsedSeconds
         self.attachments = attachments
+        self.historyTimeline = historyTimeline
+        self.hidesJobAnswer = hidesJobAnswer
     }
 }
 
@@ -427,6 +437,9 @@ final class RelayChatViewModel: ObservableObject {
     /// Live stdout/stderr tail per active job id, fed by the job SSE stream. Cleared when
     /// the job reaches a terminal state.
     @Published private(set) var liveJobTails: [String: String] = [:]
+    /// Reduced timelines of the jobs on screen, by job id: the prose and steps
+    /// the transcript draws. A job absent here renders from `liveJobTails`.
+    @Published private(set) var timelines: [String: RelayTimeline] = [:]
 
     /// Sessions handed over from a Mac. Node-level, not folder-scoped: a handoff
     /// lands in its own worktree workspace, so it is shown wherever the threads
@@ -1245,7 +1258,8 @@ final class RelayChatViewModel: ObservableObject {
         let task = Task { [weak self] in
             do {
                 guard let client = self?.client else { return }
-                for try await event in client.streamJobEvents(id: jobID) {
+                let cursor = self?.timelines[jobID]?.cursor ?? 0
+                for try await event in client.streamJobEvents(id: jobID, timeline: cursor) {
                     guard let self, !Task.isCancelled else { break }
                     switch event {
                     case .status(let updated):
@@ -1254,7 +1268,10 @@ final class RelayChatViewModel: ObservableObject {
                         self.appendLiveTail(jobID: jobID, chunk)
                     case .stderr(_, let chunk):
                         self.appendLiveTail(jobID: jobID, chunk)
+                    case .timeline(let envelope):
+                        self.timelines[jobID, default: RelayTimeline()].apply(envelope)
                     case .done(let finished):
+                        self.settleTimeline(for: finished)
                         self.replaceJob(finished)
                     }
                 }
@@ -1265,6 +1282,19 @@ final class RelayChatViewModel: ObservableObject {
             self?.jobStreamTasks[jobID] = nil
         }
         jobStreamTasks[jobID] = task
+    }
+
+    /// The reduced timeline of a job on screen, or nil when its machine sent none
+    /// and the job renders the legacy way.
+    func timeline(forJobID id: String) -> RelayTimeline? {
+        guard let timeline = timelines[id], !timeline.isEmpty else { return nil }
+        return timeline
+    }
+
+    /// Once a job is over nothing in it is still running.
+    private func settleTimeline(for job: CodexJob) {
+        guard !job.status.isActive, timelines[job.id] != nil else { return }
+        timelines[job.id]?.settle(as: job.status == .succeeded ? .done : job.status == .failed ? .failed : .cancelled)
     }
 
     private func appendLiveTail(jobID: String, _ chunk: String) {

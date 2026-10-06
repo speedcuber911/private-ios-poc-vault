@@ -2298,6 +2298,9 @@ enum CodexJobStreamEvent: Hashable {
     case status(CodexJob)
     case stdout(offset: Int64, text: String)
     case stderr(offset: Int64, text: String)
+    /// One event of the job's timeline. Sent only to a client that asked for it
+    /// with `timeline=<n>`, so an older machine simply never produces these.
+    case timeline(RelayTimelineEnvelope)
     case done(CodexJob)
 
     /// Decode a single SSE event name + data payload. Returns nil for unknown events
@@ -2315,6 +2318,9 @@ enum CodexJobStreamEvent: Hashable {
         case "stderr":
             guard let chunk = try? JSONDecoder().decode(CodexJobStreamChunk.self, from: payload) else { return nil }
             return .stderr(offset: chunk.offset ?? 0, text: chunk.text ?? "")
+        case "timeline":
+            guard let envelope = try? JSONDecoder().decode(RelayTimelineEnvelope.self, from: payload) else { return nil }
+            return .timeline(envelope)
         case "done":
             guard let job = try? JSONDecoder().decode(CodexJob.self, from: payload) else { return nil }
             return .done(job)

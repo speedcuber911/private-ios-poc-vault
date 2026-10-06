@@ -39,6 +39,14 @@ class SimulatorVaultServer(ThreadingHTTPServer):
         self.active_job_model: str | None = None
         self.active_job_prompt = "Inspect the workspace."
         self.active_job_tick = 0
+        # The scripted timeline of the job submitted last (see sim_timeline_script).
+        # It advances on its own thread, like a real job, so a stream can drop and
+        # re-attach with `timeline=<n>` without restarting the run.
+        self.active_job_timeline: list[dict] = []
+        self.active_job_timeline_enabled = False
+        self.active_job_timeline_done = True
+        self.active_job_final_status = "succeeded"
+        self.active_job_generation = 0
         self.handoff_job_id: str | None = None
         self.fixture_lock = threading.Lock()
 
@@ -134,6 +142,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.active_job_model = str(model) if isinstance(model, str) and model else None
                 self.server.active_job_prompt = str(prompt) if isinstance(prompt, str) and prompt else "Inspect the workspace."
                 self.server.active_job_tick = 0
+            start_sim_timeline(self.server)
             self.send_json({
                 "id": "sim-job-running",
                 "job": self.active_job_fixture(status="running", result=None),
@@ -154,6 +163,10 @@ class Handler(BaseHTTPRequestHandler):
             }, status=201)
             return
         if path == "/v1/codex/jobs/sim-job-running/cancel":
+            with self.server.fixture_lock:
+                self.server.active_job_generation += 1
+                self.server.active_job_final_status = "canceled"
+                self.server.active_job_timeline_done = True
             self.send_json(self.active_job_fixture(status="canceled", result="Simulator job canceled."))
             return
         approval_match = re.fullmatch(r"/v1/codex/approvals/([^/]+)/decision", path)
@@ -365,7 +378,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(codex_fixture_running_job_tick(self.server))
             return
         if path == "/v1/codex/jobs/sim-job-running/stream":
-            self.serve_codex_job_stream()
+            self.serve_codex_job_stream(parse_qs(query))
+            return
+        if path == "/v1/codex/jobs/sim-job-running/timeline":
+            self.send_json(sim_timeline_page(self.server, parse_qs(query)))
             return
         if path == "/v1/codex/jobs/sim-job-approval":
             self.send_json(codex_fixture_approval_job(self.server))
@@ -430,10 +446,11 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
 
-    def serve_codex_job_stream(self) -> None:
+    def serve_codex_job_stream(self, query: dict | None = None) -> None:
         """Canned live-job SSE fixture mirroring /v1/codex/jobs/<id>/stream:
         status snapshot, stdout replay/live events with real byte offsets,
-        heartbeat comments, then a terminal done event."""
+        heartbeat comments, then a terminal done event. A client that sends
+        `timeline=<n>` also gets the scripted timeline as `timeline` events."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache, no-transform")
@@ -466,6 +483,13 @@ class Handler(BaseHTTPRequestHandler):
             "timedOut": False,
             "error": None,
         })
+        timeline_cursor = sim_timeline_cursor(self.server, query)
+        if timeline_cursor is not None:
+            try:
+                self.stream_sim_timeline(emit, timeline_cursor, provider, model, prompt)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
         offset = 0
         for chunk in ["Scanning workspace…\n", "Reading recent activity…\n", "Drafting summary…\n"]:
             emit("stdout", {"offset": offset, "text": chunk})
@@ -484,6 +508,34 @@ class Handler(BaseHTTPRequestHandler):
                 prompt=prompt,
             ),
         )
+
+    def stream_sim_timeline(self, emit, cursor: int, provider: str, model: str | None, prompt: str) -> None:
+        """Tail the scripted timeline from `cursor` until the run ends, then send
+        `done`. Timeline messages carry no SSE id, as on a real machine."""
+        while True:
+            with self.server.fixture_lock:
+                pending = list(self.server.active_job_timeline[cursor:])
+                finished = self.server.active_job_timeline_done
+                final_status = self.server.active_job_final_status
+            for event in pending:
+                cursor += 1
+                emit("timeline", {"seq": cursor, "event": event})
+            if finished and not pending:
+                break
+            if not pending:
+                self.wfile.write(b": heartbeat\n\n")
+                self.wfile.flush()
+                time.sleep(0.1)
+        job = codex_fixture_job(
+            status=final_status,
+            result=_SIM_TIMELINE_ANSWER if final_status == "succeeded" else "Simulator job canceled.",
+            id="sim-job-running",
+            provider=provider,
+            model=model,
+            prompt=prompt,
+        )
+        job["timelineEvents"] = cursor
+        emit("done", job)
 
     def active_job_fixture(self, status: str, result: str | None) -> dict:
         with self.server.fixture_lock:
@@ -1573,6 +1625,210 @@ def codex_fixture_chat_thread_detail() -> dict:
     }
 
 
+# --- Scripted timeline --------------------------------------------------------
+#
+# One agent turn in the timeline wire shape (docs/superpowers/specs/
+# 2026-10-06-chat-composer-and-transcript.md, Part 1): reasoning, prose, reads,
+# a search, a failing command, an edit, two sub-agents with nested steps, an MCP
+# tool, passing commands and a final answer. Set SIM_TIMELINE=0 to make the
+# fixture behave like a machine that predates timelines.
+
+_SIM_TIMELINE_ANSWER = "\n".join([
+    "Fixed. `roundPrice` now rounds half up instead of truncating.",
+    "",
+    "- All 12 pricing tests pass, and the build is clean.",
+    "- Neither caller of `roundPrice` depended on the old behaviour.",
+    "- The docs already describe half-up rounding, so nothing to change there.",
+    "",
+    "```ts",
+    "return Math.round(total * 100) / 100",
+    "```",
+    "",
+    "The launch checklist still lists the rounding fix as open; tick it when you ship.",
+])
+
+
+def sim_timeline_script() -> list[tuple[float, dict]]:
+    """(pause before the event as a multiple of SIM_JOB_STREAM_DELAY, event)."""
+    script: list[tuple[float, dict]] = []
+
+    def add(pause: float, **event: object) -> None:
+        script.append((pause, dict(event)))
+
+    def say(block: str, text: str, pause: float = 0.25) -> None:
+        words = text.split(" ")
+        for start in range(0, len(words), 4):
+            chunk = " ".join(words[start:start + 4])
+            if start + 4 < len(words):
+                chunk += " "
+            add(pause, type="text", id=block, delta=chunk)
+
+    def run(step: str, lines: list[str], pause: float = 0.7) -> None:
+        for line in lines:
+            add(pause, **{"type": "step.delta", "id": step, "output": line + "\n"})
+
+    app = "/srv/codex-workspaces/poc-vault"
+
+    add(1.0, type="step", id="r1", kind="reasoning", title="Thinking", status="running")
+    run("r1", [
+        "The rounding bug is probably where the tax line is added.",
+        "Read the pricing module first, then run its tests to see the failure.",
+    ], pause=0.8)
+    add(0.5, type="step", id="r1", status="done")
+
+    say("t1", "I'll read the pricing module and the checklist, then run the pricing tests to see what fails.")
+
+    add(0.6, type="step", id="s1", kind="read", title="Read", summary="pricing.ts", status="running",
+        input={"path": f"{app}/src/pricing.ts"})
+    add(0.6, type="step", id="s1", status="done")
+    add(0.5, type="step", id="s2", kind="read", title="Read", summary="launch-checklist.html", status="running",
+        input={"path": f"{app}/launch-checklist.html"})
+    add(0.6, type="step", id="s2", status="done")
+    add(0.5, type="step", id="s3", kind="search", title="Grep", summary="roundPrice", status="running",
+        input={"pattern": "roundPrice", "path": f"{app}/src"})
+    add(0.6, type="step", id="s3", status="done",
+        output="src/pricing.ts:14\nsrc/checkout.ts:52\nsrc/cart.ts:31\n")
+
+    add(0.8, type="step", id="s4", kind="command", title="Bash", summary="Run the pricing tests", status="running",
+        input={"command": "npm test -- pricing", "description": "Run the pricing tests", "cwd": app})
+    run("s4", [
+        "> launch-checklist@0.4.0 test",
+        "> vitest run pricing",
+        " FAIL  src/pricing.test.ts > rounds half up",
+        "   expected 10.01, received 10",
+    ])
+    add(0.5, type="step", id="s4", status="failed", exitCode=1,
+        output="> launch-checklist@0.4.0 test\n> vitest run pricing\n FAIL  src/pricing.test.ts > rounds half up\n   expected 10.01, received 10\n\n Tests  1 failed | 11 passed (12)\n")
+
+    say("t2", "One test fails: `rounds half up` expects 10.01 and gets 10. `roundPrice` truncates with `Math.floor`. "
+              "I'll fix that, and ask two sub-agents to audit the callers and check what the docs promise.")
+
+    add(0.6, type="step", id="s5", kind="edit", title="Edit", summary="pricing.ts", status="running",
+        input={"path": f"{app}/src/pricing.ts"})
+    add(0.6, type="step", id="s5", status="done",
+        input={"diff": "-  return Math.floor(total * 100) / 100\n+  return Math.round(total * 100) / 100"})
+
+    add(0.6, type="step", id="a1", kind="agent", title="Agent", summary="Audit callers of roundPrice", status="running",
+        input={"description": "Audit callers of roundPrice",
+               "prompt": "Find every caller of roundPrice and report any that assume the result is floored.",
+               "agentType": "Explore"})
+    add(0.3, type="step", id="a2", kind="agent", title="Agent", summary="Check the docs for rounding rules", status="running",
+        input={"description": "Check the docs for rounding rules",
+               "prompt": "Read the pricing docs and report what rounding behaviour they promise customers.",
+               "agentType": "general-purpose"})
+    add(0.6, type="step", id="s6", parent="a1", kind="search", title="Grep", summary="roundPrice(", status="running",
+        input={"pattern": "roundPrice\\(", "path": f"{app}/src"})
+    add(0.5, type="step", id="s6", status="done", output="src/checkout.ts:52\nsrc/cart.ts:31\n")
+    add(0.4, type="step", id="s7", parent="a2", kind="fetch", title="WebFetch", summary="docs.example.com", status="running",
+        input={"url": "https://docs.example.com/pricing/rounding"})
+    add(0.6, type="step", id="s8", parent="a1", kind="read", title="Read", summary="checkout.ts", status="running",
+        input={"path": f"{app}/src/checkout.ts"})
+    add(0.5, type="step", id="s8", status="done")
+    add(0.4, type="step", id="s7", status="done")
+    add(0.5, type="step", id="s9", parent="a1", kind="read", title="Read", summary="cart.ts", status="running",
+        input={"path": f"{app}/src/cart.ts"})
+    add(0.5, type="step", id="s9", status="done")
+    add(1.2, type="step", id="a2", status="done",
+        output="The docs promise half-up rounding to the cent on every line item. Nothing mentions truncation.")
+    add(1.2, type="step", id="a1", status="done",
+        output="Two callers: `checkout.ts:52` and `cart.ts:31`. Both pass the result straight to display. Neither assumes floor.")
+
+    add(0.5, type="step", id="s10", kind="tool", title="Mark Chapter", status="done",
+        input={"name": "mark_chapter", "server": "session", "json": "{\n  \"title\": \"Verification\"\n}"})
+
+    add(0.8, type="step", id="s11", kind="command", title="Bash", summary="Run the pricing tests", status="running",
+        input={"command": "npm test -- pricing", "description": "Run the pricing tests", "cwd": app})
+    run("s11", [
+        "> launch-checklist@0.4.0 test",
+        "> vitest run pricing",
+        " ✓ src/pricing.test.ts (12)",
+        " Tests  12 passed (12)",
+    ])
+    add(0.4, type="step", id="s11", status="done", exitCode=0)
+    add(0.6, type="step", id="s12", kind="command", title="Bash", summary="Build the app", status="running",
+        input={"command": "npm run build", "description": "Build the app", "cwd": app})
+    run("s12", [
+        "> launch-checklist@0.4.0 build",
+        "> vite build",
+        "✓ 42 modules transformed.",
+        "✓ built in 1.31s",
+    ])
+    add(0.4, type="step", id="s12", status="done", exitCode=0)
+
+    say("t3", _SIM_TIMELINE_ANSWER)
+    add(0.2, type="usage", inputTokens=4210, outputTokens=612)
+    return script
+
+
+def sim_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def start_sim_timeline(server: SimulatorVaultServer) -> None:
+    enabled = os.environ.get("SIM_TIMELINE", "1") != "0"
+    with server.fixture_lock:
+        server.active_job_generation += 1
+        generation = server.active_job_generation
+        server.active_job_timeline = []
+        server.active_job_timeline_enabled = enabled
+        server.active_job_timeline_done = not enabled
+        server.active_job_final_status = "succeeded"
+    if not enabled:
+        return
+    delay = float(os.environ.get("SIM_JOB_STREAM_DELAY", "0.35"))
+
+    def run() -> None:
+        started: set[str] = set()
+        for pause, event in sim_timeline_script():
+            if delay > 0 and pause > 0:
+                time.sleep(delay * pause)
+            if event.get("type") == "step":
+                # Stamp real times so the phone's ticking durations are honest.
+                now = sim_now_iso()
+                if event["id"] not in started:
+                    started.add(event["id"])
+                    event.setdefault("startedAt", now)
+                if event.get("status") in {"done", "failed", "cancelled"}:
+                    event.setdefault("endedAt", now)
+            with server.fixture_lock:
+                if server.active_job_generation != generation:
+                    return
+                server.active_job_timeline.append(event)
+        with server.fixture_lock:
+            if server.active_job_generation == generation:
+                server.active_job_timeline_done = True
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def sim_timeline_cursor(server: SimulatorVaultServer, query: dict | None) -> int | None:
+    """The client's timeline cursor, or None when it did not ask for a timeline
+    or this run has none (then the stream is the legacy one, unchanged)."""
+    values = (query or {}).get("timeline")
+    if not values:
+        return None
+    with server.fixture_lock:
+        if not server.active_job_timeline_enabled:
+            return None
+    return bounded_int(values[0], 0, 0, 1_000_000)
+
+
+def sim_timeline_page(server: SimulatorVaultServer, query: dict) -> dict:
+    since = bounded_int((query.get("since") or ["0"])[0], 0, 0, 1_000_000)
+    with server.fixture_lock:
+        events = list(server.active_job_timeline)
+        finished = server.active_job_timeline_done
+    since = min(since, len(events))
+    page = events[since:since + 2000]
+    next_cursor = since + len(page)
+    return {
+        "jobId": "sim-job-running",
+        "events": [{"seq": since + index + 1, "event": event} for index, event in enumerate(page)],
+        "next": next_cursor,
+        "complete": finished and next_cursor == len(events),
+    }
+
+
 # Drives a simulated job lifecycle across poll ticks so the Task tab's live job card
 # shows queued -> running (growing logs) -> succeeded instead of a frozen card.
 _SIM_JOB_STAGES = [
@@ -1583,6 +1839,34 @@ _SIM_JOB_STAGES = [
 
 
 def codex_fixture_running_job_tick(server: SimulatorVaultServer) -> dict:
+    with server.fixture_lock:
+        timeline_enabled = server.active_job_timeline_enabled
+        timeline_done = server.active_job_timeline_done
+        timeline_count = len(server.active_job_timeline)
+        final_status = server.active_job_final_status
+    if timeline_enabled:
+        # A scripted run ends when its timeline does, not after N polls, so the
+        # poll and the stream never disagree about whether the job is over.
+        with server.fixture_lock:
+            provider = server.active_job_provider
+            model = server.active_job_model
+            prompt = server.active_job_prompt
+        if not timeline_done:
+            status, result = "running", None
+        elif final_status == "succeeded":
+            status, result = "succeeded", _SIM_TIMELINE_ANSWER
+        else:
+            status, result = final_status, "Simulator job canceled."
+        job = codex_fixture_job(
+            status=status,
+            result=result,
+            id="sim-job-running",
+            provider=provider,
+            model=model,
+            prompt=prompt,
+        )
+        job["timelineEvents"] = timeline_count
+        return job
     with server.fixture_lock:
         n = server.active_job_tick
         server.active_job_tick = n + 1

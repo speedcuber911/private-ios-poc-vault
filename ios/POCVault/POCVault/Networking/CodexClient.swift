@@ -1137,7 +1137,8 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
     func streamJobEvents(
         id: String,
         stdoutOffset: Int64? = nil,
-        stderrOffset: Int64? = nil
+        stderrOffset: Int64? = nil,
+        timeline: Int? = nil
     ) -> AsyncThrowingStream<CodexJobStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
@@ -1148,6 +1149,11 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
                     }
                     if let stderrOffset {
                         queryItems.append(URLQueryItem(name: "stderrOffset", value: String(stderrOffset)))
+                    }
+                    // Opt in to timeline events, from the count already held. A machine
+                    // that predates timelines ignores the parameter.
+                    if let timeline {
+                        queryItems.append(URLQueryItem(name: "timeline", value: String(max(0, timeline))))
                     }
 
                     let path = "/v1/codex/jobs/\(Self.pathComponent(id))/stream"
