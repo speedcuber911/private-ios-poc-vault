@@ -23,6 +23,7 @@ extension View {
 
 struct RelayChatView: View {
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject var viewModel: RelayChatViewModel
     let client: CodexClient
     @ObservedObject var identityStore: ClientIdentityStore
@@ -56,6 +57,9 @@ struct RelayChatView: View {
     @State private var providerLoginRequest: CodexProvider?
     @State private var activityRequest: RelayActivityRequest?
     @StateObject private var scroller = RelayTranscriptScroller()
+    @State private var backSwipeOffset: CGFloat = 0
+    @State private var viewportWidth: CGFloat = 0
+    @State private var finishingBackSwipe = false
 
     var body: some View {
         NavigationStack {
@@ -238,19 +242,59 @@ struct RelayChatView: View {
         // The chat opens as its own full-screen presentation; re-pin the app's
         // deliberate dark-only appearance so the cover can never flash light.
         .preferredColorScheme(.dark)
+        .background {
+            GeometryReader { geometry in
+                Color.clear
+                    .onAppear { viewportWidth = geometry.size.width }
+                    .onChange(of: geometry.size.width) { _, width in viewportWidth = width }
+            }
+            .allowsHitTesting(false)
+        }
+        .offset(x: reduceMotion ? 0 : backSwipeOffset)
+        .presentationBackground(.clear)
+        .simultaneousGesture(backSwipeGesture)
+    }
+
+    private var backSwipeGesture: some Gesture {
+        DragGesture(minimumDistance: 16, coordinateSpace: .global)
+            .onChanged { value in
+                guard onDismiss != nil, !finishingBackSwipe,
+                      value.startLocation.x <= 24,
+                      value.translation.width > abs(value.translation.height) * 1.5 else { return }
+                backSwipeOffset = max(0, value.translation.width)
+            }
+            .onEnded { value in
+                guard backSwipeOffset > 0, let onDismiss, !finishingBackSwipe else { return }
+                let isHorizontal = value.translation.width > abs(value.translation.height) * 1.5
+                if isHorizontal && (value.translation.width > 100 || (value.translation.width > 40 && value.predictedEndTranslation.width > 220)) {
+                    finishingBackSwipe = true
+                    dismissKeyboard()
+                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
+                        backSwipeOffset = max(viewportWidth, backSwipeOffset)
+                    }
+                    Task { @MainActor in
+                        if !reduceMotion { try? await Task.sleep(for: .milliseconds(180)) }
+                        var transaction = Transaction()
+                        transaction.disablesAnimations = true
+                        withTransaction(transaction) { onDismiss() }
+                    }
+                } else {
+                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) { backSwipeOffset = 0 }
+                }
+            }
     }
 
     private var topBar: some View {
         HStack(spacing: 4) {
             if let onDismiss {
                 Button(action: onDismiss) {
-                    Image(systemName: "chevron.down")
+                    Image(systemName: "chevron.left")
                         .font(AppTheme.uiFont(size: 16, weight: .semibold))
                         .foregroundStyle(RelayChatStyle.secondary)
                         .frame(width: 44, height: 44)
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Close chat")
+                .accessibilityLabel("Back")
             }
 
             Button {
@@ -258,7 +302,7 @@ struct RelayChatView: View {
                 showingThreads = true
             } label: {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(viewModel.folderDisplayName)
+                    Text(viewModel.conversationTitle)
                         .font(.custom("DMSans-9ptRegular", size: 17, relativeTo: .headline).weight(.semibold))
                         .foregroundStyle(AppTheme.textPrimary)
                         .lineLimit(1)
@@ -280,7 +324,7 @@ struct RelayChatView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("\(viewModel.folderDisplayName), Threads, \(viewModel.historyItems.count) conversations and invocations")
+            .accessibilityLabel("\(viewModel.conversationTitle), Threads, \(viewModel.historyItems.count) conversations and invocations")
             .accessibilityIdentifier("relay-threads")
 
             Button(action: startNewConversation) {

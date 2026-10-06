@@ -592,6 +592,16 @@ final class RelayChatViewModel: ObservableObject {
     /// new conversation instead of looking like an in-place model change.
     var currentSessionProvider: CodexProvider? { currentThreadProvider }
 
+    var conversationTitle: String {
+        if let thread = threads.first(where: { $0.sessionId == currentThreadID }) {
+            return thread.displayTitle
+        }
+        if let prompt = messages.first(where: { $0.role == .user })?.text.trimmedNonEmpty {
+            return CodexMarkdownParser.plainText(from: prompt)
+        }
+        return folderDisplayName
+    }
+
     /// Unified, newest-first history for this exact folder. Server threads carry complete
     /// conversations; standalone jobs cover invocations whose provider never produced a
     /// resumable session (or whose session discovery has not completed yet). The extra
