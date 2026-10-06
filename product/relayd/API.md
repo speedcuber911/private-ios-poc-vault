@@ -3,7 +3,9 @@
 ## Native runtime controls (implemented)
 
 Relay uses the installed, signed-in provider CLIs on the linked computer. Provider
-credentials and raw tool inputs never leave that computer.
+credentials never leave that computer. What a tool was given and what it returned
+leave it only as steps in the job timeline (§2.11), over the same authenticated
+routes as the job's logs.
 
 - `GET /v1/codex/skills?provider=<codex|claude|cursor|kimi>&workspaceId=<id>` returns sanitized
   metadata for real global and workspace skills/commands discovered on that runner.
@@ -24,6 +26,12 @@ credentials and raw tool inputs never leave that computer.
   into a 30-minute preview URL. The node proxies only that loopback origin on an
   unprivileged port; preview subresources use an opaque scoped capability and run
   in a sandboxed iframe without same-origin access to the Relay API.
+
+- Jobs record a **timeline**: the ordered prose and steps (commands, file reads and
+  edits, searches, sub-agents, thinking) of one run. A job that has one reports
+  `timelineEvents`; `GET /v1/codex/jobs/:id/stream?timeline=<n>` interleaves the events
+  live, `GET /v1/codex/jobs/:id/timeline?since=<n>` pages them, and thread detail carries
+  the same steps as history (`steps`, `trailingSteps`). See §2.11.
 
 Approval responses omit provider request ids and raw tool payloads. Terminal sessions
 are restricted to the selected workspace, have no network access, and do not source the
@@ -713,6 +721,14 @@ Relay approval MCP and a server-minted `--session-id`; cursor runs
 `session_id`; kimi runs `kimi --model kimi-code/k3 --prompt …
 --output-format stream-json` and resumes with `--session`. AWS/Bedrock
 credentials are scrubbed from the child env for direct claude/cursor/kimi jobs.
+
+Claude transport (`RELAYD_CLAUDE_TRANSPORT`, default `stream`): the invocation
+above gains `--output-format stream-json --verbose --include-partial-messages`
+and is wrapped by `src/claude-job-runner.mjs`, which records the job timeline
+(§2.11), streams the assistant's prose to stdout and one `[relay-step] …` line
+per step to stderr, and writes the final answer to the result file. `print`
+runs the invocation above exactly as written, with no timeline and the answer
+taken from stdout. Either way `result` is the final answer only.
 
 Session-id semantics: claude = server-minted upfront; cursor = parsed from
 result JSON; kimi = read from Kimi's session index/result events; codex = discovered post-run by diffing the workspace's session
@@ -1621,6 +1637,118 @@ Two implementation details that are load-bearing:
 Audit (`exec`) records the cwd, the command truncated to 200 characters, its
 length, exit code, timeout flag and duration. Output is never audited — it
 is the one field guaranteed to contain repository content.
+
+### 2.11 Job timeline (implemented)
+
+Additive. Part 1 shapes are unchanged: everything here is a new optional
+field, a new query parameter, a new SSE event name or a new route. A client
+that knows none of it sees exactly the Part 1 surface. The normative
+description of the events is
+`docs/superpowers/specs/2026-10-06-chat-composer-and-transcript.md`, Part 1;
+this section is the node's side of it.
+
+**What a timeline is.** The ordered record of one job: the prose the agent
+wrote and the steps it took. Stored per job at
+`<dataDir>/logs/<jobId>.timeline.ndjson`, append-only, one JSON event per
+line. An event's **sequence number** (`seq`) is its 1-based line number. The
+file is deleted wherever the job's logs are deleted. Claude Code jobs on the
+`stream` transport write one; Cursor, Kimi and `print`-transport Claude jobs
+do not. The runner is told where to write by `RELAY_TIMELINE_PATH` in its
+environment.
+
+**Events.** `type` selects the shape. Readers MUST ignore unknown `type`
+values and unknown fields.
+
+| `type` | Fields | Meaning |
+|---|---|---|
+| `text` | `id`, `delta` | Assistant prose. Deltas with one `id` append in order; a new `id` starts after any step. Top-level prose only. |
+| `step` | `id`, then any of `kind`, `title`, `summary`, `status`, `parent`, `startedAt`, `endedAt`, `input`, `output`, `outputTruncated`, `exitCode`, `error` | Creates the step on first sight of `id`, then merges field by field. `input` is always sent whole. |
+| `step.delta` | `id`, `output` | Appends to a running step's `output`. A later `step` carrying `output` replaces the accumulated text. |
+| `usage` | `inputTokens`, `outputTokens` | At most a few per job. |
+
+`kind` is one of `command`, `read`, `edit`, `write`, `search`, `fetch`,
+`tool`, `agent`, `reasoning`, `todo` (render an unknown kind as `tool`).
+`status` is `running`, `done`, `failed` or `cancelled`. A step still
+`running` when its job is terminal was cut short: read it as `cancelled`
+(job cancelled or timed out) or `failed` (job failed). `parent` is the `id`
+of the enclosing `agent` step. Caps: `summary` 200 characters;
+`input.command`, `input.prompt`, `input.diff`, `input.json` 8 KiB each;
+`output` 32 KiB per step counting deltas, head and tail kept, with
+`outputTruncated: true`. Every string passes the same cleaning as job logs
+(ANSI escapes and control characters removed) on its way out.
+
+**Discovery: `timelineEvents`.** The job response (§1.16) in every shape
+(`full`, `preview`, `compact`, the `done` SSE payload, and the compact jobs
+inside thread detail) gains optional integer `timelineEvents`, the number of
+events so far. It is omitted when the job has no timeline; treat absent and
+`0` alike and fall back to the log rendering. The count grows while the job
+runs, is final once the job is terminal, and survives a daemon restart.
+
+**Live: `GET /v1/codex/jobs/:id/stream?timeline=<n>`.** New optional query
+parameter on §1.18: the number of timeline events the client already holds
+(`0` for all). Only when it is present, the stream also carries
+
+```
+event: timeline
+data: {"seq":<n>,"event":{…}}
+```
+
+for every event with `seq > n`: first what is already on disk, then each new
+event as it is written, in order, all of them before `done`. These messages
+have **no `id:` line** and do not advance the stream's event counter, so
+`Last-Event-ID` (§2.1) keeps its three-part meaning and describes the log
+channels alone; a client resuming a stream sends both `Last-Event-ID` and
+`timeline=<last seq it holds>`. There is no page size on the stream. Without
+the parameter the stream is byte for byte the §1.18 stream. Errors: 400
+`stream offset must be a non-negative integer` for a malformed value.
+
+**Fetch: `GET /v1/codex/jobs/:id/timeline?since=<n>`.** Same auth as every
+other job route; 404 `job not found` likewise.
+
+```json
+{"jobId":"…","events":[{"seq":41,"event":{"type":"step","id":"s3","status":"done"}}],"next":41,"complete":true}
+```
+
+`since` defaults to `0`. `events` are those with `seq > since`, at most 2,000
+events or 1 MiB per response; `next` is the cursor for the following request.
+`complete` is true when the job is terminal and nothing follows `next`. A job
+with no timeline answers `{"events":[],"next":0,"complete":<terminal>}`. A
+`since` past the end answers no events and `next` at the end. Errors: 400
+`stream offset must be a non-negative integer`.
+
+**History: thread detail (§1.13).** Each message in
+`GET /v1/codex/threads/:id` gains optional `steps`: the complete `step`
+objects (same fields, `"type":"step"`, no deltas) that happened since the
+previous returned message, in order, a sub-agent's steps directly after
+their `agent` step with `parent` set. The response gains optional
+`trailingSteps` for steps after the last message. Both are omitted when
+empty. They are read from the harness's own session transcript, so they
+cover turns that did not run through Relay. In history `output` and the
+capped `input` fields are cut to 4 KiB, a message carries at most its latest
+200 steps, steps beyond the newest 1.5 MiB of detail keep only their row
+fields (no `output`, no capped `input` fields; `outputTruncated: true`), step ids are stable across requests but are **not** the ids the
+live timeline used for the same turn, and a step whose result the transcript
+never recorded is `cancelled` (a later prompt followed it) or `running` (the
+transcript ends there).
+
+**Claude Code mapping.** `text_delta` → `text`; a `thinking` block → a
+`reasoning` step (Claude Code usually withholds the thought text, so the
+step often has no `output`); `tool_use` → a `running` step as soon as the
+block opens, updated with `summary` and `input` once the input is complete,
+closed by its `tool_result` (`done`, or `failed` on `is_error`); `Agent` or
+`Task` → kind `agent`, and every tool call whose `parent_tool_use_id` is
+that tool's id is a child step (a sub-agent's prose and thinking are not
+emitted; its report is the agent step's `output`); `TodoWrite`, `TaskCreate`
+and `TaskUpdate` → `todo`; `mcp__<server>__<tool>` → `tool` with a readable
+`title`. `exitCode` is `0` for a foreground command that returned normally
+and the code Claude Code reports (`Exit code N`) otherwise; a command that
+was refused or blocked has `error` and no `exitCode`.
+
+**Legacy channels.** For a timeline job, stdout is the assistant's prose
+(blocks separated by a blank line) and stderr is one `[relay-step] <text>`
+line per step (`Running <command>`, `Reading <file>`, `Editing <file>`,
+`Writing <file>`, `Searching <pattern>`, `Fetching <url>`, `Agent:
+<description>`, `Using <tool>`), plus anything the CLI itself printed.
 
 ---
 

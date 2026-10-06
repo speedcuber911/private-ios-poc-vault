@@ -161,3 +161,77 @@ export function readTimeline(file, { since = 0, maxEvents = 2000, maxBytes = 102
 export function countTimelineEvents(file) {
   return readTimeline(file, { since: 0, maxEvents: 0 }).total;
 }
+
+// The same cleaning relayd applies to job logs on their way out (ANSI escapes
+// and control characters removed), applied to every string in an event.
+export function cleanTimelineStrings(value) {
+  if (typeof value === "string") {
+    return value.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "").replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+  }
+  if (Array.isArray(value)) return value.map(cleanTimelineStrings);
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [key, item] of Object.entries(value)) out[key] = cleanTimelineStrings(item);
+    return out;
+  }
+  return value;
+}
+
+const TAIL_CHUNK_BYTES = 256 * 1024;
+
+// Follows a timeline file from a cursor without re-reading what it has already
+// delivered. `since` is the count of events the reader already holds. read()
+// returns the complete events appended since the last call; a torn last line
+// waits for its newline. `count()` is the number of lines consumed so far.
+export function createTimelineTail(file, { since = 0 } = {}) {
+  const held = Number.isFinite(since) && since > 0 ? Math.trunc(since) : 0;
+  let position = 0;
+  let seq = 0;
+  let pending = [];
+
+  return {
+    count() {
+      return seq;
+    },
+    read() {
+      const events = [];
+      let fd;
+      try {
+        fd = fs.openSync(file, "r");
+      } catch {
+        return events;
+      }
+      try {
+        for (;;) {
+          const chunk = Buffer.allocUnsafe(TAIL_CHUNK_BYTES);
+          const read = fs.readSync(fd, chunk, 0, TAIL_CHUNK_BYTES, position);
+          if (read <= 0) break;
+          position += read;
+          const data = chunk.subarray(0, read);
+          let offset = 0;
+          let newline;
+          while ((newline = data.indexOf(10, offset)) !== -1) {
+            const piece = data.subarray(offset, newline);
+            offset = newline + 1;
+            const line = pending.length ? Buffer.concat([...pending, piece]) : piece;
+            pending = [];
+            seq += 1;
+            if (seq <= held) continue;
+            try {
+              events.push({ seq, event: JSON.parse(line.toString("utf8")) });
+            } catch {
+              // Not JSON: the line keeps its sequence number and is skipped.
+            }
+          }
+          if (offset < data.length) pending.push(Buffer.from(data.subarray(offset)));
+          if (read < TAIL_CHUNK_BYTES) break;
+        }
+      } catch {
+        // A read error leaves the cursor where it was for the next attempt.
+      } finally {
+        fs.closeSync(fd);
+      }
+      return events;
+    },
+  };
+}

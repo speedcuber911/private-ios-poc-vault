@@ -14,6 +14,9 @@ import { isResumableSessionId, isKimiSessionId, isThreadSessionId } from "./sess
 import { appendAudit } from "./audit.mjs";
 import { dynamicWorkspaces, workspaces, resolveWorkspaceById, browseWorkspaceForPath, cleanWorkspaceId, pathBelongsToRoot } from "./workspaces.mjs";
 import { listChatThreads, chatThreadDetailResponse, deleteChatThread } from "./chat.mjs";
+import { cleanTimelineStrings } from "./timeline.mjs";
+import { createClaudeTranscriptCollector } from "./timeline-claude.mjs";
+import { createCodexTranscriptCollector } from "./timeline-codex.mjs";
 import { jobsState, jobs, activeChildren, responseShape, normalizeJobProvider, removePersistedJobFiles, removePathInsideRoot, jobThreadId, toJobResponse, attachmentKind } from "./jobs.mjs";
 
 function cleanThreadProviderFilter(value) {
@@ -978,10 +981,12 @@ async function threadDetailResponse(sessionId, { provider = null } = {}) {
   const sortedJobs = [...state.thread.jobs].sort((left, right) =>
     compareIsoDesc(left.updatedAt || left.createdAt, right.updatedAt || right.createdAt),
   );
+  const trailingSteps = publicSteps(state.trailingSteps);
   return {
     thread: threadSummary(state.thread),
     messages: publicThreadMessages(state.messages),
     jobs: await Promise.all(sortedJobs.map((job) => toJobResponse(job, responseShape("compact")))),
+    ...(trailingSteps.length ? { trailingSteps } : {}),
   };
 }
 
@@ -991,6 +996,7 @@ async function loadThreadDetailState(sessionId, { provider = null } = {}) {
   const sessionFile = findSessionFile(sessionsDir, sessionId);
   let thread = null;
   let messages = [];
+  let trailingSteps = [];
 
   if (sessionFile) {
     const meta = readSessionMeta(sessionFile, sessionId);
@@ -1006,7 +1012,7 @@ async function loadThreadDetailState(sessionId, { provider = null } = {}) {
         timestamp: meta.timestamp,
         updatedAt: stat.mtime.toISOString(),
       });
-      messages = await readSessionMessages(sessionFile, { sessionId: meta.id });
+      ({ messages, trailingSteps } = await readSessionTranscript(sessionFile, { sessionId: meta.id }));
     }
   }
 
@@ -1024,7 +1030,7 @@ async function loadThreadDetailState(sessionId, { provider = null } = {}) {
         timestamp: claudeMeta.timestamp,
         updatedAt: stat.mtime.toISOString(),
       });
-      messages = await readSessionMessages(claudeFile, { sessionId });
+      ({ messages, trailingSteps } = await readSessionTranscript(claudeFile, { sessionId }));
     }
   }
 
@@ -1040,7 +1046,7 @@ async function loadThreadDetailState(sessionId, { provider = null } = {}) {
         timestamp: cursor.timestamp,
         updatedAt: cursor.updatedAt,
       });
-      if (cursor.file) messages = await readSessionMessages(cursor.file, { sessionId });
+      if (cursor.file) ({ messages, trailingSteps } = await readSessionTranscript(cursor.file, { sessionId }));
     }
   }
 
@@ -1077,7 +1083,7 @@ async function loadThreadDetailState(sessionId, { provider = null } = {}) {
     return { chatDetail };
   }
 
-  return { thread, messages };
+  return { thread, messages, trailingSteps };
 }
 
 
@@ -1086,12 +1092,26 @@ function isSafeThreadAttachmentId(value) {
 }
 
 function publicThreadMessages(messages) {
-  return (Array.isArray(messages) ? messages : []).map((message) => ({
-    role: message.role,
-    timestamp: message.timestamp || null,
-    text: message.text || "",
-    attachments: publicAttachments(message.attachments),
-  }));
+  return (Array.isArray(messages) ? messages : []).map((message) => {
+    const steps = publicSteps(message.steps);
+    return {
+      role: message.role,
+      timestamp: message.timestamp || null,
+      text: message.text || "",
+      attachments: publicAttachments(message.attachments),
+      // Present only when something happened before this message, so a
+      // message without steps reads exactly as it always has.
+      ...(steps.length ? { steps } : {}),
+    };
+  });
+}
+
+// Steps leave through the same cleaning as job logs.
+function publicSteps(steps) {
+  if (!Array.isArray(steps) || steps.length === 0) return [];
+  return steps
+    .filter((step) => step && typeof step === "object" && typeof step.id === "string")
+    .map((step) => cleanTimelineStrings(step));
 }
 
 function publicAttachments(attachments) {
@@ -1446,15 +1466,92 @@ function readSessionSummaryWithStat(sessionFile, stat) {
 }
 
 
-async function readSessionMessages(sessionFile, { sessionId = null } = {}) {
+async function readSessionMessages(sessionFile, options = {}) {
+  return (await readSessionTranscript(sessionFile, options)).messages;
+}
+
+// The most steps one message carries. A turn that ran more keeps its latest.
+const MAX_STEPS_PER_MESSAGE = 200;
+const MAX_SIDECHAIN_BYTES = 4 * 1024 * 1024;
+
+// Keeps the latest steps, and never a child whose agent step was dropped.
+function boundSteps(steps) {
+  if (steps.length <= MAX_STEPS_PER_MESSAGE) return steps;
+  const kept = steps.slice(-MAX_STEPS_PER_MESSAGE);
+  const ids = new Set(kept.map((step) => step.id));
+  return kept.filter((step) => !step.parent || ids.has(step.parent));
+}
+
+// Claude Code keeps each sub-agent's transcript beside the session:
+// <projects>/<project>/<sessionId>/subagents/agent-<agentId>.jsonl.
+function claudeSidechainReader(sessionFile) {
+  const directory = path.join(
+    path.dirname(sessionFile),
+    path.basename(sessionFile, path.extname(sessionFile)),
+    "subagents",
+  );
+  return (agentId) => {
+    if (typeof agentId !== "string" || !/^[A-Za-z0-9_-]{1,80}$/.test(agentId)) return [];
+    const file = path.join(directory, `agent-${agentId}.jsonl`);
+    let stat;
+    try {
+      stat = fs.statSync(file);
+    } catch {
+      return [];
+    }
+    if (!stat.isFile() || stat.size > MAX_SIDECHAIN_BYTES) return [];
+    const entries = [];
+    for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        entries.push(JSON.parse(line));
+      } catch {
+        continue;
+      }
+    }
+    return entries;
+  };
+}
+
+// Messages as before, plus the steps between them: each message may carry
+// `steps` (what happened since the previous returned message) and
+// `trailingSteps` holds what happened after the last one.
+async function readSessionTranscript(sessionFile, { sessionId = null } = {}) {
   const messages = [];
   const id = sessionId || path.basename(sessionFile, path.extname(sessionFile));
+  // Each collector ignores lines that are not its harness's, so both see
+  // every line and the reader does not need to know whose transcript this is.
+  const collectors = [
+    createClaudeTranscriptCollector({ readSidechain: claudeSidechainReader(sessionFile) }),
+    createCodexTranscriptCollector(),
+  ];
+  const takeSteps = (options) => {
+    const steps = [];
+    for (const collector of collectors) {
+      try {
+        steps.push(...collector.take(options));
+      } catch {
+        continue;
+      }
+    }
+    return steps;
+  };
+  // Steps taken before a line that turned out not to be a message.
+  let carried = [];
   const input = fs.createReadStream(sessionFile, { encoding: "utf8" });
   const lines = readline.createInterface({ input, crlfDelay: Infinity });
   for await (const line of lines) {
     if (!line.trim()) continue;
     try {
-      const turn = parseTranscriptTurn(JSON.parse(line));
+      const entry = JSON.parse(line);
+      for (const collector of collectors) {
+        try {
+          collector.push(entry);
+        } catch {
+          continue;
+        }
+      }
+      const turn = parseTranscriptTurn(entry);
       if (!turn) continue;
 
       const cleanText = turn.role === "user" ? turn.text : cleanThreadMessageText(turn.text);
@@ -1462,18 +1559,49 @@ async function readSessionMessages(sessionFile, { sessionId = null } = {}) {
       const attachments = finalizeAttachments(id, turn.attachments);
       if (!text && attachments.length === 0) continue;
 
-      messages.push({
+      const message = {
         role: turn.role,
         timestamp: turn.timestamp,
         text,
         attachments,
-      });
+      };
+      carried = boundSteps([...carried, ...takeSteps()]);
+      if (carried.length) message.steps = carried;
+      carried = [];
+      messages.push(message);
       if (messages.length > 120) messages.shift();
     } catch {
       continue;
     }
   }
-  return messages;
+  const trailingSteps = boundSteps([...carried, ...takeSteps({ final: true })]);
+  slimOlderSteps(messages, trailingSteps);
+  return { messages, trailingSteps };
+}
+
+// A long thread can hold thousands of steps. The newest keep their detail up
+// to this budget; older ones keep what a collapsed row needs (kind, title,
+// summary, status, times) and lose their bulk.
+const HISTORY_STEP_DETAIL_BYTES = 1536 * 1024;
+
+function slimOlderSteps(messages, trailingSteps) {
+  let spent = 0;
+  const groups = [trailingSteps, ...[...messages].reverse().map((message) => message.steps || [])];
+  for (const steps of groups) {
+    for (let index = steps.length - 1; index >= 0; index -= 1) {
+      const step = steps[index];
+      if (spent <= HISTORY_STEP_DETAIL_BYTES) spent += JSON.stringify(step).length;
+      if (spent <= HISTORY_STEP_DETAIL_BYTES) continue;
+      if (typeof step.output === "string" && step.output) {
+        delete step.output;
+        step.outputTruncated = true;
+      }
+      if (step.input && typeof step.input === "object") {
+        const { command, prompt, diff, json, ...rest } = step.input;
+        step.input = rest;
+      }
+    }
+  }
 }
 
 
@@ -2055,6 +2183,7 @@ export {
   threadSummary,
   readSessionSummary,
   readSessionMessages,
+  readSessionTranscript,
   readSessionLines,
   messageText,
   summaryText,
