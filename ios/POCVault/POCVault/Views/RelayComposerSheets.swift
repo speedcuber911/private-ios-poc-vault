@@ -487,7 +487,8 @@ struct RelayModelSheet: View {
                     effortPage.transition(.relaySheetPush)
                 }
             }
-            .padding(.bottom, 24)
+            // The sheet's own bottom safe area supplies the rest of the margin.
+            .padding(.bottom, 4)
         }
     }
 
@@ -528,6 +529,16 @@ struct RelayModelSheet: View {
     }
 
     private var agentPills: some View {
+        ScrollViewReader { proxy in
+            agentPillRow
+                // The selected agent may sit past the trailing edge on a long catalog.
+                .onAppear {
+                    if let tab { proxy.scrollTo(tab.id, anchor: .center) }
+                }
+        }
+    }
+
+    private var agentPillRow: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 ForEach(tabs) { candidate in
@@ -538,7 +549,11 @@ struct RelayModelSheet: View {
                         HStack(spacing: 7) {
                             switch candidate {
                             case .agent(let provider):
-                                RelayProviderMark(provider: provider, size: 14)
+                                RelayComposerProviderMark(
+                                    provider: provider,
+                                    size: 14,
+                                    color: isSelected ? AppTheme.textPrimary : RelayChatStyle.secondary
+                                )
                             case .chat:
                                 Image(systemName: "bubble.left")
                                     .font(.system(size: 12, weight: .semibold))
@@ -564,6 +579,7 @@ struct RelayModelSheet: View {
                     .buttonStyle(.plain)
                     .accessibilityAddTraits(isSelected ? .isSelected : [])
                     .accessibilityIdentifier("relay-model-agent-\(candidate.id)")
+                    .id(candidate.id)
                 }
             }
             .padding(.horizontal, 16)
@@ -697,7 +713,8 @@ struct RelayAddSheet: View {
                     skillsPage.transition(.relaySheetPush)
                 }
             }
-            .padding(.bottom, 24)
+            // The sheet's own bottom safe area supplies the rest of the margin.
+            .padding(.bottom, 4)
         }
     }
 

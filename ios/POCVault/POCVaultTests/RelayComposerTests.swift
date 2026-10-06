@@ -303,6 +303,19 @@ final class RelayComposerTests: XCTestCase {
         try render(addSheet(.fileAccess, provider: .codex, sandbox: .fullAccess), size: sheet, to: output, name: "sheet-file-access-unsandboxed")
         try render(addSheet(.approvals, provider: .codex), size: sheet, to: output, name: "sheet-approvals")
         try render(addSheet(.skills, provider: .claude), size: sheet, to: output, name: "sheet-skills")
+
+        // The same sheets really presented, to check the fitted detent, the drag
+        // indicator and the bottom inset rather than only the content.
+        let screen = CGSize(width: 402, height: 874)
+        func presented<Sheet: View>(_ content: Sheet) -> some View {
+            AppTheme.bgCanvas
+                .ignoresSafeArea()
+                .sheet(isPresented: .constant(true)) { content }
+        }
+        try render(presented(modelSheet(thread: nil)), size: screen, to: output, name: "presented-model-new", settle: 1.5)
+        try render(presented(modelSheet(thread: .claude, page: .effort)), size: screen, to: output, name: "presented-effort", settle: 1.5)
+        try render(presented(addSheet(.root, provider: .claude)), size: screen, to: output, name: "presented-add", settle: 1.5)
+        try render(presented(addSheet(.skills, provider: .claude)), size: screen, to: output, name: "presented-skills", settle: 1.5)
     }
 
     @MainActor
@@ -310,18 +323,26 @@ final class RelayComposerTests: XCTestCase {
         _ view: Content,
         size: CGSize,
         to directory: URL,
-        name: String
+        name: String,
+        settle: TimeInterval = 0.4
     ) throws {
         let host = UIHostingController(rootView: view.environment(\.colorScheme, .dark))
         host.overrideUserInterfaceStyle = .dark
         host.safeAreaRegions = []
-        let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+        // drawHierarchy renders black unless the window belongs to a live scene.
+        let scene = try XCTUnwrap(
+            UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first,
+            "Snapshots need the test host app's window scene"
+        )
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(origin: .zero, size: size)
+        window.windowLevel = .alert + 1
         window.rootViewController = host
         window.isHidden = false
         host.view.frame = window.bounds
         host.view.layoutIfNeeded()
         // Preference-driven sizing and asset images settle over a couple of passes.
-        RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+        RunLoop.main.run(until: Date().addingTimeInterval(settle))
         host.view.layoutIfNeeded()
 
         let format = UIGraphicsImageRendererFormat()
@@ -329,7 +350,13 @@ final class RelayComposerTests: XCTestCase {
         let image = UIGraphicsImageRenderer(size: size, format: format).image { _ in
             window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
         }
+        if host.presentedViewController != nil {
+            host.dismiss(animated: false)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        }
         window.isHidden = true
+        window.rootViewController = nil
+        window.windowScene = nil
         let data = try XCTUnwrap(image.pngData())
         try data.write(to: directory.appendingPathComponent("\(name).png"))
     }
