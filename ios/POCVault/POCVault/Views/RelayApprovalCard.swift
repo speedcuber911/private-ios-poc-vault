@@ -63,13 +63,13 @@ struct RelayApprovalCard: View {
                     .foregroundStyle(AppTheme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 Button("Deny") { onDecision(.decline) }
                     .buttonStyle(RelayOutlineButtonStyle())
                 Button("Approve") { onDecision(.accept) }
                     .buttonStyle(RelayPrimaryButtonStyle())
             }
-            .padding(.top, 2)
+            .padding(.top, 4)
         }
         .padding(16)
         .background(AppTheme.canvasTop, in: RoundedRectangle(cornerRadius: 18, style: .continuous))

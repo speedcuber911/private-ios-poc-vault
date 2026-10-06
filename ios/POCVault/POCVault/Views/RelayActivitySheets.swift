@@ -29,7 +29,7 @@ enum RelayActivitySheetStyle {
     static let block = AppTheme.textPrimary.opacity(0.05)
     static let control = AppTheme.textPrimary.opacity(0.08)
     static let groupRadius: CGFloat = 18
-    static let blockRadius: CGFloat = 14
+    static let blockRadius: CGFloat = 12
     /// The sheet grows with its content up to this share of the screen, then scrolls.
     static let maxScreenShare: CGFloat = 0.7
     static let headerHeight: CGFloat = 76
@@ -50,8 +50,24 @@ struct RelayActivitySheet: View {
     /// Step ids pushed on top of the root page.
     @State private var path: [String] = []
     @State private var contentHeight: CGFloat = 240
+    /// A row that stands for one step opens that step, not a list of one.
+    /// Decided when the sheet opens so a block that grows does not swap pages.
+    @State private var soleStepID: String?
 
-    private var timeline: RelayTimeline {
+    init(request: RelayActivityRequest, viewModel: RelayChatViewModel) {
+        self.request = request
+        self.viewModel = viewModel
+        let timeline = Self.timeline(for: request, in: viewModel)
+        var sole: String?
+        if case .block(let id) = request.root,
+           let block = timeline.blocks.first(where: { $0.id == id }) {
+            let steps = timeline.steps(in: block)
+            if steps.count == 1 { sole = steps[0].id }
+        }
+        _soleStepID = State(initialValue: sole)
+    }
+
+    private static func timeline(for request: RelayActivityRequest, in viewModel: RelayChatViewModel) -> RelayTimeline {
         switch request.source {
         case .job(let id):
             return viewModel.timeline(forJobID: id) ?? RelayTimeline()
@@ -60,10 +76,12 @@ struct RelayActivitySheet: View {
         }
     }
 
+    private var timeline: RelayTimeline { Self.timeline(for: request, in: viewModel) }
+
     private var currentStepID: String? {
         if let last = path.last { return last }
         if case .step(let id) = request.root { return id }
-        return nil
+        return soleStepID
     }
 
     private var rootSteps: [RelayStep] {
@@ -142,6 +160,7 @@ struct RelayActivitySheet: View {
                 .accessibilityIdentifier("relay-activity-close")
                 Spacer()
             }
+            // The 36pt circle sits on the same 16pt gutter as the content.
             .padding(.horizontal, 12)
         }
         .frame(height: RelayActivitySheetStyle.headerHeight - 24)
@@ -194,7 +213,7 @@ struct RelayStepList: View {
                     Rectangle()
                         .fill(AppTheme.hairline)
                         .frame(height: 1)
-                        .padding(.leading, 14)
+                        .padding(.leading, 16)
                 }
                 RelayStepRow(step: step, childCount: timeline.children(of: step.id).count) {
                     onOpen(step)
@@ -218,7 +237,7 @@ struct RelayStepRow: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(alignment: .firstTextBaseline, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
                 RelayCapsLabel(text: step.statusWord, color: step.statusColor, size: 9.5)
                     .lineLimit(1)
                     .frame(width: Self.wordColumn, alignment: .leading)
@@ -234,7 +253,7 @@ struct RelayStepRow: View {
                     .lineLimit(1)
                     .fixedSize()
             }
-            .padding(.horizontal, 14)
+            .padding(.horizontal, 16)
             .frame(minHeight: 48)
             .contentShape(Rectangle())
         }
@@ -270,7 +289,7 @@ struct RelayStepDetail: View {
     @State private var promptExpanded = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 16) {
             statusLine
             sections
             if let error = step.error?.trimmedNonEmpty {
@@ -283,7 +302,7 @@ struct RelayStepDetail: View {
     /// The word and the clock: ember and ticking while the step runs, then its
     /// outcome and how long it took.
     private var statusLine: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 9) {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
             RelayCapsLabel(text: step.statusWord, color: step.statusColor, size: 10)
             if step.status.isRunning {
                 TimelineView(.periodic(from: .now, by: 1)) { context in
@@ -299,7 +318,6 @@ struct RelayStepDetail: View {
         }
         .font(AppTheme.monoFont(size: 11))
         .foregroundStyle(AppTheme.textTertiary)
-        .padding(.horizontal, 2)
     }
 
     @ViewBuilder
@@ -337,7 +355,6 @@ struct RelayStepDetail: View {
                     .lineSpacing(4)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, 2)
             }
         case .todo:
             if let items = step.input.items, !items.isEmpty {
@@ -353,14 +370,19 @@ struct RelayStepDetail: View {
         return name
     }
 
+    /// Output keeps its own indentation: only the blank lines around it go.
+    private var outputText: String? {
+        let text = step.output.trimmingCharacters(in: .newlines)
+        return text.trimmingCharacters(in: .whitespaces).isEmpty ? nil : text
+    }
+
     @ViewBuilder
     private var output: some View {
-        if let text = step.output.trimmedNonEmpty {
+        if let text = outputText {
             section("Output") {
                 textBlock(text, mono: true)
                 if step.outputTruncated {
                     RelayCapsLabel(text: "Output truncated", color: AppTheme.textTertiary, size: 9)
-                        .padding(.horizontal, 2)
                 }
             }
         }
@@ -405,7 +427,7 @@ struct RelayStepDetail: View {
                             Rectangle()
                                 .fill(AppTheme.hairline)
                                 .frame(height: 1)
-                                .padding(.leading, 14)
+                                .padding(.leading, 16)
                         }
                         RelayStepRow(step: child, childCount: 0) { onOpenChild(child.id) }
                     }
@@ -464,7 +486,6 @@ struct RelayStepDetail: View {
     private func section(_ title: String, @ViewBuilder content: () -> some View) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             RelayCapsLabel(text: title, color: AppTheme.textTertiary, size: 9.5)
-                .padding(.horizontal, 2)
             content()
         }
     }

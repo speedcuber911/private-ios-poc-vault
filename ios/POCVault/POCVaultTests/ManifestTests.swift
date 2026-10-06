@@ -4276,6 +4276,24 @@ final class RelayTranscriptViewTests: XCTestCase {
         XCTAssertFalse(approval.contains(".frame(width: 3)"))
     }
 
+    func testNothingInTheTranscriptScrollsSideways() throws {
+        let files = [
+            "POCVault/Rendering/RelayMarkdownViews.swift",
+            "POCVault/Views/RelayTranscriptViews.swift",
+            "POCVault/Views/RelayActivitySheets.swift",
+            "POCVault/Views/RelayApprovalCard.swift",
+        ]
+        for file in files {
+            let source = try AppSourceFixture.load(file)
+            // Code, commands, paths, diffs and output wrap inside their block;
+            // one-line rows truncate.
+            XCTAssertFalse(source.contains("ScrollView(.horizontal"), file)
+            XCTAssertFalse(source.contains(".fixedSize(horizontal: true"), file)
+        }
+        let rows = try AppSourceFixture.load("POCVault/Views/RelayTranscriptViews.swift")
+        XCTAssertTrue(rows.contains(".truncationMode(.tail)"))
+    }
+
     /// Fails rather than skips: a renamed marker must not silently drop a contract.
     private func snippet(in source: String, from startMarker: String, to endMarker: String) throws -> String {
         let start = try XCTUnwrap(source.range(of: startMarker), "Missing marker: \(startMarker)")

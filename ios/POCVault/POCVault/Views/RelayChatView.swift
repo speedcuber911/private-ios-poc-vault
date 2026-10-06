@@ -435,8 +435,8 @@ struct RelayChatView: View {
                     .accessibilityIdentifier("relay-chat-approval")
                 }
             }
-            .padding(.horizontal, 18)
-            .padding(.bottom, 20)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 16)
             .background { RelayScrollViewFinder(scroller: scroller) }
         }
         .refreshable {
@@ -543,8 +543,8 @@ struct RelayChatView: View {
     }
 
     private static let turnSpacing: CGFloat = 24
-    private static let blockSpacing: CGFloat = 10
-    private static let headerFade: CGFloat = 14
+    private static let blockSpacing: CGFloat = 8
+    private static let headerFade: CGFloat = 12
 
     private var automaticPreviewCandidate: RelayAutomaticPreviewCandidate? {
         guard automaticallyOpensPreviews else { return nil }
@@ -2211,11 +2211,11 @@ private struct RelayJobTurn: View, Equatable {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 4) {
             if !hidesAnswer {
                 if showsByline {
                     RelayTurnByline(provider: job.provider)
-                        .padding(.bottom, 2)
+                        .padding(.bottom, 4)
                 }
                 RelayTimelineBlocks(
                     timeline: timeline,

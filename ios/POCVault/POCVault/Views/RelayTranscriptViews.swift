@@ -224,7 +224,7 @@ struct RelayTurnByline: View {
     let provider: CodexProvider?
 
     var body: some View {
-        HStack(spacing: 7) {
+        HStack(spacing: 8) {
             if let provider {
                 RelayProviderMark(provider: provider, size: 14)
                 Text(provider.relayPresentation.title)
@@ -267,7 +267,7 @@ struct RelayActivityRow: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 7) {
+            HStack(spacing: 8) {
                 Text(summary)
                     .foregroundStyle(RelayChatStyle.secondary)
                     .lineLimit(1)
@@ -325,7 +325,7 @@ struct RelayLiveRowLabel: View {
     var color: Color = AppTheme.accentBright
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 9) {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
             RelayCapsLabel(text: word, color: color, size: 10)
                 .fixedSize()
             if let since {
@@ -378,7 +378,7 @@ struct RelayTimelineBlocks: View {
                 case .prose(let text):
                     RelayTurnProse(text: text, onOpenLoopbackURL: onOpenLoopbackURL)
                         .equatable()
-                        .padding(.vertical, 5)
+                        .padding(.vertical, 4)
                 case .activity:
                     let steps = timeline.countedSteps(in: block, isActive: isActive)
                     if !steps.isEmpty {
@@ -489,7 +489,7 @@ struct RelayTurnFooter: View {
     /// not tick a second one beside them.
     @ViewBuilder
     private var status: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 4) {
             Text(job.status.label)
                 .foregroundStyle(statusColor)
             if !job.status.isActive, let seconds = job.finishedSeconds {

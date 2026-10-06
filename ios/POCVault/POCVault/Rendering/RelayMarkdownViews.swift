@@ -245,12 +245,12 @@ struct RelayMarkdownTable: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(tableFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .background(tableFill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(borderColor, lineWidth: 0.75)
         }
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .textSelection(.enabled)
     }
 
@@ -319,7 +319,6 @@ struct RelayMarkdownTable: View {
 struct RelayCodeBlock: View, Equatable {
     let text: String
     let language: String?
-    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     static func == (lhs: RelayCodeBlock, rhs: RelayCodeBlock) -> Bool {
         lhs.text == rhs.text && lhs.language == rhs.language
@@ -342,19 +341,12 @@ struct RelayCodeBlock: View, Equatable {
                 .buttonStyle(.plain)
                 .accessibilityLabel("Copy code")
             }
-            if dynamicTypeSize.isAccessibilitySize {
-                // Accessibility sizes would wrap mono text mid-token ("qu ery");
-                // keep lines intact and let the block scroll sideways instead.
-                ScrollView(.horizontal, showsIndicators: false) {
-                    codeText
-                        .fixedSize(horizontal: true, vertical: false)
-                }
-            } else {
-                codeText
-            }
+            // Code wraps inside its block at every type size: nothing in the
+            // transcript asks for a sideways swipe.
+            codeText
         }
-        .padding(10)
-        .background(AppTheme.textPrimary.opacity(0.05), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .padding(12)
+        .background(AppTheme.textPrimary.opacity(0.05), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 
     private var codeText: some View {
@@ -363,6 +355,8 @@ struct RelayCodeBlock: View, Equatable {
             .foregroundStyle(AppTheme.textPrimary)
             .textSelection(.enabled)
             .lineLimit(24)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var languageLabel: String {
