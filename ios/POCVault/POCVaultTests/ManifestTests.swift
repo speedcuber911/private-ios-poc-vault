@@ -682,13 +682,23 @@ final class ManifestTests: XCTestCase {
     func testCodexSandboxIsPickableAndTravelsOnlyOnCodexJobs() throws {
         let view = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
         let model = try AppSourceFixture.load("POCVault/Views/RelayChatViewModel.swift")
+        let sheets = try AppSourceFixture.load("POCVault/Views/RelayComposerSheets.swift")
 
-        // A picker section, not an env file the phone cannot see.
-        XCTAssertTrue(view.contains("What Codex can reach"))
-        XCTAssertTrue(view.contains("RelayCodexSandbox.allCases"))
-        XCTAssertTrue(view.contains("onPickCodexSandbox"))
-        // Full access states its consequence where it is chosen.
-        XCTAssertTrue(view.contains("codexSandbox.isUnsandboxed"))
+        // A page in the Add sheet, not an env file the phone cannot see.
+        XCTAssertTrue(view.contains("onPickCodexSandbox: onPickCodexSandbox"))
+        let fileAccess = try sourceSnippet(
+            in: sheets,
+            from: "private var fileAccessPage: some View",
+            to: "private var approvalsPage: some View"
+        )
+        XCTAssertTrue(fileAccess.contains("subpage(\"File access\")"))
+        XCTAssertTrue(fileAccess.contains("RelayCodexSandbox.allCases"))
+        XCTAssertTrue(fileAccess.contains("onPickCodexSandbox(level)"))
+        XCTAssertTrue(fileAccess.contains("detail: level.detail"))
+        // Full access states its consequence where it is chosen, as a warning.
+        XCTAssertTrue(fileAccess.contains("codexSandbox.isUnsandboxed"))
+        XCTAssertTrue(fileAccess.contains("Codex will not be stopped from changing anything on this machine"))
+        XCTAssertTrue(fileAccess.contains(".foregroundStyle(AppTheme.statusWarn)"))
 
         XCTAssertTrue(model.contains("relay.codex.sandbox"))
         XCTAssertTrue(model.contains("sandbox: provider == .codex ? codexSandbox.rawValue : nil"))
@@ -2639,6 +2649,22 @@ final class ManifestTests: XCTestCase {
         XCTAssertFalse(composerSource.contains("keyboardAccessoryClearance"))
         XCTAssertFalse(composerSource.contains(".padding(.bottom, isFocused ?"))
 
+        // Reaching for the mic leaves keyboard focus alone; sending still drops it.
+        let startDictation = try sourceSnippet(
+            in: composerSource,
+            from: "private func startDictation()",
+            to: "private func stopDictation()"
+        )
+        XCTAssertFalse(startDictation.contains("isFocused"))
+        let sendDictated = try sourceSnippet(
+            in: composerSource,
+            from: "private func sendDictated()",
+            to: "private func applyDictation"
+        )
+        XCTAssertTrue(sendDictated.contains("isFocused = false\n            onSend()"))
+        let sheets = try AppSourceFixture.load("POCVault/Views/RelayComposerSheets.swift")
+        XCTAssertFalse(sheets.contains("ToolbarItemGroup(placement: .keyboard)"))
+
         XCTAssertTrue(source.contains("TapGesture().onEnded"))
         XCTAssertTrue(source.contains("dismissKeyboard()"))
         XCTAssertTrue(source.contains("#selector(UIResponder.resignFirstResponder)"))
@@ -2652,17 +2678,46 @@ final class ManifestTests: XCTestCase {
             to: "var body: some View"
         )
 
+        // Row 2 is one fixed-height HStack: "+", model pill, mic, send. It never
+        // scrolls and never wraps, idle or dictating.
         XCTAssertFalse(controlBarSource.contains("ScrollView"))
-        XCTAssertTrue(controlBarSource.contains("modelPickerMenu"))
-        XCTAssertTrue(controlBarSource.contains("showingRunSettings = true"))
-        XCTAssertTrue(controlBarSource.contains("Dictate prompt"))
-        XCTAssertTrue(controlBarSource.contains("relay-dictate"))
-        XCTAssertTrue(controlBarSource.contains("relay-send"))
-        XCTAssertTrue(controlBarSource.contains("relay-run-settings"))
-        XCTAssertTrue(controlBarSource.contains("relay-attach"))
-        XCTAssertTrue(controlBarSource.contains("Attach files or photos"))
         XCTAssertFalse(controlBarSource.contains("VStack"))
         XCTAssertFalse(controlBarSource.contains(".refreshable"))
+        XCTAssertTrue(controlBarSource.contains(".frame(height: Layout.controlHeight)"))
+        XCTAssertTrue(controlBarSource.contains("addButton"))
+        XCTAssertTrue(controlBarSource.contains("modelPill"))
+        XCTAssertTrue(controlBarSource.contains("micButton"))
+        XCTAssertTrue(controlBarSource.contains("sendButton"))
+        XCTAssertTrue(controlBarSource.contains("addSheetStart = .root"))
+        XCTAssertTrue(controlBarSource.contains("showingModelPicker = true"))
+        XCTAssertTrue(controlBarSource.contains("AppConfiguration.supportsDictation"))
+        XCTAssertTrue(controlBarSource.contains("Dictate prompt"))
+        XCTAssertTrue(controlBarSource.contains("relay-add"))
+        XCTAssertTrue(controlBarSource.contains("relay-model-chip"))
+        XCTAssertTrue(controlBarSource.contains("relay-dictate"))
+        XCTAssertTrue(controlBarSource.contains("relay-send"))
+        XCTAssertTrue(controlBarSource.contains("relay-stop"))
+        // Disabled send is cream, never dimmed ember.
+        XCTAssertTrue(controlBarSource.contains("live ? AppTheme.accent : RelayComposerPalette.disabledDisc"))
+        // One "+" replaced the run-settings and attach buttons.
+        XCTAssertFalse(source.contains("relay-run-settings"))
+        XCTAssertFalse(source.contains("relay-attach\""))
+        XCTAssertFalse(source.contains("confirmationDialog(\"Attach\""))
+
+        // Dictation swaps what is in the row, not the row.
+        let sheets = try AppSourceFixture.load("POCVault/Views/RelayComposerSheets.swift")
+        let dictationRow = try sourceSnippet(
+            in: sheets + "\n// END",
+            from: "struct RelayDictationControls: View",
+            to: "// END"
+        )
+        XCTAssertFalse(dictationRow.contains("ScrollView"))
+        XCTAssertFalse(dictationRow.contains("VStack"))
+        XCTAssertTrue(dictationRow.contains(".frame(height: 44)"))
+        XCTAssertTrue(dictationRow.contains("relay-dictate"))
+        XCTAssertTrue(dictationRow.contains("Cancel dictation"))
+        XCTAssertTrue(dictationRow.contains("RelayCapsLabel(text: \"Transcribing\", color: AppTheme.accent)"))
+        XCTAssertTrue(source.contains("relay-dictation-error"))
         XCTAssertFalse(source.contains("usesAccessibilityLayout"))
     }
 
@@ -2678,9 +2733,17 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(composerSource.contains("static let controlHeight: CGFloat = 44"))
         XCTAssertTrue(composerSource.contains("static let actionSize: CGFloat = 44"))
         XCTAssertTrue(composerSource.contains("VStack(spacing: Layout.rowSpacing)"))
-        XCTAssertTrue(composerSource.contains("RoundedRectangle(cornerRadius: 20"))
+        // One floating raised card; the conversation fades out above it instead of
+        // meeting a hairline, and the ground beside and below it stays solid.
+        XCTAssertTrue(composerSource.contains("static let cardRadius: CGFloat = 24"))
+        XCTAssertTrue(composerSource.contains("RoundedRectangle(cornerRadius: Layout.cardRadius, style: .continuous)"))
+        XCTAssertTrue(composerSource.contains(".fill(RelayComposerPalette.raisedCard)"))
         XCTAssertTrue(composerSource.contains(".stroke(AppTheme.hairlineStrong, lineWidth: 1)"))
+        XCTAssertTrue(composerSource.contains(".background(AppTheme.bgCanvas)"))
+        XCTAssertTrue(composerSource.contains("colors: [AppTheme.bgCanvas.opacity(0), AppTheme.bgCanvas]"))
+        XCTAssertFalse(composerSource.contains("Rectangle().fill(AppTheme.hairline).frame(height: 1)"))
         XCTAssertFalse(composerSource.contains(".frame(height: 2)"))
+        XCTAssertTrue(composerSource.contains("Message, or / for commands"))
     }
 
     func testRelayComposerIsPinnedOutsideTheConversationScrollView() throws {
@@ -2703,6 +2766,16 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(source.contains("threadProvider == nil || choice.executionProvider == threadProvider"))
         XCTAssertFalse(source.contains("pendingProviderChoice"))
         XCTAssertFalse(source.contains("providerSwitchTitle"))
+
+        // The Model sheet gets the restricted catalog and picks through the guard.
+        let sheets = try AppSourceFixture.load("POCVault/Views/RelayComposerSheets.swift")
+        XCTAssertTrue(source.contains("visibleSections: visibleSections"))
+        XCTAssertTrue(source.contains("onPickChoice: requestChoice"))
+        // Inside a thread there are no agent pills, only the harness named above its models.
+        XCTAssertTrue(sheets.contains("if threadProvider == nil {\n                agentPills"))
+        XCTAssertTrue(sheets.contains("groupLabel(harness.title)"))
+        XCTAssertFalse(sheets.contains("stays with its original provider"))
+        XCTAssertFalse(source.contains("stays with its original provider"))
     }
 
     /// Revamp I4: the composer is harness-first. The mode toggle, workspace chip, and
@@ -2729,9 +2802,17 @@ final class ManifestTests: XCTestCase {
         XCTAssertFalse(source.contains("Menu(harness.title)"))
         XCTAssertFalse(source.contains("Section(\"Agents\")"))
         XCTAssertTrue(source.contains("showingModelPicker = true"))
-        XCTAssertTrue(source.contains("ForEach(visibleSections.agents)"))
-        XCTAssertTrue(source.contains("pickerSectionHeading(harness.title)"))
-        XCTAssertTrue(source.contains("title: choice.shortModelLabel"))
+        let composerSheets = try AppSourceFixture.load("POCVault/Views/RelayComposerSheets.swift")
+        XCTAssertTrue(source.contains("RelayModelSheet("))
+        XCTAssertTrue(composerSheets.contains("ForEach(visibleSections.agents)"))
+        XCTAssertTrue(composerSheets.contains("RelayModelSheetTab.tabs(for: visibleSections)"))
+        XCTAssertTrue(composerSheets.contains("case .agent: return choice.shortModelLabel"))
+        XCTAssertTrue(composerSheets.contains("case .chat: return choice.chipLabel"))
+        // A fitted sheet with its own header: no large navigation title, no Done.
+        XCTAssertFalse(composerSheets.contains("NavigationStack"))
+        XCTAssertFalse(composerSheets.contains("Button(\"Done\")"))
+        XCTAssertTrue(composerSheets.contains(".preferredColorScheme(.dark)"))
+        XCTAssertFalse(composerSheets.contains("Changes apply to your next message"))
         XCTAssertTrue(viewModelSource.contains("isProviderDefault"))
         XCTAssertFalse(source.contains("Runs this \\(harness.title) session"))
         XCTAssertFalse(source.contains("title: \"\\(harness.title) · \\(choice.shortModelLabel)\""))
@@ -2745,9 +2826,11 @@ final class ManifestTests: XCTestCase {
         XCTAssertFalse(threads.contains(".listStyle(.plain)"))
         XCTAssertTrue(threads.contains("No chats in this folder yet."))
         XCTAssertTrue(threads.contains("contextMenu"))
-        XCTAssertTrue(source.contains("ForEach(visibleSections.chatModels)"))
+        XCTAssertTrue(composerSheets.contains("choiceGroup(visibleSections.chatModels, tab: .chat)"))
         XCTAssertTrue(source.contains("relay-model-chip"))
-        XCTAssertTrue(source.contains("relay-effort-chip"))
+        XCTAssertTrue(composerSheets.contains("relay-effort-chip"))
+        XCTAssertTrue(composerSheets.contains("relay-permission-chip"))
+        XCTAssertTrue(composerSheets.contains("relay-skill-chip"))
         XCTAssertTrue(source.contains("Image(systemName: \"arrow.up\")"))
         XCTAssertTrue(source.contains(".onChange(of: modelPickerRequest)"))
 

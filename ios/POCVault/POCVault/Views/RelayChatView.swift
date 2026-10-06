@@ -567,8 +567,12 @@ private struct RelayComposer: View {
         static let horizontalInset: CGFloat = 12
         static let controlHeight: CGFloat = 44
         static let actionSize: CGFloat = 44
+        static let discSize: CGFloat = 36
+        static let cardRadius: CGFloat = 24
         static let rowSpacing: CGFloat = 8
-        static let bottomPadding: CGFloat = 10
+        static let bottomPadding: CGFloat = 8
+        /// How far the conversation fades out above the composer.
+        static let fadeHeight: CGFloat = 32
     }
 
     @Binding var text: String
@@ -603,24 +607,26 @@ private struct RelayComposer: View {
     var onRemoveAttachment: (UUID) -> Void = { _ in }
     @State private var isFocused = false
     @State private var editorSelection = NSRange(location: 0, length: 0)
-    @State private var editorHeight: CGFloat = 36
-    @State private var showingRunSettings = false
+    @State private var editorHeight: CGFloat = 28
     @State private var showingModelPicker = false
-    @State private var showingPermissionPicker = false
-    @State private var showingSkillPicker = false
-    @State private var showingAttachOptions = false
+    /// Non-nil presents the Add sheet, opened on that page.
+    @State private var addSheetStart: RelayAddSheetPage?
+    /// A tile was tapped: the picker starts once the Add sheet has finished closing.
+    @State private var pendingAttachmentSource: RelayAttachmentSource?
     @State private var showingPhotoPicker = false
     @State private var showingFileImporter = false
     @State private var showingCamera = false
     @State private var photoPickerItems: [PhotosPickerItem] = []
-    @State private var skillSearch = ""
     @StateObject private var dictation = RelayStreamingTranscriber()
     /// Whatever the user had already typed when dictation started. Live transcript
     /// is appended to this rather than replacing the field, so starting to dictate
-    /// mid-draft never eats the draft.
+    /// mid-draft never eats the draft. Cancel puts exactly this back.
     @State private var dictationPrefix = ""
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
+    /// Set by Cancel so a transcript frame that lands late cannot refill the field.
+    @State private var dictationDiscarded = false
+    /// Send was tapped while listening; the message goes out when the tail arrives.
+    @State private var sendWhenTranscribed = false
+    @State private var dictationStartError: String?
     /// Provider identity is part of the thread, not a mutable composer setting.
     /// A clean conversation has no provider yet and therefore sees the full catalog.
     private var visibleSections: RelayModelPickerSections {
@@ -701,230 +707,260 @@ private struct RelayComposer: View {
         }
     }
 
-    /// Nested menus on iPhone hide sibling harnesses after the first pick. The
-    /// sheet is the same catalog the on-appear flow already uses, so a draft can
-    /// still move from Cursor to Codex or Claude Code before anything is sent.
-    private var modelPickerMenu: some View {
+    private var providerReady: Bool {
+        harnessStatus?.isConfirmedUnavailable != true
+    }
+
+    private var canSend: Bool {
+        RelayComposerLogic.canSend(
+            text: text,
+            hasAttachments: !attachments.isEmpty,
+            isSending: isSending,
+            isListening: dictation.phase == .listening,
+            providerReady: harnessStatus?.isConfirmedUnavailable != true
+        )
+    }
+
+    private var effortLabel: String? {
+        RelayComposerLogic.effortLabel(efforts: efforts, selected: selectedEffort)
+    }
+
+    private var selectedSkills: [CodexSkillDescriptor] {
+        skills.filter { selectedSkillIDs.contains($0.id) }
+    }
+
+    private var dictationError: String? {
+        if case .failed(let message) = dictation.phase { return message }
+        return dictationStartError
+    }
+
+    /// Selected skills sit with the attachments, above the words they apply to, each
+    /// one removable where it is shown.
+    private var skillChips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(selectedSkills) { skill in
+                    Button {
+                        onToggleSkill(skill)
+                    } label: {
+                        HStack(spacing: 6) {
+                            Text("/\(skill.name)")
+                                .font(AppTheme.monoFont(size: 12, weight: .medium))
+                                .foregroundStyle(AppTheme.textPrimary)
+                                .lineLimit(1)
+                            Image(systemName: "xmark")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(RelayChatStyle.secondary)
+                        }
+                        .padding(.leading, 11)
+                        .padding(.trailing, 10)
+                        .frame(height: 30)
+                        .background(RelayComposerPalette.quietFill, in: Capsule())
+                        .frame(height: 36)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Remove skill \(skill.name)")
+                }
+            }
+            .padding(.horizontal, 6)
+        }
+        .accessibilityIdentifier("relay-draft-skills")
+    }
+
+    /// The floating card: what is attached, the words, then one fixed row of controls.
+    private var card: some View {
+        VStack(spacing: 6) {
+            if let dictationError {
+                Text(dictationError)
+                    .font(RelayChatStyle.labelFont)
+                    .foregroundStyle(AppTheme.statusWarn)
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 10)
+                    .accessibilityIdentifier("relay-dictation-error")
+            }
+
+            if !attachments.isEmpty {
+                RelayDraftAttachmentStrip(
+                    attachments: attachments,
+                    onRemove: onRemoveAttachment
+                )
+                .padding(.horizontal, 6)
+            }
+
+            if !selectedSkills.isEmpty {
+                skillChips
+            }
+
+            ZStack(alignment: .leading) {
+                if text.isEmpty {
+                    Text("Message, or / for commands")
+                        .font(RelayChatStyle.bodyFont)
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .lineLimit(1)
+                        .allowsHitTesting(false)
+                }
+                RelayCommandTextEditor(
+                    text: $text,
+                    selection: $editorSelection,
+                    isFocused: $isFocused,
+                    height: $editorHeight,
+                    // Bright ember while the words are still arriving, cream once
+                    // they are the user's to edit.
+                    textColor: dictation.phase == .listening ? AppTheme.accentBright : AppTheme.textPrimary
+                )
+                .frame(height: editorHeight)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10)
+
+            controlBar
+        }
+        .padding(.top, 12)
+        .padding(.horizontal, 6)
+        .padding(.bottom, 6)
+        .background {
+            RoundedRectangle(cornerRadius: Layout.cardRadius, style: .continuous)
+                .fill(RelayComposerPalette.raisedCard)
+                .shadow(color: Color.black.opacity(0.35), radius: 15, x: 0, y: 10)
+                .overlay {
+                    RoundedRectangle(cornerRadius: Layout.cardRadius, style: .continuous)
+                        .stroke(AppTheme.hairlineStrong, lineWidth: 1)
+                }
+        }
+    }
+
+    /// Row 2. Fixed height, never scrolls, never wraps. Dictation swaps what is in
+    /// the row but not the row, so reaching for the mic never moves the composer.
+    private var controlBar: some View {
+        HStack(alignment: .center, spacing: 0) {
+            if dictation.isActive {
+                RelayDictationControls(
+                    levels: dictation.levels,
+                    elapsed: dictation.elapsed,
+                    finalizing: dictation.phase == .finalizing,
+                    onCancel: cancelDictation,
+                    onStop: stopDictation
+                )
+            } else {
+                addButton
+                modelPill
+                Spacer(minLength: 0)
+                // Hidden rather than disabled when the build has no STT credentials:
+                // a control that can only ever fail is worse than no control.
+                if AppConfiguration.supportsDictation {
+                    micButton
+                }
+            }
+            sendButton
+        }
+        .frame(height: Layout.controlHeight)
+    }
+
+    private var addButton: some View {
         Button {
+            isFocused = false
+            addSheetStart = .root
+        } label: {
+            RelayQuietCircleLabel(systemImage: "plus", glyphSize: 16)
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("relay-add")
+        .accessibilityLabel("Add photos, files, permissions and skills")
+    }
+
+    /// Provider mark, model, effort. Opens the Model sheet, which also holds Effort.
+    private var modelPill: some View {
+        Button {
+            isFocused = false
             showingModelPicker = true
         } label: {
-            HStack(spacing: 6) {
+            HStack(spacing: 7) {
                 if let provider = selectedChoice?.executionProvider {
-                    RelayProviderMark(provider: provider, size: 14)
+                    RelayComposerProviderMark(provider: provider, size: 14)
                 }
                 Text(selectedChoice?.shortModelLabel ?? "Choose model")
-                    .font(RelayChatStyle.labelFont.weight(.medium))
+                    .font(AppTheme.uiFont(size: 14, weight: .medium))
+                    .foregroundStyle(AppTheme.textPrimary)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(RelayChatStyle.secondary)
+                if let effortLabel {
+                    Text(effortLabel)
+                        .font(AppTheme.uiFont(size: 14))
+                        .foregroundStyle(RelayComposerPalette.value)
+                        .lineLimit(1)
+                        .fixedSize()
+                }
             }
-            .foregroundStyle(AppTheme.textPrimary)
-            .frame(maxWidth: .infinity, minHeight: Layout.controlHeight, alignment: .leading)
+            .padding(.leading, 11)
+            .padding(.trailing, 13)
+            .frame(height: Layout.discSize)
+            .background(RelayComposerPalette.quietFill, in: Capsule())
+            .padding(.horizontal, 4)
+            .frame(height: Layout.controlHeight)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityIdentifier("relay-model-chip")
-        .accessibilityLabel(threadProvider == nil ? "Choose provider and model" : "Choose model for this provider")
+        .accessibilityLabel(RelayComposerLogic.pillAccessibilityLabel(
+            model: selectedChoice?.shortModelLabel,
+            effort: effortLabel
+        ))
     }
 
-    /// Live dictation state. Status is a small-caps word and a ticking duration —
-    /// never a coloured dot (design spec rule 5) — beside a waveform of what the
-    /// microphone is actually hearing.
-    @ViewBuilder private var dictationBar: some View {
-        if dictation.isActive {
-            HStack(alignment: .center, spacing: 10) {
-                VStack(alignment: .leading, spacing: 2) {
-                    RelayCapsLabel(
-                        text: dictation.phase == .finalizing ? "Transcribing" : "Listening",
-                        color: AppTheme.accent
-                    )
-                    Text(RelayStreamingTranscriber.durationLabel(dictation.elapsed))
-                        .font(AppTheme.monoFont(size: 11))
-                        .monospacedDigit()
-                        .foregroundStyle(
-                            dictation.phase == .finalizing ? AppTheme.textTertiary : RelayChatStyle.secondary
-                        )
-                }
-                .fixedSize()
-
-                waveform
-            }
-            .padding(.horizontal, 6)
-            .padding(.top, 4)
-            .padding(.bottom, 8)
-            .transition(.opacity)
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel(
-                dictation.phase == .finalizing
-                    ? "Transcribing"
-                    : "Listening, \(RelayStreamingTranscriber.durationLabel(dictation.elapsed))"
-            )
-        } else if case .failed(let message) = dictation.phase {
-            Text(message)
-                .font(RelayChatStyle.labelFont)
-                .foregroundStyle(AppTheme.statusWarn)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 6)
-                .padding(.bottom, 8)
-                .transition(.opacity)
-                .accessibilityIdentifier("relay-dictation-error")
+    private var micButton: some View {
+        Button(action: startDictation) {
+            RelayQuietCircleLabel(systemImage: "mic", glyphSize: 16, weight: .medium)
         }
+        .buttonStyle(.plain)
+        .disabled(isSending)
+        .accessibilityIdentifier("relay-dictate")
+        .accessibilityLabel("Dictate prompt")
     }
 
-    /// Centre-anchored bars of measured loudness, newest at the trailing edge and
-    /// older ones fading out, so the shape reads as moving in a direction. The two
-    /// newest carry the brighter ember: that is where the eye should land.
-    ///
-    /// Not a progress fill — dictation has no end point to fill toward — and not a
-    /// spinner, which would prove only that a timer is running.
-    private var waveform: some View {
-        let samples = paddedLevels
-        let newest = samples.count - 1
-        return HStack(alignment: .center, spacing: 2) {
-            ForEach(samples.indices, id: \.self) { index in
-                Capsule(style: .continuous)
-                    .fill(index >= newest - 1 ? AppTheme.accentBright : AppTheme.accent)
-                    .frame(width: 3, height: max(3, 30 * samples[index]))
-                    .opacity(0.2 + 0.8 * (Double(index) / Double(max(1, newest))))
-            }
-        }
-        .frame(height: 30)
-        .frame(maxWidth: .infinity, alignment: .trailing)
-        // Capture has stopped, so the bars are history, not a live reading. Dimming
-        // them is what separates LISTENING from TRANSCRIBING at a glance; leaving
-        // them lit reads as though the microphone were still open.
-        .opacity(dictation.phase == .finalizing ? 0.3 : 1)
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.1), value: samples)
-        .animation(.easeOut(duration: 0.18), value: dictation.phase)
-        .accessibilityHidden(true)
-    }
-
-    /// A short session must still fill the strip from the right, so the history is
-    /// left-padded with silence rather than drawn from the leading edge.
-    private var paddedLevels: [Double] {
-        let count = RelayStreamingTranscriber.waveformSampleCount
-        let live = dictation.levels.suffix(count)
-        return Array(repeating: 0, count: count - live.count) + live
-    }
-
-    /// Frequent controls fit in the composer. Less frequent choices live in a sheet,
-    /// so neither narrow screens nor long policy labels need a scrolling chip rail.
-    private var controlBar: some View {
-        HStack(alignment: .center, spacing: 2) {
-            modelPickerMenu
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-            Button {
+    /// Ember when it will do something, cream when it will not: never dimmed ember.
+    /// While the microphone is open it is live, and sends what was said.
+    private var sendButton: some View {
+        let listening = dictation.phase == .listening
+        let live = isStreaming || (listening ? (providerReady && !isSending) : canSend)
+        return Button {
+            if isStreaming {
                 isFocused = false
-                showingRunSettings = true
-            } label: {
-                Image(systemName: "slider.horizontal.3")
-                    .font(AppTheme.uiFont(size: 17, weight: .medium))
-                    .foregroundStyle(RelayChatStyle.secondary)
-                    .frame(width: Layout.actionSize, height: Layout.actionSize)
-                    .overlay(alignment: .topTrailing) {
-                        if !selectedSkillIDs.isEmpty {
-                            Text("\(selectedSkillIDs.count)")
-                                .font(AppTheme.uiFont(size: 10, weight: .semibold))
-                                .foregroundStyle(AppTheme.accent)
-                                .padding(2)
-                        }
-                    }
-            }
-            .buttonStyle(.plain)
-            .accessibilityIdentifier("relay-run-settings")
-            .accessibilityLabel("Run settings, \(selectedSkillIDs.count) skills selected")
-
-            Button {
+                onStop()
+            } else if listening {
+                sendDictated()
+            } else {
                 isFocused = false
-                showingAttachOptions = true
-            } label: {
-                Image(systemName: "paperclip")
-                    .font(AppTheme.uiFont(size: 18, weight: .medium))
-                    .foregroundStyle(attachments.isEmpty ? RelayChatStyle.secondary : AppTheme.accent)
-                    .frame(width: Layout.actionSize, height: Layout.actionSize)
-                    .overlay(alignment: .topTrailing) {
-                        if !attachments.isEmpty {
-                            Text("\(attachments.count)")
-                                .font(AppTheme.uiFont(size: 10, weight: .semibold))
-                                .foregroundStyle(AppTheme.accent)
-                                .padding(2)
-                        }
-                    }
+                onSend()
             }
-            .buttonStyle(.plain)
-            .disabled(isSending || isStreaming)
-            .accessibilityIdentifier("relay-attach")
-            .accessibilityLabel(attachments.isEmpty ? "Attach files or photos" : "Attach files, \(attachments.count) selected")
-
-            // Hidden rather than disabled when the build has no STT credentials:
-            // a control that can only ever fail is worse than no control.
-            if AppConfiguration.supportsDictation {
-                Button(action: toggleDictation) {
-                    Group {
-                        if dictation.isActive {
-                            // Carries Send's weight on purpose: while dictation runs it
-                            // IS the live control, and an 18pt glyph read as a footnote.
-                            ZStack {
-                                Circle()
-                                    .fill(dictation.phase == .finalizing ? .clear : AppTheme.accent)
-                                    .overlay {
-                                        Circle().stroke(
-                                            dictation.phase == .finalizing
-                                                ? AppTheme.accent.opacity(0.45) : .clear,
-                                            lineWidth: 1.5
-                                        )
-                                    }
-                                    .frame(width: 34, height: 34)
-                                RoundedRectangle(cornerRadius: 2.5, style: .continuous)
-                                    .fill(dictation.phase == .finalizing
-                                          ? AppTheme.accent.opacity(0.45) : AppTheme.onEmber)
-                                    .frame(width: 11, height: 11)
-                            }
-                        } else {
-                            Image(systemName: "mic")
-                                .font(AppTheme.uiFont(size: 22, weight: .medium))
-                                .foregroundStyle(RelayChatStyle.secondary)
-                        }
-                    }
-                    .frame(width: Layout.actionSize, height: Layout.actionSize)
-                    .contentShape(Rectangle())
+        } label: {
+            ZStack {
+                Circle()
+                    .fill(live ? AppTheme.accent : RelayComposerPalette.disabledDisc)
+                    .frame(width: Layout.discSize, height: Layout.discSize)
+                if isStreaming {
+                    RoundedRectangle(cornerRadius: 3, style: .continuous)
+                        .fill(AppTheme.onEmber)
+                        .frame(width: 12, height: 12)
+                } else {
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundStyle(live ? AppTheme.onEmber : RelayComposerPalette.disabledGlyph)
                 }
-                .buttonStyle(.plain)
-                .disabled(isSending || dictation.phase == .finalizing)
-                .accessibilityIdentifier("relay-dictate")
-                .accessibilityLabel(dictation.isActive ? "Stop dictation" : "Dictate prompt")
             }
-
-            Button {
-                isFocused = false
-                if isStreaming { onStop() } else { onSend() }
-            } label: {
-                ZStack {
-                    Circle()
-                        .fill(isStreaming || canSend ? AppTheme.accent : RelayChatStyle.surface)
-                        .frame(width: 34, height: 34)
-                    if isStreaming {
-                        RoundedRectangle(cornerRadius: 3)
-                            .fill(AppTheme.onEmber)
-                            .frame(width: 11, height: 11)
-                    } else {
-                        Image(systemName: "arrow.up")
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundStyle(canSend ? AppTheme.onEmber : RelayChatStyle.secondary)
-                    }
-                }
-                .frame(width: Layout.actionSize, height: Layout.actionSize)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .disabled(!isStreaming && !canSend)
-            .accessibilityIdentifier(isStreaming ? "relay-stop" : "relay-send")
-            .accessibilityLabel(isStreaming ? "Stop" : harnessStatus?.isConfirmedUnavailable == true ? "Provider connection required" : "Send")
+            .frame(width: Layout.actionSize, height: Layout.actionSize)
+            .contentShape(Rectangle())
         }
-        .frame(minHeight: Layout.controlHeight)
+        .buttonStyle(.plain)
+        .disabled(!live || sendWhenTranscribed)
+        .accessibilityIdentifier(isStreaming ? "relay-stop" : "relay-send")
+        .accessibilityLabel(
+            isStreaming ? "Stop"
+                : !providerReady ? "Provider connection required"
+                : listening ? "Send what was said"
+                : "Send"
+        )
     }
 
     var body: some View {
@@ -953,57 +989,23 @@ private struct RelayComposer: View {
                 .accessibilityIdentifier("relay-provider-readiness")
             }
 
-            VStack(spacing: 0) {
-                dictationBar
-
-                if !attachments.isEmpty {
-                    RelayDraftAttachmentStrip(
-                        attachments: attachments,
-                        onRemove: onRemoveAttachment
-                    )
-                    .padding(.horizontal, 4)
-                    .padding(.top, 4)
-                }
-
-                ZStack(alignment: .leading) {
-                    if text.isEmpty {
-                        Text("Message…")
-                            .font(RelayChatStyle.bodyFont)
-                            .foregroundStyle(RelayChatStyle.secondary)
-                            .allowsHitTesting(false)
-                    }
-                    RelayCommandTextEditor(
-                        text: $text,
-                        selection: $editorSelection,
-                        isFocused: $isFocused,
-                        height: $editorHeight,
-                        textColor: dictation.phase == .listening ? AppTheme.accent : AppTheme.textPrimary
-                    )
-                    .frame(height: editorHeight)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 6)
-
-                controlBar
-            }
-            .padding(.horizontal, 10)
-            .padding(.top, 6)
-            .padding(.bottom, 4)
-            .background {
-                RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .fill(RelayChatStyle.surface)
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 20, style: .continuous)
-                            .stroke(AppTheme.hairlineStrong, lineWidth: 1)
-                    }
-            }
+            card
         }
         .padding(.horizontal, Layout.horizontalInset)
-        .padding(.top, 10)
+        .padding(.top, 4)
         .padding(.bottom, Layout.bottomPadding)
+        // Solid canvas beside and below the card, so no transcript text shows
+        // through; above it the conversation fades out instead of meeting a rule.
         .background(AppTheme.bgCanvas)
-        .overlay(alignment: .top) {
-            Rectangle().fill(AppTheme.hairline).frame(height: 1)
+        .background(alignment: .top) {
+            LinearGradient(
+                colors: [AppTheme.bgCanvas.opacity(0), AppTheme.bgCanvas],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .frame(height: Layout.fadeHeight)
+            .offset(y: -Layout.fadeHeight)
+            .allowsHitTesting(false)
         }
         .animation(.easeOut(duration: 0.16), value: slashContext)
         .animation(.easeOut(duration: 0.18), value: dictation.isActive)
@@ -1012,17 +1014,39 @@ private struct RelayComposer: View {
         }
         // A dismissed composer must not leave the microphone hot or a socket open.
         .onDisappear { dictation.cancel() }
-        .sheet(isPresented: $showingRunSettings) { runSettingsSheet }
-        .sheet(isPresented: $showingModelPicker) { modelPickerSheet }
-        .sheet(isPresented: $showingPermissionPicker) { permissionPickerSheet }
-        .sheet(isPresented: $showingSkillPicker) { skillPickerSheet }
-        .confirmationDialog("Attach", isPresented: $showingAttachOptions, titleVisibility: .hidden) {
-            Button("Photo Library") { showingPhotoPicker = true }
-            if UIImagePickerController.isSourceTypeAvailable(.camera) {
-                Button("Take Photo") { showingCamera = true }
-            }
-            Button("Choose File") { showingFileImporter = true }
-            Button("Cancel", role: .cancel) {}
+        .sheet(isPresented: $showingModelPicker) {
+            RelayModelSheet(
+                visibleSections: visibleSections,
+                selectedChoice: selectedChoice,
+                threadProvider: threadProvider,
+                efforts: efforts,
+                selectedEffort: selectedEffort,
+                onPickChoice: requestChoice,
+                onPickEffort: onPickEffort,
+                onClose: { showingModelPicker = false }
+            )
+        }
+        .sheet(item: $addSheetStart, onDismiss: startPendingAttachmentSource) { start in
+            RelayAddSheet(
+                startPage: start,
+                provider: provider,
+                cameraAvailable: UIImagePickerController.isSourceTypeAvailable(.camera),
+                attachDisabled: isSending || isStreaming,
+                claudePermissionMode: claudePermissionMode,
+                codexApprovalPolicy: codexApprovalPolicy,
+                codexSandbox: codexSandbox,
+                skills: skills,
+                selectedSkillIDs: selectedSkillIDs,
+                onPickSource: { source in
+                    pendingAttachmentSource = source
+                    addSheetStart = nil
+                },
+                onPickClaudePermission: onPickClaudePermission,
+                onPickCodexApproval: onPickCodexApproval,
+                onPickCodexSandbox: onPickCodexSandbox,
+                onToggleSkill: onToggleSkill,
+                onClose: { addSheetStart = nil }
+            )
         }
         .photosPicker(
             isPresented: $showingPhotoPicker,
@@ -1059,96 +1083,16 @@ private struct RelayComposer: View {
         }
     }
 
-    private var runSettingsSheet: some View {
-        NavigationStack {
-            List {
-                if !efforts.isEmpty {
-                    Section("Reasoning") {
-                        Picker("Effort", selection: Binding(
-                            get: { selectedEffort ?? efforts[0] },
-                            set: onPickEffort
-                        )) {
-                            ForEach(efforts) { effort in
-                                Text(effort.label).tag(effort)
-                            }
-                        }
-                        .accessibilityIdentifier("relay-effort-chip")
-                    }
-                }
-                if provider?.hasTaskPermissionControls == true {
-                    Section("Permissions") {
-                        if provider == .claude {
-                            Picker("Permission mode", selection: Binding(get: { claudePermissionMode }, set: onPickClaudePermission)) {
-                                ForEach(RelayClaudePermissionMode.allCases) { mode in
-                                    Text(mode.label).tag(mode)
-                                }
-                            }
-                            Text(claudePermissionMode.detail)
-                                .font(RelayChatStyle.labelFont)
-                                .foregroundStyle(RelayChatStyle.secondary)
-                        } else {
-                            Picker("File access", selection: Binding(get: { codexSandbox }, set: onPickCodexSandbox)) {
-                                ForEach(RelayCodexSandbox.allCases) { sandbox in
-                                    Text(sandbox.label).tag(sandbox)
-                                }
-                            }
-                            .accessibilityIdentifier("relay-permission-chip")
-                            Picker("Approvals", selection: Binding(get: { codexApprovalPolicy }, set: onPickCodexApproval)) {
-                                ForEach(RelayCodexApprovalPolicy.allCases) { policy in
-                                    Text(policy.label).tag(policy)
-                                }
-                            }
-                            Text(codexSandbox.detail)
-                                .font(RelayChatStyle.labelFont)
-                                .foregroundStyle(codexSandbox.isUnsandboxed ? AppTheme.statusWarn : RelayChatStyle.secondary)
-                            Text(codexApprovalPolicy.detail)
-                                .font(RelayChatStyle.labelFont)
-                                .foregroundStyle(RelayChatStyle.secondary)
-                        }
-                    }
-                }
-                if provider != nil {
-                    Section {
-                        NavigationLink {
-                            skillPickerContent
-                        } label: {
-                            HStack {
-                                Text("Skills")
-                                Spacer()
-                                Text(selectedSkillIDs.isEmpty ? "None selected" : "\(selectedSkillIDs.count) selected")
-                                    .foregroundStyle(RelayChatStyle.secondary)
-                            }
-                        }
-                        .accessibilityIdentifier("relay-skill-chip")
-                    }
-                }
-                Section {
-                    Text("Changes apply to your next message.")
-                        .font(RelayChatStyle.labelFont)
-                        .foregroundStyle(RelayChatStyle.secondary)
-                    if threadProvider != nil {
-                        Text("This conversation stays with its original provider.")
-                            .font(RelayChatStyle.labelFont)
-                            .foregroundStyle(RelayChatStyle.secondary)
-                    }
-                }
-            }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
-            .listRowSeparator(.hidden)
-            .listSectionSeparator(.hidden)
-            .background(AppTheme.bgCanvas)
-            .navigationTitle("Run settings")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { showingRunSettings = false }
-                }
-            }
+    /// Runs when the Add sheet has finished dismissing: presenting a picker while
+    /// the sheet is still on its way out is dropped by UIKit.
+    private func startPendingAttachmentSource() {
+        guard let source = pendingAttachmentSource else { return }
+        pendingAttachmentSource = nil
+        switch source {
+        case .camera: showingCamera = true
+        case .photos: showingPhotoPicker = true
+        case .files: showingFileImporter = true
         }
-        .presentationDetents([.medium, .large])
-        .presentationDragIndicator(.visible)
-        .preferredColorScheme(.dark)
     }
 
     private var slashPalette: some View {
@@ -1244,10 +1188,10 @@ private struct RelayComposer: View {
             showingModelPicker = true
         case .permissions:
             replaceSlashToken(with: "")
-            showingPermissionPicker = true
+            addSheetStart = RelayComposerLogic.permissionsStartPage(for: provider)
         case .skills:
             replaceSlashToken(with: "")
-            showingSkillPicker = true
+            addSheetStart = .skills
         case .newConversation:
             replaceSlashToken(with: "")
             onNewConversation()
@@ -1270,292 +1214,71 @@ private struct RelayComposer: View {
         )
     }
 
-    private var modelPickerSheet: some View {
-        NavigationStack {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    if threadProvider != nil {
-                        Text("This conversation stays with its original provider.")
-                            .font(AppTheme.uiFont(size: 13))
-                            .foregroundStyle(AppTheme.textSecondary)
-                            .padding(.horizontal, 18)
-                            .padding(.top, 16)
-                    }
-                    ForEach(visibleSections.agents) { harness in
-                        pickerSectionHeading(harness.title)
-                        ForEach(harness.choices) { choice in
-                            Button {
-                                requestChoice(choice)
-                                showingModelPicker = false
-                            } label: {
-                                pickerRow(
-                                    title: choice.shortModelLabel,
-                                    selected: choice == selectedChoice,
-                                    provider: choice.executionProvider
-                                )
-                                .padding(.horizontal, 18)
-                                .padding(.vertical, 12)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    if !visibleSections.chatModels.isEmpty {
-                        pickerSectionHeading("Chat")
-                        ForEach(visibleSections.chatModels) { choice in
-                            Button {
-                                requestChoice(choice)
-                                showingModelPicker = false
-                            } label: {
-                                pickerRow(
-                                    title: choice.chipLabel,
-                                    selected: choice == selectedChoice,
-                                    provider: choice.executionProvider
-                                )
-                                .padding(.horizontal, 18)
-                                .padding(.vertical, 12)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                }
-                .padding(.bottom, 28)
-            }
-            .background(AppTheme.bgCanvas)
-            .navigationTitle("Model")
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { showingModelPicker = false }
-                }
-            }
-        }
-        .preferredColorScheme(.dark)
-    }
-
-    private func pickerSectionHeading(_ title: String) -> some View {
-        Text(title)
-            .font(AppTheme.uiFont(size: 13, weight: .medium))
-            .foregroundStyle(AppTheme.textPrimary.opacity(0.65))
-            .padding(.horizontal, 18)
-            .padding(.top, 22)
-            .padding(.bottom, 4)
-            .accessibilityAddTraits(.isHeader)
-    }
-
-    private var permissionPickerSheet: some View {
-        NavigationStack {
-            List {
-                if provider == .claude {
-                    Section("Claude Code") {
-                        ForEach(RelayClaudePermissionMode.allCases) { mode in
-                            Button {
-                                onPickClaudePermission(mode)
-                            } label: {
-                                pickerRow(
-                                    title: mode.label,
-                                    detail: mode.detail,
-                                    selected: mode == claudePermissionMode,
-                                    provider: .claude
-                                )
-                            }
-                            .relayHiddenListRow()
-                        }
-                    }
-                    Section {
-                        Text("This setting is sent only to Claude Code jobs. Codex keeps its own independent runner policy.")
-                            .font(AppTheme.uiFont(size: 12))
-                            .foregroundStyle(AppTheme.textSecondary)
-                    }
-                } else {
-                    Section("What Codex can reach") {
-                        ForEach(RelayCodexSandbox.allCases) { level in
-                            Button {
-                                onPickCodexSandbox(level)
-                            } label: {
-                                pickerRow(
-                                    title: level.label,
-                                    detail: level.detail,
-                                    selected: level == codexSandbox,
-                                    provider: .codex
-                                )
-                            }
-                            .relayHiddenListRow()
-                        }
-                        if codexSandbox.isUnsandboxed {
-                            Text("Codex will not be stopped from changing anything on this machine, including files outside your work.")
-                                .font(AppTheme.uiFont(size: 12))
-                                .foregroundStyle(AppTheme.statusWarn)
-                        }
-                    }
-
-                    Section("When Codex asks") {
-                        ForEach(RelayCodexApprovalPolicy.allCases) { policy in
-                            Button {
-                                onPickCodexApproval(policy)
-                            } label: {
-                                pickerRow(
-                                    title: policy.label,
-                                    detail: policy.detail,
-                                    selected: policy == codexApprovalPolicy,
-                                    provider: .codex
-                                )
-                            }
-                            .relayHiddenListRow()
-                        }
-                    }
-                    Section {
-                        Text("This policy is sent only to Codex. Claude Code keeps its own independent permission mode.")
-                            .font(AppTheme.uiFont(size: 12))
-                            .foregroundStyle(AppTheme.textSecondary)
-                    }
-                }
-            }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
-            .listRowSeparator(.hidden)
-            .listSectionSeparator(.hidden)
-            .background(AppTheme.bgCanvas)
-            .navigationTitle((provider ?? .codex).relayPresentation.permissionsTitle ?? "Permissions")
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { showingPermissionPicker = false }
-                }
-            }
-        }
-        .preferredColorScheme(.dark)
-    }
-
-    private var skillPickerSheet: some View {
-        NavigationStack { skillPickerContent }
-            .preferredColorScheme(.dark)
-    }
-
-    private var skillPickerContent: some View {
-        List {
-            if filteredSkills.isEmpty {
-                ContentUnavailableView(
-                    skillSearch.isEmpty
-                        ? "No installed \((provider ?? .codex).relayPresentation.skillsTitle.lowercased())"
-                        : "No matching \((provider ?? .codex).relayPresentation.skillsTitle.lowercased())",
-                    systemImage: "hammer",
-                    description: Text("Relay shows only \((provider ?? .codex).relayPresentation.title) skills discovered on this runner.")
-                )
-                .listRowBackground(Color.clear)
-            } else {
-                Section {
-                    ForEach(filteredSkills) { skill in
-                        Button {
-                            onToggleSkill(skill)
-                        } label: {
-                            pickerRow(
-                                title: skill.title,
-                                detail: skill.description,
-                                selected: selectedSkillIDs.contains(skill.id),
-                                provider: skill.provider
-                            )
-                        }
-                        .relayHiddenListRow()
-                    }
-                } header: {
-                    RelayProviderBadge(provider: provider ?? .codex, style: .plain, size: 9)
-                }
-            }
-        }
-        .searchable(text: $skillSearch, prompt: "Search installed skills")
-        .listStyle(.plain)
-        .scrollContentBackground(.hidden)
-        .listRowSeparator(.hidden)
-        .listSectionSeparator(.hidden)
-        .background(AppTheme.bgCanvas)
-        .navigationTitle((provider ?? .codex).relayPresentation.skillsTitle)
-        .toolbar {
-            ToolbarItem(placement: .confirmationAction) {
-                Button("Done") {
-                    showingSkillPicker = false
-                    showingRunSettings = false
-                }
-            }
-        }
-    }
-
-    private var filteredSkills: [CodexSkillDescriptor] {
-        let query = skillSearch.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !query.isEmpty else { return skills }
-        return skills.filter {
-            $0.name.lowercased().contains(query)
-                || $0.title.lowercased().contains(query)
-                || $0.description.lowercased().contains(query)
-        }
-    }
-
-    private func pickerRow(
-        title: String,
-        detail: String? = nil,
-        selected: Bool,
-        provider: CodexProvider? = nil
-    ) -> some View {
-        HStack(alignment: .center, spacing: 12) {
-            if let provider {
-                RelayProviderMark(provider: provider, size: 16)
-                    .frame(width: 30, height: 30)
-                    .background(provider.relayPresentation.accent.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
-            }
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title)
-                    .font(AppTheme.uiFont(size: 16, weight: .medium))
-                    .foregroundStyle(AppTheme.textPrimary)
-                if let detail, !detail.isEmpty {
-                    Text(detail)
-                        .font(AppTheme.uiFont(size: 12))
-                        .foregroundStyle(AppTheme.textSecondary)
-                        .multilineTextAlignment(.leading)
-                }
-            }
-            Spacer()
-            if selected {
-                Image(systemName: "checkmark")
-                    .font(AppTheme.uiFont(size: 13, weight: .semibold))
-                    .foregroundStyle(provider?.relayPresentation.accent ?? AppTheme.accent)
-            }
-        }
-        .contentShape(Rectangle())
-    }
-
-    private var canSend: Bool {
-        (!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
-            && !isSending
-            // Only LISTENING blocks the send. Once capture has stopped the words are
-            // already in the field, and making someone wait out the finalize grace
-            // to send what they can read is the composer arguing with them.
-            && dictation.phase != .listening
-            && harnessStatus?.isConfirmedUnavailable != true
-    }
-
     private func requestChoice(_ choice: RelayModelChoice) {
         guard threadProvider == nil || choice.executionProvider == threadProvider else { return }
         onPickChoice(choice)
     }
 
-    private func toggleDictation() {
-        if dictation.isActive {
-            Task { await dictation.stop() }
-            return
-        }
-        isFocused = false
+    /// Starting to dictate leaves keyboard focus exactly where it was.
+    private func startDictation() {
         // Anchor to the draft as it stands now; live transcript is appended to this
         // so a half-typed message survives someone reaching for the mic.
         dictationPrefix = text
-        Task { try? await dictation.start() }
+        dictationDiscarded = false
+        sendWhenTranscribed = false
+        dictationStartError = nil
+        Task {
+            do {
+                try await dictation.start()
+            } catch {
+                dictationStartError = (error as? LocalizedError)?.errorDescription
+                    ?? "Dictation could not start."
+            }
+        }
+    }
+
+    /// Stop and keep what was said.
+    private func stopDictation() {
+        Task { await dictation.stop() }
+    }
+
+    /// Stop and throw away what was said: the field goes back to the draft that was
+    /// there before the microphone opened.
+    private func cancelDictation() {
+        dictationDiscarded = true
+        sendWhenTranscribed = false
+        dictation.cancel()
+        text = dictationPrefix
+    }
+
+    /// Send tapped while the microphone is open: stop, wait for the tail of the
+    /// transcript, then send it without a second tap.
+    private func sendDictated() {
+        sendWhenTranscribed = true
+        Task {
+            let settled = await dictation.stop()
+            applyDictation(settled)
+            let shouldSend = RelayComposerLogic.shouldSendAfterDictation(
+                text: text,
+                hasAttachments: !attachments.isEmpty,
+                isSending: isSending,
+                providerReady: providerReady,
+                stillWanted: sendWhenTranscribed
+            )
+            sendWhenTranscribed = false
+            guard shouldSend else { return }
+            isFocused = false
+            onSend()
+        }
     }
 
     /// Mirrors live transcript into the field the user is about to send from, so the
     /// words are editable the instant they land rather than after a round trip.
     private func applyDictation(_ transcript: String) {
-        let spoken = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !spoken.isEmpty else { return }
-        let base = dictationPrefix.trimmingCharacters(in: .whitespacesAndNewlines)
-        text = base.isEmpty ? spoken : "\(base)\n\n\(spoken)"
+        guard !dictationDiscarded,
+              let next = RelayComposerLogic.dictatedText(prefix: dictationPrefix, transcript: transcript)
+        else { return }
+        text = next
     }
 
     @MainActor
@@ -1591,6 +1314,54 @@ private struct RelayComposer: View {
     }
 }
 
+#if DEBUG
+/// The composer over fixture values, for previews and snapshot tests. The composer
+/// itself is private to this file, so this is the only way to stand it up alone.
+struct RelayComposerPreviewHost: View {
+    @State var text: String
+    var sections: RelayModelPickerSections
+    var selectedChoice: RelayModelChoice?
+    var threadProvider: CodexProvider? = nil
+    var efforts: [CodexReasoningEffort] = []
+    var selectedEffort: CodexReasoningEffort? = nil
+    var skills: [CodexSkillDescriptor] = []
+    var selectedSkillIDs: Set<String> = []
+    var isStreaming = false
+    @State private var attachments: [RelayDraftAttachment] = []
+
+    var body: some View {
+        RelayComposer(
+            text: $text,
+            attachments: $attachments,
+            sections: sections,
+            selectedChoice: selectedChoice,
+            modelPickerRequest: 0,
+            threadProvider: threadProvider,
+            efforts: efforts,
+            selectedEffort: selectedEffort,
+            provider: selectedChoice?.executionProvider,
+            harnessStatus: nil,
+            skills: skills,
+            selectedSkillIDs: selectedSkillIDs,
+            claudePermissionMode: .acceptEdits,
+            codexApprovalPolicy: .onRequest,
+            codexSandbox: .workspace,
+            isSending: false,
+            isStreaming: isStreaming,
+            onPickChoice: { _ in },
+            onPickEffort: { _ in },
+            onToggleSkill: { _ in },
+            onPickClaudePermission: { _ in },
+            onPickCodexApproval: { _ in },
+            onPickCodexSandbox: { _ in },
+            onNewConversation: {},
+            onSend: {},
+            onStop: {}
+        )
+    }
+}
+#endif
+
 /// UITextView bridge used only for caret reporting. SwiftUI's iOS 17 text field does not
 /// expose the insertion point, but slash discovery must follow the caret when the user
 /// types `/` in the middle of an existing draft.
@@ -1615,7 +1386,7 @@ private struct RelayCommandTextEditor: UIViewRepresentable {
         view.textColor = UIColor(AppTheme.textPrimary)
         view.tintColor = UIColor(AppTheme.accent)
         view.font = UIFontMetrics(forTextStyle: .body).scaledFont(for: UIFont(name: "DMSans-9ptRegular", size: 16) ?? .systemFont(ofSize: 16))
-        view.textContainerInset = UIEdgeInsets(top: 7, left: 0, bottom: 7, right: 0)
+        view.textContainerInset = UIEdgeInsets(top: 3, left: 0, bottom: 3, right: 0)
         view.textContainer.lineFragmentPadding = 0
         view.accessibilityLabel = "Message"
         view.accessibilityIdentifier = "relay-message-editor"
@@ -1679,7 +1450,7 @@ private struct RelayCommandTextEditor: UIViewRepresentable {
             let fitting = textView.sizeThatFits(
                 CGSize(width: width, height: CGFloat.greatestFiniteMagnitude)
             ).height
-            let next = min(max(fitting, 36), 120)
+            let next = min(max(fitting, 28), 120)
             textView.isScrollEnabled = fitting > 120
             guard abs(parent.height - next) > 0.5 else { return }
             DispatchQueue.main.async { [weak self] in
