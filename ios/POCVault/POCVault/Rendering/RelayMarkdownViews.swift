@@ -187,11 +187,12 @@ struct RelayMarkdownProse: View, Equatable {
     }
 
     private func listRow(marker: String, text: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 7) {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(marker)
-                .font(AppTheme.uiFont(size: 13, weight: .semibold))
-                .foregroundStyle(color.opacity(0.78))
-                .frame(width: 22, alignment: .trailing)
+                .font(bodyFont)
+                .foregroundStyle(color.opacity(0.55))
+                .monospacedDigit()
+                .frame(minWidth: 8, alignment: .leading)
             Text(inlineMarkdown(text))
                 .font(bodyFont)
                 .foregroundStyle(color)
@@ -316,6 +317,9 @@ struct RelayMarkdownTable: View {
     }
 }
 
+/// A fenced code block: DM Mono on a quiet ink-5% block, nothing else. It
+/// wraps inside the block at every type size, so nothing scrolls sideways;
+/// copying is a long press away.
 struct RelayCodeBlock: View, Equatable {
     let text: String
     let language: String?
@@ -325,41 +329,24 @@ struct RelayCodeBlock: View, Equatable {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text(languageLabel)
-                    .font(AppTheme.monoFont(size: 11, weight: .semibold))
-                    .foregroundStyle(AppTheme.textSecondary)
-                Spacer()
-                Button {
-                    UIPasteboard.general.string = text
-                } label: {
-                    Image(systemName: "doc.on.doc")
-                        .font(AppTheme.monoFont(size: 12, weight: .semibold))
-                        .foregroundStyle(AppTheme.accent)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Copy code")
-            }
-            // Code wraps inside its block at every type size: nothing in the
-            // transcript asks for a sideways swipe.
-            codeText
-        }
-        .padding(12)
-        .background(AppTheme.textPrimary.opacity(0.05), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-    }
-
-    private var codeText: some View {
         Text(text)
-            .font(AppTheme.monoFont(size: 12))
+            .font(.custom("DMMono-Regular", size: 13, relativeTo: .footnote))
             .foregroundStyle(AppTheme.textPrimary)
+            .lineSpacing(4)
             .textSelection(.enabled)
             .lineLimit(24)
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var languageLabel: String {
-        language?.trimmedNonEmpty?.uppercased() ?? "Code"
+            .padding(.vertical, 12)
+            .padding(.horizontal, 14)
+            .background(AppTheme.textPrimary.opacity(0.05), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .padding(.top, 2)
+            .contextMenu {
+                Button {
+                    UIPasteboard.general.string = text
+                } label: { Label("Copy code", systemImage: "doc.on.doc") }
+            }
+            .accessibilityLabel(language?.trimmedNonEmpty.map { "\($0) code" } ?? "Code")
+            .accessibilityValue(text)
     }
 }

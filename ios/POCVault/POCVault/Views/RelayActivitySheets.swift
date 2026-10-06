@@ -28,11 +28,18 @@ enum RelayActivitySheetStyle {
     static let cornerRadius: CGFloat = 34
     static let block = AppTheme.textPrimary.opacity(0.05)
     static let control = AppTheme.textPrimary.opacity(0.08)
+    static let label = AppTheme.textPrimary.opacity(0.6)
     static let groupRadius: CGFloat = 18
     static let blockRadius: CGFloat = 12
+    /// Blocks and grouped lists sit on the 16pt gutter; labels and bare prose
+    /// align with the text inside them, 16pt further in.
+    static let gutter: CGFloat = 16
+    static let textInset: CGFloat = 32
+    static let bottomPadding: CGFloat = 28
     /// The sheet grows with its content up to this share of the screen, then scrolls.
     static let maxScreenShare: CGFloat = 0.7
-    static let headerHeight: CGFloat = 76
+    /// Drag indicator, the 44pt control row, and the space under it.
+    static let headerHeight: CGFloat = 69
 
     static func detentHeight(content: CGFloat, screen: CGFloat) -> CGFloat {
         let wanted = headerHeight + max(content, 60)
@@ -104,8 +111,7 @@ struct RelayActivitySheet: View {
             header
             ScrollView {
                 page(timeline)
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 8)
+                    .padding(.bottom, RelayActivitySheetStyle.bottomPadding)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background {
                         GeometryReader { proxy in
@@ -132,39 +138,37 @@ struct RelayActivitySheet: View {
     }
 
     private var header: some View {
-        ZStack {
+        HStack(spacing: 0) {
+            Button {
+                if path.isEmpty {
+                    dismiss()
+                } else {
+                    withAnimation(.easeOut(duration: 0.18)) { _ = path.removeLast() }
+                }
+            } label: {
+                Image(systemName: path.isEmpty ? "xmark" : "chevron.left")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(AppTheme.textPrimary)
+                    .frame(width: 36, height: 36)
+                    .background(RelayActivitySheetStyle.control, in: Circle())
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(path.isEmpty ? "Close" : "Back")
+            .accessibilityIdentifier("relay-activity-close")
+
             Text(title)
                 .font(AppTheme.serifFont(size: 19, weight: .medium))
                 .foregroundStyle(AppTheme.textPrimary)
                 .lineLimit(1)
-                .padding(.horizontal, 60)
+                .frame(maxWidth: .infinity)
                 .accessibilityAddTraits(.isHeader)
-            HStack {
-                Button {
-                    if path.isEmpty {
-                        dismiss()
-                    } else {
-                        withAnimation(.easeOut(duration: 0.18)) { _ = path.removeLast() }
-                    }
-                } label: {
-                    Image(systemName: path.isEmpty ? "xmark" : "chevron.left")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(AppTheme.textPrimary)
-                        .frame(width: 36, height: 36)
-                        .background(RelayActivitySheetStyle.control, in: Circle())
-                        .frame(width: 44, height: 44)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(path.isEmpty ? "Close" : "Back")
-                .accessibilityIdentifier("relay-activity-close")
-                Spacer()
-            }
-            // The 36pt circle sits on the same 16pt gutter as the content.
-            .padding(.horizontal, 12)
+
+            Color.clear.frame(width: 44, height: 44)
         }
-        .frame(height: RelayActivitySheetStyle.headerHeight - 24)
-        .padding(.top, 18)
+        .padding(.horizontal, 10)
+        .padding(.top, 19)
         .padding(.bottom, 6)
     }
 
@@ -182,6 +186,7 @@ struct RelayActivitySheet: View {
             RelayStepList(steps: rootSteps, timeline: timeline) { step in
                 push(step.id)
             }
+            .padding(.top, 4)
             .transition(.opacity)
         }
     }
@@ -210,10 +215,7 @@ struct RelayStepList: View {
         VStack(spacing: 0) {
             ForEach(Array(steps.enumerated()), id: \.element.id) { index, step in
                 if index > 0 {
-                    Rectangle()
-                        .fill(AppTheme.hairline)
-                        .frame(height: 1)
-                        .padding(.leading, 16)
+                    RelayHairline().padding(.horizontal, 16)
                 }
                 RelayStepRow(step: step, childCount: timeline.children(of: step.id).count) {
                     onOpen(step)
@@ -224,6 +226,7 @@ struct RelayStepList: View {
             RelayActivitySheetStyle.block,
             in: RoundedRectangle(cornerRadius: RelayActivitySheetStyle.groupRadius, style: .continuous)
         )
+        .padding(.horizontal, RelayActivitySheetStyle.gutter)
     }
 }
 
@@ -232,55 +235,194 @@ struct RelayStepRow: View {
     let childCount: Int
     let action: () -> Void
 
-    /// Wide enough for the longest status word ("SEARCHING") at caps size.
-    static let wordColumn: CGFloat = 76
+    static let wordColumn: CGFloat = 68
+
+    /// A step with nothing behind it (thinking that sent no text) is a plain
+    /// line: no chevron, no tap.
+    private var opens: Bool { step.hasDetail || childCount > 0 }
+    private var stepCount: String? {
+        guard step.kind == .agent, childCount > 0 else { return nil }
+        return childCount == 1 ? "1 step" : "\(childCount) steps"
+    }
 
     var body: some View {
-        Button(action: action) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                RelayCapsLabel(text: step.statusWord, color: step.statusColor, size: 9.5)
-                    .lineLimit(1)
-                    .frame(width: Self.wordColumn, alignment: .leading)
-                Text(step.rowSummary)
-                    .font(AppTheme.uiFont(size: 14))
+        if opens {
+            Button(action: action) { label }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("relay-step-row")
+        } else {
+            label
+        }
+    }
+
+    private var label: some View {
+        let summary = step.rowSummary
+        return HStack(spacing: 8) {
+            RelayCapsLabel(text: step.statusWord, color: step.statusColor, size: 10)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .frame(width: Self.wordColumn, alignment: .leading)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(summary.text)
+                    .font(summary.isCode ? RelayTranscriptStyle.mono : RelayTranscriptStyle.rowTitle)
                     .foregroundStyle(AppTheme.textPrimary)
                     .lineLimit(1)
                     .truncationMode(.tail)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                trailing
-                    .font(AppTheme.monoFont(size: 11))
-                    .foregroundStyle(AppTheme.textTertiary)
-                    .lineLimit(1)
-                    .fixedSize()
+                if let stepCount {
+                    Text(stepCount)
+                        .font(.custom("DMSans-9ptRegular", size: 12, relativeTo: .caption))
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .lineLimit(1)
+                }
             }
-            .padding(.horizontal, 16)
-            .frame(minHeight: 48)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier("relay-step-row")
-    }
-
-    @ViewBuilder
-    private var trailing: some View {
-        let steps = step.kind == .agent && childCount > 0
-            ? (childCount == 1 ? "1 step" : "\(childCount) steps")
-            : nil
-        if step.status.isRunning {
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                Text(Self.join(steps, step.duration(now: context.date).map(RelayStepClock.clock)))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            RelayStepDuration(step: step, color: AppTheme.textSecondary)
+            if opens {
+                RelayRowChevron()
             }
-        } else {
-            Text(Self.join(steps, step.finishedDurationLabel))
         }
+        .padding(.leading, 16)
+        .padding(.trailing, 12)
+        .frame(minHeight: stepCount == nil ? 52 : 64)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
     }
+}
 
-    private static func join(_ parts: String?...) -> String {
-        parts.compactMap { $0 }.joined(separator: " · ")
+/// How long a step took, or a ticking clock in ember while it runs.
+struct RelayStepDuration: View {
+    let step: RelayStep
+    var color: Color = RelayActivitySheetStyle.label
+
+    var body: some View {
+        Group {
+            if step.status.isRunning {
+                if step.startedAt != nil {
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        Text(RelayStepClock.clock(step.duration(now: context.date) ?? 0))
+                            .foregroundStyle(AppTheme.accentBright)
+                    }
+                }
+            } else if let label = step.finishedDurationLabel {
+                Text(label).foregroundStyle(color)
+            }
+        }
+        .font(RelayTranscriptStyle.clock)
+        .monospacedDigit()
+        .lineLimit(1)
+        .fixedSize()
     }
 }
 
 // MARK: - Detail
+
+/// One labelled part of a step's detail page.
+struct RelayStepSection: Identifiable, Equatable {
+    enum Content: Equatable {
+        /// DM Sans 15/22.
+        case prose(String)
+        /// DM Mono 13/20: commands, paths, patterns, JSON.
+        case code(String)
+        /// DM Mono 12/18, quieter: what a command printed.
+        case output(String)
+        case failure(String)
+        case diff([RelayDiffLine])
+        case plan([RelayTodoItem])
+    }
+
+    enum Trailing: Equatable {
+        case duration
+        case exit(Int)
+        case text(String)
+        case note(String)
+    }
+
+    let title: String
+    let content: Content
+    var trailing: Trailing? = nil
+
+    var id: String { title }
+}
+
+struct RelayDiffLine: Equatable {
+    enum Kind: Equatable { case context, added, removed }
+
+    let kind: Kind
+    let text: String
+
+    /// Unified-diff text to rows. File headers are dropped; the Path section
+    /// already names the file.
+    static func parse(_ diff: String) -> [RelayDiffLine] {
+        diff.split(separator: "\n", omittingEmptySubsequences: false).compactMap { raw -> RelayDiffLine? in
+            let line = String(raw)
+            if line.hasPrefix("+++") || line.hasPrefix("---") || line.hasPrefix("diff --git")
+                || line.hasPrefix("index ") || line.hasPrefix("\\ No newline") {
+                return nil
+            }
+            if line.hasPrefix("+") { return RelayDiffLine(kind: .added, text: String(line.dropFirst())) }
+            if line.hasPrefix("-") { return RelayDiffLine(kind: .removed, text: String(line.dropFirst())) }
+            return RelayDiffLine(kind: .context, text: line.hasPrefix(" ") ? String(line.dropFirst()) : line)
+        }
+    }
+
+    /// "+1 −1".
+    static func stat(_ lines: [RelayDiffLine]) -> String {
+        let added = lines.filter { $0.kind == .added }.count
+        let removed = lines.filter { $0.kind == .removed }.count
+        return "+\(added) −\(removed)"
+    }
+}
+
+extension RelayStep {
+    /// Output keeps its own indentation: only the blank lines around it go.
+    var trimmedOutput: String? {
+        let text = output.trimmingCharacters(in: .newlines)
+        return text.trimmingCharacters(in: .whitespaces).isEmpty ? nil : text
+    }
+
+    /// The sections of this step's detail page, top to bottom. They follow
+    /// what the step carries, not its kind: any step with a command shows it,
+    /// any step with output shows that. Empty ones are left out.
+    var detailSections: [RelayStepSection] {
+        var sections = detailFields.map {
+            RelayStepSection(title: $0.title, content: $0.isCode ? .code($0.text) : .prose($0.text))
+        }
+        if let diff = input.diff?.trimmedNonEmpty {
+            let lines = RelayDiffLine.parse(diff)
+            sections.append(RelayStepSection(title: "Diff", content: .diff(lines), trailing: .text(RelayDiffLine.stat(lines))))
+        }
+        if let items = input.items, !items.isEmpty {
+            sections.append(RelayStepSection(title: "Plan", content: .plan(items)))
+        }
+        // An agent's output is its report and a thought's is the thought; both
+        // are drawn as prose by their own pages.
+        if kind != .agent, kind != .reasoning, let text = trimmedOutput {
+            sections.append(RelayStepSection(
+                title: "Output",
+                content: .output(text),
+                trailing: outputTruncated ? .note("Truncated") : nil
+            ))
+        }
+        if let error = error?.trimmedNonEmpty {
+            sections.append(RelayStepSection(title: "Error", content: .failure(error)))
+        }
+
+        // The clock sits on the Command label; a running step without one
+        // still shows it, on its first label.
+        if let index = sections.firstIndex(where: { $0.title == "Command" }) {
+            sections[index].trailing = .duration
+        } else if status.isRunning, let first = sections.indices.first, sections[first].trailing == nil {
+            sections[first].trailing = .duration
+        }
+        // A non-zero exit is said where the output is, or failing that on the command.
+        if let exitCode, exitCode != 0,
+           let index = sections.firstIndex(where: { $0.title == "Output" })
+            ?? sections.firstIndex(where: { $0.title == "Command" }) {
+            sections[index].trailing = .exit(exitCode)
+        }
+        return sections
+    }
+}
 
 struct RelayStepDetail: View {
     let step: RelayStep
@@ -289,232 +431,260 @@ struct RelayStepDetail: View {
     @State private var promptExpanded = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            statusLine
-            sections
-            if let error = step.error?.trimmedNonEmpty {
-                section("Error") { textBlock(error, mono: false, color: AppTheme.statusError) }
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    /// The word and the clock: ember and ticking while the step runs, then its
-    /// outcome and how long it took.
-    private var statusLine: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            RelayCapsLabel(text: step.statusWord, color: step.statusColor, size: 10)
-            if step.status.isRunning {
-                TimelineView(.periodic(from: .now, by: 1)) { context in
-                    Text(step.duration(now: context.date).map(RelayStepClock.clock) ?? "")
-                }
-            } else if let label = step.finishedDurationLabel {
-                Text(label)
-            }
-            if step.kind == .command, let exitCode = step.exitCode, exitCode != 0 {
-                RelayCapsLabel(text: "Exit \(exitCode)", color: AppTheme.statusError, size: 10)
-            }
-            Spacer(minLength: 0)
-        }
-        .font(AppTheme.monoFont(size: 11))
-        .foregroundStyle(AppTheme.textTertiary)
-    }
-
-    @ViewBuilder
-    private var sections: some View {
-        switch step.kind {
-        case .command:
-            optional("Description", step.input.description ?? step.summary, mono: false)
-            optional("Command", step.input.command, mono: true)
-            output
-        case .read:
-            optional("Path", step.input.path, mono: true)
-        case .edit, .write:
-            optional("Path", step.input.path, mono: true)
-            // One ink for the whole diff: the +/- markers already say which side.
-            optional("Diff", step.input.diff, mono: true)
-        case .search:
-            optional("Pattern", step.input.pattern, mono: true)
-            optional("Path", step.input.path, mono: true)
-            output
-        case .fetch:
-            optional("URL", step.input.url, mono: true)
-            optional("Query", step.input.query, mono: false)
-            output
-        case .tool:
-            optional("Name", toolName, mono: true)
-            optional("Input", step.input.json, mono: true)
-            output
-        case .agent:
-            agentSections
-        case .reasoning:
-            if let thought = step.output.trimmedNonEmpty {
-                Text(thought)
-                    .font(RelayChatStyle.bodyFont)
-                    .foregroundStyle(RelayChatStyle.secondary)
-                    .lineSpacing(4)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        case .todo:
-            if let items = step.input.items, !items.isEmpty {
-                section("Plan") { todoList(items) }
-            }
-            output
-        }
-    }
-
-    private var toolName: String? {
-        guard let name = step.input.name?.trimmedNonEmpty else { return nil }
-        if let server = step.input.server?.trimmedNonEmpty { return "\(server) · \(name)" }
-        return name
-    }
-
-    /// Output keeps its own indentation: only the blank lines around it go.
-    private var outputText: String? {
-        let text = step.output.trimmingCharacters(in: .newlines)
-        return text.trimmingCharacters(in: .whitespaces).isEmpty ? nil : text
-    }
-
-    @ViewBuilder
-    private var output: some View {
-        if let text = outputText {
-            section("Output") {
-                textBlock(text, mono: true)
-                if step.outputTruncated {
-                    RelayCapsLabel(text: "Output truncated", color: AppTheme.textTertiary, size: 9)
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var agentSections: some View {
-        if let prompt = (step.input.prompt ?? step.input.description)?.trimmedNonEmpty {
-            section("Prompt") {
-                VStack(alignment: .leading, spacing: 0) {
-                    Text(prompt)
-                        .font(AppTheme.uiFont(size: 14))
-                        .foregroundStyle(AppTheme.textPrimary)
+        VStack(alignment: .leading, spacing: 0) {
+            switch step.kind {
+            case .agent:
+                agentPage
+            case .reasoning:
+                if let thought = step.output.trimmedNonEmpty {
+                    Text(thought)
+                        .font(RelayChatStyle.bodyFont)
+                        .foregroundStyle(RelayChatStyle.secondary)
                         .lineSpacing(3)
-                        .lineLimit(promptExpanded ? nil : 4)
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    if prompt.count > 180 || prompt.filter(\.isNewline).count >= 4 {
-                        Button(promptExpanded ? "Show less" : "Show all") {
-                            promptExpanded.toggle()
-                        }
-                        .buttonStyle(.plain)
-                        .font(RelayChatStyle.labelFont)
-                        .foregroundStyle(RelayChatStyle.secondary)
-                        .frame(minHeight: 44, alignment: .bottomLeading)
-                        .accessibilityIdentifier("relay-step-prompt-toggle")
-                    }
+                        .padding(.horizontal, RelayActivitySheetStyle.textInset)
+                        .padding(.top, 6)
                 }
-                .padding(12)
-                .background(
-                    RelayActivitySheetStyle.block,
-                    in: RoundedRectangle(cornerRadius: RelayActivitySheetStyle.blockRadius, style: .continuous)
-                )
-            }
-        }
-        if !children.isEmpty {
-            section(children.count == 1 ? "1 step" : "\(children.count) steps") {
-                VStack(spacing: 0) {
-                    ForEach(Array(children.enumerated()), id: \.element.id) { index, child in
-                        if index > 0 {
-                            Rectangle()
-                                .fill(AppTheme.hairline)
-                                .frame(height: 1)
-                                .padding(.leading, 16)
-                        }
-                        RelayStepRow(step: child, childCount: 0) { onOpenChild(child.id) }
+            default:
+                let sections = step.detailSections
+                if sections.isEmpty {
+                    // Opened on a step whose input has not arrived yet.
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        RelayCapsLabel(text: step.statusWord, color: step.statusColor, size: 10)
+                        RelayStepDuration(step: step)
                     }
+                    .padding(.horizontal, RelayActivitySheetStyle.textInset)
+                    .padding(.top, 6)
                 }
-                .background(
-                    RelayActivitySheetStyle.block,
-                    in: RoundedRectangle(cornerRadius: RelayActivitySheetStyle.groupRadius, style: .continuous)
-                )
-            }
-        }
-        if let report = step.output.trimmedNonEmpty {
-            section("Report") {
-                RelayMarkdownText(text: report, userAligned: false, bodyFont: AppTheme.uiFont(size: 14))
-                    .padding(12)
-                    .background(
-                        RelayActivitySheetStyle.block,
-                        in: RoundedRectangle(cornerRadius: RelayActivitySheetStyle.blockRadius, style: .continuous)
-                    )
-            }
-        }
-    }
-
-    private func todoList(_ items: [RelayTodoItem]) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            ForEach(Array(items.enumerated()), id: \.offset) { _, item in
-                HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    RelayCapsLabel(
-                        text: item.statusWord,
-                        color: item.isInProgress ? AppTheme.accentBright : AppTheme.textTertiary,
-                        size: 9
-                    )
-                    .frame(width: 52, alignment: .leading)
-                    Text(item.text)
-                        .font(AppTheme.uiFont(size: 14))
-                        .foregroundStyle(item.isDone ? AppTheme.textSecondary : AppTheme.textPrimary)
-                        .fixedSize(horizontal: false, vertical: true)
+                ForEach(Array(sections.enumerated()), id: \.element.id) { index, section in
+                    sectionView(section, isFirst: index == 0)
                 }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-        .background(
-            RelayActivitySheetStyle.block,
-            in: RoundedRectangle(cornerRadius: RelayActivitySheetStyle.blockRadius, style: .continuous)
-        )
     }
 
-    // An empty section is omitted rather than drawn as a blank box.
+    // MARK: Agent
+
     @ViewBuilder
-    private func optional(_ title: String, _ text: String?, mono: Bool) -> some View {
-        if let text = text?.trimmedNonEmpty {
-            section(title) { textBlock(text, mono: mono) }
+    private var agentPage: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                RelayCapsLabel(
+                    text: step.input.agentType?.trimmedNonEmpty ?? "Agent",
+                    color: AppTheme.textPrimary,
+                    size: 10
+                )
+                RelayStepDuration(step: step)
+            }
+            Text(step.displaySummary)
+                .font(.custom("DMSans-9ptRegular", size: 17, relativeTo: .headline).weight(.semibold))
+                .foregroundStyle(AppTheme.textPrimary)
+                .lineSpacing(3)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.horizontal, RelayActivitySheetStyle.textInset)
+        .padding(.top, 6)
+
+        if let prompt = step.input.prompt?.trimmedNonEmpty {
+            label("Prompt", isFirst: false)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(prompt)
+                    .font(RelayTranscriptStyle.rowTitle)
+                    .foregroundStyle(RelayChatStyle.secondary)
+                    .lineSpacing(3)
+                    .lineLimit(promptExpanded ? nil : 6)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if prompt.count > 280 || prompt.filter(\.isNewline).count >= 6 {
+                    Button(promptExpanded ? "Show less" : "Show all") {
+                        promptExpanded.toggle()
+                    }
+                    .buttonStyle(.plain)
+                    .font(RelayTranscriptStyle.small.weight(.medium))
+                    .foregroundStyle(AppTheme.textPrimary)
+                    .frame(minHeight: 44, alignment: .bottomLeading)
+                    .accessibilityIdentifier("relay-step-prompt-toggle")
+                }
+            }
+            .modifier(RelayDetailBlock())
+        }
+
+        if !children.isEmpty {
+            label(children.count == 1 ? "1 step" : "\(children.count) steps", isFirst: false)
+            VStack(spacing: 0) {
+                ForEach(Array(children.enumerated()), id: \.element.id) { index, child in
+                    if index > 0 {
+                        RelayHairline().padding(.horizontal, 16)
+                    }
+                    RelayStepRow(step: child, childCount: 0) { onOpenChild(child.id) }
+                }
+            }
+            .background(
+                RelayActivitySheetStyle.block,
+                in: RoundedRectangle(cornerRadius: RelayActivitySheetStyle.groupRadius, style: .continuous)
+            )
+            .padding(.horizontal, RelayActivitySheetStyle.gutter)
+        }
+
+        if let report = step.output.trimmedNonEmpty {
+            label("Report", isFirst: false)
+            RelayMarkdownText(text: report, userAligned: false, bodyFont: RelayChatStyle.bodyFont)
+                .padding(.horizontal, RelayActivitySheetStyle.textInset)
+        }
+
+        if let error = step.error?.trimmedNonEmpty {
+            sectionView(RelayStepSection(title: "Error", content: .failure(error)), isFirst: false)
         }
     }
 
-    private func section(_ title: String, @ViewBuilder content: () -> some View) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            RelayCapsLabel(text: title, color: AppTheme.textTertiary, size: 9.5)
-            content()
+    // MARK: Sections
+
+    private func label(_ title: String, isFirst: Bool, trailing: RelayStepSection.Trailing? = nil) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            RelayCapsLabel(text: title, color: RelayActivitySheetStyle.label, size: 10)
+            Spacer(minLength: 8)
+            switch trailing {
+            case .duration:
+                RelayStepDuration(step: step)
+            case .exit(let code):
+                RelayCapsLabel(text: "Exit \(code)", color: AppTheme.statusError, size: 10)
+            case .text(let text):
+                Text(text)
+                    .font(RelayTranscriptStyle.clock)
+                    .foregroundStyle(RelayActivitySheetStyle.label)
+            case .note(let text):
+                RelayCapsLabel(text: text, color: RelayActivitySheetStyle.label, size: 10)
+            case nil:
+                EmptyView()
+            }
+        }
+        .padding(.horizontal, RelayActivitySheetStyle.textInset)
+        .padding(.top, isFirst ? 6 : 20)
+        .padding(.bottom, 8)
+    }
+
+    @ViewBuilder
+    private func sectionView(_ section: RelayStepSection, isFirst: Bool) -> some View {
+        label(section.title, isFirst: isFirst, trailing: section.trailing)
+        switch section.content {
+        case .prose(let text):
+            textBlock(text, font: RelayTranscriptStyle.rowTitle, color: AppTheme.textPrimary, lineSpacing: 3)
+        case .code(let text):
+            textBlock(text, font: RelayTranscriptStyle.mono, color: AppTheme.textPrimary, lineSpacing: 4)
+        case .output(let text):
+            textBlock(text, font: RelayTranscriptStyle.clock, color: RelayChatStyle.secondary, lineSpacing: 3)
+        case .failure(let text):
+            textBlock(text, font: RelayTranscriptStyle.rowTitle, color: AppTheme.statusError, lineSpacing: 3)
+        case .diff(let lines):
+            RelayDiffBlock(lines: lines)
+        case .plan(let items):
+            planBlock(items)
         }
     }
 
-    private func textBlock(_ text: String, mono: Bool, color: Color = AppTheme.textPrimary) -> some View {
+    /// Text wraps inside its block, anywhere it has to: nothing scrolls sideways.
+    private func textBlock(_ text: String, font: Font, color: Color, lineSpacing: CGFloat) -> some View {
         Text(text)
-            .font(mono ? AppTheme.monoFont(size: 12) : AppTheme.uiFont(size: 14))
+            .font(font)
             .foregroundStyle(color)
-            .lineSpacing(mono ? 2 : 3)
+            .lineSpacing(lineSpacing)
             .textSelection(.enabled)
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(12)
+            .modifier(RelayDetailBlock())
+    }
+
+    private func planBlock(_ items: [RelayTodoItem]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    RelayCapsLabel(
+                        text: item.statusWord,
+                        color: item.isInProgress ? AppTheme.accentBright : RelayActivitySheetStyle.label,
+                        size: 10
+                    )
+                    .frame(width: 52, alignment: .leading)
+                    Text(item.text)
+                        .font(RelayTranscriptStyle.rowTitle)
+                        .foregroundStyle(item.isDone ? RelayChatStyle.secondary : AppTheme.textPrimary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .modifier(RelayDetailBlock())
+    }
+}
+
+/// The rounded ink-5% block a detail section's content sits in.
+private struct RelayDetailBlock: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .padding(.vertical, 12)
+            .padding(.horizontal, 16)
             .background(
                 RelayActivitySheetStyle.block,
                 in: RoundedRectangle(cornerRadius: RelayActivitySheetStyle.blockRadius, style: .continuous)
             )
+            .padding(.horizontal, RelayActivitySheetStyle.gutter)
+    }
+}
+
+/// A diff in one ink: the sign column says which side a line is on, and added
+/// lines sit on a quiet band. No red, no green.
+struct RelayDiffBlock: View {
+    let lines: [RelayDiffLine]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                // The sign has its own column, so a wrapped line hangs under its code.
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(sign(line.kind))
+                        .frame(width: 8, alignment: .leading)
+                    Text(line.text.isEmpty ? " " : line.text)
+                        .lineSpacing(5)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .foregroundStyle(line.kind == .added ? AppTheme.textPrimary : RelayActivitySheetStyle.label)
+                .padding(.vertical, 2)
+                .padding(.horizontal, 16)
+                .background(line.kind == .added ? AppTheme.textPrimary.opacity(0.08) : Color.clear)
+            }
+        }
+        .font(RelayTranscriptStyle.clock)
+        .textSelection(.enabled)
+        .padding(.vertical, 8)
+        .background(RelayActivitySheetStyle.block)
+        .clipShape(RoundedRectangle(cornerRadius: RelayActivitySheetStyle.blockRadius, style: .continuous))
+        .padding(.horizontal, RelayActivitySheetStyle.gutter)
+    }
+
+    private func sign(_ kind: RelayDiffLine.Kind) -> String {
+        switch kind {
+        case .added: return "+"
+        case .removed: return "−"
+        case .context: return ""
+        }
     }
 }
 
 // MARK: - Presentation helpers
 
 extension RelayStep {
-    /// `4s` once a step is over. Nil for one that never reported its times, and
-    /// for the sub-second steps where "0s" would only be noise.
+    /// `0.4s`, `18s`, `1m 12s` once a step is over. Nil for one that never
+    /// reported its times, and for the instant ones where "0s" would be noise.
     var finishedDurationLabel: String? {
         guard !status.isRunning, let startedAt, let endedAt else { return nil }
         let seconds = max(0, endedAt.timeIntervalSince(startedAt))
-        return seconds >= 0.5 ? RelayStepClock.short(seconds) : nil
+        guard seconds >= 0.05 else { return nil }
+        guard seconds < 9.95 else { return RelayStepClock.short(seconds) }
+        let tenths = String(format: "%.1f", seconds)
+        return (tenths.hasSuffix(".0") ? String(tenths.dropLast(2)) : tenths) + "s"
     }
 }
 
