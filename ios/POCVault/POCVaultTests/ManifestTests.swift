@@ -4172,6 +4172,11 @@ final class RelayTranscriptViewTests: XCTestCase {
         XCTAssertEqual(short.distanceFromBottom, 0)
         XCTAssertNil(follow.correction(for: short, readerIsTouching: false))
 
+        // Pulling short content down to refresh is not leaving the end.
+        var pulled = RelayScrollFollow()
+        pulled.readerScrolled(to: geometry(content: 300, offset: -120))
+        XCTAssertTrue(pulled.isFollowing)
+
         // Overscroll past the end still counts as being at the bottom.
         var bounced = RelayScrollFollow()
         bounced.readerScrolled(to: geometry(content: 2000, offset: 1460))
@@ -4222,7 +4227,7 @@ final class RelayTranscriptViewTests: XCTestCase {
         ])
         let thinking = timeline.step("r1")
         XCTAssertEqual(thinking?.liveDetail, "Checking the rounding helper.")
-        XCTAssertEqual(thinking?.rowSummary, "The bug is in the tax line.")
+        XCTAssertEqual(thinking?.rowSummary.text, "The bug is in the tax line.")
         XCTAssertNil(timeline.trailingProseLength)
 
         timeline.apply(.text(id: "t1", delta: "Looking."))
@@ -4281,10 +4286,14 @@ final class RelayTranscriptViewTests: XCTestCase {
         let chat = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
         let list = try snippet(in: chat, from: "private var messageList: some View", to: "private func transcriptRow")
 
-        // Nothing in the list scrolls because the model changed.
-        XCTAssertFalse(list.contains("ScrollViewReader"))
-        XCTAssertFalse(list.contains("scrollTo("))
+        // Nothing in the list scrolls because the model changed: no onChange
+        // of the messages scrolls it. The one scrollTo is the fallback's, used
+        // only while the backing scroll view has not been found.
         XCTAssertFalse(chat.contains("streamingTextLength"))
+        XCTAssertEqual(list.components(separatedBy: "proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)").count - 1, 2)
+        XCTAssertTrue(list.contains("scroller.fallbackScroll = { animated in"))
+        XCTAssertTrue(list.contains(".onChange(of: frame) { _, frame in scroller.measured(content: frame) }"))
+        XCTAssertTrue(list.contains("Color.clear.frame(height: 1).id(Self.bottomAnchor)"))
         XCTAssertTrue(list.contains("RelayScrollViewFinder(scroller: scroller)"))
         XCTAssertTrue(list.contains("scroller.viewportChanged()"))
         XCTAssertTrue(list.contains(".onChange(of: viewModel.messages.first?.id) { _, _ in scroller.land() }"))
@@ -4308,6 +4317,7 @@ final class RelayTranscriptViewTests: XCTestCase {
 
         let scroller = try AppSourceFixture.load("POCVault/Views/RelayTranscriptViews.swift")
         XCTAssertTrue(scroller.contains("scrollView.isTracking || scrollView.isDragging || scrollView.isDecelerating"))
+        XCTAssertTrue(scroller.contains("guard !isAttached, viewportHeight > 0 else { return }"))
         XCTAssertFalse(scroller.contains("onScrollGeometryChange"), "iOS 17 is the deployment target")
     }
 
@@ -4336,7 +4346,11 @@ final class RelayTranscriptViewTests: XCTestCase {
         let rows = try AppSourceFixture.load("POCVault/Views/RelayTranscriptViews.swift")
         XCTAssertTrue(rows.contains("static let maxLiveRows = 3"))
         XCTAssertTrue(rows.contains("idleWord = \"Working\""))
-        XCTAssertTrue(rows.contains(".frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)"))
+        XCTAssertTrue(rows.contains("static let activityRowHeight: CGFloat = 44"))
+        XCTAssertTrue(rows.contains("static let liveRowHeight: CGFloat = 60"))
+        // An approval parked on the job sits inside its turn, under "Waiting".
+        XCTAssertTrue(turn.contains("ForEach(approvals) { approval in"))
+        XCTAssertTrue(row.contains("approvals: approvals"))
         XCTAssertTrue(rows.contains("Button(\"View full log\", action: onFullLog)"))
         XCTAssertTrue(rows.contains("Button(isCancelling ? \"Stopping…\" : \"Stop\", action: onCancel)"))
     }
@@ -4372,11 +4386,140 @@ final class RelayTranscriptViewTests: XCTestCase {
         XCTAssertTrue(sheets.contains("viewModel.timeline(forJobID: id)"))
 
         let approval = try AppSourceFixture.load("POCVault/Views/RelayApprovalCard.swift")
-        XCTAssertTrue(approval.contains(".buttonStyle(RelayOutlineButtonStyle())"))
-        XCTAssertTrue(approval.contains(".buttonStyle(RelayPrimaryButtonStyle())"))
+        XCTAssertTrue(approval.contains(".buttonStyle(RelayApprovalButtonStyle(isPrimary: false))"))
+        XCTAssertTrue(approval.contains(".buttonStyle(RelayApprovalButtonStyle(isPrimary: true))"))
+        XCTAssertTrue(approval.contains(".background(isPrimary ? AppTheme.accent : Color.clear, in: Capsule())"))
+        XCTAssertFalse(approval.contains("RoundedRectangle(cornerRadius: 18"), "the approval is not a card")
         XCTAssertTrue(approval.contains("RelayCapsLabel(text: \"Needs approval\", color: AppTheme.statusWarn"))
         XCTAssertFalse(approval.contains(".borderedProminent"))
         XCTAssertFalse(approval.contains(".frame(width: 3)"))
+    }
+
+    func testFallbackFollowsOnSwiftUIMeasurementsAlone() {
+        var follow = RelayScrollFollow()
+        func measure(_ content: CGFloat, _ offset: CGFloat, viewport: CGFloat = 700) -> RelayScrollFollow.Geometry {
+            RelayScrollFollow.Geometry(contentHeight: content, viewportHeight: viewport, offsetY: offset)
+        }
+        // First measurement of a tall conversation: land at its end.
+        XCTAssertTrue(follow.observe(measure(2000, 0), after: nil))
+        // The pin moved the offset; that is not the reader leaving.
+        XCTAssertFalse(follow.observe(measure(2000, 1300), after: measure(2000, 0)))
+        XCTAssertTrue(follow.isFollowing)
+        // Content grows under a reader at the end: pin again.
+        XCTAssertTrue(follow.observe(measure(2040, 1300), after: measure(2000, 1300)))
+        // The keyboard shrinks the viewport: pin again.
+        XCTAssertTrue(follow.observe(measure(2040, 1340, viewport: 400), after: measure(2040, 1340)))
+        // The reader scrolls up: stop, and stay stopped while content grows.
+        XCTAssertFalse(follow.observe(measure(2040, 900), after: measure(2040, 1340)))
+        XCTAssertFalse(follow.isFollowing)
+        XCTAssertFalse(follow.observe(measure(2400, 900), after: measure(2040, 900)))
+        // Lazy rows being measured while they scroll (offset and height both
+        // move) is still the reader, never a reason to pull them back.
+        XCTAssertFalse(follow.observe(measure(2500, 700), after: measure(2400, 900)))
+        // Back at the end: following again.
+        XCTAssertFalse(follow.observe(measure(2500, 1800), after: measure(2500, 700)))
+        XCTAssertTrue(follow.isFollowing)
+        // Nothing to pin when already there.
+        XCTAssertFalse(follow.observe(measure(300, 0), after: measure(280, 0)))
+    }
+
+    func testStepDetailFollowsWhatTheStepCarriesNotItsKind() throws {
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        // Codex runs a read through a shell: it has a command, output and an exit code.
+        let shellRead = RelayStep(
+            id: "s1", kind: .read, title: "Read", summary: "pricing.ts", status: .failed, parentID: nil,
+            startedAt: start, endedAt: start.addingTimeInterval(3.1),
+            input: {
+                var input = RelayStepInput()
+                input.path = "/work/src/pricing.ts"
+                input.command = "sed -n 1,40p src/pricing.ts"
+                return input
+            }(),
+            output: "\n  export function roundPrice\n", outputTruncated: true, exitCode: 2, error: nil
+        )
+        let sections = shellRead.detailSections
+        XCTAssertEqual(sections.map(\.title), ["Path", "Command", "Output"])
+        XCTAssertEqual(sections[1].trailing, .duration)
+        XCTAssertEqual(sections[2].trailing, .exit(2))
+        XCTAssertEqual(sections[2].content, .output("  export function roundPrice"))
+        XCTAssertEqual(shellRead.finishedDurationLabel, "3.1s")
+        XCTAssertEqual(shellRead.rowSummary.text, "pricing.ts")
+        XCTAssertTrue(shellRead.rowSummary.isCode)
+        XCTAssertTrue(shellRead.hasDetail)
+
+        // A step's first event often carries only its title.
+        let bare = RelayStep(
+            id: "s2", kind: .command, title: "Bash", summary: nil, status: .running, parentID: nil,
+            startedAt: start, endedAt: nil, input: RelayStepInput(), output: "", outputTruncated: false,
+            exitCode: nil, error: nil
+        )
+        XCTAssertEqual(bare.liveDetail, "Bash")
+        XCTAssertTrue(bare.detailSections.isEmpty)
+        XCTAssertFalse(bare.hasDetail)
+
+        // An edit's diff, in one ink with its counts on the label.
+        var edit = bare
+        edit.kind = .edit
+        edit.status = .done
+        edit.input.path = "/work/src/pricing.ts"
+        edit.input.diff = "--- a/pricing.ts\n+++ b/pricing.ts\n fn() {\n-  floor\n+  round\n }"
+        let diff = try XCTUnwrap(edit.detailSections.last)
+        XCTAssertEqual(diff.title, "Diff")
+        XCTAssertEqual(diff.trailing, .text("+1 −1"))
+        XCTAssertEqual(diff.content, .diff([
+            RelayDiffLine(kind: .context, text: "fn() {"),
+            RelayDiffLine(kind: .removed, text: "  floor"),
+            RelayDiffLine(kind: .added, text: "  round"),
+            RelayDiffLine(kind: .context, text: "}"),
+        ]))
+    }
+
+    func testThinkingWithNoTextOpensNothing() throws {
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        var timeline = timeline([
+            .step(RelayStepPatch(id: "r1", kind: .reasoning, title: "Thinking", status: .done, startedAt: start, endedAt: start.addingTimeInterval(4))),
+            .text(id: "t1", delta: "Looking."),
+            .step(RelayStepPatch(id: "r2", kind: .reasoning, title: "Thinking", status: .done)),
+            .step(RelayStepPatch(id: "s1", kind: .read, title: "Read", status: .done, input: {
+                var input = RelayStepInput()
+                input.path = "/work/a.ts"
+                return input
+            }())),
+        ])
+        XCTAssertEqual(timeline.step("r1")?.hasDetail, false)
+        let rows = timeline.transcriptRows(isActive: false)
+        XCTAssertEqual(rows.map(\.id), ["activity-r1", "prose-t1", "activity-r2"])
+        // A sentence with nothing behind it is a plain line; one with a real step opens.
+        XCTAssertEqual(rows[0].content, .activity(summary: "Thought for 4s", failedCount: 0, opens: false))
+        XCTAssertEqual(rows[2].content, .activity(summary: "Thought, read a file", failedCount: 0, opens: true))
+        XCTAssertFalse(rows[2].followsActivity)
+
+        timeline.apply(.stepDelta(id: "r1", output: "The tax line."))
+        XCTAssertEqual(timeline.step("r1")?.hasDetail, true)
+        XCTAssertEqual(timeline.transcriptRows(isActive: false)[0].content, .activity(summary: "Thought for 4s", failedCount: 0, opens: true))
+
+        XCTAssertEqual(CodexJobStatus.succeeded.outcomeWord, "Done")
+        XCTAssertEqual(CodexJobStatus.canceled.outcomeWord, "Stopped")
+        XCTAssertNil(CodexJobStatus.running.outcomeWord)
+        XCTAssertTrue(CodexJobStatus.failed.didFail)
+    }
+
+    func testAnEmptyConversationShowsNothingAboveTheComposer() throws {
+        let chat = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
+        // The composer's pill already names the model: no icon tile, headline,
+        // tagline or model badge on the empty canvas, and nothing in their place.
+        XCTAssertFalse(chat.contains("RelayEmptyConversation"))
+        XCTAssertFalse(chat.contains("Start a conversation"))
+        XCTAssertFalse(chat.contains("Run a task"))
+        XCTAssertFalse(chat.contains("Stream a reply scoped to this folder."))
+        XCTAssertFalse(chat.contains("Queue an agent job in this folder."))
+
+        // The empty list still loads, refreshes and dismisses the keyboard.
+        let list = try snippet(in: chat, from: "private var messageList: some View", to: "private func transcriptRow")
+        XCTAssertTrue(list.contains("ProgressView(\"Loading conversation…\")"))
+        XCTAssertTrue(list.contains(".refreshable"))
+        XCTAssertFalse(list.contains("viewModel.messages.isEmpty"))
+        XCTAssertTrue(chat.contains("messageList\n                        .layoutPriority(1)\n                        .contentShape(Rectangle())\n                        .simultaneousGesture(keyboardDismissTap)"))
     }
 
     func testNothingInTheTranscriptScrollsSideways() throws {

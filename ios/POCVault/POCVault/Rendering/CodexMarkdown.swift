@@ -429,6 +429,11 @@ enum CodexInlineMarkdown {
         var attributed = (try? AttributedString(markdown: value, options: options))
             ?? AttributedString(value)
 
+        // Inline code is DM Mono a touch under the body size, with no fill.
+        for run in attributed.runs where run.inlinePresentationIntent?.contains(.code) == true {
+            attributed[run.range].font = Font.custom("DMMono-Regular", size: 14, relativeTo: .body)
+        }
+
         // Markdown only makes `[label](url)` and `<url>` tappable. Agent results
         // commonly return bare localhost URLs such as `http://localhost:3000/lab`,
         // so detect links in the rendered text and attach the missing link attribute.
