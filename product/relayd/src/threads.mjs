@@ -1417,6 +1417,10 @@ function parseTranscriptTurn(entry) {
     return take(role, messageText(entry.payload), content, entry.timestamp);
   }
   if (entry.type === "user" || entry.type === "assistant") {
+    // Claude Code writes what it tells itself as `user` entries too: a
+    // finished background agent's report, a hook's output. Those are the
+    // harness talking, not the person, and must never become a prompt bubble.
+    if (entry.type === "user" && isHarnessAuthoredUserEntry(entry)) return null;
     const content = entry.message?.content ?? entry.message ?? entry.content ?? entry.text;
     const parts = Array.isArray(content) ? content : Array.isArray(content?.content) ? content.content : [];
     return take(entry.type, contentPartsText(content), parts, entry.timestamp);
@@ -1427,6 +1431,18 @@ function parseTranscriptTurn(entry) {
     return take(entry.role, contentPartsText(content), parts, entry.timestamp);
   }
   return null;
+}
+
+// Claude Code marks who wrote a `user` entry. `promptSource: "system"`, an
+// `origin` such as `{kind: "task-notification"}` and `isMeta` all mean the CLI
+// authored it. Transcripts from before those fields existed fall through to the
+// tag list in stripInjectedUserMarkup.
+function isHarnessAuthoredUserEntry(entry) {
+  if (entry.isMeta === true) return true;
+  if (entry.promptSource === "system") return true;
+  const origin = entry.origin;
+  if (origin && typeof origin === "object" && typeof origin.kind === "string" && origin.kind !== "user") return true;
+  return false;
 }
 
 function readSessionSummary(sessionFile) {
@@ -1911,6 +1927,7 @@ const SYNTHETIC_USER_TAGS = [
   "recommended_plugins",
   "app-context",
   "skills_instructions",
+  "task-notification",
   "apps_instructions",
   "plugins_instructions",
   "collaboration_mode",
