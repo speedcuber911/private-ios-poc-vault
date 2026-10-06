@@ -43,6 +43,9 @@ class SimulatorVaultServer(ThreadingHTTPServer):
         # It advances on its own thread, like a real job, so a stream can drop and
         # re-attach with `timeline=<n>` without restarting the run.
         self.active_job_timeline: list[dict] = []
+        # The prose of that timeline as a stdout log, the way relayd keeps one:
+        # what SIM_TIMELINE_STDOUT=1 streams, from a byte offset.
+        self.active_job_stdout = bytearray()
         self.active_job_timeline_enabled = False
         self.active_job_timeline_done = True
         self.active_job_final_status = "succeeded"
@@ -351,6 +354,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/codex/threads/sim-thread-linear":
             self.send_json(codex_fixture_thread_detail())
             return
+        if path == "/v1/codex/jobs/sim-job-linear/timeline" and sim_history_steps_enabled():
+            self.send_json(sim_finished_timeline_page(parse_qs(query)))
+            return
         if path == "/v1/codex/threads/sim-claude-handoff-thread":
             job = codex_fixture_handoff_job()
             self.send_json({
@@ -485,10 +491,30 @@ class Handler(BaseHTTPRequestHandler):
         })
         timeline_cursor = sim_timeline_cursor(self.server, query)
         if timeline_cursor is not None:
+            opened = time.monotonic()
+            stdout_offset = bounded_int(((query or {}).get("stdoutOffset") or ["0"])[0], 0, 0, 1 << 40)
+            stderr_offset = bounded_int(((query or {}).get("stderrOffset") or ["0"])[0], 0, 0, 1 << 40)
+            # One line per connection, so a re-attach can be read off the log:
+            # what the client said it already held, and how the connection ended.
+            sim_log(
+                "job-stream open "
+                f"stdoutOffset={stdout_offset if 'stdoutOffset' in (query or {}) else '-'} "
+                f"stderrOffset={stderr_offset if 'stderrOffset' in (query or {}) else '-'} "
+                f"timeline={timeline_cursor}"
+            )
+            outcome = "client-gone"
+            self.sim_stream_sent = 0
             try:
-                self.stream_sim_timeline(emit, timeline_cursor, provider, model, prompt)
+                outcome = self.stream_sim_timeline(
+                    emit, timeline_cursor, provider, model, prompt, stdout_offset
+                )
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            sim_log(
+                f"job-stream close reason={outcome} timelineEventsSent={self.sim_stream_sent} "
+                f"through={timeline_cursor + self.sim_stream_sent} "
+                f"seconds={time.monotonic() - opened:.1f}"
+            )
             return
         offset = 0
         for chunk in ["Scanning workspace…\n", "Reading recent activity…\n", "Drafting summary…\n"]:
@@ -509,17 +535,43 @@ class Handler(BaseHTTPRequestHandler):
             ),
         )
 
-    def stream_sim_timeline(self, emit, cursor: int, provider: str, model: str | None, prompt: str) -> None:
+    def stream_sim_timeline(
+        self,
+        emit,
+        cursor: int,
+        provider: str,
+        model: str | None,
+        prompt: str,
+        stdout_offset: int = 0,
+    ) -> str:
         """Tail the scripted timeline from `cursor` until the run ends, then send
-        `done`. Timeline messages carry no SSE id, as on a real machine."""
+        `done`. Timeline messages carry no SSE id, as on a real machine.
+
+        SIM_STREAM_DROP_AFTER=<n> closes each connection after n timeline events
+        without sending `done`, the way a network drop does, so a client's
+        re-attach can be exercised. SIM_TIMELINE_STDOUT=1 also streams the prose
+        as `stdout` chunks with real byte offsets, from `stdoutOffset`."""
+        drop_after = bounded_int(os.environ.get("SIM_STREAM_DROP_AFTER", "0"), 0, 0, 1_000_000)
+        mirror_stdout = os.environ.get("SIM_TIMELINE_STDOUT", "0") == "1"
+        sent = 0
+        self.sim_stream_sent = 0
         while True:
             with self.server.fixture_lock:
                 pending = list(self.server.active_job_timeline[cursor:])
                 finished = self.server.active_job_timeline_done
                 final_status = self.server.active_job_final_status
-            for event in pending:
+                stdout = bytes(self.server.active_job_stdout[stdout_offset:]) if mirror_stdout else b""
+            if stdout:
+                emit("stdout", {"offset": stdout_offset, "text": stdout.decode("utf-8", errors="replace")})
+                stdout_offset += len(stdout)
+            for index, event in enumerate(pending):
                 cursor += 1
+                sent += 1
                 emit("timeline", {"seq": cursor, "event": event})
+                self.sim_stream_sent = sent
+                is_last_of_run = finished and index == len(pending) - 1
+                if drop_after and sent >= drop_after and not is_last_of_run:
+                    return "dropped"
             if finished and not pending:
                 break
             if not pending:
@@ -536,6 +588,9 @@ class Handler(BaseHTTPRequestHandler):
         )
         job["timelineEvents"] = cursor
         emit("done", job)
+        if mirror_stdout:
+            sim_log(f"job-stream done stdoutBytes={stdout_offset} timelineEvents={cursor}")
+        return "done"
 
     def active_job_fixture(self, status: str, result: str | None) -> dict:
         with self.server.fixture_lock:
@@ -716,6 +771,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: object) -> None:
         sys.stderr.write("sim-vault: " + format % args + "\n")
+
+
+def sim_log(message: str) -> None:
+    stamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    sys.stderr.write(f"sim-vault: [{stamp}] {message}\n")
+    sys.stderr.flush()
 
 
 def simulator_account_user() -> dict:
@@ -1583,7 +1644,7 @@ def codex_fixture_scoped_chat_thread_detail() -> dict:
 
 
 def codex_fixture_thread_detail() -> dict:
-    return {
+    detail = {
         "thread": codex_fixture_thread(),
         "messages": [
             {
@@ -1603,6 +1664,81 @@ def codex_fixture_thread_detail() -> dict:
             },
         ],
         "jobs": [codex_fixture_job()],
+    }
+    if sim_history_steps_enabled():
+        # Thread history as a machine with timelines sends it (spec 1.3): each
+        # message carries the steps taken since the previous one, and steps
+        # after the last message arrive as `trailingSteps`.
+        history = sim_history_steps()
+        detail["messages"][1]["steps"] = history[:2]
+        detail["messages"][2]["steps"] = history[2:6]
+        detail["trailingSteps"] = history[6:]
+        detail["jobs"][0]["timelineEvents"] = len(sim_timeline_script())
+    return detail
+
+
+def sim_history_steps_enabled() -> bool:
+    """SIM_HISTORY_STEPS=1: the finished thread `sim-thread-linear` carries
+    `steps` and `trailingSteps`, and its job reports a timeline that
+    `/v1/codex/jobs/sim-job-linear/timeline` serves. Off by default, so the
+    thread reads as one from a machine that predates timelines."""
+    return os.environ.get("SIM_HISTORY_STEPS", "0") == "1"
+
+
+def sim_history_steps() -> list[dict]:
+    """Complete step objects (no deltas), output capped at 4 KiB, as history sends them."""
+    app = "/srv/codex-workspaces/poc-vault"
+
+    def step(id: str, kind: str, title: str, second: int, seconds: float = 1.0, **fields: object) -> dict:
+        started = datetime(2026, 5, 23, 13, 34, second, tzinfo=timezone.utc)
+        ended = started + timedelta(seconds=seconds)
+        return {
+            "id": id, "kind": kind, "title": title, "status": "done",
+            "startedAt": started.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "endedAt": ended.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            **fields,
+        }
+
+    return [
+        step("h1", "reasoning", "Thinking", 4, 3.0,
+             output="Three checks, a progress count, and it has to work on a phone."),
+        step("h2", "read", "Read", 9, 0.2, summary="launch-checklist.html",
+             input={"path": f"{app}/launch-checklist.html"}),
+        step("h3", "write", "Write", 22, 0.3, summary="launch-checklist.html",
+             input={"path": f"{app}/launch-checklist.html",
+                    "diff": "+<ul class=\"checks\">\n+  <li><label><input type=\"checkbox\"> Copy reviewed</label></li>\n+</ul>"}),
+        step("h4", "command", "Bash", 26, 6.0, summary="Serve the preview", exitCode=0,
+             input={"command": "npm run preview -- --port 4317", "description": "Serve the preview",
+                    "cwd": app, "background": True},
+             output="  Local:   http://localhost:4317/lab\n"),
+        step("h5", "agent", "Agent", 33, 9.0, summary="Check the layout at phone width",
+             input={"description": "Check the layout at phone width",
+                    "prompt": "Open the preview at 390 points wide and report anything that overflows.",
+                    "agentType": "general-purpose"},
+             output="Nothing overflows at 390 points. The progress count wraps under the title, which reads fine."),
+        step("h6", "fetch", "WebFetch", 35, 1.5, summary="localhost", parent="h5",
+             input={"url": "http://localhost:4317/lab"}),
+        step("h7", "tool", "Mark Chapter", 51, 0.05,
+             input={"name": "mark_chapter", "server": "session", "json": "{\n  \"title\": \"Copy review\"\n}"}),
+        {**step("h8", "command", "Bash", 53, 4.0, summary="Run the accessibility check", exitCode=1,
+                input={"command": "npx pa11y http://localhost:4317/lab", "description": "Run the accessibility check",
+                       "cwd": app},
+                output="Error: 1 issue\n • Form control has no label (#notes)\n"),
+         "status": "failed"},
+    ]
+
+
+def sim_finished_timeline_page(query: dict) -> dict:
+    """The whole scripted turn as a finished job's timeline, paged like the real route."""
+    events = [event for _, event in sim_timeline_script()]
+    since = min(bounded_int((query.get("since") or ["0"])[0], 0, 0, 1_000_000), len(events))
+    page = events[since:since + 2000]
+    next_cursor = since + len(page)
+    return {
+        "jobId": "sim-job-linear",
+        "events": [{"seq": since + index + 1, "event": event} for index, event in enumerate(page)],
+        "next": next_cursor,
+        "complete": next_cursor == len(events),
     }
 
 
@@ -1649,7 +1785,30 @@ _SIM_TIMELINE_ANSWER = "\n".join([
 
 
 def sim_timeline_script() -> list[tuple[float, dict]]:
-    """(pause before the event as a multiple of SIM_JOB_STREAM_DELAY, event)."""
+    """(pause before the event as a multiple of SIM_JOB_STREAM_DELAY, event).
+
+    SIM_TIMELINE_REPEAT=<n> plays the turn n times over, with fresh ids each
+    round, to make a transcript long enough to test scrolling."""
+    rounds = bounded_int(os.environ.get("SIM_TIMELINE_REPEAT", "1"), 1, 1, 200)
+    if rounds == 1:
+        return sim_timeline_round()
+    script: list[tuple[float, dict]] = []
+    for round_index in range(rounds):
+        tag = f"-{round_index + 1}"
+        for pause, event in sim_timeline_round():
+            if event.get("type") == "usage":
+                if round_index < rounds - 1:
+                    continue
+            else:
+                event = dict(event)
+                event["id"] = f"{event['id']}{tag}"
+                if "parent" in event:
+                    event["parent"] = f"{event['parent']}{tag}"
+            script.append((pause, event))
+    return script
+
+
+def sim_timeline_round() -> list[tuple[float, dict]]:
     script: list[tuple[float, dict]] = []
 
     def add(pause: float, **event: object) -> None:
@@ -1770,6 +1929,7 @@ def start_sim_timeline(server: SimulatorVaultServer) -> None:
         server.active_job_generation += 1
         generation = server.active_job_generation
         server.active_job_timeline = []
+        server.active_job_stdout = bytearray()
         server.active_job_timeline_enabled = enabled
         server.active_job_timeline_done = not enabled
         server.active_job_final_status = "succeeded"
@@ -1794,6 +1954,8 @@ def start_sim_timeline(server: SimulatorVaultServer) -> None:
                 if server.active_job_generation != generation:
                     return
                 server.active_job_timeline.append(event)
+                if event.get("type") == "text":
+                    server.active_job_stdout += str(event.get("delta") or "").encode("utf-8")
         with server.fixture_lock:
             if server.active_job_generation == generation:
                 server.active_job_timeline_done = True
