@@ -264,6 +264,25 @@ struct RelayTimelinePage: Decodable, Hashable {
     }
 }
 
+/// The `steps` and `trailingSteps` arrays of thread history. One entry this
+/// build cannot read is skipped; it does not cost the turn its other steps.
+struct RelayHistorySteps: Decodable, Hashable {
+    let steps: [RelayStepPatch]
+
+    private struct Entry: Decodable {
+        let patch: RelayStepPatch?
+
+        init(from decoder: Decoder) throws {
+            patch = try? RelayStepPatch(from: decoder)
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        let entries = (try? decoder.singleValueContainer().decode([Entry].self)) ?? []
+        steps = entries.compactMap(\.patch)
+    }
+}
+
 enum RelayTimelineDate {
     private static let fractional: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
@@ -337,6 +356,24 @@ struct RelayTimeline: Hashable {
         for patch in historySteps {
             merge(patch)
         }
+    }
+
+    /// Thread history, where every step is a finished record: one that names no
+    /// status ran to completion, and one still marked running in a thread that
+    /// is no longer working was interrupted.
+    init(historySteps: [RelayStepPatch], threadIsActive: Bool) {
+        for var patch in historySteps {
+            if patch.status == nil { patch.status = .done }
+            merge(patch)
+        }
+        if !threadIsActive {
+            settle(as: .cancelled)
+        }
+    }
+
+    /// True while any step, nested or not, is still in flight.
+    var hasRunningSteps: Bool {
+        order.contains { steps[$0]?.status == .running }
     }
 
     var isEmpty: Bool { blocks.isEmpty && order.isEmpty }

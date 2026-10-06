@@ -193,6 +193,11 @@ final class RelayChatSessionStore: ObservableObject {
     /// fire even when no chat cover is on screen. Started from the root `.task`, guarded
     /// by `CodexAgentMonitorPolicy.shouldStartAppMonitor`.
     func monitorActiveWorkWhileAppIsOpen() async {
+        // Started each time the scene becomes active: put back any job stream
+        // that dropped or gave up while the app was not in front.
+        for viewModel in sessionsByKey.values {
+            viewModel.resumeLiveWork()
+        }
         await pollOnce(force: true)
         while !Task.isCancelled {
             try? await Task.sleep(nanoseconds: 2_000_000_000)
