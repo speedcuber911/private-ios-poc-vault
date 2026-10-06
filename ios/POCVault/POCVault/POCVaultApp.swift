@@ -11,6 +11,9 @@ struct POCVaultApp: App {
     @StateObject private var nodeStore: RelayNodeStore
     @StateObject private var computerLinkStore: RelayComputerLinkStore
     @StateObject private var pushService: RelayPushService
+    /// The one power model. Settings and Usage both draw their switch from it,
+    /// and it is told about the starts and stops it did not issue itself.
+    @StateObject private var powerModel: RelayMachinePowerModel
     private let codexClient: CodexClient
     private let authClient: RelayAuthClient
 
@@ -57,11 +60,28 @@ struct POCVaultApp: App {
         _computerLinkStore = StateObject(wrappedValue: RelayComputerLinkStore(
             client: RelayAuthClient(baseURL: AppConfiguration.authBaseURL)
         ))
-        _pushService = StateObject(wrappedValue: RelayPushService(
+        let pushService = RelayPushService(
             accountStore: accountStore,
             codexClient: codexClient,
             identityStore: identityStore
-        ))
+        )
+        _pushService = StateObject(wrappedValue: pushService)
+        let powerModel = RelayMachinePowerModel()
+        powerModel.configure(identityStore: identityStore)
+        codexClient.onMachineWake = { [weak powerModel] isWaking in
+            Task { @MainActor in
+                if isWaking {
+                    powerModel?.machineWakeBegan()
+                } else {
+                    powerModel?.machineWakeEnded()
+                }
+            }
+        }
+        // A power push says the machine just stopped or came up.
+        pushService.onMachinePowerPush = { [weak powerModel] in
+            Task { await powerModel?.refresh() }
+        }
+        _powerModel = StateObject(wrappedValue: powerModel)
         self.codexClient = codexClient
         self.authClient = authClient
     }
@@ -120,7 +140,8 @@ struct POCVaultApp: App {
                 computerLinkStore: computerLinkStore,
                 codexClient: codexClient,
                 authClient: authClient,
-                pushService: pushService
+                pushService: pushService,
+                powerModel: powerModel
             )
             // Pairing (or unpairing) a machine restarts the browser stack so
             // listings refetch; the shared client and the chat/status
@@ -216,6 +237,7 @@ struct POCVaultRootView: View {
     let codexClient: CodexClient
     let authClient: RelayAuthClient
     @ObservedObject var pushService: RelayPushService
+    let powerModel: RelayMachinePowerModel
 
     @Environment(\.scenePhase) private var scenePhase
     @State private var browserPath: [BrowserRoute] = []
@@ -271,6 +293,7 @@ struct POCVaultRootView: View {
                 RelayMachineMonitorView(
                     client: codexClient,
                     identityStore: identityStore,
+                    powerModel: powerModel,
                     machineName: nodeStore.pairedNode?.nodeName ?? "Machine",
                     showsDismissButton: true
                 )
@@ -424,6 +447,7 @@ struct POCVaultRootView: View {
                 computerLinkStore: computerLinkStore,
                 codexClient: codexClient,
                 authClient: authClient,
+                powerModel: powerModel,
                 showsDismissButton: false
             )
             .tag(RelayRootTab.settings)

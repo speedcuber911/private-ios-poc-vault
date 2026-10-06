@@ -190,6 +190,8 @@ struct CodexRequestBudget: Equatable {
 
     /// Background list polls (the Chats list and the completion monitor).
     static let listPoll = CodexRequestBudget(timeout: 12, allowsMachineWake: false)
+    /// Status a screen loads just by being opened (Settings' agent list).
+    static let statusRead = CodexRequestBudget(timeout: 12, allowsMachineWake: false)
 }
 
 final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
@@ -211,6 +213,12 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
     private let decoder = CodexClient.makeDecoder()
     private let wakeLock = NSLock()
     private var wakeTask: Task<Void, Error>?
+    /// Called with `true` when a request finds the machine down and starts it,
+    /// and with `false` when that wake is over. The power switch is drawn from
+    /// a model that did not issue this start, and EC2 goes on answering
+    /// `stopped` for its first seconds, so without this it would show Off for
+    /// a machine the app itself is bringing up. Set once, at launch.
+    var onMachineWake: (@Sendable (Bool) -> Void)?
     private var didFetchPowerCredential = false
 
     /// The exact decoder every node response goes through. Exposed so tests can
@@ -375,7 +383,17 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
     /// Provider installation and authentication state from the linked computer.
     /// relayd evaluates this under the same HOME/CODEX_HOME used for real tasks.
     func fetchHarnesses() async throws -> [RelayHarnessStatus] {
-        let data = try await perform(path: "/v1/harness")
+        try await fetchHarnesses(budget: nil)
+    }
+
+    /// `budget` is for a screen that only reports on the machine (Settings):
+    /// reading which agents are signed in must not be what powers it on.
+    func fetchHarnesses(budget: CodexRequestBudget?) async throws -> [RelayHarnessStatus] {
+        let data = try await perform(
+            path: "/v1/harness",
+            timeout: budget?.timeout,
+            allowWake: budget?.allowsMachineWake ?? true
+        )
         return try decoder.decode(CodexListEnvelope<RelayHarnessStatus>.self, from: data).values
     }
 
@@ -974,9 +992,12 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
     /// An older relayd answers the route fallback with a generic 404.
     func fetchMachineStats() async throws -> RelayMachineStats? {
         do {
+            // Usage reports on the machine and carries its own Power switch;
+            // looking at a stopped machine must not start it.
             let data = try await perform(
                 path: "/v1/machine/stats",
-                cachePolicy: .reloadIgnoringLocalCacheData
+                cachePolicy: .reloadIgnoringLocalCacheData,
+                allowWake: false
             )
             guard !data.isEmpty else { return nil }
             return try decoder.decode(RelayMachineStats.self, from: data)
@@ -1329,7 +1350,10 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
             "status": String(httpResponse.statusCode),
             "bytes": String(data.count)
         ])
-        if allowWake {
+        // Any answer from the node will do, not only one that was allowed to
+        // wake it: Settings and Usage read without waking, and they are the
+        // screens that need the credential.
+        if path != Self.powerCredentialPath {
             Task { await self.refreshPowerCredentialIfNeeded() }
         }
         return (data, httpResponse)
@@ -1397,10 +1421,12 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         }
         wakeTask = task
         wakeLock.unlock()
+        onMachineWake?(true)
         defer {
             wakeLock.lock()
             wakeTask = nil
             wakeLock.unlock()
+            onMachineWake?(false)
         }
         do {
             try await task.value
@@ -1412,6 +1438,8 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
             return false
         }
     }
+
+    private static let powerCredentialPath = "/v1/power/credential"
 
     private func refreshPowerCredentialIfNeeded() async {
         if identityStore.wakeCredential() != nil { return }
@@ -1427,7 +1455,7 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
             var nodeId: String?
             var wakeToken: String?
         }
-        guard let data = try? await perform(path: "/v1/power/credential", allowWake: false),
+        guard let data = try? await perform(path: Self.powerCredentialPath, allowWake: false),
               let payload = try? decoder.decode(Payload.self, from: data),
               let nodeID = payload.nodeId?.trimmedNonEmpty,
               let token = payload.wakeToken?.trimmedNonEmpty else {

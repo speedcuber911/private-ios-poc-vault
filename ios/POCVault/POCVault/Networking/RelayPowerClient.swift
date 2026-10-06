@@ -63,7 +63,7 @@ enum RelayMachinePowerError: Error, Equatable, LocalizedError {
         case .unconfigured:
             return "Machine start/stop is not configured on the control plane."
         case .rateLimited:
-            return "That machine was started too recently. Try again in a moment."
+            return "This machine's power changed a moment ago. Try again in a few seconds."
         case .awsFailed:
             return "Relay could not change the machine's power state."
         case .httpFailure(let status):
@@ -310,17 +310,65 @@ final class RelayMachinePowerModel: ObservableObject {
     static let autoStopTagLag: TimeInterval = 30
     private var autoStopSavedAt: Date?
 
+    /// How long a start or stop is followed before it is called late.
+    static let transitionTimeout: TimeInterval = 90
+    /// An auto-wake powers on, waits for AWS, then waits for `/healthz`.
+    static let wakeTimeout: TimeInterval = 150
+
     private var identityStore: ClientIdentityStore?
     private let powerClient: RelayMachinePowering
+    /// Gap between reads while the machine is in motion or a read just failed.
+    private let settleInterval: Duration
+    /// Gap between reads once the machine has settled.
+    private let steadyInterval: Duration
     /// Bumped by every start and stop. Anything that began under an older
     /// generation is stale and is thrown away, so a slow read can never move
     /// the switch back to the state it held before the user acted.
     private var generation = 0
     private var isReading = false
     private var isTransitioning = false
+    /// The machine the published state describes. Pairing a different one
+    /// starts over from `.loading` instead of showing the last machine's switch.
+    private var nodeID: String?
+    private var failedReads = 0
+    private var lastReadAt: ContinuousClock.Instant?
+    /// Set while a node request's auto-wake is starting the machine. EC2 goes
+    /// on answering `stopped` for the first seconds of a start, and this model
+    /// did not issue that start, so nothing else would stop a read in that
+    /// window from showing Off for a machine that is coming up.
+    private var wakeExpectedUntil: Date?
 
-    init(powerClient: RelayMachinePowering? = nil) {
+    private enum NoticeSource { case read, action }
+    private var noticeSource: NoticeSource?
+
+    private enum Target {
+        case on, off
+
+        /// The machine has arrived.
+        func isReached(by state: RelayMachinePowerState) -> Bool {
+            switch self {
+            case .on: return state.isRunning
+            case .off: return state.instanceState == "stopped"
+            }
+        }
+
+        /// The machine is there or on its way, whoever sent it.
+        func isUnderway(in state: RelayMachinePowerState) -> Bool {
+            switch self {
+            case .on: return state.isRunning || state.isStarting
+            case .off: return state.isStopped
+            }
+        }
+    }
+
+    init(
+        powerClient: RelayMachinePowering? = nil,
+        settleInterval: Duration = .seconds(2),
+        steadyInterval: Duration = .seconds(20)
+    ) {
         self.powerClient = powerClient ?? RelayPowerClient(baseURL: AppConfiguration.authBaseURL)
+        self.settleInterval = settleInterval
+        self.steadyInterval = steadyInterval
     }
 
     var canControl: Bool { identityStore?.wakeCredential() != nil }
@@ -329,38 +377,93 @@ final class RelayMachinePowerModel: ObservableObject {
         self.identityStore = identityStore
     }
 
+    /// Keeps the switch honest for as long as a screen shows it: a read now,
+    /// again every couple of seconds while the machine is in motion or a read
+    /// failed, and slowly once it has settled. The machine also changes state
+    /// behind the app's back (idle auto-stop, a node request's auto-wake,
+    /// another phone), and one read on appear cannot see any of that.
+    ///
+    /// Runs inside a visibility- and scene-bound `.task`: leaving the screen
+    /// or backgrounding the app stops it, and coming back starts with a read.
+    func watch() async {
+        await refresh()
+        while !Task.isCancelled {
+            // A short tick rather than one long sleep, so a machine that starts
+            // moving mid-wait is followed at once. Settings and Usage can both
+            // be watching; whichever ticks first reads, and that serves both.
+            do { try await Task.sleep(for: settleInterval) } catch { return }
+            if let lastReadAt, ContinuousClock.now - lastReadAt < nextReadDelay { continue }
+            await refresh()
+        }
+    }
+
+    private var nextReadDelay: Duration {
+        // No credential yet costs nothing to check again: it arrives from the
+        // node moments after the first request to it succeeds.
+        if !canControl { return settleInterval }
+        if failedReads > 0 {
+            return min(settleInterval * (1 << min(failedReads - 1, 4)), steadyInterval)
+        }
+        return status.isBusy || status == .loading ? settleInterval : steadyInterval
+    }
+
     /// A plain read. It yields to any start/stop that owns the switch, and to
     /// another read already in flight, rather than competing with it.
     func refresh() async {
-        guard let credential = identityStore?.wakeCredential() else {
-            status = .unavailable
-            return
-        }
+        guard let credential = currentCredential() else { return }
         guard !isTransitioning, !isReading else { return }
         isReading = true
         let readGeneration = generation
-        defer { isReading = false }
+        defer {
+            isReading = false
+            lastReadAt = .now
+        }
         do {
             let state = try await powerClient.state(nodeID: credential.nodeID, wakeToken: credential.token)
             guard readGeneration == generation else { return }
+            failedReads = 0
             apply(state)
-            if resize?.stage != "failed" { notice = nil }
+            if resize?.stage != "failed", noticeSource != .action { setNotice(nil) }
         } catch let error as RelayMachinePowerError where error == .unconfigured || error == .unauthorized {
             guard readGeneration == generation else { return }
+            failedReads = 0
             status = .unavailable
         } catch {
-            guard readGeneration == generation else { return }
+            // Backgrounding cancels the read under it. That is not a failure.
+            guard readGeneration == generation, !Task.isCancelled else { return }
+            failedReads += 1
             // A failed read is not evidence of a power state. Keep whatever we
             // last knew and say what went wrong instead of flipping the switch.
             if !status.isResolved {
                 status = .unknown
             }
-            notice = error.localizedDescription
+            // The first request after the app returns to the foreground often
+            // dies on a socket iOS closed; it is retried within seconds, so
+            // only a read that fails twice running is worth a line of red.
+            if failedReads > 1, noticeSource != .action {
+                setNotice(error.localizedDescription, source: .read)
+            }
         }
     }
 
+    /// A node request found the machine down and is starting it. Nothing on
+    /// the power screens asked for that, so they are told here.
+    func machineWakeBegan() {
+        wakeExpectedUntil = Date().addingTimeInterval(Self.wakeTimeout)
+        guard !isTransitioning else { return }
+        // A read already in flight would answer with the state before the wake.
+        generation += 1
+        Task { await refresh() }
+    }
+
+    /// The auto-wake is over, started or not: EC2 is the authority again.
+    func machineWakeEnded() {
+        wakeExpectedUntil = nil
+        Task { await refresh() }
+    }
+
     func requestResize(to target: String) async {
-        guard let credential = identityStore?.wakeCredential(), let current = instanceType,
+        guard let credential = currentCredential(), let current = instanceType,
               resizeOptions.contains(target), target != current else { return }
         guard !isSubmittingResize && !isTransitioning && resize?.isActive != true else { return }
         generation += 1
@@ -370,22 +473,22 @@ final class RelayMachinePowerModel: ObservableObject {
             isSubmittingResize = false
             requestedResizeType = nil
         }
-        notice = nil
+        setNotice(nil)
         do {
             apply(try await powerClient.resize(nodeID: credential.nodeID, wakeToken: credential.token,
                                                from: current, to: target))
         } catch {
             await refresh()
-            notice = error.localizedDescription
+            setNotice(error.localizedDescription, source: .action)
         }
     }
 
     func setAutoStop(_ enabled: Bool) async {
-        guard let credential = identityStore?.wakeCredential(), !isSavingAutoStop,
+        guard let credential = currentCredential(), !isSavingAutoStop,
               let previous = autoStopEnabled, previous != enabled else { return }
         autoStopEnabled = enabled
         isSavingAutoStop = true
-        notice = nil
+        setNotice(nil)
         do {
             let state = try await powerClient.setAutoStop(nodeID: credential.nodeID, wakeToken: credential.token,
                                                           enabled: enabled)
@@ -398,9 +501,9 @@ final class RelayMachinePowerModel: ObservableObject {
             isSavingAutoStop = false
             // A lost reply does not mean a lost write; read the tag back.
             await refresh()
-            notice = (error as? RelayMachinePowerError) == .rateLimited
+            setNotice((error as? RelayMachinePowerError) == .rateLimited
                 ? "Auto-stop changed a moment ago. Try again in a few seconds."
-                : error.localizedDescription
+                : error.localizedDescription, source: .action)
         }
     }
 
@@ -412,77 +515,103 @@ final class RelayMachinePowerModel: ObservableObject {
     }
 
     func start() async {
-        guard !isSubmittingResize && resize?.isActive != true else { return }
-        guard let credential = identityStore?.wakeCredential() else {
-            status = .unavailable
-            return
-        }
-        generation += 1
-        let myGeneration = generation
-        status = .starting
-        notice = nil
-        isTransitioning = true
-        defer { isTransitioning = false }
-        do {
-            var state = try await powerClient.start(nodeID: credential.nodeID, wakeToken: credential.token)
-            let deadline = Date().addingTimeInterval(90)
-            while Date() < deadline {
-                guard myGeneration == generation else { return }
-                // EC2 keeps reporting `stopped` for the first seconds of a
-                // start. Staying on `.starting` until it actually runs is what
-                // keeps the switch from snapping back to off and then on.
-                if state.isRunning {
-                    apply(state)
-                    return
-                }
-                try await Task.sleep(for: .seconds(2))
-                state = try await powerClient.state(nodeID: credential.nodeID, wakeToken: credential.token)
-            }
-            guard myGeneration == generation else { return }
-            apply(state)
-            if !state.isRunning {
-                notice = RelayMachinePowerError.timeout.errorDescription
-            }
-        } catch {
-            guard myGeneration == generation else { return }
-            status = .off
-            notice = error.localizedDescription
-        }
+        await transition(to: .on)
     }
 
     func stop() async {
+        await transition(to: .off)
+    }
+
+    /// Sends the start or stop, then follows the machine until it arrives.
+    private func transition(to target: Target) async {
         guard !isSubmittingResize && resize?.isActive != true else { return }
-        guard let credential = identityStore?.wakeCredential() else {
-            status = .unavailable
-            return
-        }
+        guard let credential = currentCredential() else { return }
         generation += 1
         let myGeneration = generation
-        status = .stopping
-        notice = nil
+        let previous = status
+        status = target == .on ? .starting : .stopping
+        setNotice(nil)
         isTransitioning = true
         defer { isTransitioning = false }
+
+        var latest: RelayMachinePowerState
         do {
-            var state = try await powerClient.stop(nodeID: credential.nodeID, wakeToken: credential.token)
-            let deadline = Date().addingTimeInterval(90)
-            while Date() < deadline {
-                guard myGeneration == generation else { return }
-                // `stopping` is still in motion; only a settled `stopped`
-                // ends the transition and turns the switch off.
-                if state.instanceState == "stopped" {
-                    apply(state)
-                    return
-                }
-                try await Task.sleep(for: .seconds(2))
-                state = try await powerClient.state(nodeID: credential.nodeID, wakeToken: credential.token)
-            }
+            latest = target == .on
+                ? try await powerClient.start(nodeID: credential.nodeID, wakeToken: credential.token)
+                : try await powerClient.stop(nodeID: credential.nodeID, wakeToken: credential.token)
             guard myGeneration == generation else { return }
-            apply(state)
         } catch {
+            // The request failing is not evidence of a power state: a lost
+            // reply may still have been carried out, and a rate limit means
+            // something else (a node request's auto-wake, another phone) moved
+            // the machine a moment ago. Ask where it is instead of guessing.
+            let truth = try? await powerClient.state(nodeID: credential.nodeID, wakeToken: credential.token)
             guard myGeneration == generation else { return }
-            status = .on
-            notice = error.localizedDescription
+            guard let truth else {
+                failedReads += 1
+                status = previous.isBusy ? .unknown : previous
+                setNotice(error.localizedDescription, source: .action)
+                return
+            }
+            failedReads = 0
+            // Already where the tap wanted it, or on its way: nothing to report.
+            guard target.isUnderway(in: truth) || (target == .on && isAwaitingWake) else {
+                apply(truth)
+                setNotice(error.localizedDescription, source: .action)
+                return
+            }
+            latest = truth
         }
+
+        // EC2 keeps reporting `stopped` for the first seconds of a start, and
+        // `stopping` is still in motion. Holding the busy state until the
+        // machine arrives is what keeps the switch from snapping back.
+        let deadline = Date().addingTimeInterval(Self.transitionTimeout)
+        while !target.isReached(by: latest), Date() < deadline {
+            do { try await Task.sleep(for: settleInterval) } catch { break }
+            // One failed poll says nothing about the machine. Ask again.
+            let next = try? await powerClient.state(nodeID: credential.nodeID, wakeToken: credential.token)
+            guard myGeneration == generation else { return }
+            if let next { latest = next }
+        }
+        apply(latest)
+        if target == .on, !latest.isRunning {
+            setNotice(RelayMachinePowerError.timeout.errorDescription, source: .action)
+        }
+    }
+
+    private var isAwaitingWake: Bool {
+        wakeExpectedUntil.map { Date() < $0 } ?? false
+    }
+
+    /// The wake credential. When it names a different machine than the
+    /// published state describes (a re-pair, an unpair), that state is dropped.
+    private func currentCredential() -> (nodeID: String, token: String)? {
+        let credential = identityStore?.wakeCredential()
+        if credential?.nodeID != nodeID {
+            nodeID = credential?.nodeID
+            generation += 1
+            status = .loading
+            instanceType = nil
+            resizeOptions = []
+            resize = nil
+            pricing = nil
+            autoStopEnabled = nil
+            autoStopSavedAt = nil
+            wakeExpectedUntil = nil
+            failedReads = 0
+            lastReadAt = nil
+            setNotice(nil)
+        }
+        if credential == nil, status != .unavailable {
+            status = .unavailable
+        }
+        return credential
+    }
+
+    private func setNotice(_ message: String?, source: NoticeSource = .read) {
+        notice = message
+        noticeSource = message == nil ? nil : source
     }
 
     private func apply(_ state: RelayMachinePowerState) {
@@ -497,19 +626,25 @@ final class RelayMachinePowerModel: ObservableObject {
            Date().timeIntervalSince(autoStopSavedAt ?? .distantPast) >= Self.autoStopTagLag {
             autoStopEnabled = value
         }
-        if state.resize?.stage == "failed" {
-            notice = "Size change failed. Check the machine's power and try again."
-        }
+        let next: Status
         if state.isRunning {
-            status = .on
+            wakeExpectedUntil = nil
+            next = .on
         } else if state.isStarting {
-            status = .starting
+            next = .starting
         } else if state.instanceState == "stopping" {
-            status = .stopping
+            next = .stopping
         } else if state.isStopped {
-            status = .off
+            next = isAwaitingWake ? .starting : .off
         } else {
-            status = .unknown
+            next = .unknown
+        }
+        // What a start or stop complained about stops being true once the
+        // machine has moved on from it.
+        if next != status, noticeSource == .action { setNotice(nil) }
+        status = next
+        if state.resize?.stage == "failed" {
+            setNotice("Size change failed. Check the machine's power and try again.")
         }
     }
 }

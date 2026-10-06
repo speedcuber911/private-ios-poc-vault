@@ -95,7 +95,8 @@ struct RelayMachineMonitorView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model: RelayMachineMonitorModel
-    @StateObject private var powerModel = RelayMachinePowerModel()
+    /// The app's one power model, shared with Settings.
+    @ObservedObject var powerModel: RelayMachinePowerModel
     @State private var showingStopPower = false
     @State private var showingResize = false
 
@@ -104,12 +105,14 @@ struct RelayMachineMonitorView: View {
     init(
         client: CodexClient,
         identityStore: ClientIdentityStore? = nil,
+        powerModel: RelayMachinePowerModel,
         machineName: String,
         showsDismissButton: Bool = false,
         initialStats: RelayMachineStats? = nil
     ) {
         self.client = client
         self.identityStore = identityStore
+        self.powerModel = powerModel
         self.machineName = machineName
         self.showsDismissButton = showsDismissButton
         _model = StateObject(wrappedValue: RelayMachineMonitorModel(stats: initialStats))
@@ -117,7 +120,7 @@ struct RelayMachineMonitorView: View {
 
     var body: some View {
         Group {
-            if let stats = model.stats {
+            if let stats = model.stats, !isKnownStopped {
                 usageScroll(stats)
             } else if model.unsupported {
                 statusPage(
@@ -195,11 +198,11 @@ struct RelayMachineMonitorView: View {
         }
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
-            if let identityStore {
-                powerModel.configure(identityStore: identityStore)
-                await powerModel.refresh()
-            }
             await model.monitor(client: client)
+        }
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            await powerModel.watch()
         }
         .task(id: powerModel.resize?.stage) {
             await powerModel.waitForResize()
@@ -255,14 +258,13 @@ struct RelayMachineMonitorView: View {
     }
 
     private func compactHeader(_ stats: RelayMachineStats) -> some View {
-        let status = stats.firingAlerts.isEmpty ? "Reachable" : "Under load"
-        let caps = RelayMachineStats.uptimeText(stats.host.uptimeSec).map { "\(status) · up \($0)" } ?? status
+        let headline = headline(stats)
         return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .center, spacing: 12) {
                 VStack(alignment: .leading, spacing: 2) {
                     RelayCapsLabel(
-                        text: caps,
-                        color: stats.firingAlerts.isEmpty ? AppTheme.textSecondary : AppTheme.statusWarn,
+                        text: headline.text,
+                        color: headline.warn ? AppTheme.statusWarn : AppTheme.textSecondary,
                         size: 10
                     )
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -283,6 +285,26 @@ struct RelayMachineMonitorView: View {
                 instanceRow(instanceType)
             }
         }
+    }
+
+    /// The caps line over the machine name. The last sample outlives the
+    /// machine that sent it, so "Reachable" and an uptime are only claimed
+    /// while samples are still arriving and EC2 does not say otherwise.
+    private func headline(_ stats: RelayMachineStats) -> (text: String, warn: Bool) {
+        if canControlPower {
+            switch powerModel.status {
+            case .off: return ("Off", false)
+            case .starting: return ("Starting", false)
+            case .stopping: return ("Stopping", false)
+            case .loading, .unknown, .unavailable, .on: break
+            }
+        }
+        if model.errorMessage != nil {
+            return ("Unreachable", true)
+        }
+        let status = stats.firingAlerts.isEmpty ? "Reachable" : "Under load"
+        let text = RelayMachineStats.uptimeText(stats.host.uptimeSec).map { "\(status) · up \($0)" } ?? status
+        return (text, !stats.firingAlerts.isEmpty)
     }
 
     private func instanceRow(_ instanceType: String) -> some View {
@@ -669,6 +691,12 @@ struct RelayMachineMonitorView: View {
 
     private var isPowerStatePending: Bool {
         canControlPower && !powerModel.status.isResolved
+    }
+
+    /// EC2 says stopped and the stream has gone with it: the graphs on screen
+    /// are the machine's last minutes, not its present.
+    private var isKnownStopped: Bool {
+        canControlPower && powerModel.status == .off && model.errorMessage != nil
     }
 
     private func waitForMachine() async {

@@ -45,6 +45,9 @@ final class RelayPushService: NSObject, ObservableObject, UNUserNotificationCent
     /// The latest APNs token, kept for the paired machine's power pushes,
     /// which need no account and so never wait on `pendingDeviceToken`.
     private var deviceToken: Data?
+    /// Called when a power push (paused, ready) arrives while the app is open,
+    /// so a switch on screen follows the machine instead of waiting on a poll.
+    var onMachinePowerPush: (() -> Void)?
     /// node | wake token | APNs token of the last successful power
     /// subscription. A re-pair rotates the wake token, which the server
     /// answers by dropping every subscriber, so the key includes it.
@@ -243,13 +246,22 @@ final class RelayPushService: NSObject, ObservableObject, UNUserNotificationCent
         return .none
     }
 
+    nonisolated static func isPowerPush(_ userInfo: [AnyHashable: Any]) -> Bool {
+        guard let relay = userInfo["relay"] as? [AnyHashable: Any],
+              let type = relay["type"] as? String else { return false }
+        return type.hasPrefix("power.")
+    }
+
     // MARK: - UNUserNotificationCenterDelegate
 
     nonisolated func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
-        [.banner, .list, .sound]
+        if Self.isPowerPush(notification.request.content.userInfo) {
+            await MainActor.run { self.onMachinePowerPush?() }
+        }
+        return [.banner, .list, .sound]
     }
 
     nonisolated func userNotificationCenter(
