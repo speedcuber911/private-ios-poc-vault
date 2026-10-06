@@ -2718,6 +2718,26 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(dictationRow.contains("Cancel dictation"))
         XCTAssertTrue(dictationRow.contains("RelayCapsLabel(text: \"Transcribing\", color: AppTheme.accent)"))
         XCTAssertTrue(source.contains("relay-dictation-error"))
+
+        // Nothing the composer or its sheets own scrolls sideways: agent pills fall
+        // back to a grid, attachment and skill chips wrap.
+        let composerSource = try sourceSnippet(
+            in: source,
+            from: "private struct RelayComposer: View",
+            to: "private struct RelayChatBubble"
+        )
+        XCTAssertFalse(composerSource.contains("ScrollView(.horizontal"))
+        XCTAssertFalse(sheets.contains("ScrollView(.horizontal"))
+        XCTAssertFalse(sheets.contains("ScrollViewReader"))
+        XCTAssertTrue(sheets.contains("ViewThatFits(in: .horizontal) {\n            agentPillRow\n            agentGrid"))
+        let draftStrip = try sourceSnippet(
+            in: source,
+            from: "private struct RelayDraftAttachmentStrip",
+            to: "private struct RelayDraftAttachmentChip"
+        )
+        XCTAssertFalse(draftStrip.contains("ScrollView"))
+        XCTAssertTrue(draftStrip.contains("RelayFlowLayout"))
+        XCTAssertTrue(composerSource.contains("RelayFlowLayout(spacing: 6, lineSpacing: 0)"))
         XCTAssertFalse(source.contains("usesAccessibilityLayout"))
     }
 

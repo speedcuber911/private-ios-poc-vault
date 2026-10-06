@@ -15,11 +15,31 @@ final class RelayComposerTests: XCTestCase {
     ]
     """
 
-    private func sections() throws -> RelayModelPickerSections {
-        let models = try JSONDecoder().decode(
-            [CodexModelDescriptor].self,
-            from: Data(Self.catalogJSON.utf8)
-        )
+    /// Codex, Claude Code, Cursor, Kimi and a chat model: five tabs.
+    private static let fiveAgentJSON = """
+    [
+      {"id":"codex-default","label":"Codex","provider":"codex","modes":["task"]},
+      {"id":"gpt-5.6-sol","label":"GPT-5.6 Sol","provider":"codex","modes":["chat","task"],"taskModel":"gpt-5.6-sol"},
+      {"id":"gpt-5.6-terra","label":"GPT-5.6 Terra","provider":"codex","modes":["chat","task"],"taskModel":"gpt-5.6-terra"},
+      {"id":"claude-default","label":"Claude Code","provider":"claude","modes":["task"]},
+      {"id":"claude-opus","label":"Claude Opus 5.5","provider":"claude","modes":["task"],"taskModel":"opus"},
+      {"id":"cursor-composer","label":"Composer","provider":"cursor","modes":["task"]},
+      {"id":"kimi-k3","label":"Kimi K3","provider":"kimi","modes":["task"],"taskModel":"k3"}
+    ]
+    """
+
+    /// Three harnesses and no chat models: the approved single row of pills.
+    private static let threeAgentJSON = """
+    [
+      {"id":"codex-default","label":"Codex","provider":"codex","modes":["task"]},
+      {"id":"claude-default","label":"Claude Code","provider":"claude","modes":["task"]},
+      {"id":"claude-opus","label":"Claude Opus 5.5","provider":"claude","modes":["task"],"taskModel":"opus"},
+      {"id":"cursor-composer","label":"Composer","provider":"cursor","modes":["task"]}
+    ]
+    """
+
+    private func sections(_ json: String = RelayComposerTests.catalogJSON) throws -> RelayModelPickerSections {
+        let models = try JSONDecoder().decode([CodexModelDescriptor].self, from: Data(json.utf8))
         return RelayModelDiscovery.sections(from: models)
     }
 
@@ -101,6 +121,81 @@ final class RelayComposerTests: XCTestCase {
         XCTAssertEqual(RelayModelSheetTab.chat.rowTitle(for: chat), chat.chipLabel)
         XCTAssertEqual(RelayModelSheetTab.agent(.claude).title, "Claude Code")
         XCTAssertEqual(RelayModelSheetTab.chat.title, "Chat")
+    }
+
+    func testFiveAndThreeAgentCatalogsProduceTheExpectedTabs() throws {
+        let five = try sections(Self.fiveAgentJSON)
+        XCTAssertEqual(
+            RelayModelSheetTab.tabs(for: five),
+            [.agent(.codex), .agent(.claude), .agent(.cursor), .agent(.kimi), .chat]
+        )
+        XCTAssertEqual(
+            RelayModelSheetTab.tabs(for: five).map(\.title),
+            ["Codex", "Claude Code", "Cursor", RelayModelChoice.harnessTitle(for: .kimi), "Chat"]
+        )
+        let three = try sections(Self.threeAgentJSON)
+        XCTAssertEqual(
+            RelayModelSheetTab.tabs(for: three),
+            [.agent(.codex), .agent(.claude), .agent(.cursor)]
+        )
+    }
+
+    func testEffortRowShowsOnlyOnTheTabThatOwnsTheSelection() throws {
+        let five = try sections(Self.fiveAgentJSON)
+        let sol = try choice("gpt-5.6-sol", in: five)
+        let solChat = try choice("gpt-5.6-sol", in: five, mode: .chat)
+        func shows(_ tab: RelayModelSheetTab?, _ selected: RelayModelChoice?, thread: CodexProvider? = nil) -> Bool {
+            RelayModelSheetTab.showsEffort(
+                visibleTab: tab,
+                sections: five.restricted(to: thread),
+                selectedChoice: selected,
+                threadProvider: thread
+            )
+        }
+        XCTAssertEqual(RelayModelSheetTab.owner(of: sol, in: five), .agent(.codex))
+        XCTAssertEqual(RelayModelSheetTab.owner(of: solChat, in: five), .chat)
+        XCTAssertNil(RelayModelSheetTab.owner(of: nil, in: five))
+        XCTAssertNil(RelayModelSheetTab.owner(of: sol, in: five.restricted(to: .claude)))
+
+        XCTAssertTrue(shows(.agent(.codex), sol))
+        // Browsing another agent's list: that list has no say over Codex's effort.
+        XCTAssertFalse(shows(.agent(.claude), sol))
+        XCTAssertFalse(shows(.chat, sol))
+        XCTAssertTrue(shows(.chat, solChat))
+        XCTAssertFalse(shows(.agent(.codex), solChat))
+        XCTAssertFalse(shows(.agent(.codex), nil))
+        XCTAssertFalse(shows(nil, sol))
+        // A thread shows only its own harness, so the row always applies.
+        XCTAssertTrue(shows(.agent(.codex), sol, thread: .codex))
+    }
+
+    func testChipsWrapInsteadOfRunningPastTheEdge() {
+        let chip = CGSize(width: 100, height: 30)
+        let flow = RelayComposerLogic.flowFrames(
+            sizes: [chip, chip, chip, CGSize(width: 400, height: 30)],
+            maxWidth: 250,
+            spacing: 10,
+            lineSpacing: 6
+        )
+        XCTAssertEqual(flow.frames, [
+            CGRect(x: 0, y: 0, width: 100, height: 30),
+            CGRect(x: 110, y: 0, width: 100, height: 30),
+            CGRect(x: 0, y: 36, width: 100, height: 30),
+            // Wider than the row: clamped to it, on a line of its own.
+            CGRect(x: 0, y: 72, width: 250, height: 30)
+        ])
+        XCTAssertEqual(flow.size, CGSize(width: 250, height: 102))
+        XCTAssertTrue(flow.frames.allSatisfy { $0.maxX <= 250 })
+
+        let empty = RelayComposerLogic.flowFrames(sizes: [], maxWidth: 250, spacing: 10, lineSpacing: 6)
+        XCTAssertTrue(empty.frames.isEmpty)
+        XCTAssertEqual(empty.size, .zero)
+        // Exactly filling the row does not wrap.
+        let exact = RelayComposerLogic.flowFrames(
+            sizes: [CGSize(width: 120, height: 20), CGSize(width: 120, height: 20)],
+            maxWidth: 250, spacing: 10, lineSpacing: 6
+        )
+        XCTAssertEqual(exact.size, CGSize(width: 250, height: 20))
     }
 
     // MARK: Add sheet
@@ -236,6 +331,31 @@ final class RelayComposerTests: XCTestCase {
         try render(composer("Fix the copy and push it."), size: CGSize(width: 402, height: 300), to: output, name: "composer-draft")
         try render(composer("", streaming: true, skillIDs: ["s1"]), size: CGSize(width: 402, height: 300), to: output, name: "composer-streaming-skill")
         try render(composer(""), size: CGSize(width: 320, height: 300), to: output, name: "composer-narrow")
+        let manySkills = try JSONDecoder().decode([CodexSkillDescriptor].self, from: Data("""
+        [
+          {"id":"m1","name":"code-review","title":"a","provider":"claude","group":"g","description":""},
+          {"id":"m2","name":"anthropic-skills:consolidate-memory","title":"b","provider":"claude","group":"g","description":""},
+          {"id":"m3","name":"deploy","title":"c","provider":"claude","group":"g","description":""},
+          {"id":"m4","name":"dev-desktop-handoff","title":"d","provider":"claude","group":"g","description":""},
+          {"id":"m5","name":"a-skill-with-a-name-far-too-long-to-fit-on-one-line-of-any-phone","title":"e","provider":"claude","group":"g","description":""}
+        ]
+        """.utf8))
+        try render(
+            ZStack(alignment: .bottom) {
+                AppTheme.bgCanvas
+                RelayComposerPreviewHost(
+                    text: "",
+                    sections: sections,
+                    selectedChoice: opus,
+                    efforts: efforts,
+                    selectedEffort: .high,
+                    skills: manySkills,
+                    selectedSkillIDs: Set(manySkills.map(\.id))
+                )
+                .fixedSize(horizontal: false, vertical: true)
+            },
+            size: CGSize(width: 402, height: 340), to: output, name: "composer-skills-wrap"
+        )
 
         func dictation(finalizing: Bool) -> some View {
             HStack(spacing: 0) {
@@ -273,6 +393,36 @@ final class RelayComposerTests: XCTestCase {
             .background(RelayComposerPalette.sheetGround)
         }
         let sheet = CGSize(width: 402, height: 560)
+
+        // Agent tabs: five do not fit one row and become a grid; three stay pills.
+        let five = try self.sections(Self.fiveAgentJSON)
+        let three = try self.sections(Self.threeAgentJSON)
+        let sol = try choice("gpt-5.6-sol", in: five)
+        func agentSheet(
+            _ catalog: RelayModelPickerSections,
+            selected: RelayModelChoice,
+            tab: RelayModelSheetTab? = nil
+        ) -> some View {
+            RelayModelSheet(
+                visibleSections: catalog,
+                selectedChoice: selected,
+                threadProvider: nil,
+                efforts: efforts,
+                selectedEffort: .high,
+                onPickChoice: { _ in },
+                onPickEffort: { _ in },
+                onClose: {},
+                startTab: tab
+            )
+            .background(RelayComposerPalette.sheetGround)
+        }
+        try render(agentSheet(five, selected: sol), size: sheet, to: output, name: "sheet-model-five-agents")
+        try render(agentSheet(five, selected: sol, tab: .agent(.claude)), size: sheet, to: output, name: "sheet-model-five-other-tab")
+        try render(agentSheet(five, selected: sol, tab: .chat), size: CGSize(width: 320, height: 560), to: output, name: "sheet-model-five-narrow")
+        try render(
+            agentSheet(three, selected: try choice("claude-opus", in: three)),
+            size: sheet, to: output, name: "sheet-model-three-agents"
+        )
         try render(modelSheet(thread: nil), size: sheet, to: output, name: "sheet-model-new")
         try render(modelSheet(thread: .claude), size: sheet, to: output, name: "sheet-model-thread")
         try render(modelSheet(thread: .claude, page: .effort), size: sheet, to: output, name: "sheet-effort")
@@ -313,6 +463,8 @@ final class RelayComposerTests: XCTestCase {
                 .sheet(isPresented: .constant(true)) { content }
         }
         try render(presented(modelSheet(thread: nil)), size: screen, to: output, name: "presented-model-new", settle: 1.5)
+        try render(presented(agentSheet(five, selected: sol)), size: screen, to: output, name: "presented-model-five", settle: 1.5)
+        try render(presented(agentSheet(three, selected: try choice("claude-opus", in: three))), size: screen, to: output, name: "presented-model-three", settle: 1.5)
         try render(presented(modelSheet(thread: .claude, page: .effort)), size: screen, to: output, name: "presented-effort", settle: 1.5)
         try render(presented(addSheet(.root, provider: .claude)), size: screen, to: output, name: "presented-add", settle: 1.5)
         try render(presented(addSheet(.skills, provider: .claude)), size: screen, to: output, name: "presented-skills", settle: 1.5)
