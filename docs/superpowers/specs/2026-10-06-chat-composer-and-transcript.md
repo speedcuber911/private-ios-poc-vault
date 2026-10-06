@@ -69,7 +69,7 @@ it; later ones merge field by field (a field that is absent is unchanged).
 | `input` | Object of strings (and `background` as a boolean). By kind: `command`: `command`, `description`, `cwd`, `background`. `read`: `path`, `range`. `edit`, `write`: `path`, `diff`. `search`: `pattern`, `path`. `fetch`: `url`, `query`. `tool`: `name`, `server`, `json`. `agent`: `description`, `prompt`, `agentType`. `todo`: `items` as an array of `{"text","status"}`. Any field may be absent. |
 | `output` | Text result: command output, a sub-agent's final report (markdown), the thought text for `reasoning`. |
 | `outputTruncated` | `true` when `output` was cut to fit a cap. |
-| `exitCode` | Integer, `command` only, when known. |
+| `exitCode` | Integer, when known. Mostly on `command`; Codex runs reads and searches through a shell too, so `read` and `search` steps can carry it along with `input.command` and `output`. |
 | `error` | Short failure text. |
 
 **`step.delta`**: append to a running step's `output` (live command output,
@@ -171,6 +171,38 @@ agent, used a tool, ran a command".
 | Cursor, Kimi | unchanged for now | No timeline; legacy rendering. |
 
 `job.result` must stay the final answer only, never the event stream.
+
+### 1.5 What the first real runs taught us
+
+Recorded on 2026-10-06 from Claude Code 2.1.280 and codex-cli 0.159.2. Readers
+must cope with all of it.
+
+- **A step arrives in two parts.** Its first event often has only `id`, `kind`,
+  `title` and `status`; `summary` and `input` follow in a second `step` event.
+  `input` is sent whole each time, never as a partial object.
+- **Reasoning usually has no text.** Both CLIs send empty thinking on this
+  account, so a `reasoning` step is a duration and nothing else. Readers must
+  not open an empty detail for it.
+- **Codex names steps by what the command did.** When Codex's own parse of a
+  shell command is exactly one read, search or listing, and that parse covers
+  the whole command, the step is `read` or `search`. A search that exits 1 with
+  no output found nothing and is `done`, not `failed`.
+- **Todo item statuses** are `pending`, `in_progress`, `completed` for both
+  harnesses. Claude Code's `TaskCreate`/`TaskUpdate` map to `todo` alongside the
+  older `TodoWrite`.
+- **`usage` may carry more fields** (`cachedInputTokens`,
+  `reasoningOutputTokens`, `totalTokens`), and a job can emit more than one: a
+  background agent's report starts a second model turn inside the same job.
+- **History step ids are not live step ids.** Thread history uses tool-use ids;
+  a live timeline uses its own. Never match one to the other.
+- **A background agent reports back as a user-role transcript entry.** relayd
+  drops entries the CLI authored itself so they never show as something the
+  person typed.
+- **Timeline events can trail the log channels** by about 120 ms, because the
+  daemon tails the file.
+- **Clocks differ.** Durations of finished steps come from the machine's own
+  `startedAt`/`endedAt`. A running step's clock is the phone's time minus the
+  machine's `startedAt`, so it can be off by the skew between them.
 
 ## Part 2: the transcript (phone)
 
