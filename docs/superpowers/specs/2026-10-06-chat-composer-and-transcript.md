@@ -224,6 +224,10 @@ stop and a live send.
 - Provider auth is untouched: direct subscriptions, no Bedrock, no new
   credentials on the phone.
 - relayd stays mTLS/bearer-only on the same routes; the timeline adds no new
-  unauthenticated surface, and step detail never exposes more than the job log
-  already does.
+  unauthenticated surface. It does carry more than the old logs did (file
+  diffs, tool arguments, the output of fast commands), to the same paired
+  device that could already read the job's logs and the workspace's files.
+  relayd redacts nothing in job logs today, so the timeline is not redacted
+  either; if that changes, the redaction belongs in `createTimelineWriter` so
+  every harness gets it.
 - Old phone with new relayd, and new phone with old relayd, both keep working.
