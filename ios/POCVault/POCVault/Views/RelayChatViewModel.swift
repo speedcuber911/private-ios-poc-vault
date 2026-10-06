@@ -166,6 +166,12 @@ struct RelayConversationItem: Identifiable, Hashable {
     /// Wall-clock seconds the reply took, stamped when the stream completes.
     var elapsedSeconds: Double?
     var attachments: [RelayDisplayedAttachment]
+    /// Thread history: the steps the agent took before it wrote this message.
+    /// Live jobs keep theirs in `RelayChatViewModel.timelines` instead.
+    var historyTimeline: RelayTimeline?
+    /// The transcript already shows this job's answer as its own turn, so the
+    /// job row carries only what that turn does not: outputs and the run receipt.
+    var hidesJobAnswer: Bool
 
     init(
         id: String = UUID().uuidString,
@@ -179,7 +185,9 @@ struct RelayConversationItem: Identifiable, Hashable {
         isStreaming: Bool = false,
         usage: RelayUsage? = nil,
         elapsedSeconds: Double? = nil,
-        attachments: [RelayDisplayedAttachment] = []
+        attachments: [RelayDisplayedAttachment] = [],
+        historyTimeline: RelayTimeline? = nil,
+        hidesJobAnswer: Bool = false
     ) {
         self.id = id
         self.role = role
@@ -193,6 +201,8 @@ struct RelayConversationItem: Identifiable, Hashable {
         self.usage = usage
         self.elapsedSeconds = elapsedSeconds
         self.attachments = attachments
+        self.historyTimeline = historyTimeline
+        self.hidesJobAnswer = hidesJobAnswer
     }
 }
 
@@ -369,6 +379,49 @@ enum RelayModelDiscovery {
     }
 }
 
+/// Everything the chat reads from the machine while a conversation is live,
+/// as closures, so the stream and poll paths can be driven in tests without a
+/// network. `live(_:)` is the real one; it only forwards to the client, so
+/// trust pinning and the bearer token are exactly the client's.
+struct RelayChatLiveSource {
+    /// The job stream, from the byte offsets and timeline cursor already held.
+    var jobEvents: (_ jobID: String, _ stdoutOffset: Int64?, _ stderrOffset: Int64?, _ timeline: Int)
+        -> AsyncThrowingStream<CodexJobStreamEvent, Error>
+    var timelinePage: (_ jobID: String, _ since: Int) async throws -> RelayTimelinePage
+    var chatEvents: (CodexChatRequest) -> AsyncThrowingStream<CodexChatEvent, Error>
+    /// This folder's threads and invocations.
+    var history: (_ workspaceID: String?) async throws -> (threads: [CodexThread], jobs: [CodexJob])
+    var pendingApprovals: () async throws -> [CodexApproval]
+    /// The wait between reconnects.
+    var pause: (TimeInterval) async -> Void
+
+    static func live(_ client: CodexClient) -> RelayChatLiveSource {
+        RelayChatLiveSource(
+            jobEvents: { jobID, stdoutOffset, stderrOffset, timeline in
+                client.streamJobEvents(
+                    id: jobID,
+                    stdoutOffset: stdoutOffset,
+                    stderrOffset: stderrOffset,
+                    timeline: timeline
+                )
+            },
+            timelinePage: { jobID, since in
+                try await client.fetchTimeline(jobID: jobID, since: since)
+            },
+            chatEvents: { client.streamChat($0) },
+            history: { workspaceID in
+                let threads = try await client.fetchThreads(provider: nil, workspaceID: workspaceID, limit: 200)
+                let jobs = try await client.fetchJobs(provider: nil, workspaceID: workspaceID, limit: 200)
+                return (threads, jobs)
+            },
+            pendingApprovals: { try await client.fetchPendingApprovalsIfSupported() },
+            pause: { seconds in
+                try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+            }
+        )
+    }
+}
+
 @MainActor
 final class RelayChatViewModel: ObservableObject {
     @Published private(set) var models: [CodexModelDescriptor] = []
@@ -427,6 +480,13 @@ final class RelayChatViewModel: ObservableObject {
     /// Live stdout/stderr tail per active job id, fed by the job SSE stream. Cleared when
     /// the job reaches a terminal state.
     @Published private(set) var liveJobTails: [String: String] = [:]
+    /// Reduced timelines of the jobs on screen, by job id: the prose and steps
+    /// the transcript draws. A job absent here renders from `liveJobTails`.
+    ///
+    /// Published in batches: events land in `timelineStore` as they arrive and
+    /// are copied here at most every `publishInterval`, so a burst of a hundred
+    /// events redraws the transcript a dozen times a second, not a hundred.
+    @Published private(set) var timelines: [String: RelayTimeline] = [:]
 
     /// Sessions handed over from a Mac. Node-level, not folder-scoped: a handoff
     /// lands in its own worktree workspace, so it is shown wherever the threads
@@ -452,6 +512,7 @@ final class RelayChatViewModel: ObservableObject {
     @Published private(set) var streamingMessageID: String?
 
     private let client: CodexClient
+    private let live: RelayChatLiveSource
     private let fetchJobDetail: (String) async throws -> CodexJob
     private let fetchThreadDetail: (String, String?, CodexProvider) async throws -> CodexThreadDetail
     /// Detail refreshes may finish after the user selects a different source or
@@ -468,10 +529,50 @@ final class RelayChatViewModel: ObservableObject {
     private var currentThreadWorkspaceName: String?
     private var streamTask: Task<Void, Never>?
     /// Live job SSE consumers keyed by job id. Streams are VM-owned: dismissing the chat
-    /// cover never cancels them. When a stream errors/drops the entry clears itself and
-    /// the store's 2 s monitor loop (refreshActiveWorkIfNeeded) remains the fallback
-    /// update channel.
+    /// cover never cancels them; leaving the conversation does. A stream that ends
+    /// without `done` reconnects itself from where it stopped (`runJobStream`), and
+    /// only after repeated failures hands over to the store's 2 s monitor loop
+    /// (`refreshActiveWorkIfNeeded`), which pages the timeline and tries again later.
     private var jobStreamTasks: [String: Task<Void, Never>] = [:]
+    /// Which run of `runJobStream` owns each entry above, so one that was
+    /// replaced cannot clear its successor on the way out.
+    private var jobStreamTokens: [String: UUID] = [:]
+
+    /// What has been consumed of one job's live channels, and how they are faring.
+    private struct JobLiveState {
+        /// Bytes of each log already shown: where a reconnect resumes.
+        var stdoutOffset: Int64 = 0
+        var stderrOffset: Int64 = 0
+        /// Set when the stream stopped retrying; the poll carries the job until
+        /// `streamRetryAfterGivingUp` has passed.
+        var streamGaveUpAt: Date?
+        /// The machine has no timeline route (it predates timelines).
+        var timelineUnavailable = false
+        var isSyncingTimeline = false
+        /// A finished job's timeline is fetched once, not on every poll.
+        var fetchedFinishedTimeline = false
+    }
+
+    private var jobLive: [String: JobLiveState] = [:]
+    /// The timelines as of the last event. `timelines` trails it by one batch.
+    private var timelineStore: [String: RelayTimeline] = [:]
+    private var tailStore: [String: String] = [:]
+    private var dirtyTimelineIDs: Set<String> = []
+    private var dirtyTailIDs: Set<String> = []
+    /// Chat tokens received but not yet shown, by assistant message id.
+    private var pendingChatDeltas: [String: String] = [:]
+    private var publishTask: Task<Void, Never>?
+    private var foregroundObserver: NSObjectProtocol?
+    private var lastPublishAt = Date.distantPast
+    private var detailRefreshesInFlight: Set<String> = []
+    /// How often live content reaches the screen: about twelve times a second.
+    let publishInterval: TimeInterval
+
+    /// Waits before each reconnect of a dropped job stream; after the last one
+    /// the stream gives up and the poll takes over.
+    nonisolated static let streamRetryDelays: [TimeInterval] = [0.5, 1, 2, 4, 8]
+    /// How long the poll carries a job before the stream is tried again.
+    nonisolated static let streamRetryAfterGivingUp: TimeInterval = 30
 
     private static let liveTailCharacterCap = 12_000
     /// Keep following a native transcript through long tool calls. The list drops
@@ -510,9 +611,13 @@ final class RelayChatViewModel: ObservableObject {
         workspaceID: String?,
         workspacePath: String?,
         fetchJobDetail: ((String) async throws -> CodexJob)? = nil,
-        fetchThreadDetail: ((String, String?, CodexProvider) async throws -> CodexThreadDetail)? = nil
+        fetchThreadDetail: ((String, String?, CodexProvider) async throws -> CodexThreadDetail)? = nil,
+        live: RelayChatLiveSource? = nil,
+        publishInterval: TimeInterval = 0.08
     ) {
         self.client = client
+        self.live = live ?? .live(client)
+        self.publishInterval = publishInterval
         self.fetchJobDetail = fetchJobDetail ?? { id in
             try await client.fetchJob(id: id, includeFullLogs: false)
         }
@@ -533,6 +638,21 @@ final class RelayChatViewModel: ObservableObject {
         self.codexSandbox = RelayCodexSandbox(
             rawValue: UserDefaults.standard.string(forKey: Self.codexSandboxDefaultsKey) ?? ""
         ) ?? .default
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.resumeLiveWork(restartingStreams: true)
+            }
+        }
+    }
+
+    deinit {
+        if let foregroundObserver {
+            NotificationCenter.default.removeObserver(foregroundObserver)
+        }
     }
 
     /// Folder name for the chat top bar ("Relay" for the root chat).
@@ -731,16 +851,23 @@ final class RelayChatViewModel: ObservableObject {
     /// keeps only legacy/global conversations whose workspaceId is nil.
     func refreshThreads() async {
         guard workspacePath == nil || workspaceID != nil else {
-            threads = []
-            jobs = []
+            if !threads.isEmpty { threads = [] }
+            if !jobs.isEmpty { jobs = [] }
             return
         }
         do {
-            let fetchedThreads = try await client.fetchThreads(provider: nil, workspaceID: workspaceID, limit: 200)
-            let fetchedJobs = try await client.fetchJobs(provider: nil, workspaceID: workspaceID, limit: 200)
-            threads = Self.sortedThreads(fetchedThreads.filter { belongsToHistoryScope($0.workspaceId) })
-            jobs = Self.sortedJobs(fetchedJobs.filter { belongsToHistoryScope($0.workspaceId) })
-            mergeUpdatedJobs()
+            let fetched = try await live.history(workspaceID)
+            let scopedThreads = Self.sortedThreads(fetched.threads.filter { belongsToHistoryScope($0.workspaceId) })
+            let scopedJobs = Self.sortedJobs(fetched.jobs.filter { belongsToHistoryScope($0.workspaceId) })
+            // A poll that changed nothing publishes nothing: every assignment
+            // here redraws the whole chat.
+            if threads != scopedThreads { threads = scopedThreads }
+            // The list carries the compact copy of each job. For one on screen
+            // the richer copy already held stays; only what the list knows
+            // better (status, times) is taken from it.
+            let merged = scopedJobs.map { job in conversationJob(id: job.id)?.absorbing(job) ?? job }
+            if jobs != merged { jobs = merged }
+            mergeUpdatedJobs(scopedJobs)
         } catch {
             if !isCancellation(error) {
                 errorMessage = error.localizedDescription
@@ -854,6 +981,7 @@ final class RelayChatViewModel: ObservableObject {
     func refreshActiveWorkIfNeeded() async {
         guard hasActiveConversationJob else { return }
         await refreshActiveJobDetails()
+        await syncLiveJobs()
         await refreshPendingApprovals()
         await refreshThreads()
     }
@@ -864,13 +992,24 @@ final class RelayChatViewModel: ObservableObject {
     /// started from another folder is not this conversation's to answer, and offering
     /// it here would let one screen unblock work the user cannot see.
     private func refreshPendingApprovals() async {
-        let jobIDs = Set(messages.compactMap { $0.job?.id })
-        guard !jobIDs.isEmpty else {
-            pendingApprovals = []
+        guard messages.contains(where: { $0.job != nil }) else {
+            if !pendingApprovals.isEmpty { pendingApprovals = [] }
             return
         }
-        guard let all = try? await client.fetchPendingApprovalsIfSupported() else { return }
-        pendingApprovals = all.filter { $0.isPending && jobIDs.contains($0.jobId) }
+        guard let all = try? await live.pendingApprovals() else { return }
+        // Read after the wait: the conversation may have changed while the
+        // request was out, and its approvals are not the new one's to show.
+        let jobIDs = Set(messages.compactMap { $0.job?.id })
+        let scoped = all.filter { $0.isPending && jobIDs.contains($0.jobId) }
+        if pendingApprovals != scoped { pendingApprovals = scoped }
+    }
+
+    /// Keep only the approvals that belong to a job in this conversation.
+    private func scopePendingApprovals() {
+        guard !pendingApprovals.isEmpty else { return }
+        let jobIDs = Set(messages.compactMap { $0.job?.id })
+        let scoped = pendingApprovals.filter { jobIDs.contains($0.jobId) }
+        if scoped.count != pendingApprovals.count { pendingApprovals = scoped }
     }
 
     /// Answer an approval. The card clears immediately so the run visibly resumes,
@@ -885,6 +1024,7 @@ final class RelayChatViewModel: ObservableObject {
         } catch {
             guard !isCancellation(error) else { return }
             pendingApprovals = previous
+            scopePendingApprovals()
             errorMessage = error.localizedDescription
         }
     }
@@ -893,9 +1033,10 @@ final class RelayChatViewModel: ObservableObject {
     private func refreshActiveJobDetails() async {
         let activeIDs = messages.compactMap { $0.job?.status.isActive == true ? $0.job?.id : nil }
         for id in activeIDs {
-            if let updated = try? await client.fetchJob(id: id, includeFullLogs: false) {
-                replaceJob(updated)
-            }
+            guard let updated = try? await fetchJobDetail(id) else { continue }
+            // The conversation may have moved on while the request was out.
+            guard isOnScreen(jobID: id) else { continue }
+            replaceJob(updated, from: .detail)
         }
     }
 
@@ -963,10 +1104,17 @@ final class RelayChatViewModel: ObservableObject {
     func stopStreaming() {
         streamTask?.cancel()
         streamTask = nil
+        publishPending()
         if let id = streamingMessageID, let index = messages.firstIndex(where: { $0.id == id }) {
-            messages[index].isStreaming = false
             if messages[index].text.isEmpty {
-                messages[index].text = "Stopped."
+                // Nothing was written, so there is no answer to keep. Saying so
+                // is a status line, not something the model said: stored as
+                // assistant text it would be sent back as history next turn.
+                let provider = messages[index].provider
+                messages.remove(at: index)
+                messages.append(RelayConversationItem(role: .status, text: "Stopped.", provider: provider))
+            } else {
+                messages[index].isStreaming = false
             }
         }
         streamingMessageID = nil
@@ -1026,16 +1174,7 @@ final class RelayChatViewModel: ObservableObject {
         messages.append(RelayConversationItem(id: assistantID, role: .assistant, text: "", provider: model.provider, modelLabel: model.label, isStreaming: true))
         streamingMessageID = assistantID
 
-        let history = messages.compactMap { item -> CodexChatMessage? in
-            switch item.role {
-            case .user:
-                return CodexChatMessage(role: "user", content: item.text)
-            case .assistant where !item.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty:
-                return CodexChatMessage(role: "assistant", content: item.text)
-            case .assistant, .status, .job:
-                return nil
-            }
-        }
+        let history = Self.chatHistory(from: messages)
 
         // Only continue the current thread when provider AND workspace scope match;
         // the server rejects continuations under a conflicting workspaceId.
@@ -1055,13 +1194,14 @@ final class RelayChatViewModel: ObservableObject {
         let startedAt = Date()
         let task = Task { [weak self] in
             guard let self else { return }
-            var receivedAssistantText = false
             var usage: RelayUsage?
+            var failure: String?
             do {
-                for try await event in self.client.streamChat(request) {
+                for try await event in self.live.chatEvents(request) {
                     if Task.isCancelled { break }
                     switch event {
                     case .meta(let threadId, _, let provider):
+                        guard self.streamingMessageID == assistantID else { break }
                         self.currentThreadID = threadId
                         self.currentThreadProvider = CodexProvider(rawProvider: provider)
                         self.currentThreadWorkspaceID = scopeWorkspaceID
@@ -1070,28 +1210,27 @@ final class RelayChatViewModel: ObservableObject {
                                 ?? self.workspacePath.map { URL(fileURLWithPath: $0).lastPathComponent }
                         }
                     case .delta(let delta):
-                        receivedAssistantText = true
                         self.append(delta: delta, to: assistantID)
                     case .usage(let input, let output):
                         usage = RelayUsage(inputTokens: input, outputTokens: output)
                     case .done:
                         break
                     case .error(let message):
-                        self.errorMessage = message
-                        receivedAssistantText = true
-                        self.append(delta: "\n\n\(message)", to: assistantID)
+                        failure = message
                     }
-                }
-                if !Task.isCancelled, !receivedAssistantText {
-                    self.replaceText("No response received.", for: assistantID)
                 }
             } catch {
                 if !Task.isCancelled {
-                    self.errorMessage = error.localizedDescription
-                    self.replaceText(error.localizedDescription, for: assistantID)
+                    failure = error.localizedDescription
                 }
             }
-            self.finishStreaming(id: assistantID, usage: usage, startedAt: startedAt)
+            self.finishStreaming(
+                id: assistantID,
+                usage: usage,
+                startedAt: startedAt,
+                failure: failure,
+                wasCancelled: Task.isCancelled
+            )
             if !Task.isCancelled {
                 await self.refreshThreads()
             }
@@ -1100,15 +1239,58 @@ final class RelayChatViewModel: ObservableObject {
         await task.value
     }
 
-    private func finishStreaming(id: String, usage: RelayUsage?, startedAt: Date) {
+    /// Close a chat turn. What the model wrote stays exactly as written; how the
+    /// turn ended is said beside it, as a status line. A stream that dropped
+    /// after three paragraphs keeps the three paragraphs, and neither the error
+    /// nor "No response received." is ever stored as something the model said.
+    private func finishStreaming(
+        id: String,
+        usage: RelayUsage?,
+        startedAt: Date,
+        failure: String?,
+        wasCancelled: Bool
+    ) {
+        publishPending()
+        var provider: CodexProvider?
+        var wroteNothing = false
         if let index = messages.firstIndex(where: { $0.id == id }) {
-            messages[index].isStreaming = false
-            if let usage, !usage.isEmpty { messages[index].usage = usage }
-            messages[index].elapsedSeconds = Date().timeIntervalSince(startedAt)
+            provider = messages[index].provider
+            if messages[index].text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                wroteNothing = true
+                messages.remove(at: index)
+            } else {
+                messages[index].isStreaming = false
+                if let usage, !usage.isEmpty { messages[index].usage = usage }
+                messages[index].elapsedSeconds = Date().timeIntervalSince(startedAt)
+            }
+        }
+        if !wasCancelled {
+            if let failure {
+                errorMessage = failure
+                messages.append(RelayConversationItem(role: .status, text: failure, provider: provider))
+            } else if wroteNothing {
+                messages.append(RelayConversationItem(role: .status, text: "No response received.", provider: provider))
+            }
         }
         if streamingMessageID == id { streamingMessageID = nil }
         streamTask = nil
         isSending = false
+    }
+
+    /// The turns sent to a tool-less chat model: what the user typed and what a
+    /// model answered. Status lines and job cards are the app talking, not the
+    /// conversation, and an assistant turn with no text is not a turn.
+    nonisolated static func chatHistory(from items: [RelayConversationItem]) -> [CodexChatMessage] {
+        items.compactMap { item -> CodexChatMessage? in
+            switch item.role {
+            case .user:
+                return CodexChatMessage(role: "user", content: item.text)
+            case .assistant where !item.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty:
+                return CodexChatMessage(role: "assistant", content: item.text)
+            case .assistant, .status, .job:
+                return nil
+            }
+        }
     }
 
     private func runTask(using choice: RelayModelChoice) async {
@@ -1124,6 +1306,7 @@ final class RelayChatViewModel: ObservableObject {
         defer { isSending = false }
 
         let provider = Self.taskProvider(for: model)
+        let revision = conversationRevision
         await refreshHarnesses()
         if let status = harnessesByProvider[provider], status.isConfirmedUnavailable {
             errorMessage = status.actionMessage ?? "\(provider.displayName) is not ready on this computer."
@@ -1214,6 +1397,13 @@ final class RelayChatViewModel: ObservableObject {
             } else {
                 job = try await client.fetchJob(id: created.id)
             }
+            // The user opened something else while the machine was creating
+            // the job. It runs, and the history list shows it; it does not
+            // attach itself to a conversation it was not sent from.
+            guard conversationRevision == revision else {
+                await refreshThreads()
+                return
+            }
             adoptThread(from: job)
             currentThreadProvider = provider
             currentThreadWorkspaceID = job.workspaceId ?? workspaceID
@@ -1236,44 +1426,385 @@ final class RelayChatViewModel: ObservableObject {
 
     // MARK: - Live job stream (SSE with polling fallback)
 
-    /// Attach the job SSE stream and mirror stdout/stderr into the live tail shown by the
-    /// job card. On `done` the terminal job replaces the card. If the stream errors or
-    /// drops, the task clears itself and the 2 s monitor polling keeps the card moving.
+    /// Attach the job SSE stream: stdout/stderr feed the live tail, timeline
+    /// events feed `timelines`, and `done` closes the job. The stream belongs to
+    /// the conversation showing the job, so nothing attaches for a job that is
+    /// not on screen.
     private func attachJobStream(to job: CodexJob) {
         let jobID = job.id
-        guard job.status.isActive, jobStreamTasks[jobID] == nil else { return }
-        let task = Task { [weak self] in
+        guard job.status.isActive, jobStreamTasks[jobID] == nil, isOnScreen(jobID: jobID) else { return }
+        jobLive[jobID, default: JobLiveState()].streamGaveUpAt = nil
+        let token = UUID()
+        jobStreamTokens[jobID] = token
+        jobStreamTasks[jobID] = Task { [weak self] in
+            await self?.runJobStream(jobID: jobID, token: token)
+        }
+    }
+
+    /// One job's stream, kept up for as long as the job runs.
+    ///
+    /// A stream that ends without `done` — the phone slept, the network moved,
+    /// the machine restarted — is reconnected from exactly where it stopped: the
+    /// byte offsets of both logs and the timeline cursor go back to the machine,
+    /// so nothing already shown is sent again and nothing is skipped. Reconnects
+    /// back off; after the last one the stream gives up and the poll carries
+    /// the job, trying the stream again every `streamRetryAfterGivingUp`.
+    private func runJobStream(jobID: String, token: UUID) async {
+        var failures = 0
+        // A job whose output is already partly held (the stream was restarted
+        // on returning to the foreground) resumes; a fresh one starts clean.
+        var isReattach = jobLive[jobID].map { $0.stdoutOffset > 0 || $0.stderrOffset > 0 } ?? false
+        while !Task.isCancelled, jobStreamTokens[jobID] == token {
+            let state = jobLive[jobID] ?? JobLiveState()
+            let cursor = timelineStore[jobID]?.cursor ?? 0
+            var sawDone = false
+            var progressed = false
+            var reason = "closed"
             do {
-                guard let client = self?.client else { return }
-                for try await event in client.streamJobEvents(id: jobID) {
-                    guard let self, !Task.isCancelled else { break }
+                // The first connection asks for what it always has; only a
+                // reconnect names offsets.
+                let events = live.jobEvents(
+                    jobID,
+                    isReattach ? state.stdoutOffset : nil,
+                    isReattach ? state.stderrOffset : nil,
+                    cursor
+                )
+                for try await event in events {
+                    guard !Task.isCancelled, jobStreamTokens[jobID] == token else { break }
                     switch event {
-                    case .status(let updated):
-                        self.replaceJob(updated)
-                    case .stdout(_, let chunk):
-                        self.appendLiveTail(jobID: jobID, chunk)
-                    case .stderr(_, let chunk):
-                        self.appendLiveTail(jobID: jobID, chunk)
-                    case .done(let finished):
-                        self.replaceJob(finished)
+                    case .status: break
+                    case .stdout, .stderr, .timeline, .done: progressed = true
+                    }
+                    handleJobStreamEvent(event, jobID: jobID)
+                    if case .done = event {
+                        sawDone = true
+                        break
                     }
                 }
             } catch {
-                // Stream dropped (background, network, server restart): fall back to the
-                // store-driven 2 s polling via refreshActiveWorkIfNeeded().
+                reason = CodexDiagnostics.brief(error)
             }
-            self?.jobStreamTasks[jobID] = nil
+            if sawDone {
+                let held = jobLive[jobID] ?? JobLiveState()
+                CodexDiagnostics.log("job_stream_done", fields: [
+                    "jobId": jobID,
+                    "stdoutOffset": String(held.stdoutOffset),
+                    "stderrOffset": String(held.stderrOffset),
+                    "timeline": String(timelineStore[jobID]?.cursor ?? 0)
+                ])
+            }
+            guard !sawDone, !Task.isCancelled, jobStreamTokens[jobID] == token else { break }
+            // Still worth following only while the job is on screen and running.
+            guard let job = conversationJob(id: jobID), job.status.isActive else { break }
+
+            failures = progressed ? 1 : failures + 1
+            let held = jobLive[jobID] ?? JobLiveState()
+            guard failures <= Self.streamRetryDelays.count else {
+                jobLive[jobID, default: JobLiveState()].streamGaveUpAt = Date()
+                CodexDiagnostics.log("job_stream_gave_up", fields: [
+                    "jobId": jobID,
+                    "attempts": String(failures - 1),
+                    "reason": reason
+                ])
+                break
+            }
+            CodexDiagnostics.log("job_stream_reattach", fields: [
+                "jobId": jobID,
+                "attempt": String(failures),
+                "stdoutOffset": String(held.stdoutOffset),
+                "stderrOffset": String(held.stderrOffset),
+                "timeline": String(timelineStore[jobID]?.cursor ?? 0),
+                "reason": reason
+            ])
+            isReattach = true
+            await live.pause(Self.streamRetryDelays[failures - 1])
         }
-        jobStreamTasks[jobID] = task
+        if jobStreamTokens[jobID] == token {
+            jobStreamTokens[jobID] = nil
+            jobStreamTasks[jobID] = nil
+        }
     }
 
-    private func appendLiveTail(jobID: String, _ chunk: String) {
+    /// Apply one stream event to the conversation that is showing its job, and
+    /// to no other. A stream can outlive the screen it was opened for by an
+    /// event or two; what it says then is about a job the user has left.
+    private func handleJobStreamEvent(_ event: CodexJobStreamEvent, jobID: String) {
+        guard isOnScreen(jobID: jobID) else { return }
+        switch event {
+        case .status(let updated):
+            guard updated.id == jobID else { return }
+            replaceJob(updated, from: .stream)
+        case .stdout(let offset, let chunk):
+            appendLiveTail(jobID: jobID, chunk, at: offset, channel: \.stdoutOffset)
+        case .stderr(let offset, let chunk):
+            appendLiveTail(jobID: jobID, chunk, at: offset, channel: \.stderrOffset)
+        case .timeline(let envelope):
+            applyTimeline([envelope], jobID: jobID)
+        case .done(let finished):
+            guard finished.id == jobID else { return }
+            replaceJob(finished, from: .stream)
+        }
+    }
+
+    private func stopJobStream(jobID: String) {
+        jobStreamTasks[jobID]?.cancel()
+        jobStreamTasks[jobID] = nil
+        jobStreamTokens[jobID] = nil
+    }
+
+    /// The app came back to the foreground, where every stream it held has
+    /// usually died: reconnect now instead of waiting out a backoff or a
+    /// give-up window that elapsed while the phone was asleep.
+    ///
+    /// `restartingStreams` is for a return from the background proper: a stream
+    /// held across a suspension can look open for minutes after its connection
+    /// is gone, and while it does nothing else carries the job. Restarting
+    /// costs nothing, because it resumes from the offsets and cursor held.
+    func resumeLiveWork(restartingStreams: Bool = false) {
+        for job in messages.compactMap(\.job) where job.status.isActive {
+            jobLive[job.id]?.streamGaveUpAt = nil
+            if restartingStreams { stopJobStream(jobID: job.id) }
+            attachJobStream(to: job)
+        }
+        scheduleTimelineSync()
+    }
+
+    /// The poll's share of live work, for jobs the stream is not carrying: page
+    /// the timeline from the cursor, and put the stream back once it has had
+    /// time to recover.
+    private func syncLiveJobs() async {
+        for job in messages.compactMap(\.job) where job.status.isActive && jobStreamTasks[job.id] == nil {
+            let gaveUpAt = jobLive[job.id]?.streamGaveUpAt
+            if gaveUpAt.map({ Date().timeIntervalSince($0) >= Self.streamRetryAfterGivingUp }) ?? true {
+                attachJobStream(to: job)
+            }
+        }
+        await syncTimelines()
+    }
+
+    /// Bring every on-screen job's timeline up to what its machine holds.
+    ///
+    /// Two cases, both by `GET …/timeline?since=<cursor>`: an active job whose
+    /// stream is not attached is paged on the poll cadence; a finished job that
+    /// reports more events than are held (a job opened from history, or one
+    /// whose stream dropped before the end) is fetched once. A job that reports
+    /// no `timelineEvents` came from a machine that predates timelines: the
+    /// route is never called for it and it renders the legacy way.
+    func syncTimelines() async {
+        for id in messages.compactMap({ $0.job?.id }) {
+            await syncTimeline(jobID: id)
+        }
+    }
+
+    private func scheduleTimelineSync() {
+        guard messages.contains(where: { ($0.job?.timelineEvents ?? 0) > 0 }) else { return }
+        Task { [weak self] in await self?.syncTimelines() }
+    }
+
+    private func syncTimeline(jobID: String) async {
+        guard let job = conversationJob(id: jobID) else { return }
+        let state = jobLive[jobID] ?? JobLiveState()
+        guard !state.timelineUnavailable, !state.isSyncingTimeline else { return }
+        let reported = job.timelineEvents ?? 0
+        guard reported > (timelineStore[jobID]?.cursor ?? 0) else { return }
+        let wasActive = job.status.isActive
+        if wasActive {
+            guard jobStreamTasks[jobID] == nil else { return }
+        } else {
+            guard !state.fetchedFinishedTimeline else { return }
+        }
+
+        jobLive[jobID, default: JobLiveState()].isSyncingTimeline = true
+        var completed = false
+        do {
+            var since = timelineStore[jobID]?.cursor ?? 0
+            for _ in 0..<64 {
+                let page = try await live.timelinePage(jobID, since)
+                guard isOnScreen(jobID: jobID) else { return }
+                applyTimeline(page.events, jobID: jobID)
+                // Caught up with what the job reported: anything newer is the
+                // next poll's, not another request now.
+                if page.events.isEmpty || page.next <= since || page.complete || page.next >= reported {
+                    completed = true
+                    break
+                }
+                since = page.next
+            }
+        } catch CodexClientError.httpFailure(404, _) {
+            // No such route: an older machine. Leave the job on the legacy path.
+            jobLive[jobID]?.timelineUnavailable = true
+        } catch {
+            // A failed page is retried by the next poll.
+        }
+        guard jobLive[jobID] != nil else { return }
+        jobLive[jobID]?.isSyncingTimeline = false
+        CodexDiagnostics.log("job_timeline_paged", fields: [
+            "jobId": jobID,
+            "reported": String(reported),
+            "timeline": String(timelineStore[jobID]?.cursor ?? 0),
+            "jobActive": String(wasActive)
+        ])
+        if let latest = conversationJob(id: jobID), latest.status.isFinal {
+            if completed, !wasActive { jobLive[jobID]?.fetchedFinishedTimeline = true }
+            settleTimeline(for: latest)
+        }
+    }
+
+    /// The reduced timeline of a job on screen, or nil when its machine sent none
+    /// and the job renders the legacy way.
+    func timeline(forJobID id: String) -> RelayTimeline? {
+        guard let timeline = timelines[id], !timeline.isEmpty else { return nil }
+        return timeline
+    }
+
+    /// Reduce events into the job's timeline. A sequence number already applied
+    /// (a reconnect, a poll overlapping the stream) is ignored by the reducer,
+    /// so the same event arriving twice is drawn once.
+    private func applyTimeline(_ envelopes: [RelayTimelineEnvelope], jobID: String) {
+        guard !envelopes.isEmpty else { return }
+        var timeline = timelineStore[jobID] ?? RelayTimeline()
+        var changed = false
+        for envelope in envelopes where timeline.apply(envelope) {
+            changed = true
+        }
+        guard changed else { return }
+        timelineStore[jobID] = timeline
+        dirtyTimelineIDs.insert(jobID)
+        schedulePublish()
+    }
+
+    /// Once a job is over nothing in it is still running, whichever way the
+    /// phone learned it was over: the stream's `done`, a poll, a cancel.
+    private func settleTimeline(for job: CodexJob) {
+        guard job.status.isFinal, let timeline = timelineStore[job.id], timeline.hasRunningSteps else { return }
+        var settled = timeline
+        settled.settle(as: job.status == .succeeded ? .done : job.status == .failed ? .failed : .cancelled)
+        timelineStore[job.id] = settled
+        dirtyTimelineIDs.insert(job.id)
+        // The end of a run is not something to show a beat late.
+        publishPending()
+    }
+
+    private func appendLiveTail(
+        jobID: String,
+        _ chunk: String,
+        at offset: Int64,
+        channel: WritableKeyPath<JobLiveState, Int64>
+    ) {
         guard !chunk.isEmpty else { return }
-        var tail = (liveJobTails[jobID] ?? "") + chunk
+        var state = jobLive[jobID] ?? JobLiveState()
+        let consumed = state[keyPath: channel]
+        let bytes = Array(chunk.utf8)
+        let end = offset + Int64(bytes.count)
+        // Bytes at or before the offset already consumed are a replay.
+        guard end > consumed else { return }
+        let fresh = offset >= consumed
+            ? chunk
+            : String(decoding: bytes.dropFirst(Int(consumed - offset)), as: UTF8.self)
+        state[keyPath: channel] = end
+        jobLive[jobID] = state
+
+        var tail = (tailStore[jobID] ?? "") + fresh
         if tail.count > Self.liveTailCharacterCap {
             tail = String(tail.suffix(Self.liveTailCharacterCap))
         }
-        liveJobTails[jobID] = tail
+        tailStore[jobID] = tail
+        dirtyTailIDs.insert(jobID)
+        schedulePublish()
+    }
+
+    // MARK: - Coalesced publishing
+
+    /// Live content arrives an event at a time and each publish redraws the
+    /// transcript. The first change after a quiet spell is shown at once; what
+    /// follows within `publishInterval` is shown together when it elapses.
+    private func schedulePublish() {
+        guard publishTask == nil else { return }
+        let wait = publishInterval - Date().timeIntervalSince(lastPublishAt)
+        guard wait > 0 else {
+            publishPending()
+            return
+        }
+        publishTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            self.publishTask = nil
+            self.publishPending()
+        }
+    }
+
+    /// Show everything received so far. Called by the timer, and directly at
+    /// the moments that must not wait for it (a turn ending, a job finishing).
+    func publishPending() {
+        publishTask?.cancel()
+        publishTask = nil
+        guard !dirtyTimelineIDs.isEmpty || !dirtyTailIDs.isEmpty || !pendingChatDeltas.isEmpty else { return }
+        lastPublishAt = Date()
+        if !dirtyTimelineIDs.isEmpty {
+            var next = timelines
+            for id in dirtyTimelineIDs { next[id] = timelineStore[id] }
+            dirtyTimelineIDs.removeAll()
+            if next != timelines { timelines = next }
+        }
+        if !dirtyTailIDs.isEmpty {
+            var next = liveJobTails
+            for id in dirtyTailIDs { next[id] = tailStore[id] }
+            dirtyTailIDs.removeAll()
+            if next != liveJobTails { liveJobTails = next }
+        }
+        if !pendingChatDeltas.isEmpty {
+            var next = messages
+            var changed = false
+            for (id, delta) in pendingChatDeltas {
+                guard let index = next.firstIndex(where: { $0.id == id }) else { continue }
+                next[index].text += delta
+                changed = true
+            }
+            pendingChatDeltas.removeAll()
+            if changed { messages = next }
+        }
+    }
+
+    /// The conversation on screen was replaced. Live state belongs to the jobs
+    /// a conversation shows, so what belonged to the jobs just left goes with
+    /// them: their streams stop, their timelines and tails are dropped, and
+    /// their approvals are no longer offered here.
+    private func conversationDidChange() {
+        let onScreen = Set(messages.compactMap { $0.job?.id })
+        for id in jobStreamTasks.keys where !onScreen.contains(id) {
+            stopJobStream(jobID: id)
+        }
+        jobLive = jobLive.filter { onScreen.contains($0.key) }
+        timelineStore = timelineStore.filter { onScreen.contains($0.key) }
+        tailStore = tailStore.filter { onScreen.contains($0.key) }
+        dirtyTimelineIDs.formIntersection(onScreen)
+        dirtyTailIDs.formIntersection(onScreen)
+        if timelines.keys.contains(where: { !onScreen.contains($0) }) {
+            timelines = timelines.filter { onScreen.contains($0.key) }
+        }
+        if liveJobTails.keys.contains(where: { !onScreen.contains($0) }) {
+            liveJobTails = liveJobTails.filter { onScreen.contains($0.key) }
+        }
+        pendingChatDeltas = pendingChatDeltas.filter { pending in messages.contains { $0.id == pending.key } }
+        // A chat answer still streaming into the conversation that was just
+        // replaced has nowhere to go, and must not name the new one's thread.
+        if let id = streamingMessageID, !messages.contains(where: { $0.id == id }) {
+            streamTask?.cancel()
+            streamTask = nil
+            streamingMessageID = nil
+            isSending = false
+        }
+        scopePendingApprovals()
+        scheduleTimelineSync()
+    }
+
+    private func isOnScreen(jobID: String) -> Bool {
+        messages.contains { $0.job?.id == jobID }
+    }
+
+    /// The copy of a job this conversation is showing.
+    private func conversationJob(id: String) -> CodexJob? {
+        messages.first(where: { $0.job?.id == id })?.job
     }
 
     // MARK: - Threads
@@ -1289,6 +1820,7 @@ final class RelayChatViewModel: ObservableObject {
         watchedSessionID = nil
         nativeWatchQuietSince = nil
         messages = []
+        conversationDidChange()
         prompt = ""
         draftAttachments = []
         errorMessage = nil
@@ -1374,11 +1906,13 @@ final class RelayChatViewModel: ObservableObject {
             ) {
                 selectChoice(choice)
             }
-            let items = conversationItems(from: detail)
+            messages = conversationItems(from: detail)
+            conversationDidChange()
+            // After the items are in place: a stream only attaches for a job
+            // the conversation is showing.
             for job in detail.jobs {
                 attachJobStream(to: job)
             }
-            messages = items
             errorMessage = nil
             beginNativeWatch(detail.thread)
         } catch {
@@ -1432,6 +1966,7 @@ final class RelayChatViewModel: ObservableObject {
             ))
         }
         messages = items
+        conversationDidChange()
         errorMessage = nil
         beginNativeWatch(thread)
     }
@@ -1469,6 +2004,7 @@ final class RelayChatViewModel: ObservableObject {
         let next = items.map(transcriptSignature)
         if previous != next, !items.isEmpty || messages.isEmpty {
             messages = items
+            conversationDidChange()
             nativeWatchQuietSince = nil
             for job in detail.jobs where job.status.isActive {
                 attachJobStream(to: job)
@@ -1484,25 +2020,176 @@ final class RelayChatViewModel: ObservableObject {
         }
     }
 
+    /// A restored thread, drawn the way a live one is.
+    ///
+    /// The transcript's turns keep the order the machine sent them in. Each job
+    /// the thread ran is placed at the end of the turn it produced, after its
+    /// own prompt and answer, and when the transcript already holds that answer
+    /// the job row says so (`hidesJobAnswer`) instead of showing it a second
+    /// time. Steps arrive on the message they precede and become that message's
+    /// `historyTimeline`.
     private func conversationItems(from detail: CodexThreadDetail) -> [RelayConversationItem] {
-        var items = detail.messages.enumerated().map { index, message in
-            let role: RelayConversationItem.Role = message.role == .user ? .user : message.role == .assistant ? .assistant : .status
-            return RelayConversationItem(
-                id: "turn:\(detail.thread.sessionId):\(index):\(role)",
-                role: role,
-                text: message.text,
-                timestamp: message.timestamp ?? detail.thread.updatedAt ?? Date(),
+        let sessionID = detail.thread.sessionId
+        let threadIsActive = detail.thread.hasActiveJobs
+        let fallbackStamp = detail.thread.updatedAt ?? Date()
+        var seenKeys: [String: Int] = [:]
+        var items: [RelayConversationItem] = []
+        /// Whether `items[i]` carries a time the machine actually recorded.
+        var isDated: [Bool] = []
+
+        func stepsItem(_ steps: [RelayStepPatch], stamp: Date) -> RelayConversationItem {
+            RelayConversationItem(
+                id: "turn:\(sessionID):steps:\(steps.first?.id ?? "")",
+                role: .assistant,
+                text: "",
+                timestamp: stamp,
                 provider: detail.thread.provider,
                 modelLabel: selectedChoice?.model.label,
-                attachments: message.attachments.map(RelayDisplayedAttachment.from)
+                historyTimeline: RelayTimeline(historySteps: steps, threadIsActive: threadIsActive)
             )
         }
-        items.append(contentsOf: detail.jobs.map(jobItem))
-        return items.sorted { $0.timestamp < $1.timestamp }
+
+        for message in detail.messages {
+            let role: RelayConversationItem.Role = message.role == .user ? .user : message.role == .assistant ? .assistant : .status
+            let stamp = message.timestamp ?? fallbackStamp
+            // Steps before a message that is not the agent's are a turn that
+            // ended without an answer: they stand as a turn of their own.
+            if role != .assistant, !message.steps.isEmpty {
+                items.append(stepsItem(message.steps, stamp: stamp))
+                isDated.append(message.timestamp != nil)
+            }
+            let key = Self.restoredTurnKey(role: message.role, message: message)
+            let repeats = seenKeys[key, default: 0]
+            seenKeys[key] = repeats + 1
+            items.append(RelayConversationItem(
+                id: "turn:\(sessionID):\(key)" + (repeats > 0 ? ":\(repeats)" : ""),
+                role: role,
+                text: message.text,
+                timestamp: stamp,
+                provider: detail.thread.provider,
+                modelLabel: selectedChoice?.model.label,
+                attachments: message.attachments.map(RelayDisplayedAttachment.from),
+                historyTimeline: role == .assistant && !message.steps.isEmpty
+                    ? RelayTimeline(historySteps: message.steps, threadIsActive: threadIsActive)
+                    : nil
+            ))
+            isDated.append(message.timestamp != nil)
+        }
+
+        if !detail.trailingSteps.isEmpty {
+            if let last = detail.messages.last, last.role == .assistant, let index = items.indices.last {
+                items[index].historyTimeline = RelayTimeline(
+                    historySteps: last.steps + detail.trailingSteps,
+                    threadIsActive: threadIsActive
+                )
+            } else {
+                // The last message is the user's: the steps are the answer so far.
+                items.append(stepsItem(detail.trailingSteps, stamp: fallbackStamp))
+                isDated.append(false)
+            }
+        }
+
+        // Jobs, oldest first, each claiming the user turn that started it.
+        let jobs = detail.jobs.sorted { ($0.createdAt ?? .distantPast) < ($1.createdAt ?? .distantPast) }
+        var claimed: Set<Int> = []
+        /// Job rows to insert before `items[key]` (`items.count` is the end).
+        var inserts: [Int: [RelayConversationItem]] = [:]
+        let anyDated = isDated.contains(true)
+        for job in jobs {
+            var row = jobItem(job)
+            if let promptIndex = Self.restoredPromptIndex(for: job, in: items, isDated: isDated, claimed: claimed) {
+                claimed.insert(promptIndex)
+                let turnEnd = items.indices.first(where: { $0 > promptIndex && items[$0].role == .user }) ?? items.count
+                let answered = items[(promptIndex + 1)..<turnEnd].contains {
+                    $0.role == .assistant && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                }
+                row.hidesJobAnswer = answered && !job.status.isActive
+                inserts[turnEnd, default: []].append(row)
+                continue
+            }
+            if items.isEmpty, let prompt = job.prompt?.trimmedNonEmpty {
+                // No transcript at all: show what was asked, as a live turn does.
+                inserts[0, default: []].append(RelayConversationItem(
+                    id: "prompt:\(job.id)",
+                    role: .user,
+                    text: prompt,
+                    timestamp: job.createdAt ?? fallbackStamp,
+                    provider: job.provider,
+                    modelLabel: job.model,
+                    attachments: job.attachments.map(RelayDisplayedAttachment.from)
+                ))
+            }
+            // A job the transcript does not mention goes where its time puts
+            // it; one still running, or one that cannot be dated, goes last.
+            var position = items.count
+            if !job.status.isActive, anyDated, let anchor = job.createdAt {
+                position = items.indices.first(where: { isDated[$0] && items[$0].timestamp > anchor }) ?? items.count
+            }
+            inserts[position, default: []].append(row)
+        }
+
+        var ordered: [RelayConversationItem] = []
+        ordered.reserveCapacity(items.count + jobs.count)
+        for index in items.indices {
+            ordered.append(contentsOf: inserts[index] ?? [])
+            ordered.append(items[index])
+        }
+        ordered.append(contentsOf: inserts[items.count] ?? [])
+        return ordered
+    }
+
+    /// An id for a restored turn that does not depend on where the turn sits in
+    /// the window the machine returned. Index-based ids renamed every turn each
+    /// time the 120-turn window slid, so the whole transcript was rebuilt and
+    /// the scroll position lost. A turn is named by when it was written, or by
+    /// how it starts when the transcript carries no time.
+    nonisolated static func restoredTurnKey(role: CodexThreadMessageRole, message: CodexThreadMessage) -> String {
+        if let timestamp = message.timestamp {
+            return "\(role.rawValue):\(Int64((timestamp.timeIntervalSince1970 * 1000).rounded()))"
+        }
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in message.text.prefix(96).utf8 {
+            hash = (hash ^ UInt64(byte)) &* 0x0000_0100_0000_01b3
+        }
+        return "\(role.rawValue):h\(String(hash, radix: 16))"
+    }
+
+    /// The user turn that started `job`: the first unclaimed one saying what
+    /// the job was asked, else the first written while the job ran.
+    nonisolated static func restoredPromptIndex(
+        for job: CodexJob,
+        in items: [RelayConversationItem],
+        isDated: [Bool],
+        claimed: Set<Int>
+    ) -> Int? {
+        func squashed(_ text: String?) -> String {
+            (text ?? "").split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        }
+        let candidates = items.indices.filter { items[$0].role == .user && !claimed.contains($0) }
+        let asked = squashed(job.prompt)
+        if !asked.isEmpty {
+            // A follow-up prompt can be wrapped by the app, and a harness can
+            // wrap what it records, so either may contain the other.
+            let match = candidates.first { index in
+                let said = squashed(items[index].text)
+                guard !said.isEmpty else { return false }
+                if said == asked { return true }
+                return (said.count >= 12 && asked.contains(said)) || (asked.count >= 12 && said.contains(asked))
+            }
+            if let match { return match }
+        }
+        guard let createdAt = job.createdAt else { return nil }
+        let end = job.completedAt ?? .distantFuture
+        return candidates.first { index in
+            isDated[index]
+                && items[index].timestamp >= createdAt.addingTimeInterval(-2)
+                && items[index].timestamp <= end
+        }
     }
 
     private func transcriptSignature(_ item: RelayConversationItem) -> String {
         "\(item.id)\u{0}\(item.text)\u{0}\(item.job?.status.label ?? "")\u{0}\(item.attachments.count)"
+            + "\u{0}\(item.historyTimeline?.hashValue ?? 0)\u{0}\(item.hidesJobAnswer)"
     }
 
     /// Open either a resumable thread or a standalone invocation from the unified
@@ -1571,6 +2258,7 @@ final class RelayChatViewModel: ObservableObject {
         }
         items.append(jobItem(latest))
         messages = items
+        conversationDidChange()
         attachJobStream(to: latest)
         errorMessage = nil
     }
@@ -1602,7 +2290,7 @@ final class RelayChatViewModel: ObservableObject {
         defer { cancellingJobIDs.remove(job.id) }
         do {
             if let updated = try await client.cancelJob(id: job.id) {
-                replaceJob(updated)
+                replaceJob(updated, from: .action)
             }
             await refreshThreads()
         } catch {
@@ -1617,7 +2305,7 @@ final class RelayChatViewModel: ObservableObject {
     func loadFullLog(jobID: String) async -> String {
         do {
             let full = try await client.fetchJob(id: jobID, includeFullLogs: true)
-            replaceJob(full)
+            replaceJob(full, from: .detail)
             return full.rawActivityOutput ?? full.displayOutput ?? ""
         } catch {
             errorMessage = error.localizedDescription
@@ -1652,14 +2340,11 @@ final class RelayChatViewModel: ObservableObject {
 
     // MARK: - Internals
 
+    /// Chat tokens are buffered and shown in batches, like every other live channel.
     private func append(delta: String, to id: String) {
-        guard let index = messages.firstIndex(where: { $0.id == id }) else { return }
-        messages[index].text += delta
-    }
-
-    private func replaceText(_ text: String, for id: String) {
-        guard let index = messages.firstIndex(where: { $0.id == id }) else { return }
-        messages[index].text = text
+        guard !delta.isEmpty else { return }
+        pendingChatDeltas[id, default: ""] += delta
+        schedulePublish()
     }
 
     private func jobItem(_ job: CodexJob) -> RelayConversationItem {
@@ -1675,19 +2360,71 @@ final class RelayChatViewModel: ObservableObject {
         )
     }
 
-    private func replaceJob(_ job: CodexJob) {
-        if !job.status.isActive {
-            liveJobTails[job.id] = nil
+    /// Where a copy of a job came from, which says how much it can be trusted to carry.
+    private enum JobCopySource {
+        /// The job stream: a partial `status` payload, or the terminal `done`.
+        case stream
+        /// A detail request: the 64 KiB preview, or the full logs.
+        case detail
+        /// The folder's list: the 4 KiB compact copy.
+        case list
+        /// The answer to something the user did (cancel).
+        case action
+    }
+
+    /// Take in a newer copy of a job. It is merged into the copy already held,
+    /// never swapped for it (`CodexJob.absorbing`), and it only touches the
+    /// conversation when that conversation is showing the job: a copy of a job
+    /// the user has left updates the history list and nothing else.
+    private func replaceJob(_ incoming: CodexJob, from source: JobCopySource = .detail) {
+        let listIndex = jobs.firstIndex(where: { $0.id == incoming.id })
+        let onScreenIndex = messages.firstIndex(where: { $0.job?.id == incoming.id })
+        let held = onScreenIndex.flatMap { messages[$0].job } ?? listIndex.map { jobs[$0] }
+        let job = held?.absorbing(incoming) ?? incoming
+
+        if let index = onScreenIndex {
+            var item = messages[index]
+            item.job = job
+            item.text = job.displayOutput ?? job.errorMessage ?? job.status.label
+            item.modelLabel = job.model ?? item.modelLabel
+            item.canLoadFullLog = job.hasTruncatedServerOutput
+            if item != messages[index] { messages[index] = item }
+            adoptThread(from: job)
         }
-        if let index = messages.firstIndex(where: { $0.job?.id == job.id }) {
-            messages[index] = jobItem(job)
-        }
-        if let index = jobs.firstIndex(where: { $0.id == job.id }) {
-            jobs[index] = job
-        } else {
+        if let listIndex {
+            if jobs[listIndex] != job { jobs[listIndex] = job }
+        } else if source != .list {
             jobs.insert(job, at: 0)
         }
-        adoptThread(from: job)
+
+        guard !job.status.isActive else { return }
+        if tailStore[job.id] != nil || liveJobTails[job.id] != nil {
+            tailStore[job.id] = nil
+            dirtyTailIDs.insert(job.id)
+            publishPending()
+        }
+        guard onScreenIndex != nil else { return }
+        settleTimeline(for: job)
+        if source != .stream { stopJobStream(jobID: job.id) }
+        // The job ended, but what said so carries little or none of its text:
+        // fetch the real ending once.
+        let endedHere = held?.status.isFinal != true && job.status.isFinal
+        if endedHere, source != .detail, incoming.detailRank < 2 {
+            refreshFinishedJobDetail(id: job.id)
+        }
+        if endedHere { scheduleTimelineSync() }
+    }
+
+    private func refreshFinishedJobDetail(id: String) {
+        guard !detailRefreshesInFlight.contains(id) else { return }
+        detailRefreshesInFlight.insert(id)
+        Task { [weak self] in
+            guard let self else { return }
+            let detail = try? await self.fetchJobDetail(id)
+            self.detailRefreshesInFlight.remove(id)
+            guard let detail, detail.id == id, self.isOnScreen(jobID: id) else { return }
+            self.replaceJob(detail, from: .detail)
+        }
     }
 
     /// Keep the open conversation on one native session. Creating a Codex job
@@ -1706,11 +2443,11 @@ final class RelayChatViewModel: ObservableObject {
         }
     }
 
-    private func mergeUpdatedJobs() {
-        for job in jobs {
-            if messages.contains(where: { $0.job?.id == job.id }) {
-                replaceJob(job)
-            }
+    /// Fold the list's copies into the jobs on screen. They are the poorest
+    /// copies there are, so this only ever moves status forward.
+    private func mergeUpdatedJobs(_ listed: [CodexJob]) {
+        for job in listed where isOnScreen(jobID: job.id) {
+            replaceJob(job, from: .list)
         }
     }
 

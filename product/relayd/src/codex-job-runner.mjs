@@ -4,6 +4,8 @@ import path from "node:path";
 import { AppServerClient } from "./appserver-client.mjs";
 import { ApprovalStore } from "./approval-store.mjs";
 import { isCodexHarnessNoise } from "./codex-noise.mjs";
+import { createTimelineWriter } from "./timeline.mjs";
+import { createCodexNotificationMapper, writeTimelineEvents } from "./timeline-codex.mjs";
 
 const jobId = requiredEnv("RELAY_JOB_ID");
 const workspacePath = path.resolve(requiredEnv("RELAY_WORKSPACE_PATH"));
@@ -16,6 +18,10 @@ let finalAnswer = "";
 let streamedAnswer = "";
 let currentThreadId = process.env.RELAY_RESUME_SESSION_ID || "";
 let sandboxStartupFailure = null;
+// The structured record of this job (RELAY_TIMELINE_PATH). It is written
+// beside the legacy stdout/stderr channels, never instead of them.
+const timeline = createTimelineWriter();
+const timelineMapper = createCodexNotificationMapper();
 
 const SANDBOX_STARTUP_FAILURES = [
   /bwrap:\s+Can't find source path[^\r\n]*:\s*Permission denied/i,
@@ -104,6 +110,11 @@ async function handleServerRequest(message) {
     return;
   }
   const params = message.params || {};
+  const approvalStepId = recordTimeline(() => {
+    const requested = timelineMapper.approvalRequested({ method, params });
+    writeTimelineEvents(timeline, requested.events);
+    return requested.id;
+  });
   const command = Array.isArray(params.command) ? params.command.join(" ") : params.command;
   const kind = method.includes("fileChange") ? "file_change" : params.networkApprovalContext ? "network" : "command";
   const title = kind === "file_change" ? "Apply file changes" : kind === "network" ? "Allow network access" : "Run command";
@@ -129,9 +140,11 @@ async function handleServerRequest(message) {
       timeoutMs: approvalWaitTimeoutMs(),
     });
     client.respond(message.id, { decision: resolution.decision });
+    recordTimeline(() => writeTimelineEvents(timeline, timelineMapper.approvalResolved(approvalStepId, resolution.decision)));
     step(resolution.decision.startsWith("accept") ? "Approved from Relay" : "Denied from Relay");
   } catch (error) {
     client.respond(message.id, { decision: "cancel" });
+    recordTimeline(() => writeTimelineEvents(timeline, timelineMapper.approvalResolved(approvalStepId, "cancel")));
     process.stderr.write(`[approval] ${error.message}\n`);
     if (error?.code === "approval_timeout" || /Timed out waiting for an approval decision/i.test(error?.message || "")) {
       fail(error);
@@ -140,6 +153,7 @@ async function handleServerRequest(message) {
 }
 
 function handleNotification(message) {
+  recordTimeline(() => writeTimelineEvents(timeline, timelineMapper.push(message)));
   const method = String(message.method || "");
   const params = message.params || {};
   const item = params.item || {};
@@ -224,6 +238,16 @@ function approvalWaitTimeoutMs() {
   const raw = Number(process.env.RELAY_APPROVAL_TIMEOUT_MS);
   if (Number.isFinite(raw) && raw >= 1_000) return Math.floor(raw);
   return 15 * 60 * 1000;
+}
+
+// The timeline is an extra; a fault in it must never fail or stall the job.
+function recordTimeline(write) {
+  try {
+    return write();
+  } catch (error) {
+    process.stderr.write(`[timeline] ${error?.message || error}\n`);
+    return undefined;
+  }
 }
 
 function optionalEnv(name) { return process.env[name]?.trim() || null; }

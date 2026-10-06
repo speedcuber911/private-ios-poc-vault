@@ -13,6 +13,9 @@ struct RelayMarkdownText: View {
     let onOpenLoopbackURL: ((URL) -> Void)?
     let bodyFont: Font
     @State private var blockedLoopbackURL: URL?
+    /// The parse survives body passes: a transcript re-evaluates every visible
+    /// message on each streamed token, and only the one that grew parses again.
+    @State private var memo = RelayMarkdownMemo<[CodexMarkdownSegment]>()
 
     init(
         text: String,
@@ -28,7 +31,12 @@ struct RelayMarkdownText: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
+            // Text only ever grows at its end, so a segment's position is its
+            // identity: earlier segments keep their views and, being equatable,
+            // are skipped while the last one streams.
+            let segments = segments
+            ForEach(segments.indices, id: \.self) { index in
+                let segment = segments[index]
                 switch segment.kind {
                 case .prose:
                     RelayMarkdownProse(
@@ -37,8 +45,10 @@ struct RelayMarkdownText: View {
                         isOnAccent: userAligned,
                         bodyFont: bodyFont
                     )
+                    .equatable()
                 case .code(let language):
                     RelayCodeBlock(text: segment.text, language: language)
+                        .equatable()
                 }
             }
         }
@@ -68,7 +78,22 @@ struct RelayMarkdownText: View {
     }
 
     private var segments: [CodexMarkdownSegment] {
-        CodexMarkdownParser.segments(from: text)
+        memo.value(for: text, CodexMarkdownParser.segments(from:))
+    }
+}
+
+/// Holds the last parse of a markdown view's text. A reference in `@State`, so
+/// reading it in `body` neither copies the result nor invalidates the view.
+final class RelayMarkdownMemo<Value> {
+    private var text: String?
+    private var value: Value?
+
+    func value(for text: String, _ parse: (String) -> Value) -> Value {
+        if let value, self.text == text { return value }
+        let parsed = parse(text)
+        self.text = text
+        value = parsed
+        return parsed
     }
 }
 
@@ -111,15 +136,25 @@ enum RelayOutputURLPolicy {
     }
 }
 
-struct RelayMarkdownProse: View {
+struct RelayMarkdownProse: View, Equatable {
     let text: String
     let color: Color
     let isOnAccent: Bool
     var bodyFont: Font = AppTheme.uiFont(size: 14)
+    @State private var memo = RelayMarkdownMemo<[CodexMarkdownProseBlock]>()
+
+    static func == (lhs: RelayMarkdownProse, rhs: RelayMarkdownProse) -> Bool {
+        lhs.text == rhs.text
+            && lhs.color == rhs.color
+            && lhs.isOnAccent == rhs.isOnAccent
+            && lhs.bodyFont == rhs.bodyFont
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+            let blocks = blocks
+            ForEach(blocks.indices, id: \.self) { index in
+                let block = blocks[index]
                 switch block.kind {
                 case .heading(let level):
                     Text(inlineMarkdown(block.text))
@@ -148,7 +183,7 @@ struct RelayMarkdownProse: View {
     }
 
     private var blocks: [CodexMarkdownProseBlock] {
-        CodexMarkdownParser.proseBlocks(from: text)
+        memo.value(for: text, CodexMarkdownParser.proseBlocks(from:))
     }
 
     private func listRow(marker: String, text: String) -> some View {
@@ -210,12 +245,12 @@ struct RelayMarkdownTable: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(tableFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .background(tableFill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(borderColor, lineWidth: 0.75)
         }
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .textSelection(.enabled)
     }
 
@@ -281,10 +316,13 @@ struct RelayMarkdownTable: View {
     }
 }
 
-struct RelayCodeBlock: View {
+struct RelayCodeBlock: View, Equatable {
     let text: String
     let language: String?
-    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    static func == (lhs: RelayCodeBlock, rhs: RelayCodeBlock) -> Bool {
+        lhs.text == rhs.text && lhs.language == rhs.language
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -303,19 +341,12 @@ struct RelayCodeBlock: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel("Copy code")
             }
-            if dynamicTypeSize.isAccessibilitySize {
-                // Accessibility sizes would wrap mono text mid-token ("qu ery");
-                // keep lines intact and let the block scroll sideways instead.
-                ScrollView(.horizontal, showsIndicators: false) {
-                    codeText
-                        .fixedSize(horizontal: true, vertical: false)
-                }
-            } else {
-                codeText
-            }
+            // Code wraps inside its block at every type size: nothing in the
+            // transcript asks for a sideways swipe.
+            codeText
         }
-        .padding(10)
-        .background(AppTheme.textPrimary.opacity(0.05), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .padding(12)
+        .background(AppTheme.textPrimary.opacity(0.05), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 
     private var codeText: some View {
@@ -324,6 +355,8 @@ struct RelayCodeBlock: View {
             .foregroundStyle(AppTheme.textPrimary)
             .textSelection(.enabled)
             .lineLimit(24)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var languageLabel: String {

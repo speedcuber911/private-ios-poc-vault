@@ -20,7 +20,7 @@ import { cleanThreadProviderFilter, workspaceForJob, listWorkspaceSessions, list
 import { handleChatRequest } from "./chat.mjs";
 import { isSafeArtifactId, serveJobArtifact } from "./artifacts.mjs";
 import { transcribeAudio, cleanAudioContentType, cleanAudioFilename } from "./transcribe.mjs";
-import { jobsState, jobs, activeChildren, responseShape, wantsFullLogs, enqueueJob, cleanJobProviderFilter, normalizeJobProvider, compareJobsForList, jobThreadId, cancelJob, streamJobEvents, toJobResponse, serveJobAttachment, isSafeAttachmentIndex } from "./jobs.mjs";
+import { jobsState, jobs, activeChildren, responseShape, wantsFullLogs, enqueueJob, cleanJobProviderFilter, normalizeJobProvider, compareJobsForList, jobThreadId, cancelJob, streamJobEvents, jobTimelinePage, toJobResponse, serveJobAttachment, isSafeAttachmentIndex } from "./jobs.mjs";
 import { planSessionImports, importCodexSession, createSessionUpload, appendSessionUpload, completeSessionUpload } from "./session-sync.mjs";
 import { codexThreadUiHtml } from "./ui.mjs";
 import { handleAdditionRoutes } from "./additions.mjs";
@@ -474,6 +474,15 @@ async function routeRequest(req, res) {
     const job = jobs.get(id);
     if (!job) return sendError(res, 404, "job not found");
     return streamJobEvents(req, res, job, url.searchParams);
+  }
+
+  const timelineMatch = url.pathname.match(/^\/v1\/codex\/jobs\/([^/]+)\/timeline$/);
+  if (timelineMatch && req.method === "GET") {
+    const id = timelineMatch[1];
+    if (!isSafeJobId(id)) return sendError(res, 404, "job not found");
+    const job = jobs.get(id);
+    if (!job) return sendError(res, 404, "job not found");
+    return sendJson(res, 200, jobTimelinePage(job, url.searchParams));
   }
 
   const jobMatch = url.pathname.match(/^\/v1\/codex\/jobs\/([^/]+)(?:\/(cancel))?$/);

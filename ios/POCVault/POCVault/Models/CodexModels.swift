@@ -1026,6 +1026,16 @@ enum CodexJobStatus: Hashable, Codable {
         }
     }
 
+    /// The run is over and the machine said how: nothing further will change it.
+    var isFinal: Bool {
+        switch self {
+        case .succeeded, .failed, .canceled, .timeout:
+            return true
+        case .queued, .running, .waitingForApproval, .canceling, .unknown:
+            return false
+        }
+    }
+
     var didFinishSuccessfully: Bool {
         if case .succeeded = self { return true }
         return false
@@ -1308,11 +1318,15 @@ struct CodexThreadDetail: Decodable, Hashable {
     let thread: CodexThread
     let messages: [CodexThreadMessage]
     let jobs: [CodexJob]
+    /// Steps the agent took after the last message: work still in flight, or a
+    /// turn that ended without a final answer.
+    let trailingSteps: [RelayStepPatch]
 
     enum CodingKeys: String, CodingKey {
         case thread
         case messages
         case jobs
+        case trailingSteps
     }
 
     init(from decoder: Decoder) throws {
@@ -1320,6 +1334,7 @@ struct CodexThreadDetail: Decodable, Hashable {
         self.thread = try container.decode(CodexThread.self, forKey: .thread)
         self.messages = (try? container.decodeIfPresent([CodexThreadMessage].self, forKey: .messages)) ?? []
         self.jobs = (try? container.decodeIfPresent([CodexJob].self, forKey: .jobs)) ?? []
+        self.trailingSteps = ((try? container.decodeIfPresent(RelayHistorySteps.self, forKey: .trailingSteps)) ?? nil)?.steps ?? []
     }
 }
 
@@ -1349,6 +1364,8 @@ struct CodexThreadMessage: Decodable, Hashable, Identifiable {
     let timestamp: Date?
     let text: String
     let attachments: [CodexThreadAttachment]
+    /// The steps the agent took since the previous message, complete (no deltas).
+    let steps: [RelayStepPatch]
 
     enum CodingKeys: String, CodingKey {
         case role
@@ -1358,6 +1375,7 @@ struct CodexThreadMessage: Decodable, Hashable, Identifiable {
         case content
         case message
         case attachments
+        case steps
     }
 
     init(from decoder: Decoder) throws {
@@ -1372,6 +1390,7 @@ struct CodexThreadMessage: Decodable, Hashable, Identifiable {
         let resolvedText = text ?? content ?? message ?? ""
         self.text = resolvedText.trimmingCharacters(in: .whitespacesAndNewlines)
         self.attachments = (try? container.decodeIfPresent([CodexThreadAttachment].self, forKey: .attachments)) ?? []
+        self.steps = ((try? container.decodeIfPresent(RelayHistorySteps.self, forKey: .steps)) ?? nil)?.steps ?? []
     }
 
     var id: String {
@@ -1704,42 +1723,45 @@ struct CodexTextPreview: Equatable {
 
 struct CodexJob: Decodable, Hashable, Identifiable {
     let id: String
-    let provider: CodexProvider
-    let workspaceId: String?
-    let workspaceName: String?
-    let workspacePath: String?
-    let status: CodexJobStatus
-    let prompt: String?
-    let createdAt: Date?
-    let updatedAt: Date?
-    let startedAt: Date?
-    let completedAt: Date?
-    let timeoutMs: Int?
-    let exitCode: Int?
-    let stdout: String?
-    let stderr: String?
-    let result: String?
-    let errorMessage: String?
-    let durationMs: Int?
-    let timedOut: Bool
-    let certSubject: String?
-    let model: String?
-    let reasoningEffort: String?
-    let permissionMode: String?
-    let approvalPolicy: String?
-    let skills: [String]
-    let execution: CodexExecutionReceipt?
-    let logsIncluded: String?
-    let sessionId: String?
-    let resumeSessionId: String?
-    let stdoutBytes: Int?
-    let stderrBytes: Int?
-    let resultBytes: Int?
-    let stdoutTruncated: Bool
-    let stderrTruncated: Bool
-    let resultTruncated: Bool
-    let attachments: [CodexJobAttachmentReference]
-    let artifacts: [CodexJobArtifact]
+    var provider: CodexProvider
+    var workspaceId: String?
+    var workspaceName: String?
+    var workspacePath: String?
+    var status: CodexJobStatus
+    var prompt: String?
+    var createdAt: Date?
+    var updatedAt: Date?
+    var startedAt: Date?
+    var completedAt: Date?
+    var timeoutMs: Int?
+    var exitCode: Int?
+    var stdout: String?
+    var stderr: String?
+    var result: String?
+    var errorMessage: String?
+    var durationMs: Int?
+    var timedOut: Bool
+    var certSubject: String?
+    var model: String?
+    var reasoningEffort: String?
+    var permissionMode: String?
+    var approvalPolicy: String?
+    var skills: [String]
+    var execution: CodexExecutionReceipt?
+    var logsIncluded: String?
+    var sessionId: String?
+    var resumeSessionId: String?
+    var stdoutBytes: Int?
+    var stderrBytes: Int?
+    var resultBytes: Int?
+    var stdoutTruncated: Bool
+    var stderrTruncated: Bool
+    var resultTruncated: Bool
+    var attachments: [CodexJobAttachmentReference]
+    var artifacts: [CodexJobArtifact]
+    /// How many timeline events the machine holds for this job. Absent or zero
+    /// means it has no timeline and the job renders the legacy way.
+    var timelineEvents: Int?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -1789,6 +1811,7 @@ struct CodexJob: Decodable, Hashable, Identifiable {
         case resultTruncated
         case attachments
         case artifacts
+        case timelineEvents
     }
 
     init(from decoder: Decoder) throws {
@@ -1858,6 +1881,100 @@ struct CodexJob: Decodable, Hashable, Identifiable {
         self.resultTruncated = (try container.decodeIfPresent(Bool.self, forKey: .resultTruncated)) ?? false
         self.attachments = (try? container.decodeIfPresent([CodexJobAttachmentReference].self, forKey: .attachments)) ?? []
         self.artifacts = (try? container.decodeIfPresent([CodexJobArtifact].self, forKey: .artifacts)) ?? []
+        self.timelineEvents = (try? container.decodeIntegerIfPresent(forKey: .timelineEvents)) ?? nil
+    }
+
+    /// How much of the job's text a copy carries: the full logs, the 64 KiB
+    /// preview a detail request and the stream's `done` return, the 4 KiB
+    /// compact copy the lists return, or none (a stream `status` payload).
+    var detailRank: Int {
+        switch logsIncluded?.lowercased() {
+        case "full": return 3
+        case "preview": return 2
+        case "compact": return 1
+        default: return 0
+        }
+    }
+
+    /// The copy to keep when `incoming` arrives for a job already held.
+    ///
+    /// The machine describes one job in four sizes, and they arrive
+    /// interleaved: the stream's `status` event names eleven fields and nothing
+    /// else, a list poll carries the first 4 KiB of each text field, a detail
+    /// poll 64 KiB. Replacing the held copy with whichever came last made the
+    /// prompt, model, session and answer vanish on a `status` event, and cut a
+    /// 64 KiB answer to 4 KiB with no marker on the next list poll. So a newer
+    /// copy always updates what it knows better — status, times, exit, error —
+    /// but never erases what only the held copy knows, and never swaps richer
+    /// text for poorer text of the same run.
+    func absorbing(_ incoming: CodexJob) -> CodexJob {
+        guard incoming.id == id else { return incoming }
+        // A stale poll that raced the stream's `done`: a finished job stays finished.
+        if status.isFinal, incoming.status.isActive { return self }
+
+        var merged = incoming
+        // A job never changes harness, and a copy that omits the provider
+        // decodes as the default one.
+        merged.provider = provider
+        if incoming.status == .unknown("unknown") {
+            merged.status = status
+        }
+        // Identity a partial copy does not carry.
+        merged.workspaceId = incoming.workspaceId ?? workspaceId
+        merged.workspaceName = incoming.workspaceName ?? workspaceName
+        merged.workspacePath = incoming.workspacePath ?? workspacePath
+        merged.prompt = incoming.prompt ?? prompt
+        merged.createdAt = incoming.createdAt ?? createdAt
+        merged.startedAt = incoming.startedAt ?? startedAt
+        merged.updatedAt = incoming.updatedAt ?? updatedAt
+        merged.timeoutMs = incoming.timeoutMs ?? timeoutMs
+        merged.certSubject = incoming.certSubject ?? certSubject
+        merged.model = incoming.model ?? model
+        merged.reasoningEffort = incoming.reasoningEffort ?? reasoningEffort
+        merged.permissionMode = incoming.permissionMode ?? permissionMode
+        merged.approvalPolicy = incoming.approvalPolicy ?? approvalPolicy
+        merged.skills = incoming.skills.isEmpty ? skills : incoming.skills
+        merged.execution = incoming.execution ?? execution
+        merged.sessionId = incoming.sessionId ?? sessionId
+        merged.resumeSessionId = incoming.resumeSessionId ?? resumeSessionId
+        merged.attachments = incoming.attachments.isEmpty ? attachments : incoming.attachments
+        merged.timelineEvents = [incoming.timelineEvents, timelineEvents].compactMap { $0 }.max()
+        if !merged.status.isActive {
+            merged.completedAt = incoming.completedAt ?? completedAt
+            merged.exitCode = incoming.exitCode ?? exitCode
+            merged.durationMs = incoming.durationMs ?? durationMs
+        }
+
+        // While a job runs its text keeps changing, so a full log fetched a
+        // moment ago is worth no more than the next preview.
+        let heldRank = status.isFinal ? detailRank : min(detailRank, 2)
+        let poorer = incoming.detailRank < heldRank
+        let isPartial = incoming.detailRank == 0
+        // A poorer copy still brings the first words of a final answer the held
+        // copy has never seen; that is better than nothing until detail lands.
+        let endsTheRun = !status.isFinal && incoming.status.isFinal
+        func text(_ held: String?, _ newer: String?) -> String? {
+            if isPartial { return newer ?? held }
+            if poorer, !endsTheRun { return held ?? newer }
+            return newer
+        }
+        let heldResult = result
+        merged.result = text(result, incoming.result)
+        merged.stdout = text(stdout, incoming.stdout)
+        merged.stderr = text(stderr, incoming.stderr)
+        if poorer || isPartial {
+            // The size and truncation of a text field describe the copy it came from.
+            let keptHeldResult = merged.result == heldResult
+            merged.logsIncluded = keptHeldResult ? logsIncluded : (incoming.logsIncluded ?? logsIncluded)
+            merged.resultBytes = keptHeldResult ? resultBytes : (incoming.resultBytes ?? resultBytes)
+            merged.resultTruncated = keptHeldResult ? resultTruncated : incoming.resultTruncated
+            merged.stdoutBytes = merged.stdout == stdout ? stdoutBytes : incoming.stdoutBytes
+            merged.stdoutTruncated = merged.stdout == stdout ? stdoutTruncated : incoming.stdoutTruncated
+            merged.stderrBytes = merged.stderr == stderr ? stderrBytes : incoming.stderrBytes
+            merged.stderrTruncated = merged.stderr == stderr ? stderrTruncated : incoming.stderrTruncated
+            if incoming.artifacts.isEmpty { merged.artifacts = artifacts }
+        }
+        return merged
     }
 
     var displayPrompt: String {
@@ -2298,6 +2415,9 @@ enum CodexJobStreamEvent: Hashable {
     case status(CodexJob)
     case stdout(offset: Int64, text: String)
     case stderr(offset: Int64, text: String)
+    /// One event of the job's timeline. Sent only to a client that asked for it
+    /// with `timeline=<n>`, so an older machine simply never produces these.
+    case timeline(RelayTimelineEnvelope)
     case done(CodexJob)
 
     /// Decode a single SSE event name + data payload. Returns nil for unknown events
@@ -2315,6 +2435,9 @@ enum CodexJobStreamEvent: Hashable {
         case "stderr":
             guard let chunk = try? JSONDecoder().decode(CodexJobStreamChunk.self, from: payload) else { return nil }
             return .stderr(offset: chunk.offset ?? 0, text: chunk.text ?? "")
+        case "timeline":
+            guard let envelope = try? JSONDecoder().decode(RelayTimelineEnvelope.self, from: payload) else { return nil }
+            return .timeline(envelope)
         case "done":
             guard let job = try? JSONDecoder().decode(CodexJob.self, from: payload) else { return nil }
             return .done(job)

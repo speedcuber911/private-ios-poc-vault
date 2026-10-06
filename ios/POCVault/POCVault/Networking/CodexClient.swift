@@ -83,6 +83,12 @@ enum RelayMachineStatsStreamEvent {
 /// Incremental SSE line parser. The decode step is injected so the same accumulation
 /// logic serves both the chat stream (`CodexChatEvent`) and the job stream
 /// (`CodexJobStreamEvent`). A decode returning nil drops the event (unknown/heartbeat).
+///
+/// An event is dispatched by the blank line that ends it. The parser must be fed
+/// every line, blank ones included: `URLSession.AsyncBytes.lines` drops blank
+/// lines, so a stream read through it only learns an event is complete when the
+/// next one starts, and the newest event — the step running right now — stays
+/// hidden. Streams go through `CodexSSEDecoder`, which splits lines itself.
 struct CodexSSELineParser<Event> {
     private var event = ""
     private var data = ""
@@ -132,6 +138,75 @@ struct CodexSSELineParser<Event> {
     }
 }
 
+/// Splits a byte stream into lines and keeps the blank ones, which is the whole
+/// point: a blank line is what ends an SSE event. Accepts LF, CRLF and CR.
+struct CodexSSELineSplitter {
+    private var buffer: [UInt8] = []
+    private var lastWasCarriageReturn = false
+
+    /// The line this byte completed, or nil while one is still being read.
+    mutating func ingest(_ byte: UInt8) -> String? {
+        switch byte {
+        case 0x0A:
+            if lastWasCarriageReturn {
+                lastWasCarriageReturn = false
+                return nil
+            }
+            return take()
+        case 0x0D:
+            lastWasCarriageReturn = true
+            return take()
+        default:
+            lastWasCarriageReturn = false
+            buffer.append(byte)
+            return nil
+        }
+    }
+
+    /// A final line the stream ended without terminating.
+    mutating func finish() -> String? {
+        buffer.isEmpty ? nil : take()
+    }
+
+    private mutating func take() -> String {
+        let line = String(decoding: buffer, as: UTF8.self)
+        buffer.removeAll(keepingCapacity: true)
+        return line
+    }
+}
+
+/// Bytes in, events out: each event is returned by the byte that completes it.
+struct CodexSSEDecoder<Event> {
+    private var splitter = CodexSSELineSplitter()
+    private var parser: CodexSSELineParser<Event>
+
+    init(decode: @escaping (String, String) -> Event?) {
+        parser = CodexSSELineParser(decode: decode)
+    }
+
+    mutating func ingest(_ byte: UInt8) -> [Event] {
+        guard let line = splitter.ingest(byte) else { return [] }
+        return parser.ingest(line)
+    }
+
+    mutating func ingest<Bytes: Sequence>(_ bytes: Bytes) -> [Event] where Bytes.Element == UInt8 {
+        var events: [Event] = []
+        for byte in bytes {
+            events.append(contentsOf: ingest(byte))
+        }
+        return events
+    }
+
+    mutating func finish() -> [Event] {
+        var events: [Event] = []
+        if let line = splitter.finish() {
+            events.append(contentsOf: parser.ingest(line))
+        }
+        events.append(contentsOf: parser.finish())
+        return events
+    }
+}
+
 extension CodexSSELineParser where Event == CodexChatEvent {
     /// Chat-stream parser with the original chat decode step.
     init() {
@@ -140,6 +215,14 @@ extension CodexSSELineParser where Event == CodexChatEvent {
 }
 
 enum CodexDiagnostics {
+    /// An error as its domain and code: enough to tell a timeout from a lost
+    /// connection, without a page of user-info in every log line.
+    static func brief(_ error: Error) -> String {
+        if case CodexClientError.httpFailure(let status, _) = error { return "http \(status)" }
+        let underlying = error as NSError
+        return "\(underlying.domain) \(underlying.code)"
+    }
+
     private static let encoder: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -246,7 +329,22 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         return decoder
     }
 
-    private lazy var session: URLSession = {
+    private lazy var session: URLSession = makeSession(resourceTimeout: 60)
+
+    /// How long one event stream may stay open. `timeoutIntervalForResource` is a
+    /// wall-clock cap on the whole response, so the 60 seconds that suit a
+    /// request also cut every stream at one minute, however lively it is. A
+    /// stream is bounded by its idle timeout instead (the machine heartbeats),
+    /// and by this, which only has to outlast the longest run.
+    static let streamResourceTimeout: TimeInterval = 24 * 60 * 60
+
+    /// Event streams (chat, job, terminal, machine stats) get their own session
+    /// so they can outlive a minute. It is built by the same factory with the
+    /// same delegate, so server trust is pinned and the client identity is
+    /// offered exactly as on every other request.
+    private lazy var streamSession: URLSession = makeSession(resourceTimeout: Self.streamResourceTimeout)
+
+    private func makeSession(resourceTimeout: TimeInterval) -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         // TLS 1.2 ceiling, and it is mTLS that needs it — not a downgrade for
         // its own sake.
@@ -285,7 +383,7 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         // round-trip to a live node and short enough to report rather than
         // hang. `timeoutIntervalForResource` still bounds long file listings.
         configuration.timeoutIntervalForRequest = 15
-        configuration.timeoutIntervalForResource = 60
+        configuration.timeoutIntervalForResource = resourceTimeout
         // Needed so `registerClientCredential` has somewhere to put the
         // identity that this session will actually consult. An ephemeral
         // configuration gets its own private store, which nothing outside the
@@ -294,7 +392,7 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         // nowhere.
         configuration.urlCredentialStorage = URLCredentialStorage.shared
         return URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
-    }()
+    }
 
     init(
         baseURL: URL,
@@ -738,22 +836,21 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
                     var request = URLRequest(url: url)
                     applyDeviceToken(to: &request, url: url)
                     request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-                    let (bytes, response) = try await session.bytes(for: request)
+                    let (bytes, response) = try await streamSession.bytes(for: request)
                     guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
                         throw CodexClientError.httpFailure((response as? HTTPURLResponse)?.statusCode ?? 0, nil)
                     }
-                    var event = ""
-                    var data = ""
-                    for try await line in bytes.lines {
+                    var decoder = CodexSSEDecoder<CodexTerminalStreamEvent> {
+                        Self.decodeTerminalEvent(event: $0, data: $1)
+                    }
+                    for try await byte in bytes {
                         if Task.isCancelled { break }
-                        if line.isEmpty {
-                            if let decoded = Self.decodeTerminalEvent(event: event, data: data) { continuation.yield(decoded) }
-                            event = ""; data = ""
-                        } else if line.hasPrefix("event:") {
-                            event = String(line.dropFirst(6)).trimmingCharacters(in: .whitespaces)
-                        } else if line.hasPrefix("data:") {
-                            data += String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+                        for event in decoder.ingest(byte) {
+                            continuation.yield(event)
                         }
+                    }
+                    for event in decoder.finish() {
+                        continuation.yield(event)
                     }
                     continuation.finish()
                 } catch { continuation.finish(throwing: error) }
@@ -783,6 +880,22 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
             throw CodexClientError.emptyResponse
         }
         return try decoder.decode(CodexJob.self, from: data)
+    }
+
+    /// One page of a job's timeline, from the count of events already held.
+    /// The polling path next to the job stream, and how a job opened from
+    /// history gets its steps. A machine that predates timelines has no such
+    /// route and answers 404, which the caller treats as "no timeline". A poll
+    /// must never be what powers a machine on, so this does not wake it.
+    func fetchTimeline(jobID: String, since: Int) async throws -> RelayTimelinePage {
+        let data = try await perform(
+            path: "/v1/codex/jobs/\(Self.pathComponent(jobID))/timeline",
+            queryItems: [URLQueryItem(name: "since", value: String(max(0, since)))],
+            cachePolicy: .reloadIgnoringLocalCacheData,
+            timeout: 15,
+            allowWake: false
+        )
+        return try JSONDecoder().decode(RelayTimelinePage.self, from: data)
     }
 
     func resolvedArtifactURL(_ value: String?) -> URL? {
@@ -1025,7 +1138,7 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
                     request.timeoutInterval = 30
                     request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
 
-                    let (bytes, response) = try await session.bytes(for: request)
+                    let (bytes, response) = try await streamSession.bytes(for: request)
                     guard let http = response as? HTTPURLResponse else {
                         throw CodexClientError.emptyResponse
                     }
@@ -1034,16 +1147,16 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
                         throw CodexClientError.httpFailure(http.statusCode, message)
                     }
 
-                    var parser = CodexSSELineParser<RelayMachineStatsStreamEvent> {
+                    var decoder = CodexSSEDecoder<RelayMachineStatsStreamEvent> {
                         Self.decodeMachineStatsEvent(event: $0, data: $1)
                     }
-                    for try await line in bytes.lines {
+                    for try await byte in bytes {
                         guard !Task.isCancelled else { return }
-                        for event in parser.ingest(line.trimmingCharacters(in: .newlines)) {
+                        for event in decoder.ingest(byte) {
                             continuation.yield(event)
                         }
                     }
-                    for event in parser.finish() {
+                    for event in decoder.finish() {
                         continuation.yield(event)
                     }
                     continuation.finish()
@@ -1110,7 +1223,7 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
                     request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
                     request.httpBody = try encoder.encode(body)
 
-                    let (bytes, response) = try await session.bytes(for: request)
+                    let (bytes, response) = try await streamSession.bytes(for: request)
                     guard let http = response as? HTTPURLResponse else {
                         throw CodexClientError.emptyResponse
                     }
@@ -1125,9 +1238,11 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
                         "status": String(http.statusCode)
                     ])
 
-                    var parser = CodexSSELineParser()
-                    for try await line in bytes.lines {
-                        for event in parser.ingest(line.trimmingCharacters(in: .newlines)) {
+                    var parser = CodexSSEDecoder<CodexChatEvent> {
+                        CodexClient.decodeSSE(event: $0, data: $1)
+                    }
+                    for try await byte in bytes {
+                        for event in parser.ingest(byte) {
                             continuation.yield(event)
                             if event.isTerminalChatEvent {
                                 continuation.finish()
@@ -1158,10 +1273,21 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
     func streamJobEvents(
         id: String,
         stdoutOffset: Int64? = nil,
-        stderrOffset: Int64? = nil
+        stderrOffset: Int64? = nil,
+        timeline: Int? = nil
     ) -> AsyncThrowingStream<CodexJobStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
+                let openedAt = Date()
+                // How each connection ended and how long it lived: the evidence
+                // for whether streams are being cut, and by what.
+                func logEnd(_ reason: String) {
+                    CodexDiagnostics.log("codex_job_stream_ended", fields: [
+                        "jobId": id,
+                        "reason": reason,
+                        "seconds": String(format: "%.1f", Date().timeIntervalSince(openedAt))
+                    ])
+                }
                 do {
                     var queryItems: [URLQueryItem] = []
                     if let stdoutOffset {
@@ -1169,6 +1295,11 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
                     }
                     if let stderrOffset {
                         queryItems.append(URLQueryItem(name: "stderrOffset", value: String(stderrOffset)))
+                    }
+                    // Opt in to timeline events, from the count already held. A machine
+                    // that predates timelines ignores the parameter.
+                    if let timeline {
+                        queryItems.append(URLQueryItem(name: "timeline", value: String(max(0, timeline))))
                     }
 
                     let path = "/v1/codex/jobs/\(Self.pathComponent(id))/stream"
@@ -1180,10 +1311,20 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
                     var request = URLRequest(url: url)
                     applyDeviceToken(to: &request, url: url)
                     request.httpMethod = "GET"
-                    request.timeoutInterval = 300
+                    // Idle time, not total time. The machine heartbeats every
+                    // 15 seconds, so a stream silent for this long is dead, and
+                    // failing it is what lets the caller reconnect.
+                    request.timeoutInterval = 90
                     request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                    if let lastEventID = Self.jobStreamLastEventID(
+                        stdoutOffset: stdoutOffset,
+                        stderrOffset: stderrOffset,
+                        timeline: timeline
+                    ) {
+                        request.setValue(lastEventID, forHTTPHeaderField: "Last-Event-ID")
+                    }
 
-                    let (bytes, response) = try await session.bytes(for: request)
+                    let (bytes, response) = try await streamSession.bytes(for: request)
                     guard let http = response as? HTTPURLResponse else {
                         throw CodexClientError.emptyResponse
                     }
@@ -1198,13 +1339,14 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
                         "status": String(http.statusCode)
                     ])
 
-                    var parser = CodexSSELineParser<CodexJobStreamEvent> { event, data in
+                    var parser = CodexSSEDecoder<CodexJobStreamEvent> { event, data in
                         CodexJobStreamEvent.decode(event: event, data: data)
                     }
-                    for try await line in bytes.lines {
-                        for event in parser.ingest(line.trimmingCharacters(in: .newlines)) {
+                    for try await byte in bytes {
+                        for event in parser.ingest(byte) {
                             continuation.yield(event)
                             if case .done = event {
+                                logEnd("done")
                                 continuation.finish()
                                 return
                             }
@@ -1213,17 +1355,29 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
                     for event in parser.finish() {
                         continuation.yield(event)
                         if case .done = event {
+                            logEnd("done")
                             continuation.finish()
                             return
                         }
                     }
+                    logEnd("closed")
                     continuation.finish()
                 } catch {
+                    logEnd(Task.isCancelled ? "cancelled" : CodexDiagnostics.brief(error))
                     continuation.finish(throwing: error)
                 }
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    /// The `Last-Event-ID` a resuming job stream sends: relayd's
+    /// `<stdoutOffset>:<stderrOffset>:<seq>`, which it prefers to the query
+    /// offsets. Nil on a first connection, which names no offsets at all. The
+    /// query parameters are still sent, for a machine that only reads those.
+    static func jobStreamLastEventID(stdoutOffset: Int64?, stderrOffset: Int64?, timeline: Int?) -> String? {
+        guard stdoutOffset != nil || stderrOffset != nil else { return nil }
+        return "\(max(0, stdoutOffset ?? 0)):\(max(0, stderrOffset ?? 0)):\(max(0, timeline ?? 0))"
     }
 
     private static func errorMessage(from bytes: URLSession.AsyncBytes) async throws -> String? {
