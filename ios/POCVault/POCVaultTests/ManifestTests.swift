@@ -562,6 +562,90 @@ final class ManifestTests: XCTestCase {
         XCTAssertNotEqual(chatID, taskID)
     }
 
+    /// Claude Code rows carry whatever the node's CLI lists, xhigh and max included.
+    /// Changing model keeps the picker honest: the new model's levels, its default
+    /// effort, and none at all for a model that has none.
+    @MainActor
+    func testRelayEffortLevelsFollowTheSelectedModel() throws {
+        let models = try decodeCodexModels(
+            """
+            [
+              { "id": "claude-code-opus", "label": "Claude Code · Opus", "provider": "claude", "modes": ["task"], "taskModel": "opus", "effortLevels": ["low", "medium", "high", "xhigh", "max"] },
+              { "id": "claude-code-haiku", "label": "Claude Code · Haiku", "provider": "claude", "modes": ["task"], "taskModel": "haiku", "effortLevels": ["low", "medium", "high", "xhigh", "max"] },
+              { "id": "cursor-agent-auto", "label": "Cursor Agent · Auto", "provider": "cursor", "modes": ["task"], "taskModel": "auto", "effortLevels": [] }
+            ]
+            """
+        )
+        let viewModel = RelayChatViewModel(
+            client: makeOfflineCodexClient(),
+            workspaceID: "ws-alpha",
+            workspacePath: "/srv/codex-workspaces/alpha"
+        )
+
+        viewModel.selectChoice(RelayModelChoice(model: models[0], mode: .task))
+        XCTAssertEqual(viewModel.availableEfforts, [.low, .medium, .high, .xhigh, .max])
+        XCTAssertEqual(viewModel.effectiveEffort, .high)
+        viewModel.selectEffort(.max)
+        XCTAssertEqual(viewModel.effectiveEffort, .max)
+
+        // Another model: its own default until the user picks again.
+        viewModel.selectChoice(RelayModelChoice(model: models[1], mode: .task))
+        XCTAssertEqual(viewModel.availableEfforts, [.low, .medium, .high, .xhigh, .max])
+        XCTAssertEqual(viewModel.effectiveEffort, .high)
+        viewModel.selectEffort(.xhigh)
+        XCTAssertEqual(viewModel.effectiveEffort, .xhigh)
+
+        viewModel.selectChoice(RelayModelChoice(model: models[2], mode: .task))
+        XCTAssertTrue(viewModel.availableEfforts.isEmpty)
+        XCTAssertNil(viewModel.effectiveEffort)
+    }
+
+    /// Picking a model must not close the Model sheet: the Effort row for that model
+    /// has to be reachable on the same visit. The sheet closes by its close circle,
+    /// a drag or a tap outside, and gains no Done button to make up for it.
+    func testRelayModelSheetStaysOpenWhenAModelIsPicked() throws {
+        let sheets = try AppSourceFixture.load("POCVault/Views/RelayComposerSheets.swift")
+        let modelSheet = try requiredSnippet(in: sheets, from: "struct RelayModelSheet: View", to: "// MARK: - Add sheet")
+        let rows = try requiredSnippet(in: modelSheet, from: "private func choiceGroup(", to: "private var effortPage: some View")
+        XCTAssertTrue(rows.contains("pick(choice)"))
+        XCTAssertFalse(rows.contains("onClose"))
+        let pick = try requiredSnippet(in: modelSheet, from: "func pick(_ choice: RelayModelChoice)", to: "private var showsEffort: Bool")
+        XCTAssertTrue(pick.contains("onPickChoice(choice)"))
+        XCTAssertFalse(pick.contains("onClose"))
+        // Close is the header circle and nothing else.
+        XCTAssertEqual(modelSheet.components(separatedBy: "onClose").count - 1, 2)
+        XCTAssertTrue(modelSheet.contains("RelaySheetHeader(title: \"Model\", leading: .close, action: onClose)"))
+        XCTAssertFalse(modelSheet.contains("\"Done\""))
+        // Effort sits directly under the list on the Model page, for the selection.
+        let page = try requiredSnippet(in: modelSheet, from: "private var modelPage: some View", to: "func pick(_ choice: RelayModelChoice)")
+        XCTAssertTrue(page.contains("if showsEffort,"))
+        XCTAssertTrue(page.contains("relay-effort-chip"))
+        // Picking an effort goes back to the Model page; it does not close either.
+        let effortPage = try requiredSnippet(in: modelSheet + "\n// END", from: "private var effortPage: some View", to: "// END")
+        XCTAssertTrue(effortPage.contains("onPickEffort(effort)"))
+        XCTAssertTrue(effortPage.contains("shownPage = .model"))
+        XCTAssertFalse(effortPage.contains("onClose"))
+
+        // The composer's side: a pick goes through the thread guard and stops there.
+        let chat = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
+        let request = try requiredSnippet(in: chat, from: "private func requestChoice(_ choice: RelayModelChoice)", to: "private func startDictation()")
+        XCTAssertTrue(request.contains("guard threadProvider == nil || choice.executionProvider == threadProvider else { return }"))
+        XCTAssertTrue(request.contains("onPickChoice(choice)"))
+        XCTAssertFalse(request.contains("showingModelPicker"))
+        XCTAssertTrue(chat.contains("onClose: { showingModelPicker = false }"))
+    }
+
+    /// Like `sourceSnippet`, but a missing marker FAILS instead of skipping: a rule
+    /// that silently stops running is worse than one that needs its marker updated.
+    private func requiredSnippet(in source: String, from startMarker: String, to endMarker: String) throws -> String {
+        let start = try XCTUnwrap(source.range(of: startMarker), "Missing source marker: \(startMarker)")
+        let end = try XCTUnwrap(
+            source.range(of: endMarker, range: start.upperBound..<source.endIndex),
+            "Missing source marker: \(endMarker)"
+        )
+        return String(source[start.lowerBound..<end.lowerBound])
+    }
+
     /// First send in an unregistered folder registers lazily; when registration fails the
     /// composer shows an error banner and the typed prompt survives untouched.
     @MainActor

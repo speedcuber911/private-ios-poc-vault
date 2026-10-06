@@ -1411,7 +1411,8 @@ def codex_fixture_models() -> list[dict]:
 def _sim_task_entries() -> list[dict]:
     """Task-mode entries with selectable underlying models (mirrors render-codex-api-config)."""
     codex_effort = ["low", "medium", "high", "xhigh"]
-    claude_effort = ["low", "medium", "high"]
+    # What `claude --help` lists on a current CLI; relayd reads it from there.
+    claude_effort = ["low", "medium", "high", "xhigh", "max"]
     codex_models = [
         ("GPT-5.6 Sol", "gpt-5.6-sol"),
         ("GPT-5.6 Terra", "gpt-5.6-terra"),
