@@ -361,6 +361,36 @@ final class ProviderLoginTests: XCTestCase {
         try await Self.waitUntil { flow.step == .succeeded }
     }
 
+    /// An older relayd (no op routes) and a stale "signed in": after the code
+    /// goes in, the flow must wait for the login CLI to exit before calling it
+    /// done, or it would kill the login mid-exchange.
+    @MainActor
+    func testExecSignInAgainWaitsForTheLoginToEnd() async throws {
+        let stub = StubHarnessLoginClient()
+        stub.startError = CodexClientError.httpFailure(404, "not found")
+        stub.harnesses = [try Self.harness(provider: "claude", loggedIn: true)]
+        stub.execResults = [
+            (contains: "pgrep", result: CodexExecResult(exitCode: 0, stdout: "RELAY_LOGIN_RUNNING\n")),
+            (contains: "command -v claude", result: CodexExecResult(exitCode: 0, stdout: "/usr/bin/claude\n")),
+        ]
+        let flow = Self.makeFastFlow(client: stub, provider: .claude)
+
+        await flow.start()
+        stub.loginLog = "If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=true\nPaste code here if prompted > "
+        try await Self.waitUntil {
+            if case .waitingForSignIn(let op) = flow.step { return op.verificationURL != nil }
+            return false
+        }
+        await flow.submitPasted(["new-code#state"])
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(flow.step, .completing, "the login is still exchanging the code")
+        XCTAssertFalse(stub.execCommands.contains(where: { $0.contains("pkill") && $0.contains("rm -f") }),
+                       "the running login must not be killed and cleaned up")
+
+        stub.execResults[0] = (contains: "pgrep", result: CodexExecResult(exitCode: 0, stdout: "Login successful.\n"))
+        try await Self.waitUntil { flow.step == .succeeded }
+    }
+
     func testHarnessWithARefusedSignInReadsAsExpired() throws {
         let harness = try CodexClient.makeDecoder().decode(
             RelayHarnessStatus.self,
@@ -527,11 +557,11 @@ private final class StubHarnessLoginClient: HarnessLoginClient {
 
     func execCommand(_ command: String, timeoutMs: Int?) async throws -> CodexExecResult {
         execCommands.append(command)
-        if command.contains("tail -c") {
-            return CodexExecResult(exitCode: 0, stdout: loginLog)
-        }
         if let match = execResults.first(where: { command.contains($0.contains) }) {
             return match.result
+        }
+        if command.contains("tail -c") {
+            return CodexExecResult(exitCode: 0, stdout: loginLog)
         }
         return CodexExecResult(exitCode: 0)
     }

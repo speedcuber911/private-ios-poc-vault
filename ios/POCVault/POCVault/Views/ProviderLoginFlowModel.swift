@@ -564,6 +564,21 @@ final class ProviderLoginFlowModel: ObservableObject {
                 // Signing in again: the machine said signed in before anything
                 // happened, so only a status read after the code went in counts.
                 let mayTrustStatus = !self.startedSignedIn || self.step == .completing
+                // And on the exec engine, only once the login itself has ended:
+                // the old session still reads as signed in while the CLI is
+                // exchanging the code, and calling it done there would kill it.
+                if mayTrustStatus, self.startedSignedIn, case .exec(let logPath, _, _) = self.engine {
+                    switch await self.execLoginOutcome(logPath: logPath) {
+                    case .running:
+                        continue
+                    case .refused(let line):
+                        self.stopEverythingKeepingStep()
+                        self.step = .failed("The sign-in failed on the machine: \(line)")
+                        return
+                    case .ended:
+                        break
+                    }
+                }
                 if mayTrustStatus,
                    let statuses = try? await self.client.fetchHarnesses(),
                    statuses.first(where: { $0.provider == self.provider })?.loggedIn == true {
@@ -584,6 +599,25 @@ final class ProviderLoginFlowModel: ObservableObject {
     private var isWaiting: Bool {
         if case .waitingForSignIn = step { return true }
         return false
+    }
+
+    private enum ExecLoginOutcome {
+        case running
+        case refused(String)
+        case ended
+    }
+
+    /// One exec: is the login CLI still running, and if not, did it refuse
+    /// the code? An unreadable answer counts as still running.
+    private func execLoginOutcome(logPath: String) async -> ExecLoginOutcome {
+        let command = "pgrep -f '\(loginBinaryName) \(loginArgument)' >/dev/null 2>&1 && echo RELAY_LOGIN_RUNNING; "
+            + "tail -c 2000 \(logPath) 2>/dev/null; true"
+        guard let result = try? await client.execCommand(command, timeoutMs: 8000) else { return .running }
+        if result.stdout.contains("RELAY_LOGIN_RUNNING") { return .running }
+        if let refusal = Self.loginRefusal(in: Self.strippedTerminalText(result.stdout)) {
+            return .refused(refusal)
+        }
+        return .ended
     }
 
     private func finishConnected() {
