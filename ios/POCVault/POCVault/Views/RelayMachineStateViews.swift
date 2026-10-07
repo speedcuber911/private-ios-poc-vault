@@ -1,5 +1,16 @@
 import SwiftUI
 
+/// A paired machine's name for sentences, with "Your machine" standing in when
+/// the app has no name for it (a personal install configured by file).
+enum RelayMachineLabel {
+    static let fallback = "Your machine"
+
+    /// The name where it does not start the sentence.
+    static func inSentence(_ name: String) -> String {
+        name == fallback ? "your machine" : name
+    }
+}
+
 /// What a screen that needs the machine shows while EC2 says it is not
 /// serving: off, on its way up, or on its way down. It reads the app's one
 /// power model, so every tab agrees with Settings about whether the machine
@@ -49,7 +60,7 @@ struct RelayMachineDownView: View {
 
     private var title: String {
         switch powerModel.status {
-        case .starting: return "Starting \(machineName)"
+        case .starting: return "Starting \(RelayMachineLabel.inSentence(machineName))"
         case .stopping: return "\(machineName) is stopping"
         default: return "\(machineName) is off"
         }
@@ -106,7 +117,7 @@ struct RelayMachineDownBanner: View {
 
     private var label: String {
         switch powerModel.status {
-        case .starting: return "Starting \(machineName)"
+        case .starting: return "Starting \(RelayMachineLabel.inSentence(machineName))"
         case .stopping: return "\(machineName) is stopping"
         default: return "\(machineName) is off"
         }
@@ -122,7 +133,7 @@ struct RelayComposerMachineState {
 
     var message: String {
         switch status {
-        case .starting: return "Starting \(machineName)…"
+        case .starting: return "Starting \(RelayMachineLabel.inSentence(machineName))…"
         case .stopping: return "\(machineName) is stopping."
         default: return "\(machineName) is off. Start it, or send and Relay starts it first."
         }

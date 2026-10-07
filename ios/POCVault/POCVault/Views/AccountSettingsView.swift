@@ -350,7 +350,7 @@ struct AccountSettingsView: View {
                 // Sign-in lives on the machine, so a machine that is off has no
                 // answer to give; an old "Connected" would be a guess.
                 Text(powerModel.status == .starting
-                     ? "Starting \(machineName). Agents appear once it is up."
+                     ? "Starting \(RelayMachineLabel.inSentence(machineName)). Agents appear once it is up."
                      : "\(machineName) is off. Its agents and their sign-in show here once it is on.")
                     .foregroundStyle(AppTheme.textSecondary)
                     .accessibilityIdentifier("relay-agents-machine-down")
@@ -419,7 +419,7 @@ struct AccountSettingsView: View {
     }
 
     private var machineName: String {
-        nodeStore.pairedNode?.nodeName ?? "Your machine"
+        nodeStore.pairedNode?.nodeName ?? RelayMachineLabel.fallback
     }
 
     private var computerFooter: String {

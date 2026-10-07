@@ -46,7 +46,7 @@ struct RelayChatView: View {
     /// The app's one power model: whether the machine is up decides what the
     /// composer says and whether background refreshes run at all.
     @ObservedObject var powerModel: RelayMachinePowerModel
-    var machineName = "Your machine"
+    var machineName = RelayMachineLabel.fallback
     @State private var showingThreads = false
     @State private var threadsPreferLarge = false
     @State private var fullLogRequest: RelayFullLogRequest?

@@ -426,9 +426,29 @@ final class RelayMachinePowerModel: ObservableObject {
         return status.isBusy || status == .loading ? settleInterval : steadyInterval
     }
 
+    #if DEBUG
+    /// Simulator previews only: `RELAY_SIM_POWER_STATUS=off|starting|stopping`
+    /// fakes EC2's answer, so the machine-off screens can be seen without a
+    /// wake credential (an unsigned simulator build cannot keep one).
+    private static let simulatedStatus: Status? = {
+        switch ProcessInfo.processInfo.environment["RELAY_SIM_POWER_STATUS"] {
+        case "off": return .off
+        case "starting": return .starting
+        case "stopping": return .stopping
+        default: return nil
+        }
+    }()
+    #endif
+
     /// A plain read. It yields to any start/stop that owns the switch, and to
     /// another read already in flight, rather than competing with it.
     func refresh() async {
+        #if DEBUG
+        if let simulated = Self.simulatedStatus {
+            if status == .loading { status = simulated }
+            return
+        }
+        #endif
         guard let credential = currentCredential() else { return }
         guard !isTransitioning, !isReading else { return }
         isReading = true
@@ -534,6 +554,15 @@ final class RelayMachinePowerModel: ObservableObject {
     }
 
     func start() async {
+        #if DEBUG
+        if Self.simulatedStatus != nil {
+            status = .starting
+            try? await Task.sleep(for: .seconds(4))
+            cameUpAt = Date()
+            status = .on
+            return
+        }
+        #endif
         await transition(to: .on)
     }
 

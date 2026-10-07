@@ -580,7 +580,7 @@ struct POCVaultRootView: View {
     }
 
     private var machineName: String {
-        nodeStore.pairedNode?.nodeName ?? "Your machine"
+        nodeStore.pairedNode?.nodeName ?? RelayMachineLabel.fallback
     }
 
     /// Folders and Previews have nothing to show from a machine that is off:
@@ -1063,14 +1063,14 @@ private struct CodexStatusView: View {
     }
 
     private var machineName: String {
-        nodeStore.pairedNode?.nodeName ?? "Your machine"
+        nodeStore.pairedNode?.nodeName ?? RelayMachineLabel.fallback
     }
 
     /// Just started: relayd is still coming up behind EC2's "running", so the
     /// first refused polls are expected and not worth a line of red.
     private var connectingStatus: some View {
         HStack(spacing: 10) {
-            RelayCapsLabel(text: "Connecting to \(machineName)", color: AppTheme.textTertiary)
+            RelayCapsLabel(text: "Connecting to \(RelayMachineLabel.inSentence(machineName))", color: AppTheme.textTertiary)
                 .lineLimit(1)
             ProgressView()
                 .controlSize(.small)
