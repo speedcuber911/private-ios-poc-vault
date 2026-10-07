@@ -219,6 +219,15 @@ private struct RelayChatsPolling: Equatable {
     let tab: RelayRootTab
     let sceneIsActive: Bool
     let chatIsOpen: Bool
+    /// EC2 says the machine is off or in motion: nothing would answer.
+    let machineIsDown: Bool
+}
+
+/// When the app-wide job monitor runs. A monitor request that finds the
+/// machine down would start it, so it pauses while the machine is down.
+private struct RelayMonitorTrigger: Equatable {
+    let foldersHidden: Bool
+    let machineIsDown: Bool
 }
 
 private struct RelayTerminalLaunch: Identifiable {
@@ -237,7 +246,9 @@ struct POCVaultRootView: View {
     let codexClient: CodexClient
     let authClient: RelayAuthClient
     @ObservedObject var pushService: RelayPushService
-    let powerModel: RelayMachinePowerModel
+    /// Observed here, not just passed through: whether the machine is up
+    /// decides what Chats, Folders and Previews show and whether they poll.
+    @ObservedObject var powerModel: RelayMachinePowerModel
 
     @Environment(\.scenePhase) private var scenePhase
     @State private var browserPath: [BrowserRoute] = []
@@ -271,7 +282,9 @@ struct POCVaultRootView: View {
                     Task { await next.viewModel.continueHandoff(card) }
                 },
                 presentsProviderPickerOnAppear: launch.presentsProviderPicker,
-                automaticallyOpensPreviews: launch.automaticallyOpensPreviews
+                automaticallyOpensPreviews: launch.automaticallyOpensPreviews,
+                powerModel: powerModel,
+                machineName: machineName
             )
         }
         .fullScreenCover(item: $terminalLaunch) { launch in
@@ -376,23 +389,39 @@ struct POCVaultRootView: View {
                 showProgress: !computerLinkStore.hasLoaded
             )
         }
-        .task(id: foldersAreHiddenAfterComputerDisconnect) {
+        .task(id: RelayMonitorTrigger(
+            foldersHidden: foldersAreHiddenAfterComputerDisconnect,
+            machineIsDown: powerModel.isDown
+        )) {
             // App-wide job monitor + completion notifications, owned by the session store.
             guard !foldersAreHiddenAfterComputerDisconnect, shouldStartAgentMonitor else { return }
+            guard !powerModel.isDown else { return }
             await chatSessionStore.monitorActiveWorkWhileAppIsOpen()
+        }
+        // Every tab reads the machine's power state from here, so it has to be
+        // known from launch, not only once Settings has been opened.
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            await powerModel.watch()
+        }
+        .onChange(of: powerModel.status, initial: true) { _, status in
+            codexClient.setMachineKnownDown(status == .off || status == .starting)
         }
         .task(id: RelayChatsPolling(
             tab: selectedRootTab,
             sceneIsActive: scenePhase == .active,
-            chatIsOpen: chatLaunch != nil
+            chatIsOpen: chatLaunch != nil,
+            machineIsDown: powerModel.isDown
         )) {
             // Chats is a live view, not a one-time snapshot. Refresh on entry, then
             // keep polling so a Codex, Claude Code, or Cursor session started on the
             // machine shows up — but only while the list is actually on screen: its
             // tab selected, the app active, and no chat covering it. Leaving any of
-            // those cancels this task and the poll with it.
+            // those cancels this task and the poll with it. A machine that is off
+            // has nothing to say; the poll resumes the moment it is back up.
             guard selectedRootTab == .sessions else { return }
             guard scenePhase == .active, chatLaunch == nil else { return }
+            guard !powerModel.isDown else { return }
             await statusFeedViewModel.pollWhileVisible()
         }
         #if DEBUG
@@ -408,6 +437,7 @@ struct POCVaultRootView: View {
                 feedViewModel: statusFeedViewModel,
                 identityStore: identityStore,
                 nodeStore: nodeStore,
+                powerModel: powerModel,
                 client: codexClient,
                 onOpenItem: openSession,
                 onOpenNewSession: { workspaceID in
@@ -422,6 +452,8 @@ struct POCVaultRootView: View {
             Group {
                 if foldersAreHiddenAfterComputerDisconnect {
                     disconnectedComputerScreen
+                } else if powerModel.isDown {
+                    machineDownScreen(title: "Folders", purpose: "its folders")
                 } else {
                     browserNavigation
                 }
@@ -429,13 +461,19 @@ struct POCVaultRootView: View {
             .tag(RelayRootTab.workspaces)
             .tabItem { Label("Folders", systemImage: "folder") }
 
-            RelayPreviewsView(
-                identityStore: identityStore,
-                client: codexClient,
-                workspaceAccessIsAvailable: !foldersAreHiddenAfterComputerDisconnect,
-                onOpenWorkspaces: { selectedRootTab = .workspaces },
-                onOpenJob: openPreviewSourceJob
-            )
+            Group {
+                if powerModel.isDown {
+                    machineDownScreen(title: "Previews", purpose: "the apps and files your agents made")
+                } else {
+                    RelayPreviewsView(
+                        identityStore: identityStore,
+                        client: codexClient,
+                        workspaceAccessIsAvailable: !foldersAreHiddenAfterComputerDisconnect,
+                        onOpenWorkspaces: { selectedRootTab = .workspaces },
+                        onOpenJob: openPreviewSourceJob
+                    )
+                }
+            }
             .tag(RelayRootTab.previews)
             .tabItem { Label("Previews", systemImage: "rectangle.on.rectangle") }
             .accessibilityIdentifier("relay-previews-tab")
@@ -538,6 +576,24 @@ struct POCVaultRootView: View {
                     .padding(.top, 8)
                 }
             }
+        }
+    }
+
+    private var machineName: String {
+        nodeStore.pairedNode?.nodeName ?? "Your machine"
+    }
+
+    /// Folders and Previews have nothing to show from a machine that is off:
+    /// every listing and preview is read live from it. Say so and offer Start,
+    /// instead of a spinner that would itself have woken the machine.
+    private func machineDownScreen(title: String, purpose: String) -> some View {
+        NavigationStack {
+            ZStack {
+                AppTheme.canvasGradient.ignoresSafeArea()
+                RelayMachineDownView(powerModel: powerModel, machineName: machineName, purpose: purpose)
+            }
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
         }
     }
 
@@ -839,6 +895,7 @@ private struct CodexStatusView: View {
     @ObservedObject var feedViewModel: StatusFeedViewModel
     @ObservedObject var identityStore: ClientIdentityStore
     @ObservedObject var nodeStore: RelayNodeStore
+    @ObservedObject var powerModel: RelayMachinePowerModel
     let client: CodexClient
     let onOpenItem: (CodexThreadFeedItem) -> Void
     let onOpenNewSession: (String?) -> Void
@@ -855,7 +912,16 @@ private struct CodexStatusView: View {
         NavigationStack {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    if let error = feedViewModel.errorMessage {
+                    if powerModel.isDown {
+                        // The saved list is still worth reading; the banner
+                        // says why it is not moving and offers Start.
+                        if !displayedItems.isEmpty || !displayedApprovals.isEmpty {
+                            RelayMachineDownBanner(powerModel: powerModel, machineName: machineName)
+                                .padding(.top, 4)
+                        }
+                    } else if powerModel.isWarmingUp && feedViewModel.errorMessage != nil {
+                        connectingStatus
+                    } else if let error = feedViewModel.errorMessage {
                         Text(error)
                             .font(.subheadline)
                             .foregroundStyle(AppTheme.statusError)
@@ -864,7 +930,7 @@ private struct CodexStatusView: View {
 
                     // A refresh that fails with rows on screen keeps the rows;
                     // the only sign is this word.
-                    if feedViewModel.isListStale {
+                    if feedViewModel.isListStale && !powerModel.isDown {
                         staleListStatus
                     }
 
@@ -886,7 +952,16 @@ private struct CodexStatusView: View {
                     if displayedItems.isEmpty {
                         // Only when nothing is cached and the first answer is
                         // still pending; a refresh never swaps rows for this.
-                        if feedViewModel.isAwaitingFirstList {
+                        if powerModel.isDown {
+                            if displayedApprovals.isEmpty {
+                                RelayMachineDownView(
+                                    powerModel: powerModel,
+                                    machineName: machineName,
+                                    purpose: "your chats"
+                                )
+                                .padding(.top, 96)
+                            }
+                        } else if feedViewModel.isAwaitingFirstList {
                             ProgressView("Loading chats…")
                                 .frame(maxWidth: .infinity)
                                 .padding(.top, 64)
@@ -987,6 +1062,26 @@ private struct CodexStatusView: View {
         .preferredColorScheme(.dark)
     }
 
+    private var machineName: String {
+        nodeStore.pairedNode?.nodeName ?? "Your machine"
+    }
+
+    /// Just started: relayd is still coming up behind EC2's "running", so the
+    /// first refused polls are expected and not worth a line of red.
+    private var connectingStatus: some View {
+        HStack(spacing: 10) {
+            RelayCapsLabel(text: "Connecting to \(machineName)", color: AppTheme.textTertiary)
+                .lineLimit(1)
+            ProgressView()
+                .controlSize(.small)
+                .tint(AppTheme.accent)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 18)
+        .padding(.top, 12)
+        .accessibilityIdentifier("relay-chats-connecting")
+    }
+
     private func sectionHeading(_ title: String) -> some View {
         Text(title)
             .font(.custom("DMSans-9ptRegular", size: 13, relativeTo: .subheadline).weight(.medium))
@@ -1042,6 +1137,15 @@ private struct CodexStatusView: View {
 
     @MainActor
     private func loadWorkspacesForPicker() async {
+        // Listing folders would start the machine and keep the sheet spinning
+        // until it is up; Start is one tap on the screen behind it.
+        if powerModel.isDown {
+            workspaces = []
+            workspacePickerError = powerModel.status == .starting
+                ? "\(machineName) is starting. Its folders appear once it is up."
+                : "\(machineName) is off. Start it from Chats, then pick a folder."
+            return
+        }
         isLoadingWorkspaces = true
         workspacePickerError = nil
         defer { isLoadingWorkspaces = false }

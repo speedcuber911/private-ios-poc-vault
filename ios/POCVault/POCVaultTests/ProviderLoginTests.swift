@@ -248,7 +248,7 @@ final class ProviderLoginTests: XCTestCase {
         await flow.start()
         XCTAssertTrue(stub.execCommands.first?.contains("pkill") == true, "stray logins are cleared first")
         let launch = stub.execCommands.first(where: { $0.contains("mkfifo") })
-        XCTAssertTrue(launch?.contains("/opt/node/bin/claude setup-token") == true,
+        XCTAssertTrue(launch?.contains("/opt/node/bin/claude auth login") == true,
                       "the resolved absolute path must be launched: \(launch ?? "<none>")")
 
         // The CLI writes its link (with ANSI noise) into the polled log.
@@ -261,10 +261,10 @@ final class ProviderLoginTests: XCTestCase {
                       "the sheet surfaces the machine's own output while a link is pending")
 
         // Pasting writes the code into the FIFO feeding the login's stdin.
-        flow.pastedCode = " paste-code-123 "
+        flow.pastedCode = " paste-code-123#state-9 "
         await flow.submitPastedCode()
         let paste = stub.execCommands.last
-        XCTAssertTrue(paste?.contains("'paste-code-123'") == true && paste?.contains(".in") == true,
+        XCTAssertTrue(paste?.contains("'paste-code-123#state-9'") == true && paste?.contains(".in") == true,
                       "expected a FIFO write, got: \(paste ?? "<none>")")
         XCTAssertEqual(flow.step, .completing)
 
@@ -299,6 +299,136 @@ final class ProviderLoginTests: XCTestCase {
         await flow.start()
         try await Self.waitUntil { stub.execCommands.contains(where: { $0.contains("mkfifo") }) }
         XCTAssertTrue(stub.execCommands.contains(where: { $0.contains("codex login") }))
+    }
+
+    // MARK: - Signing in again
+
+    func testClaudeCodeMustCarryBothHalves() {
+        XCTAssertTrue(ProviderLoginFlowModel.isCompleteClaudeCode("abc123#st_456"))
+        XCTAssertFalse(ProviderLoginFlowModel.isCompleteClaudeCode("abc123"), "the state half is missing")
+        XCTAssertFalse(ProviderLoginFlowModel.isCompleteClaudeCode("abc123#"))
+        XCTAssertFalse(ProviderLoginFlowModel.isCompleteClaudeCode("#st"))
+        XCTAssertFalse(ProviderLoginFlowModel.isCompleteClaudeCode("a#b#c"))
+        XCTAssertFalse(ProviderLoginFlowModel.isCompleteClaudeCode("abc 123#st"))
+    }
+
+    @MainActor
+    func testPartialClaudeCodeIsCaughtBeforeItReachesTheMachine() async throws {
+        let stub = StubHarnessLoginClient()
+        let waiting = try Self.op(
+            id: "op-1", provider: "claude", status: "waiting_for_user",
+            url: "https://claude.com/cai/oauth/authorize?code=true"
+        )
+        stub.startResult = waiting
+        stub.currentOp = waiting
+        let flow = Self.makeFastFlow(client: stub, provider: .claude)
+
+        await flow.start()
+        await flow.submitPasted(["only-the-code-half"])
+
+        XCTAssertTrue(stub.sentInputs.isEmpty, "a half code would end the CLI's login for nothing")
+        XCTAssertEqual(flow.pasteError, ProviderLoginFlowModel.partialClaudeCodeMessage)
+        if case .waitingForSignIn = flow.step {} else { XCTFail("expected to stay on sign-in, got \(flow.step)") }
+
+        await flow.submitPasted(["  code-half#state-half\n"])
+        XCTAssertEqual(stub.sentInputs, [StubHarnessLoginClient.SentInput(opID: "op-1", text: "code-half#state-half")])
+        XCTAssertNil(flow.pasteError)
+    }
+
+    /// The revoked-token case: the CLI's status still says signed in, so the
+    /// flow must not call it done before the new sign-in has actually happened.
+    @MainActor
+    func testSigningInAgainIgnoresTheStaleSignedInStatus() async throws {
+        let stub = StubHarnessLoginClient()
+        stub.harnesses = [try Self.harness(provider: "claude", loggedIn: true)]
+        let waiting = try Self.op(
+            id: "op-1", provider: "claude", status: "waiting_for_user",
+            url: "https://claude.com/cai/oauth/authorize?code=true"
+        )
+        stub.startResult = waiting
+        stub.currentOp = waiting
+        let flow = Self.makeFastFlow(client: stub, provider: .claude)
+
+        await flow.start()
+        try await Task.sleep(for: .milliseconds(300))
+        if case .waitingForSignIn = flow.step {} else { XCTFail("finished before any sign-in: \(flow.step)") }
+
+        await flow.submitPasted(["new-code#state"])
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(flow.step, .completing, "only the login op finishing may confirm a second sign-in")
+
+        stub.currentOp = try Self.op(id: "op-1", provider: "claude", status: "succeeded")
+        try await Self.waitUntil { flow.step == .succeeded }
+    }
+
+    /// An older relayd (no op routes) and a stale "signed in": after the code
+    /// goes in, the flow must wait for the login CLI to exit before calling it
+    /// done, or it would kill the login mid-exchange.
+    @MainActor
+    func testExecSignInAgainWaitsForTheLoginToEnd() async throws {
+        let stub = StubHarnessLoginClient()
+        stub.startError = CodexClientError.httpFailure(404, "not found")
+        stub.harnesses = [try Self.harness(provider: "claude", loggedIn: true)]
+        stub.execResults = [
+            (contains: "pgrep", result: CodexExecResult(exitCode: 0, stdout: "RELAY_LOGIN_RUNNING\n")),
+            (contains: "command -v claude", result: CodexExecResult(exitCode: 0, stdout: "/usr/bin/claude\n")),
+        ]
+        let flow = Self.makeFastFlow(client: stub, provider: .claude)
+
+        await flow.start()
+        stub.loginLog = "If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=true\nPaste code here if prompted > "
+        try await Self.waitUntil {
+            if case .waitingForSignIn(let op) = flow.step { return op.verificationURL != nil }
+            return false
+        }
+        await flow.submitPasted(["new-code#state"])
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(flow.step, .completing, "the login is still exchanging the code")
+        XCTAssertFalse(stub.execCommands.contains(where: { $0.contains("pkill") && $0.contains("rm -f") }),
+                       "the running login must not be killed and cleaned up")
+
+        stub.execResults[0] = (contains: "pgrep", result: CodexExecResult(exitCode: 0, stdout: "Login successful.\n"))
+        try await Self.waitUntil { flow.step == .succeeded }
+    }
+
+    func testHarnessWithARefusedSignInReadsAsExpired() throws {
+        let harness = try CodexClient.makeDecoder().decode(
+            RelayHarnessStatus.self,
+            from: Data("""
+            {"provider": "claude", "installed": true, "loggedIn": false, "authKind": "subscription",
+             "authRejected": {"at": "2026-10-07T07:09:26Z",
+                              "reason": "Failed to authenticate. API Error: 401 OAuth access token has been revoked."}}
+            """.utf8)
+        )
+        XCTAssertEqual(harness.shortStatus, "Sign-in expired")
+        XCTAssertTrue(harness.isConfirmedUnavailable)
+        XCTAssertEqual(harness.authRejection?.displayReason, "OAuth access token has been revoked")
+        XCTAssertTrue(harness.actionMessage?.contains("stopped working (OAuth access token has been revoked)") == true,
+                      harness.actionMessage ?? "<nil>")
+
+        let plain = try Self.harness(provider: "claude", loggedIn: true)
+        XCTAssertNil(plain.authRejection)
+        XCTAssertEqual(plain.shortStatus, "Connected")
+    }
+
+    func testFailedRunAsksForSignInFromTheMachineOrTheErrorItself() throws {
+        func job(_ fields: [String: Any]) throws -> CodexJob {
+            var all: [String: Any] = ["id": "job-1", "provider": "claude", "status": "failed"]
+            all.merge(fields) { _, new in new }
+            return try CodexClient.makeDecoder().decode(CodexJob.self, from: JSONSerialization.data(withJSONObject: all))
+        }
+        // relayd says so.
+        XCTAssertTrue(try job(["signInRequired": true, "error": "anything"]).needsProviderSignIn)
+        // An older relayd: the CLI's own words are enough.
+        XCTAssertTrue(try job(["error": "Failed to authenticate. API Error: 401 OAuth access token has been revoked."]).needsProviderSignIn)
+        XCTAssertTrue(try job(["provider": "codex", "error": "stream error: refresh_token_reused"]).needsProviderSignIn)
+        XCTAssertTrue(try job(["provider": "cursor", "error": "Logged in (unable to fetch user details)"]).needsProviderSignIn)
+        // Not a sign-in problem.
+        XCTAssertFalse(try job(["error": "claude exited with code 1"]).needsProviderSignIn)
+        XCTAssertFalse(try job(["status": "succeeded", "signInRequired": true]).needsProviderSignIn)
+        XCTAssertFalse(try job([
+            "error": String(repeating: "I checked the deploy and the logs. ", count: 30) + "API Error: 401 OAuth token has expired.",
+        ]).needsProviderSignIn, "an agent quoting a 401 deep in its answer is not its own sign-in failing")
     }
 
     // MARK: - Helpers
@@ -427,11 +557,11 @@ private final class StubHarnessLoginClient: HarnessLoginClient {
 
     func execCommand(_ command: String, timeoutMs: Int?) async throws -> CodexExecResult {
         execCommands.append(command)
-        if command.contains("tail -c") {
-            return CodexExecResult(exitCode: 0, stdout: loginLog)
-        }
         if let match = execResults.first(where: { command.contains($0.contains) }) {
             return match.result
+        }
+        if command.contains("tail -c") {
+            return CodexExecResult(exitCode: 0, stdout: loginLog)
         }
         return CodexExecResult(exitCode: 0)
     }

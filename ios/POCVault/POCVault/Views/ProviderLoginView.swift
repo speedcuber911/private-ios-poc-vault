@@ -10,8 +10,11 @@ import WebKit
 /// - Codex: the sign-in page redirects to the CLI's localhost login server.
 ///   Nothing listens on this phone, so an in-app browser captures that
 ///   redirect and Relay replays it on the machine, where the server runs.
-/// - Paste-back (Claude Code and the rest): the provider's page shows a code
-///   after sign-in; the user pastes it here and Relay types it into the CLI.
+/// - Paste-back (Claude Code and the rest): the sign-in page opens by itself
+///   in a real Safari view (Google sign-in and saved passwords work there,
+///   which an embedded web view breaks); the provider's page shows a code
+///   after sign-in, and one tap on the system Paste control hands it to the
+///   CLI on the machine. Typing it in stays available as a fallback.
 struct ProviderLoginView: View {
     @StateObject private var flow: ProviderLoginFlowModel
     @Environment(\.dismiss) private var dismiss
@@ -20,6 +23,10 @@ struct ProviderLoginView: View {
     @State private var callbackBrowserTarget: ProviderLoginBrowserTarget?
     @State private var didCopyCode = false
     @State private var showsNoLinkHint = false
+    @State private var showsManualEntry = false
+    /// The sign-in page opened by itself once for this link; reopening is
+    /// the user's call after that.
+    @State private var autoOpenedURL: URL?
 
     init(client: CodexClient, provider: CodexProvider) {
         _flow = StateObject(wrappedValue: ProviderLoginFlowModel(client: client, provider: provider))
@@ -49,7 +56,9 @@ struct ProviderLoginView: View {
             // native success state forward.
             if newStep == .succeeded || !isWorking(newStep) {
                 callbackBrowserTarget = nil
+                safariTarget = nil
             }
+            openSignInPageOnceIfReady(newStep)
         }
         .sheet(item: $safariTarget) { target in
             ProviderLoginSafariView(url: target.url)
@@ -188,17 +197,70 @@ struct ProviderLoginView: View {
                     try? await Task.sleep(for: .seconds(20))
                     if !Task.isCancelled { showsNoLinkHint = true }
                 }
-            } else {
+            } else if flow.usesLocalCallback || op.userCode != nil {
                 Button("Open sign-in page") {
                     openSignInPage(op: op)
                 }
                 .buttonStyle(RelayPrimaryButtonStyle())
                 .accessibilityIdentifier("relay-provider-login-open")
+            } else if flow.usesPasteBack {
+                pasteBackControls(op: op)
+            } else {
+                approvalControls(op: op)
             }
 
-            if !flow.usesLocalCallback {
+            Spacer()
+        }
+    }
+
+    /// Cursor-style: the CLI on the machine is waiting for the browser
+    /// approval and finishes by itself, so there is nothing to bring back.
+    private func approvalControls(op: RelayHarnessOp) -> some View {
+        VStack(spacing: 14) {
+            HStack(spacing: 10) {
+                ProgressView().tint(AppTheme.accent)
+                Text("Waiting for you to approve in the browser…")
+                    .font(AppTheme.uiFont(size: 13))
+                    .foregroundStyle(AppTheme.textSecondary)
+            }
+            Button("Open sign-in page again") {
+                openSignInPage(op: op)
+            }
+            .buttonStyle(RelayOutlineButtonStyle())
+            .accessibilityIdentifier("relay-provider-login-open")
+        }
+    }
+
+    /// Back from the sign-in page with the code copied: one tap on the system
+    /// Paste control (no permission prompt, no typing) finishes the sign-in.
+    private func pasteBackControls(op: RelayHarnessOp) -> some View {
+        VStack(spacing: 14) {
+            PasteButton(payloadType: String.self) { strings in
+                Task { @MainActor in await flow.submitPasted(strings) }
+            }
+            .labelStyle(.titleAndIcon)
+            .buttonBorderShape(.capsule)
+            .controlSize(.large)
+            .tint(AppTheme.accent)
+            .accessibilityIdentifier("relay-provider-login-paste-button")
+
+            if let pasteError = flow.pasteError {
+                Text(pasteError)
+                    .font(AppTheme.uiFont(size: 13))
+                    .foregroundStyle(AppTheme.statusError)
+                    .multilineTextAlignment(.center)
+                    .accessibilityIdentifier("relay-provider-login-paste-error")
+            }
+
+            Button("Open sign-in page again") {
+                openSignInPage(op: op)
+            }
+            .buttonStyle(RelayOutlineButtonStyle())
+            .accessibilityIdentifier("relay-provider-login-open")
+
+            if showsManualEntry {
                 VStack(spacing: 10) {
-                    TextField("Paste the code from the sign-in page", text: $flow.pastedCode)
+                    TextField("Code from the sign-in page", text: $flow.pastedCode)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .font(.system(size: 15, design: .monospaced))
@@ -216,9 +278,14 @@ struct ProviderLoginView: View {
                     .disabled(flow.pastedCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     .accessibilityIdentifier("relay-provider-login-complete")
                 }
+            } else {
+                Button("Type the code instead") { showsManualEntry = true }
+                    .font(AppTheme.uiFont(size: 13))
+                    .foregroundStyle(AppTheme.textTertiary)
+                    .buttonStyle(.plain)
+                    .frame(minHeight: 44)
+                    .accessibilityIdentifier("relay-provider-login-type-instead")
             }
-
-            Spacer()
         }
     }
 
@@ -290,7 +357,21 @@ struct ProviderLoginView: View {
         if op.userCode != nil {
             return "Open the sign-in page and enter the code below. Your machine confirms as soon as the provider approves it."
         }
-        return "Sign in with your own \(flow.provider.displayName) account, then paste the code the page shows you below."
+        if !flow.usesPasteBack {
+            return "Sign in with your own \(flow.provider.displayName) account and approve the request. Your machine finishes the sign-in by itself."
+        }
+        return "Sign in with your own \(flow.provider.displayName) account and copy the code the page shows. Then come back and tap Paste."
+    }
+
+    /// Paste-back sign-ins open the provider's page the moment the machine
+    /// hands over the link, so the first thing the user sees is the sign-in
+    /// itself rather than a button that leads to it.
+    private func openSignInPageOnceIfReady(_ step: ProviderLoginFlowModel.Step) {
+        guard case .waitingForSignIn(let op) = step,
+              !flow.usesLocalCallback, op.userCode == nil,
+              let url = op.verificationURL, url != autoOpenedURL else { return }
+        autoOpenedURL = url
+        safariTarget = ProviderLoginBrowserTarget(url: url)
     }
 
     private var doneButtonTitle: String {

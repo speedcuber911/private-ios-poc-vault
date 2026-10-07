@@ -303,6 +303,12 @@ final class RelayMachinePowerModel: ObservableObject {
     @Published private(set) var requestedResizeType: String?
     @Published private(set) var autoStopEnabled: Bool?
     @Published private(set) var isSavingAutoStop = false
+    /// When the machine last came up from off. relayd needs some seconds
+    /// after EC2 says running, and screens say "connecting" through that
+    /// window instead of showing its first refused requests as errors.
+    @Published private(set) var cameUpAt: Date?
+
+    static let warmUpWindow: TimeInterval = 60
 
     /// EC2 tag reads are eventually consistent: a describe in the first
     /// seconds after a write can still carry the old value. Reads landing in
@@ -372,6 +378,19 @@ final class RelayMachinePowerModel: ObservableObject {
     }
 
     var canControl: Bool { identityStore?.wakeCredential() != nil }
+
+    /// EC2 says the machine is not serving: stopped, or on its way up or
+    /// down. Only a real power reading says so, never a failed request, so
+    /// a machine without power control is never called off.
+    var isDown: Bool {
+        status == .off || status == .starting || status == .stopping
+    }
+
+    /// Up, but so recently that relayd may still be starting.
+    var isWarmingUp: Bool {
+        guard status == .on, let cameUpAt else { return false }
+        return Date().timeIntervalSince(cameUpAt) < Self.warmUpWindow
+    }
 
     func configure(identityStore: ClientIdentityStore) {
         self.identityStore = identityStore
@@ -642,6 +661,9 @@ final class RelayMachinePowerModel: ObservableObject {
         // What a start or stop complained about stops being true once the
         // machine has moved on from it.
         if next != status, noticeSource == .action { setNotice(nil) }
+        if next == .on, status == .off || status == .starting || status == .stopping {
+            cameUpAt = Date()
+        }
         status = next
         if state.resize?.stage == "failed" {
             setNotice("Size change failed. Check the machine's power and try again.")

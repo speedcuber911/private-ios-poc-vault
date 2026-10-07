@@ -158,7 +158,7 @@ struct AccountSettingsView: View {
                     }
                 }
 
-                if nodeStore.hasMachine && !(harnesses.isEmpty && isMachineKnownDown) {
+                if nodeStore.hasMachine {
                     codingAgentsSection
                 }
 
@@ -313,6 +313,10 @@ struct AccountSettingsView: View {
             // comes up: a stopped machine is not asked, and is never powered
             // on just to fill this section.
             .task(id: AgentsLoadTrigger(hasMachine: nodeStore.hasMachine, machine: agentsMachineState)) {
+                if agentsMachineState == .down {
+                    harnesses = []
+                    harnessError = nil
+                }
                 guard nodeStore.hasMachine, agentsMachineState == .reachable else { return }
                 await loadHarnesses()
             }
@@ -342,7 +346,15 @@ struct AccountSettingsView: View {
 
     private var codingAgentsSection: some View {
         Section {
-            if isLoadingHarnesses && harnesses.isEmpty {
+            if isMachineKnownDown {
+                // Sign-in lives on the machine, so a machine that is off has no
+                // answer to give; an old "Connected" would be a guess.
+                Text(powerModel.status == .starting
+                     ? "Starting \(machineName). Agents appear once it is up."
+                     : "\(machineName) is off. Its agents and their sign-in show here once it is on.")
+                    .foregroundStyle(AppTheme.textSecondary)
+                    .accessibilityIdentifier("relay-agents-machine-down")
+            } else if isLoadingHarnesses && harnesses.isEmpty {
                 HStack(spacing: 10) {
                     ProgressView()
                     Text("Checking agents on your machine…")
@@ -350,21 +362,8 @@ struct AccountSettingsView: View {
                 }
             }
 
-            ForEach(harnesses.filter(\.installed)) { harness in
-                HStack(spacing: 10) {
-                    RelayProviderMark(provider: harness.provider, size: 16)
-                    Text(harness.provider.displayName)
-                    Spacer()
-                    if harness.loggedIn == true {
-                        Text("Connected")
-                            .foregroundStyle(AppTheme.textSecondary)
-                    } else {
-                        Button(harness.loggedIn == false ? "Sign in" : "Check sign-in") {
-                            providerLoginRequest = harness.provider
-                        }
-                        .accessibilityIdentifier("relay-agent-sign-in-\(harness.provider.rawValue)")
-                    }
-                }
+            ForEach(isMachineKnownDown ? [] : harnesses.filter(\.installed)) { harness in
+                harnessRow(harness)
             }
 
             if let harnessError, !isMachineKnownDown {
@@ -378,6 +377,49 @@ struct AccountSettingsView: View {
         } header: {
             RelayFormHeader("Coding agents", info: agentsFooter)
         }
+    }
+
+    private func harnessRow(_ harness: RelayHarnessStatus) -> some View {
+        HStack(spacing: 10) {
+            RelayProviderMark(provider: harness.provider, size: 16)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(harness.provider.displayName)
+                if harness.authRejection != nil {
+                    // The provider turned the stored sign-in away on a real run,
+                    // whatever the CLI's own status check still says.
+                    Text("Sign-in expired")
+                        .font(AppTheme.uiFont(size: 13))
+                        .foregroundStyle(AppTheme.statusWarn)
+                }
+            }
+            Spacer()
+            if harness.loggedIn == true {
+                // "Connected" is the CLI's own reading, and it cannot see a
+                // token the provider revoked; signing in again stays one tap away.
+                Menu {
+                    Button("Sign in again") {
+                        providerLoginRequest = harness.provider
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Text("Connected")
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.system(size: 10, weight: .semibold))
+                    }
+                    .foregroundStyle(AppTheme.textSecondary)
+                }
+                .accessibilityIdentifier("relay-agent-connected-\(harness.provider.rawValue)")
+            } else {
+                Button(harness.loggedIn == false ? "Sign in" : "Check sign-in") {
+                    providerLoginRequest = harness.provider
+                }
+                .accessibilityIdentifier("relay-agent-sign-in-\(harness.provider.rawValue)")
+            }
+        }
+    }
+
+    private var machineName: String {
+        nodeStore.pairedNode?.nodeName ?? "Your machine"
     }
 
     private var computerFooter: String {
@@ -573,6 +615,16 @@ struct AccountSettingsView: View {
         } catch {
             // A load replaced by a newer one is not a failure to report.
             guard !Task.isCancelled else { return }
+            // Just started: relayd comes up some seconds after EC2 says
+            // running, so ask again rather than reporting that gap.
+            if powerModel.isWarmingUp {
+                try? await Task.sleep(for: .seconds(4))
+                if !Task.isCancelled { await loadHarnesses() }
+                return
+            }
+            // What the machine said last time is not what it says now: an
+            // old "Connected" next to this error would be a guess.
+            harnesses = []
             harnessError = "Relay couldn't check the agents on your machine."
         }
     }

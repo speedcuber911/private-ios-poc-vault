@@ -11,7 +11,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 
-import { codexBin, claudeBin, cursorBin, kimiBin, runHome, codexHome, kimiHome, allowedJobProviders } from "./config.mjs";
+import { codexBin, claudeBin, cursorBin, kimiBin, runHome, codexHome, claudeHome, kimiHome, dataDir, allowedJobProviders } from "./config.mjs";
 import { nowIso, cleanApiText, suffixByBytes } from "./util.mjs";
 import { appendAudit } from "./audit.mjs";
 import { emitEvent } from "./events.mjs";
@@ -100,6 +100,9 @@ function cleanHarnessProvider(value) {
 }
 
 // Optional override: RELAYD_HARNESS_LOGIN_ARGS='{"codex":["login"],...}'
+// Claude Code has no top-level `login` command: `claude login` runs "login" as
+// a prompt and exits "Not logged in". `claude auth login` prints the sign-in
+// URL and waits for the pasted code, which is the flow the phone drives.
 function loginArgsFor(provider) {
   const raw = process.env.RELAYD_HARNESS_LOGIN_ARGS;
   if (raw) {
@@ -110,7 +113,7 @@ function loginArgsFor(provider) {
       // Fall through to defaults.
     }
   }
-  return ["login"];
+  return provider === "claude" ? ["auth", "login"] : ["login"];
 }
 
 function authStatusArgsFor(provider) {
@@ -158,6 +161,16 @@ function parseProviderAuth(provider, output, commandSucceeded) {
     const authKind = parsed.isAuthenticated
       ? (parsed.hasRefreshToken ? "subscription" : parsed.hasAccessToken ? "api" : "unknown")
       : "unknown";
+    // cursor-agent calls itself authenticated whenever tokens sit on disk.
+    // When Cursor no longer accepts them, the only sign is that it cannot
+    // load the account: "Logged in (unable to fetch user details)".
+    if (parsed.isAuthenticated && /unable to fetch user details/i.test(String(parsed.message || ""))) {
+      return {
+        loggedIn: false,
+        authKind,
+        authRejected: { at: nowIso(), reason: "Cursor could not load the signed-in account" },
+      };
+    }
     return { loggedIn: parsed.isAuthenticated, authKind };
   }
   if (provider === "codex" && /not logged in|signed out|no (?:valid )?(?:session|credentials?)/i.test(text)) {
@@ -170,6 +183,152 @@ function parseProviderAuth(provider, output, commandSucceeded) {
   // that distinguishable from a confirmed signed-out state so an upgrade does
   // not make a previously working provider unusable.
   return { loggedIn: null, authKind: "unknown" };
+}
+
+// --------------------------------------------------------------------------
+// Rejected sign-ins
+// --------------------------------------------------------------------------
+
+// A provider's status command only proves credentials exist on disk: Claude
+// Code's `auth status` reports loggedIn for a token Anthropic has revoked. The
+// first run the provider turns away is the only reliable signal, so it is
+// remembered here, against the credential file it was seen with. Any new
+// sign-in (from the phone, a terminal, or sync-auth) rewrites that file and so
+// clears it; a successful login op, smoke or job clears it too.
+
+const authRejectionsVersion = 1;
+
+// Without a credential file to watch (macOS keeps Claude's in the Keychain) a
+// new sign-in cannot be noticed, so the memory lapses instead.
+const unwatchedRejectionTtlMs = 60 * 60 * 1000;
+
+// Each CLI's own wording for "the provider refused these credentials". Only
+// the start of a failure is read, so an agent that merely quotes an HTTP 401
+// from some tool it ran is not mistaken for its own sign-in failing.
+const authFailurePatterns = {
+  claude: [
+    /Failed to authenticate\.\s*API Error:\s*40[13]\b/i,
+    /OAuth (?:access )?token (?:has been revoked|has expired|is invalid)/i,
+    /\bauthentication_error\b/i,
+    /Invalid API key/i,
+    /Not logged in\b.*\/login/i,
+    /Please run \/login/i,
+  ],
+  codex: [
+    /\brefresh_token_reused\b/i,
+    /\btoken_expired\b/i,
+    /access token could not be refreshed/i,
+    /Provided authentication token is expired/i,
+    /please (?:log|sign) (?:out and sign )?in again/i,
+    /\b401 Unauthorized\b/i,
+    /\bNot logged in\b/i,
+  ],
+  cursor: [
+    /\bAuthentication required\b/i,
+    /\bNot authenticated\b/i,
+    /cursor-agent login/i,
+  ],
+};
+
+function authRejectionsPath() {
+  return path.join(dataDir, "harness", "auth-rejections.json");
+}
+
+function credentialFileFor(provider) {
+  if (provider === "claude") return path.join(claudeHome, ".credentials.json");
+  if (provider === "codex") return path.join(codexHome, "auth.json");
+  if (provider === "cursor") return path.join(process.env.XDG_CONFIG_HOME || path.join(runHome, ".config"), "cursor", "auth.json");
+  return null;
+}
+
+// mtime + size of the provider's credential file, or null when there is none
+// to watch.
+function credentialStamp(provider) {
+  const file = credentialFileFor(provider);
+  if (!file) return null;
+  try {
+    const stat = fs.statSync(file);
+    return `${Math.trunc(stat.mtimeMs)}:${stat.size}`;
+  } catch {
+    return null;
+  }
+}
+
+function readAuthRejections() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(authRejectionsPath(), "utf8"));
+    if (parsed?.v === authRejectionsVersion && parsed.providers && typeof parsed.providers === "object") {
+      return parsed.providers;
+    }
+  } catch {}
+  return {};
+}
+
+function writeAuthRejections(providers) {
+  try {
+    const filePath = authRejectionsPath();
+    fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+    const temporary = `${filePath}.new-${process.pid}-${Date.now()}`;
+    fs.writeFileSync(temporary, `${JSON.stringify({ v: authRejectionsVersion, providers }, null, 2)}\n`, { mode: 0o600 });
+    fs.renameSync(temporary, filePath);
+  } catch {
+    // Memory only; the next refused run records it again.
+  }
+}
+
+// The provider's own sentence, trimmed for display: "OAuth access token has
+// been revoked." rather than a whole stderr tail.
+function authFailureReason(provider, text) {
+  const head = String(text || "").slice(0, 600);
+  const patterns = authFailurePatterns[provider];
+  if (!patterns || !patterns.some((pattern) => pattern.test(head))) return null;
+  const line = head.split("\n").map((value) => value.trim()).find((value) => patterns.some((pattern) => pattern.test(value)));
+  return cleanApiText(line || head).replace(/\s+/g, " ").trim().slice(0, 240) || null;
+}
+
+// Called with every failed job's error. Returns true when the failure was the
+// provider refusing its credentials, so the job can say "sign in again".
+function noteProviderRunFailure(provider, errorText) {
+  const reason = authFailureReason(provider, errorText);
+  if (!reason) return false;
+  const providers = readAuthRejections();
+  providers[provider] = { at: nowIso(), reason, credentialStamp: credentialStamp(provider) };
+  writeAuthRejections(providers);
+  appendAudit("harness_auth_rejected", null, { provider });
+  emitEvent("harness.changed", { provider, action: "auth", status: "rejected" });
+  return true;
+}
+
+function clearAuthRejection(provider) {
+  const providers = readAuthRejections();
+  if (!providers[provider]) return;
+  delete providers[provider];
+  writeAuthRejections(providers);
+  emitEvent("harness.changed", { provider, action: "auth", status: "cleared" });
+}
+
+// The rejection still standing for this provider, or null. One whose
+// credential file has since changed, or that cannot be checked and is old,
+// is dropped.
+function activeAuthRejection(provider) {
+  const rejection = readAuthRejections()[provider];
+  if (!rejection) return null;
+  const stillCurrent = rejection.credentialStamp
+    ? rejection.credentialStamp === credentialStamp(provider)
+    : Date.now() - Date.parse(rejection.at || 0) < unwatchedRejectionTtlMs;
+  if (!stillCurrent) {
+    clearAuthRejection(provider);
+    return null;
+  }
+  return { at: rejection.at, reason: rejection.reason };
+}
+
+// A status reading corrected by what the provider last said to a real run.
+function withAuthRejection(provider, auth) {
+  if (auth.loggedIn === false) return auth;
+  const rejection = activeAuthRejection(provider);
+  if (!rejection) return auth;
+  return { ...auth, loggedIn: false, authRejected: rejection };
 }
 
 function detectProviderAuth(provider) {
@@ -224,12 +383,13 @@ function detectHarness(provider) {
   const version = detectProviderVersion(provider);
   if (version) installed = true;
   const auth = installed
-    ? detectProviderAuth(provider)
+    ? withAuthRejection(provider, detectProviderAuth(provider))
     : { loggedIn: false, authKind: "unknown" };
   return {
     provider,
     installed,
     version,
+    authRejected: null,
     ...auth,
     ...providerCapabilities[provider],
     taskControls: providerTaskControls(provider),
@@ -278,9 +438,22 @@ async function assertProviderReady(provider, requirements = {}) {
   if (result.missing) {
     throw Object.assign(new Error(`${displayName} is not installed on this computer.`), { status: 503 });
   }
+  const rejection = result.auth.loggedIn === false ? null : activeAuthRejection(cleanProvider);
+  if (rejection) {
+    throw Object.assign(
+      new Error(`${displayName}'s sign-in on this computer was refused (${rejection.reason.replace(/[.\s]+$/, "")}). Sign in again from the Relay app (Settings → Coding agents), then try again.`),
+      { status: 503, code: "provider_sign_in_required" },
+    );
+  }
   if (result.auth.loggedIn === false) {
+    if (result.auth.authRejected) {
+      throw Object.assign(
+        new Error(`${displayName}'s sign-in on this computer was refused (${result.auth.authRejected.reason}). Sign in again from the Relay app (Settings → Coding agents), then try again.`),
+        { status: 503, code: "provider_sign_in_required" },
+      );
+    }
     const action = cleanProvider === "cursor"
-      ? "Run cursor-agent login on the computer, then try again."
+      ? "Sign in from the Relay app (Settings → Coding agents), or run cursor-agent login on the computer, then try again."
       : `Connect ${displayName} from the Relay app (Settings → Coding agents), or run relay sync-auth on your Mac, then try again.`;
     throw Object.assign(new Error(`${displayName} is not connected on this computer. ${action}`), { status: 503 });
   }
@@ -476,6 +649,7 @@ function startLoginOp(provider) {
   child.on("close", (code) => {
     scanLoginOutput(op);
     if (code === 0) {
+      clearAuthRejection(cleanProvider);
       finishOp(op, "succeeded");
     } else if (!op.finishedAt) {
       finishOp(op, "failed", `login exited with code ${code}`);
@@ -668,6 +842,8 @@ function startSmokeOp(provider) {
   child.on("close", (code) => {
     fs.rmSync(smokeDir, { recursive: true, force: true });
     const succeeded = code === 0 && cleanApiText(op.log).trim().length > 0;
+    if (succeeded) clearAuthRejection(cleanProvider);
+    else noteProviderRunFailure(cleanProvider, op.log);
     finishOp(op, succeeded ? "succeeded" : "failed", succeeded ? null : `smoke exited with code ${code}`);
     lastSmokeByProvider.set(cleanProvider, {
       status: succeeded ? "succeeded" : "failed",
@@ -679,6 +855,10 @@ function startSmokeOp(provider) {
 }
 
 export {
+  noteProviderRunFailure,
+  clearAuthRejection,
+  activeAuthRejection,
+  authFailureReason,
   providerCapabilities,
   providerBinary,
   cleanHarnessProvider,
