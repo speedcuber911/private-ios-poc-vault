@@ -139,13 +139,6 @@ final class ProviderLoginFlowModel: ObservableObject {
         provider == .codex
     }
 
-    /// True when the provider's page shows a code to bring back (Claude Code
-    /// shows `code#state`). Cursor instead waits for the browser approval and
-    /// finishes by itself, so it has nothing to paste.
-    var usesPasteBack: Bool {
-        provider == .claude || provider == .kimi
-    }
-
     /// Each provider's CLI binary and login entry point. The command is the
     /// logical form ("codex login"); the fallback launches an absolute path
     /// when it can resolve one, because a headless machine's PATH often
@@ -155,11 +148,9 @@ final class ProviderLoginFlowModel: ObservableObject {
         switch provider {
         case .claude:
             return "claude"
-        case .cursor:
-            return "cursor-agent"
         case .kimi:
             return "kimi"
-        case .codex, .bedrock, .azure:
+        case .codex, .bedrock, .azure, .unsupported:
             return "codex"
         }
     }

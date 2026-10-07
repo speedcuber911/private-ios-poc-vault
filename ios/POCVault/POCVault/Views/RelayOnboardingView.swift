@@ -18,7 +18,7 @@ struct RelayOnboardingView: View {
         OnboardingPage(
             icon: "rectangle.connected.to.line.below",
             title: "Your machine, from your phone",
-            detail: "Start and continue Codex, Claude Code, Cursor or Kimi work on hardware you already own, without keeping a laptop open."
+            detail: "Start and continue Codex, Claude Code or Kimi work on hardware you already own, without keeping a laptop open."
         ),
         OnboardingPage(
             icon: "lock.shield",

@@ -1872,12 +1872,27 @@ private struct CodexCreateWorkspaceRequest: Encodable {
     let name: String
 }
 
+/// A list item that belongs to one agent harness. Items of a harness the app
+/// no longer supports (`CodexProvider.unsupported`) are dropped as each list
+/// is read, so no screen ever offers or shows them.
+protocol RelayAgentScoped {
+    var agentProvider: CodexProvider? { get }
+}
+
+extension CodexModelDescriptor: RelayAgentScoped { var agentProvider: CodexProvider? { provider } }
+extension RelayHarnessStatus: RelayAgentScoped { var agentProvider: CodexProvider? { provider } }
+extension CodexJob: RelayAgentScoped { var agentProvider: CodexProvider? { provider } }
+extension CodexThread: RelayAgentScoped { var agentProvider: CodexProvider? { provider } }
+extension CodexApproval: RelayAgentScoped { var agentProvider: CodexProvider? { provider } }
+extension CodexSkillDescriptor: RelayAgentScoped { var agentProvider: CodexProvider? { provider } }
+extension RelayHandoffCard: RelayAgentScoped { var agentProvider: CodexProvider? { provider } }
+
 private struct CodexListEnvelope<Element: Decodable>: Decodable {
     let values: [Element]
 
     init(from decoder: Decoder) throws {
         if let values = try? [Element](from: decoder) {
-            self.values = values
+            self.values = Self.supported(values)
             return
         }
 
@@ -1885,12 +1900,16 @@ private struct CodexListEnvelope<Element: Decodable>: Decodable {
         for key in ["items", "data", "results", "models", "workspaces", "jobs", "sessions", "threads", "handoffs", "skills", "approvals", "terminals", "harnesses"] {
             if let codingKey = CodexDynamicCodingKey(stringValue: key),
                let values = try? container.decode([Element].self, forKey: codingKey) {
-                self.values = values
+                self.values = Self.supported(values)
                 return
             }
         }
 
         self.values = []
+    }
+
+    private static func supported(_ values: [Element]) -> [Element] {
+        values.filter { ($0 as? RelayAgentScoped)?.agentProvider != .unsupported }
     }
 }
 

@@ -15,15 +15,21 @@ import kotlinx.serialization.json.JsonNames
 enum class RelayProvider(val wireValue: String, val displayName: String) {
     CODEX("codex", "Codex"),
     CLAUDE("claude", "Claude Code"),
-    CURSOR("cursor", "Cursor"),
     KIMI("kimi", "Kimi K3"),
     BEDROCK("bedrock", "Bedrock"),
-    AZURE("azure", "Azure");
+    AZURE("azure", "Azure"),
+
+    /**
+     * A harness Relay no longer supports (Cursor, retired 2026-10-07). Machines
+     * still report its history and models; they read as this, never as Codex,
+     * and the apps leave them out.
+     */
+    UNSUPPORTED("unsupported", "Unsupported agent");
 
     companion object {
         fun fromWireValue(value: String?): RelayProvider = when (value?.trim()?.lowercase()) {
             "claude", "anthropic" -> CLAUDE
-            "cursor", "cursor-agent" -> CURSOR
+            "cursor", "cursor-agent", "unsupported" -> UNSUPPORTED
             "kimi", "kimi-code", "moonshot" -> KIMI
             "bedrock" -> BEDROCK
             "azure", "azure-openai" -> AZURE
@@ -36,10 +42,10 @@ object RelayAIDataSharing {
     fun recipient(provider: RelayProvider): String = when (provider) {
         RelayProvider.CODEX -> "OpenAI (Codex)"
         RelayProvider.CLAUDE -> "Anthropic (Claude)"
-        RelayProvider.CURSOR -> "Cursor"
         RelayProvider.KIMI -> "Moonshot AI (Kimi)"
         RelayProvider.BEDROCK -> "Amazon Web Services (Amazon Bedrock)"
         RelayProvider.AZURE -> "Microsoft (Azure OpenAI)"
+        RelayProvider.UNSUPPORTED -> "the agent's provider"
     }
 
     fun disclosure(provider: RelayProvider): String =
@@ -476,7 +482,6 @@ object RelayModelCatalog {
     private val providerOrder = listOf(
         RelayProvider.CODEX,
         RelayProvider.CLAUDE,
-        RelayProvider.CURSOR,
         RelayProvider.KIMI,
         RelayProvider.BEDROCK,
         RelayProvider.AZURE,
@@ -508,10 +513,10 @@ object RelayModelCatalog {
 private fun providerLabelAliases(provider: RelayProvider): List<String> = when (provider) {
     RelayProvider.CODEX -> listOf("Codex")
     RelayProvider.CLAUDE -> listOf("Claude Code", "Claude")
-    RelayProvider.CURSOR -> listOf("Cursor Agent", "Cursor")
     RelayProvider.KIMI -> listOf("Kimi K3", "Kimi Code", "Kimi")
     RelayProvider.BEDROCK -> listOf("Bedrock")
     RelayProvider.AZURE -> listOf("Azure OpenAI", "Azure")
+    RelayProvider.UNSUPPORTED -> emptyList()
 }
 
 @Serializable

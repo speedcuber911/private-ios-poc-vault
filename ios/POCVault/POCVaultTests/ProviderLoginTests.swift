@@ -427,7 +427,6 @@ final class ProviderLoginTests: XCTestCase {
         XCTAssertTrue(try job(["error": "Failed to authenticate. API Error: 401 OAuth access token has been revoked."]).needsProviderSignIn)
         XCTAssertTrue(try job(["error": "Failed to authenticate: OAuth session expired and could not be refreshed"]).needsProviderSignIn)
         XCTAssertTrue(try job(["provider": "codex", "error": "stream error: refresh_token_reused"]).needsProviderSignIn)
-        XCTAssertTrue(try job(["provider": "cursor", "error": "Logged in (unable to fetch user details)"]).needsProviderSignIn)
         // Not a sign-in problem.
         XCTAssertFalse(try job(["error": "claude exited with code 1"]).needsProviderSignIn)
         XCTAssertFalse(try job(["status": "succeeded", "signInRequired": true]).needsProviderSignIn)

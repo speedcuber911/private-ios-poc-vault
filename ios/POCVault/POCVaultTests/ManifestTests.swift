@@ -197,7 +197,11 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(CodexProvider.claude.modelOptions, [])
         XCTAssertEqual(CodexProvider.claude.defaultReasoningEffort, .high)
         XCTAssertEqual(CodexProvider.claude.reasoningEffortOptions, CodexReasoningEffort.allCases)
-        XCTAssertEqual(CodexProvider.cursor.displayName, "Cursor")
+        // Cursor is retired: its wire names read as unsupported, never as Codex,
+        // and the app never offers it.
+        XCTAssertEqual(CodexProvider(rawProvider: "cursor"), .unsupported)
+        XCTAssertEqual(CodexProvider(rawProvider: "cursor-agent"), .unsupported)
+        XCTAssertFalse(CodexProvider.allCases.contains(.unsupported))
         XCTAssertEqual(CodexProvider.kimi.displayName, "Kimi K3")
         XCTAssertEqual(CodexProvider.kimi.defaultReasoningEffort, .high)
     }
@@ -205,8 +209,8 @@ final class ManifestTests: XCTestCase {
     func testAIDataSharingDisclosureAndConsentAreProviderSpecific() throws {
         XCTAssertEqual(CodexProvider.codex.aiDataRecipient, "OpenAI (Codex)")
         XCTAssertEqual(CodexProvider.claude.aiDataRecipient, "Anthropic (Claude)")
-        XCTAssertTrue(CodexProvider.cursor.aiDataDisclosure.contains("workspace files, attachments, and command output"))
-        XCTAssertTrue(CodexProvider.cursor.aiDataDisclosure.contains("can include personal data"))
+        XCTAssertTrue(CodexProvider.kimi.aiDataDisclosure.contains("workspace files, attachments, and command output"))
+        XCTAssertTrue(CodexProvider.kimi.aiDataDisclosure.contains("can include personal data"))
 
         let suiteName = "relay-ai-consent-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -291,10 +295,10 @@ final class ManifestTests: XCTestCase {
         let notInstalled = try JSONDecoder().decode(
             RelayHarnessStatus.self,
             from: Data("""
-            { "provider": "cursor", "installed": false, "authKind": "unknown" }
+            { "provider": "kimi", "installed": false, "authKind": "unknown" }
             """.utf8)
         )
-        XCTAssertEqual(notInstalled.actionMessage, "Cursor is not installed on this computer.")
+        XCTAssertEqual(notInstalled.actionMessage, "Kimi K3 is not installed on this computer.")
         XCTAssertFalse(notInstalled.supportsDirectLogin, "an uninstalled CLI has nothing to sign in to")
     }
 
@@ -374,8 +378,10 @@ final class ManifestTests: XCTestCase {
 
         let sections = RelayModelDiscovery.sections(from: models)
 
-        XCTAssertEqual(sections.agents.map(\.provider), [.codex, .claude, .cursor, .kimi])
-        XCTAssertEqual(sections.agents.map(\.title), ["Codex", "Claude Code", "Cursor", "Kimi K3"])
+        // The live catalog still carries a Cursor entry from older machines; it is
+        // never offered.
+        XCTAssertEqual(sections.agents.map(\.provider), [.codex, .claude, .kimi])
+        XCTAssertEqual(sections.agents.map(\.title), ["Codex", "Claude Code", "Kimi K3"])
         XCTAssertEqual(
             sections.agents[0].choices.map(\.model.id),
             ["codex-cli", "codex-gpt-5.6-sol", "codex-gpt-5.6-terra", "codex-gpt-5.6-luna"]
@@ -413,9 +419,9 @@ final class ManifestTests: XCTestCase {
     }
 
     /// A harness missing from the catalog produces no group — the client never
-    /// synthesizes providers. A single-entry harness (Cursor Auto) shows exactly one row.
+    /// synthesizes providers. A single-entry harness (Kimi K3) shows exactly one row.
     func testRelayModelDiscoveryOmitsMissingHarnessesAndNeverSynthesizesRows() throws {
-        let withoutCursor = try decodeCodexModels(
+        let withoutKimi = try decodeCodexModels(
             """
             [
               { "id": "codex-gpt-5.6-sol", "label": "Codex · GPT-5.6 Sol", "provider": "codex", "modes": ["chat", "task"], "taskModel": "gpt-5.6-sol" },
@@ -423,15 +429,11 @@ final class ManifestTests: XCTestCase {
             ]
             """
         )
-        let trimmed = RelayModelDiscovery.sections(from: withoutCursor)
+        let trimmed = RelayModelDiscovery.sections(from: withoutKimi)
         XCTAssertEqual(trimmed.agents.map(\.provider), [.codex, .claude])
-        XCTAssertFalse(trimmed.agents.contains { $0.provider == .cursor })
+        XCTAssertFalse(trimmed.agents.contains { $0.provider == .kimi })
 
         let full = RelayModelDiscovery.sections(from: try decodeCodexModels(liveShapeCatalogJSON))
-        let cursorGroup = try XCTUnwrap(full.agents.first { $0.provider == .cursor })
-        XCTAssertEqual(cursorGroup.choices.count, 1)
-        XCTAssertEqual(cursorGroup.choices[0].shortModelLabel, "Auto")
-        XCTAssertEqual(cursorGroup.choices[0].chipLabel, "Cursor · Auto")
         let kimiGroup = try XCTUnwrap(full.agents.first { $0.provider == .kimi })
         XCTAssertEqual(kimiGroup.choices.count, 1)
         XCTAssertEqual(kimiGroup.choices[0].shortModelLabel, "K3")
@@ -440,42 +442,22 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(RelayModelDiscovery.sections(from: []).isEmpty)
     }
 
-    func testRelayModelDiscoveryShowsNamedCursorModels() throws {
+    /// A machine that still has cursor-agent keeps listing its models. Cursor is
+    /// retired, so they read as unsupported and never reach the picker.
+    func testRetiredCursorModelsAreNeverOffered() throws {
         let models = try decodeCodexModels(
             """
             [
               { "id": "cursor-agent-auto", "label": "Cursor Agent · Auto", "provider": "cursor", "modes": ["task"], "taskModel": "auto" },
-              { "id": "cursor-grok-4.6-xhigh-fast", "label": "Cursor Agent · Cursor Grok 4.6 Extra High Fast", "provider": "cursor", "modes": ["task"], "taskModel": "cursor-grok-4.6-xhigh-fast" },
-              { "id": "cursor-composer-2.5-fast", "label": "Cursor Agent · Composer 2.5 Fast", "provider": "cursor", "modes": ["task"], "taskModel": "composer-2.5-fast" },
-              { "id": "cursor-claude-opus-5-thinking-high", "label": "Cursor Agent · Claude Opus 5 High", "provider": "cursor", "modes": ["task"], "taskModel": "claude-opus-5-thinking-high" },
-              { "id": "cursor-claude-opus-4-8-thinking-high", "label": "Cursor Agent · Claude Opus 4.8 High", "provider": "cursor", "modes": ["task"], "taskModel": "claude-opus-4-8-thinking-high" },
-              { "id": "cursor-gpt-5.6-sol-max-fast", "label": "Cursor Agent · GPT-5.6 Sol Max Fast", "provider": "cursor", "modes": ["task"], "taskModel": "gpt-5.6-sol-max-fast" },
-              { "id": "cursor-gpt-5.5-medium", "label": "Cursor Agent · GPT-5.5 Medium", "provider": "cursor", "modes": ["task"], "taskModel": "gpt-5.5-medium" },
-              { "id": "cursor-claude-fable-5-1-thinking-high", "label": "Cursor Agent · Claude Fable 5.1 High", "provider": "cursor", "modes": ["task"], "taskModel": "claude-fable-5-1-thinking-high" }
+              { "id": "cursor-composer-2.5-fast", "label": "Cursor Agent · Composer 2.5 Fast", "provider": "cursor-agent", "modes": ["task"], "taskModel": "composer-2.5-fast" },
+              { "id": "claude-code-opus", "label": "Claude Code · Opus", "provider": "claude", "modes": ["task"], "taskModel": "opus" }
             ]
             """
         )
-        let cursor = try XCTUnwrap(RelayModelDiscovery.sections(from: models).agents.first { $0.provider == .cursor })
-        XCTAssertEqual(cursor.choices.map(\.shortModelLabel), [
-            "Auto",
-            "Cursor Grok 4.6 Extra High Fast",
-            "Composer 2.5 Fast",
-            "Claude Opus 5 High",
-            "Claude Opus 4.8 High",
-            "GPT-5.6 Sol Max Fast",
-            "GPT-5.5 Medium",
-            "Claude Fable 5.1 High",
-        ])
-        XCTAssertEqual(cursor.choices.map(\.chipLabel), [
-            "Cursor · Auto",
-            "Cursor · Cursor Grok 4.6 Extra High Fast",
-            "Cursor · Composer 2.5 Fast",
-            "Cursor · Claude Opus 5 High",
-            "Cursor · Claude Opus 4.8 High",
-            "Cursor · GPT-5.6 Sol Max Fast",
-            "Cursor · GPT-5.5 Medium",
-            "Cursor · Claude Fable 5.1 High",
-        ])
+        XCTAssertEqual(models.map(\.provider), [.unsupported, .unsupported, .claude])
+        let sections = RelayModelDiscovery.sections(from: models)
+        XCTAssertEqual(sections.agents.map(\.provider), [.claude])
+        XCTAssertFalse(sections.allChoices.contains { $0.model.provider == .unsupported })
     }
 
     /// An Azure catalog entry (fixture-style) is chat-only: it lands in Chat models,
@@ -499,13 +481,13 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(azureChoice.chipLabel, "Azure · GPT-4o")
     }
 
-    /// Task jobs are routed by harness: Cursor keeps its own runner, Azure/dual-mode
+    /// Task jobs are routed by harness: Kimi keeps its own runner, Azure/dual-mode
     /// Codex descriptors run on the Codex runner, Bedrock aliases run through Claude.
     func testRelayTaskProviderRoutingIsHarnessSpecific() throws {
         let models = try decodeCodexModels(
             """
             [
-              { "id": "cursor-agent-auto", "label": "Cursor Agent · Auto", "provider": "cursor", "modes": ["task"], "taskModel": "auto" },
+              { "id": "kimi-k3-fast", "label": "Kimi K3 Fast", "provider": "kimi", "modes": ["task"], "taskModel": "auto" },
               { "id": "kimi-k3", "label": "Kimi K3", "provider": "kimi", "modes": ["task"], "taskModel": "kimi-code/k3" },
               { "id": "codex-gpt-5.6-sol", "label": "Codex · GPT-5.6 Sol", "provider": "codex", "modes": ["chat", "task"], "taskModel": "gpt-5.6-sol" },
               { "id": "claude-code-opus", "label": "Claude Code · Opus", "provider": "claude", "modes": ["task"], "taskModel": "opus" },
@@ -515,7 +497,7 @@ final class ManifestTests: XCTestCase {
             """
         )
 
-        XCTAssertEqual(RelayChatViewModel.taskProvider(for: models[0]), .cursor)
+        XCTAssertEqual(RelayChatViewModel.taskProvider(for: models[0]), .kimi)
         XCTAssertEqual(RelayChatViewModel.taskProvider(for: models[1]), .kimi)
         XCTAssertEqual(RelayChatViewModel.taskProvider(for: models[2]), .codex)
         XCTAssertEqual(RelayChatViewModel.taskProvider(for: models[3]), .claude)
@@ -572,7 +554,7 @@ final class ManifestTests: XCTestCase {
             [
               { "id": "claude-code-opus", "label": "Claude Code · Opus", "provider": "claude", "modes": ["task"], "taskModel": "opus", "effortLevels": ["low", "medium", "high", "xhigh", "max"] },
               { "id": "claude-code-haiku", "label": "Claude Code · Haiku", "provider": "claude", "modes": ["task"], "taskModel": "haiku", "effortLevels": ["low", "medium", "high", "xhigh", "max"] },
-              { "id": "cursor-agent-auto", "label": "Cursor Agent · Auto", "provider": "cursor", "modes": ["task"], "taskModel": "auto", "effortLevels": [] }
+              { "id": "kimi-k3", "label": "Kimi K3", "provider": "kimi", "modes": ["task"], "taskModel": "kimi-code/k3", "effortLevels": [] }
             ]
             """
         )
@@ -705,15 +687,13 @@ final class ManifestTests: XCTestCase {
     func testCodexProviderTabIconsUseBrandAssets() throws {
         XCTAssertEqual(CodexProvider.codex.tabIconAssetName, "ChatGPTMark")
         XCTAssertEqual(CodexProvider.claude.tabIconAssetName, "ClaudeMark")
-        XCTAssertEqual(CodexProvider.cursor.tabIconAssetName, "cursorarrow")
         XCTAssertEqual(CodexProvider.kimi.tabIconAssetName, "moon.stars")
         XCTAssertEqual(CodexProvider.bedrock.tabIconAssetName, "cube.transparent")
         XCTAssertEqual(CodexProvider.azure.tabIconAssetName, "cloud")
-        XCTAssertNotEqual(CodexProvider.cursor.tabIconAssetName, CodexProvider.codex.tabIconAssetName)
+        XCTAssertNotEqual(CodexProvider.kimi.tabIconAssetName, CodexProvider.codex.tabIconAssetName)
         XCTAssertNotEqual(CodexProvider.bedrock.tabIconAssetName, CodexProvider.claude.tabIconAssetName)
         XCTAssertTrue(CodexProvider.codex.hasTaskPermissionControls)
         XCTAssertTrue(CodexProvider.claude.hasTaskPermissionControls)
-        XCTAssertFalse(CodexProvider.cursor.hasTaskPermissionControls)
         XCTAssertFalse(CodexProvider.kimi.hasTaskPermissionControls)
     }
 
@@ -1130,7 +1110,7 @@ final class ManifestTests: XCTestCase {
           "workspaceId": "dir-komal-private-ios-poc-vault",
           "workspaceName": "Komal / private-ios-poc-vault",
           "cwd": "/home/komal/Komal/private-ios-poc-vault",
-          "provider": "cursor",
+          "provider": "claude",
           "lastPrompt": "continue this thread"
         }
         """)
@@ -1168,21 +1148,21 @@ final class ManifestTests: XCTestCase {
         let models = try decodeCodexModels("""
         [
           {"id":"gpt-5.5","label":"GPT-5.5","provider":"codex","modes":["chat","task"]},
-          {"id":"cursor-composer","label":"Composer","provider":"cursor","modes":["task"]}
+          {"id":"kimi-k3","label":"K3","provider":"kimi","modes":["task"]}
         ]
         """)
-        let cursor = RelayChatViewModel.choiceMatchingThread(
+        let kimi = RelayChatViewModel.choiceMatchingThread(
             from: models,
-            provider: .cursor,
+            provider: .kimi,
             mode: .task,
             model: nil
         )
-        XCTAssertEqual(cursor?.executionProvider, .cursor)
-        XCTAssertEqual(cursor?.model.id, "cursor-composer")
+        XCTAssertEqual(kimi?.executionProvider, .kimi)
+        XCTAssertEqual(kimi?.model.id, "kimi-k3")
         XCTAssertNil(
             RelayChatViewModel.choiceMatchingThread(
                 from: [],
-                provider: .cursor,
+                provider: .kimi,
                 mode: .task,
                 model: nil
             ),
@@ -1197,7 +1177,7 @@ final class ManifestTests: XCTestCase {
           "status": "succeeded",
           "workspaceId": "dir-komal-private-ios-poc-vault",
           "workspacePath": "/home/komal/Komal/private-ios-poc-vault",
-          "provider": "cursor"
+          "provider": "claude"
         }
         """)
         XCTAssertEqual(job.workspacePath, "/home/komal/Komal/private-ios-poc-vault")
@@ -2021,7 +2001,7 @@ final class ManifestTests: XCTestCase {
               "lastJobStatus": "running",
               "activeJobCount": 1,
               "lastPrompt": "Still going",
-              "provider": "cursor"
+              "provider": "claude"
             }
             """
         )
@@ -3675,7 +3655,7 @@ final class ManifestTests: XCTestCase {
         )
     }
 
-    func testCodexProviderCursorDecodingRoundTrips() throws {
+    func testRetiredCursorProviderDecodesAsUnsupported() throws {
         let models = try decodeCodexModels(
             """
             [
@@ -3686,14 +3666,10 @@ final class ManifestTests: XCTestCase {
         )
 
         XCTAssertEqual(models.count, 2)
-        XCTAssertEqual(models[0].provider, .cursor)
-        XCTAssertEqual(models[1].provider, .cursor)
-        XCTAssertTrue(models[0].supports(.task))
-        XCTAssertFalse(models[0].supports(.chat))
-        XCTAssertEqual(CodexProvider(rawProvider: "cursor-agent"), .cursor)
+        XCTAssertEqual(models[0].provider, .unsupported)
+        XCTAssertEqual(models[1].provider, .unsupported, "never mistaken for Codex")
+        XCTAssertEqual(CodexProvider(rawProvider: "future-provider"), .codex)
 
-        let encoded = try JSONEncoder().encode(CodexProvider.cursor)
-        XCTAssertEqual(String(data: encoded, encoding: .utf8), "\"cursor\"")
         XCTAssertEqual(CodexProvider(rawProvider: "kimi-code"), .kimi)
         let kimiEncoded = try JSONEncoder().encode(CodexProvider.kimi)
         XCTAssertEqual(String(data: kimiEncoded, encoding: .utf8), "\"kimi\"")
@@ -4044,7 +4020,7 @@ final class ManifestTests: XCTestCase {
           "id": "thread-photo",
           "sessionId": "thread-photo",
           "workspaceId": "hosted-project",
-          "provider": "cursor"
+          "provider": "claude"
         }
         """)
         let detail = try JSONDecoder().decode(CodexThreadDetail.self, from: Data("""
@@ -4053,7 +4029,7 @@ final class ManifestTests: XCTestCase {
             "id": "thread-photo",
             "sessionId": "thread-photo",
             "workspaceId": "hosted-project",
-            "provider": "cursor"
+            "provider": "claude"
           },
           "messages": [
             {

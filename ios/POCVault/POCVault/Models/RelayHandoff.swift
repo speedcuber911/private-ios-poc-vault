@@ -142,7 +142,7 @@ struct RelayHandoffCard: Decodable, Identifiable, Hashable {
 /// Everything here is optional: the manifest is attacker-supplied and relayd
 /// allow-lists what it keeps, so a field can legitimately be absent.
 struct RelayHandoffManifest: Decodable, Hashable {
-    /// The harness the laptop session belonged to ("claude", "codex", "cursor").
+    /// The harness the laptop session belonged to ("claude", "codex").
     let harness: String?
     let machine: String?
     let excerpt: String?
@@ -248,7 +248,10 @@ struct RelayMacSessionIndex: Decodable, Hashable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         machine = try container.decodeIfPresent(String.self, forKey: .machine)?.trimmedNonEmpty
         updatedAt = try container.decodeIfPresent(String.self, forKey: .updatedAt)
-        sessions = try container.decodeIfPresent([RelayMacSession].self, forKey: .sessions) ?? []
+        // A Mac session of a harness the app no longer supports (Cursor) has
+        // nothing to continue into on the phone.
+        sessions = (try container.decodeIfPresent([RelayMacSession].self, forKey: .sessions) ?? [])
+            .filter { CodexProvider(rawProvider: $0.harness) != .unsupported }
     }
 
     var updatedAtDate: Date? { CodexDateParser.parse(updatedAt ?? "") }

@@ -203,31 +203,11 @@ struct ProviderLoginView: View {
                 }
                 .buttonStyle(RelayPrimaryButtonStyle())
                 .accessibilityIdentifier("relay-provider-login-open")
-            } else if flow.usesPasteBack {
-                pasteBackControls(op: op)
             } else {
-                approvalControls(op: op)
+                pasteBackControls(op: op)
             }
 
             Spacer()
-        }
-    }
-
-    /// Cursor-style: the CLI on the machine is waiting for the browser
-    /// approval and finishes by itself, so there is nothing to bring back.
-    private func approvalControls(op: RelayHarnessOp) -> some View {
-        VStack(spacing: 14) {
-            HStack(spacing: 10) {
-                ProgressView().tint(AppTheme.accent)
-                Text("Waiting for you to approve in the browser…")
-                    .font(AppTheme.uiFont(size: 13))
-                    .foregroundStyle(AppTheme.textSecondary)
-            }
-            Button("Open sign-in page again") {
-                openSignInPage(op: op)
-            }
-            .buttonStyle(RelayOutlineButtonStyle())
-            .accessibilityIdentifier("relay-provider-login-open")
         }
     }
 
@@ -356,9 +336,6 @@ struct ProviderLoginView: View {
         }
         if op.userCode != nil {
             return "Open the sign-in page and enter the code below. Your machine confirms as soon as the provider approves it."
-        }
-        if !flow.usesPasteBack {
-            return "Sign in with your own \(flow.provider.displayName) account and approve the request. Your machine finishes the sign-in by itself."
         }
         return "Sign in with your own \(flow.provider.displayName) account and copy the code the page shows. Then come back and tap Paste."
     }

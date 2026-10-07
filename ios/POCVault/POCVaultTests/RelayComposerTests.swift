@@ -15,7 +15,7 @@ final class RelayComposerTests: XCTestCase {
     ]
     """
 
-    /// Codex, Claude Code, Cursor, Kimi and a chat model: five tabs.
+    /// Codex, Claude Code, Kimi, Bedrock and a chat model: five tabs.
     private static let fiveAgentJSON = """
     [
       {"id":"codex-default","label":"Codex","provider":"codex","modes":["task"]},
@@ -23,8 +23,8 @@ final class RelayComposerTests: XCTestCase {
       {"id":"gpt-5.6-terra","label":"GPT-5.6 Terra","provider":"codex","modes":["chat","task"],"taskModel":"gpt-5.6-terra"},
       {"id":"claude-default","label":"Claude Code","provider":"claude","modes":["task"]},
       {"id":"claude-opus","label":"Claude Opus 5.5","provider":"claude","modes":["task"],"taskModel":"opus"},
-      {"id":"cursor-composer","label":"Composer","provider":"cursor","modes":["task"]},
-      {"id":"kimi-k3","label":"Kimi K3","provider":"kimi","modes":["task"],"taskModel":"k3"}
+      {"id":"kimi-k3","label":"Kimi K3","provider":"kimi","modes":["task"],"taskModel":"k3"},
+      {"id":"bedrock-opus","label":"Claude Opus (Bedrock)","provider":"bedrock","modes":["task"]}
     ]
     """
 
@@ -34,7 +34,7 @@ final class RelayComposerTests: XCTestCase {
       {"id":"codex-default","label":"Codex","provider":"codex","modes":["task"]},
       {"id":"claude-default","label":"Claude Code","provider":"claude","modes":["task"]},
       {"id":"claude-opus","label":"Claude Opus 5.5","provider":"claude","modes":["task"],"taskModel":"opus"},
-      {"id":"cursor-composer","label":"Composer","provider":"cursor","modes":["task"]}
+      {"id":"kimi-default","label":"Kimi K3","provider":"kimi","modes":["task"]}
     ]
     """
 
@@ -78,7 +78,8 @@ final class RelayComposerTests: XCTestCase {
             RelayModelSheetTab.tabs(for: sections),
             sections.agents.map { .agent($0.provider) } + [.chat]
         )
-        XCTAssertEqual(Set(sections.agents.map(\.provider)), [.codex, .claude, .cursor])
+        // The catalog's Cursor entry is a retired harness: no tab for it.
+        XCTAssertEqual(Set(sections.agents.map(\.provider)), [.codex, .claude])
 
         let agentsOnly = RelayModelPickerSections(agents: sections.agents, chatModels: [])
         XCTAssertFalse(RelayModelSheetTab.tabs(for: agentsOnly).contains(.chat))
@@ -127,16 +128,16 @@ final class RelayComposerTests: XCTestCase {
         let five = try sections(Self.fiveAgentJSON)
         XCTAssertEqual(
             RelayModelSheetTab.tabs(for: five),
-            [.agent(.codex), .agent(.claude), .agent(.cursor), .agent(.kimi), .chat]
+            [.agent(.codex), .agent(.claude), .agent(.kimi), .agent(.bedrock), .chat]
         )
         XCTAssertEqual(
             RelayModelSheetTab.tabs(for: five).map(\.title),
-            ["Codex", "Claude Code", "Cursor", RelayModelChoice.harnessTitle(for: .kimi), "Chat"]
+            ["Codex", "Claude Code", RelayModelChoice.harnessTitle(for: .kimi), "Bedrock", "Chat"]
         )
         let three = try sections(Self.threeAgentJSON)
         XCTAssertEqual(
             RelayModelSheetTab.tabs(for: three),
-            [.agent(.codex), .agent(.claude), .agent(.cursor)]
+            [.agent(.codex), .agent(.claude), .agent(.kimi)]
         )
     }
 
@@ -171,13 +172,13 @@ final class RelayComposerTests: XCTestCase {
 
     // MARK: Picking a model keeps the sheet open
 
-    /// Claude Code offers what its CLI lists; Cursor has no effort at all.
+    /// Claude Code offers what its CLI lists; Kimi has no effort at all.
     private static let effortCatalogJSON = """
     [
       {"id":"codex-default","label":"Codex","provider":"codex","modes":["task"],"effortLevels":["low","medium","high","xhigh"]},
       {"id":"claude-default","label":"Claude Code","provider":"claude","modes":["task"],"effortLevels":["low","medium","high","xhigh","max"]},
       {"id":"claude-opus","label":"Claude Opus 5.5","provider":"claude","modes":["task"],"taskModel":"opus","effortLevels":["low","medium","high","xhigh","max"]},
-      {"id":"cursor-composer","label":"Composer","provider":"cursor","modes":["task"],"effortLevels":[]}
+      {"id":"kimi-default","label":"Kimi K3","provider":"kimi","modes":["task"],"effortLevels":[]}
     ]
     """
 
@@ -191,7 +192,7 @@ final class RelayComposerTests: XCTestCase {
         let catalog = try sections(Self.effortCatalogJSON)
         let codex = try choice("codex-default", in: catalog)
         let opus = try choice("claude-opus", in: catalog)
-        let cursor = try choice("cursor-composer", in: catalog)
+        let kimi = try choice("kimi-default", in: catalog)
         var picked: [RelayModelChoice] = []
         var closes = 0
         var pickedEfforts: [CodexReasoningEffort] = []
@@ -210,8 +211,8 @@ final class RelayComposerTests: XCTestCase {
         XCTAssertEqual(picked, [opus])
         XCTAssertEqual(closes, 0)
         // The same for a model with no effort levels: no special case closes it.
-        sheet.pick(cursor)
-        XCTAssertEqual(picked, [opus, cursor])
+        sheet.pick(kimi)
+        XCTAssertEqual(picked, [opus, kimi])
         XCTAssertEqual(closes, 0)
         XCTAssertTrue(pickedEfforts.isEmpty)
     }
@@ -223,7 +224,7 @@ final class RelayComposerTests: XCTestCase {
         let catalog = try sections(Self.effortCatalogJSON)
         let codex = try choice("codex-default", in: catalog)
         let opus = try choice("claude-opus", in: catalog)
-        let cursor = try choice("cursor-composer", in: catalog)
+        let kimi = try choice("kimi-default", in: catalog)
         func effortRow(on tab: RelayModelSheetTab, selected: RelayModelChoice) -> String? {
             guard RelayModelSheetTab.showsEffort(
                 visibleTab: tab, sections: catalog, selectedChoice: selected, threadProvider: nil
@@ -243,7 +244,7 @@ final class RelayComposerTests: XCTestCase {
         XCTAssertEqual(effortRow(on: .agent(.claude), selected: opus), "High")
         XCTAssertEqual(efforts(of: opus), [.low, .medium, .high, .xhigh, .max])
         // A model with no effort levels has no row, and the sheet is no different.
-        XCTAssertNil(effortRow(on: .agent(.cursor), selected: cursor))
+        XCTAssertNil(effortRow(on: .agent(.kimi), selected: kimi))
     }
 
     func testChipsWrapInsteadOfRunningPastTheEdge() {
@@ -705,9 +706,9 @@ final class RelayComposerTests: XCTestCase {
         try snapshot("driven-5-effort-max")
 
         // A model with no effort levels: no row, same sheet.
-        try activate("Cursor") { $0 == "Cursor" }
-        try activate("Cursor's only model") { $0 == "Default" }
-        XCTAssertEqual(probe.selected, try choice("cursor-composer", in: catalog))
+        try activate("Kimi K3") { $0 == RelayModelChoice.harnessTitle(for: .kimi) }
+        try activate("Kimi's only model") { $0 == "Default" }
+        XCTAssertEqual(probe.selected, try choice("kimi-default", in: catalog))
         XCTAssertTrue(probe.presented)
         XCTAssertNil(try element { $0.hasPrefix("Effort") })
         try snapshot("driven-6-no-effort-model")

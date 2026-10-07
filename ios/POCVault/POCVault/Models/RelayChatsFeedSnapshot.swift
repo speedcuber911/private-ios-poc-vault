@@ -69,7 +69,12 @@ struct RelayChatsFeedSnapshot: Equatable {
               header.version == formatVersion,
               let file = try? decoder.decode(DecodedFile.self, from: data)
         else { return nil }
-        return Restored(threads: file.threads, jobs: file.jobs, savedAt: file.savedAt)
+        // A snapshot saved before Cursor was retired may still hold its rows.
+        return Restored(
+            threads: file.threads.filter { $0.provider != .unsupported },
+            jobs: file.jobs.filter { $0.provider != .unsupported },
+            savedAt: file.savedAt
+        )
     }
 
     /// Cuts overlong text to exactly `textLimit` characters. Idempotent, so a

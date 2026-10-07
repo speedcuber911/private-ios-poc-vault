@@ -38,7 +38,8 @@ class RelayCoreTest {
     @Test
     fun providerAliasesMatchTheExistingRelayContract() {
         assertEquals(RelayProvider.CLAUDE, RelayProvider.fromWireValue("anthropic"))
-        assertEquals(RelayProvider.CURSOR, RelayProvider.fromWireValue("cursor-agent"))
+        assertEquals(RelayProvider.UNSUPPORTED, RelayProvider.fromWireValue("cursor"))
+        assertEquals(RelayProvider.UNSUPPORTED, RelayProvider.fromWireValue("cursor-agent"))
         assertEquals(RelayProvider.KIMI, RelayProvider.fromWireValue("moonshot"))
         assertEquals(RelayProvider.CODEX, RelayProvider.fromWireValue("future-provider"))
     }
@@ -48,10 +49,10 @@ class RelayCoreTest {
         val contract = RelayCoreInfo()
         assertEquals("OpenAI (Codex)", contract.aiDataRecipient("codex"))
         assertEquals("Anthropic (Claude)", contract.aiDataRecipient("anthropic"))
-        assertTrue(contract.aiDataDisclosure("cursor").contains("prompt and conversation history"))
-        assertTrue(contract.aiDataDisclosure("cursor").contains("workspace files, attachments, and command output"))
-        assertTrue(contract.aiDataDisclosure("cursor").contains("can include personal data"))
-        assertTrue(contract.aiDataDisclosure("cursor").contains("Cursor"))
+        assertTrue(contract.aiDataDisclosure("kimi").contains("prompt and conversation history"))
+        assertTrue(contract.aiDataDisclosure("kimi").contains("workspace files, attachments, and command output"))
+        assertTrue(contract.aiDataDisclosure("kimi").contains("can include personal data"))
+        assertTrue(contract.aiDataDisclosure("kimi").contains("Moonshot AI (Kimi)"))
     }
 
     @Test

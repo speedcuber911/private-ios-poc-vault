@@ -414,7 +414,7 @@ struct POCVaultRootView: View {
             machineIsDown: powerModel.isDown
         )) {
             // Chats is a live view, not a one-time snapshot. Refresh on entry, then
-            // keep polling so a Codex, Claude Code, or Cursor session started on the
+            // keep polling so a Codex or Claude Code session started on the
             // machine shows up — but only while the list is actually on screen: its
             // tab selected, the app active, and no chat covering it. Leaving any of
             // those cancels this task and the poll with it. A machine that is off
@@ -762,15 +762,6 @@ extension CodexProvider {
                 permissionsTitle: "Claude Code permissions",
                 skillsTitle: "Claude Code skills"
             )
-        case .cursor:
-            return RelayProviderPresentation(
-                title: "Cursor",
-                assetName: nil,
-                systemImage: "cursorarrow",
-                accent: Color(hex: 0xA89DD8),
-                permissionsTitle: nil,
-                skillsTitle: "Cursor skills"
-            )
         case .kimi:
             return RelayProviderPresentation(
                 title: "Kimi K3",
@@ -797,6 +788,16 @@ extension CodexProvider {
                 accent: Color(hex: 0x78A9D8),
                 permissionsTitle: nil,
                 skillsTitle: "Azure skills"
+            )
+        case .unsupported:
+            // Never offered; lists drop these items before any screen sees them.
+            return RelayProviderPresentation(
+                title: "Unsupported agent",
+                assetName: nil,
+                systemImage: "questionmark.circle",
+                accent: AppTheme.textTertiary,
+                permissionsTitle: nil,
+                skillsTitle: "Skills"
             )
         }
     }

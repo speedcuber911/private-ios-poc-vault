@@ -224,13 +224,13 @@ struct RelayModelChoice: Identifiable, Hashable {
     }
 
     /// The harness name shown for Agents grouping and the composer chip ("Codex",
-    /// "Claude Code", "Cursor"). Purely presentational; rows still come only from the
+    /// "Claude Code"). Purely presentational; rows still come only from the
     /// server catalog.
     static func harnessTitle(for provider: CodexProvider) -> String {
         switch provider {
         case .claude:
             return "Claude Code"
-        case .codex, .cursor, .kimi, .bedrock, .azure:
+        case .codex, .kimi, .bedrock, .azure, .unsupported:
             return provider.displayName
         }
     }
@@ -274,7 +274,7 @@ struct RelayModelChoice: Identifiable, Hashable {
         return text
     }
 
-    /// Composer chip text: harness plus model, e.g. "Codex · GPT-5.6 Sol" / "Cursor · Auto".
+    /// Composer chip text: harness plus model, e.g. "Codex · GPT-5.6 Sol" / "Claude Code · Opus".
     var chipLabel: String {
         if model.provider == .kimi, shortModelLabel == "K3" { return "Kimi K3" }
         return "\(harnessTitle) · \(shortModelLabel)"
@@ -286,14 +286,14 @@ struct RelayModelChoice: Identifiable, Hashable {
             return ["Codex"]
         case .claude:
             return ["Claude Code", "Claude"]
-        case .cursor:
-            return ["Cursor Agent", "Cursor"]
         case .kimi:
             return ["Kimi K3", "Kimi Code", "Kimi"]
         case .bedrock:
             return ["Bedrock"]
         case .azure:
             return ["Azure OpenAI", "Azure"]
+        case .unsupported:
+            return []
         }
     }
 }
@@ -345,8 +345,8 @@ struct RelayModelPickerSections: Hashable {
 }
 
 enum RelayModelDiscovery {
-    static let agentProviderOrder: [CodexProvider] = [.codex, .claude, .cursor, .kimi, .bedrock, .azure]
-    static let chatProviderOrder: [CodexProvider] = [.codex, .azure, .bedrock, .claude, .cursor, .kimi]
+    static let agentProviderOrder: [CodexProvider] = [.codex, .claude, .kimi, .bedrock, .azure]
+    static let chatProviderOrder: [CodexProvider] = [.codex, .azure, .bedrock, .claude, .kimi]
 
     /// Build the harness-first picker sections from the server catalog. Catalog order is
     /// preserved within each provider (the server curates it); providers absent from the
@@ -437,7 +437,7 @@ final class RelayChatViewModel: ObservableObject {
     /// True while `openThread` has seeded identity from the feed item and is still
     /// waiting on `fetchThreadDetail`. Cleared when detail lands or the request fails.
     @Published private(set) var isLoadingThreadDetail = false
-    /// Session id of a native Codex, Claude Code, or Cursor run the open chat is
+    /// Session id of a native Codex or Claude Code run the open chat is
     /// following. Nil when the open thread is idle.
     @Published private(set) var watchedSessionID: String?
     private var nativeWatchQuietSince: Date?
@@ -2501,18 +2501,18 @@ final class RelayChatViewModel: ObservableObject {
         return choices.first
     }
 
-    /// Which task runner executes a model's jobs. Cursor keeps its own runner; Azure
+    /// Which task runner executes a model's jobs. Kimi keeps its own runner; Azure
     /// descriptors fall back to the Codex runner (they are chat-first).
     nonisolated static func taskProvider(for model: CodexModelDescriptor) -> CodexProvider {
         switch model.provider {
         case .claude, .bedrock:
             return .claude
-        case .cursor:
-            return .cursor
         case .kimi:
             return .kimi
         case .codex, .azure:
             return .codex
+        case .unsupported:
+            return .unsupported
         }
     }
 

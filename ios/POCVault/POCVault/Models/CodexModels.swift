@@ -383,14 +383,20 @@ struct CodexWorkspaceDirectoryEntry: Decodable, Hashable, Identifiable {
 enum CodexProvider: String, CaseIterable, Identifiable, Codable {
     case codex
     case claude
-    case cursor
     case kimi
     case bedrock
     case azure
+    /// A harness Relay no longer supports (Cursor, retired 2026-10-07).
+    /// Machines still report its history and models; they read as this rather
+    /// than falling back to Codex, and every list leaves them out.
+    case unsupported
 
     var id: String { rawValue }
 
     static let defaultProvider = CodexProvider.codex
+
+    /// Every provider the app offers. `unsupported` is never offered.
+    static let allCases: [CodexProvider] = [.codex, .claude, .kimi, .bedrock, .azure]
 
     init(rawProvider: String?) {
         let normalized = relaySharedContract.normalizedProvider(value: rawProvider)
@@ -402,8 +408,8 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
             self = .azure
         case "claude":
             self = .claude
-        case "cursor":
-            self = .cursor
+        case "unsupported":
+            self = .unsupported
         case "kimi":
             self = .kimi
         default:
@@ -427,14 +433,14 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
             return "Codex"
         case .claude:
             return "Claude Code"
-        case .cursor:
-            return "Cursor"
         case .kimi:
             return "Kimi K3"
         case .bedrock:
             return "Bedrock"
         case .azure:
             return "Azure"
+        case .unsupported:
+            return "Unsupported agent"
         }
     }
 
@@ -458,7 +464,7 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .codex:
             return .xhigh
-        case .claude, .cursor, .kimi, .bedrock, .azure:
+        case .claude, .kimi, .bedrock, .azure, .unsupported:
             return .high
         }
     }
@@ -592,11 +598,6 @@ enum RelayProviderSignInFailure {
             #"OAuth session expired"#,
             #"Please run /login"#,
             #"Invalid API key"#,
-        ],
-        .cursor: [
-            #"unable to fetch user details"#,
-            #"\bAuthentication required\b"#,
-            #"\bNot authenticated\b"#,
         ],
         .codex: [
             #"\brefresh_token_reused\b"#,
@@ -1658,7 +1659,7 @@ struct CodexThreadFeedItem: Hashable, Identifiable {
         }
     }
 
-    /// Status chip for a row. A native Codex, Claude Code, or Cursor session has
+    /// Status chip for a row. A native Codex or Claude Code session has
     /// no Relay job status while it is running on the machine, and a resumed
     /// session can still carry the previous job's terminal status.
     var activityLabel: String? {
