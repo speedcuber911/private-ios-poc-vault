@@ -8,7 +8,7 @@
 
 import { execFileSync } from "node:child_process";
 
-import { codexBin, claudeBin, cursorBin, kimiBin, runHome, codexHome, kimiHome } from "./config.mjs";
+import { codexBin, claudeBin, kimiBin, runHome, codexHome, kimiHome } from "./config.mjs";
 import { cleanApiText } from "./util.mjs";
 
 const providerHelpCacheMs = 5 * 60 * 1000;
@@ -16,7 +16,6 @@ const providerHelpCache = new Map();
 
 function providerBinary(provider) {
   if (provider === "claude") return claudeBin;
-  if (provider === "cursor") return cursorBin;
   if (provider === "kimi") return kimiBin;
   return codexBin;
 }
@@ -31,7 +30,7 @@ function providerEnv(provider) {
     CODEX_HOME: codexHome,
     KIMI_CODE_HOME: kimiHome,
   };
-  if (provider === "claude" || provider === "cursor" || provider === "kimi") {
+  if (provider === "claude" || provider === "kimi") {
     delete env.AWS_ACCESS_KEY_ID;
     delete env.AWS_SECRET_ACCESS_KEY;
     delete env.AWS_SESSION_TOKEN;

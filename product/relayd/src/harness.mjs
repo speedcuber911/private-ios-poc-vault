@@ -11,7 +11,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 
-import { codexBin, claudeBin, cursorBin, kimiBin, runHome, codexHome, claudeHome, kimiHome, dataDir, allowedJobProviders } from "./config.mjs";
+import { codexBin, claudeBin, kimiBin, runHome, codexHome, claudeHome, kimiHome, dataDir, allowedJobProviders } from "./config.mjs";
 import { nowIso, cleanApiText, suffixByBytes } from "./util.mjs";
 import { appendAudit } from "./audit.mjs";
 import { emitEvent } from "./events.mjs";
@@ -67,17 +67,6 @@ const providerCapabilities = {
       approvalPolicies: [],
     },
   },
-  cursor: {
-    supportsApprovals: false,
-    supportsResume: true,
-    supportsChat: false,
-    taskControls: {
-      model: true,
-      reasoningEffort: false,
-      permissionModes: [],
-      approvalPolicies: [],
-    },
-  },
   kimi: {
     supportsApprovals: false,
     supportsResume: true,
@@ -94,7 +83,7 @@ const providerCapabilities = {
 function cleanHarnessProvider(value) {
   const normalized = String(value || "").trim().toLowerCase();
   if (!allowedJobProviders.has(normalized)) {
-    throw Object.assign(new Error("provider must be codex, claude, cursor, or kimi"), { status: 400 });
+    throw Object.assign(new Error("provider must be codex, claude, or kimi"), { status: 400 });
   }
   return normalized;
 }
@@ -118,7 +107,6 @@ function loginArgsFor(provider) {
 
 function authStatusArgsFor(provider) {
   if (provider === "claude") return ["auth", "status", "--json"];
-  if (provider === "cursor") return ["status", "--format", "json"];
   return ["login", "status"];
 }
 
@@ -156,22 +144,6 @@ function parseProviderAuth(provider, output, commandSucceeded) {
       loggedIn: parsed.loggedIn,
       authKind: parsed.loggedIn ? authKindFromText(parsed.authMethod || parsed.apiProvider) : "unknown",
     };
-  }
-  if (provider === "cursor" && parsed && typeof parsed.isAuthenticated === "boolean") {
-    const authKind = parsed.isAuthenticated
-      ? (parsed.hasRefreshToken ? "subscription" : parsed.hasAccessToken ? "api" : "unknown")
-      : "unknown";
-    // cursor-agent calls itself authenticated whenever tokens sit on disk.
-    // When Cursor no longer accepts them, the only sign is that it cannot
-    // load the account: "Logged in (unable to fetch user details)".
-    if (parsed.isAuthenticated && /unable to fetch user details/i.test(String(parsed.message || ""))) {
-      return {
-        loggedIn: false,
-        authKind,
-        authRejected: { at: nowIso(), reason: "Cursor could not load the signed-in account" },
-      };
-    }
-    return { loggedIn: parsed.isAuthenticated, authKind };
   }
   if (provider === "codex" && /not logged in|signed out|no (?:valid )?(?:session|credentials?)/i.test(text)) {
     return { loggedIn: false, authKind: "unknown" };
@@ -227,11 +199,6 @@ const authFailurePatterns = {
     /\b401 Unauthorized\b/i,
     /\bNot logged in\b/i,
   ],
-  cursor: [
-    /\bAuthentication required\b/i,
-    /\bNot authenticated\b/i,
-    /cursor-agent login/i,
-  ],
 };
 
 function authRejectionsPath() {
@@ -241,7 +208,6 @@ function authRejectionsPath() {
 function credentialFileFor(provider) {
   if (provider === "claude") return path.join(claudeHome, ".credentials.json");
   if (provider === "codex") return path.join(codexHome, "auth.json");
-  if (provider === "cursor") return path.join(process.env.XDG_CONFIG_HOME || path.join(runHome, ".config"), "cursor", "auth.json");
   return null;
 }
 
@@ -407,7 +373,6 @@ function listHarnesses() {
 
 function providerDisplayName(provider) {
   if (provider === "claude") return "Claude Code";
-  if (provider === "cursor") return "Cursor";
   if (provider === "kimi") return "Kimi K3";
   return "Codex";
 }
@@ -456,9 +421,7 @@ async function assertProviderReady(provider, requirements = {}) {
         { status: 503, code: "provider_sign_in_required" },
       );
     }
-    const action = cleanProvider === "cursor"
-      ? "Sign in from the Relay app (Settings → Coding agents), or run cursor-agent login on the computer, then try again."
-      : `Connect ${displayName} from the Relay app (Settings → Coding agents), or run relay sync-auth on your Mac, then try again.`;
+    const action = `Connect ${displayName} from the Relay app (Settings → Coding agents), or run relay sync-auth on your Mac, then try again.`;
     throw Object.assign(new Error(`${displayName} is not connected on this computer. ${action}`), { status: 503 });
   }
   if (cleanProvider === "claude" && requirements.reasoningEffort && !providerTaskControls(cleanProvider).reasoningEffort) {
@@ -823,9 +786,7 @@ function startSmokeOp(provider) {
   const smokeDir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-smoke-"));
   const prompt = "Reply with exactly: OK";
   let args;
-  if (cleanProvider === "cursor") {
-    args = ["-p", "--force", "--trust", "--workspace", smokeDir, "--output-format", "json", prompt];
-  } else if (cleanProvider === "kimi") {
+  if (cleanProvider === "kimi") {
     args = ["--model", "kimi-code/k3", "--prompt", prompt, "--output-format", "stream-json"];
   } else if (cleanProvider === "claude") {
     args = ["--print"];
@@ -840,7 +801,7 @@ function startSmokeOp(provider) {
   });
   attachOpChild(op, child, { timeoutMs: smokeTimeoutMs, onExpire: "expired" });
   child.stdin.on("error", () => {});
-  if (cleanProvider !== "cursor" && cleanProvider !== "kimi") child.stdin.end(prompt);
+  if (cleanProvider !== "kimi") child.stdin.end(prompt);
   else child.stdin.end();
 
   child.on("close", (code) => {

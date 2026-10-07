@@ -46,7 +46,6 @@ process.env.CODEX_WORKSPACE_BROWSE_ROOT = dir;
 process.env.RELAYD_CODEX_TRANSPORT = "exec";
 process.env.CLAUDE_BIN = fakeClaude;
 process.env.CODEX_BIN = path.join(dir, "unconfigured-codex");
-process.env.CURSOR_BIN = path.join(dir, "unconfigured-cursor-agent");
 process.env.KIMI_BIN = path.join(dir, "unconfigured-kimi");
 delete process.env.CODEX_MODEL_CATALOG;
 fs.mkdirSync(process.env.CODEX_RUN_HOME, { recursive: true });
@@ -218,7 +217,6 @@ async function startDaemon(name, help) {
       CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspace }]),
       CLAUDE_BIN: daemonClaude,
       CODEX_BIN: path.join(home, "unconfigured-codex"),
-      CURSOR_BIN: path.join(home, "unconfigured-cursor-agent"),
       KIMI_BIN: path.join(home, "unconfigured-kimi"),
     },
     stdio: ["ignore", "pipe", "pipe"],

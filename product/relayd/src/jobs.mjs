@@ -8,7 +8,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { dataDir, jobsDir, logsDir, attachmentsDir, artifactsDir, approvalsDir, codexBin, claudeBin, cursorBin, kimiBin, runHome, codexHome, kimiHome, npmCacheDir, bunCacheDir, codexTransport, maxConcurrent, maxJobStreams, jobStreamHeartbeatMs, maxBodyBytes, maxJobAttachments, maxJobAttachmentBytes, maxJobAttachmentTotalBytes, maxOutputBytes, maxJobSkills, maxSkillPromptBytes, responseOutputBytes, listOutputBytes, maxTimeoutMs, defaultTimeoutMs, terminalStatuses, allowedReasoningEfforts, allowedJobProviders, allowedClaudePermissionModes, allowedCodexApprovalPolicies, allowedCodexSandboxes, claudeAwsProfile, claudeAwsRegion, claudeDefaultModel, cleanOptionalModel, normalizeClaudeModel, realpathOrResolve, pathWithinRoot } from "./config.mjs";
+import { dataDir, jobsDir, logsDir, attachmentsDir, artifactsDir, approvalsDir, codexBin, claudeBin, kimiBin, runHome, codexHome, kimiHome, npmCacheDir, bunCacheDir, codexTransport, maxConcurrent, maxJobStreams, jobStreamHeartbeatMs, maxBodyBytes, maxJobAttachments, maxJobAttachmentBytes, maxJobAttachmentTotalBytes, maxOutputBytes, maxJobSkills, maxSkillPromptBytes, responseOutputBytes, listOutputBytes, maxTimeoutMs, defaultTimeoutMs, terminalStatuses, allowedReasoningEfforts, allowedJobProviders, retiredJobProviders, allowedClaudePermissionModes, allowedCodexApprovalPolicies, allowedCodexSandboxes, claudeAwsProfile, claudeAwsRegion, claudeDefaultModel, cleanOptionalModel, normalizeClaudeModel, realpathOrResolve, pathWithinRoot } from "./config.mjs";
 import { nowIso, durationMs, sendError, sendBytes, initSse, sendSse, isSafeJobId, headerValue, shapeTextPayload, prefixByBytes, cleanAssistantResult, cleanApiText, readTextFileBounded } from "./util.mjs";
 import { appendAudit } from "./audit.mjs";
 import { resolveWorkspaceById, cleanWorkspaceId } from "./workspaces.mjs";
@@ -17,7 +17,6 @@ import { cleanOptionalSessionId, findThreadResumeMeta, resumeMetaBelongsToWorksp
 import { extractJobArtifacts, sanitizePersistedArtifacts, publicArtifactResponses } from "./artifacts.mjs";
 import { buildCodexArgs } from "./adapters/codex.mjs";
 import { buildClaudeArgs } from "./adapters/claude.mjs";
-import { buildCursorArgs, parseCursorResult } from "./adapters/cursor.mjs";
 import { buildKimiArgs, parseKimiResult } from "./adapters/kimi.mjs";
 import { isResumableSessionId, isKimiSessionId } from "./sessionid.mjs";
 import { store } from "./store.mjs";
@@ -77,6 +76,10 @@ function loadPersistedJobs() {
   for (const { sourceId, job } of store.loadJobRecords()) {
     try {
       if (!job || typeof job.id !== "string") continue;
+      // A retired harness's job (Cursor) stays on disk but out of every list,
+      // thread and resume: read as the Codex fallback, it would hand a Cursor
+      // session id to Codex.
+      if (retiredJobProviders.has(String(job.provider || "").trim().toLowerCase())) continue;
 
       job.provider = normalizeJobProvider(job.provider);
       job.artifacts = sanitizePersistedArtifacts(job);
@@ -402,11 +405,11 @@ function cleanProviderModel(provider, value) {
 function cleanOptionalProvider(value) {
   if (value === undefined || value === null || value === "") return "codex";
   if (typeof value !== "string") {
-    throw Object.assign(new Error("provider must be codex, claude, cursor, or kimi"), { status: 400 });
+    throw Object.assign(new Error("provider must be codex, claude, or kimi"), { status: 400 });
   }
   const normalized = value.trim().toLowerCase();
   if (!allowedJobProviders.has(normalized)) {
-    throw Object.assign(new Error("provider must be codex, claude, cursor, or kimi"), { status: 400 });
+    throw Object.assign(new Error("provider must be codex, claude, or kimi"), { status: 400 });
   }
   return normalized;
 }
@@ -641,11 +644,9 @@ function promptWithSelectedSkills(prompt, provider, skills) {
   if (!skills.length) return prompt;
   const label = provider === "claude"
     ? "Claude"
-    : provider === "cursor"
-      ? "Cursor"
-      : provider === "kimi"
-        ? "Kimi"
-        : "Codex";
+    : provider === "kimi"
+      ? "Kimi"
+      : "Codex";
   const blocks = skills
     .map((skill) => {
       const body = boundedSkillBody(skill.file);
@@ -992,7 +993,6 @@ function buildJobArgs(job) {
       ? [claudeJobRunner, ...buildClaudeArgs(job, { transport: "stream" })]
       : buildClaudeArgs(job);
   }
-  if (job.provider === "cursor") return buildCursorArgs(job);
   if (job.provider === "kimi") return buildKimiArgs(job);
   return codexTransport === "app-server" ? [codexJobRunner] : buildCodexArgs(job);
 }
@@ -1000,7 +1000,6 @@ function buildJobArgs(job) {
 
 function jobBinary(provider) {
   if (provider === "claude") return claudeTransport === "stream" ? process.execPath : claudeBin;
-  if (provider === "cursor") return cursorBin;
   if (provider === "kimi") return kimiBin;
   return codexTransport === "app-server" ? process.execPath : codexBin;
 }
@@ -1054,8 +1053,8 @@ function buildJobEnv(job) {
   if (job.reasoningEffort) env.RELAY_REASONING_EFFORT = job.reasoningEffort;
   if (job.resumeSessionId) env.RELAY_RESUME_SESSION_ID = job.resumeSessionId;
 
-  if (job.provider === "cursor" || job.provider === "kimi") {
-    // Direct Cursor and Kimi subscription jobs never inherit ambient AWS
+  if (job.provider === "kimi") {
+    // Direct Kimi subscription jobs never inherit ambient AWS
     // credential or Bedrock configuration, mirroring direct Claude auth.
     delete env.AWS_ACCESS_KEY_ID;
     delete env.AWS_SECRET_ACCESS_KEY;
@@ -1101,11 +1100,9 @@ function buildExecutionReceipt(job) {
   const provider = normalizeJobProvider(job.provider);
   const providerBin = provider === "claude"
     ? claudeBin
-    : provider === "cursor"
-      ? cursorBin
-      : provider === "kimi"
-        ? kimiBin
-        : codexBin;
+    : provider === "kimi"
+      ? kimiBin
+      : codexBin;
   return {
     provider,
     transport: provider === "codex" ? codexTransport : "cli",
@@ -1593,16 +1590,15 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
   // phones and writes its final answer to the result file, like Codex.
   const claudeStream = job.provider === "claude" && job.claudeTransport === "stream";
   const stdoutResultProvider = !claudeStream
-    && (job.provider === "claude" || job.provider === "cursor" || job.provider === "kimi");
+    && (job.provider === "claude" || job.provider === "kimi");
   const runnerError = claudeStream
     ? cleanApiText(await readTextFileBounded(jobErrorPath(job), 16 * 1024).catch(() => "")).trim()
     : "";
   const resultText = stdoutResultProvider
     ? await readTextFileBounded(job.stdoutPath, maxOutputBytes)
     : await readTextFileBounded(job.resultPath, maxOutputBytes);
-  const cursorResult = job.provider === "cursor" ? parseCursorResult(resultText) : null;
   const kimiResult = job.provider === "kimi" ? parseKimiResult(resultText) : null;
-  const cleanResult = cleanAssistantResult(cursorResult?.result ?? kimiResult?.result ?? resultText).trim();
+  const cleanResult = cleanAssistantResult(kimiResult?.result ?? resultText).trim();
   const failedOutputText = stdoutResultProvider ? cleanResult : "";
 
   job.updatedAt = finishedAt;
@@ -1612,7 +1608,6 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
   job.timedOut = active.timedOut;
   const appServerSessionId = await readTextFileBounded(path.join(logsDir, `${job.id}.session-id`), 512).catch(() => "");
   job.sessionId ||=
-    cursorResult?.sessionId ||
     kimiResult?.sessionId ||
     appServerSessionId.trim() ||
     job.resumeSessionId ||
@@ -1636,7 +1631,7 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
     job.status = "failed";
     job.result = null;
     job.artifacts = [];
-    const providerName = job.provider === "cursor" ? "Cursor" : job.provider === "kimi" ? "Kimi K3" : "Claude";
+    const providerName = job.provider === "kimi" ? "Kimi K3" : "Claude";
     job.error = `${providerName} exited successfully without producing output.`;
   } else if (code === 0) {
     job.status = "succeeded";

@@ -7,7 +7,7 @@ credentials never leave that computer. What a tool was given and what it returne
 leave it only as steps in the job timeline (§2.11), over the same authenticated
 routes as the job's logs.
 
-- `GET /v1/codex/skills?provider=<codex|claude|cursor|kimi>&workspaceId=<id>` returns sanitized
+- `GET /v1/codex/skills?provider=<codex|claude|kimi>&workspaceId=<id>` returns sanitized
   metadata for real global and workspace skills/commands discovered on that runner.
 - Codex jobs accept `approvalPolicy` (`on-request`, `untrusted`, or `never`). Claude
   jobs accept `permissionMode` (`manual`, legacy alias `default`, `acceptEdits`, `plan`,
@@ -244,7 +244,7 @@ catch maps unknown errors to 500 (6633–6638).
 
 | Status | Used for (representative messages) |
 |---|---|
-| 400 | validation: `request body must be a JSON object`, `prompt is required and must be a non-empty string`, `workspaceId is not registered`, `workspace path must stay inside the workspace root`, `path must stay inside the workspace root`, `offset must be a non-negative integer`, `stream offset must be a non-negative integer`, `invalid JSON body`, `provider must be codex, claude, or cursor`, `reasoningEffort must be low, medium, high, xhigh, max, or ultra`, `session not found in runner CODEX_HOME`, `session provider does not match requested provider`, `session does not belong to workspace`, `chat thread workspace does not match requested workspaceId`, `preview is only available for HTML and SVG files` |
+| 400 | validation: `request body must be a JSON object`, `prompt is required and must be a non-empty string`, `workspaceId is not registered`, `workspace path must stay inside the workspace root`, `path must stay inside the workspace root`, `offset must be a non-negative integer`, `stream offset must be a non-negative integer`, `invalid JSON body`, `provider must be codex, claude, or kimi`, `reasoningEffort must be low, medium, high, xhigh, max, or ultra`, `session not found in runner CODEX_HOME`, `session provider does not match requested provider`, `session does not belong to workspace`, `chat thread workspace does not match requested workspaceId`, `preview is only available for HTML and SVG files` |
 | 401 | `client certificate is required` |
 | 403 | `client certificate subject is not allowed`, `file matches the read denylist` |
 | 404 | `not found`, `job not found`, `thread not found`, `artifact not found`, `artifact preview not available`, `workspace directory was not found`, `file was not found` |
@@ -302,7 +302,7 @@ the machine contract but frozen as an existing route.
 {
   "id": "gpt-4o",
   "label": "GPT-4o (Azure)",
-  "provider": "azure",            // codex|claude|cursor|kimi|azure|bedrock
+  "provider": "azure",            // codex|claude|kimi|azure|bedrock
   "modes": ["chat"],              // subset of ["chat","task"]
   "azureDeployment": "gpt-4o",    // optional
   "taskModel": "opus",            // optional: model id the app passes to POST /jobs
@@ -377,7 +377,7 @@ any response** (2077–2093, 2195–2276).
 
 ### 1.10 `GET /v1/codex/skills` (1427–1430)
 
-Query: `provider` — optional, `codex|claude|cursor|kimi` (400 otherwise; default
+Query: `provider` — optional, `codex|claude|kimi` (400 otherwise; default
 `codex`); `workspaceId` — optional registered workspace whose project-local
 commands/skills should be included (400 when unknown). 200:
 
@@ -551,8 +551,9 @@ continued on the Relay machine. Active sessions also conflict.
 daemon restart; the resolved path must remain inside the configured browse root
 and must derive the supplied workspace id.
 
-**`POST /v1/codex/session-imports`** — imports one planned Codex, Claude Code,
-or Cursor transcript. The
+**`POST /v1/codex/session-imports`** — imports one planned Codex or Claude
+Code transcript. (Cursor, retired 2026-10-07: a plan answers each Cursor
+session `conflict` / `harness_not_supported` instead of failing the plan.) The
 request carries `workspaceId`, the exact `sourceCwd` recorded by the rollout,
 and a `session` with `id`, timestamps, SHA-256, and a base64 transcript. Inline
 transcripts are capped at 20 MiB; their hash, native session id, and source cwd are
@@ -570,11 +571,10 @@ the declared total size and SHA-256 before entering the same native importer.
 **`GET /v1/codex/sessions`** (1471–1476, `listWorkspaceSessions`
 3401–3459) — provider CLI sessions found under the runner's
 `CODEX_HOME/sessions` (`*.jsonl` with a `session_meta` line, 3365–3395),
-Claude Code transcripts under `CODEX_RUN_HOME/.claude/projects/<slug>/<id>.jsonl`,
-and Cursor chats under `CODEX_RUN_HOME/.cursor/chats/<md5(cwd)>/<id>/` (plus
-`projects/<encoded-cwd>/agent-transcripts`), merged with in-memory job
-sessions. Query: `workspaceId` (400 if not registered), `provider` (any of
-`codex|claude|cursor|kimi|azure|bedrock`), `limit` (default 50, clamp 1–200;
+and Claude Code transcripts under `CODEX_RUN_HOME/.claude/projects/<slug>/<id>.jsonl`,
+merged with in-memory job sessions. Stored jobs of a retired harness (Cursor)
+are not loaded at all. Query: `workspaceId` (400 if not registered), `provider` (any of
+`codex|claude|kimi|azure|bedrock`), `limit` (default 50, clamp 1–200;
 `clampLimit` 1592–1596). Sessions whose cwd lies outside every workspace are
 excluded. 200:
 
@@ -677,7 +677,7 @@ running` (1179–1215). Queue is FIFO by `createdAt` with
 exposed (gap; see Part 2 §2.8).
 
 **`GET /v1/codex/jobs`** (1516–1529) — query `workspaceId` (400 if
-unknown), `provider` (`codex|claude|cursor|kimi`), `limit` (default 50, clamp
+unknown), `provider` (`codex|claude|kimi`), `limit` (default 50, clamp
 1–200). Non-terminal jobs sort ahead of finished ones, then by `updatedAt`
 (falling back to `createdAt`), then the list is sliced. Each entry is a
 **compact** job response (4 KiB text fields). No offset/cursor (ambiguity A2).
@@ -689,7 +689,7 @@ unknown), `provider` (`codex|claude|cursor|kimi`), `limit` (default 50, clamp
 {
   "workspaceId": "scratch",          // required, must resolve (static or dynamic)
   "prompt": "…",                      // required non-empty; ≤ body cap
-  "provider": "codex",               // optional codex|claude|cursor|kimi (default codex)
+  "provider": "codex",               // optional codex|claude|kimi (default codex)
   "model": "gpt-5-codex",            // optional provider model id; slashes are allowed for ids such as kimi-code/k3
   "reasoningEffort": "high",         // optional; codex or claude when advertised by the selected task model
   "permissionMode": "acceptEdits",   // optional; claude only; acceptEdits|auto|bypassPermissions|default|manual|dontAsk|plan; default normalizes to manual (87)
@@ -707,7 +707,7 @@ unknown), `provider` (`codex|claude|cursor|kimi`), `limit` (default 50, clamp
 Response: **202** with a preview-shaped job response (§1.16). Effects:
 attachments are written under the data dir and their runner-local paths
 appended to the prompt manifest (2781–2787). Selected skill bodies are inlined
-for Claude, Cursor, Kimi, and the legacy Codex exec transport; Codex app-server jobs
+for Claude, Kimi, and the legacy Codex exec transport; Codex app-server jobs
 receive one structured skill input instead, avoiding duplicate instructions.
 The job is then persisted and queued; audit `job_created`.
 
@@ -722,19 +722,16 @@ one that help lists (see the model catalog above); otherwise **400**
 `reasoningEffort <level> is not supported by claude model <model>`.
 
 Provider invocation (contract-relevant): prompt is delivered on **stdin**
-for codex/claude, as an argv for cursor/kimi. Codex app-server jobs send `model`,
+for codex/claude, as an argv for kimi. Codex app-server jobs send `model`,
 `effort`, `approvalPolicy`, `approvalsReviewer=user`, and `sandbox=workspace-write`
 on thread/turn requests. The compatibility exec transport uses
 `-a <approvalPolicy> --sandbox workspace-write` as top-level Codex flags and
 never adds the bypass flag. Placing them before `exec` keeps the controls valid
 for both new jobs and `exec resume` jobs.
 Claude runs `claude --print --model … --effort … --permission-mode …` with the
-Relay approval MCP and a server-minted `--session-id`; cursor runs
-`cursor-agent -p --force --trust --workspace …
---output-format json`, result parsed from the JSON envelope incl.
-`session_id`; kimi runs `kimi --model kimi-code/k3 --prompt …
+Relay approval MCP and a server-minted `--session-id`; kimi runs `kimi --model kimi-code/k3 --prompt …
 --output-format stream-json` and resumes with `--session`. AWS/Bedrock
-credentials are scrubbed from the child env for direct claude/cursor/kimi jobs.
+credentials are scrubbed from the child env for direct claude/kimi jobs.
 
 Claude transport (`RELAYD_CLAUDE_TRANSPORT`, default `stream`): the invocation
 above gains `--output-format stream-json --verbose --include-partial-messages`
@@ -744,8 +741,7 @@ per step to stderr, and writes the final answer to the result file. `print`
 runs the invocation above exactly as written, with no timeline and the answer
 taken from stdout. Either way `result` is the final answer only.
 
-Session-id semantics: claude = server-minted upfront; cursor = parsed from
-result JSON; kimi = read from Kimi's session index/result events; codex = discovered post-run by diffing the workspace's session
+Session-id semantics: claude = server-minted upfront; kimi = read from Kimi's session index/result events; codex = discovered post-run by diffing the workspace's session
 files (exactly one new file, 4769–4773); resume jobs keep the resumed id.
 
 **`GET /v1/codex/jobs/:id`** (1560–1569) — 200 job response. Shape:
@@ -801,7 +797,7 @@ preview fields), `preview` = 64 KiB, `compact` = 4 KiB. stdout/stderr are
 
 Failure semantics (4626–4693): non-zero exit → `failed` with `error` =
 stderr, else the provider's stdout, else `"<provider> exited with code
-<n>[ and signal <sig>]"`; claude/cursor exiting 0 with empty output →
+<n>[ and signal <sig>]"`; claude/kimi exiting 0 with empty output →
 `failed` with `"<Provider> exited successfully without producing
 output."`; timeout → `timeout` / `job timed out`; spawn failure → `failed`
 with the spawn error message.
@@ -1369,7 +1365,7 @@ capability flags (the catalog honesty rules extended):
 
 ```json
 {"harnesses": [{
-  "provider": "claude",              // codex|claude|cursor|kimi
+  "provider": "claude",              // codex|claude|kimi
   "installed": true, "version": "2.1.0",
   "loggedIn": true, "authKind": "subscription",   // subscription|api|unknown
   "supportsApprovals": true, "supportsResume": true, "supportsChat": false,
@@ -1666,7 +1662,7 @@ wrote and the steps it took. Stored per job at
 `<dataDir>/logs/<jobId>.timeline.ndjson`, append-only, one JSON event per
 line. An event's **sequence number** (`seq`) is its 1-based line number. The
 file is deleted wherever the job's logs are deleted. Claude Code jobs on the
-`stream` transport write one; Cursor, Kimi and `print`-transport Claude jobs
+`stream` transport write one; Kimi and `print`-transport Claude jobs
 do not. The runner is told where to write by `RELAY_TIMELINE_PATH` in its
 environment.
 

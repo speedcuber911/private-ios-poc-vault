@@ -53,7 +53,6 @@ async function startServer(dir, homeDir, extraEnv = {}) {
       CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
       CODEX_BIN: fakeCodex,
       CLAUDE_BIN: fakeClaude,
-      CURSOR_BIN: path.join(dir, "missing-cursor"),
       KIMI_BIN: path.join(dir, "missing-kimi"),
       ...extraEnv,
     },
@@ -162,42 +161,4 @@ test("authFailureReason reads the CLI's own refusal, not an agent quoting a 401"
   assert.equal(authFailureReason("claude", "Claude Code ended with error_max_turns."), null);
   assert.equal(authFailureReason("kimi", REVOKED), null);
   assert.equal(authFailureReason("claude", ""), null);
-});
-
-// cursor-agent with tokens on disk that Cursor no longer accepts: status still
-// says authenticated, and only its message gives it away.
-const STALE_CURSOR = [
-  "#!/bin/sh",
-  'if [ "$1" = "--version" ]; then echo "2026.09.18-9a7762b"; exit 0; fi',
-  'if [ "$1" = "status" ]; then echo \'{"status":"authenticated","isAuthenticated":true,"hasAccessToken":true,"hasRefreshToken":true,"message":"Logged in (unable to fetch user details)"}\'; exit 0; fi',
-  'echo "job must not start" >&2',
-  "exit 9",
-  "",
-].join("\n");
-
-test("cursor-agent that cannot load its account reads as signed out, not connected", async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-auth-rejection-cursor-"));
-  const homeDir = path.join(dir, "home");
-  fs.mkdirSync(homeDir, { recursive: true });
-  const fakeCursor = path.join(dir, "stale-cursor");
-  fs.writeFileSync(fakeCursor, STALE_CURSOR, { mode: 0o755 });
-  const server = await startServer(dir, homeDir, { CURSOR_BIN: fakeCursor });
-  try {
-    const { harnesses } = await (await fetch(`${server.baseUrl}/v1/harness`)).json();
-    const cursor = harnesses.find((entry) => entry.provider === "cursor");
-    assert.equal(cursor.installed, true);
-    assert.equal(cursor.loggedIn, false);
-    assert.match(cursor.authRejected.reason, /could not load the signed-in account/);
-
-    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ workspaceId: "scratch", provider: "cursor", prompt: "Hello" }),
-    });
-    assert.equal(create.status, 503);
-    assert.match((await create.json()).error, /Cursor's sign-in on this computer was refused.*Sign in again/);
-  } finally {
-    await server.stop();
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
 });

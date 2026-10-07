@@ -253,10 +253,7 @@ async function collectRendezvousBlob({ cloudUrl, pairingId, authToken, macKey, f
 // Installs an already-decrypted sync-auth bundle into the runner home.
 // Every member is optional; an absent (or wrong-typed) member lands in
 // `skipped` rather than being silently dropped, so the CLI can report
-// honestly which credentials actually made it onto the sandbox. Cursor has
-// no portable credential file and is never a bundle member — it is not
-// listed in `installed` or `skipped` here, by design (v0 tells the operator
-// to log in on the sandbox later, rather than pretending it synced).
+// honestly which credentials actually made it onto the sandbox.
 function installCredentialBundle(bundle, {
   runHome,
   codexHome,

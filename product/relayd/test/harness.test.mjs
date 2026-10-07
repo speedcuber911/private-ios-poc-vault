@@ -63,7 +63,6 @@ async function startServer(extraEnv = {}) {
       CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
       CODEX_BIN: fakeCodex,
       CLAUDE_BIN: fakeClaude,
-      CURSOR_BIN: path.join(dir, "missing-cursor"),
       KIMI_BIN: path.join(dir, "missing-kimi"),
       ...extraEnv,
     },
@@ -122,10 +121,8 @@ test("GET /v1/harness detects installed CLIs with versions and capability flags"
     assert.equal(byProvider.claude.loggedIn, true);
     assert.equal(byProvider.claude.supportsApprovals, true);
     assert.deepEqual(byProvider.claude.taskControls.permissionModes, ["manual", "acceptEdits", "plan", "dontAsk", "auto"]);
-    assert.equal(byProvider.cursor.installed, false);
-    assert.equal(byProvider.cursor.version, null);
-    assert.equal(byProvider.cursor.loggedIn, false);
-    assert.equal(byProvider.cursor.lastSmoke, null);
+    // Cursor is retired: relayd no longer reports it at all.
+    assert.equal(byProvider.cursor, undefined);
     assert.equal(byProvider.kimi.installed, false);
     assert.equal(byProvider.kimi.loggedIn, false);
     assert.equal(byProvider.kimi.taskControls.model, true);
@@ -264,10 +261,12 @@ test("smoke op: succeeds with output, updates lastSmoke; unknown provider is 400
 
     const bad = await fetch(`${server.baseUrl}/v1/harness/gemini/smoke`, { method: "POST" });
     assert.equal(bad.status, 400);
-    assert.match((await bad.json()).error, /provider must be codex, claude, cursor, or kimi/);
+    assert.match((await bad.json()).error, /provider must be codex, claude, or kimi/);
+    const retired = await fetch(`${server.baseUrl}/v1/harness/cursor/smoke`, { method: "POST" });
+    assert.equal(retired.status, 400);
 
     // Smoke against a missing binary fails but doesn't wedge the op.
-    const missing = await fetch(`${server.baseUrl}/v1/harness/cursor/smoke`, { method: "POST" });
+    const missing = await fetch(`${server.baseUrl}/v1/harness/kimi/smoke`, { method: "POST" });
     assert.equal(missing.status, 202);
     const missingOp = (await missing.json()).op;
     const failed = await pollOp(server, missingOp.id, (o) => ["failed", "expired"].includes(o.status));

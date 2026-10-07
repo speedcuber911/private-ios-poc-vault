@@ -26,7 +26,7 @@ function cleanThreadProviderFilter(value) {
   }
   const normalized = value.trim().toLowerCase();
   if (!allowedThreadProviders.has(normalized)) {
-    throw Object.assign(new Error("provider must be codex, claude, cursor, kimi, azure, or bedrock"), { status: 400 });
+    throw Object.assign(new Error("provider must be codex, claude, kimi, azure, or bedrock"), { status: 400 });
   }
   return normalized;
 }
@@ -145,366 +145,6 @@ function findClaudeSessionMeta(sessionId) {
   return readClaudeSessionMeta(sessionFile);
 }
 
-function cursorWorkspaceHash(cwd) {
-  return crypto.createHash("md5").update(String(cwd)).digest("hex");
-}
-
-function cursorProjectSlug(cwd) {
-  return String(cwd).replace(/^\/+/, "").replace(/\//g, "-");
-}
-
-function cursorSlugCandidates(workspace) {
-  return [...new Set([
-    cursorProjectSlug(workspace.path),
-    cursorProjectSlug(realpathOrResolve(workspace.path)),
-  ])];
-}
-
-function cursorTranscriptUpdatedAt(file, directoryStat) {
-  if (!file) return directoryStat.mtime.toISOString();
-  try {
-    const stat = fs.statSync(file);
-    if (stat.isFile() && stat.mtimeMs > directoryStat.mtimeMs) return stat.mtime.toISOString();
-  } catch {
-    // The chat folder still has a usable timestamp when the transcript leaf is missing.
-  }
-  return directoryStat.mtime.toISOString();
-}
-
-function cursorLoggedWorkspacePath(projectDir) {
-  let fd;
-  try {
-    fd = fs.openSync(path.join(projectDir, "worker.log"), "r");
-    const buf = Buffer.alloc(65536);
-    const read = fs.readSync(fd, buf, 0, buf.length, 0);
-    const match = buf.subarray(0, read).toString("utf8").match(/workspacePath=([^\s\0]+)/);
-    return match ? match[1] : null;
-  } catch {
-    return null;
-  } finally {
-    if (fd !== undefined) fs.closeSync(fd);
-  }
-}
-
-// Cursor project-folder slug -> workspace, longest path winning and the
-// earlier workspace winning a tie, exactly as a scan of the registry picks.
-//
-// Built once per listing rather than once per project folder: computing the
-// slugs means a realpath of every workspace path, and with a browse root of
-// "/" every session cwd the machine has ever seen is a workspace — most of
-// them long deleted, so each realpath threw ENOENT and captured a stack. Done
-// per folder, per workspace, that was ~11M throwing realpath calls for one
-// `GET /v1/codex/threads` on a real machine (193 folders x ~238 workspaces x
-// ~238), which pinned relayd's only thread and starved every other route.
-function cursorSlugIndex() {
-  const index = new Map();
-  for (const workspace of [...workspaces.values(), ...dynamicWorkspaces.values()]) {
-    for (const slug of cursorSlugCandidates(workspace)) {
-      const current = index.get(slug);
-      if (!current || workspace.path.length > current.path.length) index.set(slug, workspace);
-    }
-  }
-  index.registrySize = workspaces.size + dynamicWorkspaces.size;
-  return index;
-}
-
-function workspaceForCursorProjectName(projectName, projectDir, slugIndex = cursorSlugIndex()) {
-  const matched = slugIndex.get(projectName) || null;
-  if (matched) return matched;
-  // Cursor truncates long paths and appends a short hash. The folder name is
-  // then no longer the workspace slug, so the log's workspacePath is the link.
-  const hashed = /^(.+)-[0-9a-f]{6,8}$/.exec(projectName);
-  if (!hashed || hashed[1].length < 20) return null;
-  const logged = cursorLoggedWorkspacePath(projectDir);
-  if (!logged) return null;
-  return workspaceForPath(logged);
-}
-
-// Cursor project folders that belong to any of `targets` (id -> workspace),
-// in directory order, each paired with its workspace. Every folder name is
-// matched against the workspace registry once, not once per target.
-function cursorProjectDirsForWorkspaces(targets) {
-  const projectsRoot = path.join(runHome, ".cursor", "projects");
-  let entries = [];
-  try {
-    entries = fs.readdirSync(projectsRoot, { withFileTypes: true });
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-    return [];
-  }
-  const dirs = [];
-  let slugIndex = cursorSlugIndex();
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    // A hashed folder name resolves through workspaceForPath, which can add a
-    // workspace; later folders must then see it, as a fresh scan would.
-    if (slugIndex.registrySize !== workspaces.size + dynamicWorkspaces.size) slugIndex = cursorSlugIndex();
-    const projectDir = path.join(projectsRoot, entry.name);
-    const owner = workspaceForCursorProjectName(entry.name, projectDir, slugIndex);
-    const workspace = owner ? targets.get(owner.id) : null;
-    if (workspace) dirs.push({ projectDir, workspace });
-  }
-  return dirs;
-}
-
-function readJsonObject(filePath) {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-function readCursorMeta(sessionDir) {
-  const parsed = readJsonObject(path.join(sessionDir, "meta.json"));
-  const cwd = parsed?.cwd;
-  if (typeof cwd !== "string" || cwd.length === 0 || /[\0\r\n]/.test(cwd)) return null;
-  const createdAtMs = Number(parsed.createdAtMs);
-  return {
-    cwd,
-    provider: "cursor",
-    timestamp: Number.isFinite(createdAtMs) ? new Date(createdAtMs).toISOString() : cleanSessionTimestamp(parsed.timestamp),
-  };
-}
-
-function cursorTranscriptInDir(sessionDir, sessionId) {
-  const candidates = [
-    path.join(sessionDir, "transcript.jsonl"),
-    path.join(sessionDir, `${sessionId}.jsonl`),
-  ];
-  for (const file of candidates) {
-    try {
-      if (fs.statSync(file).isFile()) return file;
-    } catch {
-      // try the next known leaf name
-    }
-  }
-  return null;
-}
-
-function findCursorProjectTranscript(sessionId) {
-  const projectsRoot = path.join(runHome, ".cursor", "projects");
-  let projectNames = [];
-  try {
-    projectNames = fs.readdirSync(projectsRoot, { withFileTypes: true });
-  } catch (error) {
-    if (error.code === "ENOENT") return null;
-    throw error;
-  }
-
-  let newest = null;
-  let newestMtimeMs = -Infinity;
-  for (const entry of projectNames) {
-    if (!entry.isDirectory()) continue;
-    const file = path.join(projectsRoot, entry.name, "agent-transcripts", sessionId, `${sessionId}.jsonl`);
-    let stat;
-    try {
-      stat = fs.statSync(file);
-    } catch {
-      continue;
-    }
-    if (!stat.isFile()) continue;
-    if (newest === null || stat.mtimeMs > newestMtimeMs) {
-      newest = { file, slug: entry.name, stat };
-      newestMtimeMs = stat.mtimeMs;
-    }
-  }
-  if (!newest) return null;
-
-  const matchedWorkspace = workspaceForCursorProjectName(newest.slug, path.join(projectsRoot, newest.slug));
-  return {
-    id: sessionId,
-    cwd: matchedWorkspace?.path || null,
-    provider: "cursor",
-    timestamp: newest.stat.mtime.toISOString(),
-    file: newest.file,
-    sessionDir: path.dirname(newest.file),
-    updatedAt: newest.stat.mtime.toISOString(),
-    workspace: matchedWorkspace,
-  };
-}
-
-function findCursorSession(sessionId) {
-  if (!isResumableSessionId(sessionId)) return null;
-  const chatsRoot = path.join(runHome, ".cursor", "chats");
-  let buckets = [];
-  try {
-    buckets = fs.readdirSync(chatsRoot, { withFileTypes: true });
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-  }
-
-  let newest = null;
-  let newestMtimeMs = -Infinity;
-  for (const bucket of buckets) {
-    if (!bucket.isDirectory() || !/^[a-f0-9]{32}$/.test(bucket.name)) continue;
-    const sessionDir = path.join(chatsRoot, bucket.name, sessionId);
-    let stat;
-    try {
-      stat = fs.statSync(sessionDir);
-    } catch {
-      continue;
-    }
-    if (!stat.isDirectory()) continue;
-    const meta = readCursorMeta(sessionDir);
-    if (!meta) continue;
-    if (newest === null || stat.mtimeMs > newestMtimeMs) {
-      newest = {
-        id: sessionId,
-        ...meta,
-        file: cursorTranscriptInDir(sessionDir, sessionId),
-        sessionDir,
-        updatedAt: stat.mtime.toISOString(),
-      };
-      newestMtimeMs = stat.mtimeMs;
-    }
-  }
-  return newest || findCursorProjectTranscript(sessionId);
-}
-
-function findCursorSessionMeta(sessionId) {
-  const session = findCursorSession(sessionId);
-  if (!session?.cwd) return null;
-  return { cwd: session.cwd, provider: "cursor", timestamp: session.timestamp };
-}
-
-function materializeCursorChatWorkspaces(workspaceForCwd = workspaceForSessionCwd) {
-  const chatsRoot = path.join(runHome, ".cursor", "chats");
-  let buckets = [];
-  try {
-    buckets = fs.readdirSync(chatsRoot, { withFileTypes: true });
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-    return;
-  }
-  for (const bucket of buckets) {
-    if (!bucket.isDirectory() || !/^[a-f0-9]{32}$/.test(bucket.name)) continue;
-    let names = [];
-    try {
-      names = fs.readdirSync(path.join(chatsRoot, bucket.name), { withFileTypes: true });
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-      continue;
-    }
-    for (const entry of names) {
-      if (!entry.isDirectory() || !isResumableSessionId(entry.name)) continue;
-      const meta = readCursorMeta(path.join(chatsRoot, bucket.name, entry.name));
-      if (meta?.cwd) workspaceForCwd(meta.cwd);
-    }
-  }
-}
-
-
-function listCursorSessionsForWorkspace(workspace) {
-  return listCursorSessionsForWorkspaces([workspace]).get(workspace.id) || [];
-}
-
-// Cursor sessions for several workspaces, grouped by workspace id, from ONE
-// walk of ~/.cursor. Each workspace's list is identical to what a separate
-// per-workspace walk returns (chat folders first, then project transcripts,
-// both in directory order).
-function listCursorSessionsForWorkspaces(workspaceList, workspaceForCwd = workspaceForSessionCwd) {
-  const targets = new Map();
-  for (const workspace of workspaceList) {
-    if (workspace && !targets.has(workspace.id)) targets.set(workspace.id, workspace);
-  }
-  const groups = new Map();
-  const groupFor = (id) => {
-    let found = groups.get(id);
-    if (!found) {
-      found = new Map();
-      groups.set(id, found);
-    }
-    return found;
-  };
-  if (targets.size === 0) return new Map();
-
-  const chatsRoot = path.join(runHome, ".cursor", "chats");
-  let buckets = [];
-  try {
-    buckets = fs.readdirSync(chatsRoot, { withFileTypes: true });
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-  }
-  for (const bucket of buckets) {
-    if (!bucket.isDirectory() || !/^[a-f0-9]{32}$/.test(bucket.name)) continue;
-    let names = [];
-    try {
-      names = fs.readdirSync(path.join(chatsRoot, bucket.name), { withFileTypes: true });
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-      continue;
-    }
-    for (const entry of names) {
-      if (!entry.isDirectory() || !isResumableSessionId(entry.name)) continue;
-      const sessionDir = path.join(chatsRoot, bucket.name, entry.name);
-      const meta = readCursorMeta(sessionDir);
-      if (!meta) continue;
-      const sessionWorkspace = workspaceForCwd(meta.cwd);
-      if (!sessionWorkspace || !targets.has(sessionWorkspace.id)) continue;
-      let stat;
-      try {
-        stat = fs.statSync(sessionDir);
-      } catch {
-        continue;
-      }
-      const file = cursorTranscriptInDir(sessionDir, entry.name);
-      groupFor(sessionWorkspace.id).set(entry.name, {
-        id: entry.name,
-        provider: "cursor",
-        cwd: meta.cwd,
-        timestamp: meta.timestamp,
-        updatedAt: cursorTranscriptUpdatedAt(file, stat),
-        file,
-      });
-    }
-  }
-
-  for (const { projectDir, workspace } of cursorProjectDirsForWorkspaces(targets)) {
-    const found = groupFor(workspace.id);
-    const transcriptsDir = path.join(projectDir, "agent-transcripts");
-    let names = [];
-    try {
-      names = fs.readdirSync(transcriptsDir, { withFileTypes: true });
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-      continue;
-    }
-    for (const entry of names) {
-      if (!entry.isDirectory() || !isResumableSessionId(entry.name)) continue;
-      const file = path.join(transcriptsDir, entry.name, `${entry.name}.jsonl`);
-      let stat;
-      try {
-        stat = fs.statSync(file);
-      } catch {
-        continue;
-      }
-      if (!stat.isFile()) continue;
-      const existing = found.get(entry.name);
-      if (existing) {
-        if (!existing.file) existing.file = file;
-        const updatedAt = stat.mtime.toISOString();
-        if (Date.parse(updatedAt) > Date.parse(existing.updatedAt || 0)) existing.updatedAt = updatedAt;
-        continue;
-      }
-      found.set(entry.name, {
-        id: entry.name,
-        provider: "cursor",
-        cwd: workspace.path,
-        timestamp: stat.mtime.toISOString(),
-        updatedAt: stat.mtime.toISOString(),
-        file,
-      });
-    }
-  }
-
-  const result = new Map();
-  for (const [id, found] of groups) result.set(id, [...found.values()]);
-  return result;
-}
-
-
 function findThreadResumeMeta(sessionId) {
   const relatedJobs = [...jobs.values()]
     .filter((job) => jobThreadId(job) === sessionId)
@@ -520,9 +160,8 @@ function findThreadResumeMeta(sessionId) {
   }
 
   // A session with no job yet is a native or staged transcript: Codex
-  // rollouts, Claude Code jsonl, or Cursor chats/transcripts. Kimi still has
-  // no portable file here.
-  const sessionMeta = findSessionMeta(sessionId) || findClaudeSessionMeta(sessionId) || findCursorSessionMeta(sessionId);
+  // rollouts or Claude Code jsonl. Kimi still has no portable file here.
+  const sessionMeta = findSessionMeta(sessionId) || findClaudeSessionMeta(sessionId);
   if (!sessionMeta) return null;
   return {
     provider: normalizeJobProvider(sessionMeta.provider),
@@ -716,7 +355,7 @@ function cleanSessionTimestamp(value) {
 
 
 // One listing asks for the same few hundred cwds over and over (every
-// transcript, then every Cursor chat twice). Resolving one means a realpath,
+// transcript). Resolving one means a realpath,
 // which throws for a cwd that no longer exists, so answer each cwd once per
 // listing. Safe within a listing: a cwd always resolves to the same workspace
 // once the first lookup has registered it.
@@ -811,31 +450,6 @@ function listWorkspaceSessions({ workspaceId, provider = null, limit, includeSum
         stat,
         syncedTitles,
       });
-    }
-  }
-
-  if (!provider || provider === "cursor") {
-    if (!selectedWorkspace) materializeCursorChatWorkspaces(workspaceForCwd);
-    const cursorWorkspaces = selectedWorkspace
-      ? [selectedWorkspace]
-      : [...workspaces.values(), ...dynamicWorkspaces.values()];
-    // One pass over Cursor's folders for every workspace at once. Asking per
-    // workspace re-read every chat's meta.json once for each workspace the
-    // machine knows, and with a browse root of "/" every session cwd is one.
-    const cursorSessions = listCursorSessionsForWorkspaces(cursorWorkspaces, workspaceForCwd);
-    for (const workspace of cursorWorkspaces) {
-      for (const session of cursorSessions.get(workspace.id) || []) {
-        recordDiscoveredSession(sessionMap, summaryFiles, {
-          id: session.id,
-          sessionProvider: "cursor",
-          workspace,
-          cwd: session.cwd,
-          timestamp: session.timestamp,
-          updatedAt: session.updatedAt,
-          file: session.file,
-          syncedTitles,
-        });
-      }
     }
   }
 
@@ -1034,22 +648,6 @@ async function loadThreadDetailState(sessionId, { provider = null } = {}) {
     }
   }
 
-  if (!thread) {
-    const cursor = findCursorSession(sessionId);
-    const workspace = cursor?.workspace || (cursor?.cwd ? workspaceForSessionCwd(cursor.cwd) : null);
-    if (cursor && workspace && (!provider || provider === "cursor")) {
-      thread = threadFromSessionFile(cursor.file, {
-        id: sessionId,
-        sessionProvider: "cursor",
-        workspace,
-        cwd: cursor.cwd || workspace.path,
-        timestamp: cursor.timestamp,
-        updatedAt: cursor.updatedAt,
-      });
-      if (cursor.file) ({ messages, trailingSteps } = await readSessionTranscript(cursor.file, { sessionId }));
-    }
-  }
-
   for (const job of jobs.values()) {
     if (jobThreadId(job) !== sessionId) continue;
     const jobProvider = normalizeJobProvider(job.provider);
@@ -1235,13 +833,6 @@ function deleteThread(sessionId, { workspaceId = null, provider = null, certSubj
     (!provider || provider === "claude") &&
     (!selectedWorkspace || claudeWorkspace.id === selectedWorkspace.id);
 
-  const cursor = findCursorSession(sessionId);
-  const cursorWorkspace = cursor?.workspace || (cursor?.cwd ? workspaceForSessionCwd(cursor.cwd) : null);
-  const cursorMatches =
-    Boolean(cursor && cursorWorkspace) &&
-    (!provider || provider === "cursor") &&
-    (!selectedWorkspace || cursorWorkspace.id === selectedWorkspace.id);
-
   const matchedJobs = [...jobs.values()].filter((job) => {
     if (jobThreadId(job) !== sessionId) return false;
     const jobProvider = normalizeJobProvider(job.provider);
@@ -1252,7 +843,7 @@ function deleteThread(sessionId, { workspaceId = null, provider = null, certSubj
     return true;
   });
 
-  if (!sessionMatches && !claudeMatches && !cursorMatches && matchedJobs.length === 0) {
+  if (!sessionMatches && !claudeMatches && matchedJobs.length === 0) {
     const deletedChat = deleteChatThread(sessionId, { workspace: selectedWorkspace, provider, certSubject });
     if (deletedChat) return deletedChat;
     return null;
@@ -1273,17 +864,8 @@ function deleteThread(sessionId, { workspaceId = null, provider = null, certSubj
   const deletedClaudeFile = claudeMatches
     ? removePathInsideRoot(claudeFile, path.join(runHome, ".claude", "projects"))
     : false;
-  let deletedCursorFile = false;
-  if (cursorMatches) {
-    const cursorRoot = path.join(runHome, ".cursor");
-    if (cursor.file) deletedCursorFile = removePathInsideRoot(cursor.file, cursorRoot);
-    if (cursor.sessionDir) {
-      const metaFile = path.join(cursor.sessionDir, "meta.json");
-      removePathInsideRoot(metaFile, cursorRoot);
-    }
-  }
-  const deletedSessionFile = deletedCodexFile || deletedClaudeFile || deletedCursorFile;
-  const workspaceForAudit = selectedWorkspace || sessionWorkspace || claudeWorkspace || cursorWorkspace || workspaceForJob(matchedJobs[0]);
+  const deletedSessionFile = deletedCodexFile || deletedClaudeFile;
+  const workspaceForAudit = selectedWorkspace || sessionWorkspace || claudeWorkspace || workspaceForJob(matchedJobs[0]);
   appendAudit(
     "thread_deleted",
     {
@@ -1849,7 +1431,6 @@ function isAllowedAttachmentRoot(resolved) {
   const roots = [
     attachmentsDir,
     workspaceBrowseRoot,
-    path.join(runHome, ".cursor"),
     path.join(runHome, ".claude"),
   ];
   for (const root of roots) {
@@ -1962,8 +1543,6 @@ function questionReplyText(value) {
 }
 
 
-const CURSOR_HOUSEKEEPING_RE = /^\s*Briefly inform the user about the task result\b/i;
-
 function unwrapNativeUserPrompt(value) {
   let text = String(value ?? "");
   const queries = [];
@@ -1984,7 +1563,6 @@ function unwrapNativeUserPrompt(value) {
 
 function stripInjectedUserMarkup(value) {
   const unwrapped = unwrapNativeUserPrompt(value);
-  if (CURSOR_HOUSEKEEPING_RE.test(unwrapped)) return "";
   const reply = questionReplyText(unwrapped);
   if (reply !== null) return reply;
   let text = cleanApiText(unwrapped || "").replace(SYNTHETIC_USER_BLOCK_RE, "");
@@ -2018,13 +1596,13 @@ function isInjectedContextMessage(text) {
 
 function stripSkillInstructionPrefix(text) {
   const stripped = text
-    .replace(/^Use these (Codex|Claude|Cursor) skills for this task: [^.]+[.]\s*/i, "")
+    .replace(/^Use these (Codex|Claude) skills for this task: [^.]+[.]\s*/i, "")
     .replace(
-      /^Selected (Codex|Claude|Cursor) skills are included below[.]\s*Follow these SKILL[.]md instructions when they are relevant to the task[.]\s+[\s\S]*?\s+User task:\s*/i,
+      /^Selected (Codex|Claude) skills are included below[.]\s*Follow these SKILL[.]md instructions when they are relevant to the task[.]\s+[\s\S]*?\s+User task:\s*/i,
       "",
     );
   if (stripped !== text) return stripped;
-  if (!/^Selected (Codex|Claude|Cursor) skills are included below\b/i.test(text)) return text;
+  if (!/^Selected (Codex|Claude) skills are included below\b/i.test(text)) return text;
   const userTask = /\nUser task:\s*/i.exec(text);
   // A synced title is only the first line. If that line is the skill header
   // and the user task never made it into the stored title, drop it so the
@@ -2180,10 +1758,6 @@ export {
   findClaudeSessionFile,
   readClaudeSessionMeta,
   findClaudeSessionMeta,
-  findCursorSession,
-  findCursorSessionMeta,
-  cursorWorkspaceHash,
-  listCursorSessionsForWorkspace,
   findThreadResumeMeta,
   resumeMetaBelongsToWorkspace,
   workspaceForJob,

@@ -7,26 +7,13 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 
-import { allowedThreadProviders, bedrockRegion, cleanDisplayName, cleanOptionalEndpoint, cleanOptionalFilePath, cleanEnvironmentVariableName, cleanOptionalAwsProfile, codexBin, cursorBin, kimiBin, codexHome, runHome, workspaceBrowseRoot } from "./config.mjs";
+import { allowedThreadProviders, bedrockRegion, cleanDisplayName, cleanOptionalEndpoint, cleanOptionalFilePath, cleanEnvironmentVariableName, cleanOptionalAwsProfile, codexBin, kimiBin, codexHome, runHome, workspaceBrowseRoot, retiredJobProviders } from "./config.mjs";
 import { AppServerClient } from "./appserver-client.mjs";
 import { claudeEffortLevels } from "./provider-help.mjs";
-
-const CURSOR_FALLBACK_MODELS = [
-  { id: "auto", label: "Auto" },
-  { id: "cursor-grok-4.6-xhigh-fast", label: "Cursor Grok 4.6 Extra High Fast" },
-  { id: "composer-2.5-fast", label: "Composer 2.5 Fast" },
-  { id: "claude-opus-5-thinking-high", label: "Claude Opus 5 High" },
-  { id: "claude-opus-4-8-thinking-high", label: "Claude Opus 4.8 High" },
-  { id: "gpt-5.6-sol-max-fast", label: "GPT-5.6 Sol Max Fast" },
-  { id: "gpt-5.5-medium", label: "GPT-5.5 Medium" },
-  { id: "claude-fable-5-1-thinking-high", label: "Claude Fable 5.1 High" },
-];
 
 const modelCatalog = loadModelCatalog();
 let runtimeCodexModelsCache = { expiresAt: 0, models: null };
 let runtimeCodexModelsRefresh = null;
-let runtimeCursorModelsCache = { expiresAt: 0, models: null };
-let runtimeCursorModelsRefresh = null;
 
 function loadModelCatalog() {
   const configured = process.env.CODEX_MODEL_CATALOG
@@ -35,7 +22,10 @@ function loadModelCatalog() {
   if (!Array.isArray(configured)) {
     throw new Error("CODEX_MODEL_CATALOG must be a JSON array");
   }
-  return configured.map(cleanModelDescriptor);
+  // A configured catalog written before Cursor was retired may still list it.
+  return configured
+    .filter((entry) => !retiredJobProviders.has(String(entry?.provider || "").trim().toLowerCase()))
+    .map(cleanModelDescriptor);
 }
 
 
@@ -134,9 +124,6 @@ function defaultModelCatalog() {
       effortLevels: ["low", "medium", "high"],
     },
   ];
-  if (fs.existsSync(cursorBin)) {
-    catalog.push(...cursorCatalogEntries(CURSOR_FALLBACK_MODELS));
-  }
   if (fs.existsSync(kimiBin)) {
     catalog.push({
       id: "kimi-k3",
@@ -231,7 +218,7 @@ function cleanModelProvider(value) {
   }
   const normalized = value.trim().toLowerCase();
   if (!allowedThreadProviders.has(normalized)) {
-    throw new Error("model provider must be codex, claude, cursor, kimi, azure, or bedrock");
+    throw new Error("model provider must be codex, claude, kimi, azure, or bedrock");
   }
   return normalized;
 }
@@ -284,21 +271,10 @@ async function publicRuntimeModelCatalog() {
     }
     await runtimeCodexModelsRefresh;
   }
-  if (runtimeCursorModelsCache.expiresAt <= Date.now()) {
-    if (!runtimeCursorModelsRefresh) {
-      runtimeCursorModelsRefresh = refreshRuntimeCursorModels().finally(() => {
-        runtimeCursorModelsRefresh = null;
-      });
-    }
-    await runtimeCursorModelsRefresh;
-  }
-  const withCursor = runtimeCursorModelsCache.models
-    ? mergeRuntimeCursorModels(configured, runtimeCursorModelsCache.models)
-    : configured;
   return withInstalledClaudeEfforts(
     runtimeCodexModelsCache.models
-      ? mergeRuntimeCodexModels(withCursor, runtimeCodexModelsCache.models)
-      : withCursor,
+      ? mergeRuntimeCodexModels(configured, runtimeCodexModelsCache.models)
+      : configured,
   );
 }
 
@@ -384,198 +360,6 @@ function mergeRuntimeCodexModels(configured, runtimeModels) {
   const otherProviders = configured.filter((model) => model.provider !== "codex");
   return [...runtimeModels, ...(defaultEntry ? [defaultEntry] : []), ...otherProviders];
 }
-
-function cursorCatalogEntries(models) {
-  const seen = new Set();
-  const entries = [];
-  for (const model of models) {
-    const taskModel = typeof model?.id === "string" ? model.id.trim() : "";
-    if (!taskModel || !isPlausibleCursorModelId(taskModel) || seen.has(taskModel)) continue;
-    seen.add(taskModel);
-    const label = model.label || cursorModelDisplayName(taskModel);
-    entries.push({
-      id: taskModel === "auto" ? "cursor-agent-auto" : `cursor-${taskModel.replace(/^cursor-/, "")}`,
-      label: `Cursor Agent · ${label}`,
-      provider: "cursor",
-      modes: ["task"],
-      taskModel,
-      effortLevels: [],
-    });
-  }
-  return entries;
-}
-
-function cursorModelDisplayName(taskModel) {
-  const known = CURSOR_FALLBACK_MODELS.find((model) => model.id === taskModel);
-  if (known) return known.label;
-  if (taskModel === "auto") return "Auto";
-  if (/^gpt-/i.test(taskModel)) {
-    return taskModel.replace(/^gpt-/i, "GPT-").replace(/-/g, " ");
-  }
-  return taskModel
-    .replace(/^cursor-/, "")
-    .replace(/-thinking-high$/, "")
-    .replace(/-xhigh-/g, "-extra-high-")
-    .replace(/-xhigh$/, "-extra-high")
-    .split(/[-_]/)
-    .filter(Boolean)
-    .map((part) => (part === part.toLowerCase() ? part.charAt(0).toUpperCase() + part.slice(1) : part))
-    .join(" ");
-}
-
-function runtimeCursorDescriptor(model) {
-  if (!model) return null;
-  if (typeof model === "string") {
-    return runtimeCursorDescriptor({ id: model });
-  }
-  if (model.hidden === true) return null;
-  const taskModel = model.model ?? model.id ?? model.slug;
-  if (typeof taskModel !== "string" || !isPlausibleCursorModelId(taskModel.trim())) return null;
-  const id = taskModel.trim();
-  const label = model.displayName || model.name || cursorModelDisplayName(id);
-  return cursorCatalogEntries([{ id, label }])[0] || null;
-}
-
-function isPlausibleCursorModelId(value) {
-  if (!/^[A-Za-z0-9._:/-]{1,180}$/.test(value)) return false;
-  if (/^(error|errors|warning|info|debug|authentication|required|usage|help|tip|available|models?)$/i.test(value)) {
-    return false;
-  }
-  return value === "auto" || /[./_-]/.test(value);
-}
-
-function parseCursorModelList(text) {
-  const cleaned = String(text || "").trim();
-  if (!cleaned) return [];
-  const seen = new Set();
-  const models = [];
-  const add = (entry) => {
-    const descriptor = runtimeCursorDescriptor(entry);
-    if (!descriptor || seen.has(descriptor.taskModel)) return;
-    seen.add(descriptor.taskModel);
-    models.push(descriptor);
-  };
-
-  const tryJson = (value) => {
-    try {
-      return JSON.parse(value);
-    } catch {
-      return null;
-    }
-  };
-
-  const parsed = tryJson(cleaned);
-  if (parsed) {
-    const list = Array.isArray(parsed)
-      ? parsed
-      : Array.isArray(parsed.models)
-        ? parsed.models
-        : Array.isArray(parsed.data)
-          ? parsed.data
-          : [];
-    for (const entry of list) add(entry);
-    return models;
-  }
-
-  for (const rawLine of cleaned.split(/\r?\n/)) {
-    const line = rawLine.replace(/^\s*[-*•]\s*/, "").trim();
-    if (!line || /^(available|models?|tip:|use --model)/i.test(line)) continue;
-    const jsonLine = tryJson(line);
-    if (jsonLine) {
-      add(jsonLine);
-      continue;
-    }
-    const dashed = line.match(/^([A-Za-z0-9._:/-]{1,180})\s+[-–—]\s+(.+)$/);
-    if (dashed) {
-      add({ id: dashed[1], displayName: dashed[2].trim() });
-      continue;
-    }
-    const token = line.split(/\s+/)[0];
-    if (token && /^[A-Za-z0-9._:/-]{1,180}$/.test(token) && /[A-Za-z]/.test(token)) {
-      add({ id: token });
-    }
-  }
-  return models;
-}
-
-function cursorDiscoveryEnv() {
-  const env = { ...process.env, HOME: runHome, CODEX_HOME: codexHome };
-  for (const key of [
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_PROFILE",
-    "AWS_DEFAULT_PROFILE",
-    "AWS_REGION",
-    "AWS_DEFAULT_REGION",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_AWS_PROFILE",
-  ]) {
-    delete env[key];
-  }
-  return env;
-}
-
-function execFileText(bin, args, env, timeoutMs = 8000) {
-  return new Promise((resolve) => {
-    execFile(bin, args, { env, timeout: timeoutMs, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
-      resolve({
-        ok: !error,
-        stdout: String(stdout || ""),
-        stderr: String(stderr || ""),
-        text: `${stdout || ""}\n${stderr || ""}`,
-      });
-    });
-  });
-}
-
-async function refreshRuntimeCursorModels() {
-  if (!fs.existsSync(cursorBin)) {
-    runtimeCursorModelsCache = { models: null, expiresAt: Date.now() + 60 * 1000 };
-    return;
-  }
-  try {
-    let listed = [];
-    for (const args of [["--list-models"], ["models"]]) {
-      const result = await execFileText(cursorBin, args, cursorDiscoveryEnv());
-      listed = parseCursorModelList(result.stdout);
-      if (listed.length) break;
-    }
-    const models = listed.length ? mergeRuntimeCursorModels(cursorCatalogEntries(CURSOR_FALLBACK_MODELS), listed) : null;
-    if (!models?.length) throw new Error("Empty Cursor model list");
-    runtimeCursorModelsCache = { models, expiresAt: Date.now() + 60 * 1000 };
-  } catch {
-    runtimeCursorModelsCache.expiresAt = Date.now() + 30 * 1000;
-  }
-}
-
-function mergeRuntimeCursorModels(configured, runtimeModels) {
-  if (!Array.isArray(runtimeModels) || runtimeModels.length === 0) return configured;
-  const others = configured.filter((model) => model.provider !== "cursor");
-  const configuredCursor = configured.filter((model) => model.provider === "cursor");
-  const byId = new Map();
-  for (const entry of [...configuredCursor, ...runtimeModels]) {
-    if (!entry?.taskModel) continue;
-    byId.set(entry.taskModel, entry);
-  }
-  const auto = byId.get("auto") || cursorCatalogEntries([{ id: "auto", label: "Auto" }])[0];
-  const cursorEntries = [auto];
-  const seen = new Set(["auto"]);
-  const preferred = [
-    ...CURSOR_FALLBACK_MODELS.map((model) => model.id),
-    ...configuredCursor.map((model) => model.taskModel),
-    ...runtimeModels.map((model) => model.taskModel),
-  ];
-  for (const id of preferred) {
-    if (!id || seen.has(id)) continue;
-    const entry = byId.get(id);
-    if (!entry) continue;
-    seen.add(id);
-    cursorEntries.push(entry);
-  }
-  return [...others, ...cursorEntries];
-}
-
 
 function findCatalogModel({ provider, model, mode }) {
   return modelCatalog.find(
@@ -664,11 +448,7 @@ export {
   publicRuntimeModelCatalog,
   withInstalledClaudeEfforts,
   runtimeCodexDescriptor,
-  runtimeCursorDescriptor,
-  parseCursorModelList,
   mergeRuntimeCodexModels,
-  mergeRuntimeCursorModels,
-  cursorCatalogEntries,
   findCatalogModel,
   validateTaskSelectionFromCatalog,
   validateConfiguredTaskSelection,

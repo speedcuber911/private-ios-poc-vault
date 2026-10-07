@@ -138,7 +138,6 @@ async function startServer({ claudeScript = PARKED_LOGIN_CLAUDE, withLoginServer
       CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
       CODEX_BIN: fakeCodex,
       CLAUDE_BIN: fakeClaude,
-      CURSOR_BIN: path.join(dir, "missing-cursor"),
       KIMI_BIN: path.join(dir, "missing-kimi"),
       ...(callbackPort
         ? {

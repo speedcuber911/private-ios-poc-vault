@@ -51,7 +51,7 @@ node work goes in `product/relayd/`.
 
 ## Non-Negotiable Provider Auth Guardrail
 
-Relay uses the user's direct Codex, Claude, and Cursor subscriptions from the
+Relay uses the user's direct Codex and Claude subscriptions from the
 isolated `codex-runner` home on `pariksj-dev`. Do not route Claude through
 Bedrock or an AWS profile by default.
 
@@ -64,7 +64,7 @@ Bedrock or an AWS profile by default.
   confirms the exact AWS account/profile. The compatibility guard permits only
   `CLAUDE_AWS_PROFILE=sigiq`, but that profile is not part of the current live
   arrangement.
-- Codex, Claude, and Cursor auth state must stay under the isolated runner home;
+- Codex and Claude auth state must stay under the isolated runner home;
   do not copy it into a workspace or the repository.
 - Azure OpenAI-compatible profiles use direct bearer-key files outside the repo.
   Keep them server-side with narrow permissions and never put key material in

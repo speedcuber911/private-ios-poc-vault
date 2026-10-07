@@ -120,75 +120,19 @@ test("synced native titles remain stable ahead of transcript and follow-up promp
   assert.equal(summary.lastPrompt, "Improve iOS chat screen UX");
 });
 
-test("Claude Code and Cursor transcripts yield the same conversation turns as Codex", async () => {
+test("Claude Code transcripts yield the same conversation turns as Codex", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-thread-providers-"));
   const claudeFile = path.join(dir, "claude.jsonl");
-  const cursorFile = path.join(dir, "cursor.jsonl");
   fs.writeFileSync(claudeFile, `${[
     { type: "user", cwd: "/repo", timestamp: "2026-09-19T10:00:00.000Z", message: { content: "Fix the Claude session list" } },
     { type: "assistant", timestamp: "2026-09-19T10:00:01.000Z", message: { content: [{ type: "text", text: "Claude answer" }] } },
   ].map((line) => JSON.stringify(line)).join("\n")}\n`);
-  fs.writeFileSync(cursorFile, `${[
-    { role: "user", message: { content: [{ type: "text", text: "Show Cursor history" }] } },
-    { role: "assistant", message: { content: [{ type: "text", text: "Cursor answer" }] } },
-  ].map((line) => JSON.stringify(line)).join("\n")}\n`);
 
   const claude = await readSessionMessages(claudeFile);
-  const cursor = await readSessionMessages(cursorFile);
   assert.deepEqual(claude.map((entry) => entry.role), ["user", "assistant"]);
   assert.equal(claude[0].text, "Fix the Claude session list");
   assert.equal(claude[1].text, "Claude answer");
-  assert.deepEqual(cursor.map((entry) => [entry.role, entry.text]), [
-    ["user", "Show Cursor history"],
-    ["assistant", "Cursor answer"],
-  ]);
   assert.equal(readSessionSummary(claudeFile).firstUserPrompt, "Fix the Claude session list");
-  assert.equal(readSessionSummary(cursorFile).lastAssistantAnswer, "Cursor answer");
-});
-
-test("Cursor agent transcripts unwrap user_query and skip IDE chrome", async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-thread-cursor-native-"));
-  const file = path.join(dir, "cursor.jsonl");
-  fs.writeFileSync(file, `${[
-    {
-      role: "user",
-      message: {
-        content: [{
-          type: "text",
-          text: [
-            "<timestamp>Friday, Sep 18, 2026, 7:12 PM (UTC+5:30)</timestamp>",
-            "<user_query>",
-            "Can i somehow use my cursor subscription from the ec2 and then from the app too",
-            "</user_query>",
-          ].join("\n"),
-        }],
-      },
-    },
-    { role: "assistant", message: { content: [{ type: "text", text: "Cursor auth lives on the machine." }, { type: "tool_use", name: "Grep", input: {} }] } },
-    {
-      role: "user",
-      message: {
-        content: [{
-          type: "text",
-          text: "<timestamp>Friday, Sep 18, 2026, 7:20 PM (UTC+5:30)</timestamp>\n\n<user_query>Briefly inform the user about the task result and perform any follow-up actions (if needed). If there's no follow-ups needed, don't explicitly say that.</user_query>",
-        }],
-      },
-    },
-    { role: "user", message: { content: [{ type: "text", text: "<timestamp>later</timestamp>\n<user_query>Do they get graphs?</user_query>" }] } },
-    { role: "assistant", message: { content: [{ type: "text", text: "Yes, on Usage." }] } },
-  ].map((line) => JSON.stringify(line)).join("\n")}\n`);
-
-  const messages = await readSessionMessages(file);
-  assert.deepEqual(messages.map((entry) => [entry.role, entry.text]), [
-    ["user", "Can i somehow use my cursor subscription from the ec2 and then from the app too"],
-    ["assistant", "Cursor auth lives on the machine."],
-    ["user", "Do they get graphs?"],
-    ["assistant", "Yes, on Usage."],
-  ]);
-  assert.equal(
-    readSessionSummary(file).firstUserPrompt,
-    "Can i somehow use my cursor subscription from the ec2 and then from the app too",
-  );
 });
 
 test("Claude Code skill wrappers and tool results are not conversation turns", async () => {
@@ -260,7 +204,7 @@ test("what Claude Code tells itself is not something the person said", async () 
   assert.equal(readSessionSummary(file).firstUserPrompt, "Fix the rounding bug.");
 });
 
-test("already synced Cursor timestamp titles yield to the real prompt", () => {
+test("already synced timestamp titles yield to the real prompt", () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-thread-synced-chrome-"));
   const statePath = path.join(dataDir, "session-sync", "index.json");
   fs.mkdirSync(path.dirname(statePath), { recursive: true });

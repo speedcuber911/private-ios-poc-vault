@@ -13,10 +13,8 @@
 // exists to prevent. An earlier version of this header said Codex "needs no
 // rewriting"; that was true of Codex's own resume mechanism and false of
 // everything downstream of it, and it is why Continue was broken for every
-// Codex handoff. Cursor Agent chats are staged as `cursor-jsonl` under
-// `.cursor/chats/<md5(cwd)>/<sessionId>/` so the phone can list and open
-// them the same way; a session-less Cursor handoff still takes the
-// primed-prompt path.
+// Codex handoff. A handoff from a harness relayd no longer runs (Cursor)
+// degrades to the primed-prompt path below, like any unrecognised harness.
 //
 // ---------------------------------------------------------------------------
 // THREAT MODEL — read this before changing anything below.
@@ -356,10 +354,6 @@ function assertContained(baseDir, filePath) {
 
 function claudeProjectSlug(cwd) {
   return String(cwd).replace(/[^A-Za-z0-9]/g, "-");
-}
-
-function cursorWorkspaceHash(cwd) {
-  return crypto.createHash("md5").update(String(cwd)).digest("hex");
 }
 
 // Characters that END a path in a transcript rather than continue a filename:
@@ -825,7 +819,7 @@ function importSession({ manifest, sessionBytes, runHome, codexHome, worktreePat
   // file). requestedHarness keeps that degradation observable instead of
   // silent, so callers/logs can tell what was actually asked for.
   const requestedHarness = manifest.harness;
-  const provider = ["codex", "cursor", "kimi"].includes(manifest.harness) ? manifest.harness : "claude";
+  const provider = ["codex", "kimi"].includes(manifest.harness) ? manifest.harness : "claude";
 
   if (sessionBytes && manifest.sessionFormat === "claude-jsonl" && manifest.sessionId) {
     const sessionId = assertSafeSessionId(manifest.sessionId);
@@ -840,34 +834,6 @@ function importSession({ manifest, sessionBytes, runHome, codexHome, worktreePat
       contents: rewritten,
     });
     return { provider: "claude", requestedHarness, resumeSessionId: sessionId, primedPrompt: null };
-  }
-
-  if (sessionBytes && manifest.sessionFormat === "cursor-jsonl" && manifest.sessionId) {
-    const sessionId = assertSafeSessionId(manifest.sessionId);
-    const rewritten = rewriteSessionCwd(sessionBytes.toString("utf8"), {
-      fromCwd: manifest.cwd,
-      toCwd: worktreePath,
-    });
-    const hash = cursorWorkspaceHash(worktreePath);
-    stageSessionFile({
-      jailRoot: runHome,
-      components: [".cursor", "chats", hash, sessionId],
-      leafName: "transcript.jsonl",
-      contents: rewritten,
-    });
-    const createdAtMs = Number(manifest.createdAt);
-    stageSessionFile({
-      jailRoot: runHome,
-      components: [".cursor", "chats", hash, sessionId],
-      leafName: "meta.json",
-      contents: `${JSON.stringify({
-        schemaVersion: 1,
-        cwd: worktreePath,
-        createdAtMs: Number.isFinite(createdAtMs) ? createdAtMs : Date.now(),
-        hasConversation: true,
-      })}\n`,
-    });
-    return { provider: "cursor", requestedHarness, resumeSessionId: sessionId, primedPrompt: null };
   }
 
   if (sessionBytes && manifest.sessionFormat === "codex-rollout" && manifest.sessionId) {
@@ -901,7 +867,6 @@ export {
   SessionImportSecurityError,
   assertContained,
   claudeProjectSlug,
-  cursorWorkspaceHash,
   codexRolloutLeafName,
   repairLegacyCodexRollout,
   rewriteSessionCwd,

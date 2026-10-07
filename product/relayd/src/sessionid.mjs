@@ -25,8 +25,6 @@
 //   - Codex records `payload.id` in the rollout's `session_meta` line as a
 //     UUID (the rollout FILENAME carries a timestamp prefix as well — that
 //     filename fragment is not the id, and treating it as one is the bug);
-//   - `cursor-agent` reports `session_id` as a UUID (`adapters/cursor.mjs`
-//     already validates it with this same predicate via `isSafeJobId`);
 //   - Kimi Code persists opaque session ids in KIMI_CODE_HOME/session_index.jsonl;
 //   - relayd's own job ids are `crypto.randomUUID()`.
 //

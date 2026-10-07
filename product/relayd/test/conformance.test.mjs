@@ -800,25 +800,6 @@ async function makeArgEchoClaude(tmpDir) {
   return fakeClaude;
 }
 
-async function makeFakeCursor(tmpDir, sessionId) {
-  const fakeCursor = path.join(tmpDir, "fake-cursor-agent");
-  const argsPath = path.join(tmpDir, "fake-cursor-args.txt");
-  await fs.writeFile(
-    fakeCursor,
-    [
-      "#!/bin/sh",
-      `: > '${argsPath}'`,
-      `for arg in \"$@\"; do printf '%s\\n' \"$arg\" >> '${argsPath}'; done`,
-      "cat >/dev/null",
-      `printf '%s\\n' '${JSON.stringify({ type: "result", subtype: "success", result: "cursor answer", session_id: sessionId })}'`,
-      "exit 0",
-      "",
-    ].join("\n"),
-    { mode: 0o755 },
-  );
-  return { fakeCursor, argsPath };
-}
-
 async function makeFakeKimi(tmpDir, sessionId) {
   const fakeKimi = path.join(tmpDir, "fake-kimi");
   const argsPath = path.join(tmpDir, "fake-kimi-args.txt");
@@ -3068,14 +3049,12 @@ localTest("rejects provider/model and provider/control mismatches before queuein
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
   const workspaceDir = path.join(tmpDir, "scratch");
   await fs.mkdir(workspaceDir, { recursive: true });
-  const cursor = await makeFakeCursor(tmpDir, "0198ebd4-4b90-7a45-b2ec-94bc5b228001");
   const server = await startServer({
     CODEX_REQUIRE_MTLS: "false",
     CODEX_DATA_DIR: path.join(tmpDir, "data"),
     CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
     CODEX_BIN: await makeFakeCodex(tmpDir),
     CLAUDE_BIN: await makeArgEchoClaude(tmpDir),
-    CURSOR_BIN: cursor.fakeCursor,
   });
   try {
     const cases = [
@@ -3083,7 +3062,8 @@ localTest("rejects provider/model and provider/control mismatches before queuein
       [{ provider: "codex", model: "sonnet" }, /model is not available for codex/],
       [{ provider: "codex", permissionMode: "plan" }, /permissionMode is supported only for Claude/],
       [{ provider: "claude", approvalPolicy: "never" }, /approvalPolicy is supported only for Codex/],
-      [{ provider: "cursor", reasoningEffort: "high" }, /reasoningEffort high is not supported by cursor/],
+      // Cursor is retired: refused outright, never run as the Codex fallback.
+      [{ provider: "cursor" }, /provider must be codex, claude, or kimi/],
     ];
     for (const [fields, expected] of cases) {
       const response = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
@@ -3145,7 +3125,7 @@ test("persists providers and filters jobs, sessions, and threads by provider", a
     // Portable half: the provider filter never leaks another provider's rows
     // on any of the three list endpoints.
     if (!(await requireRemoteApi(t))) return;
-    for (const provider of ["codex", "claude", "cursor"]) {
+    for (const provider of ["codex", "claude"]) {
       const jobsResponse = await remoteFetch(`/v1/codex/jobs?provider=${provider}&limit=20`);
       assert.equal(jobsResponse.status, 200);
       const jobsBody = await jobsResponse.json();
@@ -3515,50 +3495,6 @@ localTest("rejects provider and workspace mismatches when resuming a provider-lo
     assert.equal(job.status, "succeeded");
     assert.match(job.stdout, new RegExp(`claude args: .*\\[--print\\].*\\[--resume\\] \\[${sessionId}\\]`));
     assert.doesNotMatch(job.stdout, /\[--session-id\]/);
-  } finally {
-    await server.stop();
-  }
-});
-
-localTest("runs Cursor Agent jobs and persists the returned session id", "needs a fake cursor-agent binary and reads its argv file from disk", async () => {
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
-  const workspaceDir = path.join(tmpDir, "scratch");
-  const sessionId = "019e46b1-0000-7000-8000-000000000099";
-  await fs.mkdir(workspaceDir, { recursive: true });
-  const cursor = await makeFakeCursor(tmpDir, sessionId);
-  const server = await startServer({
-    CODEX_REQUIRE_MTLS: "false",
-    CODEX_DATA_DIR: path.join(tmpDir, "data"),
-    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
-    CODEX_BIN: await makeFakeCodex(tmpDir),
-    CURSOR_BIN: cursor.fakeCursor,
-  });
-  try {
-    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        workspaceId: "scratch",
-        provider: "cursor",
-        prompt: "check cursor",
-        model: "auto",
-        timeoutMs: 5000,
-      }),
-    });
-    assert.equal(create.status, 202);
-    const created = await create.json();
-    assert.equal(created.provider, "cursor");
-
-    const job = await waitForJob(server, created.id);
-    assert.equal(job.status, "succeeded");
-    assert.equal(job.result, "cursor answer");
-    assert.equal(job.sessionId, sessionId);
-
-    const args = (await fs.readFile(cursor.argsPath, "utf8")).trim().split("\n");
-    assert.deepEqual(args.slice(0, 7), ["-p", "--force", "--trust", "--workspace", await fs.realpath(workspaceDir), "--output-format", "json"]);
-    assert.ok(args.includes("--model"));
-    assert.ok(args.includes("auto"));
-    assert.equal(args.at(-1), "check cursor");
   } finally {
     await server.stop();
   }
@@ -4585,53 +4521,7 @@ localTest("runs Codex chat read-only in the selected workspace instead of scratc
   }
 });
 
-async function makeEnvEchoCursor(tmpDir, sessionId) {
-  const fakeCursor = path.join(tmpDir, "fake-cursor-env");
-  await fs.writeFile(
-    fakeCursor,
-    [
-      "#!/bin/sh",
-      "cat >/dev/null",
-      `printf '{"type":"result","subtype":"success","result":"aws_profile=%s aws_access=%s aws_region=%s bedrock=%s home=%s","session_id":"${sessionId}"}' "\${AWS_PROFILE:-none}" "\${AWS_ACCESS_KEY_ID:-none}" "\${AWS_REGION:-none}" "\${CLAUDE_CODE_USE_BEDROCK:-none}" "$HOME"`,
-      "exit 0",
-      "",
-    ].join("\n"),
-    { mode: 0o755 },
-  );
-  return fakeCursor;
-}
-
-async function makeMalformedCursor(tmpDir) {
-  const fakeCursor = path.join(tmpDir, "fake-cursor-malformed");
-  await fs.writeFile(
-    fakeCursor,
-    ["#!/bin/sh", "cat >/dev/null", "printf 'this is not cursor json'", "exit 0", ""].join("\n"),
-    { mode: 0o755 },
-  );
-  return fakeCursor;
-}
-
-async function makeFailingCursor(tmpDir) {
-  const fakeCursor = path.join(tmpDir, "fake-cursor-failing");
-  await fs.writeFile(
-    fakeCursor,
-    ["#!/bin/sh", "cat >/dev/null", "printf 'cursor auth expired\\n' >&2", "exit 1", ""].join("\n"),
-    { mode: 0o755 },
-  );
-  return fakeCursor;
-}
-
-async function makeSlowCursor(tmpDir) {
-  const fakeCursor = path.join(tmpDir, "fake-cursor-slow");
-  await fs.writeFile(
-    fakeCursor,
-    ["#!/bin/sh", "exec sleep 20", ""].join("\n"),
-    { mode: 0o755 },
-  );
-  return fakeCursor;
-}
-
-localTest("resumes Cursor threads with --resume and applies provider filters", "needs a seeded cursor job and a fake cursor-agent binary", async () => {
+localTest("a stored Cursor job stays out of every list and cannot be resumed as Codex", "needs a seeded cursor job file", async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
   const workspaceDir = path.join(tmpDir, "scratch");
   const dataDir = path.join(tmpDir, "data");
@@ -4648,226 +4538,40 @@ localTest("resumes Cursor threads with --resume and applies provider filters", "
     sessionId,
   });
 
-  const cursor = await makeFakeCursor(tmpDir, sessionId);
   const server = await startServer({
     CODEX_REQUIRE_MTLS: "false",
     CODEX_DATA_DIR: dataDir,
     CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
     CODEX_BIN: await makeFakeCodex(tmpDir),
-    CURSOR_BIN: cursor.fakeCursor,
   });
   try {
-    // A codex resume against the cursor thread is rejected (provider lock).
-    const wrongProvider = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+    // Read as the Codex fallback, this job would surface as a Codex thread
+    // and a Codex resume would be handed its Cursor session id.
+    assert.deepEqual((await (await fetch(`${server.baseUrl}/v1/codex/jobs?limit=20`)).json()).jobs, []);
+    assert.deepEqual((await (await fetch(`${server.baseUrl}/v1/codex/threads?limit=20`)).json()).threads, []);
+    assert.equal((await fetch(`${server.baseUrl}/v1/codex/jobs/019e46b2-0000-7000-8000-000000000002`)).status, 404);
+
+    const cursorJob = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspaceId: "scratch", provider: "cursor", prompt: "continue cursor work", resumeSessionId: sessionId }),
+    });
+    assert.equal(cursorJob.status, 400);
+
+    const codexResume = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ workspaceId: "scratch", provider: "codex", prompt: "wrong", resumeSessionId: sessionId }),
     });
-    assert.equal(wrongProvider.status, 400);
+    assert.equal(codexResume.status, 400);
 
-    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        workspaceId: "scratch",
-        provider: "cursor",
-        prompt: "continue cursor work",
-        resumeSessionId: sessionId,
-        timeoutMs: 5000,
-      }),
-    });
-    assert.equal(create.status, 202);
-    const created = await create.json();
-    assert.equal(created.provider, "cursor");
-    assert.equal(created.sessionId, sessionId);
-
-    const job = await waitForJob(server, created.id);
-    assert.equal(job.status, "succeeded");
-    assert.equal(job.result, "cursor answer");
-
-    const args = (await fs.readFile(cursor.argsPath, "utf8")).trim().split("\n");
-    assert.deepEqual(args.slice(0, 7), ["-p", "--force", "--trust", "--workspace", await fs.realpath(workspaceDir), "--output-format", "json"]);
-    const resumeIndex = args.indexOf("--resume");
-    assert.notEqual(resumeIndex, -1);
-    assert.equal(args[resumeIndex + 1], sessionId);
-    assert.equal(args.at(-1), "continue cursor work");
-    assert.equal(args.filter((arg) => arg === "--resume").length, 1);
-
-    // Provider filters across jobs and threads include the cursor thread.
-    const cursorJobs = await fetch(`${server.baseUrl}/v1/codex/jobs?provider=cursor&limit=20`);
-    const cursorJobsBody = await cursorJobs.json();
-    assert.equal(cursorJobsBody.jobs.length, 2);
-    assert.ok(cursorJobsBody.jobs.every((item) => item.provider === "cursor"));
-
-    const cursorThreads = await fetch(`${server.baseUrl}/v1/codex/threads?provider=cursor&limit=20`);
-    const cursorThreadBody = await cursorThreads.json();
-    assert.deepEqual(cursorThreadBody.threads.map((thread) => thread.sessionId), [sessionId]);
-    assert.equal(cursorThreadBody.threads[0].provider, "cursor");
-    assert.equal(cursorThreadBody.threads[0].jobCount, 2);
-
-    const codexThreads = await fetch(`${server.baseUrl}/v1/codex/threads?provider=codex&limit=20`);
-    assert.deepEqual((await codexThreads.json()).threads, []);
+    // Kept on disk, not deleted.
+    await fs.access(path.join(dataDir, "jobs", "019e46b2-0000-7000-8000-000000000002.json"));
   } finally {
     await server.stop();
   }
 });
 
-localTest("scrubs ambient AWS credentials from Cursor jobs like direct Claude", "asserts the cursor child process env through a fake binary", async () => {
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
-  const workspaceDir = path.join(tmpDir, "scratch");
-  const runHome = path.join(tmpDir, "run-home");
-  const sessionId = "019e46b2-0000-7000-8000-000000000011";
-  await fs.mkdir(workspaceDir, { recursive: true });
-  await fs.mkdir(runHome, { recursive: true });
-  const server = await startServer({
-    CODEX_REQUIRE_MTLS: "false",
-    CODEX_DATA_DIR: path.join(tmpDir, "data"),
-    CODEX_RUN_HOME: runHome,
-    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
-    CODEX_BIN: await makeFakeCodex(tmpDir),
-    CURSOR_BIN: await makeEnvEchoCursor(tmpDir, sessionId),
-    CLAUDE_AWS_PROFILE: "",
-    AWS_PROFILE: "personal",
-    AWS_ACCESS_KEY_ID: "AKIAAMBIENT",
-    AWS_SECRET_ACCESS_KEY: "ambient-secret",
-    AWS_REGION: "ap-south-1",
-    AWS_DEFAULT_REGION: "ap-south-1",
-  });
-  try {
-    const create = await fetch(`${server.baseUrl}/v1/codex/jobs`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ workspaceId: "scratch", provider: "cursor", prompt: "env check", timeoutMs: 5000 }),
-    });
-    assert.equal(create.status, 202);
-    const job = await waitForJob(server, (await create.json()).id);
-    assert.equal(job.status, "succeeded");
-    assert.equal(job.result, `aws_profile=none aws_access=none aws_region=none bedrock=none home=${runHome}`);
-    assert.equal(job.sessionId, sessionId);
-  } finally {
-    await server.stop();
-  }
-});
-
-localTest("handles malformed Cursor JSON, nonzero exits, and cancellation", "needs three fake cursor-agent binaries and three separate data dirs", async () => {
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
-  const workspaceDir = path.join(tmpDir, "scratch");
-  await fs.mkdir(workspaceDir, { recursive: true });
-  const baseEnv = {
-    CODEX_REQUIRE_MTLS: "false",
-    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspaceDir }]),
-  };
-
-  // Malformed JSON falls back to the raw stdout text instead of dropping output.
-  const malformedServer = await startServer({
-    ...baseEnv,
-    CODEX_DATA_DIR: path.join(tmpDir, "data-malformed"),
-    CODEX_BIN: await makeFakeCodex(tmpDir),
-    CURSOR_BIN: await makeMalformedCursor(tmpDir),
-  });
-  try {
-    const create = await fetch(`${malformedServer.baseUrl}/v1/codex/jobs`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ workspaceId: "scratch", provider: "cursor", prompt: "bad json", timeoutMs: 5000 }),
-    });
-    const job = await waitForJob(malformedServer, (await create.json()).id);
-    assert.equal(job.status, "succeeded");
-    assert.equal(job.result, "this is not cursor json");
-    assert.equal(job.sessionId, null);
-  } finally {
-    await malformedServer.stop();
-  }
-
-  // Nonzero exit surfaces stderr as the failure message.
-  const failingServer = await startServer({
-    ...baseEnv,
-    CODEX_DATA_DIR: path.join(tmpDir, "data-failing"),
-    CODEX_BIN: await makeFakeCodex(tmpDir),
-    CURSOR_BIN: await makeFailingCursor(tmpDir),
-  });
-  try {
-    const create = await fetch(`${failingServer.baseUrl}/v1/codex/jobs`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ workspaceId: "scratch", provider: "cursor", prompt: "fail", timeoutMs: 5000 }),
-    });
-    const job = await waitForJob(failingServer, (await create.json()).id);
-    assert.equal(job.status, "failed");
-    assert.match(job.error, /cursor auth expired/);
-    assert.equal(job.result || "", "");
-  } finally {
-    await failingServer.stop();
-  }
-
-  // Cancellation terminates the running Cursor child.
-  const slowServer = await startServer({
-    ...baseEnv,
-    CODEX_DATA_DIR: path.join(tmpDir, "data-slow"),
-    CODEX_BIN: await makeFakeCodex(tmpDir),
-    CURSOR_BIN: await makeSlowCursor(tmpDir),
-  });
-  try {
-    const create = await fetch(`${slowServer.baseUrl}/v1/codex/jobs`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ workspaceId: "scratch", provider: "cursor", prompt: "slow", timeoutMs: 30000 }),
-    });
-    const created = await create.json();
-
-    // The cancel below must reach a job the server has actually started, so
-    // the running status is observed rather than assumed.
-    const started = await waitForRunning(slowServer, created.id);
-    assert.equal(started.status, "running", `job should still be running before cancel: ${JSON.stringify(started)}`);
-
-    const cancel = await fetch(`${slowServer.baseUrl}/v1/codex/jobs/${created.id}/cancel`, { method: "POST" });
-    assert.equal(cancel.status, 202);
-    const job = await waitForJob(slowServer, created.id);
-    assert.equal(job.status, "cancelled");
-    assert.equal(job.error, "job cancelled");
-  } finally {
-    await slowServer.stop();
-  }
-});
-
-localTest("lists Cursor skills only from bounded cursor skill roots", "needs seeded cursor skill roots on the server filesystem", async () => {
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-test-"));
-  const cursorSkillDir = path.join(tmpDir, "cursor-skills");
-  const runHome = path.join(tmpDir, "run-home");
-  await makeSkill(cursorSkillDir, "cursor-review", {
-    description: "Use when Cursor should review a change.",
-    body: "Cursor review process.",
-  });
-  await makeSkill(path.join(runHome, ".cursor", "skills"), "cursor-home-skill", {
-    description: "Use when testing the runner-home cursor root.",
-    body: "Runner home skill.",
-  });
-
-  const server = await startServer({
-    CODEX_REQUIRE_MTLS: "false",
-    CODEX_DATA_DIR: path.join(tmpDir, "data"),
-    CODEX_RUN_HOME: runHome,
-    CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: tmpDir }]),
-    CODEX_BIN: await makeFakeCodex(tmpDir),
-    CURSOR_SKILL_DIRS: cursorSkillDir,
-  });
-  try {
-    const response = await fetch(`${server.baseUrl}/v1/codex/skills?provider=cursor`);
-    assert.equal(response.status, 200);
-    const body = await response.json();
-    assert.deepEqual(body.skills.map((skill) => skill.id).sort(), ["cursor-home-skill", "cursor-review"]);
-    assert.ok(body.skills.every((skill) => skill.provider === "cursor"));
-    assert.ok(body.skills.every((skill) => skill.path === undefined));
-  } finally {
-    await server.stop();
-  }
-});
-
-// A harness whose phases are released by the TEST, not by a clock: it prints
-// phase one and then blocks until the test creates a gate file. That turns
-// "replay, then live follow" into a causal property of the test — the later
-// phases cannot exist before the stream is open — instead of a bet that a
-// sleep landed inside the right window on a machine that may be stalled.
 async function makeStagedCodex(tmpDir) {
   const fakeCodex = path.join(tmpDir, "fake-codex-staged");
   const gateTwo = path.join(tmpDir, "staged-gate-two");

@@ -133,7 +133,6 @@ async function startServer(sandbox, env = {}) {
       CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: sandbox.workspace }]),
       CLAUDE_BIN: sandbox.claude,
       CODEX_BIN: path.join(sandbox.root, "no-codex"),
-      CURSOR_BIN: path.join(sandbox.root, "no-cursor"),
       KIMI_BIN: path.join(sandbox.root, "no-kimi"),
       CLAUDE_CODE_USE_BEDROCK: "",
       CLAUDE_AWS_PROFILE: "",

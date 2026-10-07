@@ -39,8 +39,7 @@ const auditPath = path.join(dataDir, "audit.jsonl");
 // `npm install -g @openai/codex @anthropic-ai/claude-code` puts them at
 // /opt/relayd/node/bin/codex and .../claude. A machine installed that way
 // answered every prompt with `spawn /usr/bin/codex ENOENT` — both harnesses
-// unrunnable, from the first install. Cursor was unaffected only because its
-// default is derived from CODEX_RUN_HOME rather than guessed.
+// unrunnable, from the first install.
 //
 // This is why the resolution order below searches rather than assumes: a BYO
 // machine can have node from a distro package, a tarball, nvm or a version
@@ -91,8 +90,6 @@ function resolveHarnessBin(explicit, name, conventional, searchPath = process.en
 const codexBin = resolveHarnessBin(process.env.CODEX_BIN, "codex", "/usr/bin/codex");
 
 const claudeBin = resolveHarnessBin(process.env.CLAUDE_BIN, "claude", "/usr/bin/claude");
-
-const cursorBin = process.env.CURSOR_BIN || path.join(process.env.CODEX_RUN_HOME || process.env.HOME || "/home/ec2-user", ".local", "bin", "cursor-agent");
 
 const kimiBin = resolveHarnessBin(process.env.KIMI_BIN, "kimi", path.join(process.env.CODEX_RUN_HOME || process.env.HOME || "/home/ec2-user", ".local", "bin", "kimi"));
 
@@ -204,7 +201,12 @@ const terminalStatuses = new Set(["succeeded", "failed", "cancelled", "timeout"]
 
 const allowedReasoningEfforts = new Set(["low", "medium", "high", "xhigh", "max", "ultra"]);
 
-const allowedJobProviders = new Set(["codex", "claude", "cursor", "kimi"]);
+const allowedJobProviders = new Set(["codex", "claude", "kimi"]);
+
+// Harnesses relayd no longer runs (Cursor, retired 2026-10-07). Their stored
+// jobs and configured catalog rows are skipped as they load, never read as
+// the Codex fallback that an unknown provider gets.
+const retiredJobProviders = new Set(["cursor", "cursor-agent"]);
 
 const allowedChatProviders = new Set(["codex", "azure", "bedrock"]);
 
@@ -1141,7 +1143,6 @@ export {
   auditPath,
   codexBin,
   claudeBin,
-  cursorBin,
   kimiBin,
   gitBin,
   runHome,
@@ -1184,6 +1185,7 @@ export {
   allowedReasoningEfforts,
   allowedCodexSandboxes,
   allowedJobProviders,
+  retiredJobProviders,
   allowedChatProviders,
   allowedThreadProviders,
   allowedClaudePermissionModes,

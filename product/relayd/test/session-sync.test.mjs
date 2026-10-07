@@ -20,7 +20,7 @@ const {
   planSessionImports, importCodexSession, createSessionUpload,
   appendSessionUpload, completeSessionUpload, syncStatePath,
 } = await import("../src/session-sync.mjs");
-const { claudeProjectSlug, cursorWorkspaceHash } = await import("../src/sessionimport.mjs");
+const { claudeProjectSlug } = await import("../src/sessionimport.mjs");
 
 const ID = "11111111-2222-4333-8444-555555555555";
 const SOURCE_CWD = "/Users/dev/code/relay";
@@ -180,18 +180,13 @@ test("direct session sync never overwrites a session continued on the Relay mach
   assert.doesNotMatch(fs.readFileSync(installed, "utf8"), /local turn/);
 });
 
-test("direct session sync imports Claude and Cursor transcripts into native runner homes", () => {
+test("direct session sync imports Claude transcripts into the native runner home", () => {
   const f = fixture();
   const claudeId = "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb";
-  const cursorId = "cccccccc-1111-4222-8333-dddddddddddd";
   const claudeBytes = Buffer.from(`${JSON.stringify({
     type: "user",
     cwd: SOURCE_CWD,
     message: { content: "Fix Claude history" },
-  })}\n`, "utf8");
-  const cursorBytes = Buffer.from(`${JSON.stringify({
-    role: "user",
-    message: { content: [{ type: "text", text: "Show Cursor history" }] },
   })}\n`, "utf8");
 
   const claude = importCodexSession({
@@ -207,33 +202,40 @@ test("direct session sync imports Claude and Cursor transcripts into native runn
       transcript: claudeBytes.toString("base64"),
     },
   }, f);
-  const cursor = importCodexSession({
+  assert.equal(claude.status, "imported");
+
+  const claudeFile = path.join(f.targetRunHome, ".claude", "projects", claudeProjectSlug(f.workspace.path), `${claudeId}.jsonl`);
+  assert.match(fs.readFileSync(claudeFile, "utf8"), /Fix Claude history/);
+  assert.match(fs.readFileSync(claudeFile, "utf8"), new RegExp(f.workspace.path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
+// A Mac still offers its Cursor sessions; relayd no longer runs Cursor. Each
+// is skipped as a conflict, which the CLI already reports and moves past, so
+// the folder's Codex and Claude sessions still sync.
+test("a Cursor session in a sync plan is skipped, not fatal to the folder", () => {
+  const f = fixture();
+  const bytes = transcript();
+  const plan = planSessionImports({
+    v: 1,
+    workspaceId: "repo",
+    sessions: [
+      { id: "cccccccc-1111-4222-8333-dddddddddddd", harness: "cursor", sessionFormat: "cursor-jsonl" },
+      descriptor(bytes),
+    ],
+  }, f);
+  assert.deepEqual(plan.sessions[0], {
+    id: "cccccccc-1111-4222-8333-dddddddddddd",
+    status: "conflict",
+    reason: "harness_not_supported",
+  });
+  assert.equal(plan.sessions[1].id, ID);
+  assert.equal(plan.sessions[1].status, "upload");
+  assert.throws(() => importCodexSession({
     v: 1,
     workspaceId: "repo",
     sourceCwd: SOURCE_CWD,
-    session: {
-      id: cursorId,
-      harness: "cursor",
-      sessionFormat: "cursor-jsonl",
-      sha256: crypto.createHash("sha256").update(cursorBytes).digest("hex"),
-      sizeBytes: cursorBytes.length,
-      transcript: cursorBytes.toString("base64"),
-    },
-  }, f);
-  assert.equal(claude.status, "imported");
-  assert.equal(cursor.status, "imported");
-
-  const claudeFile = path.join(f.targetRunHome, ".claude", "projects", claudeProjectSlug(f.workspace.path), `${claudeId}.jsonl`);
-  const cursorFile = path.join(
-    f.targetRunHome, ".cursor", "chats", cursorWorkspaceHash(f.workspace.path), cursorId, "transcript.jsonl",
-  );
-  assert.match(fs.readFileSync(claudeFile, "utf8"), /Fix Claude history/);
-  assert.match(fs.readFileSync(claudeFile, "utf8"), new RegExp(f.workspace.path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  assert.match(fs.readFileSync(cursorFile, "utf8"), /Show Cursor history/);
-  assert.equal(
-    JSON.parse(fs.readFileSync(path.join(path.dirname(cursorFile), "meta.json"), "utf8")).cwd,
-    f.workspace.path,
-  );
+    session: { id: "cccccccc-1111-4222-8333-dddddddddddd", harness: "cursor", sessionFormat: "cursor-jsonl" },
+  }, f), (error) => error.status === 400);
 });
 
 test("direct session sync rejects transcript identity and cwd mismatches", () => {

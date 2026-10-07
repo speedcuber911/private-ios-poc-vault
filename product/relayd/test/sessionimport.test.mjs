@@ -7,7 +7,7 @@ import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 
 const {
-  importSession, rewriteSessionCwd, makeCodexRolloutResumable, claudeProjectSlug, cursorWorkspaceHash, summaryPrompt,
+  importSession, rewriteSessionCwd, makeCodexRolloutResumable, claudeProjectSlug, summaryPrompt,
   assertContained, codexRolloutLeafName, repairLegacyCodexRollout, SessionImportSecurityError,
 } = await import("../src/sessionimport.mjs");
 // The shared contract this module now stages by. Imported directly (it is
@@ -345,7 +345,9 @@ test("re-importing over a session file we staged earlier replaces it", () => {
   assert.deepEqual(fs.readdirSync(path.dirname(staged)).length, 1, "no staging temp file is left behind");
 });
 
-test("a cursor transcript is staged where listing can find it", () => {
+// Cursor is retired: a Cursor handoff, even one carrying its transcript,
+// degrades to the conservative primed-prompt path and stages nothing.
+test("a Cursor handoff stages no transcript and continues from a primed prompt", () => {
   const { runHome, codexHome } = homes();
   const sessionBytes = Buffer.from(`${JSON.stringify({
     role: "user",
@@ -355,17 +357,11 @@ test("a cursor transcript is staged where listing can find it", () => {
     manifest: manifest({ harness: "cursor", sessionFormat: "cursor-jsonl" }),
     sessionBytes, runHome, codexHome, worktreePath: TO_CWD,
   });
-  assert.equal(result.provider, "cursor");
-  assert.equal(result.resumeSessionId, "11111111-2222-4333-8444-555555555555");
-  assert.equal(result.primedPrompt, null);
-  const staged = path.join(
-    runHome, ".cursor", "chats", cursorWorkspaceHash(TO_CWD),
-    "11111111-2222-4333-8444-555555555555", "transcript.jsonl",
-  );
-  const meta = JSON.parse(fs.readFileSync(path.join(path.dirname(staged), "meta.json"), "utf8"));
-  assert.match(fs.readFileSync(staged, "utf8"), /Show Cursor history/);
-  assert.doesNotMatch(fs.readFileSync(staged, "utf8"), /\/Users\/dev\/code\/relay/);
-  assert.equal(meta.cwd, TO_CWD);
+  assert.equal(result.provider, "claude");
+  assert.equal(result.requestedHarness, "cursor");
+  assert.equal(result.resumeSessionId, null);
+  assert.match(result.primedPrompt, /Fix the auth redirect/);
+  assert.equal(fs.existsSync(path.join(runHome, ".cursor")), false);
 });
 
 test("a session-less handoff falls back to a primed prompt", () => {
@@ -376,7 +372,7 @@ test("a session-less handoff falls back to a primed prompt", () => {
   });
 
   assert.equal(result.resumeSessionId, null);
-  assert.equal(result.provider, "cursor");
+  assert.equal(result.provider, "claude");
   assert.match(result.primedPrompt, /Fix the auth redirect/);
   assert.match(result.primedPrompt, /I was tracing why the redirect loops\./);
   assert.match(result.primedPrompt, /2 files changed/);

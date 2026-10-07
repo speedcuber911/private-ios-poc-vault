@@ -2,8 +2,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-import { codexHome, dataDir, runHome } from "./config.mjs";
-import { importSession, claudeProjectSlug, cursorWorkspaceHash, codexRolloutLeafName } from "./sessionimport.mjs";
+import { codexHome, dataDir, runHome, retiredJobProviders } from "./config.mjs";
+import { importSession, claudeProjectSlug, codexRolloutLeafName } from "./sessionimport.mjs";
 import { isResumableSessionId } from "./sessionid.mjs";
 import { findSessionFile } from "./threads.mjs";
 import { browseWorkspaceForPath, resolveWorkspaceById } from "./workspaces.mjs";
@@ -79,12 +79,12 @@ function cleanSessionHarness(value) {
   if (value === undefined || value === null || value === "") return "codex";
   if (typeof value !== "string") fail(400, "session harness is invalid");
   const harness = value.trim().toLowerCase();
-  if (!["codex", "claude", "cursor"].includes(harness)) fail(400, "session harness is invalid");
+  if (!["codex", "claude"].includes(harness)) fail(400, "session harness is invalid");
   return harness;
 }
 
 function cleanSessionFormat(value, harness) {
-  const expected = harness === "claude" ? "claude-jsonl" : harness === "cursor" ? "cursor-jsonl" : "codex-rollout";
+  const expected = harness === "claude" ? "claude-jsonl" : "codex-rollout";
   if (value === undefined || value === null || value === "") return expected;
   if (typeof value !== "string") fail(400, "session format is invalid");
   const format = value.trim().toLowerCase();
@@ -139,11 +139,6 @@ function recordFilePath(record, targetCodexHome, targetRunHome = runHome) {
     if (typeof record.projectSlug !== "string" || path.basename(record.projectSlug) !== record.projectSlug) return null;
     return path.join(targetRunHome, ".claude", "projects", record.projectSlug, record.fileName);
   }
-  if (record.harness === "cursor") {
-    if (typeof record.workspaceHash !== "string" || !/^[a-f0-9]{32}$/.test(record.workspaceHash)) return null;
-    if (!isResumableSessionId(record.sessionId)) return null;
-    return path.join(targetRunHome, ".cursor", "chats", record.workspaceHash, record.sessionId, record.fileName);
-  }
   return path.join(targetCodexHome, "sessions", record.fileName);
 }
 
@@ -159,16 +154,6 @@ function existingRemoteSession(descriptor, workspace, {
       claudeProjectSlug(workspace.path),
       `${descriptor.id}.jsonl`,
     ));
-  }
-  if (descriptor.harness === "cursor") {
-    const sessionDir = path.join(
-      targetRunHome,
-      ".cursor",
-      "chats",
-      cursorWorkspaceHash(workspace.path),
-      descriptor.id,
-    );
-    return fs.existsSync(path.join(sessionDir, "transcript.jsonl")) || fs.existsSync(path.join(sessionDir, "meta.json"));
   }
   return Boolean(findSessionFile(path.join(targetCodexHome, "sessions"), descriptor.id));
 }
@@ -221,6 +206,12 @@ function planSessionImports(body, options = {}) {
   const state = readState(baseDir);
   let stateChanged = false;
   const sessions = body.sessions.map((value) => {
+    // A Mac can still offer sessions of a harness relayd no longer runs
+    // (Cursor). Skip each one rather than failing the whole folder's plan:
+    // the CLI already skips a "conflict" and carries on with the rest.
+    if (typeof value?.harness === "string" && retiredJobProviders.has(value.harness.trim().toLowerCase())) {
+      return { id: typeof value.id === "string" ? value.id : "", status: "conflict", reason: "harness_not_supported" };
+    }
     const descriptor = cleanDescriptor(value);
     const classification = classifyDescriptor(descriptor, workspace, { ...options, state });
     if (classification.status === "current") {
@@ -345,7 +336,6 @@ function importCodexSessionBytes(body, bytes, options = {}) {
     importedAt: new Date().toISOString(),
   };
   if (harness === "claude") record.projectSlug = claudeProjectSlug(workspace.path);
-  if (harness === "cursor") record.workspaceHash = cursorWorkspaceHash(workspace.path);
   const installedPath = recordFilePath(record, targetCodexHome, targetRunHome);
   if (!installedPath || !fs.existsSync(installedPath)) fail(500, "session import did not produce a transcript");
   record.installedSha256 = sha256File(installedPath);

@@ -29,8 +29,8 @@ function resolveUnder(env) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-data-"));
   try {
     const script =
-      `import { codexBin, claudeBin, cursorBin, kimiBin } from ${JSON.stringify(CONFIG)};` +
-      `process.stdout.write(JSON.stringify({ codexBin, claudeBin, cursorBin, kimiBin }));`;
+      `import { codexBin, claudeBin, kimiBin } from ${JSON.stringify(CONFIG)};` +
+      `process.stdout.write(JSON.stringify({ codexBin, claudeBin, kimiBin }));`;
     const out = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
       env: { ...process.env, CODEX_DATA_DIR: dataDir, ...env },
       encoding: "utf8",
@@ -108,17 +108,6 @@ test("with no binary anywhere the conventional path is still reported", (t) => {
 
   assert.equal(resolved.codexBin, "/usr/bin/codex");
   assert.equal(resolved.claudeBin, "/usr/bin/claude");
-});
-
-// Cursor was never broken — its default is derived from CODEX_RUN_HOME rather
-// than guessed at /usr/bin. Pin that, so the fix above cannot regress it.
-test("cursor still resolves under CODEX_RUN_HOME", (t) => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-home-"));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-
-  const resolved = resolveUnder({ CODEX_RUN_HOME: home, CURSOR_BIN: "" });
-
-  assert.equal(resolved.cursorBin, path.join(home, ".local", "bin", "cursor-agent"));
 });
 
 test("kimi resolves under CODEX_RUN_HOME and can be found on PATH", (t) => {

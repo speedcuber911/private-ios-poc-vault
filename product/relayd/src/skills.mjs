@@ -44,14 +44,6 @@ function skillRoots(provider, workspacePath = null) {
     ]);
   }
 
-  if (provider === "cursor") {
-    return uniqueExistingDirectories([
-      ...splitPathList(process.env.CURSOR_SKILL_DIRS),
-      path.join(runHome, ".cursor", "skills-cursor"),
-      path.join(runHome, ".cursor", "skills"),
-    ]);
-  }
-
   if (provider === "kimi") {
     return uniqueExistingDirectories([
       projectRoot && path.join(projectRoot, ".kimi-code", "skills"),
