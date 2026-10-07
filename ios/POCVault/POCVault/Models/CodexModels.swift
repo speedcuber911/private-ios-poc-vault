@@ -565,8 +565,10 @@ struct RelayHarnessAuthRejection: Decodable, Hashable {
     /// API Error: 401" preamble, which means nothing on a phone.
     var displayReason: String {
         var text = reason
-        if let range = text.range(of: #"^.*?API Error:\s*\d{3}\s*"#, options: .regularExpression) {
-            text.removeSubrange(range)
+        for preamble in [#"^.*?API Error:\s*\d{3}\s*"#, #"^Failed to authenticate[.:]\s*"#] {
+            if let range = text.range(of: preamble, options: .regularExpression) {
+                text.removeSubrange(range)
+            }
         }
         text = text.trimmingCharacters(in: CharacterSet(charactersIn: " .")).trimmingCharacters(in: .whitespaces)
         guard let first = text.first else { return "signed out" }
@@ -585,8 +587,9 @@ struct RelayHarnessAuthRejection: Decodable, Hashable {
 enum RelayProviderSignInFailure {
     private static let patterns: [CodexProvider: [String]] = [
         .claude: [
-            #"Failed to authenticate\.\s*API Error:\s*40[13]\b"#,
+            #"Failed to authenticate\b"#,
             #"OAuth (?:access )?token (?:has been revoked|has expired|is invalid)"#,
+            #"OAuth session expired"#,
             #"Please run /login"#,
             #"Invalid API key"#,
         ],

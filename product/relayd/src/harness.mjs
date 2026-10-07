@@ -207,8 +207,12 @@ const unwatchedRejectionTtlMs = 60 * 60 * 1000;
 // from some tool it ran is not mistaken for its own sign-in failing.
 const authFailurePatterns = {
   claude: [
-    /Failed to authenticate\.\s*API Error:\s*40[13]\b/i,
+    // "Failed to authenticate. API Error: 401 OAuth access token has been
+    // revoked." and "Failed to authenticate: OAuth session expired and could
+    // not be refreshed." are both Claude Code's own.
+    /Failed to authenticate\b/i,
     /OAuth (?:access )?token (?:has been revoked|has expired|is invalid)/i,
+    /OAuth session expired/i,
     /\bauthentication_error\b/i,
     /Invalid API key/i,
     /Not logged in\b.*\/login/i,

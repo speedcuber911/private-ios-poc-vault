@@ -403,6 +403,10 @@ final class ProviderLoginTests: XCTestCase {
         XCTAssertEqual(harness.shortStatus, "Sign-in expired")
         XCTAssertTrue(harness.isConfirmedUnavailable)
         XCTAssertEqual(harness.authRejection?.displayReason, "OAuth access token has been revoked")
+        XCTAssertEqual(
+            RelayHarnessAuthRejection(at: nil, reason: "Failed to authenticate: OAuth session expired and could not be refreshed").displayReason,
+            "OAuth session expired and could not be refreshed"
+        )
         XCTAssertTrue(harness.actionMessage?.contains("stopped working (OAuth access token has been revoked)") == true,
                       harness.actionMessage ?? "<nil>")
 
@@ -421,6 +425,7 @@ final class ProviderLoginTests: XCTestCase {
         XCTAssertTrue(try job(["signInRequired": true, "error": "anything"]).needsProviderSignIn)
         // An older relayd: the CLI's own words are enough.
         XCTAssertTrue(try job(["error": "Failed to authenticate. API Error: 401 OAuth access token has been revoked."]).needsProviderSignIn)
+        XCTAssertTrue(try job(["error": "Failed to authenticate: OAuth session expired and could not be refreshed"]).needsProviderSignIn)
         XCTAssertTrue(try job(["provider": "codex", "error": "stream error: refresh_token_reused"]).needsProviderSignIn)
         XCTAssertTrue(try job(["provider": "cursor", "error": "Logged in (unable to fetch user details)"]).needsProviderSignIn)
         // Not a sign-in problem.

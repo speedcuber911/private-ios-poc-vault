@@ -146,6 +146,10 @@ test("authFailureReason reads the CLI's own refusal, not an agent quoting a 401"
 
   assert.equal(authFailureReason("claude", REVOKED), REVOKED);
   assert.equal(
+    authFailureReason("claude", "Failed to authenticate: OAuth session expired and could not be refreshed"),
+    "Failed to authenticate: OAuth session expired and could not be refreshed",
+  );
+  assert.equal(
     authFailureReason("claude", "Not logged in · Please run /login"),
     "Not logged in · Please run /login",
   );
