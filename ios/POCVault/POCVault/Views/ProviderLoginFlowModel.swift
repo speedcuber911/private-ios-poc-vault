@@ -72,6 +72,8 @@ final class ProviderLoginFlowModel: ObservableObject {
         "The sign-in didn't complete. Try again."
     static let completionFailedMessage =
         "Relay couldn't hand the sign-in result to your machine. Try again."
+    static let partialClaudeCodeMessage =
+        "That is only part of the code. Copy the whole code from the page, then paste it again."
 
     let provider: CodexProvider
     @Published private(set) var step: Step = .idle
@@ -85,6 +87,8 @@ final class ProviderLoginFlowModel: ObservableObject {
     /// sign-in displays exactly what the machine said instead of a spinner
     /// with a secret.
     @Published private(set) var terminalTail: String?
+    /// Why the last pasted code was not sent, shown under the paste control.
+    @Published private(set) var pasteError: String?
 
     /// True while the exec fallback engine is driving the login.
     var isUsingTerminalEngine: Bool {
@@ -110,6 +114,12 @@ final class ProviderLoginFlowModel: ObservableObject {
     private var fallbackTimerTask: Task<Void, Never>?
     private var sawSignInArtifacts = false
     private var usedExecFallback = false
+    /// The machine already reported this provider signed in when the flow
+    /// began: signing in AGAIN, usually because the provider revoked the
+    /// token while the CLI's own status still says signed in. Then
+    /// `loggedIn: true` proves nothing, and only the login itself finishing
+    /// (or the code having gone in) counts as success.
+    private var startedSignedIn = false
 
     init(client: HarnessLoginClient, provider: CodexProvider) {
         self.client = client
@@ -127,6 +137,13 @@ final class ProviderLoginFlowModel: ObservableObject {
     /// other providers finish by pasting the code their sign-in page shows.
     var usesLocalCallback: Bool {
         provider == .codex
+    }
+
+    /// True when the provider's page shows a code to bring back (Claude Code
+    /// shows `code#state`). Cursor instead waits for the browser approval and
+    /// finishes by itself, so it has nothing to paste.
+    var usesPasteBack: Bool {
+        provider == .claude || provider == .kimi
     }
 
     /// Each provider's CLI binary and login entry point. The command is the
@@ -147,8 +164,12 @@ final class ProviderLoginFlowModel: ObservableObject {
         }
     }
 
+    /// Claude Code's sign-in is `claude auth login`: it prints the URL and
+    /// waits for the pasted code, then stores the session. (`setup-token`
+    /// only prints a token for an env var and stores nothing; `claude login`
+    /// is not a command at all and runs "login" as a prompt.)
     private var loginArgument: String {
-        provider == .claude ? "setup-token" : "login"
+        provider == .claude ? "auth login" : "login"
     }
 
     var terminalLoginCommand: String {
@@ -162,7 +183,11 @@ final class ProviderLoginFlowModel: ObservableObject {
         usedExecFallback = false
         progressDetail = nil
         terminalTail = nil
+        pasteError = nil
+        pastedCode = ""
         step = .starting
+        startedSignedIn = (try? await client.fetchHarnesses())?
+            .first(where: { $0.provider == provider })?.loggedIn == true
         do {
             adoptOp(try await client.startHarnessLogin(provider: provider))
         } catch let error as CodexClientError where error.statusCode == 409 {
@@ -189,12 +214,21 @@ final class ProviderLoginFlowModel: ObservableObject {
     func submitPastedCode() async {
         let text = pastedCode.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
+        // Claude's page shows `code#state`, and the CLI rejects either half
+        // alone. Catch a short copy here instead of losing the whole login.
+        if provider == .claude, !Self.isCompleteClaudeCode(text) {
+            pasteError = Self.partialClaudeCodeMessage
+            return
+        }
+        pasteError = nil
         switch engine {
         case .op(let id):
             step = .completing
             do {
                 _ = try await client.sendHarnessLoginInput(id: id, text: text)
-                startConnectedWatcher()
+                // The op finishing is the authority; the status list is only a
+                // shortcut, and a stale one when this is a second sign-in.
+                if !startedSignedIn { startConnectedWatcher() }
             } catch let error as CodexClientError where error.statusCode == 404 {
                 // This machine can't reach that stdin (route predates the
                 // feature). Rerun the login through exec, where typing works.
@@ -224,6 +258,20 @@ final class ProviderLoginFlowModel: ObservableObject {
         case nil:
             break
         }
+    }
+
+    /// The system Paste control hands over whatever was copied; take it and
+    /// finish in one tap.
+    func submitPasted(_ strings: [String]) async {
+        guard let text = strings.first?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return }
+        pastedCode = text
+        await submitPastedCode()
+    }
+
+    nonisolated static func isCompleteClaudeCode(_ text: String) -> Bool {
+        let parts = text.split(separator: "#", omittingEmptySubsequences: false)
+        return parts.count == 2 && !parts[0].isEmpty && !parts[1].isEmpty
+            && !text.contains(where: \.isWhitespace)
     }
 
     /// Relay a captured localhost redirect (the provider's OAuth callback) to
@@ -429,6 +477,14 @@ final class ProviderLoginFlowModel: ObservableObject {
             return
         }
 
+        // The code went in and the CLI turned it down: say so now rather than
+        // waiting out the deadline (or, signing in again, calling it done).
+        if step == .completing, let refusal = Self.loginRefusal(in: stripped) {
+            stopEverythingKeepingStep()
+            step = .failed("The sign-in failed on the machine: \(refusal)")
+            return
+        }
+
         let artifacts = Self.scanSignInArtifacts(in: stripped)
         guard artifacts.url != nil || artifacts.code != nil else { return }
         sawSignInArtifacts = true
@@ -505,7 +561,11 @@ final class ProviderLoginFlowModel: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(for: self.connectedPollInterval)
                 if Task.isCancelled { return }
-                if let statuses = try? await self.client.fetchHarnesses(),
+                // Signing in again: the machine said signed in before anything
+                // happened, so only a status read after the code went in counts.
+                let mayTrustStatus = !self.startedSignedIn || self.step == .completing
+                if mayTrustStatus,
+                   let statuses = try? await self.client.fetchHarnesses(),
                    statuses.first(where: { $0.provider == self.provider })?.loggedIn == true {
                     self.finishConnected()
                     return
@@ -606,6 +666,18 @@ final class ProviderLoginFlowModel: ObservableObject {
             "EADDRINUSE",
         ]
         for rawLine in text.split(whereSeparator: \.isNewline) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if markers.contains(where: { line.localizedCaseInsensitiveContains($0) }) {
+                return String(line.prefix(160))
+            }
+        }
+        return nil
+    }
+
+    /// What a login CLI prints when the pasted code is refused.
+    nonisolated static func loginRefusal(in text: String) -> String? {
+        let markers = ["Invalid code", "OAuth error", "Login failed", "invalid_grant"]
+        for rawLine in text.split(whereSeparator: \.isNewline).reversed() {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             if markers.contains(where: { line.localizedCaseInsensitiveContains($0) }) {
                 return String(line.prefix(160))

@@ -24,7 +24,7 @@ import { store } from "./store.mjs";
 import { emitEvent } from "./events.mjs";
 import { prepareJobWorkdir, completeJobWorktree } from "./worktree.mjs";
 import { ApprovalStore } from "./approval-store.mjs";
-import { assertProviderReady, detectProviderVersion } from "./harness.mjs";
+import { assertProviderReady, detectProviderVersion, noteProviderRunFailure, clearAuthRejection } from "./harness.mjs";
 import { validateConfiguredTaskSelection, validateRuntimeTaskSelection } from "./catalog.mjs";
 import { stripCodexHarnessNoise } from "./codex-noise.mjs";
 import { readTimeline, createTimelineTail, cleanTimelineStrings } from "./timeline.mjs";
@@ -875,6 +875,7 @@ function startJob(job) {
   job.startedAt = startedAt;
   job.updatedAt = startedAt;
   job.error = null;
+  job.signInRequired = false;
   job.timedOut = false;
   job.execution = buildExecutionReceipt(job);
   // Recorded on the job so a later restart with a different setting still
@@ -1265,6 +1266,7 @@ function jobStatusPayload(job) {
     exitCode: job.exitCode ?? null,
     timedOut: Boolean(job.timedOut),
     error: cleanApiText(job.error || "").trim() || null,
+    signInRequired: Boolean(job.signInRequired),
   };
 }
 
@@ -1655,7 +1657,12 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
       (claudeStream ? withoutRelayStepLines(stderrText) : stderrText) ||
       failedOutputText ||
       `${job.provider} exited with code ${code}${signal ? ` and signal ${signal}` : ""}`;
+    // The provider refusing its own credentials is not this job's fault: the
+    // phone offers "Sign in again" instead of a dead end, and the harness
+    // status stops claiming the provider is connected.
+    if (noteProviderRunFailure(job.provider, job.error)) job.signInRequired = true;
   }
+  if (job.status === "succeeded") clearAuthRejection(job.provider);
 
   // W2-MODULES worktree handoff v0: on success push relay/<id-prefix> to the
   // remote (never force) and prune the worktree. No-op when worktree mode is
@@ -1907,6 +1914,7 @@ async function toJobResponse(job, shape = responseShape("preview")) {
     resultBytes: result.bytes,
     resultTruncated: result.truncated,
     error: cleanApiText(job.error),
+    signInRequired: Boolean(job.signInRequired),
     certSubject: job.certSubject,
     model: job.model || null,
     reasoningEffort: job.reasoningEffort || null,

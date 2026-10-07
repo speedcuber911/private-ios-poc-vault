@@ -31,7 +31,8 @@ const PASTE_LOGIN_CLAUDE = [
   'if [ "$1" = "--version" ]; then echo "fake-claude 1.2.3"; exit 0; fi',
   'if [ "$1" = "--help" ]; then echo "  --model <model>"; exit 0; fi',
   'if [ "$1" = "auth" ] && [ "$2" = "status" ]; then echo \'{"loggedIn":false}\'; exit 0; fi',
-  'if [ "$1" = "login" ]; then',
+  // The real CLI has no top-level `login`: it would run "login" as a prompt.
+  'if [ "$1" = "auth" ] && [ "$2" = "login" ]; then',
   '  echo "Visit https://provider.example/authorize?flow=paste and paste the code shown there"',
   "  read -r line || exit 1",
   '  printf %s "$line" > "$HOME/received-input"',
@@ -47,7 +48,8 @@ const PARKED_LOGIN_CLAUDE = [
   'if [ "$1" = "--version" ]; then echo "fake-claude 1.2.3"; exit 0; fi',
   'if [ "$1" = "--help" ]; then echo "  --model <model>"; exit 0; fi',
   'if [ "$1" = "auth" ] && [ "$2" = "status" ]; then echo \'{"loggedIn":false}\'; exit 0; fi',
-  'if [ "$1" = "login" ]; then',
+  // The real CLI has no top-level `login`: it would run "login" as a prompt.
+  'if [ "$1" = "auth" ] && [ "$2" = "login" ]; then',
   '  echo "Visit https://provider.example/device and enter code WXYZ-2345 to continue"',
   "  i=0",
   `  while [ ! -f "$HOME/login-confirmed" ] && [ $i -lt ${FAKE_CLI_PARK_ITERATIONS} ]; do sleep 0.1; i=$((i+1)); done`,

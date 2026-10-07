@@ -303,6 +303,24 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
     /// a machine the app itself is bringing up. Set once, at launch.
     var onMachineWake: (@Sendable (Bool) -> Void)?
     private var didFetchPowerCredential = false
+    /// EC2 says the machine is off or starting (the app's power model, via
+    /// `setMachineKnownDown`). Guarded by `wakeLock`.
+    private var machineKnownDown = false
+
+    /// A request that may wake the machine then goes straight to the wake
+    /// cycle, instead of first spending its whole timeout on a machine that
+    /// cannot answer.
+    func setMachineKnownDown(_ isDown: Bool) {
+        wakeLock.lock()
+        machineKnownDown = isDown
+        wakeLock.unlock()
+    }
+
+    private var isMachineKnownDown: Bool {
+        wakeLock.lock()
+        defer { wakeLock.unlock() }
+        return machineKnownDown
+    }
 
     /// The exact decoder every node response goes through. Exposed so tests can
     /// decode fixtures the way the client will, instead of keeping a second
@@ -1456,6 +1474,10 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         }
         for (field, value) in additionalHeaders {
             request.setValue(value, forHTTPHeaderField: field)
+        }
+
+        if allowWake, isMachineKnownDown {
+            await wakeMachineIfNeeded()
         }
 
         let data: Data

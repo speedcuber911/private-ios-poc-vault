@@ -498,6 +498,10 @@ struct RelayHarnessStatus: Decodable, Hashable, Identifiable {
     let loggedIn: Bool?
     let authKind: String
     let taskControls: RelayHarnessTaskControls?
+    /// Set when the provider refused the stored sign-in on a real run. The
+    /// CLI's own status check cannot see a revoked token, so relayd keeps this
+    /// until the credentials change.
+    let authRejection: RelayHarnessAuthRejection?
 
     var id: CodexProvider { provider }
 
@@ -508,6 +512,7 @@ struct RelayHarnessStatus: Decodable, Hashable, Identifiable {
         case loggedIn
         case authKind
         case taskControls
+        case authRejected
     }
 
     init(from decoder: Decoder) throws {
@@ -518,6 +523,7 @@ struct RelayHarnessStatus: Decodable, Hashable, Identifiable {
         loggedIn = try container.decodeIfPresent(Bool.self, forKey: .loggedIn)
         authKind = (try container.decodeIfPresent(String.self, forKey: .authKind))?.trimmedNonEmpty ?? "unknown"
         taskControls = try container.decodeIfPresent(RelayHarnessTaskControls.self, forKey: .taskControls)
+        authRejection = try? container.decodeIfPresent(RelayHarnessAuthRejection.self, forKey: .authRejected)
     }
 
     var isConfirmedUnavailable: Bool {
@@ -526,6 +532,7 @@ struct RelayHarnessStatus: Decodable, Hashable, Identifiable {
 
     var shortStatus: String {
         if !installed { return "Not installed" }
+        if authRejection != nil { return "Sign-in expired" }
         if loggedIn == false { return "Needs connection" }
         if loggedIn == true { return "Connected" }
         return "Status unknown"
@@ -536,6 +543,9 @@ struct RelayHarnessStatus: Decodable, Hashable, Identifiable {
             return "\(provider.displayName) is not installed on this computer."
         }
         guard loggedIn == false else { return nil }
+        if let authRejection {
+            return "\(provider.displayName)'s sign-in on this machine stopped working (\(authRejection.displayReason)). Sign in again to keep going."
+        }
         return "\(provider.displayName) is not connected. Sign in from this iPhone, or run relay sync-auth on your Mac."
     }
 
@@ -544,6 +554,59 @@ struct RelayHarnessStatus: Decodable, Hashable, Identifiable {
     /// manages; an uninstalled CLI has nothing to sign in to.
     var supportsDirectLogin: Bool {
         installed
+    }
+}
+
+struct RelayHarnessAuthRejection: Decodable, Hashable {
+    let at: String?
+    let reason: String
+
+    /// The provider's sentence without the CLI's "Failed to authenticate.
+    /// API Error: 401" preamble, which means nothing on a phone.
+    var displayReason: String {
+        var text = reason
+        if let range = text.range(of: #"^.*?API Error:\s*\d{3}\s*"#, options: .regularExpression) {
+            text.removeSubrange(range)
+        }
+        text = text.trimmingCharacters(in: CharacterSet(charactersIn: " .")).trimmingCharacters(in: .whitespaces)
+        guard let first = text.first else { return "signed out" }
+        // "Token expired" reads mid-sentence as "token expired"; an acronym
+        // ("OAuth access token…") keeps its capitals.
+        let second = text.dropFirst().first
+        guard second?.isLowercase == true else { return text }
+        return first.lowercased() + text.dropFirst()
+    }
+}
+
+/// Reads a failed run's error for the provider turning away its own
+/// credentials. relayd now says so itself (`signInRequired`); this covers
+/// machines running an older relayd, using the CLIs' own wording and only the
+/// start of the error, so an agent quoting an HTTP 401 is not mistaken for it.
+enum RelayProviderSignInFailure {
+    private static let patterns: [CodexProvider: [String]] = [
+        .claude: [
+            #"Failed to authenticate\.\s*API Error:\s*40[13]\b"#,
+            #"OAuth (?:access )?token (?:has been revoked|has expired|is invalid)"#,
+            #"Please run /login"#,
+            #"Invalid API key"#,
+        ],
+        .cursor: [
+            #"unable to fetch user details"#,
+            #"\bAuthentication required\b"#,
+            #"\bNot authenticated\b"#,
+        ],
+        .codex: [
+            #"\brefresh_token_reused\b"#,
+            #"\btoken_expired\b"#,
+            #"access token could not be refreshed"#,
+            #"Provided authentication token is expired"#,
+        ],
+    ]
+
+    static func matches(provider: CodexProvider, error: String?) -> Bool {
+        guard let error, let patterns = patterns[provider] else { return false }
+        let head = String(error.prefix(600))
+        return patterns.contains { head.range(of: $0, options: [.regularExpression, .caseInsensitive]) != nil }
     }
 }
 
@@ -1764,6 +1827,10 @@ struct CodexJob: Decodable, Hashable, Identifiable {
     /// How many timeline events the machine holds for this job. Absent or zero
     /// means it has no timeline and the job renders the legacy way.
     var timelineEvents: Int?
+    /// The provider refused the machine's own sign-in (a revoked or expired
+    /// token), as relayd judged it. Older machines never send it; see
+    /// `needsProviderSignIn` for the fallback that reads the error itself.
+    var signInRequired: Bool
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -1814,6 +1881,7 @@ struct CodexJob: Decodable, Hashable, Identifiable {
         case attachments
         case artifacts
         case timelineEvents
+        case signInRequired
     }
 
     init(from decoder: Decoder) throws {
@@ -1884,6 +1952,14 @@ struct CodexJob: Decodable, Hashable, Identifiable {
         self.attachments = (try? container.decodeIfPresent([CodexJobAttachmentReference].self, forKey: .attachments)) ?? []
         self.artifacts = (try? container.decodeIfPresent([CodexJobArtifact].self, forKey: .artifacts)) ?? []
         self.timelineEvents = (try? container.decodeIntegerIfPresent(forKey: .timelineEvents)) ?? nil
+        self.signInRequired = (try? container.decodeIfPresent(Bool.self, forKey: .signInRequired)) ?? false
+    }
+
+    /// The run failed because the provider turned away the machine's sign-in,
+    /// so the useful next step is signing in again, not retrying.
+    var needsProviderSignIn: Bool {
+        guard status == .failed else { return false }
+        return signInRequired || RelayProviderSignInFailure.matches(provider: provider, error: errorMessage)
     }
 
     /// How much of the job's text a copy carries: the full logs, the 64 KiB

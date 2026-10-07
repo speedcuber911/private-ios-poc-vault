@@ -43,6 +43,10 @@ struct RelayChatView: View {
     /// Source-job inspection never replays its historical request to show an app.
     /// The visible Show app and output actions remain available on demand.
     var automaticallyOpensPreviews = true
+    /// The app's one power model: whether the machine is up decides what the
+    /// composer says and whether background refreshes run at all.
+    @ObservedObject var powerModel: RelayMachinePowerModel
+    var machineName = "Your machine"
     @State private var showingThreads = false
     @State private var threadsPreferLarge = false
     @State private var fullLogRequest: RelayFullLogRequest?
@@ -129,7 +133,8 @@ struct RelayChatView: View {
                             providerLoginRequest = provider
                         },
                         onAddAttachments: { viewModel.addDraftAttachments($0) },
-                        onRemoveAttachment: { viewModel.removeDraftAttachment(id: $0) }
+                        onRemoveAttachment: { viewModel.removeDraftAttachment(id: $0) },
+                        machineState: composerMachineState
                     )
                     .fixedSize(horizontal: false, vertical: true)
                 }
@@ -148,12 +153,14 @@ struct RelayChatView: View {
                 while !Task.isCancelled {
                     try? await Task.sleep(for: .seconds(2))
                     if Task.isCancelled { return }
+                    // A read that finds the machine off would start it.
+                    if powerModel.isDown { continue }
                     await viewModel.refreshWatchedThreadIfNeeded()
                     if viewModel.watchedSessionID == nil { return }
                 }
             }
             .onChange(of: scenePhase) { _, phase in
-                if phase == .active {
+                if phase == .active, !powerModel.isDown {
                     Task { await viewModel.refreshModels() }
                 }
             }
@@ -162,8 +169,24 @@ struct RelayChatView: View {
                 while !Task.isCancelled {
                     do { try await Task.sleep(for: .seconds(60)) }
                     catch { return }
+                    // Never wake an idle-stopped machine just to recheck models.
+                    if powerModel.isDown { continue }
                     await viewModel.refreshModels()
                 }
+            }
+            // Back up: models, agents and sign-in state may all have changed.
+            .onChange(of: powerModel.isDown) { wasDown, isDown in
+                guard wasDown, !isDown else { return }
+                Task {
+                    await viewModel.refreshHarnesses()
+                    await viewModel.refreshModels()
+                }
+            }
+            // A run the provider refused for its sign-in: re-read the agents so
+            // the composer offers Sign in too, not just the failed turn.
+            .onChange(of: latestSignInFailureJobID) { _, jobID in
+                guard jobID != nil else { return }
+                Task { await viewModel.refreshHarnesses() }
             }
             .onChange(of: threadsRequest.wrappedValue) { _, _ in
                 honorThreadsRequest()
@@ -253,6 +276,20 @@ struct RelayChatView: View {
         .offset(x: reduceMotion ? 0 : backSwipeOffset)
         .presentationBackground(.clear)
         .simultaneousGesture(backSwipeGesture)
+    }
+
+    /// What the composer says about the machine while EC2 has it down.
+    private var composerMachineState: RelayComposerMachineState? {
+        guard powerModel.isDown else { return nil }
+        return RelayComposerMachineState(
+            status: powerModel.status,
+            machineName: machineName,
+            onStart: { Task { await powerModel.start() } }
+        )
+    }
+
+    private var latestSignInFailureJobID: String? {
+        viewModel.messages.last(where: { $0.job?.needsProviderSignIn == true })?.job?.id
     }
 
     private var backSwipeGesture: some Gesture {
@@ -457,11 +494,23 @@ struct RelayChatView: View {
                 }
 
                 if viewModel.isLoadingThreadDetail {
-                    ProgressView("Loading conversation…")
-                        .tint(AppTheme.accent)
-                        .foregroundStyle(AppTheme.textSecondary)
-                        .frame(maxWidth: .infinity, minHeight: 120)
+                    if powerModel.isDown {
+                        // Opening the conversation is what started the machine;
+                        // say that instead of an unexplained minute of spinner.
+                        RelayMachineDownView(
+                            powerModel: powerModel,
+                            machineName: machineName,
+                            purpose: "this conversation"
+                        )
+                        .frame(minHeight: 160)
                         .padding(.top, Self.turnSpacing)
+                    } else {
+                        ProgressView("Loading conversation…")
+                            .tint(AppTheme.accent)
+                            .foregroundStyle(AppTheme.textSecondary)
+                            .frame(maxWidth: .infinity, minHeight: 120)
+                            .padding(.top, Self.turnSpacing)
+                    }
                 }
 
                 // An empty conversation shows nothing: the composer's own pill
@@ -606,7 +655,8 @@ struct RelayChatView: View {
                     },
                     onOpenStep: { stepID in
                         activityRequest = RelayActivityRequest(source: .job(job.id), root: .step(stepID))
-                    }
+                    },
+                    onSignIn: { providerLoginRequest = job.provider }
                 )
                 .equatable()
             } else {
@@ -631,7 +681,8 @@ struct RelayChatView: View {
                             jobID: job.id,
                             sourceURL: url
                         )
-                    }
+                    },
+                    onSignIn: { providerLoginRequest = job.provider }
                 )
             }
         } else {
@@ -759,6 +810,8 @@ private struct RelayComposer: View {
     var onConnectProvider: ((CodexProvider) -> Void)? = nil
     var onAddAttachments: ([RelayDraftAttachment]) -> Void = { _ in }
     var onRemoveAttachment: (UUID) -> Void = { _ in }
+    /// Set while the machine is off or in motion; takes the readiness line.
+    var machineState: RelayComposerMachineState? = nil
     @State private var isFocused = false
     @State private var editorSelection = NSRange(location: 0, length: 0)
     @State private var editorHeight: CGFloat = 28
@@ -1123,14 +1176,36 @@ private struct RelayComposer: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
-            if let harnessStatus, harnessStatus.isConfirmedUnavailable {
+            if let machineState {
+                HStack(alignment: .center, spacing: 8) {
+                    Text(machineState.message)
+                        .font(RelayChatStyle.labelFont)
+                        .foregroundStyle(AppTheme.statusWarn)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if machineState.status == .off {
+                        Button("Start", action: machineState.onStart)
+                            .font(RelayChatStyle.labelFont.weight(.semibold))
+                            .foregroundStyle(AppTheme.accent)
+                            .frame(minWidth: 44, minHeight: 44)
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("relay-machine-start")
+                    } else {
+                        ProgressView()
+                            .controlSize(.small)
+                            .tint(AppTheme.accent)
+                            .frame(minWidth: 44, minHeight: 44)
+                    }
+                }
+                .padding(.horizontal, 6)
+                .accessibilityIdentifier("relay-machine-readiness")
+            } else if let harnessStatus, harnessStatus.isConfirmedUnavailable {
                 HStack(alignment: .center, spacing: 8) {
                     Text(harnessStatus.actionMessage ?? "This provider is not ready on the linked computer.")
                         .font(RelayChatStyle.labelFont)
                         .foregroundStyle(AppTheme.statusWarn)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     if let onConnectProvider, harnessStatus.supportsDirectLogin, harnessStatus.loggedIn == false {
-                        Button("Connect") { onConnectProvider(harnessStatus.provider) }
+                        Button("Sign in") { onConnectProvider(harnessStatus.provider) }
                             .font(RelayChatStyle.labelFont.weight(.semibold))
                             .foregroundStyle(AppTheme.accent)
                             .frame(minWidth: 44, minHeight: 44)
@@ -2066,6 +2141,7 @@ private struct RelayJobTurn: View, Equatable {
     let onLoopbackURL: (URL) -> Void
     let onOpenBlock: (String) -> Void
     let onOpenStep: (String) -> Void
+    var onSignIn: () -> Void = {}
 
     static func == (lhs: RelayJobTurn, rhs: RelayJobTurn) -> Bool {
         lhs.job == rhs.job
@@ -2130,13 +2206,18 @@ private struct RelayJobTurn: View, Equatable {
                         .equatable()
                 }
                 if job.status == .failed || job.status == .timeout,
-                   let error = job.errorMessage?.trimmedNonEmpty {
+                   let error = job.errorMessage?.trimmedNonEmpty,
+                   error != timeline.proseText.trimmedNonEmpty {
                     Text(error)
                         .font(RelayTranscriptStyle.small)
                         .foregroundStyle(AppTheme.statusError)
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
                         .padding(.top, 8)
+                }
+                if job.needsProviderSignIn {
+                    RelaySignInAgainRow(provider: job.provider, action: onSignIn)
+                        .padding(.top, 10)
                 }
             }
 
@@ -2174,6 +2255,7 @@ private struct RelayJobCard: View {
     let onFullLog: () -> Void
     let onArtifact: (CodexJobArtifact) -> Void
     let onLoopbackURL: (URL) -> Void
+    var onSignIn: () -> Void = {}
     @State private var activityExpanded = false
 
     private var activeTailText: String? {
@@ -2247,6 +2329,10 @@ private struct RelayJobCard: View {
                 if let sourceURL = RelayOutputURLPolicy.loopbackURLs(in: text).first {
                     RelayAppPreviewNotice { onLoopbackURL(sourceURL) }
                 }
+            }
+
+            if job.needsProviderSignIn {
+                RelaySignInAgainRow(provider: job.provider, action: onSignIn)
             }
 
             if !job.artifacts.isEmpty {
