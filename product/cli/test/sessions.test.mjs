@@ -173,6 +173,24 @@ test("a Codex rollout keeps its native desktop task name", () => {
   assert.equal(session.title, "Improve iOS chat screen UX");
 });
 
+test("Codex Page-context desktop titles yield to the real prompt during sync", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-sessions-page-title-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const id = uuid("page-title");
+  const prompt = "take the latest pull from main.";
+  writeCodexRollout(home, id, CWD, null, { turns: [codexTurn("user", prompt)] });
+  const indexPath = path.join(home, ".codex", "session_index.jsonl");
+  for (const title of [
+    '<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>',
+    '<external_codex_apps_open_page>{"page_id":null}',
+    "<external_codex_apps_open_page>",
+  ]) {
+    fs.writeFileSync(indexPath, `${JSON.stringify({ id, thread_name: title })}\n`);
+    const [session] = discoverSessions({ cwd: CWD, home });
+    assert.equal(session.title, prompt);
+  }
+});
+
 test("duplicate Codex rollout files select the newest copy of one native session", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-sessions-duplicate-"));
   const id = uuid("duplicate");
@@ -560,6 +578,40 @@ test("stripSyntheticMarkup extracts the request after current Codex app context"
     stripSyntheticMarkup("<timestamp>later</timestamp>\n\n<user_query>Briefly inform the user about the task result and perform any follow-up actions (if needed). If there's no follow-ups needed, don't explicitly say that.</user_query>"),
     "",
   );
+});
+
+test("Codex Page context is removed during sync without losing the actual request", () => {
+  for (const context of [
+    '<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>',
+    '<external_codex_apps_open_page source="ambient-ui-state">\n{"page_id":"page_example"}\n</external_codex_apps_open_page>',
+    '<external_codex_apps_open_page>{"page_id":null}',
+    "<external_codex_apps_open_page>",
+  ]) {
+    assert.equal(stripSyntheticMarkup(context), "");
+    assert.equal(stripSyntheticMarkup(`Keep my changes.\n${context}`), "Keep my changes.");
+  }
+  assert.equal(
+    stripSyntheticMarkup('<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>\nKeep my changes.'),
+    "Keep my changes.",
+  );
+});
+
+test("Codex Page context is excluded from discovered titles and handoff excerpts", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-cli-sessions-page-context-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const context = '<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>';
+  const prompt = "take the latest pull from main.";
+  const file = writeCodexRollout(home, uuid("page-context"), CWD, null, {
+    turns: [codexTurn("user", context), codexTurn("user", prompt), codexTurn("assistant", "Done.")],
+  });
+  const contents = fs.readFileSync(file, "utf8");
+  const [session] = discoverSessions({ cwd: CWD, home });
+  assert.equal(session.title, prompt);
+  const excerpt = sessionExcerpt(session);
+  assert.match(excerpt, /take the latest pull from main/);
+  assert.match(excerpt, /Done\./);
+  assert.doesNotMatch(excerpt, /external_codex_apps_open_page|page_id/);
+  assert.equal(readSessionBytes(session).toString("utf8"), contents, "sync must preserve the native session");
 });
 
 test("a Cursor agent transcript is titled by the user_query, not the timestamp tag", () => {

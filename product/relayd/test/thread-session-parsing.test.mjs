@@ -253,6 +253,76 @@ test("pure Codex UI events do not become conversation titles", () => {
   );
 });
 
+test("Codex Page context is hidden from chat messages and the first-prompt title", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-thread-page-context-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "rollout.jsonl");
+  const context = '<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>';
+  const pageContext = '<external_codex_apps_open_page>{"page_id":"page_example"}</external_codex_apps_open_page>';
+  const prompt = "take the latest pull from main.";
+  const answer = "The marker <external_codex_apps_open_page> is internal context.";
+  const contents = `${[
+    message("user", context),
+    message("user", `${pageContext}\n${prompt}`),
+    message("assistant", answer),
+    message("user", pageContext),
+    message("user", `Keep my local changes.\n${context}`),
+  ].map((line) => JSON.stringify(line)).join("\n")}\n`;
+  fs.writeFileSync(file, contents);
+
+  const messages = await readSessionMessages(file);
+  assert.deepEqual(messages.map((entry) => [entry.role, entry.text]), [
+    ["user", prompt],
+    ["assistant", answer],
+    ["user", "Keep my local changes."],
+  ]);
+  assert.equal(readSessionSummary(file).firstUserPrompt, prompt);
+  assert.equal(fs.readFileSync(file, "utf8"), contents, "display filtering must preserve the native session");
+});
+
+test("Codex Page context never becomes a title, including incomplete context blocks", () => {
+  for (const context of [
+    '<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>',
+    '<external_codex_apps_open_page source="ambient-ui-state">\n{"page_id":"page_example"}\n</external_codex_apps_open_page>',
+    '<external_codex_apps_open_page>{"page_id":null}',
+    "<external_codex_apps_open_page>",
+  ]) {
+    assert.equal(userPromptSummary(context), null);
+    assert.equal(userPromptSummary(`Keep my changes.\n${context}`), "Keep my changes.");
+  }
+});
+
+test("already synced Codex Page-context titles yield to the real prompt", (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-thread-synced-page-"));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  const statePath = path.join(dataDir, "session-sync", "index.json");
+  fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  for (const savedTitle of [
+    '<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>',
+    '<external_codex_apps_open_page>{"page_id":null}',
+    "<external_codex_apps_open_page>",
+  ]) {
+    fs.writeFileSync(statePath, JSON.stringify({
+      v: 1,
+      sessions: {
+        [`repo:${SESSION_ID}`]: { workspaceId: "repo", sessionId: SESSION_ID, title: savedTitle },
+      },
+    }));
+    const titles = readSyncedSessionTitles(dataDir);
+    assert.equal(titles.size, 0);
+    const summary = threadSummary({
+      id: SESSION_ID,
+      provider: "codex",
+      title: titles.get(`repo:${SESSION_ID}`),
+      summary: { firstUserPrompt: "take the latest pull from main." },
+      jobs: [],
+      hasSessionFile: true,
+    });
+    assert.equal(summary.title, "take the latest pull from main.");
+    assert.equal(summary.lastPrompt, summary.title);
+  }
+});
+
 test("session parsing keeps attached images and serves workspace-readable files", async () => {
   const workspaceDir = path.join(bootstrap, "workspaces", "repo");
   const screenshot = path.join(workspaceDir, "capture.png");

@@ -1505,6 +1505,7 @@ const SYNTHETIC_USER_TAGS = [
   "environment_context",
   "user_instructions",
   "in-app-browser-context",
+  "external_codex_apps_open_page",
   "recommended_plugins",
   "app-context",
   "skills_instructions",

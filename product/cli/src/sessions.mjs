@@ -195,6 +195,7 @@ const SYNTHETIC_TAGS = [
   "environment_context",
   "user_instructions",
   "in-app-browser-context",
+  "external_codex_apps_open_page",
   "recommended_plugins",
   "app-context",
   "skills_instructions",
@@ -385,7 +386,8 @@ function readCodexThreadNames(home) {
     let record;
     try { record = JSON.parse(line); } catch { continue; }
     if (!isResumableSessionId(record?.id) || typeof record?.thread_name !== "string") continue;
-    const title = record.thread_name.replace(/\s+/g, " ").trim().slice(0, 200);
+    // Desktop names can already contain context; let the real prompt win.
+    const title = stripSyntheticMarkup(record.thread_name).replace(/\s+/g, " ").trim().slice(0, 200);
     if (title) names.set(record.id, title);
   }
   return names;
