@@ -313,12 +313,7 @@ struct AccountSettingsView: View {
             // comes up: a stopped machine is not asked, and is never powered
             // on just to fill this section.
             .task(id: AgentsLoadTrigger(hasMachine: nodeStore.hasMachine, machine: agentsMachineState)) {
-                if agentsMachineState == .down {
-                    harnesses = []
-                    harnessError = nil
-                }
-                guard nodeStore.hasMachine, agentsMachineState == .reachable else { return }
-                await loadHarnesses()
+                await refreshHarnessesForMachineState()
             }
             .task(id: computerLinkStore.computer?.id) {
                 guard computerLinkStore.computer?.status == .connecting else { return }
@@ -604,6 +599,15 @@ struct AccountSettingsView: View {
     /// EC2 says the machine is stopped or in motion, so a node request that
     /// fails is not news and the agents section has nothing to add.
     private var isMachineKnownDown: Bool { agentsMachineState == .down }
+
+    private func refreshHarnessesForMachineState() async {
+        if agentsMachineState == .down {
+            harnesses = []
+            harnessError = nil
+        }
+        guard nodeStore.hasMachine, agentsMachineState == .reachable else { return }
+        await loadHarnesses()
+    }
 
     private func loadHarnesses() async {
         guard nodeStore.hasMachine, !isMachineKnownDown else { return }

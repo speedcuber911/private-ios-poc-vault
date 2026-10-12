@@ -307,7 +307,9 @@ export function createPower({
         : await client.startInstances({ instanceIds: [row.instance_id] });
       const instance = result.instances?.[0];
       if (action === "stop") markStopRequested(row.node_id);
-      else markAwaitingReady(row.node_id, instance?.state || "pending");
+      // Auto-wake also reaches here after a phone's temporary connection
+      // failure. An already-running EC2 will not boot or re-register relayd.
+      else if (instance?.state !== "running") markAwaitingReady(row.node_id, instance?.state || "pending");
       return {
         status: 200,
         body: {
@@ -535,7 +537,7 @@ export function createPower({
     db.prepare(`INSERT INTO node_power_watch (node_id, state, observed_at, stop_requested_at)
       VALUES (?, 'stopping', ?, ?)
       ON CONFLICT(node_id) DO UPDATE SET stop_requested_at = excluded.stop_requested_at,
-        awaiting_ready_since = NULL`)
+        awaiting_ready_since = NULL, ready_fallback_sent_at = NULL`)
       .run(nodeId, now(), now());
   }
 
@@ -543,6 +545,8 @@ export function createPower({
     db.prepare(`INSERT INTO node_power_watch (node_id, state, observed_at, awaiting_ready_since)
       VALUES (?, ?, ?, ?)
       ON CONFLICT(node_id) DO UPDATE SET stop_requested_at = NULL,
+        ready_fallback_sent_at = CASE WHEN node_power_watch.awaiting_ready_since IS NULL
+          THEN NULL ELSE node_power_watch.ready_fallback_sent_at END,
         awaiting_ready_since = COALESCE(node_power_watch.awaiting_ready_since, excluded.awaiting_ready_since)`)
       .run(nodeId, state, now(), now());
   }
@@ -555,10 +559,12 @@ export function createPower({
     if (!watch) return;
     const nowMs = now();
     const awaiting = watch.awaiting_ready_since != null && nowMs - watch.awaiting_ready_since <= READY_WAIT_MAX_MS;
+    const fallbackPending = watch.ready_fallback_sent_at != null && UP_STATES.has(watch.state)
+      && nowMs - watch.observed_at <= WATCH_STALE_MS;
     const seenDown = !UP_STATES.has(watch.state) && nowMs - watch.observed_at <= WATCH_STALE_MS;
-    if (!awaiting && !seenDown) return;
+    if (!awaiting && !fallbackPending && !seenDown) return;
     db.prepare(`UPDATE node_power_watch SET state = 'running', stop_requested_at = NULL,
-      awaiting_ready_since = NULL WHERE node_id = ?`).run(nodeId);
+      awaiting_ready_since = NULL, ready_fallback_sent_at = NULL WHERE node_id = ?`).run(nodeId);
     const resize = resizeRow(nodeId);
     const resized = resize && ["waiting_start", "waiting_running", "complete"].includes(resize.stage)
       && nowMs - resize.started_at <= READY_WAIT_MAX_MS
@@ -576,17 +582,18 @@ export function createPower({
     const name = machineName(instance.tags);
     const prev = watchRow(nodeId);
     const nowMs = now();
-    const record = (stopRequestedAt, awaitingSince) => {
+    const record = (stopRequestedAt, awaitingSince, fallbackSentAt) => {
       db.prepare(`INSERT INTO node_power_watch
-          (node_id, state, name, observed_at, stop_requested_at, awaiting_ready_since)
-        VALUES (?, ?, ?, ?, ?, ?)
+          (node_id, state, name, observed_at, stop_requested_at, awaiting_ready_since, ready_fallback_sent_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(node_id) DO UPDATE SET state = excluded.state, name = excluded.name,
           observed_at = excluded.observed_at, stop_requested_at = excluded.stop_requested_at,
-          awaiting_ready_since = excluded.awaiting_ready_since`)
-        .run(nodeId, state, name, nowMs, stopRequestedAt, awaitingSince);
+          awaiting_ready_since = excluded.awaiting_ready_since,
+          ready_fallback_sent_at = excluded.ready_fallback_sent_at`)
+        .run(nodeId, state, name, nowMs, stopRequestedAt, awaitingSince, fallbackSentAt);
     };
     if (!prev || nowMs - prev.observed_at > WATCH_STALE_MS) {
-      record(null, null);
+      record(null, null, null);
       return;
     }
     let stopRequestedAt = prev.stop_requested_at != null && nowMs - prev.stop_requested_at <= STOP_REQUEST_QUIET_MS
@@ -595,6 +602,7 @@ export function createPower({
     let awaitingSince = prev.awaiting_ready_since != null && nowMs - prev.awaiting_ready_since <= READY_WAIT_MAX_MS
       ? prev.awaiting_ready_since
       : null;
+    let fallbackSentAt = prev.ready_fallback_sent_at;
     let push = null;
     if (state === "stopped" && prev.state !== "stopped") {
       // Announced at `stopped`, not `stopping`: by then the Lambda's
@@ -604,18 +612,23 @@ export function createPower({
       }
       stopRequestedAt = null;
       awaitingSince = null;
+      fallbackSentAt = null;
     } else if (UP_STATES.has(state) && !UP_STATES.has(prev.state)) {
       awaitingSince = awaitingSince ?? nowMs;
       stopRequestedAt = null;
-    } else if (state === "running" && awaitingSince != null && nowMs - awaitingSince >= READY_FALLBACK_MS) {
+      fallbackSentAt = null;
+    } else if (state === "running" && awaitingSince != null && fallbackSentAt == null
+      && nowMs - awaitingSince >= READY_FALLBACK_MS) {
       push = {
         type: "power.ready",
         banner: { title: `${name || "Your machine"} is on`, body: "It's running, but Relay hasn't connected yet." },
       };
-      awaitingSince = null;
+      // The fallback announces EC2 power, not Relay readiness. Keep a durable
+      // marker so a later registration corrects it once, without repeat pushes.
+      fallbackSentAt = nowMs;
     }
     // Persisted before the push goes out: one transition, at most one push.
-    record(stopRequestedAt, awaitingSince);
+    record(stopRequestedAt, awaitingSince, fallbackSentAt);
     if (push) sendPowerPush(nodeId, push.type, push.banner);
   }
 

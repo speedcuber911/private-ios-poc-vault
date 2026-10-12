@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import { hashWakeToken, resizeOptions } from "../src/power.js";
 import { instancePricing } from "../src/instance-pricing.js";
@@ -831,6 +834,137 @@ test("a machine running five minutes without relayd still gets a banner", async 
     });
     await t.tick();
     assert.equal(powerPushes(t).length, 1);
+  } finally {
+    await t.close();
+  }
+});
+
+test("starting an already running registered machine never creates another readiness wait", async () => {
+  const t = await watchedMachine("running");
+  try {
+    t.clock.t += 1_000;
+    assert.equal((await register(t, t.identity, { ts: t.clock.t })).status, 200);
+    assert.equal((await api(t.baseUrl, "POST", `/v1/power/${NODE}/start`, { headers: WAKE_HEADERS })).status, 200);
+    await t.tick(READY_FALLBACK_TEST_MS);
+    assert.equal(powerPushes(t).length, 0);
+    assert.equal(t.app.db.prepare("SELECT awaiting_ready_since FROM node_power_watch WHERE node_id = ?").get(NODE).awaiting_ready_since, null);
+  } finally {
+    await t.close();
+  }
+});
+
+test("duplicate starts during boot keep the original wait and emit the fallback only once", async () => {
+  const t = await watchedMachine("stopped");
+  try {
+    assert.equal((await api(t.baseUrl, "POST", `/v1/power/${NODE}/start`, { headers: WAKE_HEADERS })).status, 200);
+    await t.tick(60_000);
+    const since = t.app.db.prepare("SELECT awaiting_ready_since FROM node_power_watch WHERE node_id = ?").get(NODE).awaiting_ready_since;
+    assert.equal((await api(t.baseUrl, "POST", `/v1/power/${NODE}/start`, { headers: WAKE_HEADERS })).status, 200);
+    t.ec2.states.set(INSTANCE, "running");
+    await t.tick(READY_FALLBACK_TEST_MS - 60_000);
+    assert.equal(powerPushes(t).length, 1);
+    await t.tick();
+    assert.equal(powerPushes(t).length, 1);
+    assert.equal(t.app.db.prepare("SELECT awaiting_ready_since FROM node_power_watch WHERE node_id = ?").get(NODE).awaiting_ready_since, since);
+  } finally {
+    await t.close();
+  }
+});
+
+test("late registration replaces a fallback once, even after a long boot", async () => {
+  const t = await watchedMachine("stopped");
+  try {
+    t.ec2.states.set(INSTANCE, "running");
+    await t.tick();
+    for (let index = 0; index < 5; index += 1) await t.tick(READY_FALLBACK_TEST_MS);
+    assert.equal(powerPushes(t).length, 1);
+    assert.equal((await register(t, t.identity, { ts: t.clock.t })).status, 200);
+    await t.app.power.drainPushes();
+    assert.equal(powerPushes(t).length, 2);
+    assert.deepEqual(powerPushes(t)[1].body.aps.alert, { title: "pariksj-dev is ready", body: "Relay is connected." });
+    t.clock.t += 1_000;
+    assert.equal((await register(t, t.identity, { ts: t.clock.t })).status, 200);
+    await t.tick();
+    assert.equal(powerPushes(t).length, 2);
+  } finally {
+    await t.close();
+  }
+});
+
+test("power watcher migration preserves an existing startup wait and is repeatable", () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "relay-power-migration-"));
+  const file = path.join(folder, "cloud.sqlite");
+  let db;
+  try {
+    db = createDb(file);
+    db.prepare(`INSERT INTO node_power (node_id, pubkey, instance_id, region, wake_token_hash, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`).run(NODE, makeNodeIdentity().pubkeyPem, INSTANCE, "ap-south-1", WAKE_HASH, 1, 1);
+    db.exec(`DROP TABLE node_power_watch;
+      CREATE TABLE node_power_watch (
+        node_id TEXT PRIMARY KEY REFERENCES node_power(node_id) ON DELETE CASCADE,
+        state TEXT NOT NULL, name TEXT, observed_at INTEGER NOT NULL,
+        stop_requested_at INTEGER, awaiting_ready_since INTEGER
+      );`);
+    db.prepare(`INSERT INTO node_power_watch (node_id, state, observed_at, awaiting_ready_since)
+      VALUES (?, 'running', 123, 100)`).run(NODE);
+    db.close();
+    db = createDb(file);
+    const row = db.prepare("SELECT * FROM node_power_watch WHERE node_id = ?").get(NODE);
+    assert.equal(row.awaiting_ready_since, 100);
+    assert.equal(row.ready_fallback_sent_at, null);
+    db.prepare("UPDATE node_power_watch SET ready_fallback_sent_at = 120 WHERE node_id = ?").run(NODE);
+    db.close();
+    db = createDb(file);
+    assert.equal(db.prepare("SELECT ready_fallback_sent_at FROM node_power_watch WHERE node_id = ?").get(NODE).ready_fallback_sent_at, 120);
+  } finally {
+    db?.close();
+    fs.rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+test("a cloud restart keeps the fallback quiet and still corrects it when relayd arrives", async () => {
+  const first = await watchedMachine("stopped");
+  first.ec2.states.set(INSTANCE, "running");
+  await first.tick();
+  await first.tick(READY_FALLBACK_TEST_MS);
+  assert.equal(powerPushes(first).length, 1);
+  await first.close();
+
+  const second = await startPowerApp({ db: first.app.db, ec2: first.ec2, clock: first.clock });
+  try {
+    second.clock.t += 30_000;
+    await second.app.power.watchPower();
+    await second.app.power.drainPushes();
+    assert.equal(powerPushes(second).length, 0);
+    assert.equal((await register(second, first.identity, { ts: second.clock.t })).status, 200);
+    await second.app.power.drainPushes();
+    assert.equal(powerPushes(second).length, 1);
+    assert.equal(powerPushes(second)[0].body.aps.alert.body, "Relay is connected.");
+  } finally {
+    await second.close();
+  }
+});
+
+test("stopping after a fallback clears it so the next boot has its own readiness wait", async () => {
+  const t = await watchedMachine("stopped");
+  try {
+    t.ec2.states.set(INSTANCE, "running");
+    await t.tick();
+    await t.tick(READY_FALLBACK_TEST_MS);
+    assert.equal(powerPushes(t).length, 1);
+    assert.equal((await api(t.baseUrl, "POST", `/v1/power/${NODE}/stop`, { headers: WAKE_HEADERS })).status, 200);
+    await t.tick();
+    t.ec2.states.set(INSTANCE, "stopped");
+    await t.tick();
+    assert.equal(powerPushes(t).length, 1, "a stop requested through Relay remains silent");
+    t.ec2.states.set(INSTANCE, "running");
+    await t.tick();
+    await t.tick(READY_FALLBACK_TEST_MS);
+    assert.equal(powerPushes(t).length, 2);
+    assert.equal((await register(t, t.identity, { ts: t.clock.t })).status, 200);
+    await t.app.power.drainPushes();
+    assert.equal(powerPushes(t).length, 3);
+    assert.equal(powerPushes(t)[2].body.aps.alert.body, "Relay is connected.");
   } finally {
     await t.close();
   }

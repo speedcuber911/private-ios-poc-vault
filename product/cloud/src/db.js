@@ -380,14 +380,16 @@ CREATE TABLE IF NOT EXISTS node_power_devices (
 -- re-announces a change nor forgets one is pending.
 --   stop_requested_at    - a stop came through Relay; its stop stays silent
 --   awaiting_ready_since - the machine is booting; the next relayd
---                          registration (or a 5-minute fallback) announces it
+--                          registration announces readiness
+--   ready_fallback_sent_at - a fallback was sent; late readiness may replace it
 CREATE TABLE IF NOT EXISTS node_power_watch (
   node_id              TEXT PRIMARY KEY REFERENCES node_power(node_id) ON DELETE CASCADE,
   state                TEXT NOT NULL,
   name                 TEXT,
   observed_at          INTEGER NOT NULL,
   stop_requested_at    INTEGER,
-  awaiting_ready_since INTEGER
+  awaiting_ready_since INTEGER,
+  ready_fallback_sent_at INTEGER
 );
 `;
 
@@ -398,6 +400,7 @@ export function createDb(path = ":memory:") {
   migratePairingSessions(db);
   db.exec(SCHEMA);
   migrateCliComputerLinks(db);
+  migratePowerWatch(db);
   return db;
 }
 
@@ -436,4 +439,11 @@ function migrateCliComputerLinks(db) {
   addColumnIfMissing("refresh_tokens", "cli_link_id", "cli_link_id TEXT");
   addColumnIfMissing("device_codes", "cli_link_id", "cli_link_id TEXT");
   addColumnIfMissing("device_codes", "client", "client TEXT NOT NULL DEFAULT 'cli'");
+}
+
+function migratePowerWatch(db) {
+  const columns = db.prepare("PRAGMA table_info(node_power_watch)").all();
+  if (!columns.some((column) => column.name === "ready_fallback_sent_at")) {
+    db.exec("ALTER TABLE node_power_watch ADD COLUMN ready_fallback_sent_at INTEGER");
+  }
 }

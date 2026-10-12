@@ -45,10 +45,16 @@ allowlisted instance. The last observed state per node is stored in
 it starts. A registration for a node that is awaiting ready, or that the
 watcher last saw stopped, means Relay itself is up: push `power.ready`. A
 start through `POST /v1/power/:id/start` marks the node as awaiting ready
-immediately. A relayd restart on a machine that was already running stays
-silent. If the machine has been running for 5 minutes with no registration,
-push `power.ready` with a "Relay hasn't connected yet" banner instead, so a
-broken relayd is not silent.
+immediately when EC2 needs to start. A Start response of `running` leaves
+readiness tracking alone: auto-wake after a phone connection failure must not
+wait for another relayd registration on a machine that never rebooted.
+A relayd restart on a machine that was already running stays silent.
+If the machine has been running for 5 minutes with no registration, push
+`power.ready` with a "Relay hasn't connected yet" banner once, so a broken
+relayd is not silent. `ready_fallback_sent_at` records that banner separately
+from readiness. A later registration replaces it with "Relay is connected"
+once, even after a long boot; stopping the machine or a stale watcher clears
+the pending correction.
 
 **Subscription.** `PUT /v1/power/:nodeId/push` with the wake token as bearer
 and `{apnsToken, apnsEnvironment}` upserts the phone into
@@ -61,8 +67,10 @@ so only phones holding the current token are told anything.
 
 1. A push never reaches a phone that does not hold the machine's current wake
    token (subscribe is wake-token authed; re-pair clears subscribers).
-2. One transition, at most one push. State is persisted before the push is
-   sent, and the watcher skips nodes whose previous observation is stale.
+2. Each stop, fallback, or ready stage produces at most one push. A ready
+   push may correct a previous fallback using the same collapse id. State is
+   persisted before sending, including across cloud restarts, and the watcher
+   skips nodes whose previous observation is stale.
 3. A resize never produces a "stopped" push; it ends with one "ready" push
    naming the new size.
 4. APNs `410`/`Unregistered` deletes the subscription row; `BadDeviceToken`

@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import UIKit
 
 struct RelayUsage: Hashable {
@@ -445,9 +446,9 @@ final class RelayChatViewModel: ObservableObject {
     /// The explicit model+mode selection. Never inferred from `supports(.task)`; the mode
     /// travels with the choice from the picker section it was tapped in.
     @Published private(set) var selectedChoice: RelayModelChoice?
-    /// User-chosen reasoning effort for task jobs (nil = model default). Reset when the
-    /// selected choice changes so we never send an effort the model doesn't support.
-    @Published var selectedEffort: CodexReasoningEffort?
+    /// The next turn's effort, remembered per conversation and validated against
+    /// the selected model. Restoring history never replaces a newer user choice.
+    @Published private(set) var selectedEffort: CodexReasoningEffort?
     /// Claude's permission policy is deliberately provider-specific. Codex keeps its
     /// runner-enforced sandbox policy until the backend has a true interactive approval
     /// channel; we do not present a phone toggle that the current executor would ignore.
@@ -513,12 +514,17 @@ final class RelayChatViewModel: ObservableObject {
 
     private let client: CodexClient
     private let live: RelayChatLiveSource
+    private let fetchModels: () async throws -> [CodexModelDescriptor]
     private let fetchJobDetail: (String) async throws -> CodexJob
     private let fetchThreadDetail: (String, String?, CodexProvider) async throws -> CodexThreadDetail
+    private let effortDefaults: UserDefaults
+    private var selectedEffortKey: String?
+    private var selectionRevision = UUID()
     /// Detail refreshes may finish after the user selects a different source or
     /// starts a conversation. They must not replace that newer foreground state.
     private var conversationRevision = UUID()
     private var currentThreadID: String?
+    private var currentStandaloneJobID: String?
     private var currentThreadProvider: CodexProvider?
     private var currentThreadMode: RelayInteractionMode = .task
     /// Workspace the current thread belongs to. Resuming a session in a different
@@ -620,14 +626,18 @@ final class RelayChatViewModel: ObservableObject {
         client: CodexClient,
         workspaceID: String?,
         workspacePath: String?,
+        fetchModels: (() async throws -> [CodexModelDescriptor])? = nil,
         fetchJobDetail: ((String) async throws -> CodexJob)? = nil,
         fetchThreadDetail: ((String, String?, CodexProvider) async throws -> CodexThreadDetail)? = nil,
+        effortDefaults: UserDefaults = .standard,
         live: RelayChatLiveSource? = nil,
         publishInterval: TimeInterval = 0.08
     ) {
         self.client = client
         self.live = live ?? .live(client)
+        self.fetchModels = fetchModels ?? { try await client.fetchModels() }
         self.publishInterval = publishInterval
+        self.effortDefaults = effortDefaults
         self.fetchJobDetail = fetchJobDetail ?? { id in
             try await client.fetchJob(id: id, includeFullLogs: false)
         }
@@ -693,8 +703,29 @@ final class RelayChatViewModel: ObservableObject {
     }
 
     func selectChoice(_ choice: RelayModelChoice) {
+        selectionRevision = UUID()
+        applyChoice(choice, restoringEffort: false)
+        rememberSelectedEffort()
+    }
+
+    private func restoreChoice(_ choice: RelayModelChoice) {
+        applyChoice(choice, restoringEffort: true)
+    }
+
+    private func applyChoice(_ choice: RelayModelChoice, restoringEffort: Bool) {
+        let key = effortDefaultsKey(for: choice)
+        let sameConversation = selectedEffortKey == key
+        let sameChoice = selectedChoice?.id == choice.id
+        let saved = key.flatMap { effortDefaults.string(forKey: $0) }
+            .flatMap { CodexReasoningEffort(rawValue: $0) }
+        let effort = restoringEffort
+            ? (sameConversation ? selectedEffort : saved)
+            : (sameConversation && sameChoice ? selectedEffort : nil)
         selectedChoice = choice
-        selectedEffort = nil  // fall back to the new model's default until the user picks
+        selectedEffortKey = key
+        selectedEffort = effort.flatMap { candidate in
+            choice.model.effortLevels.contains { $0.lowercased() == candidate.rawValue } ? candidate : nil
+        }
     }
 
     var selectedTaskProvider: CodexProvider? {
@@ -743,7 +774,49 @@ final class RelayChatViewModel: ObservableObject {
     }
 
     func selectEffort(_ effort: CodexReasoningEffort?) {
+        if let effort, !availableEfforts.contains(effort) { return }
+        selectionRevision = UUID()
         selectedEffort = effort
+        rememberSelectedEffort()
+    }
+
+    private func effortDefaultsKey(for choice: RelayModelChoice) -> String? {
+        guard choice.mode == .task, let id = currentThreadID ?? currentStandaloneJobID else { return nil }
+        let components = [
+            client.baseURL.absoluteString,
+            currentThreadWorkspaceID ?? workspaceID ?? "",
+            (currentThreadProvider ?? choice.executionProvider).rawValue,
+            currentThreadID == nil ? "job" : "thread",
+            id
+        ]
+        guard let data = try? JSONEncoder().encode(components) else { return nil }
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        return "relay.chat.reasoning-effort.v1.\(digest)"
+    }
+
+    private func rememberSelectedEffort() {
+        guard let choice = selectedChoice, let key = effortDefaultsKey(for: choice) else { return }
+        selectedEffortKey = key
+        // An explicit default is a choice too; older job metadata must not
+        // restore its own effort after the person clears the selection.
+        effortDefaults.set(selectedEffort?.rawValue ?? "default", forKey: key)
+    }
+
+    private func restoreEffort(from jobs: [CodexJob]) {
+        guard let choice = selectedChoice, let key = effortDefaultsKey(for: choice),
+              effortDefaults.string(forKey: key) == nil, selectedEffort == nil else { return }
+        let compatible = jobs.filter {
+            $0.provider == choice.executionProvider && (choice.isProviderDefault || $0.model == nil
+                || $0.model == choice.model.id || $0.model == choice.model.taskModel)
+        }.sorted {
+            ($0.createdAt ?? $0.updatedAt ?? .distantPast) > ($1.createdAt ?? $1.updatedAt ?? .distantPast)
+        }
+        let supported = choice.model.effortLevels.compactMap { CodexReasoningEffort(rawValue: $0.lowercased()) }
+        guard let effort = compatible.lazy.compactMap({ $0.reasoningEffort ?? $0.execution?.reasoningEffort })
+            .compactMap({ CodexReasoningEffort(rawValue: $0.lowercased()) })
+            .first(where: { supported.contains($0) }) else { return }
+        selectedEffort = effort
+        rememberSelectedEffort()
     }
 
     private func ensureSelectedChoiceValid() {
@@ -760,7 +833,7 @@ final class RelayChatViewModel: ObservableObject {
                 mode: currentThreadMode,
                 model: selectedChoice?.model.id
             ) {
-                selectChoice(choice)
+                restoreChoice(choice)
             }
             return
         }
@@ -769,7 +842,7 @@ final class RelayChatViewModel: ObservableObject {
             return
         }
         if let fallback = sections.defaultChoice {
-            selectedChoice = fallback
+            restoreChoice(fallback)
         }
     }
 
@@ -782,7 +855,7 @@ final class RelayChatViewModel: ObservableObject {
         isRefreshingModels = true
         defer { isRefreshingModels = false }
         do {
-            let refreshed = try await client.fetchModels()
+            let refreshed = try await fetchModels()
             guard !Task.isCancelled else { return }
             models = refreshed
             ensureSelectedChoiceValid()
@@ -798,7 +871,7 @@ final class RelayChatViewModel: ObservableObject {
         defer { isLoading = false }
         do {
             await refreshHarnesses()
-            models = try await client.fetchModels()
+            models = try await fetchModels()
             ensureSelectedChoiceValid()
             await refreshSkills()
             await refreshThreads()
@@ -1822,6 +1895,10 @@ final class RelayChatViewModel: ObservableObject {
     func startNewConversation() {
         conversationRevision = UUID()
         currentThreadID = nil
+        currentStandaloneJobID = nil
+        selectedEffort = nil
+        selectedEffortKey = nil
+        selectionRevision = UUID()
         currentThreadProvider = nil
         currentThreadMode = .task
         currentThreadWorkspaceID = nil
@@ -1890,6 +1967,7 @@ final class RelayChatViewModel: ObservableObject {
         // Show the thread's identity and whatever the feed already carries before
         // the detail round trip, matching the source-task "show immediately" path.
         presentThreadSeed(thread)
+        let requestedSelection = selectionRevision
         isLoadingThreadDetail = true
         defer {
             if conversationRevision == revision {
@@ -1908,13 +1986,16 @@ final class RelayChatViewModel: ObservableObject {
             currentThreadMode = detail.thread.mode
             currentThreadWorkspaceID = detail.thread.workspaceId
             currentThreadWorkspaceName = detail.thread.workspaceName
-            if let choice = Self.choiceMatchingThread(
-                from: models,
-                provider: detail.thread.provider,
-                mode: detail.thread.mode,
-                model: detail.thread.model
-            ) {
-                selectChoice(choice)
+            if selectionRevision == requestedSelection {
+                if let choice = Self.choiceMatchingThread(
+                    from: models,
+                    provider: detail.thread.provider,
+                    mode: detail.thread.mode,
+                    model: detail.thread.model
+                ) {
+                    restoreChoice(choice)
+                }
+                restoreEffort(from: detail.jobs)
             }
             messages = conversationItems(from: detail)
             conversationDidChange()
@@ -1933,6 +2014,7 @@ final class RelayChatViewModel: ObservableObject {
 
     private func presentThreadSeed(_ thread: CodexThread) {
         currentThreadID = thread.sessionId
+        currentStandaloneJobID = nil
         currentThreadProvider = thread.provider
         currentThreadMode = thread.mode
         currentThreadWorkspaceID = thread.workspaceId
@@ -1944,7 +2026,7 @@ final class RelayChatViewModel: ObservableObject {
             mode: thread.mode,
             model: thread.model
         ) {
-            selectChoice(choice)
+            restoreChoice(choice)
         }
 
         var items: [RelayConversationItem] = []
@@ -2224,26 +2306,34 @@ final class RelayChatViewModel: ObservableObject {
         // network wait: a cold runner's provider probes can otherwise leave an
         // empty conversation on screen for tens of seconds.
         presentStandaloneJob(job)
+        let requestedSelection = selectionRevision
         guard let latest = try? await fetchJobDetail(job.id),
               conversationRevision == revision,
               latest.id == job.id, belongsToHistoryScope(latest.workspaceId) else { return }
-        presentStandaloneJob(latest)
+        presentStandaloneJob(latest, restoringSelection: selectionRevision == requestedSelection)
     }
 
-    private func presentStandaloneJob(_ latest: CodexJob) {
+    private func presentStandaloneJob(_ latest: CodexJob, restoringSelection: Bool = true) {
+        let adoptsSession = currentThreadID == nil && currentStandaloneJobID == latest.id
+            && latest.threadSessionId != nil
         currentThreadID = latest.threadSessionId
+        currentStandaloneJobID = latest.threadSessionId == nil ? latest.id : nil
         currentThreadProvider = latest.provider
         currentThreadMode = .task
         currentThreadWorkspaceID = latest.workspaceId
         currentThreadWorkspaceName = latest.workspaceName
 
-        if let choice = Self.choiceMatchingThread(
+        // A run can learn its native session ID during this refresh. Carry the
+        // next-turn choice to that identity before consulting older job metadata.
+        if adoptsSession || !restoringSelection { rememberSelectedEffort() }
+        if restoringSelection, let choice = Self.choiceMatchingThread(
             from: models,
             provider: latest.provider,
             mode: .task,
             model: latest.model
         ) {
-            selectChoice(choice)
+            restoreChoice(choice)
+            restoreEffort(from: [latest])
         }
 
         var items: [RelayConversationItem] = []
@@ -2442,6 +2532,7 @@ final class RelayChatViewModel: ObservableObject {
     /// already have; adopt the id as soon as the job reports it.
     private func adoptThread(from job: CodexJob) {
         currentThreadID = Self.adoptedThreadID(currentThreadID: currentThreadID, job: job)
+        currentStandaloneJobID = currentThreadID == nil ? (currentStandaloneJobID ?? job.id) : nil
         if currentThreadProvider == nil {
             currentThreadProvider = job.provider
         }
@@ -2451,6 +2542,7 @@ final class RelayChatViewModel: ObservableObject {
         if currentThreadWorkspaceName == nil {
             currentThreadWorkspaceName = job.workspaceName
         }
+        rememberSelectedEffort()
     }
 
     /// Fold the list's copies into the jobs on screen. They are the poorest

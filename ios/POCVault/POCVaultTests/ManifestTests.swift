@@ -582,6 +582,242 @@ final class ManifestTests: XCTestCase {
         XCTAssertNil(viewModel.effectiveEffort)
     }
 
+    @MainActor
+    func testReasoningEffortSurvivesSelectingTheSameModel() throws {
+        let descriptor = try reasoningModels()[0]
+        let model = RelayChatViewModel(client: makeOfflineCodexClient(), workspaceID: nil, workspacePath: nil)
+        let choice = RelayModelChoice(model: descriptor, mode: .task)
+        model.selectChoice(choice)
+        model.selectEffort(.xhigh)
+        model.selectChoice(choice)
+        XCTAssertEqual(model.effectiveEffort, .xhigh)
+    }
+
+    @MainActor
+    func testReasoningEffortSurvivesReopeningAndRefreshingTheConversation() async throws {
+        let descriptors = try reasoningModels()
+        let detail = try reasoningDetail("thread-a")
+        let (suite, defaults) = try reasoningDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let model = RelayChatViewModel(
+            client: makeOfflineCodexClient(), workspaceID: "ws-reasoning", workspacePath: nil,
+            fetchModels: { descriptors }, fetchThreadDetail: { _, _, _ in detail }, effortDefaults: defaults
+        )
+        await model.refreshModels()
+        await model.openThread(detail.thread)
+        model.selectEffort(.xhigh)
+        await model.openThread(detail.thread)
+        await model.refreshModels()
+        XCTAssertEqual(model.effectiveEffort, .xhigh)
+    }
+
+    @MainActor
+    func testReasoningEffortChosenWhileThreadDetailsLoadSurvivesTheirArrival() async throws {
+        let descriptors = try reasoningModels()
+        let detail = try reasoningDetail("thread-a")
+        let (suite, defaults) = try reasoningDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let requested = expectation(description: "thread detail requested")
+        var response: CheckedContinuation<CodexThreadDetail, Never>?
+        let model = RelayChatViewModel(
+            client: makeOfflineCodexClient(), workspaceID: "ws-reasoning", workspacePath: nil,
+            fetchModels: { descriptors },
+            fetchThreadDetail: { _, _, _ in
+                await withCheckedContinuation { response = $0; requested.fulfill() }
+            }, effortDefaults: defaults
+        )
+        await model.refreshModels()
+        let opening = Task { await model.openThread(detail.thread) }
+        await fulfillment(of: [requested], timeout: 2)
+        model.selectEffort(.low)
+        response?.resume(returning: detail)
+        await opening.value
+        XCTAssertEqual(model.effectiveEffort, .low)
+    }
+
+    @MainActor
+    func testReasoningModelChosenWhileThreadDetailsLoadSurvivesTheirArrival() async throws {
+        let descriptors = try reasoningModels()
+        let detail = try reasoningDetail("thread-a")
+        let (suite, defaults) = try reasoningDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let requested = expectation(description: "thread detail requested")
+        var response: CheckedContinuation<CodexThreadDetail, Never>?
+        let model = RelayChatViewModel(
+            client: makeOfflineCodexClient(), workspaceID: "ws-reasoning", workspacePath: nil,
+            fetchModels: { descriptors },
+            fetchThreadDetail: { _, _, _ in
+                await withCheckedContinuation { response = $0; requested.fulfill() }
+            }, effortDefaults: defaults
+        )
+        await model.refreshModels()
+        let opening = Task { await model.openThread(detail.thread) }
+        await fulfillment(of: [requested], timeout: 2)
+        model.selectChoice(RelayModelChoice(model: descriptors[1], mode: .task))
+        model.selectEffort(.medium)
+        response?.resume(returning: detail)
+        await opening.value
+        XCTAssertEqual(model.selectedChoice?.model.id, descriptors[1].id)
+        XCTAssertEqual(model.effectiveEffort, .medium)
+    }
+
+    @MainActor
+    func testReasoningEffortBelongsToEachThreadAndSurvivesRecreatingTheViewModel() async throws {
+        let descriptors = try reasoningModels()
+        let first = try reasoningDetail("thread-a")
+        let second = try reasoningDetail("thread-b")
+        let (suite, defaults) = try reasoningDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        func makeModel() -> RelayChatViewModel {
+            RelayChatViewModel(
+                client: makeOfflineCodexClient(), workspaceID: "ws-reasoning", workspacePath: nil,
+                fetchModels: { descriptors },
+                fetchThreadDetail: { id, _, _ in id == first.thread.sessionId ? first : second },
+                effortDefaults: defaults
+            )
+        }
+        let model = makeModel()
+        await model.refreshModels()
+        await model.openThread(first.thread)
+        model.selectEffort(.xhigh)
+        await model.openThread(second.thread)
+        XCTAssertEqual(model.effectiveEffort, .high, "a different conversation starts with its own default")
+        model.selectEffort(.low)
+        await model.openThread(first.thread)
+        XCTAssertEqual(model.effectiveEffort, .xhigh)
+
+        let restored = makeModel()
+        await restored.refreshModels()
+        await restored.openThread(second.thread)
+        XCTAssertEqual(restored.effectiveEffort, .low)
+        restored.startNewConversation()
+        XCTAssertEqual(restored.effectiveEffort, .high)
+    }
+
+    @MainActor
+    func testReasoningEffortRestoresTheLastJobUntilTheUserChoosesAnotherValue() async throws {
+        let descriptors = try reasoningModels()
+        let detail = try reasoningDetail("thread-a", jobEffort: "xhigh")
+        let (suite, defaults) = try reasoningDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let model = RelayChatViewModel(
+            client: makeOfflineCodexClient(), workspaceID: "ws-reasoning", workspacePath: nil,
+            fetchModels: { descriptors }, fetchThreadDetail: { _, _, _ in detail }, effortDefaults: defaults
+        )
+        await model.refreshModels()
+        await model.openThread(detail.thread)
+        XCTAssertEqual(model.effectiveEffort, .xhigh)
+        model.selectEffort(.low)
+        await model.openThread(detail.thread)
+        XCTAssertEqual(model.effectiveEffort, .low, "older job metadata cannot replace a user's next-turn choice")
+        model.selectEffort(nil)
+        await model.openThread(detail.thread)
+        XCTAssertEqual(model.effectiveEffort, .high, "an explicit default also overrides older job metadata")
+    }
+
+    @MainActor
+    func testReasoningEffortIsScopedToTheMachineForIdenticalSessionIDs() async throws {
+        let descriptors = try reasoningModels()
+        let detail = try reasoningDetail("thread-a")
+        let (suite, defaults) = try reasoningDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let first = RelayChatViewModel(
+            client: makeOfflineCodexClient(), workspaceID: "ws-reasoning", workspacePath: nil,
+            fetchModels: { descriptors }, fetchThreadDetail: { _, _, _ in detail }, effortDefaults: defaults
+        )
+        await first.refreshModels()
+        await first.openThread(detail.thread)
+        first.selectEffort(.xhigh)
+        let otherClient = CodexClient(
+            baseURL: try XCTUnwrap(URL(string: "http://127.0.0.1:8788")),
+            identityStore: ClientIdentityStore(defaults: defaults)
+        )
+        let other = RelayChatViewModel(
+            client: otherClient, workspaceID: "ws-reasoning", workspacePath: nil,
+            fetchModels: { descriptors }, fetchThreadDetail: { _, _, _ in detail }, effortDefaults: defaults
+        )
+        await other.refreshModels()
+        await other.openThread(detail.thread)
+        XCTAssertEqual(other.effectiveEffort, .high)
+        XCTAssertEqual(first.effectiveEffort, .xhigh)
+    }
+
+    @MainActor
+    func testReasoningEffortFollowsAStandaloneJobIntoItsThread() async throws {
+        let descriptors = try reasoningModels()
+        let snapshot = try decodeCodexJob("""
+        {"id":"job-starting","status":"succeeded","workspaceId":"ws-reasoning","provider":"codex","model":"gpt-a","reasoningEffort":"high"}
+        """)
+        let attached = try decodeCodexJob("""
+        {"id":"job-starting","status":"succeeded","workspaceId":"ws-reasoning","provider":"codex","model":"gpt-a","reasoningEffort":"high","sessionId":"thread-a"}
+        """)
+        let detail = try reasoningDetail("thread-a", jobEffort: "high")
+        let item = CodexThreadFeedItem(source: .pendingJob(snapshot))
+
+        for selectDuringLoad in [false, true] {
+            let (suite, defaults) = try reasoningDefaults()
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let requested = expectation(description: "job detail requested")
+            var shouldWait = false
+            var response: CheckedContinuation<CodexJob, Never>?
+            let model = RelayChatViewModel(
+                client: makeOfflineCodexClient(), workspaceID: "ws-reasoning", workspacePath: nil,
+                fetchModels: { descriptors },
+                fetchJobDetail: { _ in
+                    if !shouldWait { return snapshot }
+                    return await withCheckedContinuation { response = $0; requested.fulfill() }
+                }, effortDefaults: defaults
+            )
+            await model.refreshModels()
+            await model.openHistoryItem(item)
+            model.selectEffort(.low)
+            shouldWait = true
+            let opening = Task { await model.openHistoryItem(item) }
+            await fulfillment(of: [requested], timeout: 2)
+            if selectDuringLoad { model.selectEffort(.medium) }
+            response?.resume(returning: attached)
+            await opening.value
+            let expected: CodexReasoningEffort = selectDuringLoad ? .medium : .low
+            XCTAssertEqual(model.effectiveEffort, expected)
+
+            let restored = RelayChatViewModel(
+                client: makeOfflineCodexClient(), workspaceID: "ws-reasoning", workspacePath: nil,
+                fetchModels: { descriptors }, fetchThreadDetail: { _, _, _ in detail }, effortDefaults: defaults
+            )
+            await restored.refreshModels()
+            await restored.openThread(detail.thread)
+            XCTAssertEqual(restored.effectiveEffort, expected, "the choice must follow the job's new session ID")
+        }
+    }
+
+    private func reasoningModels() throws -> [CodexModelDescriptor] {
+        try decodeCodexModels("""
+        [
+          { "id": "codex-a", "label": "Codex A", "provider": "codex", "modes": ["task"], "taskModel": "gpt-a", "effortLevels": ["low", "medium", "high", "xhigh"] },
+          { "id": "codex-b", "label": "Codex B", "provider": "codex", "modes": ["task"], "taskModel": "gpt-b", "effortLevels": ["low", "medium", "high"] }
+        ]
+        """)
+    }
+
+    private func reasoningDefaults() throws -> (String, UserDefaults) {
+        let suite = "relay-reasoning-\(UUID().uuidString)"
+        return (suite, try XCTUnwrap(UserDefaults(suiteName: suite)))
+    }
+
+    private func reasoningDetail(_ sessionID: String, jobEffort: String? = nil) throws -> CodexThreadDetail {
+        let thread: [String: Any] = [
+            "id": sessionID, "sessionId": sessionID, "workspaceId": "ws-reasoning",
+            "provider": "codex", "model": "gpt-a"
+        ]
+        let jobs: [[String: Any]] = jobEffort.map { effort in [[
+            "id": "job-\(sessionID)", "status": "succeeded", "provider": "codex",
+            "workspaceId": "ws-reasoning", "threadSessionId": sessionID,
+            "model": "gpt-a", "reasoningEffort": effort
+        ]] } ?? []
+        let data = try JSONSerialization.data(withJSONObject: ["thread": thread, "messages": [], "jobs": jobs])
+        return try JSONDecoder().decode(CodexThreadDetail.self, from: data)
+    }
+
     /// Picking a model must not close the Model sheet: the Effort row for that model
     /// has to be reachable on the same visit. The sheet closes by its close circle,
     /// a drag or a tap outside, and gains no Done button to make up for it.
