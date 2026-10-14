@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 // Composer sheets (model, effort, add, permissions, skills). Owned by the composer lane.
 //
@@ -132,6 +133,18 @@ enum RelayModelSheetTab: Hashable, Identifiable {
     }
 }
 
+/// One pasteboard item that pastes as an attachment.
+struct RelayPastedImage: Equatable {
+    let item: Int
+    let typeIdentifiers: [String]
+}
+
+struct RelayPastePlan: Equatable {
+    var images: [RelayPastedImage]
+    /// Some item carries words, so the text view's own paste runs as well.
+    var pastesText: Bool
+}
+
 enum RelayComposerLogic {
     /// The effort word shown in the pill and on the Effort row. Nil hides both.
     static func effortLabel(
@@ -201,6 +214,26 @@ enum RelayComposerLogic {
             isListening: false,
             providerReady: providerReady
         )
+    }
+
+    /// What a paste into the message field does with each pasteboard item, given
+    /// each item's type identifiers in pasteboard order. An item that is only a
+    /// picture becomes an attachment, its image types listed best first. Anything
+    /// that carries plain text pastes as words, even when it also carries an image:
+    /// Word, Pages, Keynote and Numbers put a picture of the copied text next to the
+    /// text itself, and that copy is meant as words.
+    static func pastePlan(itemTypes: [[String]]) -> RelayPastePlan {
+        var plan = RelayPastePlan(images: [], pastesText: false)
+        for (index, types) in itemTypes.enumerated() {
+            let resolved = types.compactMap(UTType.init)
+            let imageTypes = resolved.filter { $0.conforms(to: .image) }.map(\.identifier)
+            if imageTypes.isEmpty || resolved.contains(where: { $0.conforms(to: .plainText) }) {
+                plan.pastesText = true
+            } else {
+                plan.images.append(RelayPastedImage(item: index, typeIdentifiers: imageTypes))
+            }
+        }
+        return plan
     }
 
     /// The field while dictating: the draft that was already there, then what was

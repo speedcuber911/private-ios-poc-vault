@@ -353,6 +353,65 @@ final class RelayComposerTests: XCTestCase {
         )
     }
 
+    // MARK: Pasting pictures
+
+    func testPastePlanAttachesPicturesAndKeepsWordsAsWords() {
+        let plan = RelayComposerLogic.pastePlan(itemTypes: [
+            // A screenshot from "Copy and Delete".
+            ["public.png"],
+            // Safari's "Copy" on an image: the picture and its address.
+            ["public.jpeg", "public.url"],
+            // Word / Keynote: the copied text plus a picture of it. Words win.
+            ["public.utf8-plain-text", "public.png"],
+            // A copied Photos item offering several encodings, best first.
+            ["public.heic", "public.jpeg"]
+        ])
+        XCTAssertEqual(plan.images, [
+            RelayPastedImage(item: 0, typeIdentifiers: ["public.png"]),
+            RelayPastedImage(item: 1, typeIdentifiers: ["public.jpeg"]),
+            RelayPastedImage(item: 3, typeIdentifiers: ["public.heic", "public.jpeg"])
+        ])
+        XCTAssertTrue(plan.pastesText)
+
+        XCTAssertEqual(
+            RelayComposerLogic.pastePlan(itemTypes: [["public.png"]]),
+            RelayPastePlan(images: [RelayPastedImage(item: 0, typeIdentifiers: ["public.png"])], pastesText: false)
+        )
+        // Plain text, or a bare link, is the text view's own paste.
+        XCTAssertEqual(
+            RelayComposerLogic.pastePlan(itemTypes: [["public.utf8-plain-text"], ["public.url"]]),
+            RelayPastePlan(images: [], pastesText: true)
+        )
+    }
+
+    @MainActor
+    func testPastingAPictureAddsItAsAnAttachment() throws {
+        let pasteboard = try XCTUnwrap(UIPasteboard(name: UIPasteboard.Name("relay-tests-\(UUID().uuidString)"), create: true))
+        defer { UIPasteboard.remove(withName: pasteboard.name) }
+        let png = try XCTUnwrap(UIGraphicsImageRenderer(size: CGSize(width: 4, height: 4)).image { context in
+            UIColor.orange.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 4, height: 4))
+        }.pngData())
+        pasteboard.items = [
+            ["public.png": png],
+            // Claims to be a picture but is not one: dropped, not attached as junk.
+            ["public.png": Data("not an image".utf8)],
+            ["public.png": png]
+        ]
+
+        let view = RelayComposerTextView()
+        view.pasteboard = pasteboard
+        var pasted: [RelayDraftAttachment] = []
+        view.onPasteImages = { pasted += $0 }
+
+        XCTAssertTrue(view.canPerformAction(#selector(UITextView.paste(_:)), withSender: nil))
+        view.paste(nil)
+
+        XCTAssertEqual(pasted.map(\.filename), ["pasted-image.png", "pasted-image.png"])
+        XCTAssertEqual(pasted.map(\.contentType), ["image/png", "image/png"])
+        XCTAssertEqual(view.text, "")
+    }
+
     func testWaveformHistoryIsPaddedFromTheLeadingEdge() {
         XCTAssertEqual(RelayComposerLogic.paddedLevels([0.5, 1], count: 4), [0, 0, 0.5, 1])
         XCTAssertEqual(RelayComposerLogic.paddedLevels([0.1, 0.2, 0.3], count: 2), [0.2, 0.3])

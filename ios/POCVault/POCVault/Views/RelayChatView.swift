@@ -1014,7 +1014,9 @@ private struct RelayComposer: View {
                     height: $editorHeight,
                     // Bright ember while the words are still arriving, cream once
                     // they are the user's to edit.
-                    textColor: dictation.phase == .listening ? AppTheme.accentBright : AppTheme.textPrimary
+                    textColor: dictation.phase == .listening ? AppTheme.accentBright : AppTheme.textPrimary,
+                    // Same rule as the Add sheet's attach tiles.
+                    onPasteImages: isSending || isStreaming ? nil : onAddAttachments
                 )
                 .frame(height: editorHeight)
             }
@@ -1604,13 +1606,15 @@ private struct RelayCommandTextEditor: UIViewRepresentable {
     /// edit. Colouring the whole field avoids attributed ranges, which this bridge
     /// would have to rebuild on every keystroke.
     var textColor: Color = AppTheme.textPrimary
+    /// Pasted pictures go here. Nil while attaching is off; paste is then words only.
+    var onPasteImages: (([RelayDraftAttachment]) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
     }
 
-    func makeUIView(context: Context) -> UITextView {
-        let view = UITextView()
+    func makeUIView(context: Context) -> RelayComposerTextView {
+        let view = RelayComposerTextView()
         view.delegate = context.coordinator
         view.backgroundColor = .clear
         view.textColor = UIColor(AppTheme.textPrimary)
@@ -1626,8 +1630,9 @@ private struct RelayCommandTextEditor: UIViewRepresentable {
         return view
     }
 
-    func updateUIView(_ view: UITextView, context: Context) {
+    func updateUIView(_ view: RelayComposerTextView, context: Context) {
         context.coordinator.parent = self
+        view.onPasteImages = onPasteImages
         if view.text != text {
             view.text = text
         }
@@ -1687,6 +1692,57 @@ private struct RelayCommandTextEditor: UIViewRepresentable {
                 self?.parent.height = next
             }
         }
+    }
+}
+
+/// The message field. Paste takes pictures as well as words: a copied screenshot or
+/// photo lands in the attachment strip exactly as if it had been picked from Photos.
+final class RelayComposerTextView: UITextView {
+    var onPasteImages: (([RelayDraftAttachment]) -> Void)?
+    /// Tests swap in a private pasteboard; the app always reads the general one.
+    var pasteboard: UIPasteboard = .general
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        // `hasImages` looks only at types, so offering Paste never raises the
+        // system's "Allow Paste" prompt. Reading happens in `paste`, which is the
+        // user's own gesture.
+        if action == #selector(paste(_:)), onPasteImages != nil, pasteboard.hasImages {
+            return true
+        }
+        return super.canPerformAction(action, withSender: sender)
+    }
+
+    override func paste(_ sender: Any?) {
+        guard let onPasteImages, pasteboard.hasImages else {
+            super.paste(sender)
+            return
+        }
+        let items = IndexSet(integersIn: 0..<pasteboard.numberOfItems)
+        let plan = RelayComposerLogic.pastePlan(itemTypes: pasteboard.types(forItemSet: items) ?? [])
+        if plan.pastesText {
+            super.paste(sender)
+        }
+        let attachments = plan.images.compactMap(pastedAttachment)
+        if !attachments.isEmpty {
+            onPasteImages(attachments)
+        }
+    }
+
+    /// The item's best representation that actually decodes, re-encoded the way a
+    /// picked photo is.
+    private func pastedAttachment(_ image: RelayPastedImage) -> RelayDraftAttachment? {
+        for identifier in image.typeIdentifiers {
+            guard let data = pasteboard.data(forPasteboardType: identifier, inItemSet: IndexSet(integer: image.item))?.first,
+                  UIImage(data: data) != nil
+            else { continue }
+            let type = UTType(identifier)
+            return RelayDraftAttachment.make(
+                filename: "pasted-image.\(type?.preferredFilenameExtension ?? "png")",
+                data: data,
+                contentType: type?.preferredMIMEType
+            )
+        }
+        return nil
     }
 }
 
