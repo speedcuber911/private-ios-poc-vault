@@ -132,8 +132,22 @@ existing TestFlight process. A development install depends on the signing
 profile's lifetime. Install the iPhone beta in TestFlight; its Information → App
 Details section offers installation for an included compatible watch app. App
 Store Connect manages the uploaded build; it does not install apps on the watch.
-TestFlight/distribution and App Store metadata updates have not been performed by
-this change.
+Before the first Xcode Cloud distribution build, an Account Holder or Admin with
+access to Certificates, Identifiers & Profiles must register the explicit App ID
+`com.parikshit.pocvault.watchkitapp` under the same team as the iPhone app. Use
+`Relay Watch` as its description. No additional capabilities are required by the
+current watch target. Xcode Cloud cannot register this identifier automatically;
+without it, export fails with `Automatic signing cannot register bundle identifier`
+and `No profiles for 'com.parikshit.pocvault.watchkitapp' were found`. After
+registration, rebuild the existing Relay TestFlight workflow so automatic signing
+can create the distribution profile.
+
+App Store Connect access alone does not guarantee developer-portal access. Users
+invited by an individual Apple Developer Program member can access App Store
+Connect without joining that member's developer team. In that case the Account
+Holder must register the watch identifier. See Apple's [App ID registration
+instructions](https://developer.apple.com/help/account/identifiers/register-an-app-id/)
+and [account roles](https://developer.apple.com/help/account/access/roles).
 
 ## Verification
 
