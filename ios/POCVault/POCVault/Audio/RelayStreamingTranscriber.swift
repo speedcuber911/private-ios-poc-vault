@@ -62,6 +62,11 @@ final class RelayStreamingTranscriber: NSObject, ObservableObject {
     private var ticker: Timer?
     private var startedAt: Date?
     private var finalContinuation: CheckedContinuation<String, Never>?
+    private var finalizeTask: Task<Void, Never>?
+    private var socketGeneration = UUID()
+    private var captureGeneration = UUID()
+    private var externalAudio = false
+    private var tapInstalled = false
     /// Sarvam emits one frame per settled segment rather than a growing whole, so
     /// the utterance is the join of everything received in arrival order.
     private var segments: [String] = []
@@ -91,6 +96,8 @@ final class RelayStreamingTranscriber: NSObject, ObservableObject {
         guard !sharedSecret.isEmpty else { throw TranscriberError.unconfigured }
         guard await Self.requestMicrophonePermission() else { throw TranscriberError.microphoneDenied }
 
+        cancel()
+
         segments = []
         transcript = ""
         elapsed = 0
@@ -101,6 +108,8 @@ final class RelayStreamingTranscriber: NSObject, ObservableObject {
         do {
             try startEngine()
         } catch {
+            stopEngine()
+            try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
             closeSocket()
             throw TranscriberError.engineFailed
         }
@@ -110,39 +119,91 @@ final class RelayStreamingTranscriber: NSObject, ObservableObject {
         startTicking()
     }
 
+    /// The watch supplies PCM through its paired phone. This uses precisely the
+    /// same service, authentication and transcript handling as iPhone dictation,
+    /// without activating the phone's microphone or its metering timer.
+    func startExternalAudio() throws {
+        guard !sharedSecret.isEmpty else { throw TranscriberError.unconfigured }
+        cancel()
+        externalAudio = true
+        segments = []
+        transcript = ""
+        elapsed = 0
+        levels = []
+        try openSocket()
+        phase = .listening
+    }
+
+    func appendExternalAudio(_ pcm: Data) async throws {
+        guard externalAudio, phase == .listening, let socket else {
+            throw RelayWatchError("Dictation stopped. Review the text received so far.")
+        }
+        let generation = socketGeneration
+        try await socket.send(Self.audioMessage(pcm))
+        guard generation == socketGeneration, phase == .listening else {
+            throw RelayWatchError("Dictation stopped. Review the text received so far.")
+        }
+    }
+
+    func finishExternalAudio() async throws -> String {
+        let generation = captureGeneration
+        let text = await stop()
+        guard captureGeneration == generation else { throw CancellationError() }
+        if case .failed(let message) = phase { throw RelayWatchError(message) }
+        guard externalAudio else { throw CancellationError() }
+        externalAudio = false
+        return text
+    }
+
     /// Stops capture and waits briefly for the provider to flush the tail of the
     /// utterance. Returns the final transcript — empty if nothing was heard.
     @discardableResult
     func stop() async -> String {
         guard isActive else { return transcript }
+        guard phase != .finalizing else { return transcript }
 
         stopEngine()
         stopTicking()
         phase = .finalizing
 
-        socket?.send(.string(#"{"type":"flush"}"#)) { _ in }
-
+        let generation = socketGeneration
         let settled = await withCheckedContinuation { (continuation: CheckedContinuation<String, Never>) in
             finalContinuation = continuation
+            socket?.send(.string(#"{"type":"flush"}"#)) { [weak self] error in
+                guard error != nil else { return }
+                Task { @MainActor in
+                    guard let self, self.socketGeneration == generation else { return }
+                    self.phase = .failed("Dictation could not finish. Review the text received so far.")
+                    self.resumeFinal(with: self.transcript)
+                }
+            }
             // The tail is a courtesy, not a contract: if the provider goes quiet we
             // keep whatever already arrived rather than stranding the user's words.
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: Self.finalizeGraceNanoseconds)
+            finalizeTask = Task { @MainActor in
+                do { try await Task.sleep(nanoseconds: Self.finalizeGraceNanoseconds) }
+                catch { return }
+                guard self.socketGeneration == generation else { return }
+                if self.externalAudio {
+                    self.phase = .failed("The final words could not be confirmed. Review your text before sending.")
+                }
                 self.resumeFinal(with: self.transcript)
             }
         }
 
+        guard socketGeneration == generation else { return settled }
         closeSocket()
-        phase = .idle
+        if phase == .finalizing { phase = .idle }
         transcript = settled
         return settled
     }
 
     func cancel() {
+        captureGeneration = UUID()
         stopEngine()
         stopTicking()
         closeSocket()
         resumeFinal(with: transcript)
+        externalAudio = false
         phase = .idle
     }
 
@@ -152,6 +213,8 @@ final class RelayStreamingTranscriber: NSObject, ObservableObject {
     /// so the provider's `final` frame and the grace timer cannot both resume it —
     /// double-resuming a checked continuation is a hard crash, dropping one is a leak.
     private func resumeFinal(with text: String) {
+        finalizeTask?.cancel()
+        finalizeTask = nil
         guard let continuation = finalContinuation else { return }
         finalContinuation = nil
         continuation.resume(returning: text)
@@ -192,14 +255,17 @@ final class RelayStreamingTranscriber: NSObject, ObservableObject {
                 }
             }
         }
+        tapInstalled = true
 
         engine.prepare()
-        try engine.start()
+        do { try engine.start() }
+        catch { stopEngine(); throw error }
     }
 
     private func stopEngine() {
-        guard engine.isRunning else { return }
+        guard tapInstalled else { return }
         engine.inputNode.removeTap(onBus: 0)
+        tapInstalled = false
         engine.stop()
         converter = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
@@ -255,17 +321,24 @@ final class RelayStreamingTranscriber: NSObject, ObservableObject {
         request.setValue(sharedSecret, forHTTPHeaderField: "x-relay-stt-key")
         let task = session.webSocketTask(with: request)
         socket = task
+        socketGeneration = UUID()
         task.resume()
-        receiveNext()
+        receiveNext(generation: socketGeneration)
     }
 
     private func closeSocket() {
+        socketGeneration = UUID()
         socket?.cancel(with: .normalClosure, reason: nil)
         socket = nil
     }
 
     private func sendAudio(_ pcm: Data) {
         guard let socket, phase == .listening else { return }
+        guard let message = try? Self.audioMessage(pcm) else { return }
+        socket.send(message) { _ in }
+    }
+
+    private static func audioMessage(_ pcm: Data) throws -> URLSessionWebSocketTask.Message {
         let frame: [String: Any] = [
             "audio": [
                 "data": pcm.base64EncodedString(),
@@ -273,27 +346,29 @@ final class RelayStreamingTranscriber: NSObject, ObservableObject {
                 "encoding": "audio/wav",
             ]
         ]
-        guard let payload = try? JSONSerialization.data(withJSONObject: frame),
-              let text = String(data: payload, encoding: .utf8)
-        else { return }
-        socket.send(.string(text)) { _ in }
+        let payload = try JSONSerialization.data(withJSONObject: frame)
+        return .string(String(decoding: payload, as: UTF8.self))
     }
 
-    private func receiveNext() {
+    private func receiveNext(generation: UUID) {
+        guard generation == socketGeneration else { return }
         socket?.receive { [weak self] result in
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.socketGeneration == generation else { return }
                 switch result {
                 case .success(let message):
                     self.handle(message)
-                    self.receiveNext()
+                    self.receiveNext(generation: generation)
                 case .failure:
                     // A closed socket during finalize is the ordinary end of a session,
                     // not an error worth showing over the words the user just spoke.
-                    if self.phase == .listening {
+                    if self.phase == .listening || self.externalAudio {
                         self.phase = .failed("Dictation stopped unexpectedly.")
                     }
+                    self.stopEngine()
+                    self.stopTicking()
                     self.resumeFinal(with: self.transcript)
+                    self.closeSocket()
                 }
             }
         }
@@ -321,7 +396,10 @@ final class RelayStreamingTranscriber: NSObject, ObservableObject {
         case "error":
             let message = (object["message"] as? String) ?? "Dictation failed."
             phase = .failed(message)
+            stopEngine()
+            stopTicking()
             resumeFinal(with: transcript)
+            closeSocket()
         default:
             break
         }

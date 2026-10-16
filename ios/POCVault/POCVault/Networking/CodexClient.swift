@@ -779,8 +779,14 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
     }
 
     func createJob(_ request: CodexCreateJobRequest) async throws -> CodexCreateJobResponse {
+        try await createJob(request, expectedBaseURL: nil)
+    }
+
+    /// A companion command must stay on the machine whose catalog it displayed,
+    /// even if the phone retargets while the async call is being scheduled.
+    func createJob(_ request: CodexCreateJobRequest, expectedBaseURL: URL?) async throws -> CodexCreateJobResponse {
         let data = try encoder.encode(request)
-        let responseData = try await perform(path: "/v1/codex/jobs", method: "POST", body: data)
+        let responseData = try await perform(path: "/v1/codex/jobs", method: "POST", body: data, expectedBaseURL: expectedBaseURL)
         guard !responseData.isEmpty else {
             throw CodexClientError.emptyResponse
         }
@@ -816,12 +822,17 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
     }
 
     func decideApproval(id: String, decision: CodexApprovalDecision, message: String? = nil) async throws -> CodexApproval {
+        try await decideApproval(id: id, decision: decision, message: message, expectedBaseURL: nil)
+    }
+
+    func decideApproval(id: String, decision: CodexApprovalDecision, message: String? = nil, expectedBaseURL: URL?) async throws -> CodexApproval {
         var payload: [String: String] = ["decision": decision.rawValue]
         if let message { payload["message"] = message }
         let data = try await perform(
             path: "/v1/codex/approvals/\(Self.pathComponent(id))/decision",
             method: "POST",
-            body: try JSONEncoder().encode(payload)
+            body: try JSONEncoder().encode(payload),
+            expectedBaseURL: expectedBaseURL
         )
         return try decoder.decode(CodexApprovalEnvelope.self, from: data).approval
     }
@@ -1064,7 +1075,11 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
 
     @discardableResult
     func cancelJob(id: String) async throws -> CodexJob? {
-        let data = try await perform(path: "/v1/codex/jobs/\(Self.pathComponent(id))/cancel", method: "POST")
+        try await cancelJob(id: id, expectedBaseURL: nil)
+    }
+
+    func cancelJob(id: String, expectedBaseURL: URL?) async throws -> CodexJob? {
+        let data = try await perform(path: "/v1/codex/jobs/\(Self.pathComponent(id))/cancel", method: "POST", expectedBaseURL: expectedBaseURL)
         guard !data.isEmpty else {
             return nil
         }
@@ -1419,7 +1434,8 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         additionalHeaders: [String: String] = [:],
         cachePolicy: URLRequest.CachePolicy? = nil,
         timeout: TimeInterval? = nil,
-        allowWake: Bool = true
+        allowWake: Bool = true,
+        expectedBaseURL: URL? = nil
     ) async throws -> Data {
         try await performWithResponse(
             path: path,
@@ -1430,7 +1446,8 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
             additionalHeaders: additionalHeaders,
             cachePolicy: cachePolicy,
             timeout: timeout,
-            allowWake: allowWake
+            allowWake: allowWake,
+            expectedBaseURL: expectedBaseURL
         ).data
     }
 
@@ -1446,9 +1463,12 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         additionalHeaders: [String: String] = [:],
         cachePolicy: URLRequest.CachePolicy? = nil,
         timeout: TimeInterval? = nil,
-        allowWake: Bool = true
+        allowWake: Bool = true,
+        expectedBaseURL: URL? = nil
     ) async throws -> (data: Data, response: HTTPURLResponse) {
-        let url = endpoint(path: path, queryItems: queryItems)
+        let requestBaseURL = baseURL
+        guard expectedBaseURL == nil || expectedBaseURL == requestBaseURL else { throw URLError(.cancelled) }
+        let url = endpoint(path: path, queryItems: queryItems, baseURL: requestBaseURL)
         guard url.scheme != nil, url.host != nil else {
             throw CodexClientError.invalidEndpoint(url)
         }
@@ -1663,7 +1683,8 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         return destination
     }
 
-    private func endpoint(path: String, queryItems: [URLQueryItem]) -> URL {
+    private func endpoint(path: String, queryItems: [URLQueryItem], baseURL fixedBaseURL: URL? = nil) -> URL {
+        let baseURL = fixedBaseURL ?? self.baseURL
         let base = baseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let normalizedPath = path.hasPrefix("/") ? String(path.dropFirst()) : path
         let rawURL = "\(base)/\(normalizedPath)"

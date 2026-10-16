@@ -1,0 +1,190 @@
+<style>
+  #relay-watch-preview { color-scheme: light dark; }
+  #relay-watch-preview .preview-tabs { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; padding: 16px 0; }
+  #relay-watch-preview .preview-tabs button { font: 500 13px system-ui; color: light-dark(#43434a, #d5d5dc); background: light-dark(#eeeeF2, #25252b); border: 0; border-radius: 20px; padding: 10px 15px; }
+  #relay-watch-preview .preview-tabs button[aria-pressed="true"] { color: light-dark(#fff, #171719); background: light-dark(#242429, #ececef); }
+  #relay-watch-preview .stage { display: grid; place-items: center; padding: 12px 22px 24px; }
+  #relay-watch-preview .watch { --w-bg: light-dark(#f5f5f7, #050505); --w-card: light-dark(#e9e9ed, #202023); --w-fg: light-dark(#16161b, #f8f8fa); --w-muted: light-dark(#62626b, #b7b7c2); --w-accent: light-dark(#b83e20, #ff7954); width: min(260px, 100%); box-sizing: border-box; background: var(--w-bg); color: var(--w-fg); border: 9px solid light-dark(#3b3b43, #55555d); border-radius: 56px; padding: 23px 16px 22px; min-height: 340px; font: 16px/1.35 -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
+  #relay-watch-preview .watch header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 7px 14px; font-size: 13px; font-weight: 500; }
+  #relay-watch-preview .watch header span:first-child { color: var(--w-accent); }
+  #relay-watch-preview .watch h3 { font: 500 21px/1.16 system-ui; margin: 5px 0 12px; }
+  #relay-watch-preview .watch p { margin: 8px 0 12px; }
+  #relay-watch-preview .watch .small { font-size: 12px; color: var(--w-muted); }
+  #relay-watch-preview .watch .tag { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--w-accent); margin: 4px 0 10px; }
+  #relay-watch-preview .watch button { box-sizing: border-box; width: 100%; min-height: 44px; display: flex; gap: 8px; align-items: center; justify-content: center; margin: 6px 0; padding: 10px; border: 0; border-radius: 22px; background: var(--w-card); color: var(--w-fg); font: 500 14px/1.3 system-ui; }
+  #relay-watch-preview .watch button.primary { background: var(--w-accent); color: light-dark(#fff, #180b06); }
+  #relay-watch-preview .watch .row { text-align: left; justify-content: space-between; border-radius: 14px; }
+  #relay-watch-preview .watch .row span { min-width: 0; overflow-wrap: anywhere; }
+  #relay-watch-preview .watch .row small { display: block; font-size: 11px; font-weight: 400; color: var(--w-muted); }
+  #relay-watch-preview .watch textarea { box-sizing: border-box; width: 100%; min-height: 94px; border: 1px solid var(--w-muted); border-radius: 12px; color: var(--w-fg); background: var(--w-card); padding: 10px; font: 16px/1.35 system-ui; resize: vertical; }
+  #relay-watch-preview .watch .progress-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--w-accent); margin-right: 5px; }
+  #relay-watch-preview .watch .rule { height: 1px; background: var(--w-card); margin: 14px 0; }
+  #relay-watch-preview .watch .wave { display: flex; align-items: center; justify-content: center; gap: 4px; height: 48px; margin: 10px 0; }
+  #relay-watch-preview .watch .wave span { width: 5px; border-radius: 4px; background: var(--w-accent); }
+  #relay-watch-preview .watch .timer { font: 500 16px/1.4 system-ui; font-variant-numeric: tabular-nums; }
+  #relay-watch-preview .watch .live-transcript { min-height: 74px; overflow-wrap: anywhere; }
+  #relay-watch-preview .watch .error { color: light-dark(#a12a16, #ffae96); }
+  #relay-watch-preview .watch button:disabled { opacity: .5; }
+  #relay-watch-preview .preview-caption { text-align: center; padding: 0 10px 10px; font: 400 12px system-ui; color: light-dark(#676771, #aaaab4); }
+  @media (max-width: 360px) { #relay-watch-preview .stage { padding-left: 8px; padding-right: 8px; } }
+</style>
+<div id="relay-watch-preview" aria-label="Relay watch interactive concept with sample data">
+  <div class="preview-tabs" aria-label="Preview screens">
+    <button type="button" data-screen="home" aria-pressed="true" class="cursor-interaction">Threads</button>
+    <button type="button" data-screen="recording" aria-pressed="false" class="cursor-interaction">Dictating</button>
+    <button type="button" data-screen="review" aria-pressed="false" class="cursor-interaction">Review</button>
+    <button type="button" data-screen="question" aria-pressed="false" class="cursor-interaction">Needs you</button>
+    <button type="button" data-screen="running" aria-pressed="false" class="cursor-interaction">Progress</button>
+    <button type="button" data-screen="done" aria-pressed="false" class="cursor-interaction">Finished</button>
+  </div>
+  <div class="stage viz-dotted-background">
+    <div class="watch" aria-label="Relay on Apple Watch">
+      <header><span>Relay</span><span>9:41</span></header>
+      <div class="screen" aria-live="polite">
+        <h3>Relay</h3>
+        <button type="button" class="primary cursor-interaction" data-action="compose"><i data-lucide="plus" aria-hidden="true"></i>New thread</button>
+        <div class="rule"></div>
+        <div class="tag">Threads</div>
+        <button type="button" class="row cursor-interaction" data-action="question"><span>Fix the login screen<small>Needs your reply</small></span><i data-lucide="chevron-right" aria-hidden="true"></i></button>
+        <button type="button" class="row cursor-interaction" data-action="running"><span>Polish onboarding<small>Working</small></span><i data-lucide="chevron-right" aria-hidden="true"></i></button>
+      </div>
+    </div>
+  </div>
+  <div class="preview-caption">Scrollable watch screens · sample data · simulated voice</div>
+</div>
+<script>
+(() => {
+  const root = document.getElementById('relay-watch-preview');
+  const screen = root.querySelector('.screen');
+  const example = 'Fix the login screen and test the changes.';
+  const defaults = { screen: 'home', folder: 'Relay', model: 'GPT-5.4', effort: 'High', prompt: '', reply: false, transcript: '', seconds: 0, prefix: '', error: '' };
+  const state = { ...defaults };
+  const appearance = { size: 'SE 40 mm', phone: 'Available' };
+  const choices = { folder: ['Relay', 'Scratch', 'Sigiq'], model: ['GPT-5.4', 'Claude Sonnet 4.6'], effort: ['Default', 'Low', 'Medium', 'High'] };
+  let animation;
+  function cancelAnimation() { clearTimeout(animation); animation = undefined; }
+  const escape = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const button = (label, action, primary = false) => `<button type="button" class="${primary ? 'primary ' : ''}cursor-interaction" data-action="${action}">${label}</button>`;
+  function render() {
+    root.querySelector('.watch').style.width = appearance.size === 'SE 40 mm' ? '250px' : '280px';
+    root.querySelector('.watch').style.maxWidth = '100%';
+    root.querySelectorAll('[data-screen]').forEach(el => el.setAttribute('aria-pressed', String(el.dataset.screen === state.screen)));
+    let html;
+    if (state.screen === 'home') {
+      html = `${button('<i data-lucide="plus" aria-hidden="true"></i>New thread', 'new', true)}<div class="tag">Needs you</div>${button('Fix the login screen<br>Needs your reply', 'question')}<div class="rule"></div><div class="tag">Threads</div>${button('Polish onboarding<br>Working', 'running')}`;
+    } else if (state.screen === 'compose' || state.screen === 'review') {
+      html = `<h3>${state.reply ? 'Reply' : 'New thread'}</h3><div class="tag">Prompt</div>`;
+      html += button(`<i data-lucide="mic" aria-hidden="true"></i>${state.prompt ? 'Add dictation' : 'Dictate'}`, 'dictate', true);
+      html += `<label class="small" for="relay-watch-transcript">${state.prompt ? 'Edit transcript' : 'Type instead'}</label><textarea id="relay-watch-transcript" aria-label="Review transcript" placeholder="Your prompt">${escape(state.prompt)}</textarea>`;
+      if (state.error) html += `<p class="small error" role="alert">${escape(state.error)}</p>`;
+      html += `<p class="small">Review your words before sending.</p><div class="tag">Run in</div>`;
+      for (const key of ['folder', 'model', 'effort']) {
+        if (state.reply && key === 'folder') { html += `<p class="small">Folder: ${escape(state.folder)}</p>`; continue; }
+        html += `<button type="button" class="row cursor-interaction" data-action="${key}"><span><small>${key[0].toUpperCase() + key.slice(1)}</small>${escape(state[key])}</span><i data-lucide="chevron-right" aria-hidden="true"></i></button>`;
+      }
+      html += `<button type="button" class="primary cursor-interaction" data-action="send" ${state.prompt.trim() ? '' : 'disabled'}><i data-lucide="arrow-up" aria-hidden="true"></i>Send</button>`;
+    } else if (choices[state.screen]) {
+      html = `<h3>${state.screen[0].toUpperCase() + state.screen.slice(1)}</h3>` + choices[state.screen].map((value, index) => button(escape(value), 'choose-' + index, value === state[state.screen])).join('');
+    } else if (state.screen === 'recording' || state.screen === 'finishing') {
+      const finishing = state.screen === 'finishing';
+      const heights = [10,16,24,38,28,44,34,20,36,46,30,18,26,16,10];
+      html = `<h3>${state.reply ? 'Reply' : 'New thread'}</h3><div class="tag">${finishing ? 'Finishing…' : 'Listening'}</div><div class="timer">0:${String(state.seconds).padStart(2,'0')} / 1:00</div><div class="wave" role="img" aria-label="Microphone level">${heights.map(h => `<span style="height:${finishing ? 5 : h}px"></span>`).join('')}</div><p class="live-transcript">${escape(state.transcript || 'Speak your prompt…')}</p>`;
+      if (!finishing) html += button('<i data-lucide="square" aria-hidden="true"></i>Stop', 'stop', true);
+      html += button('Cancel', 'cancel-dictation');
+    } else if (state.screen === 'question') {
+      html = `<div class="tag">Needs your reply</div><h3>Fix the login screen</h3><p>Keep the existing sign-in flow, or replace it?</p>${button('<i data-lucide="mic" aria-hidden="true"></i>Reply', 'reply', true)}${button('Threads', 'home')}`;
+    } else if (state.screen === 'running') {
+      html = `<div class="tag"><span class="progress-dot"></span>Working</div><h3>Fixing login.</h3><p>The layout is fixed. Checking the sign-in tests now.</p><div class="rule"></div><p class="small">Edited 2 files, ran a command</p><p class="small">Updated just now</p>${button('Threads', 'home')}`;
+    } else {
+      html = `<div class="tag">Finished</div><h3>Ready to review.</h3><p>Fixed the login layout. All 12 tests pass.</p><p class="small">Kept your existing sign-in flow.</p>${button('<i data-lucide="mic" aria-hidden="true"></i>Reply', 'reply', true)}${button('Threads', 'home')}`;
+    }
+    screen.innerHTML = html;
+    if (globalThis.lucide) lucide.createIcons({attrs:{width:16,height:16}});
+  }
+  function save() {
+    if (window.openai?.setWidgetState) window.openai.setWidgetState({modelContent:{folder:state.folder,model:state.model,effort:state.effort},privateContent:{screen:state.screen}}).catch(() => {});
+  }
+  function beginRecording() {
+    state.prefix = state.prompt;
+    state.transcript = '';
+    state.seconds = 0;
+    state.error = '';
+    if (appearance.phone === 'Unavailable') {
+      state.error = 'iPhone could not connect. Open Relay on your connected iPhone, then try again.';
+      state.screen = 'compose'; render(); return;
+    }
+    state.screen = 'recording';
+    const phrases = state.reply ? ['Keep', 'Keep the existing', 'Keep the existing sign-in flow.'] : ['Fix the login', 'Fix the login screen', 'Fix the login screen and test', example];
+    let index = 0;
+    function next() {
+      if (state.screen !== 'recording' || index >= phrases.length) return;
+      state.transcript = phrases[index++]; state.seconds = index * 2; render();
+      if (index < phrases.length) animation = setTimeout(next, 700);
+    }
+    animation = setTimeout(next, 450);
+  }
+  function restore(saved) {
+    if (!saved) return;
+    for (const key of ['folder','model','effort']) if (choices[key].includes(saved.modelContent?.[key])) state[key] = saved.modelContent[key];
+    const next = saved.privateContent?.screen;
+    if (['home','compose','question','running','done'].includes(next)) state.screen = next;
+  }
+  root.addEventListener('click', event => {
+    const target = event.target.closest('button');
+    if (!target || !root.contains(target)) return;
+    cancelAnimation();
+    if (target.dataset.screen) {
+      state.screen = target.dataset.screen;
+      state.error = '';
+      if (state.screen === 'recording') { state.prefix = state.prompt; state.transcript = 'Fix the login screen and test'; state.seconds = 6; }
+      if (state.screen === 'review' && !state.prompt) state.prompt = example;
+    }
+    else {
+      const action = target.dataset.action;
+      if (!action) return;
+      if (action.startsWith('choose-')) {
+        const value = choices[state.screen]?.[Number(action.slice(7))];
+        if (value) { state[state.screen] = value; if (state.screen === 'model') state.effort = 'Default'; }
+        state.screen = state.prompt ? 'review' : 'compose';
+      } else if (action === 'new') {
+        state.reply = false; state.prompt = ''; state.error = ''; state.screen = 'compose';
+      } else if (action === 'dictate') {
+        beginRecording();
+      } else if (action === 'stop') {
+        state.screen = 'finishing';
+        animation = setTimeout(() => {
+          state.prompt = [state.prefix.trim(), state.transcript.trim()].filter(Boolean).join(' ');
+          state.error = state.transcript.trim() ? '' : 'No speech was received. Try again.';
+          state.screen = 'review'; render(); save();
+        }, 550);
+      } else if (action === 'cancel-dictation') {
+        state.prompt = state.prefix; state.transcript = ''; state.screen = 'compose';
+      } else if (action === 'send') {
+        const value = screen.querySelector('textarea').value.trim();
+        if (!value) return;
+        state.prompt = value; state.screen = 'running';
+      } else if (action === 'reply') {
+        state.reply = true; state.prompt = ''; state.error = ''; state.screen = 'compose';
+      } else {
+        if (action === 'home') state.reply = false;
+        state.screen = action;
+      }
+    }
+    render(); save();
+  });
+  root.addEventListener('input', event => {
+    if (event.target.id !== 'relay-watch-transcript') return;
+    state.prompt = event.target.value;
+    const send = screen.querySelector('[data-action="send"]');
+    if (send) send.disabled = !state.prompt.trim();
+  });
+  restore(window.openai?.widgetState);
+  render();
+  window.addEventListener('openai:set_globals', event => { restore(event.detail?.globals?.widgetState); render(); });
+  if (globalThis.Tweak) {
+    const tweak = new Tweak({container:root.querySelector('.watch'),onChange:render});
+    tweak.addSelect(appearance,'size',{label:'Watch size',options:['SE 40 mm','SE 44 mm']});
+    tweak.addSelect(appearance,'phone',{label:'iPhone connection',options:['Available','Unavailable']});
+  }
+})();
+</script>

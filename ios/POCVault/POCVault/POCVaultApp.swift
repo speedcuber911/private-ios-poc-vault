@@ -16,6 +16,7 @@ struct POCVaultApp: App {
     @StateObject private var powerModel: RelayMachinePowerModel
     private let codexClient: CodexClient
     private let authClient: RelayAuthClient
+    private let watchBridge: RelayWatchBridge
 
     init() {
         let identityStore = ClientIdentityStore()
@@ -84,6 +85,7 @@ struct POCVaultApp: App {
         _powerModel = StateObject(wrappedValue: powerModel)
         self.codexClient = codexClient
         self.authClient = authClient
+        self.watchBridge = RelayWatchBridge(client: codexClient, nodes: nodeStore)
     }
 
     var body: some Scene {
