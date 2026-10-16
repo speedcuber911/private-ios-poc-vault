@@ -99,10 +99,13 @@ energy use under the same device settings before claiming a battery improvement.
    `ios/POCVault/POCVault.xcodeproj` in Xcode.
 2. Install the iOS and watchOS platform support in Xcode. The iPhone target also
    needs JDK 17 for the existing RelayCore Gradle build; see `mobile/README.md`.
-3. In Signing & Capabilities, select the same authorized development team for
-   `POCVault` and `RelayWatch`. Keep the iPhone ID `com.parikshit.pocvault` and the
+3. Confirm `POCVault` and `RelayWatch` resolve to the same authorized development
+   team. Both inherit the existing signing team from the project build settings;
+   override `DEVELOPMENT_TEAM` for the whole build when using another authorized
+   team. Keep the iPhone ID `com.parikshit.pocvault` and the
    watch ID `com.parikshit.pocvault.watchkitapp`. Automatic signing can register
-   the watch ID and device. The watch deliberately contains no checked-in team.
+   the watch ID and device. The watch must have a resolved signing team for
+   Xcode Cloud distribution exports as well as local device builds.
 4. Pair the watch to your iPhone. Connect/trust the iPhone on the Mac; keep the
    watch unlocked and nearby with Bluetooth/Wi-Fi enabled. Enable Developer Mode
    on iPhone and watch when Xcode requests it. If the switch is initially absent,
