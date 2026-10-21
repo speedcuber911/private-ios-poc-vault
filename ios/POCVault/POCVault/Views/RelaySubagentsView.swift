@@ -179,16 +179,35 @@ struct RelayChatSectionPicker: View {
     let subagentCount: Int
 
     var body: some View {
-        Picker("Conversation view", selection: $selection) {
-            Text("Chat").tag(RelayChatSection.chat)
-            Text(subagentCount == 0 ? "Subagents" : "Subagents (\(subagentCount))")
-                .tag(RelayChatSection.subagents)
+        HStack(spacing: 4) {
+            sectionButton("Chat", section: .chat)
+            sectionButton(subagentCount == 0 ? "Subagents" : "Subagents (\(subagentCount))", section: .subagents)
         }
-        .pickerStyle(.segmented)
-        .frame(minHeight: 44)
+        .padding(4)
+        .background(Color.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 13))
         .padding(.horizontal, 16)
-        .padding(.bottom, 4)
+        .padding(.bottom, 8)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Conversation view")
         .accessibilityIdentifier("relay-chat-sections")
+    }
+
+    private func sectionButton(_ title: String, section: RelayChatSection) -> some View {
+        let isSelected = selection == section
+        return Button { selection = section } label: {
+            Text(title)
+                .font(AppTheme.uiFont(size: 16, weight: isSelected ? .semibold : .medium))
+                .foregroundStyle(isSelected ? AppTheme.textPrimary : AppTheme.textSecondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 10)
+                .frame(maxWidth: .infinity, minHeight: 48)
+                .background(isSelected ? AppTheme.textPrimary.opacity(0.12) : .clear,
+                            in: RoundedRectangle(cornerRadius: 9))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }
 

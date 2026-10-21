@@ -741,8 +741,13 @@ final class RelayComposerTests: XCTestCase {
         ])
         let agents = RelaySubagent.collect(messages: [.init(id: "history", role: .assistant, text: "", provider: .codex, historyTimeline: timeline)], timelines: [:])
         for width: CGFloat in [320, 390] {
-            try render(RelaySubagentsView(subagents: agents, isLoading: false, errorMessage: nil, onOpen: { _ in })
+            try render(VStack(spacing: 0) {
+                RelayChatSectionPicker(selection: .constant(.subagents), subagentCount: agents.count)
+                RelaySubagentsView(subagents: agents, isLoading: false, errorMessage: nil, onOpen: { _ in })
+            }
                 .background(AppTheme.bgCanvas), size: CGSize(width: width, height: 700), to: output, name: "nested-agents-\(Int(width))")
+            try render(RelayChatSectionPicker(selection: .constant(.chat), subagentCount: agents.count)
+                .background(AppTheme.bgCanvas), size: CGSize(width: width, height: 64), to: output, name: "chat-sections-\(Int(width))")
             try render(RelayQueuedInputs(messages: [
                 .init(id: "one", text: "Focus on the failing tests first.", mode: "queue", status: "queued"),
                 .init(id: "two", text: "Check the retry path too.", mode: "queue", status: "queued")
