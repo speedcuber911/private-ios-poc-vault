@@ -1092,6 +1092,12 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         try await cancelJob(id: id, expectedBaseURL: nil)
     }
 
+    func sendJobInput(id: String, request: RelayJobInputRequest) async throws -> CodexJob {
+        let data = try await perform(path: "/v1/codex/jobs/\(Self.pathComponent(id))/messages",
+                                     method: "POST", body: try encoder.encode(request))
+        return try decoder.decode(CodexJob.self, from: data)
+    }
+
     func cancelJob(id: String, expectedBaseURL: URL?) async throws -> CodexJob? {
         let data = try await perform(path: "/v1/codex/jobs/\(Self.pathComponent(id))/cancel", method: "POST", expectedBaseURL: expectedBaseURL)
         guard !data.isEmpty else {

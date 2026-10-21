@@ -559,6 +559,13 @@ export function createClaudeStreamMapper({ now = () => new Date().toISOString() 
   }
 
   return {
+    startTurn() {
+      textId = "";
+      stepSinceText = true;
+      lastText = "";
+      result = null;
+      blocks = new Map();
+    },
     push(line) {
       if (!line || typeof line !== "object") return [];
       switch (line.type) {

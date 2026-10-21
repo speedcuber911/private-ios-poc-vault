@@ -14,15 +14,19 @@
 import fs from "node:fs";
 import readline from "node:readline";
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 
 import { createTimelineWriter } from "./timeline.mjs";
 import { createClaudeStreamMapper, legacyStepLine } from "./timeline-claude.mjs";
+import { connectRunnerInput } from "./runner-input.mjs";
 
 const claudeBin = process.env.RELAY_CLAUDE_BIN?.trim() || "claude";
 const resultPath = requiredEnv("RELAY_RESULT_PATH");
 const sessionPath = process.env.RELAY_SESSION_RESULT_PATH || "";
 const errorPath = process.env.RELAY_ERROR_PATH || "";
 const claudeArgs = process.argv.slice(2);
+const interactiveInput = process.env.RELAY_INTERACTIVE_INPUT === "1";
+if (interactiveInput) claudeArgs.push("--input-format", "stream-json", "--replay-user-messages");
 
 const writer = createTimelineWriter();
 const mapper = createClaudeStreamMapper();
@@ -39,6 +43,63 @@ let stderrTail = "";
 const announced = new Set();
 // kind and title by step id: they arrive when a step opens, its input later.
 const stepLabels = new Map();
+const acknowledgements = new Map();
+let turnActive = true;
+let interrupting = false;
+let interruptedResult;
+const inputs = connectRunnerInput({
+  onState: (event) => {
+    if (event.type === "input.state" && event.status !== "queued") writer.user(event.id, event.text, event.status);
+  },
+  start: sendUserMessage,
+  steer: async (message) => {
+    // Claude's explicit interrupt ends the old turn; the follow-up then runs
+    // in the same CLI/session. Wait for both acknowledgement and old result.
+    interrupting = true;
+    const ended = turnActive ? waitForAck("interrupted-result") : Promise.resolve();
+    interruptedResult = () => acknowledge("interrupted-result");
+    try {
+      const id = crypto.randomUUID();
+      const accepted = waitForAck(id);
+      writeInput({ type: "control_request", request_id: id, request: { subtype: "interrupt" } });
+      await Promise.all([accepted, ended]);
+      interrupting = false;
+      await sendUserMessage(message);
+    } catch (error) {
+      interrupting = false;
+      if (!turnActive) void inputs.turnFinished();
+      throw error;
+    } finally { interruptedResult = null; }
+  },
+  finish: () => child.stdin.end(),
+});
+
+function writeInput(value) { child.stdin.write(`${JSON.stringify(value)}\n`); }
+function waitForAck(id) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      acknowledgements.delete(id);
+      reject(new Error("Claude did not confirm delivery. Check the conversation before resending."));
+    }, 15_000);
+    acknowledgements.set(id, { resolve, reject, timer });
+  });
+}
+function acknowledge(id, error) {
+  const pending = acknowledgements.get(id);
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  acknowledgements.delete(id);
+  if (error) pending.reject(new Error(error));
+  else pending.resolve();
+}
+async function sendUserMessage(message) {
+  const accepted = waitForAck(message.id);
+  mapper.startTurn();
+  turnActive = true;
+  writeInput({ type: "user", uuid: message.id, session_id: mapper.sessionId() || "",
+    parent_tool_use_id: null, message: { role: "user", content: message.text } });
+  await accepted;
+}
 
 const child = spawn(claudeBin, claudeArgs, {
   cwd: process.cwd(),
@@ -71,13 +132,23 @@ function stop() {
 }
 
 for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(signal, stop);
+process.once("disconnect", stop);
 // The daemon is gone: nobody is reading, so nothing should keep running.
 process.stdout.on("error", stop);
 process.stderr.on("error", () => {});
 
 child.stdin.on("error", () => {});
 process.stdin.on("error", () => {});
-process.stdin.pipe(child.stdin);
+if (interactiveInput) {
+  let prompt = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (chunk) => { prompt += chunk; });
+  process.stdin.on("end", () => {
+    writeInput({ type: "user", uuid: crypto.randomUUID(), session_id: "", parent_tool_use_id: null,
+      message: { role: "user", content: prompt } });
+    void inputs.activate();
+  });
+} else process.stdin.pipe(child.stdin);
 
 child.stderr.setEncoding("utf8");
 child.stderr.on("data", (chunk) => {
@@ -99,6 +170,23 @@ lines.on("line", (raw) => {
     plainOutput += `${raw}\n`;
     process.stdout.write(`${raw}\n`);
     return;
+  }
+  if (line.type === "control_response") {
+    const response = line.response || {};
+    acknowledge(response.request_id, response.subtype === "error" ? response.error || "Claude refused the interrupt." : null);
+    return;
+  }
+  if (line.type === "user" && !line.parent_tool_use_id && line.uuid) acknowledge(line.uuid);
+  if (interactiveInput && line.type === "result") {
+    turnActive = false;
+    if (interrupting) {
+      interruptedResult?.();
+      return;
+    }
+    // Error results end the job; queued messages must not keep retrying a
+    // provider that has rejected authentication or exhausted its budget.
+    if (line.is_error) child.stdin.end();
+    else void inputs.turnFinished();
   }
   let events;
   try {
@@ -123,6 +211,7 @@ const exit = await new Promise((resolve) => {
   child.once("error", (error) => resolve({ code: null, signal: null, error }));
   child.once("close", (code, signal) => resolve({ code, signal, error: null }));
 });
+for (const id of acknowledgements.keys()) acknowledge(id, "Claude exited before confirming delivery.");
 await Promise.race([linesDone, new Promise((resolve) => setTimeout(resolve, 2000))]);
 clearTimeout(killTimer);
 writer.close();

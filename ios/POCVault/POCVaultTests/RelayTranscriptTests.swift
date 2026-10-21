@@ -134,6 +134,64 @@ final class RelayTranscriptTests: XCTestCase {
         XCTAssertEqual(Set(rows.map(\.id)).count, 2)
     }
 
+    func testWorkingGrandchildStaysUnderItsParentInsteadOfBecomingASibling() throws {
+        var timeline = RelayTimeline()
+        try decode(#"""
+        {"type":"step","id":"parent","kind":"agent","status":"done","agent":{"id":"parent-thread","name":"Reviewer","status":"done"}}
+        {"type":"step","id":"sibling","kind":"agent","status":"done","agent":{"id":"sibling-thread","name":"Writer","status":"done"}}
+        {"type":"step","id":"child","parent":"parent","kind":"agent","status":"running","agent":{"id":"child-thread","name":"Tests","status":"working"}}
+        """#).forEach { timeline.apply($0) }
+        let message = RelayConversationItem(id: "history", role: .assistant, text: "", provider: .codex, historyTimeline: timeline)
+        let rows = RelaySubagent.collect(messages: [message], timelines: [:])
+        XCTAssertEqual(rows.map(\.step.id), ["parent", "child", "sibling"], "Descendants must stay with their parent even when only the child is working")
+        XCTAssertEqual(rows.map(\.depth), [0, 1, 0])
+        XCTAssertEqual(rows[1].parentID, rows[0].id)
+    }
+
+    func testNestedAgentsResolveThroughToolsAndTolerateBrokenParentLinks() throws {
+        var timeline = RelayTimeline()
+        try decode(#"""
+        {"type":"step","id":"root","kind":"agent","status":"done"}
+        {"type":"step","id":"tool","parent":"root","kind":"tool","status":"done"}
+        {"type":"step","id":"child","parent":"tool","kind":"agent","status":"done"}
+        {"type":"step","id":"grandchild","parent":"child","kind":"agent","status":"done"}
+        {"type":"step","id":"orphan","parent":"missing","kind":"agent","status":"done"}
+        {"type":"step","id":"self","parent":"self","kind":"agent","status":"done"}
+        """#).forEach { timeline.apply($0) }
+        let rows = RelaySubagent.collect(messages: [.init(id: "history", role: .assistant, text: "", provider: .claude, historyTimeline: timeline)], timelines: [:])
+        XCTAssertEqual(rows.map(\.step.id), ["root", "child", "grandchild", "orphan", "self"])
+        XCTAssertEqual(rows.map(\.depth), [0, 1, 2, 0, 0])
+    }
+
+    func testLiveParentIdentityDoesNotOrphanItsRestoredChild() throws {
+        let history = RelayTimeline(historySteps: [
+            .init(id: "spawn", kind: .agent, status: .done, agent: .init(callId: "call")),
+            .init(id: "child", kind: .agent, status: .done, parent: "spawn")
+        ])
+        let live = RelayTimeline(historySteps: [.init(id: "live-spawn", kind: .agent, status: .done,
+            agent: .init(id: "native-parent", callId: "call"))])
+        let job = try JSONDecoder().decode(CodexJob.self, from: Data(#"{"id":"job","provider":"codex","status":"running"}"#.utf8))
+        let rows = RelaySubagent.collect(messages: [
+            .init(id: "history", role: .assistant, text: "", provider: .codex, historyTimeline: history),
+            .init(role: .job, text: "", job: job)
+        ], timelines: ["job": live])
+        XCTAssertEqual(rows.map(\.depth), [0, 1])
+        XCTAssertEqual(rows.last?.parentID, rows.first?.id)
+    }
+
+    func testSteeredUserMessageStaysBetweenAssistantOutputsAndPatchesInPlace() throws {
+        var timeline = RelayTimeline()
+        try decode(#"""
+        {"type":"text","id":"before","delta":"Original direction"}
+        {"type":"user","id":"follow-up","text":"Focus on tests","status":"sending"}
+        {"type":"text","id":"after","delta":"Testing now"}
+        {"type":"user","id":"follow-up","text":"Focus on tests","status":"sent"}
+        """#).forEach { timeline.apply($0) }
+        XCTAssertEqual(timeline.blocks.map(\.id), ["prose-before", "user-follow-up", "prose-after"])
+        XCTAssertEqual(timeline.blocks[1].content, .user(text: "Focus on tests", status: "sent"))
+        XCTAssertEqual(timeline.proseText, "Original direction\n\nTesting now", "User input is never copied as an assistant answer")
+    }
+
     private func stepIDs(_ block: RelayTimelineBlock) -> [String] {
         if case .activity(let ids) = block.content { return ids }
         return []
@@ -605,6 +663,7 @@ final class RelayChatLiveDataTests: XCTestCase {
         detail: @escaping (String) async throws -> CodexJob,
         thread: ((String, String?, CodexProvider) async throws -> CodexThreadDetail)? = nil,
         workspaceID: String? = "ws",
+        submitInput: ((String, RelayJobInputRequest) async throws -> CodexJob)? = nil,
         publishInterval: TimeInterval = 0
     ) -> RelayChatViewModel {
         RelayChatViewModel(
@@ -612,6 +671,7 @@ final class RelayChatLiveDataTests: XCTestCase {
             workspaceID: workspaceID,
             workspacePath: nil,
             fetchJobDetail: detail,
+            submitInput: submitInput,
             fetchThreadDetail: thread,
             live: script.source(),
             publishInterval: publishInterval
@@ -1281,6 +1341,53 @@ final class RelayChatLiveDataTests: XCTestCase {
     }
 
     // MARK: Tool-less chat
+
+    func testRunningFollowUpRetriesWithSameIDAndPromotesWithoutCreatingAnotherJob() async throws {
+        let script = LiveScript()
+        var current = try runningJob(#", "acceptsInput":true"#)
+        var requests: [RelayJobInputRequest] = []
+        var loseResponse = true
+        let model = makeModel(script, detail: { _ in current }, submitInput: { id, request in
+            XCTAssertEqual(id, current.id)
+            requests.append(request)
+            current.inputMessages = [.init(id: request.id, text: request.text, mode: request.mode, status: "queued")]
+            if loseResponse { loseResponse = false; throw URLError(.networkConnectionLost) }
+            return current
+        })
+        try await openRunningJob(script, model: model, job: current)
+        model.prompt = "Focus on tests"
+        await model.sendCurrentPrompt()
+        XCTAssertEqual(model.prompt, "Focus on tests", "A lost response must preserve the draft")
+        await model.sendCurrentPrompt()
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests[0].id, requests[1].id)
+        XCTAssertEqual(requests[0].mode, "queue")
+        XCTAssertEqual(model.prompt, "")
+        XCTAssertEqual(model.pendingInputs.count, 1)
+        await model.sendQueuedInputNow(try XCTUnwrap(model.pendingInputs.first))
+        XCTAssertEqual(requests.last?.mode, "now")
+        XCTAssertEqual(requests.last?.id, requests.first?.id)
+        XCTAssertEqual(model.messages.filter { $0.job != nil }.count, 1)
+        model.startNewConversation()
+        XCTAssertTrue(model.pendingInputs.isEmpty)
+    }
+
+    func testOlderRunnerKeepsTheDraftInsteadOfStartingAConcurrentTurn() async throws {
+        let script = LiveScript()
+        let current = try runningJob()
+        var sent = false
+        let model = makeModel(script, detail: { _ in current }, submitInput: { _, _ in
+            sent = true
+            return current
+        })
+        try await openRunningJob(script, model: model, job: current)
+        model.prompt = "New direction"
+        await model.sendCurrentPrompt()
+        XCTAssertFalse(sent)
+        XCTAssertEqual(model.prompt, "New direction")
+        XCTAssertNotNil(model.errorMessage)
+        XCTAssertEqual(model.messages.filter { $0.job != nil }.count, 1)
+    }
 
     func testARejectedHandoffRestoresTheDraftWithoutASentBubble() async throws {
         let script = LiveScript()

@@ -12,6 +12,61 @@ enum RelayChatStyle {
     static let labelFont = Font.subheadline
 }
 
+struct RelayQueuedInputs: View {
+    let messages: [RelayJobInputMessage]
+    let provider: CodexProvider?
+    let canSteer: Bool
+    let isSending: Bool
+    let onSendNow: (RelayJobInputMessage) -> Void
+    @State private var contentHeight: CGFloat = 80
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                ForEach(messages) { message in
+                    HStack(alignment: .top, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(message.status == "failed" ? "Delivery not confirmed" : message.status == "sending" ? "Sending…" : "Queued")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(message.status == "failed" ? AppTheme.statusError : AppTheme.textSecondary)
+                            Text(message.text).font(.subheadline).lineLimit(3)
+                            if let error = message.error {
+                                Text(error).font(.caption).foregroundStyle(AppTheme.textSecondary)
+                            }
+                        }
+                        Spacer(minLength: 0)
+                        if message.status == "queued", canSteer {
+                            Button(provider == .codex ? "Steer now" : "Send now") {
+                                onSendNow(message)
+                            }
+                            .font(.subheadline.weight(.medium))
+                            .frame(minHeight: 44)
+                            .disabled(isSending)
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 4)
+            .background(GeometryReader { geometry in
+                Color.clear.preference(key: RelayInputQueueHeight.self, value: geometry.size.height)
+            })
+        }
+        .frame(height: min(contentHeight, 140))
+        .onPreferenceChange(RelayInputQueueHeight.self) { height in
+            if height > 0 { contentHeight = height }
+        }
+        .tint(AppTheme.accent)
+        .accessibilityIdentifier("relay-queued-inputs")
+    }
+
+}
+
+private struct RelayInputQueueHeight: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
 extension View {
     func relayHiddenListRow() -> some View {
         self
@@ -60,6 +115,7 @@ struct RelayChatView: View {
     @State private var modelPickerRequest = 0
     @State private var didHandleInitialProviderPicker = false
     @State private var aiDataConsentRequest: RelayAIDataConsentRequest?
+    @State private var sendImmediately = false
     @State private var providerLoginRequest: CodexProvider?
     @State private var activityRequest: RelayActivityRequest?
     @State private var subagentRequest: RelaySubagent?
@@ -146,6 +202,9 @@ struct RelayChatView: View {
                                 projectContextLabel
                             }
                         }
+                    if !viewModel.pendingInputs.isEmpty {
+                        queuedInputs
+                    }
                     RelayComposer(
                         text: $viewModel.prompt,
                         attachments: $viewModel.draftAttachments,
@@ -184,7 +243,11 @@ struct RelayChatView: View {
                         },
                         onAddAttachments: { viewModel.addDraftAttachments($0) },
                         onRemoveAttachment: { viewModel.removeDraftAttachment(id: $0) },
-                        machineState: composerMachineState
+                        machineState: composerMachineState,
+                        activeRunProvider: viewModel.canSteerConversation ? viewModel.activeConversationJob?.provider : nil,
+                        onSendNow: {
+                            requestPromptSend(now: true)
+                        }
                     )
                     .fixedSize(horizontal: false, vertical: true)
                     }
@@ -492,13 +555,14 @@ struct RelayChatView: View {
         else { viewModel.startNewConversation() }
     }
 
-    private func requestPromptSend() {
+    private func requestPromptSend(now: Bool = false) {
+        sendImmediately = now
         if viewModel.needsProjectForTask, let onChooseProject {
             dismissKeyboard()
             onChooseProject()
             return
         }
-        guard let provider = viewModel.selectedChoice?.model.provider else {
+        guard let provider = viewModel.activeConversationJob?.provider ?? viewModel.selectedChoice?.model.provider else {
             sendPrompt()
             return
         }
@@ -513,7 +577,19 @@ struct RelayChatView: View {
     /// their message and its answer appear.
     private func sendPrompt() {
         scroller.jumpToLatest()
-        Task { await viewModel.sendCurrentPrompt() }
+        let now = sendImmediately
+        sendImmediately = false
+        Task {
+            if now { await viewModel.sendActivePrompt(now: true) }
+            else { await viewModel.sendCurrentPrompt() }
+        }
+    }
+
+    private var queuedInputs: some View {
+        RelayQueuedInputs(messages: viewModel.pendingInputs, provider: viewModel.activeConversationJob?.provider,
+                          canSteer: viewModel.canSteerConversation, isSending: viewModel.isSending) { message in
+            Task { await viewModel.sendQueuedInputNow(message) }
+        }
     }
 
     private func presentAIDataConsent(
@@ -928,6 +1004,9 @@ private struct RelayComposer: View {
     var onRemoveAttachment: (UUID) -> Void = { _ in }
     /// Set while the machine is off or in motion; takes the readiness line.
     var machineState: RelayComposerMachineState? = nil
+    var activeRunProvider: CodexProvider? = nil
+    var onSendNow: () -> Void = {}
+    @State private var showingSendOptions = false
     @State private var isFocused = false
     @State private var editorSelection = NSRange(location: 0, length: 0)
     @State private var editorHeight: CGFloat = 28
@@ -1251,7 +1330,8 @@ private struct RelayComposer: View {
                 sendDictated()
             } else {
                 isFocused = false
-                onSend()
+                if activeRunProvider != nil { showingSendOptions = true }
+                else { onSend() }
             }
         } label: {
             ZStack {
@@ -1278,8 +1358,17 @@ private struct RelayComposer: View {
             isStreaming ? "Stop"
                 : !providerReady ? "Provider connection required"
                 : listening ? "Send what was said"
-                : "Send"
+                : activeRunProvider != nil ? "Send follow-up" : "Send"
         )
+        .confirmationDialog("Send follow-up", isPresented: $showingSendOptions, titleVisibility: .visible) {
+            Button("Queue after this turn") { onSend() }
+            Button(activeRunProvider == .codex ? "Steer now" : "Send now") { onSendNow() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(activeRunProvider == .claude
+                 ? "Send now interrupts the current turn and continues with your message."
+                 : "Steer now adds your message to the current turn.")
+        }
     }
 
     var body: some View {
@@ -1670,6 +1759,7 @@ struct RelayComposerPreviewHost: View {
     var skills: [CodexSkillDescriptor] = []
     var selectedSkillIDs: Set<String> = []
     var isStreaming = false
+    var activeRunProvider: CodexProvider? = nil
     @State private var attachments: [RelayDraftAttachment] = []
 
     var body: some View {
@@ -1699,7 +1789,8 @@ struct RelayComposerPreviewHost: View {
             onPickCodexSandbox: { _ in },
             onNewConversation: {},
             onSend: {},
-            onStop: {}
+            onStop: {},
+            activeRunProvider: activeRunProvider
         )
     }
 }

@@ -24,7 +24,7 @@ const REVOKED_CLAUDE = [
   'if [ "$1" = "--version" ]; then echo "fake-claude 2.1.226"; exit 0; fi',
   'if [ "$1" = "--help" ]; then echo "  --model <model>  --effort <level>  --permission-mode <mode>"; exit 0; fi',
   'if [ "$1" = "auth" ] && [ "$2" = "status" ]; then echo \'{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}\'; exit 0; fi',
-  "cat > /dev/null",
+  'case "$*" in *--input-format*) IFS= read -r prompt;; *) cat > /dev/null;; esac',
   `echo '{"type":"result","subtype":"success","is_error":true,"result":"${REVOKED}","session_id":"s-1"}'`,
   "exit 1",
   "",

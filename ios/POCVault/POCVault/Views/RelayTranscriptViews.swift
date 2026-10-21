@@ -507,6 +507,21 @@ struct RelayTimelineBlocks: View {
         VStack(alignment: .leading, spacing: 0) {
             ForEach(timeline.blocks) { block in
                 switch block.content {
+                case .user(let text, let status):
+                    VStack(alignment: .trailing, spacing: 4) {
+                        Text(text)
+                            .font(RelayChatStyle.bodyFont)
+                            .textSelection(.enabled)
+                            .padding(12)
+                            .background(AppTheme.textPrimary.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+                        if status != "sent" {
+                            Text(status == "failed" ? "Delivery not confirmed" : "Sending…")
+                                .font(.caption)
+                                .foregroundStyle(status == "failed" ? AppTheme.statusError : AppTheme.textSecondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .padding(.vertical, 8)
                 case .prose(let text):
                     RelayTurnProse(text: text, onOpenLoopbackURL: onOpenLoopbackURL)
                         .equatable()
@@ -712,6 +727,7 @@ struct RelayTurnFooter: View {
 /// One drawn row of a turn: a prose block, or the sentence for a run of steps.
 struct RelayTranscriptRow: Identifiable, Equatable {
     enum Content: Equatable {
+        case user(text: String, status: String)
         case prose(String)
         /// `opens` is false when no step behind the sentence has anything to show.
         case activity(summary: String, failedCount: Int, opens: Bool)
@@ -743,6 +759,8 @@ extension RelayTimeline {
         var rows: [RelayTranscriptRow] = []
         for block in blocks {
             switch block.content {
+            case .user(let text, let status):
+                rows.append(RelayTranscriptRow(id: block.id, content: .user(text: text, status: status)))
             case .prose(let text):
                 rows.append(RelayTranscriptRow(id: block.id, content: .prose(text)))
             case .activity:

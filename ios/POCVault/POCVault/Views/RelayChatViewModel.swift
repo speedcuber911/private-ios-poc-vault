@@ -520,6 +520,8 @@ final class RelayChatViewModel: ObservableObject {
     private let fetchModels: () async throws -> [CodexModelDescriptor]
     private let fetchJobDetail: (String) async throws -> CodexJob
     private let submitJob: (CodexCreateJobRequest) async throws -> CodexCreateJobResponse
+    private let submitInput: (String, RelayJobInputRequest) async throws -> CodexJob
+    private var retryInput: (jobID: String, request: RelayJobInputRequest)?
     private let fetchThreadDetail: (String, String?, CodexProvider) async throws -> CodexThreadDetail
     private let effortDefaults: UserDefaults
     private var selectedEffortKey: String?
@@ -642,6 +644,7 @@ final class RelayChatViewModel: ObservableObject {
         fetchModels: (() async throws -> [CodexModelDescriptor])? = nil,
         fetchJobDetail: ((String) async throws -> CodexJob)? = nil,
         submitJob: ((CodexCreateJobRequest) async throws -> CodexCreateJobResponse)? = nil,
+        submitInput: ((String, RelayJobInputRequest) async throws -> CodexJob)? = nil,
         fetchThreadDetail: ((String, String?, CodexProvider) async throws -> CodexThreadDetail)? = nil,
         effortDefaults: UserDefaults = .standard,
         live: RelayChatLiveSource? = nil,
@@ -656,6 +659,7 @@ final class RelayChatViewModel: ObservableObject {
             try await client.fetchJob(id: id, includeFullLogs: false)
         }
         self.submitJob = submitJob ?? { try await client.createJob($0) }
+        self.submitInput = submitInput ?? { try await client.sendJobInput(id: $0, request: $1) }
         self.fetchThreadDetail = fetchThreadDetail ?? { sessionID, workspaceID, provider in
             try await client.fetchThreadDetail(
                 sessionID: sessionID,
@@ -1085,6 +1089,68 @@ final class RelayChatViewModel: ObservableObject {
         messages.contains { $0.job?.status.isActive == true }
     }
 
+    var activeConversationJob: CodexJob? {
+        messages.compactMap(\.job).last { $0.status.isActive }
+    }
+
+    var canSteerConversation: Bool { activeConversationJob?.acceptsInput == true }
+
+    var pendingInputs: [RelayJobInputMessage] {
+        messages.compactMap(\.job).flatMap(\.inputMessages).filter { $0.isPending || $0.status == "failed" }
+    }
+
+    /// The same request id is reused after a network failure: an accepted
+    /// message must never be duplicated because its HTTP response was lost.
+    func sendActivePrompt(now: Bool = false) async {
+        guard !isSending, let job = activeConversationJob else { return }
+        guard job.acceptsInput == true else {
+            errorMessage = "This run cannot receive follow-ups yet. Wait for it to finish, or update Relay on this computer."
+            return
+        }
+        guard draftAttachments.isEmpty else {
+            errorMessage = "Send a text follow-up while the agent is working. Your attachments can be sent after this run."
+            return
+        }
+        let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        let previous = retryInput
+        let id = previous?.jobID == job.id && previous?.request.text == text ? previous!.request.id : UUID().uuidString
+        let request = RelayJobInputRequest(id: id, text: text, mode: now ? "now" : "queue")
+        retryInput = (job.id, request)
+        isSending = true
+        defer { isSending = false }
+        let revision = conversationRevision
+        do {
+            let updated = try await submitInput(job.id, request)
+            guard revision == conversationRevision else { return }
+            replaceJob(updated, from: .action)
+            if prompt.trimmingCharacters(in: .whitespacesAndNewlines) == text { prompt = "" }
+            retryInput = nil
+            errorMessage = nil
+        } catch {
+            guard revision == conversationRevision else { return }
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func sendQueuedInputNow(_ message: RelayJobInputMessage) async {
+        guard !isSending, let job = messages.compactMap(\.job).first(where: {
+            $0.status.isActive && $0.inputMessages.contains { $0.id == message.id }
+        }), job.acceptsInput == true,
+              message.status == "queued" else { return }
+        isSending = true
+        defer { isSending = false }
+        let revision = conversationRevision
+        do {
+            let updated = try await submitInput(job.id, RelayJobInputRequest(id: message.id, text: message.text, mode: "now"))
+            guard revision == conversationRevision else { return }
+            replaceJob(updated, from: .action)
+            errorMessage = nil
+        } catch {
+            if revision == conversationRevision { errorMessage = error.localizedDescription }
+        }
+    }
+
     /// One pass of the app-wide monitor loop (owned by `RelayChatSessionStore`, ~2 s):
     /// while this conversation has an active job, pull its latest detail and refresh
     /// threads so the job card keeps showing progress — even when the chat cover is
@@ -1155,6 +1221,10 @@ final class RelayChatViewModel: ObservableObject {
     // MARK: - Sending
 
     func sendCurrentPrompt() async {
+        if hasActiveConversationJob {
+            await sendActivePrompt()
+            return
+        }
         guard let choice = selectedChoice else {
             errorMessage = "No model is available."
             return
@@ -1813,9 +1883,11 @@ final class RelayChatViewModel: ObservableObject {
     /// Once a job is over nothing in it is still running, whichever way the
     /// phone learned it was over: the stream's `done`, a poll, a cancel.
     private func settleTimeline(for job: CodexJob) {
-        guard job.status.isFinal, let timeline = timelineStore[job.id], timeline.hasRunningSteps else { return }
+        guard job.status.isFinal, let timeline = timelineStore[job.id] else { return }
         var settled = timeline
         settled.settle(as: job.status == .succeeded ? .done : job.status == .failed ? .failed : .cancelled)
+        settled.reconcileInputs(job.inputMessages)
+        guard settled != timeline else { return }
         timelineStore[job.id] = settled
         dirtyTimelineIDs.insert(job.id)
         // The end of a run is not something to show a beat late.

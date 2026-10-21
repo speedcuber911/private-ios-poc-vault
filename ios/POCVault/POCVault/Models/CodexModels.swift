@@ -1803,6 +1803,22 @@ struct CodexTextPreview: Equatable {
     }
 }
 
+struct RelayJobInputMessage: Codable, Hashable, Identifiable {
+    let id: String
+    let text: String
+    var mode: String
+    var status: String
+    var error: String?
+
+    var isPending: Bool { status == "queued" || status == "sending" }
+}
+
+struct RelayJobInputRequest: Encodable {
+    let id: String
+    let text: String
+    let mode: String
+}
+
 struct CodexJob: Decodable, Hashable, Identifiable {
     let id: String
     var provider: CodexProvider
@@ -1844,6 +1860,8 @@ struct CodexJob: Decodable, Hashable, Identifiable {
     /// How many timeline events the machine holds for this job. Absent or zero
     /// means it has no timeline and the job renders the legacy way.
     var timelineEvents: Int?
+    var acceptsInput: Bool?
+    var inputMessages: [RelayJobInputMessage]
     /// The provider refused the machine's own sign-in (a revoked or expired
     /// token), as relayd judged it. Older machines never send it; see
     /// `needsProviderSignIn` for the fallback that reads the error itself.
@@ -1898,6 +1916,7 @@ struct CodexJob: Decodable, Hashable, Identifiable {
         case attachments
         case artifacts
         case timelineEvents
+        case acceptsInput, inputMessages
         case signInRequired
     }
 
@@ -1969,6 +1988,8 @@ struct CodexJob: Decodable, Hashable, Identifiable {
         self.attachments = (try? container.decodeIfPresent([CodexJobAttachmentReference].self, forKey: .attachments)) ?? []
         self.artifacts = (try? container.decodeIfPresent([CodexJobArtifact].self, forKey: .artifacts)) ?? []
         self.timelineEvents = (try? container.decodeIntegerIfPresent(forKey: .timelineEvents)) ?? nil
+        self.acceptsInput = try container.decodeIfPresent(Bool.self, forKey: .acceptsInput)
+        self.inputMessages = try container.decodeIfPresent([RelayJobInputMessage].self, forKey: .inputMessages) ?? []
         self.signInRequired = (try? container.decodeIfPresent(Bool.self, forKey: .signInRequired)) ?? false
     }
 
@@ -2034,6 +2055,18 @@ struct CodexJob: Decodable, Hashable, Identifiable {
         merged.resumeSessionId = incoming.resumeSessionId ?? resumeSessionId
         merged.attachments = incoming.attachments.isEmpty ? attachments : incoming.attachments
         merged.timelineEvents = [incoming.timelineEvents, timelineEvents].compactMap { $0 }.max()
+        merged.acceptsInput = incoming.acceptsInput ?? acceptsInput
+        // SSE status frames omit input text. Never erase the queue on them,
+        // or let a stale detail response revert acknowledged delivery.
+        merged.inputMessages = inputMessages
+        for message in incoming.inputMessages {
+            if let index = merged.inputMessages.firstIndex(where: { $0.id == message.id }) {
+                let held = merged.inputMessages[index]
+                if held.isPending && !(held.status == "sending" && message.status == "queued") {
+                    merged.inputMessages[index] = message
+                }
+            } else { merged.inputMessages.append(message) }
+        }
         if !merged.status.isActive {
             merged.completedAt = incoming.completedAt ?? completedAt
             merged.exitCode = incoming.exitCode ?? exitCode

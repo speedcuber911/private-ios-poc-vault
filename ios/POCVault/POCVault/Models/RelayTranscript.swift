@@ -330,13 +330,14 @@ struct RelayTimelineUsage: Decodable, Hashable {
 
 enum RelayTimelineEvent: Decodable, Hashable {
     case text(id: String, delta: String)
+    case user(id: String, text: String, status: String)
     case step(RelayStepPatch)
     case stepDelta(id: String, output: String)
     case usage(RelayTimelineUsage)
     /// A type this build does not know. It still counts toward the cursor.
     case unknown
 
-    private enum CodingKeys: String, CodingKey { case type, id, delta, output }
+    private enum CodingKeys: String, CodingKey { case type, id, delta, output, text, status }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -348,6 +349,12 @@ enum RelayTimelineEvent: Decodable, Hashable {
                 return
             }
             self = .text(id: id, delta: delta)
+        case "user":
+            guard let id = container.lenient(String.self, .id), let text = container.lenient(String.self, .text) else {
+                self = .unknown
+                return
+            }
+            self = .user(id: id, text: text, status: container.lenient(String.self, .status) ?? "sent")
         case "step":
             self = (try? RelayStepPatch(from: decoder)).map(RelayTimelineEvent.step) ?? .unknown
         case "step.delta":
@@ -453,6 +460,7 @@ struct RelayStep: Identifiable, Hashable {
 
 struct RelayTimelineBlock: Identifiable, Hashable {
     enum Content: Hashable {
+        case user(text: String, status: String)
         /// Markdown the agent wrote.
         case prose(String)
         /// A run of consecutive top-level steps, by id.
@@ -516,6 +524,10 @@ struct RelayTimeline: Hashable {
         switch event {
         case .text(let id, let delta):
             appendProse(id: id, delta: delta)
+        case .user(let id, let text, let status):
+            let block = RelayTimelineBlock(id: "user-\(id)", content: .user(text: text, status: status))
+            if let index = blocks.firstIndex(where: { $0.id == block.id }) { blocks[index] = block }
+            else { blocks.append(block) }
         case .step(let patch):
             merge(patch)
         case .stepDelta(let id, let output):
@@ -572,6 +584,13 @@ struct RelayTimeline: Hashable {
     /// Top-level steps still in flight, oldest first: what the live rows show.
     var runningSteps: [RelayStep] {
         order.compactMap { steps[$0] }.filter { $0.status == .running && $0.parentID == nil }
+    }
+
+    mutating func reconcileInputs(_ messages: [RelayJobInputMessage]) {
+        for message in messages {
+            guard let index = blocks.firstIndex(where: { $0.id == "user-\(message.id)" }) else { continue }
+            blocks[index].content = .user(text: message.text, status: message.status)
+        }
     }
 
     /// The agent's prose joined in order, for copy and for the legacy text paths.

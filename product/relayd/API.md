@@ -748,6 +748,32 @@ files (exactly one new file, 4769–4773); resume jobs keep the resumed id.
 `preview` by default; `full` when `?full=1|true|yes|on` or
 `?include=fullLogs` (1616–1625). 404 on unknown/unsafe id.
 
+**`POST /v1/codex/jobs/:id/messages`** — send a text follow-up to a running
+Relay-owned Codex app-server or Claude stream job. Uses the job's existing
+authentication boundary. Request: `{id, text, mode}`, where `id` is a stable
+client message ID, `text` is nonempty and at most 32,000 UTF-8 bytes, and `mode`
+is `queue` or `now`. Returns **202** with the job, including `acceptsInput` and
+`inputMessages` (`id`, `text`, `mode`, `status`, optional `error`). Status is
+`queued`, `sending`, `sent`, or `failed`; `sent` requires provider acknowledgement.
+A failed acknowledgement can leave delivery uncertain; clients should show the
+error and must not automatically resend with a new ID.
+
+`queue` waits for the current turn to finish. `now` uses Codex `turn/steer`
+with its expected turn ID, or Claude's stream-input interrupt followed by a
+user message in the same process/session. Posting the same ID with `mode: now`
+promotes a queued message. Retries with the same ID/text are idempotent; changing
+its text is **409**. Model, permissions, skills and attachments are fixed for
+the run. Unsupported, stopping, or ended runs return **409**; invalid input is
+**400**. At most 100 follow-ups are retained per job.
+
+The daemon persists messages and the runner owns delivery, so closing the phone
+does not stop the queue. A runner exit or daemon restart marks unconfirmed
+messages failed. An externally owned desktop session has no input channel here.
+Compact job lists omit follow-up text; detail and action responses carry it.
+Follow-ups also appear in the job timeline as `user` events with
+`id`, `text`, and `status`; later events with the same ID patch delivery status
+without moving the message or counting its text as assistant output.
+
 **`POST /v1/codex/jobs/:id/cancel`** (1571–1574, `cancelJob` 4100–4132)
 — queued job: immediately `cancelled` (error `job cancelled before
 start`, durationMs 0). Running job: sets error `cancellation requested`,

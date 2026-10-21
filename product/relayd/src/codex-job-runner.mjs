@@ -6,6 +6,7 @@ import { ApprovalStore } from "./approval-store.mjs";
 import { isCodexHarnessNoise } from "./codex-noise.mjs";
 import { createTimelineWriter } from "./timeline.mjs";
 import { createCodexNotificationMapper, writeTimelineEvents } from "./timeline-codex.mjs";
+import { connectRunnerInput } from "./runner-input.mjs";
 
 const jobId = requiredEnv("RELAY_JOB_ID");
 const workspacePath = path.resolve(requiredEnv("RELAY_WORKSPACE_PATH"));
@@ -17,6 +18,8 @@ let completed = false;
 let finalAnswer = "";
 let streamedAnswer = "";
 let currentThreadId = process.env.RELAY_RESUME_SESSION_ID || "";
+let currentTurnId = null;
+let turnDefaults;
 let sandboxStartupFailure = null;
 // The structured record of this job (RELAY_TIMELINE_PATH). It is written
 // beside the legacy stdout/stderr channels, never instead of them.
@@ -35,7 +38,26 @@ const SANDBOX_STARTUP_FAILURES = [
 for (const signal of ["SIGTERM", "SIGINT"]) {
   process.once(signal, () => controller.abort(new Error(`received ${signal}`)));
 }
+process.once("disconnect", () => controller.abort(new Error("Relay disconnected")));
 
+const inputs = connectRunnerInput({
+  onState: (event) => {
+    if (event.type === "input.state" && event.status !== "queued") timeline.user(event.id, event.text, event.status);
+  },
+  start: async (message) => {
+    finalAnswer = "";
+    streamedAnswer = "";
+    const result = await client.request("turn/start", { ...turnDefaults,
+      input: [{ type: "text", text: message.text }] });
+    currentTurnId = result?.turn?.id || currentTurnId;
+  },
+  steer: async (message) => {
+    if (!currentTurnId) throw new Error("The active turn ended. Send this message as a new turn.");
+    await client.request("turn/steer", { threadId: currentThreadId, expectedTurnId: currentTurnId,
+      input: [{ type: "text", text: message.text }] });
+  },
+  finish: succeed,
+});
 const prompt = await readStdin();
 const client = new AppServerClient({
   codexBin: process.env.RELAY_CODEX_BIN || "codex",
@@ -98,7 +120,10 @@ try {
   const effort = optionalEnv("RELAY_REASONING_EFFORT");
   if (model) turnParams.model = model;
   if (effort) turnParams.effort = effort;
-  await client.request("turn/start", turnParams);
+  turnDefaults = turnParams;
+  const started = await client.request("turn/start", turnParams);
+  currentTurnId = started?.turn?.id || currentTurnId;
+  await inputs.activate();
 } catch (error) {
   fail(error);
 }
@@ -153,10 +178,12 @@ async function handleServerRequest(message) {
 }
 
 function handleNotification(message) {
+  if (message.params?.threadId && message.params.threadId !== currentThreadId) return;
   recordTimeline(() => writeTimelineEvents(timeline, timelineMapper.push(message)));
   const method = String(message.method || "");
   const params = message.params || {};
   const item = params.item || {};
+  if (method === "turn/started") currentTurnId = params.turn?.id || params.turnId || currentTurnId;
   if (method === "item/started") {
     if (item.type === "commandExecution") step(`Running ${displayCommand(item.command)}`);
     else if (item.type === "fileChange") step(`Editing ${fileChangePaths(item)}`);
@@ -191,8 +218,10 @@ function handleNotification(message) {
   }
   if (method === "turn/completed") {
     const turn = params.turn || {};
+    if (currentTurnId && turn.id && currentTurnId !== turn.id) return;
+    currentTurnId = null;
     if (turn.status === "completed" && sandboxStartupFailure) fail(sandboxStartupFailure);
-    else if (turn.status === "completed") succeed();
+    else if (turn.status === "completed") void inputs.turnFinished();
     else fail(new Error(turn.error?.message || `Codex turn ended with ${turn.status || "unknown status"}`));
   }
 }

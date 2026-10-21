@@ -12,6 +12,8 @@ struct RelaySubagent: Identifiable, Hashable {
     let provider: CodexProvider?
     let parentTitle: String?
     let descendants: [RelayStep]
+    private(set) var parentID: String? = nil
+    private(set) var depth: Int = 0
     private let priority: Int
 
     var id: String { step.agent?.id.map { "\(provider?.rawValue ?? "agent"):\($0)" } ?? request.id }
@@ -37,10 +39,11 @@ struct RelaySubagent: Identifiable, Hashable {
 
     static func collect(messages: [RelayConversationItem], timelines: [String: RelayTimeline]) -> [RelaySubagent] {
         var result: [RelaySubagent] = []
+        var aliases: [String: String] = [:]
 
         func append(_ timeline: RelayTimeline, source: RelayActivityRequest.Source, provider: CodexProvider?, priority: Int) {
             for step in timeline.subagentSteps {
-                let entry = RelaySubagent(
+                var entry = RelaySubagent(
                     request: RelayActivityRequest(source: source, root: .step(step.id)),
                     step: step,
                     provider: provider,
@@ -48,6 +51,17 @@ struct RelaySubagent: Identifiable, Hashable {
                     descendants: timeline.descendants(of: step.id),
                     priority: priority
                 )
+                var ancestor = step.parentID
+                var visited: Set<String> = [step.id]
+                while let ancestorID = ancestor, visited.insert(ancestorID).inserted,
+                      let parent = timeline.step(ancestorID) {
+                    if parent.kind == .agent {
+                        entry.parentID = parent.agent?.id.map { "\(provider?.rawValue ?? "agent"):\($0)" }
+                            ?? RelayActivityRequest(source: source, root: .step(parent.id)).id
+                        break
+                    }
+                    ancestor = parent.parentID
+                }
                 // A restored turn and its job can carry the same native call.
                 // Prefer the live job while active, then the richer transcript.
                 // Different jobs may reuse short item ids; keep those separate.
@@ -64,7 +78,16 @@ struct RelaySubagent: Identifiable, Hashable {
                 if let duplicate {
                     let existing = result[duplicate]
                     if priority > existing.priority || (priority == existing.priority && step.agent?.id != nil &&
-                        (step.input.prompt != nil || existing.step.input.prompt == nil)) { result[duplicate] = entry }
+                        (step.input.prompt != nil || existing.step.input.prompt == nil)) {
+                        entry.parentID = entry.parentID ?? existing.parentID
+                        result[duplicate] = entry
+                        aliases[existing.id] = entry.id
+                        aliases[existing.request.id] = entry.id
+                    } else if existing.parentID == nil {
+                        result[duplicate].parentID = entry.parentID
+                    }
+                    aliases[entry.id] = result[duplicate].id
+                    aliases[entry.request.id] = result[duplicate].id
                 } else {
                     result.append(entry)
                 }
@@ -80,9 +103,34 @@ struct RelaySubagent: Identifiable, Hashable {
                 append(timeline, source: .job(job.id), provider: job.provider, priority: job.status.isActive ? 2 : 0)
             }
         }
-        // Keep arrival order within each group so streaming updates do not
-        // continually move the row the reader is trying to open.
-        return result.filter(\.isWorking) + result.filter { !$0.isWorking }
+        // Sort sibling groups only, then walk each entire branch. A working
+        // grandchild must never jump out above its parent. Broken/cyclic links
+        // remain visible once instead of hiding tasks or recursing forever.
+        for index in result.indices {
+            var parent = result[index].parentID
+            var visited = Set<String>()
+            while let id = parent, visited.insert(id).inserted, let replacement = aliases[id], replacement != id {
+                parent = replacement
+            }
+            result[index].parentID = parent
+        }
+        let ids = Set(result.map(\.id))
+        var ordered: [RelaySubagent] = []
+        var visited = Set<String>()
+        func appendBranch(_ entry: RelaySubagent, depth: Int) {
+            guard visited.insert(entry.id).inserted else { return }
+            var row = entry
+            row.depth = depth
+            ordered.append(row)
+            let children = result.filter { $0.parentID == entry.id }
+            for child in children.filter(\.isWorking) + children.filter({ !$0.isWorking }) {
+                appendBranch(child, depth: depth + 1)
+            }
+        }
+        let roots = result.filter { $0.parentID == nil || !ids.contains($0.parentID!) }
+        for root in roots.filter(\.isWorking) + roots.filter({ !$0.isWorking }) { appendBranch(root, depth: 0) }
+        for orphan in result where !visited.contains(orphan.id) { appendBranch(orphan, depth: 0) }
+        return ordered
     }
 }
 
@@ -172,13 +220,14 @@ struct RelaySubagentsView: View {
                         .accessibilityIdentifier("relay-subagents-empty")
                     }
                 } else {
-                    ForEach(subagents) { subagent in
+                    ForEach(Array(subagents.enumerated()), id: \.element.id) { index, subagent in
                         Button { onOpen(subagent) } label: {
                             row(subagent)
                         }
+                        .padding(.leading, CGFloat(min(subagent.depth, 4)) * 20)
                         .buttonStyle(.plain)
                         .accessibilityIdentifier("relay-subagent-row")
-                        if subagent.id != subagents.last?.id {
+                        if index + 1 < subagents.count, subagents[index + 1].depth == 0 {
                             Divider().overlay(AppTheme.textPrimary.opacity(0.08))
                         }
                     }
@@ -194,6 +243,13 @@ struct RelaySubagentsView: View {
 
     private func row(_ subagent: RelaySubagent) -> some View {
         HStack(alignment: .top, spacing: 12) {
+            if subagent.depth > 0 {
+                Image(systemName: "arrow.turn.down.right")
+                    .font(.caption)
+                    .foregroundStyle(AppTheme.textSecondary)
+                    .padding(.top, 8)
+                    .accessibilityHidden(true)
+            }
             RelayAgentAvatar(seed: subagent.step.subagentAvatarSeed)
                 .padding(.top, 2)
             VStack(alignment: .leading, spacing: 6) {
@@ -209,7 +265,7 @@ struct RelaySubagentsView: View {
                         .lineLimit(2)
                         .multilineTextAlignment(.leading)
                 }
-                if let parent = subagent.parentTitle {
+                if let parent = subagent.parentTitle, subagent.depth == 0 || subagent.depth > 4 {
                     Text("Within \(parent)")
                         .font(.caption)
                         .foregroundStyle(AppTheme.textSecondary)
@@ -229,7 +285,7 @@ struct RelaySubagentsView: View {
         .frame(minHeight: 72)
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
-        .accessibilityHint("Opens the subagent conversation")
+        .accessibilityHint("Level \(subagent.depth + 1). Opens the subagent conversation")
     }
 
     @ViewBuilder
@@ -367,6 +423,7 @@ struct RelaySubagentChatView: View {
                                     .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.plain)
+                                .padding(.leading, CGFloat(min(child.depth, 4)) * 20)
                             }
                         }
                     }

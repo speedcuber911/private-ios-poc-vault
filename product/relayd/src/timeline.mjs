@@ -79,6 +79,10 @@ export function createTimelineWriter({ file = process.env.RELAY_TIMELINE_PATH ||
       write({ type: "text", id, delta });
     },
 
+    user(id, text, status) {
+      write({ type: "user", id, text, status });
+    },
+
     // Create or update a step. Pass only the fields that changed.
     step(fields) {
       if (!fields || !fields.id) return;

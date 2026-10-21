@@ -679,6 +679,80 @@ final class RelayComposerTests: XCTestCase {
         try render(presented(addSheet(.skills, provider: .claude)), size: screen, to: output, name: "presented-skills", settle: 1.5)
     }
 
+    @MainActor
+    func testSteeringChoicesAndNestedSubagentSnapshots() throws {
+        guard let directory = ProcessInfo.processInfo.environment["RELAY_COMPOSER_SNAPSHOT_DIR"], !directory.isEmpty else {
+            throw XCTSkip("Set RELAY_COMPOSER_SNAPSHOT_DIR to inspect steering and nesting")
+        }
+        let output = URL(fileURLWithPath: directory, isDirectory: true)
+        try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+        if let library = dlopen("/usr/lib/libAccessibility.dylib", RTLD_NOW),
+           let symbol = dlsym(library, "_AXSSetAutomationEnabled") {
+            unsafeBitCast(symbol, to: (@convention(c) (Int32) -> Void).self)(1)
+        }
+        let catalog = try sections()
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        for provider in [CodexProvider.codex, .claude] {
+            let selected = try choice(provider == .codex ? "gpt-5.5" : "claude-opus", in: catalog)
+            let host = UIHostingController(rootView: RelayComposerPreviewHost(
+                text: "Focus on the failing tests first.", sections: catalog, selectedChoice: selected,
+                activeRunProvider: provider
+            ).frame(maxHeight: .infinity, alignment: .bottom).background(AppTheme.bgCanvas).environment(\.colorScheme, .dark))
+            let window = UIWindow(windowScene: scene)
+            window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+            window.windowLevel = .alert + 1
+            window.rootViewController = host
+            window.isHidden = false
+            host.overrideUserInterfaceStyle = .dark
+            host.view.frame = window.bounds
+            host.view.layoutIfNeeded()
+            defer {
+                host.dismiss(animated: false)
+                window.isHidden = true
+                window.rootViewController = nil
+                window.windowScene = nil
+            }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+            let send = try XCTUnwrap(Self.accessibilityElement(in: host.view) { $0 == "Send follow-up" })
+            XCTAssertTrue(send.accessibilityActivate())
+            RunLoop.main.run(until: Date().addingTimeInterval(1.5))
+            let sheet = try XCTUnwrap(host.presentedViewController?.view)
+            sheet.layoutIfNeeded()
+            XCTAssertNotNil(Self.accessibilityElement(in: sheet) { $0 == "Queue after this turn" })
+            XCTAssertNotNil(Self.accessibilityElement(in: sheet) { $0 == (provider == .codex ? "Steer now" : "Send now") })
+            let image = UIGraphicsImageRenderer(size: window.bounds.size).image { _ in
+                window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+            }
+            try XCTUnwrap(image.pngData()).write(to: output.appendingPathComponent("steering-\(provider.rawValue).png"))
+            let sheetImage = UIGraphicsImageRenderer(size: sheet.bounds.size).image { _ in
+                sheet.drawHierarchy(in: sheet.bounds, afterScreenUpdates: true)
+            }
+            try XCTUnwrap(sheetImage.pngData()).write(to: output.appendingPathComponent("steering-options-\(provider.rawValue).png"))
+        }
+        let timeline = RelayTimeline(historySteps: [
+            .init(id: "root", kind: .agent, summary: "Review the implementation", status: .done,
+                  agent: .init(id: "reviewer", name: "Reviewer", status: "working")),
+            .init(id: "child", kind: .agent, summary: "Check edge cases", status: .done, parent: "root",
+                  agent: .init(id: "tester", name: "Test review", status: "working")),
+            .init(id: "grandchild", kind: .agent, summary: "Trace retry failures", status: .done, parent: "child",
+                  agent: .init(id: "retries", name: "Retry audit", status: "done")),
+            .init(id: "sibling", kind: .agent, summary: "Review the documentation", status: .done,
+                  agent: .init(id: "writer", name: "Documentation", status: "done"))
+        ])
+        let agents = RelaySubagent.collect(messages: [.init(id: "history", role: .assistant, text: "", provider: .codex, historyTimeline: timeline)], timelines: [:])
+        for width: CGFloat in [320, 390] {
+            try render(RelaySubagentsView(subagents: agents, isLoading: false, errorMessage: nil, onOpen: { _ in })
+                .background(AppTheme.bgCanvas), size: CGSize(width: width, height: 700), to: output, name: "nested-agents-\(Int(width))")
+            try render(RelayQueuedInputs(messages: [
+                .init(id: "one", text: "Focus on the failing tests first.", mode: "queue", status: "queued"),
+                .init(id: "two", text: "Check the retry path too.", mode: "queue", status: "queued")
+            ], provider: .codex, canSteer: true, isSending: false, onSendNow: { _ in })
+                .frame(maxHeight: .infinity, alignment: .bottom).background(AppTheme.bgCanvas),
+                size: CGSize(width: width, height: 200), to: output, name: "queued-inputs-\(Int(width))",
+                expectedLabels: ["Focus on the failing tests first.", "Check the retry path too.", "Steer now"])
+        }
+    }
+
     // MARK: Driven sheet (opt-in, with the snapshots)
 
     /// What the composer and view model do around the sheet, reduced to state the
@@ -869,7 +943,8 @@ final class RelayComposerTests: XCTestCase {
         size: CGSize,
         to directory: URL,
         name: String,
-        settle: TimeInterval = 0.4
+        settle: TimeInterval = 0.4,
+        expectedLabels: [String] = []
     ) throws {
         let host = UIHostingController(rootView: view.environment(\.colorScheme, .dark))
         host.overrideUserInterfaceStyle = .dark
@@ -889,6 +964,12 @@ final class RelayComposerTests: XCTestCase {
         // Preference-driven sizing and asset images settle over a couple of passes.
         RunLoop.main.run(until: Date().addingTimeInterval(settle))
         host.view.layoutIfNeeded()
+
+        for label in expectedLabels {
+            let element = try XCTUnwrap(Self.accessibilityElement(in: host.view) { $0 == label })
+            XCTAssertFalse(element.accessibilityFrame.isEmpty, "\(label) must remain visible after layout")
+            XCTAssertTrue(window.frame.contains(element.accessibilityFrame), "\(label) must be inside the panel")
+        }
 
         let format = UIGraphicsImageRendererFormat()
         format.scale = 3

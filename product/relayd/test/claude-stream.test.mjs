@@ -42,7 +42,10 @@ const retarget = (text) => text.split("00000000-0000-4000-8000-000000000001").jo
 process.on("SIGTERM", () => process.exit(143));
 let prompt = "";
 process.stdin.on("data", (chunk) => { prompt += chunk; });
-process.stdin.on("end", async () => {
+let started = false;
+async function run() {
+  if (started) return;
+  started = true;
   fs.writeFileSync(path.join(process.cwd(), "fake-claude-call.json"), JSON.stringify({
     args,
     pid: process.pid,
@@ -99,7 +102,15 @@ process.stdin.on("end", async () => {
     );
   }
   return leave(0);
-});
+}
+process.stdin.on("end", run);
+if (args.includes("--input-format")) {
+  process.stdin.on("data", () => {
+    if (started || !prompt.includes("\\n")) return;
+    prompt = JSON.parse(prompt.split("\\n")[0]).message.content;
+    void run();
+  });
+}
 `;
   fs.writeFileSync(file, source, { mode: 0o755 });
   return file;

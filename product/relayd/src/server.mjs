@@ -21,7 +21,7 @@ import { cleanThreadProviderFilter, workspaceForJob, listWorkspaceSessions, list
 import { handleChatRequest } from "./chat.mjs";
 import { isSafeArtifactId, serveJobArtifact } from "./artifacts.mjs";
 import { transcribeAudio, cleanAudioContentType, cleanAudioFilename } from "./transcribe.mjs";
-import { jobsState, jobs, activeChildren, responseShape, wantsFullLogs, enqueueJob, cleanJobProviderFilter, normalizeJobProvider, compareJobsForList, jobThreadId, cancelJob, streamJobEvents, jobTimelinePage, toJobResponse, serveJobAttachment, isSafeAttachmentIndex } from "./jobs.mjs";
+import { jobsState, jobs, activeChildren, responseShape, wantsFullLogs, enqueueJob, cleanJobProviderFilter, normalizeJobProvider, compareJobsForList, jobThreadId, cancelJob, submitJobInput, streamJobEvents, jobTimelinePage, toJobResponse, serveJobAttachment, isSafeAttachmentIndex } from "./jobs.mjs";
 import { planSessionImports, importCodexSession, createSessionUpload, appendSessionUpload, completeSessionUpload } from "./session-sync.mjs";
 import { codexThreadUiHtml } from "./ui.mjs";
 import { handleAdditionRoutes } from "./additions.mjs";
@@ -505,7 +505,7 @@ async function routeRequest(req, res) {
     return sendJson(res, 200, jobTimelinePage(job, url.searchParams));
   }
 
-  const jobMatch = url.pathname.match(/^\/v1\/codex\/jobs\/([^/]+)(?:\/(cancel))?$/);
+  const jobMatch = url.pathname.match(/^\/v1\/codex\/jobs\/([^/]+)(?:\/(cancel|messages))?$/);
   if (jobMatch) {
     const [, id, action] = jobMatch;
     if (!isSafeJobId(id)) return sendError(res, 404, "job not found");
@@ -519,6 +519,10 @@ async function routeRequest(req, res) {
     if (action === "cancel" && req.method === "POST") {
       const cancelledJob = cancelJob(job);
       return sendJson(res, 202, await toJobResponse(cancelledJob, responseShape("preview")));
+    }
+    if (action === "messages" && req.method === "POST") {
+      const updated = submitJobInput(job, await readBody(req));
+      return sendJson(res, 202, await toJobResponse(updated, responseShape("preview")));
     }
   }
 

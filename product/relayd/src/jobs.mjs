@@ -95,6 +95,7 @@ function loadPersistedJobs() {
         job.timedOut = false;
         job.result = null;
         job.error = "service restarted while job was running";
+        failPendingInputs(job, "The service restarted before delivery was confirmed. Check the conversation before resending.");
         sealJobTimelineCount(job);
         persistJob(job);
         appendAudit("stale_running_marked_failed", job);
@@ -861,6 +862,58 @@ function cancelJob(job) {
   return job;
 }
 
+function supportsJobInput(job) {
+  return (job.provider === "codex" && codexTransport === "app-server")
+    || (job.provider === "claude" && claudeTransport === "stream");
+}
+
+function failPendingInputs(job, reason) {
+  for (const message of job.inputMessages || []) {
+    if (message.status === "queued" || message.status === "sending") {
+      message.status = "failed";
+      message.error = reason;
+    }
+  }
+}
+
+function submitJobInput(job, body) {
+  const id = body?.id;
+  const text = typeof body?.text === "string" ? body.text.trim() : "";
+  if (typeof id !== "string" || !/^[a-zA-Z0-9-]{1,80}$/.test(id)
+      || !text || Buffer.byteLength(text) > 32_000 || !["queue", "now"].includes(body?.mode)) {
+    throw Object.assign(new Error("A message id, text (up to 32000 bytes), and queue or now mode are required."), { status: 400 });
+  }
+  const previous = job.inputMessages?.find((message) => message.id === id);
+  if (previous && previous.text !== text) {
+    throw Object.assign(new Error("This message id already belongs to different text."), { status: 409 });
+  }
+  // Retrying an acknowledged request is a read, even if the job has ended.
+  if (previous && (previous.status !== "queued" || body.mode === previous.mode)) return job;
+  const active = activeChildren.get(job.id);
+  if (!supportsJobInput(job) || !active?.child?.connected || active.finalized
+      || active.inputClosed || active.cancelRequested || terminalStatuses.has(job.status)) {
+    throw Object.assign(new Error("This run cannot receive messages. Refresh the conversation and send a new turn."), { status: 409 });
+  }
+  if (!previous && (job.inputMessages?.length || 0) >= 100) {
+    throw Object.assign(new Error("This run has reached its follow-up message limit."), { status: 409 });
+  }
+  const message = previous || { id, text, createdAt: nowIso(), status: "queued" };
+  message.mode = body.mode;
+  if (!previous) (job.inputMessages ||= []).push(message);
+  job.updatedAt = nowIso();
+  touchJob(job);
+  if (job.provider === "claude" && message.mode === "now") {
+    approvalStore.cancelPendingForJob(job.id, "The user interrupted this turn with a follow-up.");
+  }
+  active.child.send({ type: "input.submit", message }, (error) => {
+    if (!error || message.status === "sent" || message.status === "failed") return;
+    message.status = "failed";
+    message.error = "The runner disconnected before confirming this message.";
+    touchJob(job);
+  });
+  return job;
+}
+
 
 function processQueue() {
   while (activeChildren.size < maxConcurrent && jobsState.queuedJobIds.length > 0) {
@@ -913,7 +966,7 @@ function startJob(job) {
   const child = spawn(jobBinary(job.provider), args, {
     cwd: job.worktree?.path || job.workspacePath,
     env: childEnv,
-    stdio: ["pipe", "pipe", "pipe"],
+    stdio: supportsJobInput(job) ? ["pipe", "pipe", "pipe", "ipc"] : ["pipe", "pipe", "pipe"],
   });
 
   const active = {
@@ -938,6 +991,19 @@ function startJob(job) {
       : null,
   };
   activeChildren.set(job.id, active);
+  child.on("message", (event) => {
+    if (event?.type === "input.closed") {
+      active.inputClosed = true;
+      touchJob(job);
+    } else if (event?.type === "input.state" && ["queued", "sending", "sent", "failed"].includes(event.status)) {
+      const message = job.inputMessages?.find((entry) => entry.id === event.id);
+      if (!message || message.status === "sent" || message.status === "failed") return;
+      message.status = event.status;
+      message.error = typeof event.error === "string" ? event.error.slice(0, 1000) : undefined;
+      job.updatedAt = nowIso();
+      touchJob(job);
+    }
+  });
 
   armJobTimeout(job, active);
   active.approvalPollTimer = setInterval(() => pollJobApprovals(job, active), 200);
@@ -1057,6 +1123,7 @@ function buildJobEnv(job) {
     RELAY_ERROR_PATH: jobErrorPath(job),
     RELAY_CLAUDE_BIN: claudeBin,
     RELAY_CODEX_BIN: codexBin,
+    RELAY_INTERACTIVE_INPUT: supportsJobInput(job) ? "1" : "0",
     RELAY_CODEX_APPROVAL_POLICY: job.approvalPolicy || "on-request",
     RELAY_CODEX_SANDBOX: job.sandbox || "workspace-write",
     RELAY_CODEX_SKILL_INPUTS: JSON.stringify(
@@ -1587,6 +1654,7 @@ function notifyJobStatusChanged(job) {
 async function finishJob(job, active, { code, signal, stdout, stderr, spawnError }) {
   if (active.finalized) return;
   active.finalized = true;
+  failPendingInputs(job, "The run ended before delivery was confirmed. Check the conversation before resending.");
 
   clearTimeout(active.timeoutTimer);
   clearTimeout(active.killTimer);
@@ -1893,6 +1961,9 @@ async function toJobResponse(job, shape = responseShape("preview")) {
   return {
     id: job.id,
     status,
+    ...(shape.logsIncluded !== "compact" ? { inputMessages: job.inputMessages || [] } : {}),
+    acceptsInput: supportsJobInput(job) && !!activeChildren.get(job.id)?.child?.connected
+      && !activeChildren.get(job.id)?.inputClosed && !activeChildren.get(job.id)?.cancelRequested,
     // Present only when the job has a timeline, so a job without one reads
     // exactly as it always has.
     ...(timelineEvents > 0 ? { timelineEvents } : {}),
@@ -2002,6 +2073,7 @@ export {
   compareJobsForList,
   jobThreadId,
   cancelJob,
+  submitJobInput,
   processQueue,
   startJob,
   buildJobArgs,
