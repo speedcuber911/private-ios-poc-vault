@@ -152,7 +152,10 @@ caches. Deployment is complete only when CodePipeline reports `Succeeded`, the
 EC2 `current` symlink matches the source SHA, and the public health endpoint is
 green.
 
-Active conversations renew a bounded `RelayKeepAwakeUntil` instance tag, so
+Activity holds are disabled by default. After the cloud policy below is in
+place, an operator can opt in with `RELAYD_ACTIVITY_HOLD_ENABLED=1` on the
+worker and restart `relayd`. With this enabled, active conversations renew a
+bounded `RelayKeepAwakeUntil` instance tag, so
 low CPU or network traffic alone cannot stop a working agent. The node sends
 only an expiry in its signed heartbeat. Paired machines can send this heartbeat
 without an account; this does not authorize handoff or credential sync.

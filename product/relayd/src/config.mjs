@@ -375,6 +375,9 @@ const updateServiceName = cleanDisplayName(process.env.RELAYD_SERVICE_NAME || "r
 
 // Optional EC2 power registration. Unset means "discover from IMDS, or skip".
 const powerEnabled = parseBooleanEnv("RELAYD_POWER", true);
+// Activity holds require a separate cloud IAM policy. Keep them opt-in so
+// upgrading a node does not change the operator's idle-shutdown behavior.
+const activityHoldsEnabled = parseBooleanEnv("RELAYD_ACTIVITY_HOLD_ENABLED", false);
 const powerInstanceId = (process.env.RELAYD_POWER_INSTANCE_ID || "").trim().toLowerCase() || null;
 const powerRegion = (process.env.RELAYD_POWER_REGION || process.env.AWS_REGION || "ap-south-1").trim().toLowerCase();
 const powerEnrollToken = (process.env.RELAYD_POWER_ENROLL_TOKEN || "").trim() || null;
@@ -1227,6 +1230,7 @@ export {
   updateHealthWaitSec,
   updateServiceName,
   powerEnabled,
+  activityHoldsEnabled,
   powerInstanceId,
   powerRegion,
   powerEnrollToken,

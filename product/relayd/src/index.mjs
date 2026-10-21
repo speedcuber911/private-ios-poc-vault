@@ -32,6 +32,7 @@ import {
   tunnelBackoffBaseMs,
   tunnelBackoffMaxMs,
   cloudUrl,
+  activityHoldsEnabled,
   handoffEnabled,
   handoffPollWaitSec,
   autoUpdate,
@@ -334,13 +335,13 @@ async function startHandoffPickup() {
       // machine is stuck mid-update" become answerable. A getter, not a value:
       // it changes underneath this long-lived client.
       pendingVersion: updateEngine ? () => updateEngine.pendingVersion() : null,
-      keepAwakeUntil: () => {
+      keepAwakeUntil: activityHoldsEnabled ? () => {
         activityTracker.interacted(latestCodexActivity(codexHome));
         return activityTracker.keepAwakeUntil({
           busy: activeChildren.size > 0 || jobsState.queuedJobIds.length > 0
             || liveClaudeSessions(runHome).some((session) => session.status !== "idle"),
         });
-      },
+      } : null,
     });
     setJobNotificationHook((type, job) => cloud.postEvent(type, { jobId: job.id }));
     updateEngine?.setPostEvent((type) => cloud.postEvent(type));
