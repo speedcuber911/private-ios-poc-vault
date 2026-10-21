@@ -83,7 +83,6 @@ final class RelayTranscriptScroller: ObservableObject {
     private var follow = RelayScrollFollow()
     private weak var scrollView: UIScrollView?
     private var observations: [NSKeyValueObservation] = []
-    private var lastOffsetY: CGFloat = 0
     private var isAdjusting = false
     /// Scrolls to the transcript's bottom anchor through SwiftUI. Used only
     /// while no scroll view is attached.
@@ -135,7 +134,6 @@ final class RelayTranscriptScroller: ObservableObject {
         guard !Self.forcesFallback, self.scrollView !== scrollView else { return }
         observations.removeAll()
         self.scrollView = scrollView
-        lastOffsetY = scrollView.contentOffset.y
         observations = [
             scrollView.observe(\.contentSize, options: [.old, .new]) { [weak self] _, change in
                 guard change.oldValue != change.newValue else { return }
@@ -204,20 +202,16 @@ final class RelayTranscriptScroller: ObservableObject {
         isAdjusting = true
         scrollView.setContentOffset(CGPoint(x: scrollView.contentOffset.x, y: target), animated: false)
         isAdjusting = false
-        lastOffsetY = scrollView.contentOffset.y
     }
 
     private func offsetChanged() {
         guard let scrollView, let geometry else { return }
-        let previous = lastOffsetY
-        lastOffsetY = geometry.offsetY
         guard !isAdjusting else { return }
         let readerDriven = scrollView.isTracking || scrollView.isDragging || scrollView.isDecelerating
-        // The status-bar tap scrolls up without a touch on the list; it is still
-        // the reader leaving the bottom.
-        let movedUpUntouched = geometry.offsetY < previous - 0.5
-            && geometry.distanceFromBottom > RelayScrollFollow.threshold
-        guard readerDriven || movedUpUntouched else { return }
+        // SwiftUI also moves this offset when resolving lazy row heights.
+        // Treating that as a reader scroll can strand a reopened chat outside
+        // its rendered rows and stop all subsequent corrections.
+        guard readerDriven else { return }
         follow.readerScrolled(to: geometry)
         publish()
     }
@@ -299,17 +293,15 @@ struct RelayJumpToLatestButton: View {
 /// The transcript's type and measures, from the design canvas. Rows read these
 /// so a restyle is one place.
 enum RelayTranscriptStyle {
-    static let gutter: CGFloat = 16
+    static let gutter: CGFloat = 20
     static let raised = Color(hex: 0x272421)
     static let chevron = AppTheme.textTertiary
-    /// DM Sans 13/20: activity rows, the footer's buttons.
-    static let small = Font.custom("DMSans-9ptRegular", size: 13, relativeTo: .subheadline)
-    /// DM Sans 15/20: a live row's summary, a step row's description.
-    static let rowTitle = Font.custom("DMSans-9ptRegular", size: 15, relativeTo: .subheadline)
-    /// DM Mono 12: durations.
-    static let clock = Font.custom("DMMono-Regular", size: 12, relativeTo: .caption)
-    /// DM Mono 13/20: commands, paths, file names.
-    static let mono = Font.custom("DMMono-Regular", size: 13, relativeTo: .footnote)
+    static let small = Font.subheadline
+    static let rowTitle = Font.subheadline
+    /// Stable-width digits keep elapsed times from shifting the row.
+    static let clock = Font.caption.monospacedDigit()
+    /// Commands, paths, and file names.
+    static let mono = Font.footnote.monospaced()
     static let activityRowHeight: CGFloat = 44
     static let liveRowHeight: CGFloat = 60
     /// Two activity rows back to back close up by this much to read as a pair.
@@ -349,7 +341,7 @@ struct RelayTurnByline: View {
         }
         .font(RelayTranscriptStyle.small.weight(.medium))
         .foregroundStyle(RelayChatStyle.secondary)
-        .frame(height: 20)
+        .frame(minHeight: 20)
     }
 }
 
@@ -378,6 +370,7 @@ struct RelayTurnProse: View, Equatable {
 struct RelayActivityRow: View {
     let summary: String
     var failedCount = 0
+    var symbol = "list.bullet"
     var action: (() -> Void)? = nil
 
     var body: some View {
@@ -392,7 +385,10 @@ struct RelayActivityRow: View {
     }
 
     private func label(showsChevron: Bool) -> some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 10) {
+            Image(systemName: symbol)
+                .foregroundStyle(AppTheme.textTertiary)
+                .accessibilityHidden(true)
             Text(summary)
                 .foregroundStyle(AppTheme.textSecondary)
                 .lineLimit(1)
@@ -405,10 +401,8 @@ struct RelayActivityRow: View {
                     .fixedSize()
                     .layoutPriority(1)
             }
-            if showsChevron {
-                RelayRowChevron().layoutPriority(1)
-            }
             Spacer(minLength: 0)
+            if showsChevron { RelayRowChevron().layoutPriority(1) }
         }
         .font(RelayTranscriptStyle.small)
         .frame(maxWidth: .infinity, minHeight: RelayTranscriptStyle.activityRowHeight, alignment: .leading)
@@ -458,7 +452,9 @@ struct RelayLiveRowLabel: View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    RelayCapsLabel(text: word, color: AppTheme.accentBright, size: 10)
+                    Text(word)
+                        .font(AppTheme.uiFont(size: 14, weight: .medium))
+                        .foregroundStyle(AppTheme.textSecondary)
                         .fixedSize()
                     if let since {
                         TimelineView(.periodic(from: .now, by: 1)) { context in
@@ -474,7 +470,7 @@ struct RelayLiveRowLabel: View {
                     Text(detail)
                         .font(RelayTranscriptStyle.rowTitle)
                         .foregroundStyle(AppTheme.textPrimary)
-                        .lineLimit(1)
+                        .lineLimit(2)
                         .truncationMode(.tail)
                 }
             }
@@ -484,7 +480,6 @@ struct RelayLiveRowLabel: View {
             }
         }
         .frame(maxWidth: .infinity, minHeight: RelayTranscriptStyle.liveRowHeight, alignment: .leading)
-        .overlay(alignment: .top) { RelayHairline() }
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
     }
@@ -509,58 +504,43 @@ struct RelayTimelineBlocks: View {
     static let maxLiveRows = 3
 
     var body: some View {
-        // Blocks stack with no gap: the 44pt rows give the rhythm.
         VStack(alignment: .leading, spacing: 0) {
-            let rows = timeline.transcriptRows(isActive: isActive)
-            ForEach(rows) { row in
-                switch row.content {
+            ForEach(timeline.blocks) { block in
+                switch block.content {
                 case .prose(let text):
                     RelayTurnProse(text: text, onOpenLoopbackURL: onOpenLoopbackURL)
                         .equatable()
-                        // Prose straight under the byline needs air the rows bring themselves.
-                        .padding(.top, row.id == rows.first?.id ? 8 : 0)
-                case .activity(let summary, let failedCount, let opens):
-                    RelayActivityRow(
-                        summary: summary,
-                        failedCount: failedCount,
-                        action: opens ? { onOpenBlock(row.id) } : nil
-                    )
-                    .padding(.top, row.followsActivity ? -RelayTranscriptStyle.activityPairOverlap : 0)
+                        .padding(.vertical, 8)
+                case .activity:
+                    let finished = timeline.countedSteps(in: block, isActive: isActive)
+                    if !finished.isEmpty {
+                        RelayActivityRow(
+                            summary: RelayTimeline.summary(of: finished),
+                            failedCount: RelayTimeline.failedCount(in: finished),
+                            symbol: finished.count == 1 ? finished[0].kind.symbol : "list.bullet",
+                            action: finished.contains { $0.hasDetail || !timeline.children(of: $0.id).isEmpty }
+                                ? { onOpenBlock(block.id) } : nil
+                        )
+                    }
+                    if isActive {
+                        let running = timeline.steps(in: block).filter { $0.status.isRunning }
+                        ForEach(running.prefix(Self.maxLiveRows)) { step in
+                            RelayLiveStepRow(step: step, word: isWaiting ? idleWord : nil) { onOpenStep(step.id) }
+                        }
+                        if running.count > Self.maxLiveRows {
+                            RelayActivityRow(summary: "\(running.count - Self.maxLiveRows) more in progress") { onOpenBlock(block.id) }
+                        }
+                    }
                 }
             }
-            if isActive {
-                liveRows
-                    .padding(.top, rows.last?.isProse == true ? 12 : 0)
+            if isActive, timeline.runningSteps.isEmpty {
+                RelayIdleLiveRow(word: idleWord, since: idleSince,
+                                 proseLength: isWaiting ? nil : timeline.trailingProseLength)
+                    .padding(.top, 8)
             }
         }
     }
 
-    @ViewBuilder
-    private var liveRows: some View {
-        let running = timeline.runningSteps
-        if running.isEmpty {
-            RelayIdleLiveRow(
-                word: idleWord,
-                since: idleSince,
-                // A parked approval is always worth saying; otherwise prose
-                // that is still arriving is its own sign of life.
-                proseLength: isWaiting ? nil : timeline.trailingProseLength
-            )
-        } else {
-            VStack(alignment: .leading, spacing: 0) {
-                ForEach(running.prefix(Self.maxLiveRows)) { step in
-                    RelayLiveStepRow(step: step, word: isWaiting ? idleWord : nil) { onOpenStep(step.id) }
-                }
-                if running.count > Self.maxLiveRows {
-                    Text("+\(running.count - Self.maxLiveRows) more")
-                        .font(RelayTranscriptStyle.small)
-                        .foregroundStyle(AppTheme.textSecondary)
-                        .frame(maxWidth: .infinity, minHeight: RelayTranscriptStyle.activityRowHeight, alignment: .leading)
-                        .overlay(alignment: .top) { RelayHairline() }
-                }
-            }
-        }
-    }
 }
 
 /// Nothing is running and no prose is arriving, but the job is: say so, with
@@ -594,6 +574,95 @@ private struct RelayIdleLiveRow: View {
     }
 }
 
+/// Copy is visible; selecting across paragraphs uses one native text view so
+/// the reader can move selection handles through the whole reply.
+struct RelayMessageActions: View {
+    let text: String
+    @State private var selectingText = false
+
+    var body: some View {
+        HStack(spacing: 20) {
+            RelayCopyButton(text: text)
+            Button("Select text", systemImage: "text.cursor") { selectingText = true }
+                .frame(minHeight: 44)
+        }
+        .font(.caption)
+        .foregroundStyle(RelayChatStyle.secondary)
+        .buttonStyle(.plain)
+        .sheet(isPresented: $selectingText) { RelayTextSelectionSheet(text: text) }
+    }
+}
+
+struct RelayCopyButton: View {
+    let text: String
+    var label = "Copy"
+    @State private var copied = false
+
+    var body: some View {
+        Button {
+            UIPasteboard.general.string = text
+            copied = true
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        } label: {
+            Label(copied ? "Copied" : label, systemImage: "doc.on.doc")
+                .frame(minWidth: 64, minHeight: 44, alignment: .leading)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .task(id: copied) {
+            guard copied else { return }
+            do { try await Task.sleep(for: .seconds(2)) } catch { return }
+            copied = false
+        }
+    }
+}
+
+struct RelayTextSelectionSheet: View {
+    let text: String
+    var monospaced = false
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            RelaySelectableMessageText(text: text, monospaced: monospaced)
+                .background(AppTheme.bgCanvas)
+                .navigationTitle("Select text")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) { RelayCopyButton(text: text, label: "Copy all") }
+                    ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } }
+                }
+        }
+        .presentationDetents([.large])
+        .presentationDragIndicator(.visible)
+    }
+}
+
+struct RelaySelectableMessageText: UIViewRepresentable {
+    let text: String
+    var monospaced = false
+
+    func makeUIView(context: Context) -> UITextView {
+        let view = UITextView()
+        view.isEditable = false
+        view.isSelectable = true
+        view.backgroundColor = .clear
+        view.textColor = UIColor(AppTheme.textPrimary)
+        view.tintColor = UIColor(AppTheme.accent)
+        view.font = monospaced
+            ? UIFontMetrics(forTextStyle: .body).scaledFont(for: .monospacedSystemFont(ofSize: 15, weight: .regular))
+            : .preferredFont(forTextStyle: .body)
+        view.adjustsFontForContentSizeCategory = true
+        view.textContainerInset = UIEdgeInsets(top: 20, left: 20, bottom: 28, right: 20)
+        view.accessibilityLabel = "Message text"
+        return view
+    }
+
+    func updateUIView(_ view: UITextView, context: Context) {
+        if view.text != text { view.text = text }
+    }
+}
+
 /// How the run ended, the full log, and Stop while it is going. While the job
 /// runs the live rows carry the status, so the footer adds no second clock.
 struct RelayTurnFooter: View {
@@ -605,11 +674,8 @@ struct RelayTurnFooter: View {
     var body: some View {
         HStack(alignment: .center, spacing: 8) {
             if let outcome = job.status.outcomeWord {
-                RelayCapsLabel(
-                    text: outcome,
-                    color: job.status.didFail ? AppTheme.statusError : AppTheme.textPrimary,
-                    size: 10
-                )
+                Text(outcome.capitalized)
+                    .foregroundStyle(job.status.didFail ? AppTheme.statusError : RelayChatStyle.secondary)
                 if let seconds = job.finishedSeconds {
                     Text(RelayStepClock.clock(seconds))
                         .font(RelayTranscriptStyle.clock)
@@ -618,10 +684,11 @@ struct RelayTurnFooter: View {
                 }
             }
             Spacer(minLength: 8)
-            Button("View full log", action: onFullLog)
+            Button("Activity", action: onFullLog)
                 .frame(minHeight: 44)
                 .contentShape(Rectangle())
                 .accessibilityIdentifier("relay-job-full-log")
+                .accessibilityLabel("View full activity log")
             if job.status.isActive {
                 Button(isCancelling ? "Stopping…" : "Stop", action: onCancel)
                     .frame(minWidth: 44, minHeight: 44)
@@ -636,8 +703,7 @@ struct RelayTurnFooter: View {
         .buttonStyle(.plain)
         .lineLimit(1)
         .frame(minHeight: 44)
-        .overlay(alignment: .top) { RelayHairline() }
-        .padding(.top, 16)
+        .padding(.top, 8)
     }
 }
 
@@ -710,6 +776,11 @@ extension RelayStep {
     var rowSummary: (text: String, isCode: Bool) {
         switch kind {
         case .command:
+            if let description = input.description?.trimmedNonEmpty { return (description, false) }
+            if let summary = summary?.trimmedNonEmpty,
+               summary != input.command?.split(whereSeparator: \.isNewline).first.map(String.init) {
+                return (summary, false)
+            }
             if let line = input.command?.split(whereSeparator: \.isNewline).first { return (String(line), true) }
         case .read, .edit, .write:
             if let path = input.path?.trimmedNonEmpty { return ((path as NSString).lastPathComponent, true) }
@@ -830,4 +901,20 @@ enum RelayTranscriptLayout {
 private extension RelayConversationItem {
     var isAgentTurnPart: Bool { role == .assistant || role == .job }
     var turnProvider: CodexProvider? { job?.provider ?? provider }
+}
+
+extension RelayStepKind {
+    var symbol: String {
+        switch self {
+        case .command: return "terminal"
+        case .read: return "doc.text"
+        case .edit, .write: return "pencil.line"
+        case .search: return "magnifyingglass"
+        case .fetch: return "globe"
+        case .agent: return "person.2"
+        case .reasoning: return "ellipsis"
+        case .todo: return "list.bullet"
+        case .tool: return "wrench"
+        }
+    }
 }

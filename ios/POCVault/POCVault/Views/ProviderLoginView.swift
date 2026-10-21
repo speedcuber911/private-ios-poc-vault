@@ -111,7 +111,7 @@ struct ProviderLoginView: View {
 
             VStack(spacing: 10) {
                 Text("Sign in to \(flow.provider.displayName)")
-                    .font(AppTheme.serifFont(size: 26))
+                    .font(AppTheme.uiFont(size: 26, weight: .semibold))
                     .foregroundStyle(AppTheme.textPrimary)
                     .multilineTextAlignment(.center)
                 Text(signInDetail(op: op))
@@ -136,8 +136,8 @@ struct ProviderLoginView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 14)
                     .background {
-                        RoundedRectangle(cornerRadius: 12)
-                            .stroke(AppTheme.hairlineStrong, lineWidth: 1)
+                        RoundedRectangle(cornerRadius: 18)
+                            .fill(AppTheme.textPrimary.opacity(0.05))
                     }
                 }
                 .buttonStyle(.plain)
@@ -169,8 +169,8 @@ struct ProviderLoginView: View {
                         }
                         .padding(10)
                         .background {
-                            RoundedRectangle(cornerRadius: 10)
-                                .stroke(AppTheme.hairlineStrong, lineWidth: 1)
+                            RoundedRectangle(cornerRadius: 14)
+                                .fill(AppTheme.textPrimary.opacity(0.05))
                         }
                         .accessibilityIdentifier("relay-provider-login-terminal-tail")
                     } else if showsNoLinkHint, flow.isUsingTerminalEngine {
@@ -246,8 +246,8 @@ struct ProviderLoginView: View {
                         .font(.system(size: 15, design: .monospaced))
                         .padding(12)
                         .background {
-                            RoundedRectangle(cornerRadius: 10)
-                                .stroke(AppTheme.hairlineStrong, lineWidth: 1)
+                            RoundedRectangle(cornerRadius: 14)
+                                .fill(AppTheme.textPrimary.opacity(0.05))
                         }
                         .accessibilityIdentifier("relay-provider-login-paste")
 
@@ -276,7 +276,7 @@ struct ProviderLoginView: View {
                 .font(.system(size: 40, weight: .medium))
                 .foregroundStyle(AppTheme.accentGradient)
             Text("\(flow.provider.displayName) is connected")
-                .font(AppTheme.serifFont(size: 26))
+                .font(AppTheme.uiFont(size: 26, weight: .semibold))
                 .foregroundStyle(AppTheme.textPrimary)
                 .multilineTextAlignment(.center)
             Text("The session lives on your machine. You can start working from this iPhone right away.")
@@ -318,7 +318,7 @@ struct ProviderLoginView: View {
                 .font(.system(size: 40, weight: .medium))
                 .foregroundStyle(AppTheme.accentGradient)
             Text(title)
-                .font(AppTheme.serifFont(size: 26))
+                .font(AppTheme.uiFont(size: 26, weight: .semibold))
                 .foregroundStyle(AppTheme.textPrimary)
                 .multilineTextAlignment(.center)
             Text(detail)

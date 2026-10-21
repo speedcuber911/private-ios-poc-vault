@@ -186,11 +186,55 @@ struct RelayStepPatch: Decodable, Hashable {
     }
 }
 
+/// One provider-reported plan window. Missing percentages are not zero.
+struct RelayUsageLimit: Decodable, Hashable, Identifiable {
+    let id: String
+    var name: String?
+    var windowMinutes: Int?
+    var usedPercent: Double?
+    var resetsAt: Date?
+    var reportedAt: Date?
+    var status: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, windowMinutes, usedPercent, resetsAt, reportedAt, status
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = c.lenient(String.self, .name)
+        windowMinutes = c.lenient(Int.self, .windowMinutes)
+        usedPercent = c.lenient(Double.self, .usedPercent).flatMap { $0.isFinite && $0 >= 0 ? min(100, $0) : nil }
+        resetsAt = c.lenient(String.self, .resetsAt).flatMap(RelayTimelineDate.parse)
+        reportedAt = c.lenient(String.self, .reportedAt).flatMap(RelayTimelineDate.parse)
+        status = c.lenient(String.self, .status)
+    }
+
+    var title: String {
+        if let name, !name.isEmpty { return name }
+        switch windowMinutes {
+        case 300: return "Current session"
+        case 10080: return "All models"
+        case let minutes? where minutes > 0: return minutes % 60 == 0 ? "\(minutes / 60)-hour limit" : "\(minutes)-minute limit"
+        default: return "Plan limit"
+        }
+    }
+
+    func hasReset(at date: Date) -> Bool { resetsAt.map { $0 <= date } ?? false }
+}
+
 struct RelayTimelineUsage: Decodable, Hashable {
     var inputTokens: Int?
     var outputTokens: Int?
+    var contextTokens: Int?
+    var contextWindow: Int?
+    var contextReportedAt: Date?
+    var limits: [RelayUsageLimit]?
 
-    private enum CodingKeys: String, CodingKey { case inputTokens, outputTokens }
+    private enum CodingKeys: String, CodingKey {
+        case inputTokens, outputTokens, contextTokens, contextWindow, contextReportedAt, limits
+    }
 
     init(inputTokens: Int? = nil, outputTokens: Int? = nil) {
         self.inputTokens = inputTokens
@@ -198,9 +242,39 @@ struct RelayTimelineUsage: Decodable, Hashable {
     }
 
     init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        inputTokens = container.lenient(Int.self, .inputTokens)
-        outputTokens = container.lenient(Int.self, .outputTokens)
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        inputTokens = c.lenient(Int.self, .inputTokens)
+        outputTokens = c.lenient(Int.self, .outputTokens)
+        contextTokens = c.lenient(Int.self, .contextTokens).flatMap { $0 >= 0 ? $0 : nil }
+        contextWindow = c.lenient(Int.self, .contextWindow).flatMap { $0 > 0 ? $0 : nil }
+        contextReportedAt = c.lenient(String.self, .contextReportedAt).flatMap(RelayTimelineDate.parse)
+        limits = c.lenient([RelayUsageLimit].self, .limits)
+    }
+
+    var contextFraction: Double? {
+        guard let contextTokens, let contextWindow, contextWindow > 0 else { return nil }
+        return min(1, Double(contextTokens) / Double(contextWindow))
+    }
+
+    func merging(_ newer: RelayTimelineUsage) -> RelayTimelineUsage {
+        var result = self
+        result.inputTokens = newer.inputTokens ?? inputTokens
+        result.outputTokens = newer.outputTokens ?? outputTokens
+        if newer.contextTokens != nil {
+            result.contextTokens = newer.contextTokens
+            // A new model may not report its capacity; never reuse the old one.
+            result.contextWindow = newer.contextWindow
+            result.contextReportedAt = newer.contextReportedAt
+        }
+        if let updates = newer.limits {
+            var windows = limits ?? []
+            for update in updates {
+                if let index = windows.firstIndex(where: { $0.id == update.id }) { windows[index] = update }
+                else { windows.append(update) }
+            }
+            result.limits = windows
+        }
+        return result
     }
 }
 
@@ -396,10 +470,7 @@ struct RelayTimeline: Hashable {
         case .stepDelta(let id, let output):
             steps[id]?.output += output
         case .usage(let newer):
-            usage = RelayTimelineUsage(
-                inputTokens: newer.inputTokens ?? usage?.inputTokens,
-                outputTokens: newer.outputTokens ?? usage?.outputTokens
-            )
+            usage = (usage ?? RelayTimelineUsage()).merging(newer)
         case .unknown:
             break
         }
@@ -607,6 +678,12 @@ extension RelayTimeline {
     /// "Ran 5 commands, read 2 files": counts by kind in order of first
     /// appearance. A run that is only thinking says how long it took.
     static func summary(of steps: [RelayStep], now: Date = Date()) -> String {
+        if steps.count == 1, let step = steps.first, step.kind != .reasoning {
+            let detail = step.displaySummary.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !detail.isEmpty, detail != step.title {
+                return "\(step.statusWord): \(detail)"
+            }
+        }
         var kinds: [RelayStepKind] = []
         var counts: [RelayStepKind: Int] = [:]
         for step in steps {

@@ -8,8 +8,8 @@ import UIKit
 enum RelayChatStyle {
     static let secondary = AppTheme.textPrimary.opacity(0.72)
     static let surface = AppTheme.textPrimary.opacity(0.06)
-    static let bodyFont = Font.custom("DMSans-9ptRegular", size: 16, relativeTo: .body)
-    static let labelFont = Font.custom("DMSans-9ptRegular", size: 13, relativeTo: .subheadline)
+    static let bodyFont = Font.body
+    static let labelFont = Font.subheadline
 }
 
 extension View {
@@ -30,6 +30,9 @@ struct RelayChatView: View {
     /// Set when the chat is presented as a folder's full-screen cover; shows the
     /// dismiss chevron in the top bar. Dismissing never cancels streams (VM-owned).
     var onDismiss: (() -> Void)? = nil
+    var onOpenSidebar: (() -> Void)? = nil
+    var onNewChat: (() -> Void)? = nil
+    var onChooseProject: (() -> Void)? = nil
     /// Raised by the root when a handoff push is tapped: open the threads list,
     /// which is where handoff cards live. Lowered again once honored, so a second
     /// push after the sheet was closed still opens it.
@@ -57,9 +60,9 @@ struct RelayChatView: View {
     @State private var modelPickerRequest = 0
     @State private var didHandleInitialProviderPicker = false
     @State private var aiDataConsentRequest: RelayAIDataConsentRequest?
-    @State private var automaticallyPresentedConsentProviders: Set<CodexProvider> = []
     @State private var providerLoginRequest: CodexProvider?
     @State private var activityRequest: RelayActivityRequest?
+    @State private var showingUsage = false
     @StateObject private var scroller = RelayTranscriptScroller()
     @State private var backSwipeOffset: CGFloat = 0
     @State private var viewportWidth: CGFloat = 0
@@ -87,15 +90,32 @@ struct RelayChatView: View {
                         }
                         .zIndex(1)
                         .simultaneousGesture(keyboardDismissTap)
-                    messageList
-                        .layoutPriority(1)
-                        .contentShape(Rectangle())
-                        .simultaneousGesture(keyboardDismissTap)
+                    Group {
+                        if isEmptyConversation {
+                            welcomeCanvas
+                        } else {
+                            messageList
+                        }
+                    }
+                    .layoutPriority(1)
+                    .contentShape(Rectangle())
+                    .simultaneousGesture(keyboardDismissTap)
                 }
             }
             .toolbar(.hidden, for: .navigationBar)
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 if !showingThreads {
+                    VStack(alignment: .leading, spacing: 0) {
+                        if let onChooseProject {
+                            if viewModel.messages.isEmpty {
+                                Button(action: onChooseProject) { projectContextLabel }
+                                    .buttonStyle(.plain)
+                                    .disabled(viewModel.isSending)
+                                    .accessibilityIdentifier("relay-chat-project")
+                            } else {
+                                projectContextLabel
+                            }
+                        }
                     RelayComposer(
                         text: $viewModel.prompt,
                         attachments: $viewModel.draftAttachments,
@@ -137,25 +157,26 @@ struct RelayChatView: View {
                         machineState: composerMachineState
                     )
                     .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
             .task {
                 honorThreadsRequest()
                 await viewModel.bootstrap()
-                presentAIDataConsentIfNeeded()
                 if presentsProviderPickerOnAppear, !didHandleInitialProviderPicker {
                     didHandleInitialProviderPicker = true
                     modelPickerRequest += 1
                 }
             }
-            .task(id: viewModel.watchedSessionID) {
-                guard viewModel.watchedSessionID != nil else { return }
+            .task(id: "\(scenePhase)-\(viewModel.watchedSessionID ?? "")") {
+                guard scenePhase == .active, viewModel.watchedSessionID != nil else { return }
                 while !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(2))
+                    if !powerModel.isDown { await viewModel.refreshWatchedThreadIfNeeded() }
+                    do { try await Task.sleep(for: .seconds(viewModel.nativeWatchPollInterval)) }
+                    catch { return }
                     if Task.isCancelled { return }
                     // A read that finds the machine off would start it.
                     if powerModel.isDown { continue }
-                    await viewModel.refreshWatchedThreadIfNeeded()
                     if viewModel.watchedSessionID == nil { return }
                 }
             }
@@ -191,9 +212,6 @@ struct RelayChatView: View {
             .onChange(of: threadsRequest.wrappedValue) { _, _ in
                 honorThreadsRequest()
             }
-            .onChange(of: viewModel.selectedChoice?.id) { _, _ in
-                presentAIDataConsentIfNeeded()
-            }
             .onChange(of: automaticPreviewCandidate?.key) { _, _ in
                 openRequestedPreviewIfNeeded()
             }
@@ -219,6 +237,9 @@ struct RelayChatView: View {
             }
             .sheet(item: $fullLogRequest) { request in
                 RelayFullLogSheet(jobID: request.jobID, viewModel: viewModel)
+            }
+            .sheet(isPresented: $showingUsage) {
+                RelayConversationUsageSheet(viewModel: viewModel)
             }
             .sheet(item: $activityRequest) { request in
                 RelayActivitySheet(request: request, viewModel: viewModel)
@@ -295,12 +316,17 @@ struct RelayChatView: View {
     private var backSwipeGesture: some Gesture {
         DragGesture(minimumDistance: 16, coordinateSpace: .global)
             .onChanged { value in
-                guard onDismiss != nil, !finishingBackSwipe,
+                guard onDismiss != nil || onOpenSidebar != nil, !finishingBackSwipe,
                       value.startLocation.x <= 24,
                       value.translation.width > abs(value.translation.height) * 1.5 else { return }
-                backSwipeOffset = max(0, value.translation.width)
+                if onOpenSidebar == nil { backSwipeOffset = max(0, value.translation.width) }
             }
             .onEnded { value in
+                if let onOpenSidebar, value.startLocation.x <= 24,
+                   value.translation.width > 70, value.translation.width > abs(value.translation.height) * 1.5 {
+                    onOpenSidebar()
+                    return
+                }
                 guard backSwipeOffset > 0, let onDismiss, !finishingBackSwipe else { return }
                 let isHorizontal = value.translation.width > abs(value.translation.height) * 1.5
                 if isHorizontal && (value.translation.width > 100 || (value.translation.width > 40 && value.predictedEndTranslation.width > 220)) {
@@ -321,82 +347,82 @@ struct RelayChatView: View {
             }
     }
 
-    private var topBar: some View {
-        HStack(spacing: 4) {
-            if let onDismiss {
-                Button(action: onDismiss) {
-                    Image(systemName: "chevron.left")
-                        .font(AppTheme.uiFont(size: 16, weight: .semibold))
-                        .foregroundStyle(RelayChatStyle.secondary)
-                        .frame(width: 44, height: 44)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Back")
-            }
+    private var projectContextLabel: some View {
+        Label(viewModel.projectLabel ?? "Choose project", systemImage: "folder")
+            .font(.caption)
+            .foregroundStyle(RelayChatStyle.secondary)
+            .lineLimit(1)
+            .frame(minHeight: 36)
+            .padding(.horizontal, 24)
+    }
 
+    private var isEmptyConversation: Bool {
+        viewModel.messages.isEmpty && !viewModel.isLoadingThreadDetail && viewModel.errorMessage == nil
+    }
+
+    private var welcomeCanvas: some View {
+        VStack(spacing: 0) {
+            Spacer()
+            Text("What are we\nworking on?")
+                .font(.system(.largeTitle, design: .serif))
+                .foregroundStyle(AppTheme.textPrimary)
+                .multilineTextAlignment(.center)
+                .lineSpacing(3)
+                .padding(.horizontal, 28)
+                .accessibilityIdentifier("relay-chat-welcome")
+            Spacer()
+            Spacer().frame(maxHeight: 56)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var topBar: some View {
+        HStack(spacing: 8) {
             Button {
-                threadsPreferLarge = false
-                showingThreads = true
+                dismissKeyboard()
+                if let onOpenSidebar { onOpenSidebar() }
+                else if let onDismiss { onDismiss() }
+                else { showingThreads = true }
             } label: {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(viewModel.conversationTitle)
-                        .font(.custom("DMSans-9ptRegular", size: 17, relativeTo: .headline).weight(.semibold))
-                        .foregroundStyle(AppTheme.textPrimary)
-                        .lineLimit(1)
-                    HStack(spacing: 5) {
-                        Text("Threads")
-                        Text("\(viewModel.historyItems.count)")
-                        if !viewModel.handoffs.isEmpty {
-                            Text("· \(viewModel.handoffs.count) handed off")
-                                .foregroundStyle(AppTheme.accentBright)
-                        }
-                        Image(systemName: "chevron.down")
-                            .font(.system(size: 9, weight: .semibold))
-                    }
-                    .font(.custom("DMSans-9ptRegular", size: 12, relativeTo: .caption))
-                    .foregroundStyle(RelayChatStyle.secondary)
-                    .lineLimit(1)
-                }
-                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-                .contentShape(Rectangle())
+                Label("Threads", systemImage: "line.3.horizontal")
+                    .font(.subheadline)
+                    .frame(minWidth: 44, minHeight: 44)
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("\(viewModel.conversationTitle), Threads, \(viewModel.historyItems.count) conversations and invocations")
+            .foregroundStyle(RelayChatStyle.secondary)
+            .accessibilityLabel("Open threads sidebar")
             .accessibilityIdentifier("relay-threads")
-
+            Spacer(minLength: 8)
+            Text(viewModel.messages.isEmpty ? "Relay" : viewModel.conversationTitle)
+                .font(.headline)
+                .lineLimit(1)
+                .foregroundStyle(AppTheme.textPrimary)
+            Spacer(minLength: 8)
             Button(action: startNewConversation) {
                 Image(systemName: "square.and.pencil")
-                    .font(AppTheme.uiFont(size: 16, weight: .medium))
-                    .foregroundStyle(RelayChatStyle.secondary)
+                    .font(AppTheme.uiFont(size: 19))
                     .frame(width: 44, height: 44)
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("New conversation")
-
-            if let provider = viewModel.selectedChoice?.model.provider {
+            .foregroundStyle(RelayChatStyle.secondary)
+            .accessibilityLabel("New chat")
+            .accessibilityIdentifier("relay-new-chat")
+            if !viewModel.messages.isEmpty, let provider = viewModel.selectedChoice?.model.provider {
                 Menu {
+                    Button("Usage", systemImage: "chart.pie") { showingUsage = true }
                     if let path = viewModel.folderPathLabel {
-                        Section("Folder") {
-                            Text(path)
-                            Button("Copy folder path", systemImage: "doc.on.doc") {
-                                UIPasteboard.general.string = path
-                            }
-                        }
+                        Button("Copy folder path", systemImage: "doc.on.doc") { UIPasteboard.general.string = path }
                     }
-                    Button("AI data sharing") {
-                        presentAIDataConsent(for: provider, purpose: .review)
-                    }
+                    Button("AI data sharing") { presentAIDataConsent(for: provider, purpose: .review) }
                 } label: {
-                    Image(systemName: "ellipsis")
-                        .font(AppTheme.uiFont(size: 16, weight: .semibold))
-                        .foregroundStyle(RelayChatStyle.secondary)
-                        .frame(width: 44, height: 44)
+                    Image(systemName: "ellipsis").frame(width: 36, height: 44)
                 }
+                .foregroundStyle(RelayChatStyle.secondary)
                 .accessibilityIdentifier("relay-chat-overflow")
                 .accessibilityLabel("Chat options")
             }
         }
-        .padding(.horizontal, 10)
+        .padding(.horizontal, 16)
         .padding(.vertical, 4)
     }
 
@@ -408,11 +434,17 @@ struct RelayChatView: View {
     }
 
     private func startNewConversation() {
-        viewModel.startNewConversation()
-        modelPickerRequest += 1
+        dismissKeyboard()
+        if let onNewChat { onNewChat() }
+        else { viewModel.startNewConversation() }
     }
 
     private func requestPromptSend() {
+        if viewModel.needsProjectForTask, let onChooseProject {
+            dismissKeyboard()
+            onChooseProject()
+            return
+        }
         guard let provider = viewModel.selectedChoice?.model.provider else {
             sendPrompt()
             return
@@ -429,15 +461,6 @@ struct RelayChatView: View {
     private func sendPrompt() {
         scroller.jumpToLatest()
         Task { await viewModel.sendCurrentPrompt() }
-    }
-
-    private func presentAIDataConsentIfNeeded() {
-        guard let provider = viewModel.selectedChoice?.model.provider,
-              !RelayAIDataConsentStore.hasConsent(for: provider),
-              !automaticallyPresentedConsentProviders.contains(provider),
-              aiDataConsentRequest == nil else { return }
-        automaticallyPresentedConsentProviders.insert(provider)
-        presentAIDataConsent(for: provider, purpose: .review)
     }
 
     private func presentAIDataConsent(
@@ -488,6 +511,19 @@ struct RelayChatView: View {
         return ScrollViewReader { proxy in
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
+                if let control = viewModel.sessionControl {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Open in \(control.owner). Close it there to continue here.")
+                            .font(.subheadline)
+                            .foregroundStyle(AppTheme.textSecondary)
+                        if let url = control.claudeURL {
+                            Link("Continue in Claude", destination: url)
+                                .font(.subheadline.weight(.medium))
+                                .tint(AppTheme.accent)
+                        }
+                    }
+                    .padding(.top, Self.turnSpacing)
+                }
                 if let error = viewModel.errorMessage {
                     RelayStatusBanner(text: error)
                         .padding(.top, Self.turnSpacing)
@@ -513,13 +549,24 @@ struct RelayChatView: View {
                     }
                 }
 
-                // An empty conversation shows nothing: the composer's own pill
-                // already names the model, so the canvas stays clean.
+                if viewModel.messages.isEmpty, !viewModel.isLoadingThreadDetail, viewModel.errorMessage == nil {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Start a conversation")
+                            .font(.title2.weight(.semibold))
+                            .foregroundStyle(AppTheme.textPrimary)
+                        Text("Ask a question, share a file, or pick up a thread.")
+                            .font(.body)
+                            .foregroundStyle(RelayChatStyle.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.top, 48)
+                    .padding(.bottom, 24)
+                }
                 ForEach(viewModel.messages) { item in
                     let continues = continuing.contains(item.id)
                     transcriptRow(
                         item,
-                        showsByline: !continues,
+                        showsByline: false,
                         approvals: item.job.map { job in
                             inlineApprovalJobs.contains(job.id)
                                 ? viewModel.pendingApprovals.filter { $0.jobId == job.id }
@@ -564,6 +611,7 @@ struct RelayChatView: View {
         .coordinateSpace(name: Self.scrollSpace)
         .refreshable {
             await viewModel.refreshThreads()
+            await viewModel.refreshWatchedThreadIfNeeded()
         }
         .scrollDismissesKeyboard(.interactively)
         .scrollBounceBehavior(.basedOnSize)
@@ -590,6 +638,7 @@ struct RelayChatView: View {
                     proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
                 }
             }
+            scroller.land()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidChangeFrameNotification)) { _ in
             scroller.viewportChanged()
@@ -666,6 +715,7 @@ struct RelayChatView: View {
                     client: client,
                     liveTail: viewModel.liveJobTails[job.id],
                     hidesAnswer: item.hidesJobAnswer,
+                    showsByline: showsByline,
                     isCancelling: viewModel.cancellingJobIDs.contains(job.id),
                     onCancel: {
                         Task { await viewModel.cancel(job: job) }
@@ -690,15 +740,28 @@ struct RelayChatView: View {
                 item: item,
                 client: client,
                 showsByline: showsByline,
+                showsActions: isLastProseInTurn(item),
                 onOpenAttachment: { attachment in
                     attachmentRequest = attachment
                 },
                 onOpenActivity: { blockID in
                     activityRequest = RelayActivityRequest(source: .message(item.id), root: .block(blockID))
+                },
+                onOpenStep: { stepID in
+                    activityRequest = RelayActivityRequest(source: .message(item.id), root: .step(stepID))
                 }
             )
             .equatable()
         }
+    }
+
+    private func isLastProseInTurn(_ item: RelayConversationItem) -> Bool {
+        guard !item.isStreaming, let index = viewModel.messages.firstIndex(where: { $0.id == item.id }) else { return false }
+        for later in viewModel.messages.dropFirst(index + 1) {
+            if later.role == .user { break }
+            if !later.text.isEmpty || later.job?.status.isActive == true { return false }
+        }
+        return !viewModel.isSending && !viewModel.hasActiveConversationJob
     }
 
     private static let turnSpacing: CGFloat = 16
@@ -1001,7 +1064,7 @@ private struct RelayComposer: View {
 
             ZStack(alignment: .leading) {
                 if text.isEmpty {
-                    Text("Message, or / for commands")
+                    Text("Message Relay…")
                         .font(RelayChatStyle.bodyFont)
                         .foregroundStyle(AppTheme.textSecondary)
                         .lineLimit(1)
@@ -1031,7 +1094,7 @@ private struct RelayComposer: View {
         .background {
             RoundedRectangle(cornerRadius: Layout.cardRadius, style: .continuous)
                 .fill(RelayComposerPalette.raisedCard)
-                .shadow(color: Color.black.opacity(0.35), radius: 15, x: 0, y: 10)
+                .shadow(color: Color.black.opacity(0.16), radius: 8, x: 0, y: 4)
                 .overlay {
                     RoundedRectangle(cornerRadius: Layout.cardRadius, style: .continuous)
                         .stroke(AppTheme.hairlineStrong, lineWidth: 1)
@@ -1093,18 +1156,13 @@ private struct RelayComposer: View {
                     .foregroundStyle(AppTheme.textPrimary)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                if let effortLabel {
-                    Text(effortLabel)
-                        .font(AppTheme.uiFont(size: 14))
-                        .foregroundStyle(RelayComposerPalette.value)
-                        .lineLimit(1)
-                        .fixedSize()
-                }
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(RelayComposerPalette.value)
             }
             .padding(.leading, 11)
             .padding(.trailing, 13)
             .frame(height: Layout.discSize)
-            .background(RelayComposerPalette.quietFill, in: Capsule())
             .padding(.horizontal, 4)
             .frame(height: Layout.controlHeight)
             .contentShape(Rectangle())
@@ -1597,7 +1655,7 @@ struct RelayComposerPreviewHost: View {
 /// UITextView bridge used only for caret reporting. SwiftUI's iOS 17 text field does not
 /// expose the insertion point, but slash discovery must follow the caret when the user
 /// types `/` in the middle of an existing draft.
-private struct RelayCommandTextEditor: UIViewRepresentable {
+struct RelayCommandTextEditor: UIViewRepresentable {
     @Binding var text: String
     @Binding var selection: NSRange
     @Binding var isFocused: Bool
@@ -1619,10 +1677,11 @@ private struct RelayCommandTextEditor: UIViewRepresentable {
         view.backgroundColor = .clear
         view.textColor = UIColor(AppTheme.textPrimary)
         view.tintColor = UIColor(AppTheme.accent)
-        view.font = UIFontMetrics(forTextStyle: .body).scaledFont(for: UIFont(name: "DMSans-9ptRegular", size: 16) ?? .systemFont(ofSize: 16))
+        view.font = UIFont.preferredFont(forTextStyle: .body)
         view.textContainerInset = UIEdgeInsets(top: 3, left: 0, bottom: 3, right: 0)
         view.textContainer.lineFragmentPadding = 0
         view.accessibilityLabel = "Message"
+        view.accessibilityHint = "Type a message, paste text or an image, or type slash for commands."
         view.accessibilityIdentifier = "relay-message-editor"
         view.keyboardDismissMode = .interactive
         view.adjustsFontForContentSizeCategory = true
@@ -1632,6 +1691,8 @@ private struct RelayCommandTextEditor: UIViewRepresentable {
 
     func updateUIView(_ view: RelayComposerTextView, context: Context) {
         context.coordinator.parent = self
+        context.coordinator.isApplyingUpdate = true
+        defer { context.coordinator.isApplyingUpdate = false }
         view.onPasteImages = onPasteImages
         if view.text != text {
             view.text = text
@@ -1640,9 +1701,12 @@ private struct RelayCommandTextEditor: UIViewRepresentable {
         if view.textColor != resolved {
             view.textColor = resolved
         }
-        let safeLocation = min(selection.location, (view.text as NSString).length)
-        let safeSelection = NSRange(location: safeLocation, length: 0)
-        if view.selectedRange != safeSelection {
+        let textLength = (view.text as NSString).length
+        let safeLocation = max(0, min(selection.location, textLength))
+        let safeSelection = NSRange(location: safeLocation, length: max(0, min(selection.length, textLength - safeLocation)))
+        // Keep the user's selected words through streaming/layout updates, and
+        // let the keyboard own its marked range while composing a character.
+        if view.markedTextRange == nil, view.selectedRange != safeSelection {
             view.selectedRange = safeSelection
         }
         if isFocused, !view.isFirstResponder {
@@ -1655,28 +1719,35 @@ private struct RelayCommandTextEditor: UIViewRepresentable {
 
     final class Coordinator: NSObject, UITextViewDelegate {
         var parent: RelayCommandTextEditor
+        // UIKit can call its delegate synchronously when SwiftUI sets selection
+        // or focus. Do not publish back into SwiftUI during that render pass.
+        var isApplyingUpdate = false
 
         init(parent: RelayCommandTextEditor) {
             self.parent = parent
         }
 
         func textViewDidBeginEditing(_ textView: UITextView) {
+            guard !isApplyingUpdate else { return }
             parent.isFocused = true
             parent.selection = textView.selectedRange
         }
 
         func textViewDidEndEditing(_ textView: UITextView) {
+            guard !isApplyingUpdate else { return }
             parent.isFocused = false
             parent.selection = textView.selectedRange
         }
 
         func textViewDidChange(_ textView: UITextView) {
+            guard !isApplyingUpdate else { return }
             parent.text = textView.text
             parent.selection = textView.selectedRange
             updateHeight(for: textView)
         }
 
         func textViewDidChangeSelection(_ textView: UITextView) {
+            guard !isApplyingUpdate else { return }
             parent.selection = textView.selectedRange
         }
 
@@ -1751,14 +1822,17 @@ private struct RelayChatBubble: View, Equatable {
     let client: CodexClient
     /// False when this message continues the agent's turn above it.
     var showsByline = true
+    var showsActions = true
     var onOpenAttachment: (RelayDisplayedAttachment) -> Void
     /// Thread history: opens the steps the agent took before this message.
     var onOpenActivity: (String) -> Void = { _ in }
+    var onOpenStep: (String) -> Void = { _ in }
     @State private var showCopied = false
+    @State private var selectingText = false
 
     /// A message that did not change is skipped while another one streams.
     static func == (lhs: RelayChatBubble, rhs: RelayChatBubble) -> Bool {
-        lhs.item == rhs.item && lhs.showsByline == rhs.showsByline
+        lhs.item == rhs.item && lhs.showsByline == rhs.showsByline && lhs.showsActions == rhs.showsActions
     }
 
     private var isWaitingForFirstToken: Bool { item.isStreaming && item.text.isEmpty && item.attachments.isEmpty }
@@ -1784,10 +1858,14 @@ private struct RelayChatBubble: View, Equatable {
                     UIPasteboard.general.string = item.text
                     flashCopied()
                 } label: { Label("Copy", systemImage: "doc.on.doc") }
+                if !item.text.isEmpty {
+                    Button("Select text", systemImage: "text.cursor") { selectingText = true }
+                }
             }
 
             if !isUser { Spacer(minLength: 0) }
         }
+        .sheet(isPresented: $selectingText) { RelayTextSelectionSheet(text: item.text) }
     }
 
     private var messageColumn: some View {
@@ -1804,21 +1882,11 @@ private struct RelayChatBubble: View, Equatable {
                 }
             }
 
-            // The steps the agent took before it wrote this message.
             if let timeline = item.historyTimeline {
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(timeline.transcriptRows(isActive: false)) { row in
-                        if case .activity(let summary, let failedCount, let opens) = row.content {
-                            RelayActivityRow(
-                                summary: summary,
-                                failedCount: failedCount,
-                                action: opens ? { onOpenActivity(row.id) } : nil
-                            )
-                            .padding(.top, row.followsActivity ? -RelayTranscriptStyle.activityPairOverlap : 0)
-                        }
-                    }
-                }
-                .padding(.vertical, -7)
+                RelayTimelineBlocks(
+                    timeline: timeline, isActive: !timeline.runningSteps.isEmpty,
+                    onOpenBlock: onOpenActivity, onOpenStep: onOpenStep
+                )
             }
 
             if !item.attachments.isEmpty {
@@ -1832,12 +1900,24 @@ private struct RelayChatBubble: View, Equatable {
 
             if isWaitingForFirstToken {
                 RelayLiveRowLabel(word: "Thinking", since: item.timestamp)
+            } else if isUser, !item.text.isEmpty {
+                Text(verbatim: item.text)
+                    .font(RelayChatStyle.bodyFont)
+                    .foregroundStyle(AppTheme.textPrimary)
+                    .lineSpacing(4)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             } else if !item.text.isEmpty {
                 RelayStreamingContent(
                     text: item.text,
                     isStreaming: item.isStreaming,
                     tint: item.provider?.relayPresentation.accent ?? AppTheme.accent
                 )
+            }
+
+            if !isUser, showsActions, !item.isStreaming, !item.text.isEmpty {
+                RelayMessageActions(text: item.text)
             }
 
             if let footer = footerText {
@@ -1923,7 +2003,7 @@ private struct RelayDraftAttachmentChip: View {
 
             Button(action: onRemove) {
                 Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 16))
+                    .font(AppTheme.uiFont(size: 16))
                     .foregroundStyle(AppTheme.textPrimary, AppTheme.bgCanvas)
             }
             .buttonStyle(.plain)
@@ -2287,6 +2367,10 @@ private struct RelayJobTurn: View, Equatable {
             }
 
             RelayTurnFooter(job: job, isCancelling: isCancelling, onFullLog: onFullLog, onCancel: onCancel)
+            if !hidesAnswer, !job.status.isActive,
+               let answer = (fallbackAnswer ?? timeline.proseText).trimmedNonEmpty {
+                RelayMessageActions(text: answer)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .contain)
@@ -2306,6 +2390,7 @@ private struct RelayJobCard: View {
     let liveTail: String?
     /// The transcript already shows this job's answer as its own turn.
     var hidesAnswer = false
+    var showsByline = false
     let isCancelling: Bool
     let onCancel: () -> Void
     let onFullLog: () -> Void
@@ -2343,7 +2428,7 @@ private struct RelayJobCard: View {
         case .queued: return "Waiting to start"
         case .waitingForApproval: return "Waiting for your approval"
         case .canceling: return "Stopping run"
-        case .succeeded: return "Run complete"
+        case .succeeded: return "Activity"
         case .failed: return "Run failed"
         case .timeout: return "Run timed out"
         case .canceled: return "Run stopped"
@@ -2356,12 +2441,7 @@ private struct RelayJobCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 7) {
-                RelayProviderMark(provider: job.provider, size: 14)
-                Text(job.provider.relayPresentation.title)
-                    .font(RelayChatStyle.labelFont.weight(.medium))
-                    .foregroundStyle(RelayChatStyle.secondary)
-            }
+            if showsByline { RelayTurnByline(provider: job.provider) }
 
             if job.status.isActive, let prose = leadingProse {
                 Text(CodexInlineMarkdown.attributed(prose))
@@ -2381,6 +2461,7 @@ private struct RelayJobCard: View {
                         onOpenLoopbackURL: onLoopbackURL,
                         bodyFont: RelayChatStyle.bodyFont
                     )
+                    RelayMessageActions(text: text)
                 }
                 if let sourceURL = RelayOutputURLPolicy.loopbackURLs(in: text).first {
                     RelayAppPreviewNotice { onLoopbackURL(sourceURL) }
@@ -2462,7 +2543,7 @@ private struct RelayJobCard: View {
 
                 Rectangle().fill(AppTheme.hairline).frame(height: 1)
                 HStack {
-                    Button("View full log", action: onFullLog)
+                    Button("View activity", action: onFullLog)
                         .frame(minHeight: 44)
                     Spacer()
                     if job.status.isActive {
@@ -2476,8 +2557,8 @@ private struct RelayJobCard: View {
                 .foregroundStyle(RelayChatStyle.secondary)
                 .buttonStyle(.plain)
             }
-            .padding(.horizontal, 14)
-            .background(RelayChatStyle.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .padding(.horizontal, job.status.isActive ? 14 : 0)
+            .background(job.status.isActive ? RelayChatStyle.surface : Color.clear, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
         .accessibilityElement(children: .contain)
         .onChange(of: job.status.isActive) { _, isActive in
@@ -2546,7 +2627,7 @@ private struct RelayChatRunStatus: View {
                     .foregroundStyle(RelayChatStyle.secondary)
             }
         }
-        .font(.custom("DMSans-9ptRegular", size: 12, relativeTo: .caption))
+        .font(AppTheme.uiFont(size: 12))
     }
 
     private var statusColor: Color {
@@ -3309,15 +3390,7 @@ private struct RelayStatusBanner: View {
     let text: String
 
     var body: some View {
-        Text(text)
-            .font(AppTheme.uiFont(size: 13))
-            .foregroundStyle(AppTheme.statusError)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(12)
-            .overlay {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(AppTheme.statusError.opacity(0.3), lineWidth: 1)
-            }
+        RelayInlineNotice(text: text)
     }
 }
 

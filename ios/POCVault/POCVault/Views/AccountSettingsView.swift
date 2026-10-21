@@ -35,155 +35,38 @@ struct AccountSettingsView: View {
 
     var body: some View {
         NavigationStack {
-            Form {
-                machineSection
-
-                if accountStore.user == nil {
-                    Section {
-                        Button("Sign in to Relay") { showingSignIn = true }
-                            .accessibilityIdentifier("relay-settings-sign-in")
-                    } header: {
-                        RelayFormHeader("Account", info: accountFooter)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 32) {
+                    accountSection
+                    if accountStore.user != nil { signedInSection }
+                    machineSection
+                    if nodeStore.hasMachine { codingAgentsSection }
+                    if accountStore.user != nil {
+                        securitySection
                     }
+                    aboutSection
                 }
-
-                if let user = accountStore.user {
-                    Section("Account") {
-                        LabeledContent("Name", value: user.preferredName)
-                        LabeledContent("Email", value: user.email)
-                        if let username = user.username, !username.isEmpty {
-                            LabeledContent("Username", value: username)
-                        }
-                        LabeledContent(
-                            "Sign-in method",
-                            value: user.usesPassword ? "Username and password" : "Apple"
-                        )
-                    }
-
-                    Section {
-                        if !computerLinkStore.hasLoaded && computerLinkStore.isLoading {
-                            HStack(spacing: 10) {
-                                ProgressView()
-                                Text("Checking signed-in places…")
-                                    .foregroundStyle(AppTheme.textSecondary)
-                            }
-                        } else {
-                            if let linkedComputer = computerLinkStore.computer {
-                                LabeledContent("Computer", value: computerName(linkedComputer))
-                                LabeledContent("Status", value: computerStatus(linkedComputer))
-                                if let platform = linkedComputer.platform {
-                                    LabeledContent("Platform", value: platformLabel(platform))
-                                }
-                                if let connectedAt = linkedComputer.connectedAt {
-                                    LabeledContent(
-                                        "Connected",
-                                        value: Self.computerDateFormatter.string(
-                                            from: Date(timeIntervalSince1970: Double(connectedAt) / 1_000)
-                                        )
-                                    )
-                                }
-
-                                Button("Disconnect computer", role: .destructive) {
-                                    showingDisconnectConfirmation = true
-                                }
-                                .disabled(computerLinkStore.isDisconnecting || isRemovingBrowser)
-                                .accessibilityIdentifier("relay-disconnect-computer")
-                            }
-
-                            ForEach(browsers) { browser in
-                                LabeledContent("Browser", value: browserName(browser))
-                                if let platform = browser.platform {
-                                    LabeledContent("Platform", value: platformLabel(platform))
-                                }
-                                LabeledContent(
-                                    "Signed in",
-                                    value: Self.computerDateFormatter.string(
-                                        from: Date(timeIntervalSince1970: Double(browser.createdAt) / 1_000)
-                                    )
-                                )
-                                Button("Remove", role: .destructive) {
-                                    browserToRemove = browser
-                                }
-                                .disabled(computerLinkStore.isDisconnecting || isRemovingBrowser)
-                                .accessibilityIdentifier("relay-remove-browser")
-                            }
-
-                            Button("Approve a sign-in") {
-                                showingCLILink = true
-                            }
-                            .disabled(
-                                computerLinkStore.isLoading
-                                    || computerLinkStore.isDisconnecting
-                                    || isRemovingBrowser
-                            )
-                            .accessibilityIdentifier("relay-approve-sign-in")
-                        }
-
-                        if let signedInError = signedInPlacesError ?? computerLinkStore.errorMessage {
-                            Label(signedInError, systemImage: "exclamationmark.triangle.fill")
-                                .foregroundStyle(AppTheme.statusError)
-
-                            Button("Try again") {
-                                Task { await loadLinkedComputer() }
-                            }
-                        }
-                    } header: {
-                        RelayFormHeader("Signed in", info: computerFooter)
-                    }
-
-                    Section {
-                        Button("Sign out", role: .destructive) {
-                            Task {
-                                await accountStore.signOut()
-                                dismiss()
-                            }
-                        }
-                        .disabled(accountStore.isWorking)
-
-                        Button("Delete account", role: .destructive) {
-                            deletionPassword = ""
-                            showingDeleteConfirmation = true
-                        }
-                        .disabled(accountStore.isWorking)
-                        .accessibilityIdentifier("relay-delete-account")
-                    } header: {
-                        RelayFormHeader("Security", info: securityFooter)
-                    }
-
-                    if let error = accountStore.errorMessage {
-                        Section {
-                            Label(error, systemImage: "exclamationmark.triangle.fill")
-                                .foregroundStyle(AppTheme.statusError)
-                        }
-                    }
-                }
-
-                if nodeStore.hasMachine {
-                    codingAgentsSection
-                }
-
-                Section("About") {
-                    LabeledContent("App", value: "Relay")
-                    LabeledContent("Version", value: versionText)
-                    Link("Privacy Policy", destination: URL(string: "https://app.openrelay.sh/privacy")!)
-                    Link("Terms of Use", destination: URL(string: "https://app.openrelay.sh/terms")!)
-                    Link("Support", destination: URL(string: "https://app.openrelay.sh/support")!)
-                }
+                .font(AppTheme.uiFont(size: 16))
+                .foregroundStyle(AppTheme.textPrimary)
+                .labeledContentStyle(RelaySettingsValueStyle())
+                .buttonStyle(RelaySettingsButtonStyle())
+                .padding(.horizontal, 24)
+                .padding(.top, 20)
+                .padding(.bottom, 32)
             }
-            .scrollContentBackground(.hidden)
             .scrollBounceBehavior(.basedOnSize)
-            .contentMargins(.bottom, showsDismissButton ? 0 : 56, for: .scrollContent)
-            .refreshable {
-                await loadLinkedComputer()
-            }
+            .refreshable { await loadLinkedComputer() }
             .background(AppTheme.bgCanvas)
-            .tint(AppTheme.accent)
-            .navigationTitle("Account & Settings")
+            .tint(AppTheme.textPrimary)
+            .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 if showsDismissButton {
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button("Done") { dismiss() }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("Back to chat", systemImage: "xmark") { dismiss() }
+                            .labelStyle(.iconOnly)
+                            .buttonStyle(.plain)
+                            .tint(AppTheme.textSecondary)
                     }
                 }
             }
@@ -339,8 +222,172 @@ struct AccountSettingsView: View {
         .preferredColorScheme(.dark)
     }
 
+    private var accountSection: some View {
+        RelaySettingsSection("Account", info: accountFooter) {
+            if let user = accountStore.user {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(user.preferredName)
+                        .font(AppTheme.uiFont(size: 22, weight: .semibold))
+                    Text(user.email)
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .textSelection(.enabled)
+                }
+                .padding(.vertical, 4)
+
+                DisclosureGroup("Account details") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        if let username = user.username, !username.isEmpty {
+                            LabeledContent("Username", value: username)
+                        }
+                        LabeledContent("Sign-in method", value: user.usesPassword ? "Username and password" : "Apple")
+                    }
+                    .padding(.top, 12)
+                }
+                .padding(.vertical, 8)
+            } else {
+                Button("Sign in to Relay") { showingSignIn = true }
+                    .accessibilityIdentifier("relay-settings-sign-in")
+            }
+        }
+    }
+
+    private var signedInSection: some View {
+        RelaySettingsSection("Signed-in devices", info: computerFooter) {
+            if !computerLinkStore.hasLoaded && computerLinkStore.isLoading {
+                HStack(spacing: 10) {
+                    ProgressView()
+                    Text("Checking devices…").foregroundStyle(AppTheme.textSecondary)
+                }
+            } else {
+                if let computer = computerLinkStore.computer {
+                    linkedComputerRow(computer)
+                }
+                ForEach(browsers) { browser in
+                    browserRow(browser)
+                }
+                Button("Approve a sign-in", systemImage: "qrcode.viewfinder") {
+                    showingCLILink = true
+                }
+                .disabled(computerLinkStore.isLoading || computerLinkStore.isDisconnecting || isRemovingBrowser)
+                .accessibilityIdentifier("relay-approve-sign-in")
+            }
+
+            if let error = signedInPlacesError ?? computerLinkStore.errorMessage {
+                RelayInlineNotice(text: error, actionTitle: "Retry", isWorking: computerLinkStore.isLoading) {
+                    Task { await loadLinkedComputer() }
+                }
+            }
+        }
+    }
+
+    private func linkedComputerRow(_ computer: CLIComputerLink) -> some View {
+        HStack(alignment: .top, spacing: 14) {
+            Image(systemName: "laptopcomputer")
+                .foregroundStyle(AppTheme.textSecondary)
+                .frame(width: 24, height: 24)
+                .padding(.top, 3)
+            VStack(alignment: .leading, spacing: 5) {
+                Text(computerName(computer))
+                Text([computer.platform.map(platformLabel), computerStatus(computer)].compactMap { $0 }.joined(separator: " · "))
+                    .font(AppTheme.uiFont(size: 14))
+                    .foregroundStyle(AppTheme.textSecondary)
+                if let connectedAt = computer.connectedAt {
+                    Text("Connected " + Self.computerDateFormatter.string(from: Date(timeIntervalSince1970: Double(connectedAt) / 1_000)))
+                        .font(AppTheme.uiFont(size: 13))
+                        .foregroundStyle(AppTheme.textTertiary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Menu {
+                Button("Disconnect computer", role: .destructive) { showingDisconnectConfirmation = true }
+                    .accessibilityIdentifier("relay-disconnect-computer")
+            } label: {
+                Image(systemName: "ellipsis").frame(width: 44, height: 44)
+            }
+            .disabled(computerLinkStore.isDisconnecting || isRemovingBrowser)
+            .buttonStyle(.plain)
+            .accessibilityLabel("Manage \(computerName(computer))")
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func browserRow(_ browser: RelayBrowserSession) -> some View {
+        HStack(alignment: .top, spacing: 14) {
+            Image(systemName: "globe")
+                .foregroundStyle(AppTheme.textSecondary)
+                .frame(width: 24, height: 24)
+                .padding(.top, 3)
+            VStack(alignment: .leading, spacing: 5) {
+                Text(browserName(browser))
+                if let platform = browser.platform {
+                    Text(platformLabel(platform))
+                        .font(AppTheme.uiFont(size: 14))
+                        .foregroundStyle(AppTheme.textSecondary)
+                }
+                Text("Signed in " + Self.computerDateFormatter.string(from: Date(timeIntervalSince1970: Double(browser.createdAt) / 1_000)))
+                    .font(AppTheme.uiFont(size: 13))
+                    .foregroundStyle(AppTheme.textTertiary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Menu {
+                Button("Remove", role: .destructive) { browserToRemove = browser }
+                    .accessibilityIdentifier("relay-remove-browser")
+            } label: {
+                Image(systemName: "ellipsis").frame(width: 44, height: 44)
+            }
+            .disabled(computerLinkStore.isDisconnecting || isRemovingBrowser)
+            .buttonStyle(.plain)
+            .accessibilityLabel("Manage \(browserName(browser))")
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var securitySection: some View {
+        RelaySettingsSection("Security", info: securityFooter) {
+            Button("Sign out") {
+                Task {
+                    await accountStore.signOut()
+                    dismiss()
+                }
+            }
+            .disabled(accountStore.isWorking)
+
+            Button("Delete account", role: .destructive) {
+                deletionPassword = ""
+                showingDeleteConfirmation = true
+            }
+            .disabled(accountStore.isWorking)
+            .accessibilityIdentifier("relay-delete-account")
+
+            if let error = accountStore.errorMessage {
+                RelayInlineNotice(text: error)
+            }
+        }
+    }
+
+    private var aboutSection: some View {
+        RelaySettingsSection("About Relay") {
+            LabeledContent("Version", value: versionText)
+            settingsLink("Privacy policy", url: "https://app.openrelay.sh/privacy")
+            settingsLink("Terms of use", url: "https://app.openrelay.sh/terms")
+            settingsLink("Support", url: "https://app.openrelay.sh/support")
+        }
+    }
+
+    private func settingsLink(_ title: String, url: String) -> some View {
+        Link(destination: URL(string: url)!) {
+            HStack {
+                Text(title)
+                Spacer()
+                Image(systemName: "arrow.up.right")
+                    .font(AppTheme.uiFont(size: 12))
+                    .foregroundStyle(AppTheme.textTertiary)
+            }
+        }
+    }
+
     private var codingAgentsSection: some View {
-        Section {
+        RelaySettingsSection("Coding agents", info: agentsFooter) {
             if isMachineKnownDown {
                 // Sign-in lives on the machine, so a machine that is off has no
                 // answer to give; an old "Connected" would be a guess.
@@ -362,15 +409,10 @@ struct AccountSettingsView: View {
             }
 
             if let harnessError, !isMachineKnownDown {
-                Label(harnessError, systemImage: "exclamationmark.triangle.fill")
-                    .foregroundStyle(AppTheme.statusError)
-
-                Button("Try again") {
+                RelayInlineNotice(text: harnessError, actionTitle: "Retry", isWorking: isLoadingHarnesses) {
                     Task { await loadHarnesses() }
                 }
             }
-        } header: {
-            RelayFormHeader("Coding agents", info: agentsFooter)
         }
     }
 
@@ -411,6 +453,8 @@ struct AccountSettingsView: View {
                 .accessibilityIdentifier("relay-agent-sign-in-\(harness.provider.rawValue)")
             }
         }
+        .frame(minHeight: 44)
+        .buttonStyle(.plain)
     }
 
     private var machineName: String {
@@ -440,21 +484,19 @@ struct AccountSettingsView: View {
     /// plainly and costs nothing else in the app.
     @ViewBuilder
     private var machineSection: some View {
-        Section {
+        RelaySettingsSection("Machine", info: machineFooter) {
             if let node = nodeStore.pairedNode {
                 VStack(alignment: .leading, spacing: 16) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(node.nodeName)
-                            .font(AppTheme.serifFont(size: 22))
+                            .font(AppTheme.uiFont(size: 18, weight: .medium))
                             .foregroundStyle(AppTheme.textPrimary)
-                        Text(node.apiBaseURL.absoluteString)
-                            .font(AppTheme.monoFont(size: 13))
-                            .foregroundStyle(AppTheme.textSecondary)
-                            .textSelection(.enabled)
                         Text(node.registeredAccountID == nil ? "Paired to this phone" : "Connected to your account")
                             .font(AppTheme.uiFont(size: 13))
                             .foregroundStyle(AppTheme.textTertiary)
                     }
+
+                    connectionDetails(node.apiBaseURL)
 
                     if identityStore.wakeCredential() != nil {
                         RelayMachinePowerSwitch(
@@ -465,9 +507,7 @@ struct AccountSettingsView: View {
                         RelayMachineSizeControl(model: powerModel)
                         RelayMachineAutoStopToggle(model: powerModel)
                         if let notice = powerModel.notice {
-                            Text(notice)
-                                .font(AppTheme.uiFont(size: 13))
-                                .foregroundStyle(AppTheme.statusError)
+                            RelayInlineNotice(text: notice)
                         }
                     }
                 }
@@ -481,7 +521,7 @@ struct AccountSettingsView: View {
                         machineName: node.nodeName
                     )
                 } label: {
-                    Text("Usage")
+                    usageLabel
                 }
                 .accessibilityIdentifier("relay-settings-machine-usage")
 
@@ -500,8 +540,7 @@ struct AccountSettingsView: View {
                 }
 
                 if let machineNotice {
-                    Label(machineNotice, systemImage: "exclamationmark.triangle.fill")
-                        .foregroundStyle(AppTheme.statusError)
+                    RelayInlineNotice(text: machineNotice)
                 }
 
                 Button("Unpair machine", role: .destructive) {
@@ -511,16 +550,11 @@ struct AccountSettingsView: View {
             } else if AppConfiguration.hasConfiguredPersonalInstall {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Linked computer")
-                        .font(AppTheme.serifFont(size: 22))
+                        .font(AppTheme.uiFont(size: 18, weight: .medium))
                         .foregroundStyle(AppTheme.textPrimary)
-                    Text(AppConfiguration.codexBaseURL.absoluteString)
-                        .font(AppTheme.monoFont(size: 13))
-                        .foregroundStyle(AppTheme.textSecondary)
-                    Text("support/vault-config.json")
-                        .font(AppTheme.uiFont(size: 13))
-                        .foregroundStyle(AppTheme.textTertiary)
                 }
                 .padding(.vertical, 4)
+                connectionDetails(AppConfiguration.codexBaseURL)
                 NavigationLink {
                     RelayMachineMonitorView(
                         client: codexClient,
@@ -529,7 +563,7 @@ struct AccountSettingsView: View {
                         machineName: "Linked computer"
                     )
                 } label: {
-                    Text("Usage")
+                    usageLabel
                 }
                 Button("Pair a machine") { showingPairing = true }
                     .accessibilityIdentifier("relay-settings-pair")
@@ -537,8 +571,30 @@ struct AccountSettingsView: View {
                 Button("Pair a machine") { showingPairing = true }
                     .accessibilityIdentifier("relay-settings-pair")
             }
-        } header: {
-            RelayFormHeader("Machine", info: machineFooter)
+        }
+    }
+
+    private func connectionDetails(_ url: URL) -> some View {
+        DisclosureGroup("Connection details") {
+            Text(url.absoluteString)
+                .font(AppTheme.monoFont(size: 13))
+                .foregroundStyle(AppTheme.textSecondary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 12)
+        }
+        .font(AppTheme.uiFont(size: 14))
+        .foregroundStyle(AppTheme.textSecondary)
+        .padding(.vertical, 8)
+    }
+
+    private var usageLabel: some View {
+        HStack {
+            Text("Usage")
+            Spacer()
+            Image(systemName: "chevron.right")
+                .font(AppTheme.uiFont(size: 12))
+                .foregroundStyle(AppTheme.textTertiary)
         }
     }
 
@@ -652,7 +708,7 @@ struct AccountSettingsView: View {
             browsers = places.browsers
             computerLinkStore.adoptPlaces(places, accountID: accountID)
         } catch {
-            signedInPlacesError = "Relay couldn't refresh signed-in places."
+            signedInPlacesError = "Couldn’t refresh your signed-in devices."
         }
     }
 
@@ -906,7 +962,7 @@ struct RelayMachineSizeControl: View {
             if let currentHourly, let currentMonthly {
                 HStack(alignment: .firstTextBaseline, spacing: 7) {
                     Text(monthlyPrice(currentMonthly))
-                        .font(AppTheme.serifFont(size: 22))
+                        .font(AppTheme.uiFont(size: 18, weight: .medium))
                         .foregroundStyle(AppTheme.textPrimary)
                     Text("/ month")
                         .font(AppTheme.uiFont(size: 13))
@@ -1128,7 +1184,7 @@ private struct RelayMachineResizeProgressView: View {
                 .accessibilityHidden(true)
 
                 Text(stageTitle)
-                    .font(AppTheme.serifFont(size: 32))
+                    .font(AppTheme.uiFont(size: 32, weight: .semibold))
                     .foregroundStyle(AppTheme.textPrimary)
                     .padding(.top, 30)
                 Text(isRecovering
@@ -1197,5 +1253,62 @@ private struct RelayMachineResizeProgressView: View {
         case "recovering", "recovery_wait": return "Restoring machine power"
         default: return "Changing machine size"
         }
+    }
+}
+
+/// Open sections use spacing and type to group settings, without form chrome.
+private struct RelaySettingsSection<Content: View>: View {
+    let title: String
+    var info: String?
+    let content: Content
+
+    init(_ title: String, info: String? = nil, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.info = info
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            RelayFormHeader(title, info: info)
+                .font(AppTheme.uiFont(size: 14, weight: .medium))
+                .foregroundStyle(AppTheme.textSecondary)
+                .accessibilityAddTraits(.isHeader)
+            VStack(alignment: .leading, spacing: 8) { content }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct RelaySettingsButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(AppTheme.uiFont(size: 16))
+            .foregroundStyle(configuration.role == .destructive ? AppTheme.statusError : AppTheme.textPrimary)
+            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+            .contentShape(Rectangle())
+            .opacity(!isEnabled ? 0.4 : configuration.isPressed ? 0.6 : 1)
+    }
+}
+
+private struct RelaySettingsValueStyle: LabeledContentStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .firstTextBaseline, spacing: 24) {
+                configuration.label.fixedSize(horizontal: true, vertical: false)
+                Spacer(minLength: 0)
+                configuration.content
+                    .foregroundStyle(AppTheme.textSecondary)
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                configuration.label
+                configuration.content.foregroundStyle(AppTheme.textSecondary)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+        .textSelection(.enabled)
     }
 }

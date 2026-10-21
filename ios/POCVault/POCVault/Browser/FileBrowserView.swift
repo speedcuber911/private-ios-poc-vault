@@ -77,7 +77,7 @@ struct FileBrowserView: View {
         .navigationTitle(isRoot ? "Explorer" : viewModel.folderName)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { toolbarContent }
-        .toolbarBackground(AppTheme.canvasBottom, for: .navigationBar)
+        .toolbarBackground(AppTheme.bgCanvas, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
         .refreshable {
             await viewModel.refresh(includingConversations: activeSection == .chats)
@@ -131,10 +131,8 @@ struct FileBrowserView: View {
             if !isRoot { sectionSwitcher }
             filterField
         }
-        .background(AppTheme.canvasBottom)
-        .overlay(alignment: .bottom) {
-            Rectangle().fill(AppTheme.hairline).frame(height: 0.5)
-        }
+        .background(AppTheme.bgCanvas)
+
     }
 
     private var pathBar: some View {
@@ -174,7 +172,7 @@ struct FileBrowserView: View {
     }
 
     private var sectionSwitcher: some View {
-        HStack(spacing: 24) {
+        HStack(spacing: 8) {
             ForEach(FileBrowserSection.allCases, id: \.self) { section in
                 Button {
                     withAnimation(.easeOut(duration: 0.18)) { selectedSection = section }
@@ -192,11 +190,8 @@ struct FileBrowserView: View {
                     }
                     .foregroundStyle(selectedSection == section ? AppTheme.textPrimary : AppTheme.textSecondary)
                     .frame(minHeight: 40)
-                    .overlay(alignment: .bottom) {
-                        Rectangle()
-                            .fill(selectedSection == section ? AppTheme.accent : Color.clear)
-                            .frame(height: 2)
-                    }
+                    .padding(.horizontal, 12)
+                    .background(selectedSection == section ? AppTheme.textPrimary.opacity(0.07) : Color.clear, in: Capsule())
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier(section == .files ? "relay-folder-files" : "relay-folder-chats")
@@ -204,9 +199,7 @@ struct FileBrowserView: View {
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 16)
-        .overlay(alignment: .bottom) {
-            Rectangle().fill(AppTheme.hairline).frame(height: 0.5)
-        }
+
     }
 
     private var filterField: some View {
@@ -226,7 +219,7 @@ struct FileBrowserView: View {
                 if !viewModel.searchText.isEmpty {
                     Button { viewModel.searchText = "" } label: {
                         Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 15))
+                            .font(AppTheme.uiFont(size: 15))
                             .foregroundStyle(AppTheme.textTertiary)
                             .frame(width: 32, height: 32)
                     }
@@ -238,10 +231,7 @@ struct FileBrowserView: View {
             .padding(.trailing, viewModel.searchText.isEmpty ? 12 : 4)
             .frame(height: 40)
             .background(AppTheme.textPrimary.opacity(0.045), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(filterIsFocused ? AppTheme.hairlineStrong : AppTheme.hairline, lineWidth: 1)
-            }
+
 
             if activeSection == .files {
                 hiddenFoldersToggle
@@ -269,10 +259,7 @@ struct FileBrowserView: View {
                 AppTheme.textPrimary.opacity(showsHiddenFolders ? 0.10 : 0.045),
                 in: RoundedRectangle(cornerRadius: 10, style: .continuous)
             )
-            .overlay {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(showsHiddenFolders ? AppTheme.hairlineStrong : AppTheme.hairline, lineWidth: 1)
-            }
+
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -553,12 +540,12 @@ struct FileBrowserView: View {
         ToolbarItem(placement: .principal) {
             VStack(spacing: 1) {
                 Text(isRoot ? "Explorer" : viewModel.folderName)
-                    .font(.custom("DMSans-9ptRegular", size: 17, relativeTo: .headline).weight(.semibold))
+                    .font(AppTheme.uiFont(size: 17, weight: .semibold))
                     .foregroundStyle(AppTheme.textPrimary)
                     .lineLimit(1)
                 if isRoot, let machineLabel {
                     Text(machineLabel)
-                        .font(.custom("DMSans-9ptRegular", size: 11, relativeTo: .caption))
+                        .font(AppTheme.uiFont(size: 11))
                         .foregroundStyle(AppTheme.textPrimary.opacity(0.65))
                         .lineLimit(1)
                 }
@@ -673,24 +660,7 @@ private struct FileBrowserRow: View {
 
 private struct FileBrowserErrorBanner: View {
     let text: String
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 13, weight: .semibold))
-                .padding(.top, 1)
-            Text(text)
-                .font(AppTheme.uiFont(size: 13))
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .foregroundStyle(AppTheme.statusError)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 11)
-        .background(AppTheme.statusError.opacity(0.07))
-        .overlay(alignment: .leading) {
-            Rectangle().fill(AppTheme.statusError.opacity(0.7)).frame(width: 2)
-        }
-    }
+    var body: some View { RelayInlineNotice(text: text) }
 }
 
 extension CodexWorkspaceDirectoryEntry {

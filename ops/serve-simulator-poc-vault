@@ -1837,6 +1837,10 @@ def sim_timeline_script() -> list[tuple[float, dict]]:
 
 def sim_timeline_round() -> list[tuple[float, dict]]:
     script: list[tuple[float, dict]] = []
+    preview_time = datetime.now(timezone.utc)
+
+    def stamp(seconds: int) -> str:
+        return (preview_time + timedelta(seconds=seconds)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
     def add(pause: float, **event: object) -> None:
         script.append((pause, dict(event)))
@@ -1942,7 +1946,14 @@ def sim_timeline_round() -> list[tuple[float, dict]]:
     add(0.4, type="step", id="s12", status="done", exitCode=0)
 
     say("t3", _SIM_TIMELINE_ANSWER)
-    add(0.2, type="usage", inputTokens=4210, outputTokens=612)
+    add(0.2, type="usage", inputTokens=4210, outputTokens=612,
+        contextTokens=172000, contextWindow=200000, contextReportedAt=stamp(0),
+        limits=[
+            {"id": "five_hour", "name": "Current session", "windowMinutes": 300,
+             "usedPercent": 0, "resetsAt": stamp(5 * 3600), "reportedAt": stamp(0)},
+            {"id": "seven_day", "name": "All models", "windowMinutes": 10080,
+             "usedPercent": 12, "resetsAt": stamp(7 * 86400), "reportedAt": stamp(0)},
+        ])
     return script
 
 

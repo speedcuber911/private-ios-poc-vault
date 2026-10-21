@@ -269,7 +269,7 @@ struct RelayMachineMonitorView: View {
                     )
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text(stats.host.hostname ?? machineName)
-                            .font(AppTheme.serifFont(size: 26))
+                            .font(AppTheme.uiFont(size: 26, weight: .semibold))
                             .foregroundStyle(AppTheme.textPrimary)
                             .lineLimit(1)
                             .minimumScaleFactor(0.7)
@@ -647,7 +647,7 @@ struct RelayMachineMonitorView: View {
             }
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(name ?? machineName)
-                    .font(AppTheme.serifFont(size: 26))
+                    .font(AppTheme.uiFont(size: 26, weight: .semibold))
                     .foregroundStyle(AppTheme.textPrimary)
                 RelayInfoButton(title: "Usage", message: info)
             }
@@ -732,45 +732,23 @@ struct RelayMonitorBox<Content: View>: View {
     @ViewBuilder let content: Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: spacing) {
-            content
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(title).font(AppTheme.uiFont(size: 16, weight: .semibold))
+                Spacer(minLength: 12)
+                if let trailing {
+                    Text(trailing)
+                        .font(AppTheme.uiFont(size: 13))
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .monospacedDigit()
+                }
+            }
+            VStack(alignment: .leading, spacing: spacing) { content }
+                .font(AppTheme.uiFont(size: 14))
         }
-        .font(AppTheme.monoFont(size: 12))
-        .padding(.top, 16)
-        .padding(.bottom, 12)
+        .padding(.vertical, 16)
         .padding(.horizontal, horizontalPadding)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(AppTheme.hairlineStrong, lineWidth: 1)
-        }
-        .overlay(alignment: .topLeading) {
-            HStack(alignment: .firstTextBaseline, spacing: 1) {
-                Text("\(number)")
-                    .font(AppTheme.monoFont(size: 9))
-                    .foregroundStyle(AppTheme.accent)
-                    .baselineOffset(5)
-                Text(title)
-                    .font(AppTheme.monoFont(size: 13))
-                    .foregroundStyle(AppTheme.textPrimary)
-            }
-            .padding(.horizontal, 6)
-            .background(AppTheme.bgCanvas)
-            .offset(x: 10, y: -9)
-            .accessibilityHidden(true)
-        }
-        .overlay(alignment: .topTrailing) {
-            if let trailing {
-                Text(trailing)
-                    .font(AppTheme.monoFont(size: 12))
-                    .foregroundStyle(AppTheme.textSecondary)
-                    .monospacedDigit()
-                    .padding(.horizontal, 6)
-                    .background(AppTheme.bgCanvas)
-                    .offset(x: -10, y: -8)
-                    .accessibilityHidden(true)
-            }
-        }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(title)
     }

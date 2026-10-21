@@ -30,7 +30,7 @@ struct RelayMarkdownText: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 14) {
             // Text only ever grows at its end, so a segment's position is its
             // identity: earlier segments keep their views and, being equatable,
             // are skipped while the last one streams.
@@ -151,7 +151,7 @@ struct RelayMarkdownProse: View, Equatable {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 12) {
             let blocks = blocks
             ForEach(blocks.indices, id: \.self) { index in
                 let block = blocks[index]
@@ -167,7 +167,7 @@ struct RelayMarkdownProse: View, Equatable {
                     Text(inlineMarkdown(block.text))
                         .font(bodyFont)
                         .foregroundStyle(color)
-                        .lineSpacing(3)
+                        .lineSpacing(4)
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
                 case .bullet:
@@ -196,7 +196,7 @@ struct RelayMarkdownProse: View, Equatable {
             Text(inlineMarkdown(text))
                 .font(bodyFont)
                 .foregroundStyle(color)
-                .lineSpacing(3)
+                .lineSpacing(4)
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
         }
@@ -205,13 +205,13 @@ struct RelayMarkdownProse: View, Equatable {
     private func headingFont(for level: Int) -> Font {
         switch level {
         case 1:
-            AppTheme.uiFont(size: 19, weight: .bold)
+            .title3.weight(.semibold)
         case 2:
-            AppTheme.uiFont(size: 17, weight: .bold)
+            .headline
         case 3:
-            AppTheme.uiFont(size: 15, weight: .semibold)
+            .body.weight(.semibold)
         default:
-            AppTheme.uiFont(size: 14, weight: .semibold)
+            .subheadline.weight(.semibold)
         }
     }
 
@@ -317,36 +317,45 @@ struct RelayMarkdownTable: View {
     }
 }
 
-/// A fenced code block: DM Mono on a quiet ink-5% block, nothing else. It
-/// wraps inside the block at every type size, so nothing scrolls sideways;
-/// copying is a long press away.
+/// Code stays readable at the phone's type size, with a visible copy action.
+/// Long blocks open in a scrollable selection sheet instead of silently ending
+/// at the preview's line limit or expanding a huge view in the transcript.
 struct RelayCodeBlock: View, Equatable {
     let text: String
     let language: String?
+    @State private var showingCode = false
 
     static func == (lhs: RelayCodeBlock, rhs: RelayCodeBlock) -> Bool {
         lhs.text == rhs.text && lhs.language == rhs.language
     }
 
     var body: some View {
-        Text(text)
-            .font(.custom("DMMono-Regular", size: 13, relativeTo: .footnote))
-            .foregroundStyle(AppTheme.textPrimary)
-            .lineSpacing(4)
-            .textSelection(.enabled)
-            .lineLimit(24)
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 12)
-            .padding(.horizontal, 14)
-            .background(AppTheme.textPrimary.opacity(0.05), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .padding(.top, 2)
-            .contextMenu {
-                Button {
-                    UIPasteboard.general.string = text
-                } label: { Label("Copy code", systemImage: "doc.on.doc") }
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(language?.trimmedNonEmpty ?? "Code")
+                    .font(.caption)
+                    .foregroundStyle(RelayChatStyle.secondary)
+                Spacer()
+                RelayCopyButton(text: text, label: "Copy code")
+                    .font(.caption)
             }
-            .accessibilityLabel(language?.trimmedNonEmpty.map { "\($0) code" } ?? "Code")
-            .accessibilityValue(text)
+            Text(text)
+                .font(.footnote.monospaced())
+                .foregroundStyle(AppTheme.textPrimary)
+                .lineSpacing(4)
+                .textSelection(.enabled)
+                .lineLimit(24)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button("Open full code", systemImage: "arrow.up.left.and.arrow.down.right") { showingCode = true }
+                .font(.caption)
+                .frame(minHeight: 44)
+                .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 14)
+        .padding(.bottom, 4)
+        .background(AppTheme.textPrimary.opacity(0.05), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .padding(.top, 2)
+        .sheet(isPresented: $showingCode) { RelayTextSelectionSheet(text: text, monospaced: true) }
     }
 }

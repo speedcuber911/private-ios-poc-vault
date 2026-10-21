@@ -220,7 +220,7 @@ private enum RelayRootTab: Hashable {
 private struct RelayChatsPolling: Equatable {
     let tab: RelayRootTab
     let sceneIsActive: Bool
-    let chatIsOpen: Bool
+    let sidebarIsOpen: Bool
     /// EC2 says the machine is off or in motion: nothing would answer.
     let machineIsDown: Bool
 }
@@ -259,35 +259,56 @@ struct POCVaultRootView: View {
     @State private var didRestoreBrowserPath = false
     @State private var chatLaunch: RelayChatLaunch?
     @State private var terminalLaunch: RelayTerminalLaunch?
+    @State private var pendingTerminalLaunch: RelayTerminalLaunch?
+    @State private var pendingDiagnostics = false
+    @State private var pendingMachineMonitor = false
     /// Raised when a handoff push is tapped: the threads list is where handoff
     /// cards live, so that is where the tap has to land.
     @State private var opensThreadsForHandoff = false
     @State private var selectedRootTab = RelayRootTab.sessions
+    @State private var showingSidebar = false
+    @State private var showingWorkspacePicker = false
+    @State private var lastChatFolderPath: String?
+    @State private var lastChatWorkspaceID: String?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showingDiagnostics = false
     @State private var showingMachineMonitor = false
 
     var body: some View {
-        mainTabs
+        chatShell
         .tint(AppTheme.accent)
         .preferredColorScheme(.dark)
-        .fullScreenCover(item: $chatLaunch) { launch in
-            RelayChatView(
-                viewModel: launch.viewModel,
-                client: codexClient,
-                identityStore: identityStore,
-                onDismiss: { chatLaunch = nil },
-                threadsRequest: $opensThreadsForHandoff,
-                onBindChatToFolder: { path, workspaceID, card in
-                    opensThreadsForHandoff = false
-                    let next = chatSessionStore.launch(folderPath: path, workspaceID: workspaceID)
-                    chatLaunch = next
-                    Task { await next.viewModel.continueHandoff(card) }
-                },
-                presentsProviderPickerOnAppear: launch.presentsProviderPicker,
-                automaticallyOpensPreviews: launch.automaticallyOpensPreviews,
-                powerModel: powerModel,
-                machineName: machineName
-            )
+        .sheet(isPresented: Binding(
+            get: { selectedRootTab != .sessions },
+            set: { if !$0 { selectedRootTab = .sessions } }
+        ), onDismiss: {
+            if let launch = pendingTerminalLaunch {
+                pendingTerminalLaunch = nil
+                terminalLaunch = launch
+            } else if pendingDiagnostics {
+                pendingDiagnostics = false
+                showingDiagnostics = true
+            } else if pendingMachineMonitor {
+                pendingMachineMonitor = false
+                showingMachineMonitor = true
+            }
+        }) {
+            secondaryDestination
+            .background(AppTheme.bgCanvas)
+            .tint(AppTheme.accent)
+            .preferredColorScheme(.dark)
+        }
+        .sheet(isPresented: $showingWorkspacePicker) {
+            RelayChatProjectPicker(client: codexClient) { workspace in
+                let previous = chatLaunch?.viewModel
+                let next = chatSessionStore.launchNewSession(
+                    folderPath: workspace.path, workspaceID: workspace.id, preservingDraftFrom: previous
+                )
+                next.viewModel.adoptWorkspaceID(workspace.id, name: workspace.name)
+                chatLaunch = next
+                rememberChatContext(folderPath: workspace.path, workspaceID: workspace.id)
+                showingWorkspacePicker = false
+            }
         }
         .fullScreenCover(item: $terminalLaunch) { launch in
             RelayTerminalView(
@@ -317,6 +338,12 @@ struct POCVaultRootView: View {
         }
         .task {
             identityStore.importIdentityFromSetupEnvironmentIfNeeded()
+            if chatLaunch == nil {
+                let saved = UserDefaults.standard.dictionary(forKey: chatContextDefaultsKey)
+                lastChatFolderPath = saved?["path"] as? String
+                lastChatWorkspaceID = saved?["workspace"] as? String
+                openNewSession(folderPath: lastChatFolderPath, workspaceID: lastChatWorkspaceID)
+            }
         }
         // Two independent reasons to register for pushes: an account (the
         // session-authed device route, for handoffs and runs) or a paired
@@ -347,8 +374,11 @@ struct POCVaultRootView: View {
                 opensThreadsForHandoff = true
             case .machine:
                 pushService.clearPendingRoute()
-                selectedRootTab = .settings
-                showingMachineMonitor = true
+                if selectedRootTab == .sessions { showingMachineMonitor = true }
+                else {
+                    pendingMachineMonitor = true
+                    selectedRootTab = .sessions
+                }
             case .job(_, let jobID):
                 pushService.clearPendingRoute()
                 selectedRootTab = .sessions
@@ -412,17 +442,12 @@ struct POCVaultRootView: View {
         .task(id: RelayChatsPolling(
             tab: selectedRootTab,
             sceneIsActive: scenePhase == .active,
-            chatIsOpen: chatLaunch != nil,
+            sidebarIsOpen: showingSidebar,
             machineIsDown: powerModel.isDown
         )) {
-            // Chats is a live view, not a one-time snapshot. Refresh on entry, then
-            // keep polling so a Codex or Claude Code session started on the
-            // machine shows up — but only while the list is actually on screen: its
-            // tab selected, the app active, and no chat covering it. Leaving any of
-            // those cancels this task and the poll with it. A machine that is off
-            // has nothing to say; the poll resumes the moment it is back up.
-            guard selectedRootTab == .sessions else { return }
-            guard scenePhase == .active, chatLaunch == nil else { return }
+            // Keep the sidebar current only while it is actually visible.
+            guard selectedRootTab == .sessions, showingSidebar else { return }
+            guard scenePhase == .active else { return }
             guard !powerModel.isDown else { return }
             await statusFeedViewModel.pollWhileVisible()
         }
@@ -433,68 +458,113 @@ struct POCVaultRootView: View {
         #endif
     }
 
-    private var mainTabs: some View {
-        TabView(selection: $selectedRootTab) {
-            CodexStatusView(
-                feedViewModel: statusFeedViewModel,
-                identityStore: identityStore,
-                nodeStore: nodeStore,
-                powerModel: powerModel,
-                client: codexClient,
-                onOpenItem: openSession,
-                onOpenNewSession: { workspaceID in
-                    openNewSession(folderPath: nil, workspaceID: workspaceID)
-                },
-                onBrowseFiles: { selectedRootTab = .workspaces }
-            )
-            .tag(RelayRootTab.sessions)
-            .tabItem { Label("Chats", systemImage: "bubble.left.and.bubble.right") }
-            .badge(statusFeedViewModel.approvals.count)
-
-            Group {
-                if foldersAreHiddenAfterComputerDisconnect {
-                    disconnectedComputerScreen
-                } else if powerModel.isDown {
-                    machineDownScreen(title: "Folders", purpose: "its folders")
-                } else {
-                    browserNavigation
-                }
+    private var chatShell: some View {
+        ZStack(alignment: .leading) {
+            AppTheme.bgCanvas.ignoresSafeArea()
+            if let launch = chatLaunch {
+                RelayChatView(
+                    viewModel: launch.viewModel,
+                    client: codexClient,
+                    identityStore: identityStore,
+                    onOpenSidebar: { setSidebar(true) },
+                    onNewChat: { openNewSession(folderPath: lastChatFolderPath, workspaceID: lastChatWorkspaceID) },
+                    onChooseProject: { showingWorkspacePicker = true },
+                    threadsRequest: $opensThreadsForHandoff,
+                    onBindChatToFolder: { path, workspaceID, card in
+                        opensThreadsForHandoff = false
+                        openChat(folderPath: path, workspaceID: workspaceID)
+                        if let model = chatLaunch?.viewModel { Task { await model.continueHandoff(card) } }
+                    },
+                    automaticallyOpensPreviews: false,
+                    powerModel: powerModel,
+                    machineName: machineName
+                )
+                .id(launch.id)
+                .accessibilityHidden(showingSidebar)
+                .allowsHitTesting(!showingSidebar)
             }
-            .tag(RelayRootTab.workspaces)
-            .tabItem { Label("Folders", systemImage: "folder") }
-
-            Group {
-                if powerModel.isDown {
-                    machineDownScreen(title: "Previews", purpose: "the apps and files your agents made")
-                } else {
-                    RelayPreviewsView(
-                        identityStore: identityStore,
-                        client: codexClient,
-                        workspaceAccessIsAvailable: !foldersAreHiddenAfterComputerDisconnect,
-                        onOpenWorkspaces: { selectedRootTab = .workspaces },
-                        onOpenJob: openPreviewSourceJob
+            if showingSidebar {
+                Color.black.opacity(0.4)
+                    .ignoresSafeArea()
+                    .onTapGesture { setSidebar(false) }
+                    .accessibilityLabel("Close sidebar")
+                    .accessibilityAddTraits(.isButton)
+                GeometryReader { geometry in
+                    RelayChatSidebar(
+                        feed: statusFeedViewModel,
+                        onClose: { setSidebar(false) },
+                        onNewChat: { openNewSession(folderPath: lastChatFolderPath, workspaceID: lastChatWorkspaceID) },
+                        onOpenChat: openSession,
+                        onHandoffs: { setSidebar(false); opensThreadsForHandoff = true },
+                        onFolders: { openDestination(.workspaces) },
+                        onPreviews: { openDestination(.previews) },
+                        onSettings: { openDestination(.settings) }
                     )
+                    .frame(width: min(340, geometry.size.width - 44))
+                    .frame(maxHeight: .infinity)
+                    .background(AppTheme.canvasBottom.ignoresSafeArea())
+                    .gesture(DragGesture().onEnded { value in
+                        if value.translation.width < -60 { setSidebar(false) }
+                    })
                 }
+                .transition(.move(edge: .leading))
             }
-            .tag(RelayRootTab.previews)
-            .tabItem { Label("Previews", systemImage: "rectangle.on.rectangle") }
-            .accessibilityIdentifier("relay-previews-tab")
-
-            AccountSettingsView(
-                accountStore: accountStore,
-                nodeStore: nodeStore,
-                identityStore: identityStore,
-                computerLinkStore: computerLinkStore,
-                codexClient: codexClient,
-                authClient: authClient,
-                powerModel: powerModel,
-                showsDismissButton: false
-            )
-            .tag(RelayRootTab.settings)
-            .tabItem { Label("Settings", systemImage: "gearshape") }
         }
-        .toolbarBackground(AppTheme.canvasBottom, for: .tabBar)
-        .toolbarBackground(.visible, for: .tabBar)
+    }
+
+    @ViewBuilder
+    private var secondaryDestination: some View {
+        switch selectedRootTab {
+        case .workspaces:
+            if foldersAreHiddenAfterComputerDisconnect {
+                disconnectedComputerScreen
+            } else if powerModel.isDown {
+                machineDownScreen(title: "Files", purpose: "its folders")
+            } else {
+                browserNavigation
+            }
+        case .previews:
+            RelayPreviewsView(
+                identityStore: identityStore, client: codexClient,
+                workspaceAccessIsAvailable: !foldersAreHiddenAfterComputerDisconnect && !powerModel.isDown,
+                onOpenWorkspaces: { selectedRootTab = .workspaces },
+                onOpenJob: openPreviewSourceJob,
+                onClose: { selectedRootTab = .sessions }
+            )
+        case .settings:
+            AccountSettingsView(
+                accountStore: accountStore, nodeStore: nodeStore, identityStore: identityStore,
+                computerLinkStore: computerLinkStore, codexClient: codexClient,
+                authClient: authClient, powerModel: powerModel
+            )
+        case .sessions:
+            EmptyView()
+        }
+    }
+
+    private func setSidebar(_ visible: Bool) {
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.22)) { showingSidebar = visible }
+    }
+
+    private func openDestination(_ destination: RelayRootTab) {
+        setSidebar(false)
+        if destination == .workspaces {
+            browserPath = lastChatFolderPath.map { [.folder(path: $0)] } ?? []
+            didRestoreBrowserPath = true
+        }
+        selectedRootTab = destination
+    }
+
+    private var chatContextDefaultsKey: String { "relay.chatContext.\(nodeStore.effectiveBaseURL.absoluteString)" }
+
+    private func rememberChatContext(folderPath: String?, workspaceID: String?) {
+        lastChatFolderPath = folderPath
+        lastChatWorkspaceID = workspaceID
+        var context: [String: String] = [:]
+        context["path"] = folderPath
+        context["workspace"] = workspaceID
+        UserDefaults.standard.set(context, forKey: chatContextDefaultsKey)
     }
 
     private var browserNavigation: some View {
@@ -510,6 +580,7 @@ struct POCVaultRootView: View {
                             identityStore: identityStore,
                             entry: entry
                         )
+                        .toolbar { secondaryCloseToolbar }
                     }
                 }
         }
@@ -578,6 +649,7 @@ struct POCVaultRootView: View {
                     .padding(.top, 8)
                 }
             }
+            .toolbar { secondaryCloseToolbar }
         }
     }
 
@@ -596,6 +668,7 @@ struct POCVaultRootView: View {
             }
             .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar { secondaryCloseToolbar }
         }
     }
 
@@ -621,19 +694,27 @@ struct POCVaultRootView: View {
             onOpenChat: { path, workspaceID in
                 openNewSession(folderPath: path, workspaceID: workspaceID)
             },
-            onOpenConversation: { item in
-                let launch = chatSessionStore.launch(
-                    folderPath: folderPath ?? item.folderPath,
-                    workspaceID: item.workspaceID
-                )
-                chatLaunch = launch
-                Task { await launch.viewModel.openHistoryItem(item) }
-            },
+            onOpenConversation: openSession,
             onOpenTerminal: { workspaceID, workspaceName in
-                terminalLaunch = RelayTerminalLaunch(workspaceID: workspaceID, workspaceName: workspaceName)
+                pendingTerminalLaunch = RelayTerminalLaunch(workspaceID: workspaceID, workspaceName: workspaceName)
+                selectedRootTab = .sessions
             },
-            onOpenDiagnostics: isRoot ? { showingDiagnostics = true } : nil
+            onOpenDiagnostics: isRoot ? {
+                pendingDiagnostics = true
+                selectedRootTab = .sessions
+            } : nil
         )
+        .toolbar { secondaryCloseToolbar }
+    }
+
+    @ToolbarContentBuilder
+    private var secondaryCloseToolbar: some ToolbarContent {
+        ToolbarItem(placement: .topBarTrailing) {
+            Button { selectedRootTab = .sessions } label: {
+                Image(systemName: "xmark").foregroundStyle(AppTheme.textPrimary)
+            }
+            .accessibilityLabel("Back to chat")
+        }
     }
 
     /// Breadcrumb taps move within the existing navigation stack when possible.
@@ -657,14 +738,23 @@ struct POCVaultRootView: View {
     }
 
     private func openChat(folderPath: String?, workspaceID: String?) {
+        setSidebar(false)
+        selectedRootTab = .sessions
+        rememberChatContext(folderPath: folderPath, workspaceID: workspaceID)
         chatLaunch = chatSessionStore.launch(folderPath: folderPath, workspaceID: workspaceID)
     }
 
     private func openNewSession(folderPath: String?, workspaceID: String?) {
+        setSidebar(false)
+        selectedRootTab = .sessions
+        rememberChatContext(folderPath: folderPath, workspaceID: workspaceID)
         chatLaunch = chatSessionStore.launchNewSession(folderPath: folderPath, workspaceID: workspaceID)
     }
 
     private func openSession(_ item: CodexThreadFeedItem) {
+        setSidebar(false)
+        selectedRootTab = .sessions
+        rememberChatContext(folderPath: item.folderPath, workspaceID: item.workspaceID)
         let launch = chatSessionStore.launch(
             folderPath: item.folderPath,
             workspaceID: item.workspaceID
@@ -674,6 +764,7 @@ struct POCVaultRootView: View {
     }
 
     private func openPreviewSourceJob(_ job: CodexJob) {
+        selectedRootTab = .sessions
         let item = CodexThreadFeedItem(source: .pendingJob(job))
         let launch = chatSessionStore.launch(
             folderPath: item.folderPath,
@@ -715,10 +806,11 @@ struct POCVaultRootView: View {
             selectedRootTab = .previews
         case "status":
             selectedRootTab = .sessions
+            showingSidebar = true
         case "account":
             selectedRootTab = .settings
         case "usage":
-            selectedRootTab = .settings
+            selectedRootTab = .sessions
             showingMachineMonitor = true
         default:
             break
@@ -728,6 +820,161 @@ struct POCVaultRootView: View {
         }
     }
     #endif
+}
+
+/// The only top-level navigation: a quiet list of conversations beside the chat.
+private struct RelayChatSidebar: View {
+    @ObservedObject var feed: StatusFeedViewModel
+    let onClose: () -> Void
+    let onNewChat: () -> Void
+    let onOpenChat: (CodexThreadFeedItem) -> Void
+    let onHandoffs: () -> Void
+    let onFolders: () -> Void
+    let onPreviews: () -> Void
+    let onSettings: () -> Void
+    @State private var search = ""
+
+    private var chats: [CodexThreadFeedItem] {
+        guard !search.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return feed.feedItems }
+        return feed.feedItems.filter {
+            $0.title.localizedCaseInsensitiveContains(search) || $0.workspaceLabel.localizedCaseInsensitiveContains(search)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Relay").font(.title2.weight(.semibold))
+                Spacer()
+                Button(action: onClose) { Image(systemName: "sidebar.left").frame(width: 44, height: 44) }
+                    .accessibilityLabel("Close sidebar")
+            }
+            .padding(.horizontal, 20)
+            sidebarAction("New chat", icon: "square.and.pencil", action: onNewChat)
+                .accessibilityIdentifier("relay-new-chat")
+            HStack(spacing: 10) {
+                Image(systemName: "magnifyingglass").foregroundStyle(AppTheme.textSecondary)
+                TextField("Search chats", text: $search)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            }
+            .font(.subheadline)
+            .padding(12)
+            .background(AppTheme.textPrimary.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
+            .padding(.horizontal, 16)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    Text("Recent chats")
+                        .font(.caption)
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .padding(.horizontal, 20)
+                        .padding(.top, 18)
+                        .padding(.bottom, 8)
+                    if chats.isEmpty {
+                        Text(search.isEmpty ? "Your conversations will appear here." : "No matching chats")
+                            .font(.subheadline)
+                            .foregroundStyle(AppTheme.textSecondary)
+                            .padding(20)
+                    }
+                    ForEach(chats) { item in
+                        Button { onOpenChat(item) } label: {
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text(item.title).font(.subheadline).lineLimit(2)
+                                HStack(spacing: 6) {
+                                    Text(item.workspaceLabel).lineLimit(1)
+                                    if item.status == .waitingForApproval {
+                                        Text("· Approval needed").foregroundStyle(AppTheme.statusWarn)
+                                    } else if item.status?.isActive == true {
+                                        Text("· Working")
+                                    }
+                                }
+                                .font(.caption)
+                                .foregroundStyle(AppTheme.textSecondary)
+                            }
+                            .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 8)
+                            .contentShape(Rectangle())
+                        }
+                        .accessibilityIdentifier("relay-recent-chat-\(item.id)")
+                    }
+                    if feed.isListStale {
+                        Text("Showing saved chats")
+                            .font(.caption)
+                            .foregroundStyle(AppTheme.textSecondary)
+                            .padding(20)
+                    }
+                }
+            }
+            .scrollDismissesKeyboard(.interactively)
+            Divider().overlay(AppTheme.hairline).padding(.horizontal, 20)
+            VStack(spacing: 0) {
+                sidebarAction("From desktop", icon: "desktopcomputer", action: onHandoffs)
+                sidebarAction("Files", icon: "folder", action: onFolders)
+                sidebarAction("Previews", icon: "rectangle.on.rectangle", action: onPreviews)
+                sidebarAction("Settings", icon: "gearshape", action: onSettings)
+            }
+            .padding(.bottom, 8)
+        }
+        .foregroundStyle(AppTheme.textPrimary)
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("relay-chat-sidebar")
+    }
+
+    private func sidebarAction(_ title: String, icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: icon)
+                .font(.subheadline)
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .padding(.horizontal, 20)
+                .contentShape(Rectangle())
+        }
+    }
+}
+
+private struct RelayChatProjectPicker: View {
+    let client: CodexClient
+    let onChoose: (CodexWorkspace) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var workspaces: [CodexWorkspace] = []
+    @State private var error: String?
+    @State private var loading = true
+    @State private var search = ""
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    if loading { ProgressView("Loading projects…") }
+                    if let error { Text(error).foregroundStyle(AppTheme.statusError) }
+                    ForEach(workspaces.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) }) { workspace in
+                        Button { onChoose(workspace) } label: {
+                            Label(workspace.name, systemImage: "folder")
+                                .foregroundStyle(AppTheme.textPrimary)
+                                .frame(minHeight: 36)
+                        }
+                    }
+                    if !loading, workspaces.isEmpty, error == nil {
+                        Text("Open Files from the sidebar to choose a folder on your computer.")
+                    }
+                } footer: {
+                    Text("Choose where your agent works. Your draft stays with you.")
+                }
+            }
+            .searchable(text: $search, prompt: "Find a project")
+            .scrollContentBackground(.hidden)
+            .background(AppTheme.bgCanvas)
+            .navigationTitle("Choose project")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } } }
+            .task {
+                do { workspaces = try await client.fetchCodexWorkspaces() }
+                catch { self.error = error.localizedDescription }
+                loading = false
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
 }
 
 struct RelayProviderPresentation {
@@ -1087,7 +1334,7 @@ private struct CodexStatusView: View {
 
     private func sectionHeading(_ title: String) -> some View {
         Text(title)
-            .font(.custom("DMSans-9ptRegular", size: 13, relativeTo: .subheadline).weight(.medium))
+            .font(.system(size: 13).weight(.medium))
             .foregroundStyle(AppTheme.textPrimary.opacity(0.65))
             .padding(.horizontal, 18)
             .padding(.top, 20)
@@ -1424,13 +1671,13 @@ struct RelayConversationRow: View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(alignment: .firstTextBaseline, spacing: 12) {
                 Text(CodexInlineMarkdown.title(item.title))
-                    .font(.custom("DMSans-9ptRegular", size: 16, relativeTo: .body).weight(.medium))
+                    .font(.system(size: 16).weight(.medium))
                     .foregroundStyle(AppTheme.textPrimary)
                     .lineLimit(dynamicTypeSize.isAccessibilitySize ? 3 : 2)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 if !dynamicTypeSize.isAccessibilitySize, let updatedAt = item.updatedAt {
                     Text(activityStamp(updatedAt))
-                        .font(.custom("DMSans-9ptRegular", size: 12, relativeTo: .caption))
+                        .font(.system(size: 12))
                         .foregroundStyle(AppTheme.textPrimary.opacity(0.6))
                         .fixedSize()
                 }
@@ -1439,7 +1686,7 @@ struct RelayConversationRow: View {
                 providerTag
                 if let attentionLabel = item.activityLabel { statusLabel(attentionLabel) }
                 Text(item.workspaceLabel)
-                    .font(.custom("DMSans-9ptRegular", size: 13, relativeTo: .subheadline))
+                    .font(.system(size: 13))
                     .foregroundStyle(AppTheme.textPrimary.opacity(0.65))
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -1456,7 +1703,7 @@ struct RelayConversationRow: View {
         HStack(spacing: 5) {
             RelayProviderMark(provider: item.provider, size: 12)
             Text(item.provider.relayPresentation.title)
-                .font(.custom("DMSans-9ptRegular", size: 12, relativeTo: .caption).weight(.medium))
+                .font(.system(size: 12).weight(.medium))
                 .foregroundStyle(item.provider.relayPresentation.accent)
                 .lineLimit(1)
         }
@@ -1474,7 +1721,7 @@ struct RelayConversationRow: View {
 
     private func statusLabel(_ text: String) -> some View {
         Text(text)
-            .font(.custom("DMSans-9ptRegular", size: 12, relativeTo: .caption).weight(.medium))
+            .font(.system(size: 12).weight(.medium))
             .foregroundStyle(item.status == .failed || item.status == .timeout ? AppTheme.statusError : AppTheme.accentBright)
             .fixedSize(horizontal: true, vertical: false)
     }
@@ -1486,9 +1733,9 @@ struct RelayConversationRow: View {
 enum AppTheme {
     // Canvas
     static let canvasTop = Color(hex: 0x1E1B17)
-    static let canvasBottom = Color(hex: 0x151310)
+    static let canvasBottom = Color(hex: 0x1C1B19)
     /// Solid canvas for sheets and fills that cannot take the gradient.
-    static let bgCanvas = Color(hex: 0x1A1815)
+    static let bgCanvas = Color(hex: 0x232220)
     // Relay uses a flat canvas. Keep the historical property name so older views
     // adopt the flatter treatment without each screen carrying its own background.
     static let canvasGradient = canvasBottom
@@ -1522,11 +1769,11 @@ enum AppTheme {
     private static let ink = Color(hex: 0xEDE8DF)
 
     static func uiFont(size: CGFloat, weight: Font.Weight = .regular) -> Font {
-        Font.custom("DMSans-9ptRegular", size: size).weight(weight)
+        Font(UIFontMetrics.default.scaledFont(for: UIFont.systemFont(ofSize: size))).weight(weight)
     }
 
     static func monoFont(size: CGFloat, weight: Font.Weight = .regular) -> Font {
-        Font.custom("DMMono-Regular", size: size).weight(weight)
+        Font(UIFontMetrics.default.scaledFont(for: UIFont.monospacedSystemFont(ofSize: size, weight: .regular))).weight(weight)
     }
 
     /// New York serif — screen titles, wordmark, folder/chat headers only.
@@ -1574,6 +1821,56 @@ struct RelayInfoButton: View {
     }
 }
 
+/// Recoverable feedback stays beside the content it describes, without a card
+/// or alert border. Long copy and larger text can put the action on its own line.
+struct RelayInlineNotice: View {
+    let text: String
+    var actionTitle: String? = nil
+    var isWorking = false
+    var action: (() -> Void)? = nil
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .firstTextBaseline, spacing: 16) {
+                message
+                if action != nil { actionButton.fixedSize() }
+            }
+            VStack(alignment: .leading, spacing: 0) {
+                message
+                if action != nil { actionButton.padding(.leading, 24) }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var message: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 9) {
+            Image(systemName: "exclamationmark.circle")
+                .font(AppTheme.uiFont(size: 14))
+                .foregroundStyle(AppTheme.statusError)
+                .accessibilityHidden(true)
+            Text(text)
+                .font(AppTheme.uiFont(size: 14))
+                .foregroundStyle(AppTheme.textSecondary)
+                .lineSpacing(3)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+        }
+    }
+
+    private var actionButton: some View {
+        Button(actionTitle ?? "Retry") { action?() }
+            .font(AppTheme.uiFont(size: 14, weight: .medium))
+            .foregroundStyle(AppTheme.accent)
+            .frame(minWidth: 44, minHeight: 44, alignment: .leading)
+            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            .disabled(isWorking)
+    }
+}
+
 /// Form section title plus an optional trailing info control.
 struct RelayFormHeader: View {
     let title: String
@@ -1597,17 +1894,15 @@ struct RelayFormHeader: View {
     }
 }
 
-/// Small-caps letterspaced label — the only rendering for status words, bylines,
-/// and section labels (spec rule 5: status is typographic, never a dot).
+/// Quiet sentence-case labels shared by status, bylines and section headings.
 struct RelayCapsLabel: View {
     let text: String
     var color: Color = AppTheme.textTertiary
     var size: CGFloat = 10
 
     var body: some View {
-        Text(text.uppercased())
-            .font(AppTheme.uiFont(size: size, weight: .semibold))
-            .tracking(1.1)
+        Text(text)
+            .font(AppTheme.uiFont(size: max(size, 12), weight: .medium))
             .foregroundStyle(color)
     }
 }
@@ -1638,7 +1933,7 @@ struct RelayPrimaryButtonStyle: ButtonStyle {
     }
 }
 
-/// Secondary action: hairline outline pill, cream text.
+/// Secondary action: a soft neutral pill, with the same readable type as chat.
 struct RelayOutlineButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -1646,7 +1941,7 @@ struct RelayOutlineButtonStyle: ButtonStyle {
             .foregroundStyle(AppTheme.textPrimary)
             .frame(maxWidth: .infinity)
             .frame(height: 50)
-            .overlay(Capsule().stroke(AppTheme.hairlineStrong, lineWidth: 1))
+            .background(AppTheme.textPrimary.opacity(0.07), in: Capsule())
             .contentShape(Capsule())
             .opacity(configuration.isPressed ? 0.7 : 1)
     }

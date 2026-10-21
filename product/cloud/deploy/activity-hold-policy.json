@@ -1,0 +1,18 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "KeepActiveRelayWorkersAwake",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": [
+        "arn:aws:ec2:ap-south-1:507121383669:instance/i-05863951ad0263c8e",
+        "arn:aws:ec2:ap-south-1:507121383669:instance/i-0364bb0f31f506e7c"
+      ],
+      "Condition": {
+        "ForAllValues:StringEquals": { "aws:TagKeys": ["RelayKeepAwakeUntil"] },
+        "Null": { "aws:TagKeys": "false" }
+      }
+    }
+  ]
+}

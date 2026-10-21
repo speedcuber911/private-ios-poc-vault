@@ -103,7 +103,7 @@ test("a real run maps to prose, a command, a read and an edit, in order", () => 
   assert.ok(prose.every((text) => !text.includes("owner: relay")));
 
   // Usage is this turn's requests summed, reported once.
-  assert.equal(events.filter((event) => event.type === "usage").length, 1);
+  assert.equal(events.filter((event) => event.type === "usage" && event.inputTokens !== undefined).length, 1);
   assert.deepEqual(usage, {
     type: "usage", inputTokens: 95889, outputTokens: 239, cachedInputTokens: 84352, reasoningOutputTokens: 0, totalTokens: 96128,
   });

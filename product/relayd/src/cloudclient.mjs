@@ -116,6 +116,7 @@ function createCloudClient({
   channel = releaseChannel,
   version = runningVersion,
   pendingVersion = null,
+  keepAwakeUntil = null,
 } = {}) {
   const paths = baseDir ? identityPaths(baseDir) : identityPaths();
   const nodeId = readNodeId(paths);
@@ -542,6 +543,15 @@ function createCloudClient({
     }
   }
 
+  function activityHold() {
+    try {
+      const value = keepAwakeUntil?.();
+      return typeof value === "number" && Number.isFinite(value) ? value : null;
+    } catch {
+      return null;
+    }
+  }
+
   // The body used to be the literal `{}`: the cloud had a `version` column on
   // the node row that nothing ever filled, so "which machines are stale" had
   // no answer and every update was done by hand. Additive and backward
@@ -556,7 +566,9 @@ function createCloudClient({
         ...signedHeaders("POST", pathWithQuery),
         "content-type": "application/json",
       },
-      body: JSON.stringify({ version, channel, pendingVersion: stagedVersion() }),
+      body: JSON.stringify({ version, channel, pendingVersion: stagedVersion(),
+        ...(typeof keepAwakeUntil === "function" ? { keepAwakeUntil: activityHold() } : {}),
+      }),
     });
     if (res.status !== 200) throw new Error(`cloud_heartbeat_${res.status}`);
     return res.json().catch(() => ({ ok: true }));

@@ -39,7 +39,7 @@ struct RelayApprovalCard: View {
                 }
             }
             Text(approval.title)
-                .font(.custom("DMSans-9ptRegular", size: 17, relativeTo: .headline).weight(.semibold))
+                .font(AppTheme.uiFont(size: 17, weight: .semibold))
                 .foregroundStyle(AppTheme.textPrimary)
                 .lineSpacing(3)
                 .fixedSize(horizontal: false, vertical: true)
@@ -78,7 +78,6 @@ struct RelayApprovalCard: View {
             .padding(.top, 16)
         }
         .padding(.top, 16)
-        .overlay(alignment: .top) { RelayHairline() }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(approval.provider.relayPresentation.title) approval request")
     }
@@ -91,16 +90,11 @@ struct RelayApprovalButtonStyle: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(.custom("DMSans-9ptRegular", size: 16, relativeTo: .body).weight(.semibold))
+            .font(AppTheme.uiFont(size: 16, weight: .semibold))
             .foregroundStyle(isPrimary ? AppTheme.onEmber : AppTheme.textPrimary)
             .frame(maxWidth: .infinity)
             .frame(height: 48)
-            .background(isPrimary ? AppTheme.accent : Color.clear, in: Capsule())
-            .overlay {
-                if !isPrimary {
-                    Capsule().stroke(AppTheme.hairlineStrong, lineWidth: 1)
-                }
-            }
+            .background(isPrimary ? AppTheme.accent : AppTheme.textPrimary.opacity(0.07), in: Capsule())
             .contentShape(Capsule())
             .opacity(configuration.isPressed ? 0.8 : 1)
     }

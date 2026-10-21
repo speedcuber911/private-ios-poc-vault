@@ -243,6 +243,7 @@ struct RelayPreviewsView: View {
     let workspaceAccessIsAvailable: Bool
     let onOpenWorkspaces: () -> Void
     let onOpenJob: (CodexJob) -> Void
+    let onClose: (() -> Void)?
 
     @StateObject private var model: RelayPreviewsModel
     @State private var artifactRequest: CodexJobArtifact?
@@ -253,13 +254,15 @@ struct RelayPreviewsView: View {
         client: CodexClient,
         workspaceAccessIsAvailable: Bool,
         onOpenWorkspaces: @escaping () -> Void,
-        onOpenJob: @escaping (CodexJob) -> Void
+        onOpenJob: @escaping (CodexJob) -> Void,
+        onClose: (() -> Void)? = nil
     ) {
         self.identityStore = identityStore
         self.client = client
         self.workspaceAccessIsAvailable = workspaceAccessIsAvailable
         self.onOpenWorkspaces = onOpenWorkspaces
         self.onOpenJob = onOpenJob
+        self.onClose = onClose
         _model = StateObject(wrappedValue: RelayPreviewsModel(client: client))
     }
 
@@ -293,7 +296,7 @@ struct RelayPreviewsView: View {
             VStack(alignment: .leading, spacing: 20) {
                 HStack {
                     Text("Previews")
-                        .font(AppTheme.serifFont(size: 32))
+                        .font(AppTheme.uiFont(size: 24, weight: .semibold))
                         .foregroundStyle(AppTheme.textPrimary)
                     RelayInfoButton(
                         title: "Previews",
@@ -309,6 +312,15 @@ struct RelayPreviewsView: View {
                     .disabled(model.isLoading || !workspaceAccessIsAvailable)
                     .accessibilityLabel("Refresh workspace results")
                     .accessibilityIdentifier("relay-workspace-previews-refresh")
+                    if let onClose {
+                        Button(action: onClose) {
+                            Image(systemName: "xmark").frame(width: 44, height: 44)
+                                .background(AppTheme.textPrimary.opacity(0.07), in: Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(AppTheme.textPrimary)
+                        .accessibilityLabel("Back to chat")
+                    }
                 }
 
                 if !workspaceAccessIsAvailable {
@@ -476,9 +488,6 @@ struct StatusCard: View {
         }
         .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(AppTheme.hairline, lineWidth: 1)
-        }
+
     }
 }

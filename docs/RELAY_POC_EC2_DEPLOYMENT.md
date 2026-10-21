@@ -152,6 +152,26 @@ caches. Deployment is complete only when CodePipeline reports `Succeeded`, the
 EC2 `current` symlink matches the source SHA, and the public health endpoint is
 green.
 
+Active conversations renew a bounded `RelayKeepAwakeUntil` instance tag, so
+low CPU or network traffic alone cannot stop a working agent. The node sends
+only an expiry in its signed heartbeat. Paired machines can send this heartbeat
+without an account; this does not authorize handoff or credential sync.
+The hold expires one hour after the last app interaction, native Codex rollout
+write, or observed active run. Idle heartbeats do not renew it.
+
+The cloud instance role needs the narrowly scoped policy in
+`product/cloud/deploy/activity-hold-policy.json` in addition to its existing
+power permissions. Install it with:
+
+```bash
+aws iam put-role-policy --role-name poc-ec2-instance \
+  --policy-name relay-activity-hold \
+  --policy-document file://product/cloud/deploy/activity-hold-policy.json
+```
+
+Verify a fresh hold on the target worker and the idle-stop Lambda's skip result
+after deployment. A healthy cloud endpoint alone does not verify this path.
+
 ## Database and backup operations
 
 SQLite is the database the application supports today; PostgreSQL is not

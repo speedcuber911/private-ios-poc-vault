@@ -9,6 +9,7 @@
 // codex-rollout.ndjson). Item types the captures did not exercise (MCP, web
 // search, plans, collab agents) follow the schema only.
 import { TIMELINE_CAPS, clipText } from "./timeline.mjs";
+import { codexPlanUsage } from "./usage.mjs";
 
 // ---------------------------------------------------------------------------
 // Shared: one description of a Codex item, whichever source it came from.
@@ -650,9 +651,19 @@ export function createCodexNotificationMapper({ now = () => Date.now() } = {}) {
           planCount += 1;
           return [stepEvent({ id: `plan-${params.turnId || "turn"}-${planCount}`, ...described, startedAt: at, endedAt: at })];
         }
-        case "thread/tokenUsage/updated":
+        case "thread/tokenUsage/updated": {
           addUsage(params);
-          return [];
+          const tokens = params.tokenUsage;
+          if (isForeign(params) || !Number.isFinite(tokens?.last?.totalTokens) || tokens.last.totalTokens < 0) return [];
+          // Last request only: compaction can make this smaller than before.
+          return [{ type: "usage", contextTokens: tokens.last.totalTokens,
+            ...(Number.isFinite(tokens.modelContextWindow) && tokens.modelContextWindow > 0 ? { contextWindow: tokens.modelContextWindow } : {}),
+            contextReportedAt: stamp() }];
+        }
+        case "account/rateLimits/updated": {
+          const limits = codexPlanUsage(params.rateLimits, stamp());
+          return limits.length ? [{ type: "usage", limits }] : [];
+        }
         case "turn/completed": {
           if (isForeign(params) || !usage) return [];
           const event = { type: "usage", ...usage };

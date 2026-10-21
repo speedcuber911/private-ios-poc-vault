@@ -20,6 +20,7 @@
 import path from "node:path";
 
 import { TIMELINE_CAPS, clipText } from "./timeline.mjs";
+import { claudeContext, claudePlanUsage } from "./usage.mjs";
 
 const BUILTIN_KINDS = Object.freeze({
   Bash: "command",
@@ -347,6 +348,7 @@ export function createClaudeStreamMapper({ now = () => new Date().toISOString() 
   let stepSinceText = true;
   let lastText = "";
   let result = null;
+  let context = null;
 
   const nextId = (prefix) => `${prefix}${(counters[prefix] += 1)}`;
 
@@ -400,7 +402,12 @@ export function createClaudeStreamMapper({ now = () => new Date().toISOString() 
     const event = line.event || {};
     if (event.type === "message_start") {
       blocks = new Map();
+      context = claudeContext(event.message);
       if (event.message?.id) streamedMessages.add(event.message.id);
+      return [];
+    }
+    if (event.type === "message_delta" && context && Number.isFinite(event.usage?.output_tokens)) {
+      context.output = Math.max(0, event.usage.output_tokens);
       return [];
     }
     if (event.type === "content_block_start") {
@@ -457,6 +464,7 @@ export function createClaudeStreamMapper({ now = () => new Date().toISOString() 
 
   function onAssistant(line) {
     const message = line.message || {};
+    if (!line.parent_tool_use_id) context = claudeContext(message) || context;
     const parentTool = line.parent_tool_use_id ? tools.get(line.parent_tool_use_id) : null;
     // A sub-agent whose Agent step we never saw has nowhere to nest.
     if (line.parent_tool_use_id && !parentTool) return [];
@@ -527,6 +535,12 @@ export function createClaudeStreamMapper({ now = () => new Date().toISOString() 
       type: "usage",
       inputTokens: count(usage.input_tokens) + count(usage.cache_creation_input_tokens) + count(usage.cache_read_input_tokens),
       outputTokens: count(usage.output_tokens),
+      ...(context ? {
+        contextTokens: context.input + context.output,
+        contextReportedAt: now(),
+        ...(Number.isFinite(line.modelUsage?.[context.model]?.contextWindow) && line.modelUsage[context.model].contextWindow > 0
+          ? { contextWindow: line.modelUsage[context.model].contextWindow } : {}),
+      } : {}),
     }];
   }
 
@@ -544,6 +558,10 @@ export function createClaudeStreamMapper({ now = () => new Date().toISOString() 
         case "assistant": return onAssistant(line);
         case "user": return onUser(line);
         case "result": return onResult(line);
+        case "rate_limit_event": {
+          const limits = claudePlanUsage(line.rate_limit_info, now());
+          return limits.length ? [{ type: "usage", limits }] : [];
+        }
         default: return [];
       }
     },

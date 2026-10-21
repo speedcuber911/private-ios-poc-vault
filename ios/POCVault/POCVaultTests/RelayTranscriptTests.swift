@@ -1,4 +1,5 @@
 import XCTest
+import UIKit
 @testable import POCVault
 
 /// The job timeline: decoding relayd's events and reducing them to the blocks
@@ -51,6 +52,61 @@ final class RelayTranscriptTests: XCTestCase {
     private func prose(_ block: RelayTimelineBlock) -> String? {
         if case .prose(let text) = block.content { return text }
         return nil
+    }
+
+    @MainActor
+    func testProgrammaticLayoutMovementDoesNotStopFollowingTheConversation() async {
+        let scroll = UIScrollView(frame: CGRect(x: 0, y: 0, width: 390, height: 600))
+        scroll.contentSize = CGSize(width: 390, height: 1800)
+        scroll.contentOffset.y = 1200
+        let scroller = RelayTranscriptScroller()
+        scroller.attach(scroll)
+        // SwiftUI changes the offset while resolving estimated row heights.
+        // No drag, flick, or reader action happened.
+        scroll.contentOffset.y = 300
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+        XCTAssertTrue(scroller.isAtBottom)
+        scroll.contentSize.height = 2000
+        XCTAssertEqual(scroll.contentOffset.y, 1400, accuracy: 0.5)
+    }
+
+    func testUsageMergesWindowsWithoutTurningUnknownIntoZero() throws {
+        let events = try decode(#"""
+        {"type":"usage","contextTokens":172000,"contextWindow":200000,"limits":[{"id":"session","usedPercent":86},{"id":"week","usedPercent":0}]}
+        {"type":"usage","inputTokens":500000,"outputTokens":200}
+        {"type":"usage","limits":[{"id":"session","resetsAt":"2026-10-21T10:00:00Z"}]}
+        """#)
+        var timeline = RelayTimeline()
+        for event in events { timeline.apply(event) }
+        XCTAssertEqual(timeline.usage?.contextFraction, 0.86)
+        XCTAssertEqual(timeline.usage?.inputTokens, 500000)
+        XCTAssertNil(timeline.usage?.limits?.first?.usedPercent)
+        XCTAssertEqual(timeline.usage?.limits?.last?.usedPercent, 0)
+        XCTAssertEqual(timeline.usage?.limits?.count, 2)
+        let date = try XCTUnwrap(RelayTimelineDate.parse("2026-10-21T11:00:00Z"))
+        XCTAssertTrue(try XCTUnwrap(timeline.usage?.limits?.first).hasReset(at: date))
+    }
+
+    func testContextCompactionAndUnknownCapacityDoNotKeepPreviousPercentage() throws {
+        let events = try decode(#"""
+        {"type":"usage","contextTokens":172000,"contextWindow":200000}
+        {"type":"usage","contextTokens":10000}
+        """#)
+        var timeline = RelayTimeline()
+        for event in events { timeline.apply(event) }
+        XCTAssertEqual(timeline.usage?.contextTokens, 10000)
+        XCTAssertNil(timeline.usage?.contextFraction)
+        XCTAssertNil(timeline.usage?.contextWindow)
+    }
+
+    func testOldUsageNeverTreatsCumulativeInputAsContext() throws {
+        var timeline = RelayTimeline()
+        for event in try decode(#"{"type":"usage","inputTokens":500000,"outputTokens":200}"#) { timeline.apply(event) }
+        XCTAssertNil(timeline.usage?.contextTokens)
+        XCTAssertNil(timeline.usage?.contextFraction)
+        XCTAssertNil(timeline.usage?.limits)
     }
 
     func testCanonicalExampleReducesToTheSpecBlockSequence() throws {
@@ -106,6 +162,20 @@ final class RelayTranscriptTests: XCTestCase {
             RelayTimeline.summary(of: timeline.steps(in: timeline.blocks[0])),
             "Ran 5 commands, read 2 files, thought"
         )
+    }
+
+    func testSingleCommandUsesItsDescriptionInConversationAndStepList() throws {
+        var input = RelayStepInput()
+        input.command = "npm test -- pricing"
+        input.description = "Verify the rounding fix"
+        let timeline = RelayTimeline(historySteps: [RelayStepPatch(
+            id: "check", kind: .command, title: "Bash", summary: "Verify the rounding fix", status: .done, input: input
+        )])
+        let step = try XCTUnwrap(timeline.step("check"))
+        XCTAssertEqual(RelayTimeline.summary(of: [step]), "Ran: Verify the rounding fix")
+        XCTAssertEqual(step.rowSummary.text, "Verify the rounding fix")
+        XCTAssertFalse(step.rowSummary.isCode)
+        XCTAssertTrue(step.detailSections.contains { $0.title == "Command" })
     }
 
     func testAFinalStepOutputReplacesWhatTheDeltasAccumulated() throws {
@@ -873,6 +943,39 @@ final class RelayChatLiveDataTests: XCTestCase {
 
     // MARK: Thread history
 
+    func testPartialTranscriptKeepsThePromptOfAResumedRelayJob() async throws {
+        let detail = try threadDetail(#"""
+        {"thread":{"id":"th-1","sessionId":"th-1","workspaceId":"ws","provider":"claude"},
+         "messages":[
+           {"role":"user","text":"From the desktop","timestamp":"2026-10-17T07:00:00Z"},
+           {"role":"assistant","text":"First answer","timestamp":"2026-10-17T07:00:10Z"}
+         ],
+         "jobs":[
+           {"id":"phone-turn","provider":"claude","status":"succeeded","workspaceId":"ws","prompt":"Continue from my phone","result":"Second answer","createdAt":"2026-10-17T07:05:00Z"}
+         ]}
+        """#)
+        let model = makeModel(LiveScript(), detail: { _ in throw CancellationError() }, thread: { _, _, _ in detail })
+        await model.openThread(try thread())
+        XCTAssertEqual(model.messages.map { $0.job?.id ?? $0.text }, [
+            "From the desktop", "First answer", "Continue from my phone", "phone-turn"
+        ])
+    }
+
+    func testAnOpenIdleThreadPicksUpNewDesktopPrompts() async throws {
+        var current = try threadDetail(#"""
+        {"thread":{"id":"th-1","sessionId":"th-1","workspaceId":"ws","provider":"claude"},
+         "messages":[{"role":"user","text":"Earlier prompt"}],"jobs":[]}
+        """#)
+        let model = makeModel(LiveScript(), detail: { _ in throw CancellationError() }, thread: { _, _, _ in current })
+        await model.openThread(try thread())
+        current = try threadDetail(#"""
+        {"thread":{"id":"th-1","sessionId":"th-1","workspaceId":"ws","provider":"claude","live":true},
+         "messages":[{"role":"user","text":"Earlier prompt"},{"role":"user","text":"Resumed on desktop"}],"jobs":[]}
+        """#)
+        await model.refreshWatchedThreadIfNeeded()
+        XCTAssertEqual(model.messages.map(\.text), ["Earlier prompt", "Resumed on desktop"])
+    }
+
     private func threadDetail(_ json: String) throws -> CodexThreadDetail {
         try JSONDecoder().decode(CodexThreadDetail.self, from: Data(json.utf8))
     }
@@ -903,7 +1006,7 @@ final class RelayChatLiveDataTests: XCTestCase {
         let model = makeModel(LiveScript(), detail: { _ in throw CancellationError() }, thread: { _, _, _ in detail })
         await model.openThread(try thread())
 
-        XCTAssertEqual(model.messages.map(\.role), [.user, .assistant, .assistant])
+        XCTAssertEqual(model.messages.map(\.role), [.user, .assistant, .assistant, .assistant])
         XCTAssertNil(model.messages[0].historyTimeline)
         let first = try XCTUnwrap(model.messages[1].historyTimeline)
         XCTAssertEqual(first.blocks.count, 1)
@@ -912,10 +1015,9 @@ final class RelayChatLiveDataTests: XCTestCase {
         XCTAssertEqual(first.step("h1")?.duration(now: Date()), 1)
         XCTAssertEqual(first.step("h2")?.status, .failed)
 
-        // Trailing steps attach to the last assistant message. In a thread
-        // that is no longer working, a step left running was interrupted and
-        // one that names no status ran to completion.
-        let last = try XCTUnwrap(model.messages[2].historyTimeline)
+        // Steps that happened after the final prose keep their own place.
+        XCTAssertNil(model.messages[2].historyTimeline)
+        let last = try XCTUnwrap(model.messages.last?.historyTimeline)
         XCTAssertEqual(last.step("h3")?.status, .cancelled)
         XCTAssertEqual(last.step("h4")?.status, .done)
         XCTAssertTrue(last.runningSteps.isEmpty)
@@ -987,7 +1089,7 @@ final class RelayChatLiveDataTests: XCTestCase {
 
         XCTAssertEqual(
             model.messages.map { $0.job?.id ?? $0.text },
-            ["job-old", "Older question", "Older answer.", "Run the tests", "job-live"]
+            ["Something the transcript never recorded", "job-old", "Older question", "Older answer.", "Run the tests", "job-live"]
         )
         XCTAssertEqual(model.messages.filter { $0.role == .job }.map(\.hidesJobAnswer), [false, false])
         try await waitUntil("the active job of an opened thread is attached") { script.streamCalls.count == 1 }
@@ -1023,6 +1125,31 @@ final class RelayChatLiveDataTests: XCTestCase {
     }
 
     // MARK: Tool-less chat
+
+    func testARejectedHandoffRestoresTheDraftWithoutASentBubble() async throws {
+        let script = LiveScript()
+        var sent = false
+        let model = RelayChatViewModel(
+            client: CodexClient(baseURL: URL(string: "http://127.0.0.1:9")!, identityStore: ClientIdentityStore()),
+            workspaceID: "ws", workspacePath: nil,
+            submitJob: { _ in
+                sent = true
+                throw CodexClientError.httpFailure(409, "This conversation is still open in Claude Desktop.")
+            },
+            live: script.source()
+        )
+        let descriptor = try JSONDecoder().decode(CodexModelDescriptor.self, from: Data(
+            #"{"id":"claude-default","label":"Claude Code","provider":"claude","modes":["task"]}"#.utf8
+        ))
+        model.selectChoice(RelayModelChoice(model: descriptor, mode: .task))
+        model.prompt = "Continue where I left off"
+        await model.sendCurrentPrompt()
+        XCTAssertTrue(sent)
+        XCTAssertEqual(model.prompt, "Continue where I left off")
+        XCTAssertTrue(model.messages.isEmpty, "A rejected prompt must not look like part of the saved conversation")
+        XCTAssertTrue(model.errorMessage?.contains("Claude Desktop") == true)
+        XCTAssertFalse(model.isSending)
+    }
 
     private func chatModel() throws -> CodexModelDescriptor {
         try XCTUnwrap(try CodexClient.makeDecoder().decode(

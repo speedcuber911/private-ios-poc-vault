@@ -2,9 +2,7 @@ import SwiftUI
 
 /// A session handed over from a Mac, waiting to be picked up here.
 ///
-/// Editorial Ember: one outlined card on the canvas, small-caps words for
-/// status (never a dot), the branch in the mono face, ember reserved for the
-/// single primary action.
+/// A quiet session summary with one clear continuation action.
 struct RelayHandoffCardView: View {
     let card: RelayHandoffCard
     let manifest: RelayHandoffManifest?
@@ -16,7 +14,7 @@ struct RelayHandoffCardView: View {
             header
 
             Text(card.title)
-                .font(AppTheme.serifFont(size: 18))
+                .font(AppTheme.uiFont(size: 18, weight: .semibold))
                 .foregroundStyle(AppTheme.textPrimary)
                 .fixedSize(horizontal: false, vertical: true)
 
@@ -54,16 +52,6 @@ struct RelayHandoffCardView: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(card.isActionable ? sessionProvider.relayPresentation.accent.opacity(0.4) : AppTheme.hairline, lineWidth: 1)
-        }
-        .overlay(alignment: .leading) {
-            RoundedRectangle(cornerRadius: 2)
-                .fill(sessionProvider.relayPresentation.accent)
-                .frame(width: 3)
-                .padding(.vertical, 12)
-        }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(sessionProvider.relayPresentation.title) handoff, \(card.statusLabel)")
     }

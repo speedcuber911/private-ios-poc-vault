@@ -409,7 +409,7 @@ final class ChatsFeedTests: XCTestCase {
 
         // Polls only while the list is on screen, at the gentler cadence.
         XCTAssertTrue(root.contains("await statusFeedViewModel.pollWhileVisible()"))
-        XCTAssertTrue(root.contains("guard scenePhase == .active, chatLaunch == nil else { return }"))
+        XCTAssertTrue(root.contains("guard selectedRootTab == .sessions, showingSidebar else { return }"))
         XCTAssertFalse(root.contains("Task.sleep(for: .seconds(2))"))
         XCTAssertGreaterThanOrEqual(StatusFeedViewModel.pollInterval, 4)
         XCTAssertLessThanOrEqual(StatusFeedViewModel.pollInterval, 5)

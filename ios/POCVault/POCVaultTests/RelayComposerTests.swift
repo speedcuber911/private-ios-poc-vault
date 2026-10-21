@@ -53,6 +53,32 @@ final class RelayComposerTests: XCTestCase {
 
     // MARK: Pill
 
+    @MainActor
+    func testChoosingAProjectKeepsDraftAndModelEvenWhenReusingItsSession() throws {
+        let client = CodexClient(baseURL: URL(string: "http://127.0.0.1:9")!, identityStore: ClientIdentityStore())
+        let store = RelayChatSessionStore(client: client)
+        let original = store.session(forFolderPath: nil)
+        let model = try choice("claude-sonnet", in: sections())
+        original.selectChoice(model)
+        original.prompt = "Review this change\nKeep this second line."
+        XCTAssertTrue(original.needsProjectForTask)
+
+        let scoped = store.launchNewSession(folderPath: "/repo", workspaceID: "repo", preservingDraftFrom: original)
+        XCTAssertEqual(scoped.viewModel.prompt, original.prompt)
+        XCTAssertEqual(scoped.viewModel.selectedChoice?.id, model.id)
+        XCTAssertFalse(scoped.viewModel.needsProjectForTask)
+        XCTAssertFalse(scoped.presentsProviderPicker)
+        scoped.viewModel.adoptWorkspaceID("repo", name: "My project")
+        XCTAssertEqual(scoped.viewModel.projectLabel, "My project")
+        scoped.viewModel.adoptWorkspaceID("another-repo", name: "Other project")
+        XCTAssertEqual(scoped.viewModel.projectLabel, "My project", "A history refresh cannot change this chat's project")
+
+        let same = store.launchNewSession(folderPath: "/repo", workspaceID: "repo", preservingDraftFrom: scoped.viewModel)
+        XCTAssertEqual(same.viewModel.prompt, "Review this change\nKeep this second line.")
+        XCTAssertEqual(same.viewModel.selectedChoice?.id, model.id)
+        XCTAssertTrue(same.viewModel.messages.isEmpty)
+    }
+
     func testEffortLabelFollowsSelectionAndHidesWithoutEfforts() {
         XCTAssertNil(RelayComposerLogic.effortLabel(efforts: [], selected: nil))
         XCTAssertNil(RelayComposerLogic.effortLabel(efforts: [], selected: .high))
@@ -354,6 +380,45 @@ final class RelayComposerTests: XCTestCase {
     }
 
     // MARK: Pasting pictures
+
+    @MainActor
+    private final class SelectionProbe: ObservableObject {
+        @Published var text = "Keep this selected 👋🏽 text"
+        @Published var selection = NSRange(location: 5, length: 13)
+        @Published var height: CGFloat = 28
+    }
+
+    private struct SelectionHarness: View {
+        @ObservedObject var probe: SelectionProbe
+        var body: some View {
+            RelayCommandTextEditor(
+                text: $probe.text, selection: $probe.selection,
+                isFocused: .constant(false), height: $probe.height
+            )
+        }
+    }
+
+    @MainActor
+    func testComposerPreservesTextSelectionAcrossViewUpdates() async throws {
+        let probe = SelectionProbe()
+        let host = UIHostingController(rootView: SelectionHarness(probe: probe))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 220))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.layoutIfNeeded()
+        func editor(in view: UIView) -> RelayComposerTextView? {
+            if let editor = view as? RelayComposerTextView { return editor }
+            return view.subviews.lazy.compactMap { editor(in: $0) }.first
+        }
+        let field = try XCTUnwrap(editor(in: host.view))
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(field.selectedRange, NSRange(location: 5, length: 13))
+        // A normal SwiftUI update must not collapse the selected words to a caret.
+        probe.height = 40
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(field.selectedRange, NSRange(location: 5, length: 13))
+    }
 
     func testPastePlanAttachesPicturesAndKeepsWordsAsWords() {
         let plan = RelayComposerLogic.pastePlan(itemTypes: [

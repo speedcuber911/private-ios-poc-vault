@@ -24,7 +24,7 @@ struct RelayActivityRequest: Identifiable, Hashable {
 }
 
 enum RelayActivitySheetStyle {
-    static let ground = Color(hex: 0x211E1A)
+    static let ground = AppTheme.bgCanvas
     static let cornerRadius: CGFloat = 34
     static let block = AppTheme.textPrimary.opacity(0.05)
     static let control = AppTheme.textPrimary.opacity(0.08)
@@ -34,7 +34,7 @@ enum RelayActivitySheetStyle {
     /// Blocks and grouped lists sit on the 16pt gutter; labels and bare prose
     /// align with the text inside them, 16pt further in.
     static let gutter: CGFloat = 16
-    static let textInset: CGFloat = 32
+    static let textInset: CGFloat = 24
     static let bottomPadding: CGFloat = 28
     /// The sheet grows with its content up to this share of the screen, then scrolls.
     static let maxScreenShare: CGFloat = 0.7
@@ -101,8 +101,9 @@ struct RelayActivitySheet: View {
         if let id = currentStepID {
             return timeline.step(id)?.title ?? "Step"
         }
-        let count = rootSteps.count
-        return count == 1 ? "1 step" : "\(count) steps"
+        let summary = RelayTimeline.summary(of: rootSteps)
+        if Set(rootSteps.map { $0.kind.rawValue }).count > 1 { return "\(rootSteps.count) steps" }
+        return summary.isEmpty ? "Activity" : summary
     }
 
     var body: some View {
@@ -159,7 +160,7 @@ struct RelayActivitySheet: View {
             .accessibilityIdentifier("relay-activity-close")
 
             Text(title)
-                .font(AppTheme.serifFont(size: 19, weight: .medium))
+                .font(AppTheme.uiFont(size: 17, weight: .semibold))
                 .foregroundStyle(AppTheme.textPrimary)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity)
@@ -213,19 +214,13 @@ struct RelayStepList: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            ForEach(Array(steps.enumerated()), id: \.element.id) { index, step in
-                if index > 0 {
-                    RelayHairline().padding(.horizontal, 16)
-                }
+            ForEach(steps) { step in
                 RelayStepRow(step: step, childCount: timeline.children(of: step.id).count) {
                     onOpen(step)
                 }
             }
         }
-        .background(
-            RelayActivitySheetStyle.block,
-            in: RoundedRectangle(cornerRadius: RelayActivitySheetStyle.groupRadius, style: .continuous)
-        )
+
         .padding(.horizontal, RelayActivitySheetStyle.gutter)
     }
 }
@@ -258,11 +253,15 @@ struct RelayStepRow: View {
     private var label: some View {
         let summary = step.rowSummary
         return HStack(spacing: 8) {
-            RelayCapsLabel(text: step.statusWord, color: step.statusColor, size: 10)
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
-                .frame(width: Self.wordColumn, alignment: .leading)
-            VStack(alignment: .leading, spacing: 2) {
+            Image(systemName: step.kind.symbol)
+                .font(AppTheme.uiFont(size: 16))
+                .foregroundStyle(AppTheme.textSecondary)
+                .frame(width: 24)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 5) {
+                Text(step.statusWord)
+                    .font(AppTheme.uiFont(size: 15))
+                    .foregroundStyle(step.status == .failed ? AppTheme.statusError : AppTheme.textPrimary)
                 Text(summary.text)
                     .font(summary.isCode ? RelayTranscriptStyle.mono : RelayTranscriptStyle.rowTitle)
                     .foregroundStyle(AppTheme.textPrimary)
@@ -270,7 +269,7 @@ struct RelayStepRow: View {
                     .truncationMode(.tail)
                 if let stepCount {
                     Text(stepCount)
-                        .font(.custom("DMSans-9ptRegular", size: 12, relativeTo: .caption))
+                        .font(AppTheme.uiFont(size: 12))
                         .foregroundStyle(AppTheme.textSecondary)
                         .lineLimit(1)
                 }
@@ -283,7 +282,8 @@ struct RelayStepRow: View {
         }
         .padding(.leading, 16)
         .padding(.trailing, 12)
-        .frame(minHeight: stepCount == nil ? 52 : 64)
+        .padding(.vertical, 10)
+        .frame(minHeight: 64)
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
     }
@@ -479,7 +479,7 @@ struct RelayStepDetail: View {
                 RelayStepDuration(step: step)
             }
             Text(step.displaySummary)
-                .font(.custom("DMSans-9ptRegular", size: 17, relativeTo: .headline).weight(.semibold))
+                .font(AppTheme.uiFont(size: 17, weight: .semibold))
                 .foregroundStyle(AppTheme.textPrimary)
                 .lineSpacing(3)
                 .fixedSize(horizontal: false, vertical: true)
@@ -516,16 +516,9 @@ struct RelayStepDetail: View {
             label(children.count == 1 ? "1 step" : "\(children.count) steps", isFirst: false)
             VStack(spacing: 0) {
                 ForEach(Array(children.enumerated()), id: \.element.id) { index, child in
-                    if index > 0 {
-                        RelayHairline().padding(.horizontal, 16)
-                    }
                     RelayStepRow(step: child, childCount: 0) { onOpenChild(child.id) }
                 }
             }
-            .background(
-                RelayActivitySheetStyle.block,
-                in: RoundedRectangle(cornerRadius: RelayActivitySheetStyle.groupRadius, style: .continuous)
-            )
             .padding(.horizontal, RelayActivitySheetStyle.gutter)
         }
 
@@ -544,7 +537,9 @@ struct RelayStepDetail: View {
 
     private func label(_ title: String, isFirst: Bool, trailing: RelayStepSection.Trailing? = nil) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            RelayCapsLabel(text: title, color: RelayActivitySheetStyle.label, size: 10)
+            Text(title)
+                .font(AppTheme.uiFont(size: 14, weight: .medium))
+                .foregroundStyle(RelayActivitySheetStyle.label)
             Spacer(minLength: 8)
             switch trailing {
             case .duration:
@@ -568,16 +563,35 @@ struct RelayStepDetail: View {
 
     @ViewBuilder
     private func sectionView(_ section: RelayStepSection, isFirst: Bool) -> some View {
-        label(section.title, isFirst: isFirst, trailing: section.trailing)
+        HStack(spacing: 8) {
+            label(section.title, isFirst: isFirst, trailing: section.trailing)
+            if let text = section.copyText {
+                RelayCopyButton(text: text)
+                    .padding(.trailing, RelayActivitySheetStyle.textInset)
+                    .padding(.top, isFirst ? 0 : 14)
+            }
+        }
         switch section.content {
         case .prose(let text):
-            textBlock(text, font: RelayTranscriptStyle.rowTitle, color: AppTheme.textPrimary, lineSpacing: 3)
+            Text(text)
+                .font(RelayTranscriptStyle.rowTitle)
+                .foregroundStyle(AppTheme.textPrimary)
+                .lineSpacing(3)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, RelayActivitySheetStyle.textInset)
         case .code(let text):
-            textBlock(text, font: RelayTranscriptStyle.mono, color: AppTheme.textPrimary, lineSpacing: 4)
+            Text(RelayCodeSyntax.highlighted(text, fileName: section.title == "Command" ? "command.sh" : "content.json"))
+                .font(RelayTranscriptStyle.mono)
+                .lineSpacing(4)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .modifier(RelayDetailBlock())
         case .output(let text):
             textBlock(text, font: RelayTranscriptStyle.clock, color: RelayChatStyle.secondary, lineSpacing: 3)
         case .failure(let text):
-            textBlock(text, font: RelayTranscriptStyle.rowTitle, color: AppTheme.statusError, lineSpacing: 3)
+            RelayInlineNotice(text: text).padding(.horizontal, RelayActivitySheetStyle.textInset)
         case .diff(let lines):
             RelayDiffBlock(lines: lines)
         case .plan(let items):
@@ -693,4 +707,204 @@ private extension RelayTodoItem {
     var isDone: Bool { normalized == "completed" || normalized == "done" }
     var isInProgress: Bool { normalized == "in_progress" || normalized == "doing" || normalized == "running" }
     var statusWord: String { isDone ? "Done" : isInProgress ? "Doing" : "To do" }
+}
+
+private extension RelayStepSection {
+    var copyText: String? {
+        switch content {
+        case .code(let text), .output(let text): return text
+        default: return nil
+        }
+    }
+}
+
+/// Provider usage belongs to the conversation, separate from the computer's
+/// CPU/memory monitor. Old machines and imported chats can have no telemetry.
+struct RelayConversationUsageSheet: View {
+    @ObservedObject var viewModel: RelayChatViewModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var refreshing = false
+    @State private var showingExplanation = false
+
+    private var usage: RelayTimelineUsage? { viewModel.conversationUsage }
+    private var limits: [RelayUsageLimit] { usage?.limits ?? [] }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            ScrollView {
+                VStack(alignment: .leading, spacing: 28) {
+                    if showingExplanation {
+                        Text("Context is the space used by the latest model request. Plan limits are shared with your other chats. These are the provider’s last reports; they update as it sends new data.")
+                            .font(.subheadline)
+                            .foregroundStyle(AppTheme.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    section("Context") { contextCard }
+                    section("Plan usage") {
+                        if limits.isEmpty {
+                            unavailable("Plan limits haven’t been reported by this connection.")
+                        } else {
+                            VStack(spacing: 12) {
+                                ForEach(limits.filter { $0.windowMinutes != 10080 }) { limit in limitCard(limit) }
+                                if limits.contains(where: { $0.windowMinutes == 10080 }) {
+                                    Text("Weekly limits")
+                                        .font(.subheadline)
+                                        .foregroundStyle(AppTheme.textSecondary)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .padding(.top, 12)
+                                    ForEach(limits.filter { $0.windowMinutes == 10080 }) { limit in limitCard(limit) }
+                                }
+                            }
+                        }
+                    }
+                    if let usage, usage.inputTokens != nil || usage.outputTokens != nil {
+                        section("Last turn") {
+                            HStack(spacing: 24) {
+                                tokenCount("Input tokens", value: usage.inputTokens)
+                                tokenCount("Output tokens", value: usage.outputTokens)
+                            }
+                        }
+                    }
+                    Text("Refresh checks your computer for newer reports. Older connections and imported chats may not include usage.")
+                        .font(.footnote)
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.horizontal, 24)
+                .padding(.top, 24)
+                .padding(.bottom, 32)
+            }
+            .scrollBounceBehavior(.basedOnSize)
+        }
+        .background(AppTheme.bgCanvas)
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+        .presentationCornerRadius(34)
+        .presentationBackground(AppTheme.bgCanvas)
+        .preferredColorScheme(.dark)
+    }
+
+    private var header: some View {
+        HStack {
+            Button { dismiss() } label: {
+                Image(systemName: "xmark").frame(width: 44, height: 44)
+                    .background(RelayActivitySheetStyle.control, in: Circle())
+            }
+            .frame(width: 80, alignment: .leading)
+            .accessibilityLabel("Close usage")
+            Spacer()
+            Text("Usage").font(.headline)
+            Spacer()
+            HStack(spacing: 0) {
+                Button {
+                    refreshing = true
+                    Task {
+                        await viewModel.refreshConversationUsage()
+                        refreshing = false
+                    }
+                } label: {
+                    Group {
+                        if refreshing { ProgressView().controlSize(.small) }
+                        else { Image(systemName: "arrow.clockwise") }
+                    }.frame(width: 44, height: 44)
+                }
+                .disabled(refreshing)
+                .accessibilityLabel("Refresh usage")
+                Button { withAnimation { showingExplanation.toggle() } } label: {
+                    Image(systemName: "info").frame(width: 36, height: 44)
+                }
+                .accessibilityLabel("About usage")
+            }
+            .background(RelayActivitySheetStyle.control, in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(AppTheme.textPrimary)
+        .padding(.horizontal, 20)
+        .padding(.top, 20)
+    }
+
+    private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title).font(.subheadline).foregroundStyle(AppTheme.textSecondary)
+            content()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder private var contextCard: some View {
+        if let usage, let tokens = usage.contextTokens {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Context window")
+                    Spacer()
+                    if let fraction = usage.contextFraction { Text(percent(fraction * 100)).foregroundStyle(AppTheme.textSecondary) }
+                }
+                if let fraction = usage.contextFraction {
+                    ProgressView(value: fraction).tint(fraction >= 0.8 ? .orange : AppTheme.accent)
+                        .accessibilityLabel("Context window")
+                        .accessibilityValue(percent(fraction * 100))
+                }
+                Text(usage.contextWindow.map { "\(tokens.formatted()) of \($0.formatted()) tokens" } ?? "\(tokens.formatted()) tokens · capacity not reported")
+                    .font(.footnote).foregroundStyle(AppTheme.textSecondary)
+                if let date = usage.contextReportedAt { reported(date) }
+            }
+            .usageSurface()
+        } else {
+            unavailable("Context usage hasn’t been reported for this chat.")
+        }
+    }
+
+    private func limitCard(_ limit: RelayUsageLimit) -> some View {
+        TimelineView(.periodic(from: .now, by: 60)) { context in
+            let expired = limit.hasReset(at: context.date)
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(limit.title)
+                    Spacer(minLength: 8)
+                    Text(expired ? "Awaiting update" : limit.usedPercent.map(percent) ?? (limit.status == "rejected" ? "Limit reached" : "Not reported"))
+                        .font(.subheadline).foregroundStyle(AppTheme.textSecondary)
+                }
+                if !expired, let value = limit.usedPercent {
+                    ProgressView(value: value, total: 100).tint(value >= 80 ? .orange : .blue)
+                        .accessibilityLabel(limit.title).accessibilityValue(percent(value))
+                }
+                if let date = limit.resetsAt {
+                    Text(expired ? "Last window ended \(date.formatted(date: .abbreviated, time: .shortened))" : "Resets \(date.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.footnote).foregroundStyle(AppTheme.textSecondary)
+                }
+                if let date = limit.reportedAt { reported(date) }
+            }
+            .usageSurface()
+        }
+    }
+
+    private func unavailable(_ message: String) -> some View {
+        Text(message).font(.subheadline).foregroundStyle(AppTheme.textSecondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 8)
+    }
+
+    private func reported(_ date: Date) -> some View {
+        Text("Reported \(date.formatted(date: .abbreviated, time: .shortened))")
+            .font(.caption).foregroundStyle(AppTheme.textSecondary)
+    }
+
+    private func tokenCount(_ title: String, value: Int?) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(value.map { $0.formatted() } ?? "—").font(.title3.monospacedDigit())
+            Text(title).font(.footnote).foregroundStyle(AppTheme.textSecondary)
+        }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func percent(_ value: Double) -> String { "\(Int(value.rounded()))% used" }
+}
+
+private extension View {
+    func usageSurface() -> some View {
+        self.font(.body).foregroundStyle(AppTheme.textPrimary)
+            .padding(18)
+            .background(RelayActivitySheetStyle.block, in: RoundedRectangle(cornerRadius: 22))
+    }
 }

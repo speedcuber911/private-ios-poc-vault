@@ -88,7 +88,7 @@ struct NodePairingView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text("Connect your machine")
-                            .font(AppTheme.serifFont(size: 31))
+                            .font(AppTheme.uiFont(size: 31, weight: .semibold))
                             .foregroundStyle(AppTheme.textPrimary)
                         RelayInfoButton(
                             title: "Pairing",
@@ -261,7 +261,7 @@ struct NodePairingView: View {
                 ProgressView().tint(AppTheme.accent)
             }
             Text(title)
-                .font(AppTheme.serifFont(size: 28))
+                .font(AppTheme.uiFont(size: 28, weight: .semibold))
                 .foregroundStyle(AppTheme.textPrimary)
             Text(detail)
                 .font(AppTheme.uiFont(size: 15))
@@ -281,7 +281,7 @@ struct NodePairingView: View {
                 .font(.system(size: 32, weight: .medium))
                 .foregroundStyle(isSecurityEvent ? AppTheme.statusError : AppTheme.statusWarn)
             Text(isSecurityEvent ? "Pairing stopped" : "Couldn't pair")
-                .font(AppTheme.serifFont(size: 28))
+                .font(AppTheme.uiFont(size: 28, weight: .semibold))
                 .foregroundStyle(AppTheme.textPrimary)
             Text(message)
                 .font(AppTheme.uiFont(size: 15))
@@ -360,7 +360,7 @@ struct NodeVerificationView: View {
             Spacer()
 
             Text("Check the code")
-                .font(AppTheme.serifFont(size: 30))
+                .font(AppTheme.uiFont(size: 30, weight: .semibold))
                 .foregroundStyle(AppTheme.textPrimary)
 
             Text(code)
@@ -418,7 +418,7 @@ struct NodeVerificationView: View {
                 .font(.system(size: 32, weight: .medium))
                 .foregroundStyle(AppTheme.statusError)
             Text("Unpair and revoke")
-                .font(AppTheme.serifFont(size: 28))
+                .font(AppTheme.uiFont(size: 28, weight: .semibold))
                 .foregroundStyle(AppTheme.textPrimary)
             Text("Something else answered the pairing request. This phone already holds a credential it issued, so removing it here is only half the job — revoke it on your machine as well.")
                 .font(AppTheme.uiFont(size: 15))

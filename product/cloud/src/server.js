@@ -946,14 +946,27 @@ export function createApp({
     // dropped instead of refused.
     if (method === "POST" && path === "/v1/node/heartbeat") {
       const pathWithQuery = `${path}${url.search}`;
-      const verified = verifyNodeRequest(req, pathWithQuery, { registry, now, replayGuard: handoffReplayGuard });
+      // Pair-first machines have a power identity before an optional account
+      // enrollment. Accept that key for this presence/keep-awake route only;
+      // it must not grant account, handoff, or credential-sync access.
+      const heartbeatRegistry = { getNode(id) {
+        const accountNode = registry.getNode(id);
+        if (accountNode) return accountNode;
+        const paired = power.get(id);
+        return paired ? { id: paired.node_id, pubkey: paired.pubkey } : null;
+      } };
+      const verified = verifyNodeRequest(req, pathWithQuery, { registry: heartbeatRegistry, now, replayGuard: handoffReplayGuard });
       if (verified.error) return sendJson(res, 401, { error: "unauthorized" });
       const body = await readJson(req, config.jsonBodyMaxBytes);
-      registry.touchNode(verified.node.id, {
-        version: heartbeatVersionPatch(body?.version),
-        channel: heartbeatChannelPatch(body?.channel),
-        pendingVersion: heartbeatVersionPatch(body?.pendingVersion),
-      });
+      if (registry.getNode(verified.node.id)) {
+        registry.touchNode(verified.node.id, {
+          version: heartbeatVersionPatch(body?.version),
+          channel: heartbeatChannelPatch(body?.channel),
+          pendingVersion: heartbeatVersionPatch(body?.pendingVersion),
+        });
+      }
+      // AWS latency must not delay the node's liveness acknowledgement.
+      void power.recordActivity(verified.node.id, body?.keepAwakeUntil).catch(() => null);
       return sendJson(res, 200, { ok: true, lastSeen: now() });
     }
 

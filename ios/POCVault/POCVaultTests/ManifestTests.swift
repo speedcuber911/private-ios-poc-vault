@@ -8,9 +8,9 @@ final class ManifestTests: XCTestCase {
         let root = try AppSourceFixture.load("POCVault/POCVaultApp.swift")
         let library = try AppSourceFixture.load("POCVault/Views/LibraryView.swift")
         XCTAssertTrue(root.contains("case previews"))
-        XCTAssertTrue(root.contains(".tag(RelayRootTab.previews)"))
+        XCTAssertTrue(root.contains("case .previews:"))
         XCTAssertTrue(root.contains("selectedRootTab = .previews"))
-        XCTAssertTrue(root.contains("relay-previews-tab"))
+        XCTAssertTrue(root.contains("sidebarAction(\"Previews\""))
         XCTAssertFalse(root.contains("identityStore.$lastImportedCertificateName.dropFirst()"))
         XCTAssertFalse(root.contains(".id(previewIdentityRevision)"))
         XCTAssertFalse(root.contains("manifestClient"))
@@ -152,7 +152,7 @@ final class ManifestTests: XCTestCase {
         let normalHistory = store.launch(folderPath: nil, workspaceID: "scratch")
         XCTAssertTrue(normalHistory.automaticallyOpensPreviews)
         XCTAssertTrue(source.viewModel === normalHistory.viewModel, "Presentation intent must not change the cached conversation")
-        XCTAssertTrue(store.launchNewSession(folderPath: nil, workspaceID: "scratch").automaticallyOpensPreviews)
+        XCTAssertFalse(store.launchNewSession(folderPath: nil, workspaceID: "scratch").automaticallyOpensPreviews)
 
         let chat = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
         let candidate = try sourceSnippet(in: chat, from: "private var automaticPreviewCandidate", to: "private func openRequestedPreviewIfNeeded")
@@ -161,7 +161,7 @@ final class ManifestTests: XCTestCase {
         let sourceRoute = try sourceSnippet(in: root, from: "private func openPreviewSourceJob", to: "private var shouldStartAgentMonitor")
         XCTAssertTrue(sourceRoute.contains("automaticallyOpensPreviews: false"))
         XCTAssertTrue(sourceRoute.contains("openHistoryItem(item)"))
-        XCTAssertTrue(root.contains("automaticallyOpensPreviews: launch.automaticallyOpensPreviews"))
+        XCTAssertTrue(root.contains("automaticallyOpensPreviews: false"))
     }
 
     func testCodexJobDisplayOutputPrefersSingleResultWhenStreamsDuplicate() throws {
@@ -227,7 +227,8 @@ final class ManifestTests: XCTestCase {
     func testAIDataConsentIsReachableBeforeProviderConnectionOrSend() throws {
         let source = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
 
-        XCTAssertTrue(source.contains("presentAIDataConsentIfNeeded()"))
+        XCTAssertTrue(source.contains("RelayAIDataConsentStore.hasConsent(for: provider)"))
+        XCTAssertTrue(source.contains("purpose: .sendPrompt"))
         XCTAssertTrue(source.contains("purpose: .review"))
         // Persistent composer row removed; disclosure stays reachable from the overflow menu.
         XCTAssertTrue(source.contains("relay-chat-overflow"))
@@ -935,8 +936,8 @@ final class ManifestTests: XCTestCase {
 
     func testRelayDesignTokensUseEditorialEmberPalette() throws {
         assertColor(AppTheme.canvasTop, red: 0x1E, green: 0x1B, blue: 0x17, alpha: 1)
-        assertColor(AppTheme.canvasBottom, red: 0x15, green: 0x13, blue: 0x10, alpha: 1)
-        assertColor(AppTheme.bgCanvas, red: 0x1A, green: 0x18, blue: 0x15, alpha: 1)
+        assertColor(AppTheme.canvasBottom, red: 0x1C, green: 0x1B, blue: 0x19, alpha: 1)
+        assertColor(AppTheme.bgCanvas, red: 0x23, green: 0x22, blue: 0x20, alpha: 1)
         assertColor(AppTheme.textPrimary, red: 0xED, green: 0xE8, blue: 0xDF, alpha: 1)
         assertColor(AppTheme.textSecondary, red: 0xED, green: 0xE8, blue: 0xDF, alpha: 0.55)
         assertColor(AppTheme.textTertiary, red: 0xED, green: 0xE8, blue: 0xDF, alpha: 0.38)
@@ -1077,24 +1078,24 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(chatSource.contains("TimelineView"))
     }
 
-    func testRootUsesNativeTabsIncludingPreviewsWhileKeepingFileBrowserNavigation() throws {
+    func testRootOpensChatWithSidebarAndKeepsToolsReachable() throws {
         let source = try AppSourceFixture.load("POCVault/POCVaultApp.swift")
         let browserSource = try AppSourceFixture.load("POCVault/Browser/FileBrowserView.swift")
 
-        // Chats is home; Folders keeps real BrowserRoute navigation, and Previews
-        // and Settings remain directly accessible through native tabs.
+        // Chat is home. Files, previews, and settings remain in the sidebar.
         XCTAssertTrue(source.contains("NavigationStack(path: $browserPath)"))
         XCTAssertTrue(source.contains(".navigationDestination(for: BrowserRoute.self)"))
         XCTAssertTrue(source.contains("case folder(path: String)"))
         XCTAssertTrue(source.contains("case file(entry: CodexWorkspaceDirectoryEntry)"))
         XCTAssertTrue(source.contains("FileViewerView("))
         XCTAssertFalse(source.contains("FileViewerPlaceholderView"))
-        XCTAssertTrue(source.contains("TabView(selection: $selectedRootTab)"))
-        XCTAssertTrue(source.contains("Label(\"Folders\""))
-        XCTAssertTrue(source.contains("Label(\"Previews\""))
-        XCTAssertTrue(source.contains("Label(\"Chats\""))
-        XCTAssertTrue(source.contains("Label(\"Settings\""))
-        XCTAssertTrue(source.contains("@State private var selectedRootTab = RelayRootTab.sessions"))
+        XCTAssertFalse(source.contains("TabView(selection: $selectedRootTab)"))
+        XCTAssertTrue(source.contains("private var chatShell: some View"))
+        XCTAssertTrue(source.contains("RelayChatSidebar("))
+        XCTAssertTrue(source.contains("sidebarAction(\"Files\""))
+        XCTAssertTrue(source.contains("sidebarAction(\"Previews\""))
+        XCTAssertTrue(source.contains("sidebarAction(\"Settings\""))
+        XCTAssertTrue(source.contains("if chatLaunch == nil"))
         XCTAssertFalse(source.contains("RelayTabBar"))
 
         // Sessions must not keep the empty snapshot it may have loaded before the user
@@ -1103,7 +1104,7 @@ final class ManifestTests: XCTestCase {
         // stops while the app is backgrounded or a chat covers the list.
         XCTAssertTrue(source.contains(".task(id: RelayChatsPolling("))
         XCTAssertTrue(source.contains("tab: selectedRootTab,"))
-        XCTAssertTrue(source.contains("guard selectedRootTab == .sessions else { return }"))
+        XCTAssertTrue(source.contains("guard selectedRootTab == .sessions, showingSidebar else { return }"))
         XCTAssertTrue(source.contains("await statusFeedViewModel.refresh()"))
         XCTAssertFalse(source.contains("bootstrapIfNeeded"))
 
@@ -1116,7 +1117,7 @@ final class ManifestTests: XCTestCase {
         // a cover. Published content is full-screen inside the preview feature.
         XCTAssertTrue(source.contains("RelayPreviewsView("))
         XCTAssertFalse(source.contains(".fullScreenCover(isPresented: $showingLibrary)"))
-        XCTAssertTrue(source.contains(".fullScreenCover(item: $chatLaunch)"))
+        XCTAssertFalse(source.contains(".fullScreenCover(item: $chatLaunch)"))
         XCTAssertFalse(source.contains(".sheet(isPresented: $showingStatus)"))
         XCTAssertTrue(source.contains(".sheet(isPresented: $showingDiagnostics)"))
 
@@ -1124,12 +1125,10 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(source.contains("chatSessionStore.monitorActiveWorkWhileAppIsOpen()"))
         XCTAssertTrue(source.contains("CodexAgentMonitorPolicy.shouldStartAppMonitor"))
 
-        // Settings lives under the tab bar, so the Form must not bounce when
-        // the page fits and must keep the last section above the tabs.
-        // Explainer copy sits behind RelayInfoButton, not Form footers.
+        // Settings is a sheet with open sections. Explainer copy stays behind
+        // the info control, and short pages do not bounce.
         let settings = try AppSourceFixture.load("POCVault/Views/AccountSettingsView.swift")
         XCTAssertTrue(settings.contains("scrollBounceBehavior(.basedOnSize)"))
-        XCTAssertTrue(settings.contains("contentMargins(.bottom"))
         XCTAssertTrue(settings.contains("adoptPlaces(") || settings.contains("adoptPlaces ("))
         XCTAssertTrue(settings.contains("RelayFormHeader"))
         XCTAssertTrue(settings.contains("RelayMachinePowerSwitch"))
@@ -1330,7 +1329,7 @@ final class ManifestTests: XCTestCase {
         )
 
         XCTAssertTrue(launch.viewModel === cached, "The folder cache should be reused without reopening its old thread")
-        XCTAssertTrue(launch.presentsProviderPicker, "A new session should ask whether to use Codex, Claude Code, or another available runner")
+        XCTAssertFalse(launch.presentsProviderPicker, "A new chat opens directly; the model remains available in the composer")
         XCTAssertTrue(cached.prompt.isEmpty)
         XCTAssertNil(cached.errorMessage)
         XCTAssertTrue(cached.messages.isEmpty)
@@ -3068,7 +3067,7 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(composerSource.contains("colors: [AppTheme.bgCanvas.opacity(0), AppTheme.bgCanvas]"))
         XCTAssertFalse(composerSource.contains("Rectangle().fill(AppTheme.hairline).frame(height: 1)"))
         XCTAssertFalse(composerSource.contains(".frame(height: 2)"))
-        XCTAssertTrue(composerSource.contains("Message, or / for commands"))
+        XCTAssertTrue(composerSource.contains("Message Relay…"))
     }
 
     func testRelayComposerIsPinnedOutsideTheConversationScrollView() throws {
@@ -3081,7 +3080,7 @@ final class ManifestTests: XCTestCase {
 
         XCTAssertTrue(chatSource.contains(".safeAreaInset(edge: .bottom, spacing: 0)"))
         XCTAssertTrue(chatSource.contains(".fixedSize(horizontal: false, vertical: true)"))
-        XCTAssertTrue(chatSource.contains("messageList\n                        .layoutPriority(1)"))
+        XCTAssertTrue(chatSource.contains(".layoutPriority(1)"))
     }
 
     func testRelayComposerDoesNotOfferCrossProviderSwitchingInsideAThread() throws {
@@ -3196,12 +3195,12 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(rowSource.contains("activityStamp"))
         XCTAssertTrue(source.contains("try? await Task.sleep(for: .seconds(4))"))
         XCTAssertTrue(source.contains("await viewModel.openHistoryItem(item)"))
-        XCTAssertTrue(source.contains("Text(\"Threads\")"))
+        XCTAssertTrue(source.contains("Label(\"Threads\", systemImage:"))
         // The explanatory subtitle was dropped by the Editorial Ember copy rule; the
         // row is still reachable and labeled for VoiceOver.
         XCTAssertFalse(source.contains("Past conversations & invocations"))
         XCTAssertTrue(source.contains(".accessibilityIdentifier(\"relay-threads\")"))
-        XCTAssertTrue(source.contains("conversations and invocations"))
+        XCTAssertTrue(source.contains("Open threads sidebar"))
         XCTAssertTrue(source.contains(".navigationTitle(\"Threads\")"))
         XCTAssertFalse(source.contains("clock.arrow.circlepath"))
         XCTAssertTrue(source.contains("@State private var fullLogRequest: RelayFullLogRequest?"))
@@ -4495,7 +4494,7 @@ final class RelayTranscriptViewTests: XCTestCase {
         let block = try XCTUnwrap(timeline.blocks.first)
 
         let live = timeline.countedSteps(in: block, isActive: true)
-        XCTAssertEqual(RelayTimeline.summary(of: live), "Read a file")
+        XCTAssertEqual(RelayTimeline.summary(of: live), "Read: pricing.ts")
         XCTAssertEqual(timeline.runningSteps.map(\.id), ["s2"])
         XCTAssertEqual(timeline.runningSteps.first?.statusWord, "Running")
         XCTAssertEqual(timeline.runningSteps.first?.liveDetail, "Run the pricing tests")
@@ -4603,7 +4602,7 @@ final class RelayTranscriptViewTests: XCTestCase {
         XCTAssertFalse(list.contains("viewModel.isStreaming"))
 
         // Sending returns to the end; the keyboard and refresh contracts survive.
-        let send = try snippet(in: chat, from: "private func sendPrompt()", to: "private func presentAIDataConsentIfNeeded")
+        let send = try snippet(in: chat, from: "private func sendPrompt()", to: "private func presentAIDataConsent(")
         XCTAssertTrue(send.contains("scroller.jumpToLatest()"))
         XCTAssertTrue(list.contains(".scrollDismissesKeyboard(.interactively)"))
         XCTAssertTrue(list.contains(".refreshable"))
@@ -4638,7 +4637,7 @@ final class RelayTranscriptViewTests: XCTestCase {
         // History: the steps before a message sit above its prose.
         let bubble = try snippet(in: chat, from: "private struct RelayChatBubble", to: "private struct RelayDraftAttachmentStrip")
         XCTAssertTrue(bubble.contains("if let timeline = item.historyTimeline {"))
-        XCTAssertTrue(bubble.contains("RelayActivityRow("))
+        XCTAssertTrue(bubble.contains("RelayTimelineBlocks("))
 
         let rows = try AppSourceFixture.load("POCVault/Views/RelayTranscriptViews.swift")
         XCTAssertTrue(rows.contains("static let maxLiveRows = 3"))
@@ -4648,7 +4647,7 @@ final class RelayTranscriptViewTests: XCTestCase {
         // An approval parked on the job sits inside its turn, under "Waiting".
         XCTAssertTrue(turn.contains("ForEach(approvals) { approval in"))
         XCTAssertTrue(row.contains("approvals: approvals"))
-        XCTAssertTrue(rows.contains("Button(\"View full log\", action: onFullLog)"))
+        XCTAssertTrue(rows.contains("Button(\"Activity\", action: onFullLog)"))
         XCTAssertTrue(rows.contains("Button(isCancelling ? \"Stopping…\" : \"Stop\", action: onCancel)"))
     }
 
@@ -4663,7 +4662,9 @@ final class RelayTranscriptViewTests: XCTestCase {
             XCTAssertFalse(source.contains("Circle().fill(AppTheme.status"), file)
             XCTAssertFalse(source.contains("checkmark.circle.fill"), file)
             XCTAssertFalse(source.contains("play.fill"), file)
-            XCTAssertFalse(source.contains("ProgressView"), file)
+            if !file.contains("RelayActivitySheets") {
+                XCTAssertFalse(source.contains("ProgressView"), file)
+            }
             XCTAssertFalse(source.contains("Color.green"), file)
             XCTAssertFalse(source.contains("Color.red"), file)
         }
@@ -4671,10 +4672,10 @@ final class RelayTranscriptViewTests: XCTestCase {
         XCTAssertFalse(try AppSourceFixture.load("POCVault/Views/RelayChatView.swift").contains("RelayTypingDots"))
 
         let sheets = try AppSourceFixture.load("POCVault/Views/RelayActivitySheets.swift")
-        XCTAssertTrue(sheets.contains("static let ground = Color(hex: 0x211E1A)"))
+        XCTAssertTrue(sheets.contains("static let ground = AppTheme.bgCanvas"))
         XCTAssertTrue(sheets.contains("static let cornerRadius: CGFloat = 34"))
         XCTAssertTrue(sheets.contains(".presentationDragIndicator(.visible)"))
-        XCTAssertTrue(sheets.contains("AppTheme.serifFont(size: 19, weight: .medium)"))
+        XCTAssertTrue(sheets.contains("AppTheme.uiFont(size: 17, weight: .semibold)"))
         XCTAssertTrue(sheets.contains(".frame(width: 36, height: 36)"))
         XCTAssertTrue(sheets.contains(".preferredColorScheme(.dark)"))
         XCTAssertFalse(sheets.contains("NavigationStack"))
@@ -4685,7 +4686,7 @@ final class RelayTranscriptViewTests: XCTestCase {
         let approval = try AppSourceFixture.load("POCVault/Views/RelayApprovalCard.swift")
         XCTAssertTrue(approval.contains(".buttonStyle(RelayApprovalButtonStyle(isPrimary: false))"))
         XCTAssertTrue(approval.contains(".buttonStyle(RelayApprovalButtonStyle(isPrimary: true))"))
-        XCTAssertTrue(approval.contains(".background(isPrimary ? AppTheme.accent : Color.clear, in: Capsule())"))
+        XCTAssertTrue(approval.contains(".background(isPrimary ? AppTheme.accent : AppTheme.textPrimary.opacity(0.07), in: Capsule())"))
         XCTAssertFalse(approval.contains("RoundedRectangle(cornerRadius: 18"), "the approval is not a card")
         XCTAssertTrue(approval.contains("RelayCapsLabel(text: \"Needs approval\", color: AppTheme.statusWarn"))
         XCTAssertFalse(approval.contains(".borderedProminent"))
@@ -4801,12 +4802,11 @@ final class RelayTranscriptViewTests: XCTestCase {
         XCTAssertTrue(CodexJobStatus.failed.didFail)
     }
 
-    func testAnEmptyConversationShowsNothingAboveTheComposer() throws {
+    func testAnEmptyConversationOffersASimpleWelcomeAboveTheComposer() throws {
         let chat = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
-        // The composer's pill already names the model: no icon tile, headline,
-        // tagline or model badge on the empty canvas, and nothing in their place.
+        // A new chat has a simple welcome and composer, without a dashboard.
         XCTAssertFalse(chat.contains("RelayEmptyConversation"))
-        XCTAssertFalse(chat.contains("Start a conversation"))
+        XCTAssertTrue(chat.contains("Start a conversation"))
         XCTAssertFalse(chat.contains("Run a task"))
         XCTAssertFalse(chat.contains("Stream a reply scoped to this folder."))
         XCTAssertFalse(chat.contains("Queue an agent job in this folder."))
@@ -4815,8 +4815,8 @@ final class RelayTranscriptViewTests: XCTestCase {
         let list = try snippet(in: chat, from: "private var messageList: some View", to: "private func transcriptRow")
         XCTAssertTrue(list.contains("ProgressView(\"Loading conversation…\")"))
         XCTAssertTrue(list.contains(".refreshable"))
-        XCTAssertFalse(list.contains("viewModel.messages.isEmpty"))
-        XCTAssertTrue(chat.contains("messageList\n                        .layoutPriority(1)\n                        .contentShape(Rectangle())\n                        .simultaneousGesture(keyboardDismissTap)"))
+        XCTAssertTrue(chat.contains("if isEmptyConversation {\n                            welcomeCanvas"))
+        XCTAssertTrue(chat.contains(".contentShape(Rectangle())\n                    .simultaneousGesture(keyboardDismissTap)"))
     }
 
     func testNothingInTheTranscriptScrollsSideways() throws {

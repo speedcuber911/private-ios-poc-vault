@@ -141,6 +141,8 @@ export function createPower({
   const mutateHits = new Map();
   const advancing = new Set();
   const pushesInFlight = new Set();
+  const activityHolds = new Map();
+  const activityWrites = new Set();
 
   function get(nodeId) {
     return db.prepare("SELECT * FROM node_power WHERE node_id = ?").get(nodeId) || null;
@@ -367,6 +369,28 @@ export function createPower({
     } catch (error) {
       log(`power aws autostop failed for ${row.node_id}: ${error?.message || error}`);
       return { status: 502, body: { error: "power_aws_failed" } };
+    }
+  }
+
+  // Authenticated node heartbeats carry only an expiry. Never accept an
+  // instance id from that body, or let a node set an unbounded power hold.
+  async function recordActivity(nodeId, requestedUntil) {
+    if (typeof requestedUntil !== "number" || !Number.isFinite(requestedUntil)) return;
+    const row = get(nodeId);
+    if (!row || !configured() || !allowlist.has(row.instance_id)) return;
+    const stamp = now();
+    const until = Math.min(requestedUntil, stamp + 60 * 60 * 1000);
+    if (activityWrites.has(row.instance_id) || until <= stamp || until < (activityHolds.get(row.instance_id) || 0) + 5 * 60 * 1000) return;
+    activityWrites.add(row.instance_id);
+    try {
+      await client.createTags({ instanceId: row.instance_id, tags: { RelayKeepAwakeUntil: new Date(until).toISOString() } });
+      activityHolds.set(row.instance_id, until);
+    } catch {
+      // Do not turn an AWS outage into a disconnected Relay node. Retry on
+      // the next heartbeat; the previously written hold remains in force.
+      log(`power activity hold could not be refreshed for ${nodeId}`);
+    } finally {
+      activityWrites.delete(row.instance_id);
     }
   }
 
@@ -688,6 +712,7 @@ export function createPower({
     mutate,
     describe,
     setAutoStop,
+    recordActivity,
     requestResize,
     advanceResizes,
     subscribePush,

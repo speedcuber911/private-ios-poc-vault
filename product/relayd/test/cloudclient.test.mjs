@@ -67,6 +67,27 @@ test("heartbeat signs POST /v1/node/heartbeat and does not treat it as an event"
   }
 });
 
+test("activity holds are refreshed per heartbeat without a failed probe making the node unreachable", async () => {
+  const node = freshNode();
+  const cloud = await startFakeCloud((res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  try {
+    let expiry = 1234;
+    const client = createCloudClient({ cloudUrl: cloud.url, baseDir: node.baseDir, keepAwakeUntil: () => {
+      if (expiry === -1) throw new Error("probe failed");
+      return expiry;
+    } });
+    await client.heartbeat();
+    expiry = 5678;
+    await client.heartbeat();
+    expiry = -1;
+    await client.heartbeat();
+    assert.deepEqual(cloud.calls.map((call) => JSON.parse(call.raw).keepAwakeUntil), [1234, 5678, null]);
+  } finally { await cloud.close(); }
+});
+
 test("pollHandoffs signs the exact method, path, node id, and timestamp", async () => {
   const node = freshNode();
   const cloud = await startFakeCloud((res) => {

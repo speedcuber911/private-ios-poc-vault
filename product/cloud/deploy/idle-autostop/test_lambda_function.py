@@ -66,6 +66,19 @@ class IdleAutoStopTest(unittest.TestCase):
         self.run_with(instance("i-a", "pariksj-dev"))
         self.ec2.stop_instances.assert_not_called()
 
+    def test_active_relay_conversation_survives_low_cpu_and_network(self):
+        self.f.DRY_RUN = False
+        until = (NOW + datetime.timedelta(minutes=55)).isoformat()
+        results = self.run_with(instance("i-a", "komal-dev", RelayKeepAwakeUntil=until))
+        self.assertIn("Relay activity", results[0])
+        self.ec2.stop_instances.assert_not_called()
+
+    def test_missing_network_out_metrics_cannot_prove_idle(self):
+        self.f.DRY_RUN = False
+        self.metrics["netout0"] = series(0.5, points=0)
+        self.run_with(instance("i-a", "komal-dev"))
+        self.ec2.stop_instances.assert_not_called()
+
     def test_live_run_stops_and_tags_an_idle_machine(self):
         self.f.DRY_RUN = False
         results = self.run_with(instance("i-a", "pariksj-dev", AutoStopEnabled="true"))

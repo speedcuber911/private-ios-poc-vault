@@ -25,6 +25,56 @@ const {
 
 const SESSION_ID = "11111111-2222-4333-8444-555555555555";
 
+test("Codex event-only prompts and replies survive reopening on the phone", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-thread-events-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "rollout.jsonl");
+  fs.writeFileSync(file, [
+    { type: "session_meta", payload: { id: SESSION_ID, cwd: "/repo" } },
+    { type: "event_msg", timestamp: "2026-10-17T10:00:00Z", payload: { type: "user_message", message: "Continue from my desktop", images: [] } },
+    { type: "event_msg", timestamp: "2026-10-17T10:00:01Z", payload: { type: "agent_reasoning", text: "Internal reasoning" } },
+    { type: "event_msg", timestamp: "2026-10-17T10:00:02Z", payload: { type: "agent_message", message: "The change is ready." } },
+  ].map(JSON.stringify).join("\n") + "\n");
+  assert.deepEqual((await readSessionMessages(file)).map(({ role, text }) => [role, text]), [
+    ["user", "Continue from my desktop"], ["assistant", "The change is ready."],
+  ]);
+  assert.equal(readSessionSummary(file).firstUserPrompt, "Continue from my desktop");
+  assert.equal(readSessionSummary(file).lastAssistantAnswer, "The change is ready.");
+});
+
+test("Codex event mirrors do not duplicate turns or swallow repeated prompts", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-thread-mirrors-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  for (const eventFirst of [false, true]) {
+    const file = path.join(dir, `${eventFirst}.jsonl`);
+    const entries = [];
+    for (const [role, text] of [["user", "Again"], ["user", "Again"], ["assistant", "Done"]]) {
+      const event = { type: "event_msg", payload: { type: role === "user" ? "user_message" : "agent_message", message: text } };
+      const response = message(role, text);
+      entries.push(...(eventFirst ? [event, response] : [response, event]));
+    }
+    fs.writeFileSync(file, entries.map(JSON.stringify).join("\n") + "\n");
+    assert.deepEqual((await readSessionMessages(file)).map(({ role, text }) => [role, text]), [
+      ["user", "Again"], ["user", "Again"], ["assistant", "Done"],
+    ]);
+  }
+});
+
+test("Claude Desktop human-origin SDK prompts remain visible", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-thread-claude-desktop-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "claude.jsonl");
+  fs.writeFileSync(file, [
+    { type: "user", promptSource: "sdk", origin: { kind: "human" }, message: { role: "user", content: "Continue this work from desktop" } },
+    { type: "user", promptSource: "sdk", origin: { kind: "task-notification" }, message: { role: "user", content: "Background task completed" } },
+    { type: "assistant", message: { content: [{ type: "text", text: "I have the conversation." }] } },
+  ].map(JSON.stringify).join("\n") + "\n");
+  assert.deepEqual((await readSessionMessages(file)).map(({ role, text }) => [role, text]), [
+    ["user", "Continue this work from desktop"], ["assistant", "I have the conversation."],
+  ]);
+  assert.equal(readSessionSummary(file).firstUserPrompt, "Continue this work from desktop");
+});
+
 function message(role, text, timestamp) {
   return {
     type: "response_item",

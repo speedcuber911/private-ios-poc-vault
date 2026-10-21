@@ -3,6 +3,7 @@ import http from "node:http";
 import https from "node:https";
 import { execFile, spawn } from "node:child_process";
 import crypto from "node:crypto";
+import { assertClaudeSessionAvailable } from "./native-session-owner.mjs";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -279,6 +280,7 @@ function createJob(body, certSubject, validatedTaskSelection = null) {
     if (!resumeMetaBelongsToWorkspace(resumeMeta, workspace)) {
       throw Object.assign(new Error("session does not belong to workspace"), { status: 400 });
     }
+    if (provider === "claude") assertClaudeSessionAvailable(resumeSessionId, runHome);
   }
 
   const requestedTimeout = body.timeoutMs === undefined ? defaultTimeoutMs : Number(body.timeoutMs);
@@ -871,6 +873,19 @@ function processQueue() {
 
 
 function startJob(job) {
+  // The desktop may have opened the conversation while this job was queued.
+  if (job.provider === "claude" && job.resumeSessionId) {
+    try { assertClaudeSessionAvailable(job.resumeSessionId, runHome); }
+    catch (error) {
+      job.status = "failed";
+      job.error = error.message;
+      job.updatedAt = job.finishedAt = nowIso();
+      job.durationMs = 0;
+      touchJob(job, "job_failed");
+      void jobNotificationHook("job.failed", job).catch(() => null);
+      return;
+    }
+  }
   const startedAt = nowIso();
   job.status = "running";
   job.startedAt = startedAt;

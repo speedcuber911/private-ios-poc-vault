@@ -265,7 +265,7 @@ function spkiPinOf(pem) {
 // Every certificate the peer sent, leaf first.
 function servedChain({ port, host = "127.0.0.1" }) {
   return new Promise((resolve, reject) => {
-    const socket = tls.connect({ port, host, rejectUnauthorized: false, servername: host }, () => {
+    const socket = tls.connect({ port, host, rejectUnauthorized: false }, () => {
       const chain = [];
       const seen = new Set();
       let cert = socket.getPeerCertificate(true);

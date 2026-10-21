@@ -71,7 +71,7 @@ struct AuthenticationView: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text("Relay")
-                        .font(AppTheme.serifFont(size: 40))
+                        .font(AppTheme.uiFont(size: 40, weight: .semibold))
                         .foregroundStyle(AppTheme.textPrimary)
                     RelayInfoButton(
                         title: "Relay",
@@ -219,15 +219,7 @@ struct AuthenticationView: View {
     }
 
     private func errorBanner(_ text: String) -> some View {
-        Text(text)
-            .font(AppTheme.uiFont(size: 13))
-            .foregroundStyle(AppTheme.statusError)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(12)
-            .overlay {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(AppTheme.statusError.opacity(0.3), lineWidth: 1)
-            }
+        RelayInlineNotice(text: text)
     }
 
     private var credentialsAreValid: Bool {

@@ -439,9 +439,12 @@ final class RelayChatViewModel: ObservableObject {
     /// waiting on `fetchThreadDetail`. Cleared when detail lands or the request fails.
     @Published private(set) var isLoadingThreadDetail = false
     /// Session id of a native Codex or Claude Code run the open chat is
-    /// following. Nil when the open thread is idle.
+    /// following, including an idle conversation that may resume on desktop.
     @Published private(set) var watchedSessionID: String?
+    @Published private(set) var sessionControl: CodexThread.SessionControl?
     private var nativeWatchQuietSince: Date?
+    private var isRefreshingWatchedThread = false
+    var nativeWatchPollInterval: TimeInterval { nativeWatchQuietSince == nil ? 2 : 10 }
     @Published private(set) var cancellingJobIDs: Set<String> = []
     /// The explicit model+mode selection. Never inferred from `supports(.task)`; the mode
     /// travels with the choice from the picker section it was tapped in.
@@ -506,7 +509,7 @@ final class RelayChatViewModel: ObservableObject {
     /// workspace-root chat.
     let workspacePath: String?
 
-    private var registeredWorkspaceName: String?
+    @Published private var registeredWorkspaceName: String?
 
     /// Id of the assistant message currently streaming, or nil when idle. The composer
     /// flips its send button to a stop button while this is set.
@@ -516,6 +519,7 @@ final class RelayChatViewModel: ObservableObject {
     private let live: RelayChatLiveSource
     private let fetchModels: () async throws -> [CodexModelDescriptor]
     private let fetchJobDetail: (String) async throws -> CodexJob
+    private let submitJob: (CodexCreateJobRequest) async throws -> CodexCreateJobResponse
     private let fetchThreadDetail: (String, String?, CodexProvider) async throws -> CodexThreadDetail
     private let effortDefaults: UserDefaults
     private var selectedEffortKey: String?
@@ -581,10 +585,6 @@ final class RelayChatViewModel: ObservableObject {
     nonisolated static let streamRetryAfterGivingUp: TimeInterval = 30
 
     private static let liveTailCharacterCap = 12_000
-    /// Keep following a native transcript through long tool calls. The list drops
-    /// the Running pin after a few quiet minutes; an open chat waits longer so a
-    /// thinking pause does not freeze the transcript.
-    private static let nativeWatchQuietLimit: TimeInterval = 15 * 60
     private static let claudePermissionDefaultsKey = "relay.claude.permissionMode"
     private static let codexApprovalDefaultsKey = "relay.codex.approvalPolicy"
     private static let codexSandboxDefaultsKey = "relay.codex.sandbox"
@@ -628,6 +628,7 @@ final class RelayChatViewModel: ObservableObject {
         workspacePath: String?,
         fetchModels: (() async throws -> [CodexModelDescriptor])? = nil,
         fetchJobDetail: ((String) async throws -> CodexJob)? = nil,
+        submitJob: ((CodexCreateJobRequest) async throws -> CodexCreateJobResponse)? = nil,
         fetchThreadDetail: ((String, String?, CodexProvider) async throws -> CodexThreadDetail)? = nil,
         effortDefaults: UserDefaults = .standard,
         live: RelayChatLiveSource? = nil,
@@ -641,6 +642,7 @@ final class RelayChatViewModel: ObservableObject {
         self.fetchJobDetail = fetchJobDetail ?? { id in
             try await client.fetchJob(id: id, includeFullLogs: false)
         }
+        self.submitJob = submitJob ?? { try await client.createJob($0) }
         self.fetchThreadDetail = fetchThreadDetail ?? { sessionID, workspaceID, provider in
             try await client.fetchThreadDetail(
                 sessionID: sessionID,
@@ -688,12 +690,26 @@ final class RelayChatViewModel: ObservableObject {
         workspacePath
     }
 
+    var projectLabel: String? {
+        currentThreadWorkspaceName ?? registeredWorkspaceName
+            ?? workspacePath.map { URL(fileURLWithPath: $0).lastPathComponent }
+            ?? currentThreadWorkspaceID ?? workspaceID
+    }
+
+    /// A new agent chat asks for its execution scope without losing its draft.
+    var needsProjectForTask: Bool {
+        (selectedChoice?.mode == .task || !draftAttachments.isEmpty)
+            && currentThreadID == nil && workspaceID == nil && workspacePath == nil
+    }
+
     /// Adopt a workspace id learned outside this VM (e.g. the browser registered the
     /// folder after this session was created). First-writer wins; ids are stable per path.
-    func adoptWorkspaceID(_ id: String) {
-        guard workspaceID == nil, let trimmed = id.trimmedNonEmpty else { return }
+    func adoptWorkspaceID(_ id: String, name: String? = nil) {
+        guard let trimmed = id.trimmedNonEmpty, workspaceID == nil || workspaceID == trimmed else { return }
+        let needsSkills = workspaceID == nil
         workspaceID = trimmed
-        Task { await refreshSkills() }
+        if let name = name?.trimmedNonEmpty { registeredWorkspaceName = name }
+        if needsSkills { Task { await refreshSkills() } }
     }
 
     // MARK: - Model selection
@@ -1452,15 +1468,17 @@ final class RelayChatViewModel: ObservableObject {
         )
         let userPrompt = text.isEmpty ? "Please inspect the attached file(s)." : text
         let requestPrompt = Self.followUpTaskPrompt(userText: userPrompt, conversationJobs: conversationJobs)
-        messages.append(RelayConversationItem(
+        let outgoingItem = RelayConversationItem(
             role: .user,
             text: text,
             provider: provider,
             modelLabel: model.label,
             attachments: outgoingAttachments.map(\.displayed)
-        ))
+        )
+        messages.append(outgoingItem)
+        var jobWasAccepted = false
         do {
-            let created = try await client.createJob(CodexCreateJobRequest(
+            let created = try await submitJob(CodexCreateJobRequest(
                 workspaceId: workspaceID,
                 prompt: requestPrompt,
                 timeoutMs: Self.taskTimeoutMs,
@@ -1474,6 +1492,7 @@ final class RelayChatViewModel: ObservableObject {
                 attachments: outgoingAttachments.map(\.jobAttachment),
                 resumeSessionId: resumeID
             ))
+            jobWasAccepted = true
             let job: CodexJob
             if let createdJob = created.job {
                 job = createdJob
@@ -1495,6 +1514,12 @@ final class RelayChatViewModel: ObservableObject {
             attachJobStream(to: job)
             await refreshThreads()
         } catch {
+            guard conversationRevision == revision else { return }
+            if !jobWasAccepted,
+               case CodexClientError.httpFailure(let status, _) = error,
+               (400..<500).contains(status) {
+                messages.removeAll { $0.id == outgoingItem.id }
+            }
             if prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 prompt = text
             }
@@ -1503,7 +1528,6 @@ final class RelayChatViewModel: ObservableObject {
             }
             await refreshHarnesses()
             errorMessage = error.localizedDescription
-            messages.append(RelayConversationItem(role: .status, text: error.localizedDescription, provider: provider))
         }
     }
 
@@ -1733,6 +1757,23 @@ final class RelayChatViewModel: ObservableObject {
         }
     }
 
+    /// Only the visible conversation supplies these figures; never borrow
+    /// another thread's context or treat cumulative input totals as capacity.
+    var conversationUsage: RelayTimelineUsage? {
+        for item in messages.reversed() {
+            if let job = item.job { return timelines[job.id]?.usage }
+            if let usage = item.usage {
+                return RelayTimelineUsage(inputTokens: usage.inputTokens, outputTokens: usage.outputTokens)
+            }
+        }
+        return nil
+    }
+
+    func refreshConversationUsage() async {
+        await refreshActiveWorkIfNeeded()
+        await syncTimelines()
+    }
+
     /// The reduced timeline of a job on screen, or nil when its machine sent none
     /// and the job renders the legacy way.
     func timeline(forJobID id: String) -> RelayTimeline? {
@@ -1905,6 +1946,7 @@ final class RelayChatViewModel: ObservableObject {
         currentThreadWorkspaceName = nil
         isLoadingThreadDetail = false
         watchedSessionID = nil
+        sessionControl = nil
         nativeWatchQuietSince = nil
         messages = []
         conversationDidChange()
@@ -2063,33 +2105,32 @@ final class RelayChatViewModel: ObservableObject {
         beginNativeWatch(thread)
     }
 
-    /// Follow a session that is running on the machine. Relay jobs already stream;
-    /// a native transcript only moves when we re-read it. Opening an idle thread
-    /// stops a watch left over from the previous conversation.
+    /// Keep the visible native conversation discoverable even while idle: the
+    /// next prompt may come from desktop. The view polls only while foregrounded
+    /// and backs off when quiet; Relay jobs continue to use their own streams.
     private func beginNativeWatch(_ thread: CodexThread) {
-        if thread.hasActiveJobs {
-            if watchedSessionID != thread.sessionId {
-                nativeWatchQuietSince = nil
-                watchedSessionID = thread.sessionId
-            }
-            return
-        }
-        if currentThreadID == thread.sessionId {
+        sessionControl = thread.sessionControl
+        guard thread.mode == .task else {
             watchedSessionID = nil
             nativeWatchQuietSince = nil
+            return
         }
+        watchedSessionID = thread.sessionId
+        nativeWatchQuietSince = thread.hasActiveJobs ? nil : Date()
     }
 
-    /// One poll of the open native transcript. Stops after the file has been
-    /// quiet for `nativeWatchQuietLimit`, which covers a long tool call without
-    /// following an idle thread forever.
+    /// One poll of the open native transcript. A quiet thread uses the slower
+    /// cadence rather than permanently losing updates from another surface.
     func refreshWatchedThreadIfNeeded() async {
         guard let sessionID = watchedSessionID, sessionID == currentThreadID else { return }
-        guard !isSending, !isLoadingThreadDetail, !hasActiveConversationJob else { return }
+        guard !isSending, !isLoadingThreadDetail, !hasActiveConversationJob, !isRefreshingWatchedThread else { return }
         guard let provider = currentThreadProvider else { return }
+        isRefreshingWatchedThread = true
+        defer { isRefreshingWatchedThread = false }
         let revision = conversationRevision
         guard let detail = try? await fetchThreadDetail(sessionID, workspaceID, provider) else { return }
-        guard conversationRevision == revision, currentThreadID == sessionID, !isSending else { return }
+        guard !Task.isCancelled, conversationRevision == revision, currentThreadID == sessionID, !isSending else { return }
+        sessionControl = detail.thread.sessionControl
 
         let items = conversationItems(from: detail)
         let previous = messages.map(transcriptSignature)
@@ -2106,9 +2147,6 @@ final class RelayChatViewModel: ObservableObject {
             nativeWatchQuietSince = nil
         } else if nativeWatchQuietSince == nil {
             nativeWatchQuietSince = Date()
-        } else if Date().timeIntervalSince(nativeWatchQuietSince ?? .distantPast) >= Self.nativeWatchQuietLimit {
-            watchedSessionID = nil
-            nativeWatchQuietSince = nil
         }
     }
 
@@ -2169,16 +2207,8 @@ final class RelayChatViewModel: ObservableObject {
         }
 
         if !detail.trailingSteps.isEmpty {
-            if let last = detail.messages.last, last.role == .assistant, let index = items.indices.last {
-                items[index].historyTimeline = RelayTimeline(
-                    historySteps: last.steps + detail.trailingSteps,
-                    threadIsActive: threadIsActive
-                )
-            } else {
-                // The last message is the user's: the steps are the answer so far.
-                items.append(stepsItem(detail.trailingSteps, stamp: fallbackStamp))
-                isDated.append(false)
-            }
+            items.append(stepsItem(detail.trailingSteps, stamp: fallbackStamp))
+            isDated.append(false)
         }
 
         // Jobs, oldest first, each claiming the user turn that started it.
@@ -2199,9 +2229,16 @@ final class RelayChatViewModel: ObservableObject {
                 inserts[turnEnd, default: []].append(row)
                 continue
             }
-            if items.isEmpty, let prompt = job.prompt?.trimmedNonEmpty {
-                // No transcript at all: show what was asked, as a live turn does.
-                inserts[0, default: []].append(RelayConversationItem(
+            // A job the transcript does not mention goes where its time puts
+            // it; one still running, or one that cannot be dated, goes last.
+            var position = items.count
+            if !job.status.isActive, anyDated, let anchor = job.createdAt {
+                position = items.indices.first(where: { isDated[$0] && items[$0].timestamp > anchor }) ?? items.count
+            }
+            if let prompt = job.prompt?.trimmedNonEmpty {
+                // A native file can lag or omit just this turn. Keep the real
+                // prompt we already have even when older messages are present.
+                inserts[position, default: []].append(RelayConversationItem(
                     id: "prompt:\(job.id)",
                     role: .user,
                     text: prompt,
@@ -2210,12 +2247,6 @@ final class RelayChatViewModel: ObservableObject {
                     modelLabel: job.model,
                     attachments: job.attachments.map(RelayDisplayedAttachment.from)
                 ))
-            }
-            // A job the transcript does not mention goes where its time puts
-            // it; one still running, or one that cannot be dated, goes last.
-            var position = items.count
-            if !job.status.isActive, anyDated, let anchor = job.createdAt {
-                position = items.indices.first(where: { isDated[$0] && items[$0].timestamp > anchor }) ?? items.count
             }
             inserts[position, default: []].append(row)
         }

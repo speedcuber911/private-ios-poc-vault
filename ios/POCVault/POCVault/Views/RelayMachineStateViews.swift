@@ -25,7 +25,7 @@ struct RelayMachineDownView: View {
     var body: some View {
         VStack(spacing: 14) {
             Text(title)
-                .font(AppTheme.serifFont(size: 26))
+                .font(AppTheme.uiFont(size: 26, weight: .semibold))
                 .foregroundStyle(AppTheme.textPrimary)
                 .multilineTextAlignment(.center)
             Text(detail)

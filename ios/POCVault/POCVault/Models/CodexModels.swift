@@ -1182,6 +1182,16 @@ enum CodexTerminalStreamEvent: Hashable {
 }
 
 struct CodexThread: Decodable, Hashable, Identifiable {
+    struct SessionControl: Decodable, Hashable {
+        let owner: String
+        let remoteControlURL: URL?
+
+        var claudeURL: URL? {
+            guard let url = remoteControlURL, url.scheme == "https", url.host == "claude.ai",
+                  url.path.hasPrefix("/code/session_"), url.user == nil, url.password == nil else { return nil }
+            return url
+        }
+    }
     let id: String
     let mode: RelayInteractionMode
     let provider: CodexProvider
@@ -1202,6 +1212,7 @@ struct CodexThread: Decodable, Hashable, Identifiable {
     let lastError: String?
     let hasSessionFile: Bool
     let isSmokeTest: Bool
+    let sessionControl: SessionControl?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -1227,6 +1238,7 @@ struct CodexThread: Decodable, Hashable, Identifiable {
         case lastError
         case hasSessionFile
         case isSmokeTest
+        case sessionControl
     }
 
     init(from decoder: Decoder) throws {
@@ -1266,6 +1278,7 @@ struct CodexThread: Decodable, Hashable, Identifiable {
         self.lastError = try container.decodeLooseStringIfPresent(forKey: .lastError)
         self.hasSessionFile = (try container.decodeIfPresent(Bool.self, forKey: .hasSessionFile)) ?? true
         self.isSmokeTest = (try container.decodeIfPresent(Bool.self, forKey: .isSmokeTest)) ?? false
+        self.sessionControl = try container.decodeIfPresent(SessionControl.self, forKey: .sessionControl)
     }
 
     var displayTitle: String {

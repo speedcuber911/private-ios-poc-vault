@@ -2,6 +2,8 @@
 import fs from "node:fs";
 import http from "node:http";
 import https from "node:https";
+import { activityTracker, latestCodexActivity } from "./activity.mjs";
+import { liveClaudeSessions } from "./native-session-owner.mjs";
 
 // Evaluation-order guards: config first (env validation throws at startup),
 // then catalog (CODEX_MODEL_CATALOG validation), then workspaces (CODEX_WORKSPACES).
@@ -332,6 +334,13 @@ async function startHandoffPickup() {
       // machine is stuck mid-update" become answerable. A getter, not a value:
       // it changes underneath this long-lived client.
       pendingVersion: updateEngine ? () => updateEngine.pendingVersion() : null,
+      keepAwakeUntil: () => {
+        activityTracker.interacted(latestCodexActivity(codexHome));
+        return activityTracker.keepAwakeUntil({
+          busy: activeChildren.size > 0 || jobsState.queuedJobIds.length > 0
+            || liveClaudeSessions(runHome).some((session) => session.status !== "idle"),
+        });
+      },
     });
     setJobNotificationHook((type, job) => cloud.postEvent(type, { jobId: job.id }));
     updateEngine?.setPostEvent((type) => cloud.postEvent(type));

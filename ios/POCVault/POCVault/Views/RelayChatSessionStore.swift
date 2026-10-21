@@ -6,9 +6,8 @@ import Foundation
 struct RelayChatLaunch: Identifiable {
     let id: String
     let viewModel: RelayChatViewModel
-    /// A launch from a "New session" affordance starts with a clean draft and
-    /// immediately asks which runner/model should own it. History and push routes
-    /// leave this false because they open a specific existing conversation.
+    /// Optional legacy presentation intent. The chat-first shell keeps model
+    /// selection in the composer and never interrupts a new chat with a picker.
     let presentsProviderPicker: Bool
     /// Inspecting an output's source job must keep its conversation visible.
     /// This is presentation intent, not cached conversation state.
@@ -147,14 +146,23 @@ final class RelayChatSessionStore: ObservableObject {
     /// Start a genuinely new session in a folder even when its cached view model is
     /// still showing an older thread. The cache remains valuable for live streams and
     /// folder metadata; only its foreground conversation state is reset.
-    func launchNewSession(folderPath: String?, workspaceID: String? = nil) -> RelayChatLaunch {
+    func launchNewSession(folderPath: String?, workspaceID: String? = nil, preservingDraftFrom source: RelayChatViewModel? = nil) -> RelayChatLaunch {
+        // Snapshot before resetting: choosing the same project can reuse this VM.
+        let draft = source?.prompt
+        let attachments = source?.draftAttachments
+        let choice = source?.selectedChoice
+        let effort = source?.selectedEffort
         let viewModel = session(forFolderPath: folderPath, workspaceID: workspaceID)
         viewModel.startNewConversation()
+        if let draft { viewModel.prompt = draft }
+        if let attachments { viewModel.draftAttachments = attachments }
+        if let choice { viewModel.selectChoice(choice) }
+        if let effort { viewModel.selectEffort(effort) }
         return RelayChatLaunch(
             id: Self.canonicalKey(forFolderPath: folderPath, workspaceID: workspaceID),
             viewModel: viewModel,
-            presentsProviderPicker: true,
-            automaticallyOpensPreviews: true
+            presentsProviderPicker: false,
+            automaticallyOpensPreviews: false
         )
     }
 

@@ -154,8 +154,8 @@ struct DiagnosticsView: View {
 
     private var titleFont: Font {
         showsNavigationChrome
-            ? AppTheme.serifFont(size: 28)
-            : AppTheme.serifFont(size: 20)
+            ? AppTheme.uiFont(size: 28, weight: .semibold)
+            : AppTheme.uiFont(size: 20, weight: .semibold)
     }
 }
 
@@ -183,7 +183,7 @@ private struct DiagnosticRow: View {
                     .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(AppTheme.textPrimary)
                 Text(check.detail)
-                    .font(.system(size: 12))
+                    .font(AppTheme.uiFont(size: 12))
                     .foregroundStyle(AppTheme.textSecondary)
                     .lineLimit(2)
                     .truncationMode(.middle)
@@ -197,14 +197,7 @@ private struct DiagnosticRow: View {
 
 private struct DiagnosticCardModifier: ViewModifier {
     let cornerRadius: CGFloat
-
-    func body(content: Content) -> some View {
-        content
-            .overlay {
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(AppTheme.hairline, lineWidth: 1)
-            }
-    }
+    func body(content: Content) -> some View { content }
 }
 
 private extension View {

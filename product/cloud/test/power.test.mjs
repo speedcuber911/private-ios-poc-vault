@@ -3,12 +3,14 @@ import { test } from "node:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
 
 import { hashWakeToken, resizeOptions } from "../src/power.js";
 import { instancePricing } from "../src/instance-pricing.js";
 import { createEc2Client, parseInstanceStates, parseInstanceTags } from "../src/ec2.js";
 import { createDb } from "../src/db.js";
 import { startTestApp, api, makeNodeIdentity } from "./helpers.mjs";
+import { nodeRequestSigningInput } from "../src/nodeauth.js";
 
 const INSTANCE = "i-0123456789abcdef0";
 const OTHER_INSTANCE = "i-0fedcba9876543210";
@@ -96,6 +98,51 @@ function registerBody(identity, extra = {}) {
     ...(extra.enrollToken !== undefined ? { enrollToken: extra.enrollToken } : {}),
   };
 }
+
+test("activity from a registered node holds auto-stop without extending idle heartbeats forever", async () => {
+  const t = await startPowerApp();
+  try {
+    await register(t, makeNodeIdentity());
+    const id = "node-aabbccddeeff0011";
+    const until = t.clock.t + 60 * 60 * 1000;
+    await t.app.power.recordActivity(id, until);
+    assert.equal(t.ec2.tags.get(INSTANCE).RelayKeepAwakeUntil, new Date(until).toISOString());
+    const writes = t.ec2.calls.length;
+    await t.app.power.recordActivity(id, until);
+    await t.app.power.recordActivity(id, null);
+    await t.app.power.recordActivity("unregistered", until);
+    await t.app.power.recordActivity(id, "tomorrow");
+    assert.equal(t.ec2.calls.length, writes);
+    t.clock.t += 6 * 60 * 1000;
+    await t.app.power.recordActivity(id, t.clock.t + 24 * 60 * 60 * 1000);
+    assert.equal(t.ec2.tags.get(INSTANCE).RelayKeepAwakeUntil, new Date(t.clock.t + 60 * 60 * 1000).toISOString());
+  } finally { await t.close(); }
+});
+
+test("a paired machine without an account can renew its activity hold only with its registered signing key", async () => {
+  const t = await startPowerApp();
+  try {
+    const identity = makeNodeIdentity();
+    await register(t, identity);
+    const nodeId = "node-aabbccddeeff0011";
+    const pathWithQuery = "/v1/node/heartbeat";
+    const headers = {
+      "x-relay-node": nodeId, "x-relay-ts": String(t.clock.t),
+      "x-relay-signature": "invalid",
+    };
+    const body = { keepAwakeUntil: t.clock.t + 60 * 60 * 1000, instanceId: OTHER_INSTANCE };
+    const denied = await api(t.baseUrl, "POST", pathWithQuery, { body, headers });
+    assert.equal(denied.status, 401);
+    assert.equal(t.ec2.tags.size, 0);
+    headers["x-relay-signature"] = crypto.sign(null,
+      nodeRequestSigningInput({ method: "POST", pathWithQuery, ts: t.clock.t, nodeId }), identity.privateKey).toString("base64url");
+    const accepted = await api(t.baseUrl, "POST", pathWithQuery, { body, headers });
+    assert.equal(accepted.status, 200);
+    assert.equal(t.ec2.tags.get(INSTANCE).RelayKeepAwakeUntil, new Date(body.keepAwakeUntil).toISOString());
+    assert.equal(t.ec2.tags.has(OTHER_INSTANCE), false);
+    assert.equal(t.app.registry.getNode(nodeId), null, "A power heartbeat does not enroll an account or grant handoff access");
+  } finally { await t.close(); }
+});
 
 async function register(t, identity, extra = {}) {
   const body = registerBody(identity, extra);

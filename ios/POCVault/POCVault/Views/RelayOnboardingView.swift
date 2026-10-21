@@ -38,7 +38,7 @@ struct RelayOnboardingView: View {
             VStack(spacing: 18) {
                 HStack {
                     Text("Relay")
-                        .font(AppTheme.serifFont(size: 24))
+                        .font(AppTheme.uiFont(size: 24, weight: .semibold))
                         .foregroundStyle(AppTheme.textPrimary)
                     Spacer()
                     RelayCapsLabel(text: "\(page + 1) of \(pages.count)")
@@ -54,7 +54,7 @@ struct RelayOnboardingView: View {
                                 .font(.system(size: 48, weight: .medium))
                                 .foregroundStyle(AppTheme.accentGradient)
                             Text(item.title)
-                                .font(AppTheme.serifFont(size: 31))
+                                .font(AppTheme.uiFont(size: 31, weight: .semibold))
                                 .foregroundStyle(AppTheme.textPrimary)
                                 .multilineTextAlignment(.center)
                             Text(item.detail)

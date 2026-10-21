@@ -154,6 +154,7 @@ test("the Codex runner writes a timeline beside unchanged legacy channels", asyn
     },
     { type: "step", id: "w1", status: "done", endedAt: "2026-10-06T07:31:48.000Z" },
     { type: "text", id: "m2", delta: "Done." },
+    { type: "usage", contextTokens: 130, contextReportedAt: recorded.events[12]?.contextReportedAt },
     { type: "usage", inputTokens: 120, outputTokens: 10, cachedInputTokens: 100, reasoningOutputTokens: 3, totalTokens: 130 },
   ]);
   assert.match(recorded.events[8].endedAt, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);

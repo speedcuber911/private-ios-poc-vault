@@ -18,6 +18,7 @@ process.env.RELAYD_CODEX_TRANSPORT = "app-server";
 const {
   continueUnfinishedThreadPrompt,
   applyDiscoveredSessionId,
+  createJob,
 } = await import("../src/jobs.mjs");
 const { maxTimeoutMs } = await import("../src/config.mjs");
 
@@ -26,6 +27,25 @@ test("phone-length agent jobs may run for four hours before the stuck-job cap", 
 });
 
 const sessionId = "019e46a5-0000-7000-8000-000000000001";
+
+test("a phone cannot start a competing writer on a live Claude Desktop conversation", async (t) => {
+  const project = path.join(process.env.CODEX_RUN_HOME, ".claude", "projects", "test");
+  const registry = path.join(process.env.CODEX_RUN_HOME, ".claude", "sessions");
+  fs.mkdirSync(project, { recursive: true });
+  fs.mkdirSync(registry, { recursive: true });
+  fs.writeFileSync(path.join(project, `${sessionId}.jsonl`), JSON.stringify({
+    type: "user", cwd: workspace, sessionId, message: { content: "An existing conversation" },
+  }) + "\n");
+  const record = path.join(registry, `${process.pid}.json`);
+  fs.writeFileSync(record, JSON.stringify({
+    pid: process.pid, sessionId, cwd: workspace, startedAt: Date.now() - process.uptime() * 1000,
+    ...(process.platform === "linux" ? { procStart: fs.readFileSync(`/proc/${process.pid}/stat`, "utf8").split(") ")[1].split(" ")[19] } : {}),
+    entrypoint: "claude-desktop", status: "idle",
+  }));
+  t.after(() => fs.rmSync(record, { force: true }));
+  assert.throws(() => createJob({ workspaceId: "scratch", provider: "claude", prompt: "Continue here", resumeSessionId: sessionId }),
+    (error) => error.status === 409 && /Claude Desktop/.test(error.message));
+});
 
 test("follow-up after a cancelled turn keeps the unfinished instruction on the runner prompt", () => {
   const jobs = [

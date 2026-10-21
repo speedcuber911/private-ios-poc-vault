@@ -929,7 +929,7 @@ struct FileViewerView: View {
                 .foregroundStyle(AppTheme.accent)
 
             Text(viewModel.entry.displayName)
-                .font(AppTheme.serifFont(size: 20))
+                .font(AppTheme.uiFont(size: 20, weight: .semibold))
                 .foregroundStyle(AppTheme.textPrimary)
                 .multilineTextAlignment(.center)
 
@@ -1042,7 +1042,7 @@ struct FileViewerView: View {
         ToolbarItem(placement: .principal) {
             VStack(spacing: 1) {
                 Text(viewModel.entry.displayName)
-                    .font(AppTheme.serifFont(size: 16))
+                    .font(AppTheme.uiFont(size: 16, weight: .semibold))
                     .foregroundStyle(AppTheme.textPrimary)
                     .lineLimit(1)
                 if let metadata = metadataLine {
@@ -1114,18 +1114,7 @@ struct FileViewerView: View {
 
 private struct FileViewerErrorBanner: View {
     let text: String
-
-    var body: some View {
-        Text(text)
-            .font(AppTheme.uiFont(size: 13))
-            .foregroundStyle(AppTheme.statusError)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(12)
-            .overlay {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(AppTheme.statusError.opacity(0.3), lineWidth: 1)
-            }
-    }
+    var body: some View { RelayInlineNotice(text: text) }
 }
 
 /// One quiet row under the folder path or the file title: branch, then the

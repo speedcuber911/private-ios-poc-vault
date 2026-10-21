@@ -7,6 +7,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
+import { claudeSessionControl } from "./native-session-owner.mjs";
 
 import { runHome, codexHome, dataDir, attachmentsDir, threadSummaryCharacters, threadMessageCharacters, workspaceBrowseRoot, terminalStatuses, allowedThreadProviders, realpathOrResolve, pathWithinRoot } from "./config.mjs";
 import { isSafeJobId, cleanApiText, sendBytes, sendError } from "./util.mjs";
@@ -597,7 +598,9 @@ async function threadDetailResponse(sessionId, { provider = null } = {}) {
   );
   const trailingSteps = publicSteps(state.trailingSteps);
   return {
-    thread: threadSummary(state.thread),
+    thread: { ...threadSummary(state.thread),
+      ...(state.thread.provider === "claude" ? { sessionControl: claudeSessionControl(sessionId, runHome) } : {}),
+    },
     messages: publicThreadMessages(state.messages),
     jobs: await Promise.all(sortedJobs.map((job) => toJobResponse(job, responseShape("compact")))),
     ...(trailingSteps.length ? { trailingSteps } : {}),
@@ -998,6 +1001,21 @@ function parseTranscriptTurn(entry) {
     const content = Array.isArray(entry.payload.content) ? entry.payload.content : [];
     return take(role, messageText(entry.payload), content, entry.timestamp);
   }
+  // Native Codex histories can retain the UI events without the model-facing
+  // response_item mirror (for example after an import). These are still the
+  // person's prompt and the assistant's visible reply. Reasoning/tool events
+  // stay with the timeline collectors below.
+  if (entry.type === "event_msg") {
+    const payload = entry.payload;
+    const role = payload?.type === "user_message" ? "user"
+      : payload?.type === "agent_message" ? "assistant" : null;
+    if (!role || typeof payload.message !== "string") return null;
+    const content = role === "user" && Array.isArray(payload.local_images)
+      ? payload.local_images.filter((file) => typeof file === "string")
+        .map((file) => ({ type: "input_image", path: file }))
+      : [];
+    return take(role, payload.message, content, entry.timestamp);
+  }
   if (entry.type === "user" || entry.type === "assistant") {
     // Claude Code writes what it tells itself as `user` entries too: a
     // finished background agent's report, a hook's output. Those are the
@@ -1016,14 +1034,15 @@ function parseTranscriptTurn(entry) {
 }
 
 // Claude Code marks who wrote a `user` entry. `promptSource: "system"`, an
-// `origin` such as `{kind: "task-notification"}` and `isMeta` all mean the CLI
-// authored it. Transcripts from before those fields existed fall through to the
-// tag list in stripInjectedUserMarkup.
+// `origin` such as `{kind: "task-notification"}` and `isMeta` mean the CLI
+// authored it. Desktop/SDK prompts use `origin.kind: "human"`; those are the
+// person too. Older transcripts fall through to stripInjectedUserMarkup.
 function isHarnessAuthoredUserEntry(entry) {
   if (entry.isMeta === true) return true;
   if (entry.promptSource === "system") return true;
   const origin = entry.origin;
-  if (origin && typeof origin === "object" && typeof origin.kind === "string" && origin.kind !== "user") return true;
+  if (origin && typeof origin === "object" && typeof origin.kind === "string"
+      && origin.kind !== "user" && origin.kind !== "human") return true;
   return false;
 }
 
@@ -1136,12 +1155,14 @@ async function readSessionTranscript(sessionFile, { sessionId = null } = {}) {
   };
   // Steps taken before a line that turned out not to be a message.
   let carried = [];
+  let mirrorCandidate = null;
   const input = fs.createReadStream(sessionFile, { encoding: "utf8" });
   const lines = readline.createInterface({ input, crlfDelay: Infinity });
   for await (const line of lines) {
     if (!line.trim()) continue;
     try {
       const entry = JSON.parse(line);
+      if (entry.type === "event_msg" && entry.payload?.type === "task_started") mirrorCandidate = null;
       for (const collector of collectors) {
         try {
           collector.push(entry);
@@ -1163,10 +1184,22 @@ async function readSessionTranscript(sessionFile, { sessionId = null } = {}) {
         text,
         attachments,
       };
+      const source = entry.type === "event_msg" || entry.type === "response_item" ? entry.type : null;
+      const previous = messages.at(-1);
+      if (source && mirrorCandidate?.source !== source && mirrorCandidate?.message === previous
+          && previous?.role === message.role && previous.text === message.text) {
+        // Pair just the adjacent event/response representations, never all
+        // equal text: "again" sent twice is two real prompts. Keep the richer
+        // attachment representation without repeating the message.
+        if (message.attachments.length > previous.attachments.length) previous.attachments = message.attachments;
+        mirrorCandidate = null;
+        continue;
+      }
       carried = boundSteps([...carried, ...takeSteps()]);
       if (carried.length) message.steps = carried;
       carried = [];
       messages.push(message);
+      mirrorCandidate = source ? { source, message } : null;
       if (messages.length > 120) messages.shift();
     } catch {
       continue;

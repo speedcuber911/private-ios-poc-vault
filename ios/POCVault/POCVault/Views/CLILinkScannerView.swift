@@ -112,7 +112,7 @@ struct CLILinkScannerView: View {
     private func confirmBody(machineName: String?, platform: String?, client: DeviceCodeClient) -> some View {
         VStack(alignment: .leading, spacing: 20) {
             Text(machineName?.isEmpty == false ? machineName! : (client == .web ? "This browser" : "Unknown computer"))
-                .font(AppTheme.serifFont(size: 28))
+                .font(AppTheme.uiFont(size: 28, weight: .semibold))
                 .foregroundStyle(AppTheme.textPrimary)
             Text(platformLabel(platform))
                 .font(AppTheme.uiFont(size: 15))
@@ -157,7 +157,7 @@ struct CLILinkScannerView: View {
         VStack(spacing: 16) {
             Spacer()
             Text(client == .web ? "Signed in" : "Link approved")
-                .font(AppTheme.serifFont(size: 28))
+                .font(AppTheme.uiFont(size: 28, weight: .semibold))
                 .foregroundStyle(AppTheme.textPrimary)
             Text(approvalDetail(machineName, client: client))
                 .font(AppTheme.uiFont(size: 15))

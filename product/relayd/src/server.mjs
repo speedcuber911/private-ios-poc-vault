@@ -6,6 +6,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { activityTracker } from "./activity.mjs";
 
 import { host, port, requireMtls, allowedCertSubjects, maxConcurrent, maxBodyBytes, maxTranscriptionAudioBytes, proxyBaseUrl, proxyClientCertPath, proxyClientKeyPath, grantPublicKey, nodeId, approvalsDir, codexBin, runHome, codexHome } from "./config.mjs";
 import { isJwtShaped, verifyBrowserGrant, activityScope, scopeCovers } from "./grant.mjs";
@@ -207,6 +208,10 @@ async function routeRequest(req, res) {
   const auth = authorize(req, { pathname: url.pathname });
   if (!auth.ok) {
     return sendError(res, auth.status, auth.error);
+  }
+  // Public health probes and failed authentication must never keep a box up.
+  if (url.pathname.startsWith("/v1/codex/") && url.pathname !== "/v1/codex/health") {
+    activityTracker.interacted();
   }
 
   if (req.method === "GET" && url.pathname === "/v1/codex/health") {

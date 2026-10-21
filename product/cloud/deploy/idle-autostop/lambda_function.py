@@ -96,6 +96,15 @@ def lambda_handler(event, context):
             results.append(f"{name_tag} ({instance_id}): auto-stop turned off ({OPT_OUT_TAG}=false), skip")
             continue
 
+        tags = {tag["Key"]: tag["Value"] for tag in inst.get("Tags", [])}
+        try:
+            hold_until = datetime.datetime.fromisoformat(tags.get("RelayKeepAwakeUntil", "").replace("Z", "+00:00"))
+            if hold_until.tzinfo is not None and hold_until > now:
+                results.append(f"{name_tag} ({instance_id}): Relay activity hold until {hold_until.isoformat()}, skip")
+                continue
+        except (TypeError, ValueError):
+            pass
+
         launch_time = inst["LaunchTime"]
         if (now - launch_time) < datetime.timedelta(minutes=IDLE_WINDOW_MINUTES):
             results.append(
@@ -112,10 +121,11 @@ def lambda_handler(event, context):
         netin_values = netin_r.get("Values", [])
         netout_values = netout_r.get("Values", [])
 
-        if len(cpu_values) < expected_points * 0.8 or len(netin_values) < expected_points * 0.8:
+        if any(len(values) < expected_points * 0.8 for values in (cpu_values, netin_values, netout_values)):
             results.append(
                 f"{name_tag} ({instance_id}): insufficient metric coverage "
                 f"(cpu={len(cpu_values)}, net_in={len(netin_values)}, "
+                f"net_out={len(netout_values)}, "
                 f"expected~{expected_points}), skip"
             )
             continue

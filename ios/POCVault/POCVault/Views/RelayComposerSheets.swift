@@ -14,9 +14,9 @@ import UniformTypeIdentifiers
 /// in the theme because nothing outside the composer uses them yet.
 enum RelayComposerPalette {
     /// The floating composer card.
-    static let raisedCard = Color(hex: 0x272421)
+    static let raisedCard = Color(hex: 0x30302D)
     /// Ground of every composer sheet.
-    static let sheetGround = Color(hex: 0x211E1A)
+    static let sheetGround = AppTheme.bgCanvas
     /// "+", mic, close, back, stop: one quiet circle.
     static let quietFill = AppTheme.textPrimary.opacity(0.08)
     static let groupFill = AppTheme.textPrimary.opacity(0.05)
@@ -423,7 +423,7 @@ struct RelaySheetHeader: View {
             .accessibilityLabel(accessibilityLabel)
 
             Text(title)
-                .font(AppTheme.serifFont(size: 19))
+                .font(AppTheme.uiFont(size: 19, weight: .semibold))
                 .foregroundStyle(AppTheme.textPrimary)
                 .frame(maxWidth: .infinity)
                 .accessibilityAddTraits(.isHeader)
@@ -443,17 +443,13 @@ struct RelaySheetHeader: View {
     }
 }
 
-/// One rounded group of rows with inset hairlines between them.
+/// Open picker rows share the same surface and spacing as Settings.
 struct RelaySheetGroup<Content: View>: View {
     @ViewBuilder var content: Content
 
     var body: some View {
-        VStack(spacing: 0) { content }
-            .background(
-                RelayComposerPalette.groupFill,
-                in: RoundedRectangle(cornerRadius: 18, style: .continuous)
-            )
-            .padding(.horizontal, 16)
+        VStack(spacing: 4) { content }
+            .padding(.horizontal, 8)
     }
 }
 
@@ -461,11 +457,7 @@ struct RelaySheetDivider: View {
     var leadingInset: CGFloat = 16
 
     var body: some View {
-        Rectangle()
-            .fill(AppTheme.hairline)
-            .frame(height: 1)
-            .padding(.leading, leadingInset)
-            .padding(.trailing, 16)
+        Color.clear.frame(height: 4).accessibilityHidden(true)
     }
 }
 
@@ -761,7 +753,7 @@ struct RelayModelSheet: View {
                             if isSelected {
                                 cell.fill(RelayComposerPalette.selectedPillFill)
                             } else {
-                                cell.strokeBorder(AppTheme.hairlineStrong, lineWidth: 1)
+                                cell.fill(Color.clear)
                             }
                         }
                         .contentShape(Rectangle())
