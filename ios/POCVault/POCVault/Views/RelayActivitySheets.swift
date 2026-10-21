@@ -53,6 +53,7 @@ enum RelayActivitySheetStyle {
 struct RelayActivitySheet: View {
     let request: RelayActivityRequest
     @ObservedObject var viewModel: RelayChatViewModel
+    var timelineOverride: RelayTimeline?
     @Environment(\.dismiss) private var dismiss
     /// Step ids pushed on top of the root page.
     @State private var path: [String] = []
@@ -61,10 +62,11 @@ struct RelayActivitySheet: View {
     /// Decided when the sheet opens so a block that grows does not swap pages.
     @State private var soleStepID: String?
 
-    init(request: RelayActivityRequest, viewModel: RelayChatViewModel) {
+    init(request: RelayActivityRequest, viewModel: RelayChatViewModel, timelineOverride: RelayTimeline? = nil) {
         self.request = request
         self.viewModel = viewModel
-        let timeline = Self.timeline(for: request, in: viewModel)
+        self.timelineOverride = timelineOverride
+        let timeline = timelineOverride ?? Self.timeline(for: request, in: viewModel)
         var sole: String?
         if case .block(let id) = request.root,
            let block = timeline.blocks.first(where: { $0.id == id }) {
@@ -83,7 +85,7 @@ struct RelayActivitySheet: View {
         }
     }
 
-    private var timeline: RelayTimeline { Self.timeline(for: request, in: viewModel) }
+    private var timeline: RelayTimeline { timelineOverride ?? Self.timeline(for: request, in: viewModel) }
 
     private var currentStepID: String? {
         if let last = path.last { return last }
@@ -159,12 +161,19 @@ struct RelayActivitySheet: View {
             .accessibilityLabel(path.isEmpty ? "Close" : "Back")
             .accessibilityIdentifier("relay-activity-close")
 
-            Text(title)
-                .font(AppTheme.uiFont(size: 17, weight: .semibold))
-                .foregroundStyle(AppTheme.textPrimary)
-                .lineLimit(1)
-                .frame(maxWidth: .infinity)
-                .accessibilityAddTraits(.isHeader)
+            HStack(spacing: 8) {
+                if let id = currentStepID, let step = timeline.step(id), step.kind == .agent {
+                    RelayAgentAvatar(seed: step.subagentAvatarSeed)
+                    Text(step.agent?.name ?? step.agent?.role ?? step.input.agentType ?? title)
+                } else {
+                    Text(title)
+                }
+            }
+            .font(AppTheme.uiFont(size: 17, weight: .semibold))
+            .foregroundStyle(AppTheme.textPrimary)
+            .lineLimit(1)
+            .frame(maxWidth: .infinity)
+            .accessibilityAddTraits(.isHeader)
 
             Color.clear.frame(width: 44, height: 44)
         }
@@ -477,6 +486,11 @@ struct RelayStepDetail: View {
                     size: 10
                 )
                 RelayStepDuration(step: step)
+                if let status = step.agent?.statusLabel {
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(status == "Failed" ? AppTheme.statusError : AppTheme.textSecondary)
+                }
             }
             Text(step.displaySummary)
                 .font(AppTheme.uiFont(size: 17, weight: .semibold))

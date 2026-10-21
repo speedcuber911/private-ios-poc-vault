@@ -116,6 +116,52 @@ struct RelayStepInput: Decodable, Hashable {
     }
 }
 
+/// The provider's child agent, separate from the tool call that launched it.
+/// Missing identity or lifecycle fields stay unknown on older machines.
+struct RelayNativeAgent: Decodable, Hashable {
+    var id: String?
+    var callId: String?
+    var name: String?
+    var role: String?
+    var status: String?
+
+    private enum CodingKeys: String, CodingKey { case id, callId, name, role, status }
+
+    init(id: String? = nil, callId: String? = nil, name: String? = nil, role: String? = nil, status: String? = nil) {
+        self.id = id
+        self.callId = callId
+        self.name = name
+        self.role = role
+        self.status = status
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = c.lenient(String.self, .id)?.trimmedNonEmpty
+        callId = c.lenient(String.self, .callId)?.trimmedNonEmpty
+        name = c.lenient(String.self, .name)?.trimmedNonEmpty
+        role = c.lenient(String.self, .role)?.trimmedNonEmpty
+        status = c.lenient(String.self, .status)?.trimmedNonEmpty
+    }
+
+    func merging(_ newer: RelayNativeAgent) -> RelayNativeAgent {
+        RelayNativeAgent(id: newer.id ?? id, callId: newer.callId ?? callId,
+                         name: newer.name ?? name, role: newer.role ?? role, status: newer.status ?? status)
+    }
+
+    var statusLabel: String? {
+        switch status {
+        case "working": return "Working"
+        case "waiting": return "Waiting"
+        case "idle": return "Idle"
+        case "done": return "Done"
+        case "failed": return "Failed"
+        case "stopped": return "Stopped"
+        default: return nil
+        }
+    }
+}
+
 /// A `step` event: the first one for an id creates the step, later ones carry
 /// only the fields that changed. Thread history sends complete ones.
 struct RelayStepPatch: Decodable, Hashable {
@@ -132,10 +178,11 @@ struct RelayStepPatch: Decodable, Hashable {
     var outputTruncated: Bool?
     var exitCode: Int?
     var error: String?
+    var agent: RelayNativeAgent?
 
     private enum CodingKeys: String, CodingKey {
         case id, kind, title, summary, status, parent, startedAt, endedAt
-        case input, output, outputTruncated, exitCode, error
+        case input, output, outputTruncated, exitCode, error, agent
     }
 
     init(
@@ -151,7 +198,8 @@ struct RelayStepPatch: Decodable, Hashable {
         output: String? = nil,
         outputTruncated: Bool? = nil,
         exitCode: Int? = nil,
-        error: String? = nil
+        error: String? = nil,
+        agent: RelayNativeAgent? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -166,6 +214,7 @@ struct RelayStepPatch: Decodable, Hashable {
         self.outputTruncated = outputTruncated
         self.exitCode = exitCode
         self.error = error
+        self.agent = agent
     }
 
     init(from decoder: Decoder) throws {
@@ -183,6 +232,7 @@ struct RelayStepPatch: Decodable, Hashable {
         outputTruncated = container.lenient(Bool.self, .outputTruncated)
         exitCode = container.lenient(Int.self, .exitCode)
         error = container.lenient(String.self, .error)
+        agent = container.lenient(RelayNativeAgent.self, .agent)
     }
 }
 
@@ -398,6 +448,7 @@ struct RelayStep: Identifiable, Hashable {
     var outputTruncated: Bool
     var exitCode: Int?
     var error: String?
+    var agent: RelayNativeAgent? = nil
 }
 
 struct RelayTimelineBlock: Identifiable, Hashable {
@@ -502,6 +553,22 @@ struct RelayTimeline: Hashable {
         order.compactMap { steps[$0] }.filter { $0.parentID == id }
     }
 
+    /// Includes nested agents, in the order this conversation encountered them.
+    var subagentSteps: [RelayStep] {
+        order.compactMap { steps[$0] }.filter { $0.kind == .agent }
+    }
+
+    func descendants(of id: String) -> [RelayStep] {
+        var visited: Set<String> = [id]
+        var pending = [id]
+        while let parent = pending.popLast() {
+            for child in children(of: parent) where visited.insert(child.id).inserted {
+                pending.append(child.id)
+            }
+        }
+        return order.compactMap { steps[$0] }.filter { $0.id != id && visited.contains($0.id) }
+    }
+
     /// Top-level steps still in flight, oldest first: what the live rows show.
     var runningSteps: [RelayStep] {
         order.compactMap { steps[$0] }.filter { $0.status == .running && $0.parentID == nil }
@@ -539,6 +606,7 @@ struct RelayTimeline: Hashable {
             if let truncated = patch.outputTruncated { step.outputTruncated = truncated }
             if let exitCode = patch.exitCode { step.exitCode = exitCode }
             if let error = patch.error { step.error = error }
+            if let agent = patch.agent { step.agent = (step.agent ?? RelayNativeAgent()).merging(agent) }
             steps[patch.id] = step
             return
         }
@@ -557,7 +625,8 @@ struct RelayTimeline: Hashable {
             output: patch.output ?? "",
             outputTruncated: patch.outputTruncated ?? false,
             exitCode: patch.exitCode,
-            error: patch.error
+            error: patch.error,
+            agent: patch.agent
         )
         order.append(patch.id)
 

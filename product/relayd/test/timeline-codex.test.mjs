@@ -16,6 +16,67 @@ import {
 // Fixtures are real captures from codex-cli 0.159.2 (`codex app-server --stdio`
 // and the rollouts those two sessions wrote), with ids and paths replaced.
 const fixtures = path.join(path.dirname(new URL(import.meta.url).pathname), "fixtures");
+
+test("native child identity and completion remain separate from a successful spawn", () => {
+  const mapper = createCodexNotificationMapper();
+  mapper.push({ method: "turn/started", params: { threadId: "main" } });
+  mapper.push({ method: "thread/started", params: { thread: { id: "child", agentNickname: "Kepler", agentRole: "explorer" } } });
+  const item = { type: "collabAgentToolCall", id: "spawn", tool: "spawnAgent", prompt: "Audit callers", receiverThreadIds: [] };
+  mapper.push({ method: "item/started", params: { threadId: "main", item } });
+  const launched = mapper.push({ method: "item/completed", params: { threadId: "main", item: { ...item, status: "completed", receiverThreadIds: ["child"] } } });
+  assert.equal(launched[0].status, "done");
+  assert.equal(launched[0].agent.id, "child");
+  assert.equal(launched[0].agent.status, undefined);
+  assert.equal(launched[1].agent.name, "Kepler");
+  const completed = mapper.push({ method: "item/completed", params: { threadId: "main", item: {
+    type: "subAgentActivity", id: "activity-2", kind: "completed", agentThreadId: "child", agentPath: "/root/audit"
+  } } });
+  assert.equal(completed.length, 1);
+  assert.equal(completed[0].id, "spawn");
+  assert.equal(completed[0].agent.status, "done");
+  assert.equal(completed[0].agent.name, "Kepler", "the native nickname takes precedence over the task path");
+});
+
+test("older collab rollout items retain child IDs and later wait status", () => {
+  const collector = createCodexTranscriptCollector();
+  collector.push({ type: "event_msg", payload: { type: "item_completed", item: {
+    type: "CollabAgentToolCall", id: "spawn", tool: "spawnAgent", prompt: "Audit", status: "completed",
+    receiver_thread_ids: ["child"], agents_states: { child: { status: "running" } }
+  } } });
+  collector.push({ type: "event_msg", payload: { type: "item_completed", item: {
+    type: "CollabAgentToolCall", id: "wait", tool: "wait", status: "completed",
+    receiver_thread_ids: ["child"], agents_states: { child: { status: "completed" } }
+  } } });
+  const [agent] = collector.take();
+  assert.equal(agent.agent.id, "child");
+  assert.equal(agent.agent.status, "done");
+});
+
+test("native rollout activity enriches one child across spawn receipts and later completion", () => {
+  const collector = createCodexTranscriptCollector();
+  collector.push({ type: "response_item", payload: { type: "function_call", name: "spawn_agent", call_id: "spawn", arguments: JSON.stringify({ task_name: "audit", message: "Audit callers", agent_type: "explorer" }) } });
+  collector.push({ type: "event_msg", payload: { type: "item_completed", item: { type: "SubAgentActivity", id: "spawn", kind: "started", agent_thread_id: "child", agent_path: "/root/audit" } } });
+  collector.push({ type: "response_item", payload: { type: "function_call_output", call_id: "spawn", output: '{"agent_id":"child"}' } });
+  const [step] = collector.take();
+  assert.equal(step.agent.id, "child");
+  assert.equal(step.agent.name, "audit");
+  assert.equal(step.agent.status, "working");
+  assert.equal(step.input.prompt, "Audit callers");
+  assert.equal(step.output, undefined, "the launch receipt is not a final report");
+  collector.push({ type: "event_msg", payload: { type: "item_completed", item: { type: "SubAgentActivity", id: "later", kind: "completed", agent_thread_id: "child", agent_path: "/root/audit" } } });
+  assert.deepEqual(collector.take(), [], "later lifecycle events must not invent another agent");
+  assert.equal(step.agent.status, "done");
+});
+
+test("code-mode native lifecycle discovers a child even without a separate spawn call", () => {
+  const collector = createCodexTranscriptCollector();
+  for (const kind of ["started", "interacted", "completed"]) collector.push({ type: "event_msg", payload: { type: "item_completed", item: {
+    type: "SubAgentActivity", id: kind, kind, agent_thread_id: "child", agent_path: "/root/review"
+  } } });
+  const steps = collector.take();
+  assert.equal(steps.length, 1);
+  assert.equal(steps[0].agent.status, "done");
+});
 function fixture(name) {
   return fs.readFileSync(path.join(fixtures, name), "utf8").trim().split("\n").map((line) => JSON.parse(line));
 }

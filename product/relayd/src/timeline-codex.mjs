@@ -287,6 +287,18 @@ function describePlan(plan, explanation) {
 
 const COLLAB_SPAWN = new Set(["spawnAgent", "spawn_agent"]);
 
+function nativeAgentStatus(status) {
+  return ({ pendingInit: "waiting", running: "working", completed: "done", errored: "failed", interrupted: "stopped", shutdown: "stopped" })[status];
+}
+
+function activityAgent(item) {
+  const id = item.agentThreadId || item.agent_thread_id;
+  if (!nonEmpty(id)) return null;
+  const path = item.agentPath || item.agent_path;
+  return pruned({ id, name: nonEmpty(path) ? path.split("/").filter(Boolean).pop() : undefined,
+    status: ({ started: "working", interrupted: "stopped", completed: "done" })[item.kind] });
+}
+
 // The full description of an item in app-server (camelCase) shape. `status`,
 // `exitCode`, `output` and `error` are only meaningful once the item completed.
 // Returns null for items that are not steps (messages).
@@ -351,12 +363,14 @@ export function describeCodexItem(item) {
           input.prompt = item.prompt;
         }
         if (nonEmpty(item.model)) input.agentType = item.model;
+        const id = item.receiverThreadIds?.[0];
         return {
           kind: "agent",
           title: "Agent",
           summary: firstLine(item.prompt) || "Sub-agent",
           input,
           status: stepStatus(item.status),
+          agent: pruned({ id, callId: item.id, status: nativeAgentStatus(item.agentsStates?.[id]?.status) }),
         };
       }
       const args = {};
@@ -418,6 +432,7 @@ export function createCodexNotificationMapper({ now = () => Date.now() } = {}) {
   const streamedText = new Set(); // agentMessage item ids that streamed deltas
   const usedTextIds = new Set();
   const threadParents = new Map(); // sub-agent thread id -> agent step id
+  const agentMetadata = new Map();
   let primaryThread = "";
   let block = null; // { key, id }
   let stepSinceText = false;
@@ -453,6 +468,7 @@ export function createCodexNotificationMapper({ now = () => Date.now() } = {}) {
       status: "running",
       startedAt: stamp(startedAtMs),
       input,
+      agent: described.agent,
     });
   }
 
@@ -468,6 +484,7 @@ export function createCodexNotificationMapper({ now = () => Date.now() } = {}) {
       exitCode: described.exitCode,
       output: described.output,
       error: described.error,
+      agent: described.agent,
     };
     if (state) {
       if (described.summary && described.summary !== state.sent.summary) fields.summary = described.summary;
@@ -547,7 +564,7 @@ export function createCodexNotificationMapper({ now = () => Date.now() } = {}) {
     // the end): one event carries the whole step.
     const endedMs = Number(params.completedAtMs) || now();
     const startedMs = Number.isFinite(item.durationMs) ? endedMs - item.durationMs : endedMs;
-    steps.set(id, { closed: true, sent: { summary: "", input: "" }, source: "" });
+    steps.set(id, { closed: true, kind: described.kind, sent: { summary: "", input: "" }, source: "" });
     return [stepEvent({
       id,
       parent: parentFor(params),
@@ -561,7 +578,34 @@ export function createCodexNotificationMapper({ now = () => Date.now() } = {}) {
       exitCode: described.exitCode,
       output: described.output,
       error: described.error,
+      agent: described.agent,
     })];
+  }
+
+  function agentActivity(item) {
+    const agent = activityAgent(item);
+    if (!agent) return [];
+    const nickname = agentMetadata.get(agent.id)?.name;
+    Object.assign(agent, pruned({ ...agentMetadata.get(agent.id), ...agent }));
+    if (nickname) agent.name = nickname;
+    agentMetadata.set(agent.id, agent);
+    const id = threadParents.get(agent.id) || (steps.get(item.id)?.kind === "agent" ? item.id : `agent-${agent.id}`);
+    threadParents.set(agent.id, id);
+    if (steps.has(id)) return [stepEvent({ id, agent })];
+    // Code-mode native activity can arrive without a separate spawn tool item.
+    const event = open(id, { kind: "agent", title: "Agent", summary: agent.name, agent });
+    steps.get(id).closed = true;
+    return [{ ...event, status: "done" }];
+  }
+
+  function agentStates(item) {
+    const events = [];
+    for (const [thread, state] of Object.entries(item.agentsStates || {})) {
+      const id = threadParents.get(thread);
+      const status = nativeAgentStatus(state?.status);
+      if (id && status) events.push(stepEvent({ id, agent: { id: thread, status } }));
+    }
+    return events;
   }
 
   // A delta for a step we never saw start still lands somewhere visible.
@@ -611,10 +655,26 @@ export function createCodexNotificationMapper({ now = () => Date.now() } = {}) {
       if (!primaryThread && params.threadId && method.startsWith("item/")) primaryThread = params.threadId;
 
       switch (method) {
+        case "thread/started": {
+          const thread = params.thread;
+          if (!thread?.id) return [];
+          const agent = pruned({ id: thread.id, name: thread.agentNickname, role: thread.agentRole });
+          agentMetadata.set(thread.id, agent);
+          const id = threadParents.get(thread.id);
+          return id ? [stepEvent({ id, agent })] : [];
+        }
         case "item/started":
           return itemStarted(params);
-        case "item/completed":
-          return itemCompleted(params);
+        case "item/completed": {
+          const item = params.item || {};
+          if (item.type === "subAgentActivity") return agentActivity(item);
+          const events = itemCompleted(params);
+          if (item.type === "collabAgentToolCall" && COLLAB_SPAWN.has(item.tool)) {
+            const thread = item.receiverThreadIds?.[0];
+            if (thread && agentMetadata.has(thread)) events.push(stepEvent({ id: item.id, agent: agentMetadata.get(thread) }));
+          }
+          return [...events, ...agentStates(item)];
+        }
         case "item/agentMessage/delta":
           return isForeign(params) ? [] : textEvents(params.itemId, params.delta);
         case "item/commandExecution/outputDelta":
@@ -753,6 +813,9 @@ function camelAction(action) {
 function normalizeRolloutItem(item) {
   const type = item.type === "Extension" && item.kind === "web.search" ? "webSearch" : lowerFirst(item.type);
   switch (type) {
+    case "collabAgentToolCall":
+      return { ...item, type, receiverThreadIds: item.receiverThreadIds ?? item.receiver_thread_ids,
+        agentsStates: item.agentsStates ?? item.agents_states };
     case "commandExecution":
       return {
         type,
@@ -860,7 +923,8 @@ function describeCall(call) {
     if (prompt) input.prompt = prompt;
     const agentType = [args.agent_type, args.agent, args.model].find(nonEmpty);
     if (agentType) input.agentType = agentType;
-    return { kind: "agent", title: "Agent", summary: description || "Sub-agent", input };
+    return { kind: "agent", title: "Agent", summary: description || "Sub-agent", input,
+      agent: pruned({ callId: call.id, name: args.task_name || args.name, role: args.agent_type }) };
   }
   if (name === "view_image") {
     return { kind: "read", title: "View Image", summary: baseName(args.path), input: nonEmpty(args.path) ? { path: args.path } : {} };
@@ -950,8 +1014,18 @@ export function createCodexTranscriptCollector() {
   let slots = [];
   const calls = new Map(); // call_id -> slot
   const seenIds = new Set();
+  const agentCalls = new Map();
+  const nativeAgents = new Map();
   let reasoningSeen = new Set(); // per turn: reasoning text already emitted
   let fallbackId = 0;
+
+  function rememberAgent(fields) {
+    if (!fields?.id) return fields;
+    const agent = nativeAgents.get(fields.id) || {};
+    Object.assign(agent, fields);
+    nativeAgents.set(fields.id, agent);
+    return agent;
+  }
 
   function addStep(step) {
     slots.push({ ready: true, step: finishHistoryStep(step) });
@@ -961,6 +1035,15 @@ export function createCodexTranscriptCollector() {
     if (slot.ready || slot.dropped) return;
     const call = slot.call;
     const described = describeCall(call);
+    let agent;
+    if (described.kind === "agent") {
+      const result = parseArguments(extra.output);
+      agent = rememberAgent(pruned({ ...described.agent, ...slot.agent,
+        id: result.agent_id || result.agentId || slot.agent?.id,
+        name: result.nickname || result.agent_name || slot.agent?.name || described.agent?.name }));
+      // A launch receipt is metadata, not the child's final response.
+      if (result.agent_id || result.agentId || result.agent_path) extra.output = undefined;
+    }
     const declined = /rejected by user/i.test(extra.output || "");
     if (declined) extra = { ...extra, status: "cancelled", error: "Declined", output: undefined };
     const status = extra.status || (Number.isInteger(extra.exitCode) && extra.exitCode !== 0 && described.kind === "command" ? "failed" : "done");
@@ -976,6 +1059,7 @@ export function createCodexTranscriptCollector() {
       exitCode: described.kind === "command" ? extra.exitCode : undefined,
       output: extra.output,
       error: extra.error,
+      agent,
     });
     slot.ready = true;
     calls.delete(call.id);
@@ -1004,6 +1088,7 @@ export function createCodexTranscriptCollector() {
     };
     slots.push(slot);
     calls.set(id, slot);
+    if (describeCall(slot.call).kind === "agent") agentCalls.set(id, slot);
   }
 
   function endTurn() {
@@ -1022,9 +1107,27 @@ export function createCodexTranscriptCollector() {
   function executedItem(payload, timestamp) {
     const raw = payload.item;
     if (!raw || typeof raw !== "object") return;
-    // The spawn call carries the prompt; the activity pings add nothing to it.
-    if (raw.type === "SubAgentActivity") return;
+    if (raw.type === "SubAgentActivity" || raw.type === "subAgentActivity") {
+      const fields = activityAgent(raw);
+      if (!fields) return;
+      const alreadyKnown = nativeAgents.has(fields.id);
+      const agent = rememberAgent(fields);
+      const slot = agentCalls.get(raw.id);
+      if (slot) {
+        slot.agent = agent;
+        if (slot.step) slot.step.agent = rememberAgent({ ...slot.step.agent, ...agent });
+      } else if (!alreadyKnown) {
+        const id = `agent-${agent.id}`;
+        seenIds.add(id);
+        addStep({ id, kind: "agent", title: "Agent", summary: agent.name, status: "done", startedAt: isoTime(timestamp), agent });
+      }
+      return;
+    }
     const item = normalizeRolloutItem(raw);
+    for (const [id, state] of Object.entries(item.agentsStates || {})) {
+      const status = nativeAgentStatus(state?.status);
+      if (status) rememberAgent({ id, status });
+    }
     const described = describeCodexItem(item);
     if (!described) return;
     const endedAt = isoTime(payload.completed_at_ms) || isoTime(timestamp);
@@ -1055,6 +1158,7 @@ export function createCodexTranscriptCollector() {
       exitCode: described.exitCode,
       output: described.output,
       error: described.error,
+      agent: described.agent ? rememberAgent(described.agent) : undefined,
     });
   }
 

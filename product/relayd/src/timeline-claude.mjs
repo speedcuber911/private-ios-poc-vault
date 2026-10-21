@@ -213,6 +213,7 @@ export function describeClaudeTool(name, rawInput, { cwd = "" } = {}) {
           prompt: str(input.prompt),
           agentType: str(input.subagent_type),
         }),
+        agent: compact({ id: str(input.resume), name: str(input.name), role: str(input.subagent_type) }),
       };
     }
     case "todo": {
@@ -288,8 +289,11 @@ export function describeClaudeToolResult(tool, block, structured) {
   }
 
   if (tool.kind === "agent") {
+    fields.agent = { ...tool.agent, ...compact({
+      id: str(detail?.agentId) || /\bagentId:\s*([A-Za-z0-9_-]+)/.exec(text)?.[1],
+      status: failed ? "failed" : detail?.isAsync === true ? "working" : detail?.status === "completed" ? "done" : undefined }) };
     const report = detail && Array.isArray(detail.content) ? contentText(detail.content) : "";
-    const output = report || stripAgentHandBack(text);
+    const output = detail?.isAsync === true ? "" : report || stripAgentHandBack(text);
     if (output) fields.output = output;
     if (failed) fields.error = clipText(firstLine(text), TIMELINE_CAPS.summary).text || "Agent failed";
     return fields;
@@ -366,6 +370,7 @@ export function createClaudeStreamMapper({ now = () => new Date().toISOString() 
   function openTool(block, { parent, startedAt, described }) {
     const kind = BUILTIN_KINDS[block.name] || "tool";
     const tool = { id: nextId(kind === "agent" ? "a" : "s"), kind, name: block.name, input: null, described: false };
+    if (kind === "agent") tool.agent = { callId: block.id };
     tools.set(block.id, tool);
     stepSinceText = true;
     const event = { type: "step", id: tool.id };
@@ -374,6 +379,7 @@ export function createClaudeStreamMapper({ now = () => new Date().toISOString() 
       const detail = describeClaudeTool(block.name, block.input, { cwd });
       tool.kind = detail.kind;
       tool.input = detail.input;
+      if (kind === "agent") tool.agent = { ...tool.agent, ...detail.agent };
       tool.described = true;
       Object.assign(event, compact({ kind: detail.kind, title: detail.title, summary: detail.summary }));
       event.status = "running";
@@ -384,6 +390,7 @@ export function createClaudeStreamMapper({ now = () => new Date().toISOString() 
       const detail = describeClaudeTool(block.name, {}, { cwd });
       Object.assign(event, { kind: detail.kind, title: detail.title, status: "running", startedAt });
     }
+    if (tool.agent) event.agent = tool.agent;
     return event;
   }
 
@@ -391,8 +398,9 @@ export function createClaudeStreamMapper({ now = () => new Date().toISOString() 
     const detail = describeClaudeTool(tool.name, input, { cwd });
     tool.kind = detail.kind;
     tool.input = detail.input;
+    if (tool.kind === "agent") tool.agent = { ...tool.agent, ...detail.agent };
     tool.described = true;
-    return compact({ type: "step", id: tool.id, summary: detail.summary, input: detail.input });
+    return compact({ type: "step", id: tool.id, summary: detail.summary, input: detail.input, agent: tool.agent });
   }
 
   function onStreamEvent(line) {
@@ -514,7 +522,13 @@ export function createClaudeStreamMapper({ now = () => new Date().toISOString() 
       // The structured copy describes a single result; with several results in
       // one line it cannot be attributed.
       const structured = content.length === 1 ? line.tool_use_result : null;
-      out.push({ type: "step", id: tool.id, ...describeClaudeToolResult(tool, block, structured), endedAt: at });
+      const fields = describeClaudeToolResult(tool, block, structured);
+      if (fields.agent) {
+        // A late launch receipt must not overwrite an already reported finish.
+        if (["done", "failed", "stopped"].includes(tool.agent?.status)) fields.agent.status = tool.agent.status;
+        tool.agent = fields.agent;
+      }
+      out.push({ type: "step", id: tool.id, ...fields, endedAt: at });
     }
     return out;
   }
@@ -553,6 +567,15 @@ export function createClaudeStreamMapper({ now = () => new Date().toISOString() 
             cwd = str(line.cwd) || cwd;
             sessionId = str(line.session_id) || sessionId;
           }
+          if (["task_started", "task_notification"].includes(line.subtype)) {
+            const tool = tools.get(line.tool_use_id);
+            if (tool?.kind === "agent") {
+              const status = line.subtype === "task_started" ? "working"
+                : ({ completed: "done", failed: "failed", stopped: "stopped" })[line.status];
+              tool.agent = { ...tool.agent, ...compact({ id: str(line.task_id), status }) };
+              return [{ type: "step", id: tool.id, agent: tool.agent }];
+            }
+          }
           return [];
         case "stream_event": return onStreamEvent(line);
         case "assistant": return onAssistant(line);
@@ -586,6 +609,7 @@ export function createClaudeStreamMapper({ now = () => new Date().toISOString() 
 function historyStep(detail, extra) {
   const step = compact({ type: "step", ...extra, kind: detail.kind, title: detail.title, summary: detail.summary });
   if (detail.input) step.input = clipHistoryInput(detail.input);
+  if (detail.kind === "agent") step.agent = { ...detail.agent, callId: extra.id };
   return step;
 }
 
@@ -598,8 +622,9 @@ function clipHistoryInput(input) {
 }
 
 function applyHistoryResult(step, fields) {
-  const { output, input, ...rest } = fields;
+  const { output, input, agent, ...rest } = fields;
   Object.assign(step, rest);
+  if (agent) step.agent = { ...step.agent, ...agent };
   if (input) step.input = clipHistoryInput(input);
   if (typeof output === "string" && output) {
     const clipped = clipText(output, TIMELINE_CAPS.historyOutput);
@@ -623,6 +648,7 @@ const MAX_AGENT_DEPTH = 3;
 export function createClaudeTranscriptCollector({ readSidechain = () => [] } = {}) {
   let entries = [];
   const pending = new Map();
+  const nativeAgents = new Map();
   const inlineSidechains = new Map();
   let cwd = "";
   let thoughts = 0;
@@ -703,6 +729,7 @@ export function createClaudeTranscriptCollector({ readSidechain = () => [] } = {
           done: false,
         };
         pending.set(block.id, record);
+        if (detail.kind === "agent") nativeAgents.set(block.id, record);
         entries.push(record);
       }
     }
@@ -727,10 +754,14 @@ export function createClaudeTranscriptCollector({ readSidechain = () => [] } = {
       if (!record) continue;
       pending.delete(block.tool_use_id);
       const structured = content.length === 1 ? entry.toolUseResult : null;
-      applyHistoryResult(record.step, describeClaudeToolResult(record.detail, block, structured));
+      const result = describeClaudeToolResult(record.detail, block, structured);
+      if (result.agent && structured?.isAsync === true && ["done", "failed", "stopped"].includes(record.step.agent?.status)) {
+        result.agent.status = record.step.agent.status;
+      }
+      applyHistoryResult(record.step, result);
       if (entry.timestamp) record.step.endedAt = entry.timestamp;
       if (record.detail.kind === "agent") {
-        record.children = childSteps(str(structured?.agentId), record.step.id, 1);
+        record.children = childSteps(record.step.agent?.id, record.step.id, 1);
       }
       record.done = true;
     }
@@ -747,6 +778,14 @@ export function createClaudeTranscriptCollector({ readSidechain = () => [] } = {
         return;
       }
       if (typeof entry.cwd === "string" && entry.cwd) cwd = entry.cwd;
+      if (entry.type === "system" && ["task_started", "task_notification"].includes(entry.subtype)) {
+        const record = nativeAgents.get(entry.tool_use_id);
+        if (record) {
+          const status = entry.subtype === "task_started" ? "working"
+            : ({ completed: "done", failed: "failed", stopped: "stopped" })[entry.status];
+          record.step.agent = { ...record.step.agent, ...compact({ id: str(entry.task_id), status }) };
+        }
+      }
       if (entry.type === "assistant") pushAssistant(entry);
       else if (entry.type === "user") pushUser(entry);
     },

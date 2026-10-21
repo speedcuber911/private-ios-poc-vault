@@ -67,10 +67,29 @@ it; later ones merge field by field (a field that is absent is unchanged).
 | `parent` | `id` of the enclosing `agent` step when this step ran inside a sub-agent. Absent at top level. |
 | `startedAt`, `endedAt` | ISO 8601 UTC. |
 | `input` | Object of strings (and `background` as a boolean). By kind: `command`: `command`, `description`, `cwd`, `background`. `read`: `path`, `range`. `edit`, `write`: `path`, `diff`. `search`: `pattern`, `path`. `fetch`: `url`, `query`. `tool`: `name`, `server`, `json`. `agent`: `description`, `prompt`, `agentType`. `todo`: `items` as an array of `{"text","status"}`. Any field may be absent. |
+| `agent` | Optional native child identity on an `agent` step: `id` (provider child ID), `callId` (native launch call ID), `name`, `role`, `status`. Fields merge individually. Child status is `waiting`, `working`, `idle`, `done`, `failed`, or `stopped` only when reported; unknown values remain unknown. A tool's `status: done` alone does not mean the child finished. |
 | `output` | Text result: command output, a sub-agent's final report (markdown), the thought text for `reasoning`. |
 | `outputTruncated` | `true` when `output` was cut to fit a cap. |
 | `exitCode` | Integer, when known. Mostly on `command`; Codex runs reads and searches through a shell too, so `read` and `search` steps can carry it along with `input.command` and `output`. |
 | `error` | Short failure text. |
+
+Codex and Claude chats expose `Chat` and `Subagents` beneath the chat title.
+The list combines native transcript activity and Relay job activity, deduplicated
+by provider child ID or launch call ID. Each child keeps a deterministic colored
+avatar across status changes and reopening. Selecting a native child opens its
+conversation, with the same message, attachment and tool rendering as the parent.
+Returning preserves the parent's draft and scroll position. Children without a
+native ID retain the recorded activity view.
+
+`GET /v1/codex/threads/:parent/subagents/:child?provider=codex|claude` reads an
+existing native transcript under the normal authenticated API boundary. Codex
+requires a native spawn reference or ancestry chain; Claude requires a regular
+sidecar beneath that parent's native session directory. Nested children reuse the
+root parent scope. Child attachments use
+`/v1/codex/threads/:parent/subagents/:provider/:child/attachments/:attachment/raw`.
+Opening a child creates no job and exposes no
+arbitrary-path execution. The reader polls only while foregrounded and the
+machine is available; unsynced transcripts show a retry and recorded activity.
 
 **`step.delta`**: append to a running step's `output` (live command output,
 live thinking).

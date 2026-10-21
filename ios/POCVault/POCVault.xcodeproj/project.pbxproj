@@ -79,6 +79,7 @@
 		200000000000000000000091 /* RelayTranscript.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000091 /* RelayTranscript.swift */; };
 		200000000000000000000092 /* RelayTranscriptViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000092 /* RelayTranscriptViews.swift */; };
 		200000000000000000000093 /* RelayActivitySheets.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000093 /* RelayActivitySheets.swift */; };
+		200000000000000000000096 /* RelaySubagentsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000096 /* RelaySubagentsView.swift */; };
 		200000000000000000000094 /* RelayComposerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000094 /* RelayComposerTests.swift */; };
 		200000000000000000000095 /* RelayTranscriptTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000095 /* RelayTranscriptTests.swift */; };
 		A3ABC87830FA1576A2B26390 /* RelayWatchApp.swift in Watch Sources */ = {
@@ -213,6 +214,7 @@
 		100000000000000000000091 /* RelayTranscript.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayTranscript.swift; sourceTree = "<group>"; };
 		100000000000000000000092 /* RelayTranscriptViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayTranscriptViews.swift; sourceTree = "<group>"; };
 		100000000000000000000093 /* RelayActivitySheets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayActivitySheets.swift; sourceTree = "<group>"; };
+		100000000000000000000096 /* RelaySubagentsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelaySubagentsView.swift; sourceTree = "<group>"; };
 		100000000000000000000094 /* RelayComposerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayComposerTests.swift; sourceTree = "<group>"; };
 		100000000000000000000095 /* RelayTranscriptTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayTranscriptTests.swift; sourceTree = "<group>"; };
 		34BCC44A496F5B805169396D /* RelayWatchApp.swift */ = {
@@ -411,6 +413,7 @@
 				100000000000000000000090 /* RelayComposerSheets.swift */,
 				100000000000000000000092 /* RelayTranscriptViews.swift */,
 				100000000000000000000093 /* RelayActivitySheets.swift */,
+				100000000000000000000096 /* RelaySubagentsView.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -680,6 +683,7 @@
 				200000000000000000000091 /* RelayTranscript.swift in Sources */,
 				200000000000000000000092 /* RelayTranscriptViews.swift in Sources */,
 				200000000000000000000093 /* RelayActivitySheets.swift in Sources */,
+				200000000000000000000096 /* RelaySubagentsView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

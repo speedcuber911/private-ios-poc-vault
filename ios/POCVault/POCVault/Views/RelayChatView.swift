@@ -62,6 +62,8 @@ struct RelayChatView: View {
     @State private var aiDataConsentRequest: RelayAIDataConsentRequest?
     @State private var providerLoginRequest: CodexProvider?
     @State private var activityRequest: RelayActivityRequest?
+    @State private var subagentRequest: RelaySubagent?
+    @State private var selectedSection: RelayChatSection = .chat
     @State private var showingUsage = false
     @StateObject private var scroller = RelayTranscriptScroller()
     @State private var backSwipeOffset: CGFloat = 0
@@ -69,12 +71,19 @@ struct RelayChatView: View {
     @State private var finishingBackSwipe = false
 
     var body: some View {
+        let subagents = viewModel.subagents
+        let showsSubagents = viewModel.showsSubagentsTab && selectedSection == .subagents
         NavigationStack {
             ZStack {
                 AppTheme.bgCanvas.ignoresSafeArea()
 
                 VStack(spacing: 0) {
-                    topBar
+                    VStack(spacing: 0) {
+                        topBar
+                        if viewModel.showsSubagentsTab {
+                            RelayChatSectionPicker(selection: $selectedSection, subagentCount: subagents.count)
+                        }
+                    }
                         .background(AppTheme.bgCanvas.ignoresSafeArea(edges: .top))
                         // The transcript scrolls under an opaque header and
                         // fades out below it instead of colliding with the title.
@@ -90,11 +99,32 @@ struct RelayChatView: View {
                         }
                         .zIndex(1)
                         .simultaneousGesture(keyboardDismissTap)
-                    Group {
-                        if isEmptyConversation {
-                            welcomeCanvas
-                        } else {
-                            messageList
+                    ZStack {
+                        // Keep the transcript mounted so returning from the
+                        // Subagents tab preserves the reader's scroll position.
+                        Group {
+                            if isEmptyConversation {
+                                welcomeCanvas
+                            } else {
+                                messageList
+                            }
+                        }
+                        .opacity(showsSubagents ? 0 : 1)
+                        .allowsHitTesting(!showsSubagents)
+                        .accessibilityHidden(showsSubagents)
+                        if showsSubagents {
+                            RelaySubagentsView(
+                                subagents: subagents,
+                                isLoading: viewModel.isLoadingThreadDetail,
+                                errorMessage: viewModel.errorMessage,
+                                onOpen: { agent in
+                                    if agent.step.agent?.id != nil, viewModel.nativeSessionID != nil {
+                                        subagentRequest = agent
+                                    } else {
+                                        activityRequest = agent.request
+                                    }
+                                }
+                            )
                         }
                     }
                     .layoutPriority(1)
@@ -104,7 +134,7 @@ struct RelayChatView: View {
             }
             .toolbar(.hidden, for: .navigationBar)
             .safeAreaInset(edge: .bottom, spacing: 0) {
-                if !showingThreads {
+                if !showingThreads && !showsSubagents {
                     VStack(alignment: .leading, spacing: 0) {
                         if let onChooseProject {
                             if viewModel.messages.isEmpty {
@@ -212,6 +242,19 @@ struct RelayChatView: View {
             .onChange(of: threadsRequest.wrappedValue) { _, _ in
                 honorThreadsRequest()
             }
+            .onChange(of: selectedSection) { _, _ in dismissKeyboard() }
+            .onChange(of: viewModel.conversationSelectionID) { _, _ in
+                selectedSection = .chat
+                activityRequest = nil
+                subagentRequest = nil
+            }
+            .onChange(of: viewModel.showsSubagentsTab) { _, visible in
+                if !visible { selectedSection = .chat }
+            }
+            .onChange(of: viewModel.pendingApprovals.map(\.id)) { _, approvals in
+                // Keep a waiting decision visible even while inspecting agents.
+                if !approvals.isEmpty { selectedSection = .chat }
+            }
             .onChange(of: automaticPreviewCandidate?.key) { _, _ in
                 openRequestedPreviewIfNeeded()
             }
@@ -243,6 +286,16 @@ struct RelayChatView: View {
             }
             .sheet(item: $activityRequest) { request in
                 RelayActivitySheet(request: request, viewModel: viewModel)
+            }
+            .fullScreenCover(item: $subagentRequest) { agent in
+                if let sessionID = viewModel.nativeSessionID {
+                    NavigationStack {
+                        RelaySubagentChatView(agent: agent, parentSessionID: sessionID,
+                            client: client, parentModel: viewModel, powerModel: powerModel,
+                            onClose: { subagentRequest = nil })
+                    }
+                    .preferredColorScheme(.dark)
+                }
             }
             .sheet(item: $aiDataConsentRequest) { request in
                 RelayAIDataConsentSheet(
@@ -1817,7 +1870,7 @@ final class RelayComposerTextView: UITextView {
     }
 }
 
-private struct RelayChatBubble: View, Equatable {
+struct RelayChatBubble: View, Equatable {
     let item: RelayConversationItem
     let client: CodexClient
     /// False when this message continues the agent's turn above it.
@@ -2105,7 +2158,7 @@ private struct RelayAttachmentThumb: View {
     }
 }
 
-private struct RelayAttachmentViewer: View {
+struct RelayAttachmentViewer: View {
     let attachment: RelayDisplayedAttachment
     let client: CodexClient
     @Environment(\.dismiss) private var dismiss

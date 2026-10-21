@@ -597,6 +597,19 @@ final class RelayChatViewModel: ObservableObject {
     /// Provider locked to the open resumable session. A different provider must start a
     /// new conversation instead of looking like an in-place model change.
     var currentSessionProvider: CodexProvider? { currentThreadProvider }
+    var nativeSessionID: String? { currentThreadID }
+
+    /// Changes on navigation, not when a stream updates the open conversation.
+    var conversationSelectionID: UUID { conversationRevision }
+
+    var subagents: [RelaySubagent] {
+        RelaySubagent.collect(messages: messages, timelines: timelines)
+    }
+
+    var showsSubagentsTab: Bool {
+        let provider = currentSessionProvider ?? selectedChoice?.model.provider
+        return provider == .codex || provider == .claude || !subagents.isEmpty
+    }
 
     var conversationTitle: String {
         if let thread = threads.first(where: { $0.sessionId == currentThreadID }) {
@@ -2159,6 +2172,11 @@ final class RelayChatViewModel: ObservableObject {
     /// time. Steps arrive on the message they precede and become that message's
     /// `historyTimeline`.
     private func conversationItems(from detail: CodexThreadDetail) -> [RelayConversationItem] {
+        Self.conversationItems(from: detail, modelLabel: selectedChoice?.model.label)
+    }
+
+    /// The same transcript rendering for a parent chat and a native child.
+    static func conversationItems(from detail: CodexThreadDetail, modelLabel: String?) -> [RelayConversationItem] {
         let sessionID = detail.thread.sessionId
         let threadIsActive = detail.thread.hasActiveJobs
         let fallbackStamp = detail.thread.updatedAt ?? Date()
@@ -2174,7 +2192,7 @@ final class RelayChatViewModel: ObservableObject {
                 text: "",
                 timestamp: stamp,
                 provider: detail.thread.provider,
-                modelLabel: selectedChoice?.model.label,
+                modelLabel: modelLabel,
                 historyTimeline: RelayTimeline(historySteps: steps, threadIsActive: threadIsActive)
             )
         }
@@ -2197,7 +2215,7 @@ final class RelayChatViewModel: ObservableObject {
                 text: message.text,
                 timestamp: stamp,
                 provider: detail.thread.provider,
-                modelLabel: selectedChoice?.model.label,
+                modelLabel: modelLabel,
                 attachments: message.attachments.map(RelayDisplayedAttachment.from),
                 historyTimeline: role == .assistant && !message.steps.isEmpty
                     ? RelayTimeline(historySteps: message.steps, threadIsActive: threadIsActive)
@@ -2218,7 +2236,7 @@ final class RelayChatViewModel: ObservableObject {
         var inserts: [Int: [RelayConversationItem]] = [:]
         let anyDated = isDated.contains(true)
         for job in jobs {
-            var row = jobItem(job)
+            var row = Self.restoredJobItem(job)
             if let promptIndex = Self.restoredPromptIndex(for: job, in: items, isDated: isDated, claimed: claimed) {
                 claimed.insert(promptIndex)
                 let turnEnd = items.indices.first(where: { $0 > promptIndex && items[$0].role == .user }) ?? items.count
@@ -2479,6 +2497,10 @@ final class RelayChatViewModel: ObservableObject {
     }
 
     private func jobItem(_ job: CodexJob) -> RelayConversationItem {
+        Self.restoredJobItem(job)
+    }
+
+    private static func restoredJobItem(_ job: CodexJob) -> RelayConversationItem {
         RelayConversationItem(
             id: job.id,
             role: .job,

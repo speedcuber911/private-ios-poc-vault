@@ -1678,6 +1678,10 @@ final class ManifestTests: XCTestCase {
             URL(string: "https://codex.pocs.conformal.live/v1/codex/threads/thread-id/attachments/abcdabcdabcdabcd/raw")
         )
         XCTAssertNil(CodexClient.resolvedArtifactURL(nil, baseURL: baseURL))
+        let childPath = "/v1/codex/threads/parent/subagents/claude/child/attachments/abcdabcdabcdabcd/raw"
+        XCTAssertEqual(CodexClient.resolvedArtifactURL(childPath, baseURL: baseURL)?.path, childPath)
+        XCTAssertNil(CodexClient.resolvedArtifactURL("https://untrusted.example" + childPath, baseURL: baseURL))
+        XCTAssertNil(CodexClient.resolvedArtifactURL(childPath.replacingOccurrences(of: "/claude/", with: "/unknown/"), baseURL: baseURL))
     }
 
     func testRelayOutputURLPolicyBlocksOnlyPhoneLoopbackLinks() {
@@ -4635,7 +4639,7 @@ final class RelayTranscriptViewTests: XCTestCase {
         XCTAssertTrue(turn.contains("case .waitingForApproval: return \"Waiting\""))
 
         // History: the steps before a message sit above its prose.
-        let bubble = try snippet(in: chat, from: "private struct RelayChatBubble", to: "private struct RelayDraftAttachmentStrip")
+        let bubble = try snippet(in: chat, from: "struct RelayChatBubble", to: "private struct RelayDraftAttachmentStrip")
         XCTAssertTrue(bubble.contains("if let timeline = item.historyTimeline {"))
         XCTAssertTrue(bubble.contains("RelayTimelineBlocks("))
 
@@ -4815,7 +4819,7 @@ final class RelayTranscriptViewTests: XCTestCase {
         let list = try snippet(in: chat, from: "private var messageList: some View", to: "private func transcriptRow")
         XCTAssertTrue(list.contains("ProgressView(\"Loading conversation…\")"))
         XCTAssertTrue(list.contains(".refreshable"))
-        XCTAssertTrue(chat.contains("if isEmptyConversation {\n                            welcomeCanvas"))
+        XCTAssertNotNil(chat.range(of: #"if isEmptyConversation \{\s+welcomeCanvas"#, options: .regularExpression))
         XCTAssertTrue(chat.contains(".contentShape(Rectangle())\n                    .simultaneousGesture(keyboardDismissTap)"))
     }
 

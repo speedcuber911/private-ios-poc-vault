@@ -15,6 +15,51 @@ import { TIMELINE_CAPS } from "../src/timeline.mjs";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixture = (name) => path.join(here, "fixtures", name);
 
+test("native Claude background launch and child completion have distinct lifecycle states", () => {
+  const mapper = createClaudeStreamMapper();
+  const [opened] = mapper.push({ type: "assistant", message: { content: [{ type: "tool_use", id: "native-call", name: "Agent", input: {
+    name: "rounding-reviewer", description: "Check rounding", subagent_type: "Explore", prompt: "Audit the rounding tests"
+  } }] } });
+  assert.equal(opened.agent.callId, "native-call");
+  assert.equal(opened.agent.name, "rounding-reviewer");
+  const [launch] = mapper.push({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "native-call", content: "Agent launched" }] }, tool_use_result: { agentId: "child", isAsync: true } });
+  assert.equal(launch.status, "done");
+  assert.equal(launch.agent.id, "child");
+  assert.equal(launch.agent.status, "working");
+  assert.equal(launch.output, undefined);
+  const [done] = mapper.push({ type: "system", subtype: "task_notification", tool_use_id: "native-call", task_id: "child", status: "completed" });
+  assert.equal(done.id, opened.id);
+  assert.equal(done.agent.status, "done");
+  assert.deepEqual(mapper.push({ type: "system", subtype: "task_notification", tool_use_id: "unseen-shell", task_id: "shell", status: "completed" }), []);
+});
+
+test("Claude desktop history preserves native identity and explicit completion", () => {
+  const collector = createClaudeTranscriptCollector();
+  collector.push({ type: "assistant", message: { content: [{ type: "tool_use", id: "native-call", name: "Agent", input: { name: "reviewer", subagent_type: "Explore", prompt: "Audit" } }] } });
+  collector.push({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "native-call", content: "All checked" }] }, toolUseResult: { agentId: "child", status: "completed" } });
+  const [step] = collector.take();
+  assert.deepEqual(step.agent, { callId: "native-call", id: "child", name: "reviewer", role: "Explore", status: "done" });
+});
+
+test("a late Claude background launch receipt cannot undo a native completion", () => {
+  const mapper = createClaudeStreamMapper();
+  mapper.push({ type: "assistant", message: { content: [{ type: "tool_use", id: "call", name: "Agent", input: { subagent_type: "Explore" } }] } });
+  mapper.push({ type: "system", subtype: "task_notification", tool_use_id: "call", task_id: "child", status: "completed" });
+  const [receipt] = mapper.push({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "call", content: "Launched" }] }, tool_use_result: { agentId: "child", isAsync: true } });
+  assert.equal(receipt.agent.status, "done");
+});
+
+test("Claude history retains native lifecycle changes after the spawn step was returned", () => {
+  const collector = createClaudeTranscriptCollector();
+  collector.push({ type: "assistant", message: { content: [{ type: "tool_use", id: "call", name: "Agent", input: { subagent_type: "Explore" } }] } });
+  collector.push({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "call", content: "Launched" }] }, toolUseResult: { agentId: "child", isAsync: true } });
+  const [step] = collector.take();
+  assert.equal(step.agent.status, "working");
+  collector.push({ type: "system", subtype: "task_notification", tool_use_id: "call", task_id: "child", status: "completed" });
+  assert.equal(step.agent.status, "done");
+  assert.deepEqual(collector.take(), [], "the same native child is not listed twice");
+});
+
 // The stream fixtures are recordings of Claude Code 2.1.280 run with
 // `--print --output-format stream-json --verbose --include-partial-messages`,
 // trimmed (bulky bookkeeping fields and rate-limit lines dropped) and sanitised

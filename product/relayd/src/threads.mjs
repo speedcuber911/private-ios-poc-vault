@@ -338,6 +338,8 @@ function readSessionMetaWithStat(sessionFile, stat, expectedSessionId) {
             cwd,
             provider: normalizeJobProvider(entry.payload.provider),
             timestamp: cleanSessionTimestamp(entry.payload.timestamp || entry.timestamp),
+            parentThreadId: entry.payload.parent_thread_id || entry.payload.parentThreadId
+              || entry.payload.source?.subagent?.spawn?.parent_thread_id || null,
           };
         }
       }
@@ -607,6 +609,69 @@ async function threadDetailResponse(sessionId, { provider = null } = {}) {
   };
 }
 
+// A native child is opened through its parent, never through a caller-supplied
+// path. Claude stores children beneath the parent's session directory; Codex
+// stores separate rollouts and records their parent in session_meta.
+async function loadSubagentDetailState(parentId, agentId, { provider = null } = {}) {
+  if (!isThreadSessionId(parentId) || !/^[A-Za-z0-9_-]{1,80}$/.test(agentId)
+      || !["codex", "claude"].includes(provider)) return null;
+  const parent = await loadThreadDetailState(parentId, { provider });
+  if (!parent?.thread) return null;
+  let file;
+  let transcriptOptions;
+  if (provider === "claude") {
+    const parentFile = findClaudeSessionFile(parentId);
+    if (!parentFile) return null;
+    file = claudeSidechainFile(parentFile, agentId);
+    if (!file) return null;
+    transcriptOptions = { sessionId: agentId, sidechainAgentId: agentId,
+      readSidechain: claudeSidechainReader(parentFile) };
+  } else {
+    if (!isThreadSessionId(agentId) || agentId === parentId) return null;
+    const sessionsDir = path.join(codexHome, "sessions");
+    file = findSessionFile(sessionsDir, agentId);
+    if (!file) return null;
+    const referenced = [...parent.messages.flatMap((message) => message.steps || []), ...parent.trailingSteps]
+      .some((step) => step.kind === "agent" && step.agent?.id === agentId);
+    // Older rollouts lack ancestry metadata, but the parent's native spawn
+    // receipt is also proof of the relationship. Follow ancestry for nested
+    // agents and children whose launch has aged out of the message window.
+    let related = referenced;
+    let ancestor = agentId;
+    const seen = new Set();
+    for (let depth = 0; !related && depth < 16 && !seen.has(ancestor); depth += 1) {
+      seen.add(ancestor);
+      const ancestorFile = findSessionFile(sessionsDir, ancestor);
+      const meta = ancestorFile ? readSessionMeta(ancestorFile, ancestor) : null;
+      ancestor = meta?.parentThreadId;
+      if (!isThreadSessionId(ancestor)) break;
+      related = ancestor === parentId;
+    }
+    if (!related) return null;
+    const meta = readSessionMeta(file, agentId);
+    if (!meta || meta.provider !== "codex" || !workspaceForSessionCwd(meta.cwd)) return null;
+    transcriptOptions = { sessionId: agentId };
+  }
+  const transcript = await readSessionTranscript(file, transcriptOptions);
+  // Child attachments use the same parent-scoped authorization on every read.
+  for (const message of transcript.messages) {
+    for (const attachment of message.attachments || []) {
+      if (attachment.rawURL) attachment.rawURL = `/v1/codex/threads/${parentId}/subagents/${provider}/${agentId}/attachments/${attachment.id}/raw`;
+    }
+  }
+  return { ...transcript, thread: { ...parent.thread, id: agentId, sessionId: agentId,
+    jobs: [], updatedAt: fs.statSync(file).mtime.toISOString(), title: null,
+    summary: { firstUserPrompt: transcript.messages.find((message) => message.role === "user")?.text,
+      lastAssistantAnswer: transcript.messages.findLast((message) => message.role === "assistant")?.text } } };
+}
+
+async function subagentThreadDetailResponse(parentId, agentId, options) {
+  const state = await loadSubagentDetailState(parentId, agentId, options);
+  if (!state) return null;
+  return { thread: threadSummary(state.thread), messages: publicThreadMessages(state.messages),
+    jobs: [], trailingSteps: publicSteps(state.trailingSteps) };
+}
+
 
 async function loadThreadDetailState(sessionId, { provider = null } = {}) {
   const sessionsDir = path.join(codexHome, "sessions");
@@ -781,11 +846,12 @@ function dedupeAttachments(attachments) {
   return out;
 }
 
-async function serveThreadAttachment(res, sessionId, attachmentId, { provider = null } = {}) {
+async function serveThreadAttachment(res, sessionId, attachmentId, { provider = null, agentId = null } = {}) {
   if (!isThreadSessionId(sessionId) || !isSafeThreadAttachmentId(attachmentId)) {
     return sendError(res, 404, "attachment not found");
   }
-  const state = await loadThreadDetailState(sessionId, { provider });
+  const state = agentId ? await loadSubagentDetailState(sessionId, agentId, { provider })
+    : await loadThreadDetailState(sessionId, { provider });
   if (!state || state.chatDetail) return sendError(res, 404, "attachment not found");
   mergeJobAttachmentsIntoMessages(state.messages, state.thread.jobs, state.thread.sessionId || sessionId);
   const attachment = (state.messages || [])
@@ -1102,44 +1168,44 @@ function boundSteps(steps) {
 // Claude Code keeps each sub-agent's transcript beside the session:
 // <projects>/<project>/<sessionId>/subagents/agent-<agentId>.jsonl.
 function claudeSidechainReader(sessionFile) {
+  return (agentId) => {
+    const file = claudeSidechainFile(sessionFile, agentId);
+    if (!file || fs.statSync(file).size > MAX_SIDECHAIN_BYTES) return [];
+    return fs.readFileSync(file, "utf8").split("\n").flatMap((line) => {
+      try { return line.trim() ? [JSON.parse(line)] : []; } catch { return []; }
+    });
+  };
+}
+
+function claudeSidechainFile(sessionFile, agentId) {
+  if (typeof agentId !== "string" || !/^[A-Za-z0-9_-]{1,80}$/.test(agentId)) return null;
   const directory = path.join(
     path.dirname(sessionFile),
     path.basename(sessionFile, path.extname(sessionFile)),
     "subagents",
   );
-  return (agentId) => {
-    if (typeof agentId !== "string" || !/^[A-Za-z0-9_-]{1,80}$/.test(agentId)) return [];
-    const file = path.join(directory, `agent-${agentId}.jsonl`);
-    let stat;
-    try {
-      stat = fs.statSync(file);
-    } catch {
-      return [];
-    }
-    if (!stat.isFile() || stat.size > MAX_SIDECHAIN_BYTES) return [];
-    const entries = [];
-    for (const line of fs.readFileSync(file, "utf8").split("\n")) {
-      if (!line.trim()) continue;
-      try {
-        entries.push(JSON.parse(line));
-      } catch {
-        continue;
-      }
-    }
-    return entries;
-  };
+  const file = path.join(directory, `agent-${agentId}.jsonl`);
+  try {
+    // Reject symlinks that could turn a native child id into a file elsewhere.
+    const expected = path.join(fs.realpathSync(path.dirname(sessionFile)),
+      path.basename(sessionFile, path.extname(sessionFile)), "subagents");
+    if (!fs.lstatSync(file).isFile() || fs.realpathSync(directory) !== expected
+        || !pathWithinRoot(fs.realpathSync(file), expected)) return null;
+    return file;
+  } catch { return null; }
 }
 
 // Messages as before, plus the steps between them: each message may carry
 // `steps` (what happened since the previous returned message) and
 // `trailingSteps` holds what happened after the last one.
-async function readSessionTranscript(sessionFile, { sessionId = null } = {}) {
+async function readSessionTranscript(sessionFile, { sessionId = null, sidechainAgentId = null,
+  readSidechain = claudeSidechainReader(sessionFile) } = {}) {
   const messages = [];
   const id = sessionId || path.basename(sessionFile, path.extname(sessionFile));
   // Each collector ignores lines that are not its harness's, so both see
   // every line and the reader does not need to know whose transcript this is.
   const collectors = [
-    createClaudeTranscriptCollector({ readSidechain: claudeSidechainReader(sessionFile) }),
+    createClaudeTranscriptCollector({ readSidechain }),
     createCodexTranscriptCollector(),
   ];
   const takeSteps = (options) => {
@@ -1161,7 +1227,16 @@ async function readSessionTranscript(sessionFile, { sessionId = null } = {}) {
   for await (const line of lines) {
     if (!line.trim()) continue;
     try {
-      const entry = JSON.parse(line);
+      let entry = JSON.parse(line);
+      if (sidechainAgentId) {
+        if (entry.agentId && entry.agentId !== sidechainAgentId) continue;
+        // In its own chat the child is the root. Its tools must not be
+        // discarded by the collector's parent-chat sidechain suppression.
+        entry = { ...entry, isSidechain: false };
+      } else if (entry.isSidechain === true) {
+        for (const collector of collectors) collector.push(entry);
+        continue;
+      }
       if (entry.type === "event_msg" && entry.payload?.type === "task_started") mirrorCandidate = null;
       for (const collector of collectors) {
         try {
@@ -1802,6 +1877,7 @@ export {
   listWorkspaceThreads,
   resolveOptionalWorkspaceFilter,
   threadDetailResponse,
+  subagentThreadDetailResponse,
   serveThreadAttachment,
   isSafeThreadAttachmentId,
   deleteThread,

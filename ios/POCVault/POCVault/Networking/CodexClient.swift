@@ -764,6 +764,15 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         return try decoder.decode(CodexThreadDetail.self, from: data)
     }
 
+    func fetchSubagentDetail(parentSessionID: String, agentID: String, provider: CodexProvider) async throws -> CodexThreadDetail {
+        let data = try await perform(
+            path: "/v1/codex/threads/\(Self.pathComponent(parentSessionID))/subagents/\(Self.pathComponent(agentID))",
+            queryItems: [URLQueryItem(name: "provider", value: provider.rawValue)]
+        )
+        guard !data.isEmpty else { throw CodexClientError.emptyResponse }
+        return try decoder.decode(CodexThreadDetail.self, from: data)
+    }
+
     func deleteThread(sessionID: String, workspaceID: String?, provider: CodexProvider? = nil) async throws {
         var queryItems: [URLQueryItem] = []
         if let workspaceID, !workspaceID.isEmpty {
@@ -970,6 +979,11 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         }
 
         let parts = url.pathComponents.filter { $0 != "/" }
+        if parts.count == 10, parts[0] == "v1", parts[1] == "codex", parts[2] == "threads",
+           !parts[3].isEmpty, parts[4] == "subagents", ["codex", "claude"].contains(parts[5]),
+           !parts[6].isEmpty, parts[7] == "attachments", !parts[8].isEmpty, parts[9] == "raw" {
+            return true
+        }
         guard parts.count == 7, parts[0] == "v1", parts[1] == "codex", !parts[3].isEmpty, !parts[5].isEmpty, parts[6] == "raw" || parts[6] == "preview" else {
             return false
         }

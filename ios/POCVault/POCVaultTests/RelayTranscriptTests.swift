@@ -44,6 +44,96 @@ final class RelayTranscriptTests: XCTestCase {
         return timeline
     }
 
+    func testNativeAgentIdentitySurvivesLifecyclePatchesAndHistoryRestore() throws {
+        var timeline = RelayTimeline()
+        let events = try decode(#"""
+        {"type":"step","id":"spawn","kind":"agent","status":"done","agent":{"id":"child","name":"Kepler","role":"explorer","status":"working"}}
+        {"type":"step","id":"spawn","agent":{"status":"done"}}
+        """#)
+        events.forEach { timeline.apply($0) }
+        let message = RelayConversationItem(id: "desktop", role: .assistant, text: "", provider: .codex, historyTimeline: timeline)
+        let row = try XCTUnwrap(RelaySubagent.collect(messages: [message], timelines: [:]).first)
+        XCTAssertEqual(row.name, "Kepler")
+        XCTAssertEqual(row.step.agent?.id, "child")
+        XCTAssertEqual(row.step.subagentAvatarSeed, "child")
+        XCTAssertEqual(row.statusLabel, "Done")
+        XCTAssertFalse(row.isWorking)
+        XCTAssertEqual(RelayAgentAvatar.fingerprint(row.step.subagentAvatarSeed), RelayAgentAvatar.fingerprint("child"))
+        XCTAssertNotEqual(RelayAgentAvatar.fingerprint("child"), RelayAgentAvatar.fingerprint("another-child"))
+    }
+
+    func testNativeAgentDeduplicatesDifferentLiveAndHistoryStepIDs() throws {
+        let history = RelayTimeline(historySteps: [RelayStepPatch(id: "tool-use", kind: .agent, status: .done,
+            agent: RelayNativeAgent(id: "child", callId: "tool-use", name: "Reviewer", status: "done"))])
+        let live = RelayTimeline(historySteps: [RelayStepPatch(id: "a1", kind: .agent, status: .done,
+            agent: RelayNativeAgent(id: "child", callId: "tool-use", name: "Reviewer", status: "working"))])
+        let job = try JSONDecoder().decode(CodexJob.self, from: Data(#"{"id":"job","provider":"claude","status":"running"}"#.utf8))
+        let messages = [RelayConversationItem(id: "history", role: .assistant, text: "", provider: .claude, historyTimeline: history),
+                        RelayConversationItem(id: "live", role: .job, text: "", job: job)]
+        let rows = RelaySubagent.collect(messages: messages, timelines: ["job": live])
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows.first?.request.source, .job("job"))
+        XCTAssertEqual(rows.first?.statusLabel, "Working", "a finished spawn call is independent of a running child")
+        XCTAssertEqual(rows.first?.step.subagentAvatarSeed, history.step("tool-use")?.subagentAvatarSeed)
+    }
+
+    func testSubagentsIncludeNestedTasksAndDoNotConfuseSpawnWithCompletion() throws {
+        let events = try decode(#"""
+        {"type":"step","id":"spawn","kind":"agent","summary":"Audit callers","status":"done","output":"{\"agent_id\":\"child\"}"}
+        {"type":"step","id":"nested","parent":"spawn","kind":"agent","summary":"Check tests","status":"done"}
+        {"type":"step","id":"read","parent":"nested","kind":"read","status":"running"}
+        """#)
+        var timeline = RelayTimeline()
+        for event in events { timeline.apply(event) }
+        var message = RelayConversationItem(id: "desktop", role: .assistant, text: "", provider: .codex, historyTimeline: timeline)
+        let active = RelaySubagent.collect(messages: [message], timelines: [:])
+        XCTAssertEqual(active.map(\.step.id), ["spawn", "nested"])
+        XCTAssertEqual(active.first?.descendants.map(\.id), ["nested", "read"])
+        XCTAssertEqual(active.last?.parentTitle, "Audit callers")
+        XCTAssertTrue(active.allSatisfy(\.isWorking), "a running descendant keeps its ancestors active")
+        XCTAssertEqual(active.first?.request, RelayActivityRequest(source: .message("desktop"), root: .step("spawn")))
+
+        timeline.apply(.step(RelayStepPatch(id: "read", status: .done)))
+        message.historyTimeline = timeline
+        let settled = RelaySubagent.collect(messages: [message], timelines: [:])
+        XCTAssertTrue(settled.allSatisfy { !$0.isWorking })
+        XCTAssertTrue(settled.allSatisfy { $0.statusLabel == nil }, "a successful spawn is not proof its child completed")
+    }
+
+    func testSubagentsDeduplicateNativeHistoryAndJobWithoutLeakingOtherChats() throws {
+        let history = try canonicalTimeline()
+        let job = try JSONDecoder().decode(CodexJob.self, from: Data(#"{"id":"job","provider":"claude","status":"running"}"#.utf8))
+        let message = RelayConversationItem(id: "history", role: .assistant, text: "Answer", provider: .claude, historyTimeline: history)
+        let jobMessage = RelayConversationItem(id: "job-row", role: .job, text: "", job: job)
+        var live = history
+        live.apply(.step(RelayStepPatch(id: "a1", status: .running)))
+        let entries = RelaySubagent.collect(messages: [message, jobMessage], timelines: ["job": live, "unrelated-job": live])
+        XCTAssertEqual(entries.count, 1)
+        XCTAssertEqual(entries.first?.request.source, .job("job"))
+        XCTAssertTrue(entries.first?.isWorking == true)
+        XCTAssertTrue(RelaySubagent.collect(messages: [], timelines: ["job": live]).isEmpty)
+
+        let finishedJob = try JSONDecoder().decode(CodexJob.self, from: Data(#"{"id":"job","provider":"claude","status":"succeeded"}"#.utf8))
+        let finished = RelayConversationItem(id: "job-row", role: .job, text: "", job: finishedJob)
+        let restored = RelaySubagent.collect(messages: [message, finished], timelines: ["job": history])
+        XCTAssertEqual(restored.count, 1)
+        XCTAssertEqual(restored.first?.request.source, .message("history"))
+    }
+
+    func testSubagentsKeepReusedItemIDsInSeparateJobsAndSortActiveFirst() throws {
+        let first = try JSONDecoder().decode(CodexJob.self, from: Data(#"{"id":"first","provider":"codex","status":"succeeded"}"#.utf8))
+        let second = try JSONDecoder().decode(CodexJob.self, from: Data(#"{"id":"second","provider":"codex","status":"running"}"#.utf8))
+        let done = RelayTimeline(historySteps: [RelayStepPatch(id: "1", kind: .agent, status: .done)])
+        let active = RelayTimeline(historySteps: [RelayStepPatch(id: "1", kind: .agent, status: .running)])
+        let rows = RelaySubagent.collect(messages: [
+            RelayConversationItem(role: .job, text: "", job: first),
+            RelayConversationItem(role: .job, text: "", job: second),
+        ], timelines: ["first": done, "second": active])
+        XCTAssertEqual(rows.count, 2)
+        XCTAssertEqual(rows.map(\.request.source), [.job("second"), .job("first")])
+        XCTAssertEqual(Set(rows.map(\.id)).count, 2)
+    }
+
     private func stepIDs(_ block: RelayTimelineBlock) -> [String] {
         if case .activity(let ids) = block.content { return ids }
         return []
@@ -461,6 +551,47 @@ private final class LiveScript {
 
 @MainActor
 final class RelayChatLiveDataTests: XCTestCase {
+    func testNativeChildReaderPreservesMessagesToolsAndLastSuccessfulSnapshot() async throws {
+        let detail = try JSONDecoder().decode(CodexThreadDetail.self, from: Data(#"""
+        {"thread":{"id":"child","sessionId":"child","provider":"claude","updatedAt":"2026-10-21T10:00:00Z"},
+         "messages":[{"role":"user","text":"Inspect the feature"},
+          {"role":"assistant","text":"The native reply","steps":[{"id":"read","kind":"read","status":"done","summary":"example.swift"}]}],
+         "trailingSteps":[{"id":"spawn","kind":"agent","status":"done","agent":{"id":"nested","name":"Reviewer","status":"working"}}]}
+        """#.utf8))
+        var fails = false
+        let child = RelaySubagentChatModel {
+            if fails { throw URLError(.notConnectedToInternet) }
+            return detail
+        }
+        await child.refresh()
+        XCTAssertFalse(child.isLoading)
+        XCTAssertNil(child.errorMessage)
+        XCTAssertEqual(child.messages.map(\.text), ["Inspect the feature", "The native reply", ""])
+        XCTAssertEqual(child.messages[1].historyTimeline?.step("read")?.kind, .read)
+        XCTAssertEqual(child.subagents.first?.name, "Reviewer")
+        let snapshot = child.messages
+        await child.refresh()
+        XCTAssertEqual(child.messages, snapshot, "polling does not duplicate child messages")
+        fails = true
+        await child.refresh()
+        XCTAssertNotNil(child.errorMessage)
+        XCTAssertEqual(child.messages, snapshot, "a connection drop keeps the conversation readable")
+    }
+
+    func testLeavingChildReaderDiscardsAnInFlightResponse() async throws {
+        let detail = try JSONDecoder().decode(CodexThreadDetail.self, from: Data(#"{"thread":{"id":"child","sessionId":"child","provider":"codex"},"messages":[{"role":"assistant","text":"Late reply"}]}"#.utf8))
+        var resume: CheckedContinuation<CodexThreadDetail, Never>?
+        let child = RelaySubagentChatModel { await withCheckedContinuation { resume = $0 } }
+        let task = Task { await child.refresh() }
+        await Task.yield()
+        try await waitUntil("child fetch starts") { resume != nil }
+        task.cancel()
+        resume?.resume(returning: detail)
+        await task.value
+        XCTAssertTrue(child.messages.isEmpty)
+        XCTAssertNil(child.errorMessage)
+    }
+
     private func job(_ json: String) throws -> CodexJob {
         try JSONDecoder().decode(CodexJob.self, from: Data(json.utf8))
     }
@@ -974,6 +1105,31 @@ final class RelayChatLiveDataTests: XCTestCase {
         """#)
         await model.refreshWatchedThreadIfNeeded()
         XCTAssertEqual(model.messages.map(\.text), ["Earlier prompt", "Resumed on desktop"])
+    }
+
+    func testSubagentsFollowClaudeDesktopPollingAndClearOnNewChat() async throws {
+        var current = try threadDetail(#"""
+        {"thread":{"id":"th-1","sessionId":"th-1","workspaceId":"ws","provider":"claude","live":true},
+         "messages":[{"role":"user","text":"Audit this project"}],
+         "trailingSteps":[{"id":"agent-1","kind":"agent","summary":"Review tests","status":"running"}],"jobs":[]}
+        """#)
+        let model = makeModel(LiveScript(), detail: { _ in throw CancellationError() }, thread: { _, _, _ in current })
+        await model.openThread(try thread())
+        let selection = model.conversationSelectionID
+        XCTAssertTrue(model.showsSubagentsTab)
+        XCTAssertEqual(model.subagents.first?.step.displaySummary, "Review tests")
+        XCTAssertEqual(model.subagents.first?.statusLabel, "In progress")
+        current = try threadDetail(#"""
+        {"thread":{"id":"th-1","sessionId":"th-1","workspaceId":"ws","provider":"claude","live":true},
+         "messages":[{"role":"user","text":"Audit this project"}],
+         "trailingSteps":[{"id":"agent-1","kind":"agent","summary":"Review tests","status":"failed","error":"Agent failed"}],"jobs":[]}
+        """#)
+        await model.refreshWatchedThreadIfNeeded()
+        XCTAssertEqual(model.conversationSelectionID, selection, "a live update must not switch the selected tab")
+        XCTAssertEqual(model.subagents.first?.statusLabel, "Failed")
+        model.startNewConversation()
+        XCTAssertNotEqual(model.conversationSelectionID, selection)
+        XCTAssertTrue(model.subagents.isEmpty)
     }
 
     private func threadDetail(_ json: String) throws -> CodexThreadDetail {

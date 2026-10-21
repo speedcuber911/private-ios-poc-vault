@@ -17,7 +17,7 @@ import { publicRuntimeModelCatalog } from "./catalog.mjs";
 import { fsListResponse, serveFsFile } from "./fsapi.mjs";
 import { fsGitStatus } from "./fsgit.mjs";
 import { listProviderSkills, publicSkill } from "./skills.mjs";
-import { cleanThreadProviderFilter, workspaceForJob, listWorkspaceSessions, listWorkspaceThreads, resolveOptionalWorkspaceFilter, threadDetailResponse, serveThreadAttachment, isSafeThreadAttachmentId, deleteThread } from "./threads.mjs";
+import { cleanThreadProviderFilter, workspaceForJob, listWorkspaceSessions, listWorkspaceThreads, resolveOptionalWorkspaceFilter, threadDetailResponse, subagentThreadDetailResponse, serveThreadAttachment, isSafeThreadAttachmentId, deleteThread } from "./threads.mjs";
 import { handleChatRequest } from "./chat.mjs";
 import { isSafeArtifactId, serveJobArtifact } from "./artifacts.mjs";
 import { transcribeAudio, cleanAudioContentType, cleanAudioFilename } from "./transcribe.mjs";
@@ -389,6 +389,21 @@ async function routeRequest(req, res) {
     const workspaceId = url.searchParams.get("workspaceId");
     const provider = cleanThreadProviderFilter(url.searchParams.get("provider"));
     return sendJson(res, 200, { threads: listWorkspaceThreads({ workspaceId, provider, limit }) });
+  }
+
+  const subagentAttachmentMatch = url.pathname.match(/^\/v1\/codex\/threads\/([^/]+)\/subagents\/(codex|claude)\/([^/]+)\/attachments\/([^/]+)\/raw$/);
+  if (subagentAttachmentMatch && req.method === "GET") {
+    return serveThreadAttachment(res, decodeURIComponent(subagentAttachmentMatch[1]),
+      decodeURIComponent(subagentAttachmentMatch[4]), { provider: subagentAttachmentMatch[2],
+        agentId: decodeURIComponent(subagentAttachmentMatch[3]) });
+  }
+  const subagentMatch = url.pathname.match(/^\/v1\/codex\/threads\/([^/]+)\/subagents\/([^/]+)$/);
+  if (subagentMatch && req.method === "GET") {
+    const parentId = decodeURIComponent(subagentMatch[1]);
+    const agentId = decodeURIComponent(subagentMatch[2]);
+    const provider = cleanThreadProviderFilter(url.searchParams.get("provider"));
+    const detail = await subagentThreadDetailResponse(parentId, agentId, { provider });
+    return detail ? sendJson(res, 200, detail) : sendError(res, 404, "subagent not found");
   }
 
   const threadAttachmentMatch = url.pathname.match(/^\/v1\/codex\/threads\/([^/]+)\/attachments\/([^/]+)\/raw$/);
