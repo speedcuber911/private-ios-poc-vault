@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import http from "node:http";
+import { buildClaudeArgs } from "../src/adapters/claude.mjs";
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-job-controls-"));
 const workspace = path.join(dir, "workspace");
@@ -21,6 +22,17 @@ process.env.CODEX_REQUIRE_MTLS = "true";
 process.env.CODEX_ALLOWED_CERT_SUBJECTS = "CN=iphone";
 
 const { buildJobPrompt, buildJobEnv, runtimeCacheTargets, submitJobInput, jobs, activeChildren, jobPath, loadPersistedJobs } = await import("../src/jobs.mjs");
+
+test("Claude manual approval uses the native default mode and retains the Relay approval tool", () => {
+  for (const permissionMode of [undefined, "manual", "default", "plan", "acceptEdits", "auto", "dontAsk", "bypassPermissions"]) {
+    const args = buildClaudeArgs({ permissionMode, sessionId: "00000000-0000-4000-8000-000000000001" });
+    assert.equal(args[args.indexOf("--permission-mode") + 1],
+      !permissionMode || permissionMode === "manual" ? "default" : permissionMode);
+    assert.equal(args[args.indexOf("--permission-prompt-tool") + 1], "mcp__relay_approvals__approve");
+    assert.ok(args.includes("--strict-mcp-config"));
+    assert.ok(!args.includes("--dangerously-skip-permissions"));
+  }
+});
 
 test("Codex app-server receives each selected skill once as a structured input", () => {
   const skill = { id: "review", name: "review", file: skillFile, kind: "skill" };

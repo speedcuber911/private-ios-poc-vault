@@ -20,7 +20,10 @@ function buildClaudeArgs(job, { transport = "print" } = {}) {
   if (transport === "stream") args.push(...claudeStreamFlags);
   if (job.model) args.push("--model", job.model);
   if (job.reasoningEffort) args.push("--effort", job.reasoningEffort);
-  args.push("--permission-mode", job.permissionMode || "manual");
+  // Relay calls its approval-driven mode "manual". Claude's CLI names that
+  // policy "default"; sending the Relay label makes the CLI exit before a run.
+  const permissionMode = job.permissionMode || "manual";
+  args.push("--permission-mode", permissionMode === "manual" ? "default" : permissionMode);
   args.push("--mcp-config", JSON.stringify({
     mcpServers: {
       relay_approvals: {

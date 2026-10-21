@@ -292,7 +292,7 @@ test("a Claude job streams a timeline, keeps the legacy channels, and answers wi
     const value = (name) => call.args[call.args.indexOf(name) + 1];
     assert.equal(value("--model"), "sonnet");
     assert.equal(value("--effort"), "high");
-    assert.equal(value("--permission-mode"), "manual");
+    assert.equal(value("--permission-mode"), "default");
     assert.equal(value("--permission-prompt-tool"), "mcp__relay_approvals__approve");
     assert.equal(value("--session-id"), created.sessionId);
     assert.ok(call.args.includes("--strict-mcp-config"));

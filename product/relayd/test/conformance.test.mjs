@@ -3343,7 +3343,7 @@ localTest("runs Claude jobs with configured binary, stdin prompt, and stdout res
     assert.equal(job.reasoningEffort, "high");
     assert.match(job.stdout, /claude args: .*\[--print\]/);
     assert.match(job.stdout, /\[--model\] \[sonnet\]/);
-    assert.match(job.stdout, /\[--permission-mode\] \[manual\]/);
+    assert.match(job.stdout, /\[--permission-mode\] \[default\]/);
     assert.match(job.stdout, /\[--permission-prompt-tool\] \[mcp__relay_approvals__approve\]/);
     assert.match(job.stdout, new RegExp(`\\[--session-id\\] \\[${created.sessionId}\\]`));
     assert.doesNotMatch(job.stdout, /--dangerously-skip-permissions/);

@@ -729,6 +729,7 @@ on thread/turn requests. The compatibility exec transport uses
 never adds the bypass flag. Placing them before `exec` keeps the controls valid
 for both new jobs and `exec resume` jobs.
 Claude runs `claude --print --model … --effort … --permission-mode …` with the
+native `default` permission mode for Relay's `manual` approval policy and the
 Relay approval MCP and a server-minted `--session-id`; kimi runs `kimi --model kimi-code/k3 --prompt …
 --output-format stream-json` and resumes with `--session`. AWS/Bedrock
 credentials are scrubbed from the child env for direct claude/kimi jobs.
