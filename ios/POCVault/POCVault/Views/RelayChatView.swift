@@ -465,11 +465,12 @@ struct RelayChatView: View {
 
     private var projectContextLabel: some View {
         Label(viewModel.projectLabel ?? "Choose project", systemImage: "folder")
-            .font(.caption)
+            .font(AppTheme.uiFont(size: 15, weight: .medium))
             .foregroundStyle(RelayChatStyle.secondary)
             .lineLimit(1)
-            .frame(minHeight: 36)
+            .frame(minHeight: 44)
             .padding(.horizontal, 24)
+            .contentShape(Rectangle())
     }
 
     private var isEmptyConversation: Bool {
