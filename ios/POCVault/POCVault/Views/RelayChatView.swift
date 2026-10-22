@@ -465,10 +465,10 @@ struct RelayChatView: View {
 
     private var projectContextLabel: some View {
         Label(viewModel.projectLabel ?? "Choose project", systemImage: "folder")
-            .font(AppTheme.uiFont(size: 15, weight: .medium))
+            .font(AppTheme.uiFont(size: 17, weight: .medium))
             .foregroundStyle(RelayChatStyle.secondary)
             .lineLimit(1)
-            .frame(minHeight: 44)
+            .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
             .padding(.horizontal, 24)
             .contentShape(Rectangle())
     }
@@ -502,8 +502,10 @@ struct RelayChatView: View {
                 else { showingThreads = true }
             } label: {
                 Label("Threads", systemImage: "line.3.horizontal")
-                    .font(.subheadline)
-                    .frame(minWidth: 44, minHeight: 44)
+                    .font(.body)
+                    .padding(.horizontal, 4)
+                    .frame(minWidth: 48, minHeight: 48)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .foregroundStyle(RelayChatStyle.secondary)
@@ -517,8 +519,9 @@ struct RelayChatView: View {
             Spacer(minLength: 8)
             Button(action: startNewConversation) {
                 Image(systemName: "square.and.pencil")
-                    .font(AppTheme.uiFont(size: 19))
-                    .frame(width: 44, height: 44)
+                    .font(AppTheme.uiFont(size: 21))
+                    .frame(width: 48, height: 48)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .foregroundStyle(RelayChatStyle.secondary)

@@ -9,11 +9,12 @@ struct RelayWatchApp: App {
         let isActive: Bool
         let isComposing: Bool
         let watchedJobID: String?
+        let powerState: RelayWatchMachine.State?
     }
 
     private var refreshContext: RefreshContext {
         RefreshContext(isActive: scenePhase == .active, isComposing: store.isComposing,
-                       watchedJobID: store.watchedJobID)
+                       watchedJobID: store.watchedJobID, powerState: store.snapshot?.machine?.state)
     }
 
     var body: some Scene {

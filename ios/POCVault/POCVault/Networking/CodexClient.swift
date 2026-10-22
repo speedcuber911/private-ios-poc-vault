@@ -491,8 +491,9 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         identityStore.hasStoredIdentity
     }
 
-    func fetchModels() async throws -> [CodexModelDescriptor] {
-        let data = try await perform(path: "/v1/codex/models")
+    func fetchModels(budget: CodexRequestBudget? = nil) async throws -> [CodexModelDescriptor] {
+        let data = try await perform(path: "/v1/codex/models", timeout: budget?.timeout,
+                                     allowWake: budget?.allowsMachineWake ?? true)
         return try decoder.decode(CodexListEnvelope<CodexModelDescriptor>.self, from: data).values
     }
 
@@ -566,8 +567,9 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
 
     /// Registered workspaces on the machine. The direct-login fallback needs one
     /// only as the mount point for a terminal session; any registered id works.
-    func fetchCodexWorkspaces() async throws -> [CodexWorkspace] {
-        let data = try await perform(path: "/v1/codex/workspaces")
+    func fetchCodexWorkspaces(budget: CodexRequestBudget? = nil) async throws -> [CodexWorkspace] {
+        let data = try await perform(path: "/v1/codex/workspaces", timeout: budget?.timeout,
+                                     allowWake: budget?.allowsMachineWake ?? true)
         return try decoder.decode(CodexListEnvelope<CodexWorkspace>.self, from: data).values
     }
 

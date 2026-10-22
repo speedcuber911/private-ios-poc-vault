@@ -119,6 +119,31 @@ struct RelayWatchApproval: Codable, Identifiable, Equatable {
     let requiresPhone: Bool
 }
 
+struct RelayWatchMachine: Codable, Equatable {
+    enum State: String, Codable {
+        case on, off, starting, stopping, unknown, unavailable
+
+        var label: String {
+            switch self {
+            case .on: return "On"
+            case .off: return "Off"
+            case .starting: return "Starting…"
+            case .stopping: return "Stopping…"
+            case .unknown: return "Status unknown"
+            case .unavailable: return "Power unavailable"
+            }
+        }
+        var isTransitioning: Bool { self == .starting || self == .stopping }
+    }
+
+    let name: String
+    let state: State
+    let canControl: Bool
+    var canStart: Bool { canControl && (state == .off || state == .unknown) }
+    var canStop: Bool { canControl && state == .on }
+    var blocksRuns: Bool { state == .off || state.isTransitioning }
+}
+
 struct RelayWatchSnapshot: Codable, Equatable {
     var version = RelayWatchWire.version
     let sourceID: String
@@ -127,12 +152,16 @@ struct RelayWatchSnapshot: Codable, Equatable {
     let folders: [RelayWatchFolder]
     var threads: [RelayWatchThread]
     let approvals: [RelayWatchApproval]
+    // Optional so a newer watch still reads snapshots from an older phone.
+    var machine: RelayWatchMachine? = nil
+    var activityNotice: String? = nil
 
     /// A new fetch time alone does not justify another background transfer.
     func hasSameContent(as other: RelayWatchSnapshot) -> Bool {
         version == other.version && sourceID == other.sourceID
             && models == other.models && folders == other.folders
             && threads == other.threads && approvals == other.approvals
+            && machine == other.machine && activityNotice == other.activityNotice
     }
 }
 
@@ -149,6 +178,7 @@ enum RelayWatchRefreshPolicy {
         if failures > 0 {
             return min(300, 30 * pow(2, Double(min(failures - 1, 4))))
         }
+        if snapshot?.machine?.state.isTransitioning == true { return 5 }
         if let watchedJobID, snapshot?.threads.contains(where: {
             $0.jobID == watchedJobID && $0.isActive
         }) == true { return 15 }
@@ -158,7 +188,7 @@ enum RelayWatchRefreshPolicy {
 }
 
 struct RelayWatchCommand: Codable, Equatable {
-    enum Kind: String, Codable { case refresh, delivery, send, decide, cancel }
+    enum Kind: String, Codable { case refresh, delivery, send, decide, cancel, powerOn, powerOff }
     var version = RelayWatchWire.version
     var id = UUID().uuidString
     let kind: Kind
@@ -173,12 +203,21 @@ struct RelayWatchCommand: Codable, Equatable {
     var decision: String?
     var originalRequestID: String?
 
-    var isMutation: Bool { [.send, .decide, .cancel].contains(kind) }
+    var isPowerCommand: Bool { kind == .powerOn || kind == .powerOff }
+    var isMutation: Bool { [.send, .decide, .cancel].contains(kind) || isPowerCommand }
     var draftKey: String { "relay.watch.draft.\(sourceID).\(sessionID ?? "new")" }
 
     func validate(against snapshot: RelayWatchSnapshot) throws {
         guard version == RelayWatchWire.version else { throw RelayWatchError("Update Relay on both devices.") }
         guard sourceID == snapshot.sourceID else { throw RelayWatchError("The linked machine changed. Refresh before sending.") }
+        if isPowerCommand {
+            guard let machine = snapshot.machine,
+                  (kind == .powerOn ? machine.canStart : machine.canStop) else {
+                throw RelayWatchError("Refresh the machine's power status before trying again.")
+            }
+        } else if isMutation, snapshot.machine?.blocksRuns == true {
+            throw RelayWatchError("Turn on your machine and wait for it to start first.")
+        }
         if kind == .send {
             let text = (prompt ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty, text.count <= 8_000 else { throw RelayWatchError("Enter a prompt of up to 8,000 characters.") }

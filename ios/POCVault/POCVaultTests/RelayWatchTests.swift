@@ -2,6 +2,199 @@ import XCTest
 @testable import POCVault
 
 final class RelayWatchTests: XCTestCase {
+    func testPowerCommandsRequireTheCurrentMachineAndAnAvailableAction() throws {
+        var value = snapshot()
+        let start = RelayWatchCommand(kind: .powerOn, sourceID: value.sourceID)
+        let stop = RelayWatchCommand(kind: .powerOff, sourceID: value.sourceID)
+        XCTAssertThrowsError(try start.validate(against: value))
+        for state in [RelayWatchMachine.State.starting, .stopping, .unavailable] {
+            value.machine = RelayWatchMachine(name: "Mac", state: state, canControl: true)
+            XCTAssertThrowsError(try start.validate(against: value))
+            XCTAssertThrowsError(try stop.validate(against: value))
+        }
+        value.machine = RelayWatchMachine(name: "Mac", state: .off, canControl: true)
+        XCTAssertNoThrow(try start.validate(against: value))
+        XCTAssertThrowsError(try stop.validate(against: value))
+        XCTAssertThrowsError(try send().validate(against: value))
+        value.machine = RelayWatchMachine(name: "Mac", state: .on, canControl: true)
+        XCTAssertNoThrow(try stop.validate(against: value))
+        XCTAssertThrowsError(try start.validate(against: value))
+        value.machine = RelayWatchMachine(name: "Mac", state: .on, canControl: false)
+        XCTAssertThrowsError(try stop.validate(against: value))
+        var stale = start
+        stale.sourceID = "another-machine"
+        XCTAssertThrowsError(try stale.validate(against: value))
+        XCTAssertTrue(start.isMutation)
+        XCTAssertTrue(stop.isMutation)
+    }
+
+    func testPowerSnapshotRetainsOnlySameMachineHistoryAndDropsStaleApprovals() throws {
+        let previous = snapshot()
+        let machine = RelayWatchMachine(name: "Mac", state: .off, canControl: true)
+        let offline = RelayWatchProjection.powerSnapshot(sourceID: previous.sourceID, machine: machine, cached: previous)
+        XCTAssertEqual(offline.threads, previous.threads)
+        XCTAssertTrue(offline.approvals.isEmpty)
+        XCTAssertEqual(offline.machine, machine)
+        XCTAssertFalse(offline.hasSameContent(as: previous))
+        let changed = RelayWatchProjection.powerSnapshot(sourceID: "machine-b", machine: machine, cached: previous)
+        XCTAssertTrue(changed.threads.isEmpty)
+        XCTAssertTrue(changed.models.isEmpty)
+        XCTAssertTrue(changed.folders.isEmpty)
+        let decoded = try RelayWatchWire.decode(RelayWatchSnapshot.self, from: RelayWatchWire.encode(offline))
+        XCTAssertEqual(decoded, offline)
+        // Old phones omit the optional power payload entirely.
+        XCTAssertNil(try RelayWatchWire.decode(RelayWatchSnapshot.self, from: RelayWatchWire.encode(previous)).machine)
+    }
+
+    func testPowerTransitionsRefreshQuicklyOnlyWhileWatchIsVisible() {
+        var value = snapshot()
+        value.machine = RelayWatchMachine(name: "Mac", state: .starting, canControl: true)
+        XCTAssertEqual(RelayWatchRefreshPolicy.interval(isActive: true, isComposing: false,
+            watchedJobID: nil, snapshot: value, failures: 0), 5)
+        XCTAssertNil(RelayWatchRefreshPolicy.interval(isActive: false, isComposing: false,
+            watchedJobID: nil, snapshot: value, failures: 0))
+        XCTAssertEqual(RelayWatchRefreshPolicy.interval(isActive: true, isComposing: false,
+            watchedJobID: nil, snapshot: value, failures: 2), 60)
+    }
+
+    func testPowerProjectionLocksControlsDuringResizeAndPreservesUnknownState() {
+        var power = RelayMachinePowerState(nodeID: "node", instanceState: "pending")
+        XCTAssertEqual(RelayWatchProjection.machine(name: "Mac", state: power).state, .starting)
+        power.instanceState = "stopping"
+        XCTAssertEqual(RelayWatchProjection.machine(name: "Mac", state: power).state, .stopping)
+        power.instanceState = nil
+        XCTAssertEqual(RelayWatchProjection.machine(name: "Mac", state: power).state, .unknown)
+        power.instanceState = "running"
+        power.resize = .init(targetType: "t3.large", stage: "stopping")
+        XCTAssertFalse(RelayWatchProjection.machine(name: "Mac", state: power).canStop)
+    }
+
+    @MainActor
+    func testWatchCanReadAndStartAStoppedMachineWithoutItsNodeAPI() async throws {
+        let (bridge, power, _, _) = try powerBridge()
+        let reply = await bridge.handle(RelayWatchCommand(kind: .refresh))
+        XCTAssertEqual(reply.outcome, .ok)
+        XCTAssertEqual(reply.snapshot?.machine?.state, .off)
+        XCTAssertTrue(reply.snapshot?.threads.isEmpty == true)
+        XCTAssertEqual(power.starts, 0)
+        let command = RelayWatchCommand(kind: .powerOn, sourceID: bridge.sourceID)
+        let started = await bridge.handle(command)
+        XCTAssertEqual(started.outcome, .ok)
+        XCTAssertEqual(started.snapshot?.machine?.state, .starting)
+        XCTAssertEqual(power.starts, 1)
+        XCTAssertEqual(power.lastNodeID, "watch-power-node")
+        let wire = String(decoding: try JSONEncoder().encode(started), as: UTF8.self)
+        XCTAssertFalse(wire.contains("watch-test-token"))
+        XCTAssertFalse(wire.contains("unreachable.invalid"))
+        power.instanceState = "stopped"
+        let staleRead = await bridge.handle(.init(kind: .refresh))
+        XCTAssertEqual(staleRead.snapshot?.machine?.state, .starting)
+        let secondStart = await bridge.handle(.init(kind: .powerOn, sourceID: bridge.sourceID))
+        XCTAssertEqual(secondStart.outcome, .rejected)
+        // Duplicate delivery and a receipt lookup must never start it again.
+        _ = await bridge.handle(command)
+        var lookup = RelayWatchCommand(kind: .delivery, sourceID: bridge.sourceID)
+        lookup.originalRequestID = command.id
+        let receipt = await bridge.handle(lookup)
+        XCTAssertEqual(receipt.outcome, .ok)
+        XCTAssertEqual(power.starts, 1)
+    }
+
+    @MainActor
+    func testWatchCanStopWithoutReadingChatsAndKeepsUncertainWritesFromRetrying() async throws {
+        let (bridge, power, _, _) = try powerBridge()
+        power.instanceState = "running"
+        let stopped = await bridge.handle(.init(kind: .powerOff, sourceID: bridge.sourceID))
+        XCTAssertEqual(stopped.outcome, .ok)
+        XCTAssertEqual(stopped.snapshot?.machine?.state, .stopping)
+        XCTAssertEqual(power.stops, 1)
+        power.instanceState = "running"
+        let staleRead = await bridge.handle(.init(kind: .refresh))
+        XCTAssertEqual(staleRead.snapshot?.machine?.state, .stopping)
+        power.instanceState = "stopped"
+        power.writeError = URLError(.timedOut)
+        let command = RelayWatchCommand(kind: .powerOn, sourceID: bridge.sourceID)
+        let uncertain = await bridge.handle(command)
+        XCTAssertEqual(uncertain.outcome, .uncertain)
+        _ = await bridge.handle(command)
+        XCTAssertEqual(power.starts, 1)
+    }
+
+    @MainActor
+    func testWatchRejectsChangedPairingAndMismatchedPowerCredentials() async throws {
+        let (bridge, power, nodes, identity) = try powerBridge()
+        identity.storeWakeToken("wrong-node-token", nodeID: "another-node")
+        let mismatched = await bridge.handle(.init(kind: .powerOn, sourceID: bridge.sourceID))
+        XCTAssertEqual(mismatched.outcome, .rejected)
+        XCTAssertEqual(power.reads, 0)
+        XCTAssertEqual(power.starts, 0)
+        identity.storeWakeToken("watch-test-token", nodeID: "watch-power-node")
+        let original = bridge.sourceID
+        power.onRead = {
+            nodes.adopt(RelayPairedNode(nodeID: "watch-power-node", nodeName: "Mac",
+                apiBaseURL: nodes.effectiveBaseURL, deviceID: "new-pairing"))
+        }
+        let changed = await bridge.handle(.init(kind: .powerOn, sourceID: original))
+        XCTAssertEqual(changed.outcome, .rejected)
+        XCTAssertEqual(power.starts, 0)
+    }
+
+    @MainActor
+    private func powerBridge() throws -> (RelayWatchBridge, WatchPowerStub, RelayNodeStore, ClientIdentityStore) {
+        let suite = "relay-watch-power-tests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let nodes = RelayNodeStore(defaults: defaults)
+        let identity = ClientIdentityStore()
+        identity.forgetPairedMaterialForTesting()
+        identity.storeWakeToken("watch-test-token", nodeID: "watch-power-node")
+        let url = try XCTUnwrap(URL(string: "https://unreachable.invalid"))
+        nodes.adopt(RelayPairedNode(nodeID: "watch-power-node", nodeName: "Development Mac",
+            apiBaseURL: url, deviceID: "watch-test-device"))
+        let power = WatchPowerStub()
+        let receipts = FileManager.default.temporaryDirectory.appendingPathComponent("watch-\(UUID().uuidString).json")
+        addTeardownBlock {
+            defaults.removePersistentDomain(forName: suite)
+            identity.forgetPairedMaterialForTesting()
+            try? FileManager.default.removeItem(at: receipts)
+        }
+        return (RelayWatchBridge(client: CodexClient(baseURL: url, identityStore: identity, powerClient: power),
+            nodes: nodes, identityStore: identity, powerClient: power, receiptURL: receipts, connectsWatch: false), power, nodes, identity)
+    }
+
+    private final class WatchPowerStub: RelayMachinePowering {
+        var instanceState = "stopped"
+        var reads = 0
+        var starts = 0
+        var stops = 0
+        var lastNodeID: String?
+        var writeError: Error?
+        var onRead: (() -> Void)?
+        func state(nodeID: String, wakeToken: String) async throws -> RelayMachinePowerState {
+            reads += 1
+            onRead?()
+            return .init(nodeID: nodeID, instanceState: instanceState)
+        }
+        func start(nodeID: String, wakeToken: String) async throws -> RelayMachinePowerState {
+            starts += 1
+            lastNodeID = nodeID
+            if let writeError { throw writeError }
+            instanceState = "pending"
+            return .init(nodeID: nodeID, instanceState: instanceState)
+        }
+        func stop(nodeID: String, wakeToken: String) async throws -> RelayMachinePowerState {
+            stops += 1
+            if let writeError { throw writeError }
+            instanceState = "stopping"
+            return .init(nodeID: nodeID, instanceState: instanceState)
+        }
+        func resize(nodeID: String, wakeToken: String, from: String, to: String) async throws -> RelayMachinePowerState {
+            throw RelayMachinePowerError.unconfigured
+        }
+        func setAutoStop(nodeID: String, wakeToken: String, enabled: Bool) async throws -> RelayMachinePowerState {
+            throw RelayMachinePowerError.unconfigured
+        }
+    }
+
     func testDictationBatchesRejectMissingRepeatedAndMalformedAudio() throws {
         var ledger = RelayWatchAudioLedger()
         let pcm = Data(repeating: 0, count: RelayWatchDictationWire.chunkBytes)

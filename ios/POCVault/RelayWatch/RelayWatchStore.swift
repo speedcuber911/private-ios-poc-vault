@@ -23,6 +23,12 @@ final class RelayWatchStore: NSObject, ObservableObject, WCSessionDelegate {
 
     override init() {
         super.init()
+        #if DEBUG && targetEnvironment(simulator)
+        if let state = Self.previewState {
+            snapshot = Self.previewSnapshot(state: state)
+            return
+        }
+        #endif
         if let data = defaults.data(forKey: pendingKey) {
             pendingCommand = try? JSONDecoder().decode(RelayWatchCommand.self, from: data)
         }
@@ -39,6 +45,9 @@ final class RelayWatchStore: NSObject, ObservableObject, WCSessionDelegate {
     }
 
     func refresh(automatically: Bool = false) async {
+        #if DEBUG && targetEnvironment(simulator)
+        if Self.previewState != nil { return }
+        #endif
         guard isSceneActive, !isBusy, !Task.isCancelled,
               WCSession.default.activationState == .activated else { return }
         if automatically {
@@ -87,11 +96,14 @@ final class RelayWatchStore: NSObject, ObservableObject, WCSessionDelegate {
                 defaults.removeObject(forKey: command.draftKey)
                 lastSentCommand = command
             }
-            notice = command.kind == .send ? "Sent. Your run appears in Threads." : "Action received. Refreshing…"
+            notice = command.isPowerCommand ? nil
+                : command.kind == .send ? "Sent. Your run appears in Recent chats." : "Action received. Refreshing…"
             WKInterfaceDevice.current().play(.success)
             return true
         } catch {
-            errorMessage = "Delivery unconfirmed. Check delivery before sending again. Your draft is saved."
+            errorMessage = command.isPowerCommand
+                ? "Power request unconfirmed. Check delivery or open Relay on iPhone."
+                : "Delivery unconfirmed. Check delivery before sending again. Your draft is saved."
             return false
         }
     }
@@ -103,14 +115,30 @@ final class RelayWatchStore: NSObject, ObservableObject, WCSessionDelegate {
 
     /// Only offered after the person explicitly checks the run on their phone.
     func acknowledgeUnconfirmedDelivery() {
+        let wasPowerCommand = pendingCommand?.isPowerCommand == true
         pendingCommand = nil
         defaults.removeObject(forKey: pendingKey)
         errorMessage = nil
-        notice = "Review Threads before starting another run."
+        notice = wasPowerCommand ? "Refresh to check machine power." : "Review Recent chats before starting another run."
     }
 
     private func request(_ command: RelayWatchCommand) async throws -> RelayWatchReply {
-        let reply = try await exchange(try RelayWatchWire.encode(command), id: command.id, timeout: 30)
+        #if DEBUG && targetEnvironment(simulator)
+        if Self.previewState != nil {
+            guard let snapshot else { return RelayWatchReply(outcome: .rejected) }
+            try command.validate(against: snapshot)
+            if command.isPowerCommand {
+                let transition: RelayWatchMachine.State = command.kind == .powerOn ? .starting : .stopping
+                Task {
+                    try? await Task.sleep(for: .seconds(2))
+                    apply(Self.previewSnapshot(state: command.kind == .powerOn ? .on : .off))
+                }
+                return RelayWatchReply(snapshot: Self.previewSnapshot(state: transition))
+            }
+            return RelayWatchReply(snapshot: snapshot)
+        }
+        #endif
+        let reply = try await exchange(try RelayWatchWire.encode(command), id: command.id, timeout: 60)
         return try RelayWatchWire.decode(RelayWatchReply.self, from: reply)
     }
 
@@ -186,4 +214,23 @@ final class RelayWatchStore: NSObject, ObservableObject, WCSessionDelegate {
     nonisolated func session(_ session: WCSession, didReceiveApplicationContext applicationContext: [String: Any]) {
         Task { @MainActor in self.receiveContext(applicationContext) }
     }
+
+    #if DEBUG && targetEnvironment(simulator)
+    /// Local visual fixtures never activate Watch Connectivity or control hardware.
+    private static var previewState: RelayWatchMachine.State? {
+        ProcessInfo.processInfo.environment["RELAY_WATCH_PREVIEW"].flatMap(RelayWatchMachine.State.init(rawValue:))
+    }
+
+    private static func previewSnapshot(state: RelayWatchMachine.State) -> RelayWatchSnapshot {
+        RelayWatchSnapshot(sourceID: "watch-preview", updatedAt: Date(),
+            models: [.init(id: "codex", label: "Codex", provider: "codex", efforts: ["low", "high"])],
+            folders: [.init(id: "relay", name: "Relay")],
+            threads: [
+                .init(id: "preview-chat", sessionID: "preview-session", jobID: nil, workspaceID: "relay",
+                      provider: "codex", title: "Review the latest changes", status: "Ready", isActive: false,
+                      excerpt: "The changes are ready for your review.")
+            ], approvals: [], machine: .init(name: "Preview Mac", state: state, canControl: state != .unavailable),
+            activityNotice: state == .off ? "Turn on your machine to refresh chats." : nil)
+    }
+    #endif
 }

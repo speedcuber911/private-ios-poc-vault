@@ -7,50 +7,145 @@ struct RelayWatchHome: View {
         NavigationStack {
             List {
                 if let snapshot = store.snapshot {
+                    if let machine = snapshot.machine {
+                        RelayWatchPowerControl(sourceID: snapshot.sourceID, machine: machine)
+                    }
+                    RelayWatchFeedback()
                     NavigationLink {
                         RelayWatchComposer(sourceID: snapshot.sourceID)
-                    } label: { Label("New thread", systemImage: "plus.bubble") }
-                    .disabled(snapshot.models.isEmpty || snapshot.folders.isEmpty || store.pendingCommand != nil)
+                    } label: {
+                        Label("New chat", systemImage: "square.and.pencil")
+                            .font(.headline)
+                            .frame(minHeight: 44)
+                    }
+                    .disabled(snapshot.models.isEmpty || snapshot.folders.isEmpty
+                              || snapshot.machine?.blocksRuns == true || store.pendingCommand != nil)
+                    .accessibilityIdentifier("watch-new-chat")
 
                     if !snapshot.approvals.isEmpty {
                         Section("Needs you") {
                             ForEach(snapshot.approvals) { approval in
                                 NavigationLink {
                                     RelayWatchApprovalView(sourceID: snapshot.sourceID, approval: approval)
-                                } label: { Label(approval.title, systemImage: "hand.raised") }
+                                } label: { Label(approval.title, systemImage: "hand.raised").lineLimit(2) }
                             }
                         }
                     }
-                    Section("Threads") {
+                    Section("Recent chats") {
                         ForEach(snapshot.threads) { thread in
                             NavigationLink {
                                 RelayWatchThreadView(sourceID: snapshot.sourceID, initialThread: thread)
                             } label: {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(thread.title).lineLimit(2)
-                                    Text(thread.status).font(.caption).foregroundStyle(.secondary)
+                                VStack(alignment: .leading, spacing: 5) {
+                                    Text(thread.title).font(.body.weight(.medium)).lineLimit(2)
+                                    if snapshot.activityNotice == nil {
+                                        Label(thread.status, systemImage: thread.isActive ? "hourglass" : "bubble.left")
+                                            .font(.caption2).foregroundStyle(.secondary)
+                                    }
                                 }
+                                .padding(.vertical, 4)
                             }
                         }
-                        if snapshot.threads.isEmpty { Text("Your threads will appear here.").font(.footnote) }
+                        if let notice = snapshot.activityNotice {
+                            Text(notice).font(.footnote).foregroundStyle(.secondary)
+                        } else if snapshot.threads.isEmpty {
+                            Text("Start a chat here or on iPhone.").font(.footnote).foregroundStyle(.secondary)
+                        }
                     }
-                    if snapshot.models.isEmpty || snapshot.folders.isEmpty {
-                        Text("Set up an agent and a folder in Relay on iPhone first.").font(.footnote)
+                    if snapshot.machine?.blocksRuns != true, snapshot.activityNotice == nil,
+                       snapshot.models.isEmpty || snapshot.folders.isEmpty {
+                        Text("Choose an agent and a project in Relay on iPhone first.").font(.footnote)
                     }
-                    Text("Updated \(snapshot.updatedAt, style: .relative) ago")
-                        .font(.caption2).foregroundStyle(.secondary)
                 } else {
-                    Text("Open Relay on your paired iPhone and connect your machine.")
-                        .font(.footnote)
+                    Label("Connect with iPhone", systemImage: "iphone")
+                        .font(.headline)
+                    Text("Open Relay on your paired iPhone to see your machine and chats.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    RelayWatchFeedback()
                 }
-                RelayWatchFeedback()
-                Button { Task { await store.refresh() } } label: {
-                    Label(store.isBusy ? "Connecting…" : "Refresh", systemImage: "arrow.clockwise")
-                }.disabled(store.isBusy)
+                Section {
+                    Button { Task { await store.refresh() } } label: {
+                        Label(store.isBusy ? "Refreshing…" : "Refresh", systemImage: "arrow.clockwise")
+                            .frame(minHeight: 44)
+                    }.disabled(store.isBusy)
+                } footer: {
+                    if let snapshot = store.snapshot {
+                        Text("Updated \(snapshot.updatedAt, style: .relative) ago")
+                    }
+                }
             }
             .navigationTitle("Relay")
         }
         .id(store.snapshot?.sourceID ?? "unpaired")
+    }
+}
+
+struct RelayWatchPowerControl: View {
+    @EnvironmentObject private var store: RelayWatchStore
+    let sourceID: String
+    let machine: RelayWatchMachine
+    @State private var confirmsStop = false
+
+    private var canAct: Bool {
+        (machine.canStart || machine.canStop) && !store.isBusy
+            && store.pendingCommand == nil && store.snapshot?.sourceID == sourceID
+    }
+
+    private var isPowered: Bool { machine.state == .on || machine.state == .starting }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(machine.name).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                HStack(spacing: 6) {
+                    if machine.state.isTransitioning {
+                        ProgressView().controlSize(.small).frame(width: 14, height: 14)
+                    }
+                    Text(machine.state.label).font(.body.weight(.medium))
+                        .lineLimit(1).minimumScaleFactor(0.8)
+                }
+            }
+            Spacer(minLength: 0)
+            // Like the iPhone switch, display confirmed state while a tap requests a change.
+            Toggle("Machine power", isOn: .constant(isPowered))
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .allowsHitTesting(false)
+                .disabled(!canAct)
+        }
+        .frame(minHeight: 52)
+        .contentShape(Rectangle())
+        .overlay {
+            Button(action: requestToggle) { Color.clear.contentShape(Rectangle()) }
+                .buttonStyle(.plain)
+                .disabled(!canAct)
+        }
+        .accessibilityRepresentation {
+            Toggle(machine.name, isOn: Binding(get: { isPowered }, set: { _ in requestToggle() }))
+                .accessibilityValue(machine.state.label)
+                .disabled(!canAct)
+        }
+        .accessibilityIdentifier("watch-machine-power")
+        .confirmationDialog("Turn off \(machine.name)?", isPresented: $confirmsStop, titleVisibility: .visible) {
+            Button("Turn off machine", role: .destructive) { changePower(.powerOff) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Running work will be interrupted.")
+        }
+    }
+
+    private func requestToggle() {
+        guard canAct else { return }
+        if machine.canStop { confirmsStop = true }
+        else { changePower(.powerOn) }
+    }
+
+    private func changePower(_ kind: RelayWatchCommand.Kind) {
+        Task {
+            if await store.perform(RelayWatchCommand(kind: kind, sourceID: sourceID)) {
+                await store.refresh()
+            }
+        }
     }
 }
 
@@ -67,6 +162,7 @@ struct RelayWatchComposer: View {
     @State private var folderID = ""
     @State private var modelID = ""
     @State private var effort = ""
+    @State private var showsOptions = false
 
     private var models: [RelayWatchModel] {
         (store.snapshot?.models ?? []).filter { thread == nil || $0.provider == thread?.provider }
@@ -76,7 +172,7 @@ struct RelayWatchComposer: View {
     private var canSend: Bool {
         !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && model != nil
             && !folderID.isEmpty && !store.isBusy && store.pendingCommand == nil
-            && store.snapshot?.sourceID == sourceID && !dictation.isActive
+            && store.snapshot?.sourceID == sourceID && store.snapshot?.machine?.blocksRuns != true && !dictation.isActive
     }
 
     var body: some View {
@@ -104,23 +200,39 @@ struct RelayWatchComposer: View {
                     .font(.caption2).foregroundStyle(.secondary)
             }
             if !dictation.isActive {
-                Section("Run in") {
-                    if thread == nil {
-                        Picker("Folder", selection: $folderID) {
-                            Text("Choose folder").tag("")
-                            ForEach(store.snapshot?.folders ?? []) { Text($0.name).tag($0.id) }
+                if let folder = store.snapshot?.folders.first(where: { $0.id == folderID }) {
+                    Text(folder.name).font(.footnote).foregroundStyle(.secondary)
+                }
+                if let model { Text(model.label).font(.caption2).foregroundStyle(.secondary) }
+                Section {
+                    Button { showsOptions.toggle() } label: {
+                        HStack {
+                            Text("Options")
+                            Spacer()
+                            Image(systemName: showsOptions ? "chevron.up" : "chevron.down")
+                                .font(.caption)
                         }
-                    } else {
-                        Text(store.snapshot?.folders.first(where: { $0.id == folderID })?.name ?? "Thread folder")
+                        .frame(minHeight: 44)
                     }
-                    Picker("Model", selection: $modelID) {
-                        Text("Choose model").tag("")
-                        ForEach(models) { Text($0.label).tag($0.id) }
-                    }
-                    if let model, !model.efforts.isEmpty {
-                        Picker("Effort", selection: $effort) {
-                            Text("Model default").tag("")
-                            ForEach(model.efforts, id: \.self) { Text($0.capitalized).tag($0) }
+                    .accessibilityValue(showsOptions ? "Expanded" : "Collapsed")
+                    if showsOptions {
+                        if thread == nil {
+                            Picker("Folder", selection: $folderID) {
+                                Text("Choose folder").tag("")
+                                ForEach(store.snapshot?.folders ?? []) { Text($0.name).tag($0.id) }
+                            }
+                        } else {
+                            Text(store.snapshot?.folders.first(where: { $0.id == folderID })?.name ?? "Thread folder")
+                        }
+                        Picker("Model", selection: $modelID) {
+                            Text("Choose model").tag("")
+                            ForEach(models) { Text($0.label).tag($0.id) }
+                        }
+                        if let model, !model.efforts.isEmpty {
+                            Picker("Effort", selection: $effort) {
+                                Text("Model default").tag("")
+                                ForEach(model.efforts, id: \.self) { Text($0.capitalized).tag($0) }
+                            }
                         }
                     }
                 }
@@ -139,11 +251,11 @@ struct RelayWatchComposer: View {
                         await store.refresh()
                     }
                 }
-            } label: { Label("Send", systemImage: "arrow.up") }
+            } label: { Label("Send", systemImage: "arrow.up").frame(minHeight: 44) }
             .disabled(!canSend)
             RelayWatchFeedback()
         }
-        .navigationTitle(thread == nil ? "New thread" : "Reply")
+        .navigationTitle(thread == nil ? "New chat" : "Reply")
         .onAppear {
             store.isComposing = true
             guard !restored else { return }
@@ -152,6 +264,10 @@ struct RelayWatchComposer: View {
             folderID = thread?.workspaceID ?? UserDefaults.standard.string(forKey: "relay.watch.folder.\(sourceID)") ?? ""
             let remembered = UserDefaults.standard.string(forKey: "relay.watch.model.\(sourceID)")
             modelID = models.first(where: { $0.id == remembered })?.id ?? models.first?.id ?? ""
+            if !(store.snapshot?.folders.contains(where: { $0.id == folderID }) ?? false) {
+                folderID = store.snapshot?.folders.count == 1 ? store.snapshot?.folders.first?.id ?? "" : ""
+            }
+            showsOptions = folderID.isEmpty
         }
         .onDisappear { dictation.cancel(discard: false); store.isComposing = false }
         .onChange(of: dictation.transcript) { text in
@@ -193,7 +309,11 @@ struct RelayWatchThreadView: View {
     var body: some View {
         List {
             Text(thread.title).font(.headline)
-            Label(thread.status, systemImage: thread.isActive ? "hourglass" : "bubble.left")
+            if let notice = store.snapshot?.activityNotice {
+                Text(notice).font(.footnote).foregroundStyle(.secondary)
+            } else {
+                Label(thread.status, systemImage: thread.isActive ? "hourglass" : "bubble.left")
+            }
             if let progress = thread.progress { Text(progress).font(.footnote).foregroundStyle(.secondary) }
             Section("Latest reply") {
                 Text(thread.excerpt.isEmpty ? (thread.isActive ? "Working on your request." : "Open Relay on iPhone for this conversation.") : thread.excerpt)
@@ -210,11 +330,11 @@ struct RelayWatchThreadView: View {
                 NavigationLink {
                     RelayWatchComposer(sourceID: sourceID, thread: thread)
                 } label: { Label("Reply", systemImage: "mic") }
-                .disabled(!sameMachine || store.pendingCommand != nil)
+                .disabled(!sameMachine || store.pendingCommand != nil || store.snapshot?.machine?.blocksRuns == true)
             }
             if thread.isActive, thread.jobID != nil {
                 Button("Stop run", role: .destructive) { confirmCancel = true }
-                    .disabled(store.isBusy || !sameMachine || store.pendingCommand != nil)
+                    .disabled(store.isBusy || !sameMachine || store.pendingCommand != nil || store.snapshot?.machine?.blocksRuns == true)
             }
             RelayWatchFeedback()
         }

@@ -85,7 +85,8 @@ struct POCVaultApp: App {
         _powerModel = StateObject(wrappedValue: powerModel)
         self.codexClient = codexClient
         self.authClient = authClient
-        self.watchBridge = RelayWatchBridge(client: codexClient, nodes: nodeStore)
+        self.watchBridge = RelayWatchBridge(client: codexClient, nodes: nodeStore,
+            identityStore: identityStore, powerModel: powerModel)
     }
 
     var body: some Scene {

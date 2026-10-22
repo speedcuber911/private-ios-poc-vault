@@ -10,11 +10,16 @@ import UIKit
 final class RelayWatchBridge: NSObject, WCSessionDelegate {
     private let client: CodexClient
     private let nodes: RelayNodeStore
+    private let identityStore: ClientIdentityStore
+    private let powerClient: RelayMachinePowering
+    private let powerModel: RelayMachinePowerModel?
     private var nodeObservation: AnyCancellable?
     private var mutationInFlight = false
     private var receipts: [String: Receipt] = [:]
     private var watchedTimeline: (source: String, jobID: String, timeline: RelayTimeline)?
     private var lastPublishedSnapshot: RelayWatchSnapshot?
+    private var cachedSnapshot: RelayWatchSnapshot?
+    private var powerTransition: (source: String, target: RelayWatchMachine.State, requestedAt: Date)?
     private let dictation = RelayWatchDictationBridge()
     private let receiptURL: URL
 
@@ -24,22 +29,29 @@ final class RelayWatchBridge: NSObject, WCSessionDelegate {
         let reply: RelayWatchReply
     }
 
-    init(client: CodexClient, nodes: RelayNodeStore) {
+    init(client: CodexClient, nodes: RelayNodeStore, identityStore: ClientIdentityStore,
+         powerModel: RelayMachinePowerModel? = nil, powerClient: RelayMachinePowering? = nil,
+         receiptURL: URL? = nil, connectsWatch: Bool = true) {
         self.client = client
         self.nodes = nodes
-        receiptURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        self.identityStore = identityStore
+        self.powerClient = powerClient ?? RelayPowerClient(baseURL: AppConfiguration.authBaseURL)
+        self.powerModel = powerModel
+        self.receiptURL = receiptURL ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("relay-watch-receipts.json")
-        if let data = try? Data(contentsOf: receiptURL),
+        if let data = try? Data(contentsOf: self.receiptURL),
            let saved = try? JSONDecoder().decode([String: Receipt].self, from: data) {
             receipts = saved
         }
         super.init()
-        guard WCSession.isSupported() else { return }
+        guard connectsWatch, WCSession.isSupported() else { return }
         WCSession.default.delegate = self
         WCSession.default.activate()
         nodeObservation = nodes.$pairedNode.dropFirst().sink { [weak self] _ in
             // Clear display data on unpair/re-pair, even when the host is the same.
             self?.lastPublishedSnapshot = nil
+            self?.cachedSnapshot = nil
+            self?.powerTransition = nil
             self?.dictation.cancel(reason: "Your iPhone connection changed. Record again after refreshing.")
             let session = WCSession.default
             if session.activationState == .activated, session.isWatchAppInstalled {
@@ -48,7 +60,7 @@ final class RelayWatchBridge: NSObject, WCSessionDelegate {
         }
     }
 
-    private var sourceID: String {
+    var sourceID: String {
         let identity = nodes.effectiveBaseURL.absoluteString + "|" + (nodes.pairedNode?.deviceID ?? "personal")
         return Self.digest(Data(identity.utf8))
     }
@@ -72,34 +84,85 @@ final class RelayWatchBridge: NSObject, WCSessionDelegate {
         }
     }
 
-    private func loadSnapshot(watchedJobID: String? = nil) async throws -> (RelayWatchSnapshot, [CodexModelDescriptor]) {
+    private func powerCredential() -> (nodeID: String, token: String)? {
+        guard let credential = identityStore.wakeCredential(),
+              nodes.pairedNode == nil || nodes.pairedNode?.nodeID == credential.nodeID else { return nil }
+        return credential
+    }
+
+    private func loadMachine() async -> RelayWatchMachine {
+        let name = nodes.pairedNode?.nodeName ?? RelayMachineLabel.fallback
+        guard let credential = powerCredential() else {
+            return RelayWatchMachine(name: name, state: .unavailable, canControl: false)
+        }
+        do {
+            let state = try await powerClient.state(nodeID: credential.nodeID, wakeToken: credential.token)
+            return holdPowerTransition(RelayWatchProjection.machine(name: name, state: state))
+        } catch let error as RelayMachinePowerError where error == .unauthorized || error == .unconfigured {
+            return RelayWatchMachine(name: name, state: .unavailable, canControl: false)
+        } catch {
+            return holdPowerTransition(RelayWatchMachine(name: name, state: .unknown, canControl: true))
+        }
+    }
+
+    private func holdPowerTransition(_ machine: RelayWatchMachine) -> RelayWatchMachine {
+        guard let transition = powerTransition else { return machine }
+        guard transition.source == sourceID, machine.state != transition.target,
+              Date().timeIntervalSince(transition.requestedAt) < RelayMachinePowerModel.transitionTimeout else {
+            powerTransition = nil
+            return machine
+        }
+        // EC2 reads can briefly report the pre-request state after an accepted write.
+        return RelayWatchMachine(name: machine.name, state: transition.target == .on ? .starting : .stopping,
+                                 canControl: machine.canControl)
+    }
+
+    private func loadSnapshot(watchedJobID: String? = nil, powerOnly: Bool = false,
+                              allowsCachedActivity: Bool = true) async throws -> (RelayWatchSnapshot, [CodexModelDescriptor]) {
         try requireMachine()
         let source = sourceID
-        async let models = client.fetchModels()
-        async let folders = client.fetchCodexWorkspaces()
-        async let threads = client.fetchThreads(limit: 30, budget: .listPoll)
-        async let jobs = client.fetchJobs(limit: 30, budget: .listPoll)
-        async let approvals = client.fetchPendingApprovalsIfSupported(budget: .listPoll)
-        let values = try await (models, folders, threads, jobs, approvals)
+        let machine = await loadMachine()
         try requireMachine(source)
-        var snapshot = RelayWatchProjection.snapshot(
-            sourceID: source, models: values.0, folders: values.1,
-            threads: values.2, jobs: values.3, approvals: values.4
-        )
-        if let watchedJobID, let index = snapshot.threads.firstIndex(where: { $0.jobID == watchedJobID }),
-           values.3.contains(where: { $0.id == watchedJobID && ($0.timelineEvents ?? 0) > 0 }) {
-            var timeline = watchedTimeline.flatMap { $0.source == source && $0.jobID == watchedJobID ? $0.timeline : nil } ?? RelayTimeline()
-            if let page = try? await client.fetchTimeline(jobID: watchedJobID, since: timeline.cursor) {
-                for event in page.events { timeline.apply(event) }
-                watchedTimeline = (source, watchedJobID, timeline)
-                RelayWatchProjection.update(&snapshot.threads[index], from: timeline)
-            }
+        if powerOnly || machine.blocksRuns {
+            return (RelayWatchProjection.powerSnapshot(sourceID: source, machine: machine, cached: cachedSnapshot,
+                notice: machine.state == .off ? "Turn on your machine to refresh chats." : "Chats refresh when your machine is ready."), [])
         }
-        try requireMachine(source)
-        return (snapshot, values.0)
+        do {
+            // Opening the watch must never wake a machine that was switched off.
+            async let models = client.fetchModels(budget: .statusRead)
+            async let folders = client.fetchCodexWorkspaces(budget: .statusRead)
+            async let threads = client.fetchThreads(limit: 30, budget: .listPoll)
+            async let jobs = client.fetchJobs(limit: 30, budget: .listPoll)
+            async let approvals = client.fetchPendingApprovalsIfSupported(budget: .listPoll)
+            let values = try await (models, folders, threads, jobs, approvals)
+            try requireMachine(source)
+            var snapshot = RelayWatchProjection.snapshot(
+                sourceID: source, models: values.0, folders: values.1,
+                threads: values.2, jobs: values.3, approvals: values.4
+            )
+            snapshot.machine = machine
+            if let watchedJobID, let index = snapshot.threads.firstIndex(where: { $0.jobID == watchedJobID }),
+               values.3.contains(where: { $0.id == watchedJobID && ($0.timelineEvents ?? 0) > 0 }) {
+                var timeline = watchedTimeline.flatMap { $0.source == source && $0.jobID == watchedJobID ? $0.timeline : nil } ?? RelayTimeline()
+                if let page = try? await client.fetchTimeline(jobID: watchedJobID, since: timeline.cursor) {
+                    for event in page.events { timeline.apply(event) }
+                    watchedTimeline = (source, watchedJobID, timeline)
+                    RelayWatchProjection.update(&snapshot.threads[index], from: timeline)
+                }
+            }
+            try requireMachine(source)
+            return (snapshot, values.0)
+        } catch {
+            try requireMachine(source)
+            guard allowsCachedActivity else { throw error }
+            return (RelayWatchProjection.powerSnapshot(sourceID: source, machine: machine, cached: cachedSnapshot,
+                notice: "Chats couldn't refresh. Try again shortly."), [])
+        }
     }
 
     private func publish(_ snapshot: RelayWatchSnapshot) {
+        guard snapshot.sourceID == sourceID else { return }
+        cachedSnapshot = snapshot
         let session = WCSession.default
         guard session.activationState == .activated, session.isWatchAppInstalled,
               snapshot.sourceID == sourceID else { return }
@@ -121,15 +184,19 @@ final class RelayWatchBridge: NSObject, WCSessionDelegate {
         try JSONEncoder().encode(receipts).write(to: receiptURL, options: .atomic)
     }
 
-    private func handle(_ command: RelayWatchCommand) async -> RelayWatchReply {
+    func handle(_ command: RelayWatchCommand) async -> RelayWatchReply {
         guard command.version == RelayWatchWire.version else {
             return RelayWatchReply(outcome: .rejected, error: "Update Relay on both devices.")
+        }
+        if command.isMutation || command.kind == .delivery {
+            do { try requireMachine(command.sourceID) }
+            catch { return RelayWatchReply(outcome: .rejected, error: error.localizedDescription) }
         }
         if command.kind == .delivery {
             // A receipt lookup can NEVER start a run, including when the
             // original message was lost before this phone received it.
             return command.originalRequestID.flatMap { receipts[$0]?.reply }
-                ?? RelayWatchReply(outcome: .uncertain, error: "No delivery receipt yet. Check Threads on iPhone before clearing this warning.")
+                ?? RelayWatchReply(outcome: .uncertain, error: "No delivery receipt yet. Check Relay on iPhone before clearing this warning.")
         }
         if let receipt = receipts[command.id] {
             guard (try? Self.fingerprint(command)) == receipt.fingerprint else {
@@ -144,7 +211,9 @@ final class RelayWatchBridge: NSObject, WCSessionDelegate {
         defer { if command.isMutation { mutationInFlight = false } }
         var sentToServer = false
         do {
-            let (snapshot, models) = try await loadSnapshot(watchedJobID: command.isMutation ? nil : command.jobID)
+            try requireMachine(command.isMutation ? command.sourceID : nil)
+            let (snapshot, models) = try await loadSnapshot(watchedJobID: command.isMutation ? nil : command.jobID,
+                powerOnly: command.isPowerCommand, allowsCachedActivity: !command.isMutation)
             if !command.isMutation {
                 publish(snapshot)
                 return RelayWatchReply(snapshot: snapshot)
@@ -160,12 +229,28 @@ final class RelayWatchBridge: NSObject, WCSessionDelegate {
             // suspension occurs between this check and starting the API request.
             try requireMachine(command.sourceID)
             let requestBaseURL = client.baseURL
-            let uncertain = RelayWatchReply(outcome: .uncertain, error: "Delivery is unconfirmed. Check Threads on iPhone before sending again.")
+            let uncertainMessage = command.isPowerCommand
+                ? "Power request unconfirmed. Check the machine on iPhone before trying again."
+                : "Delivery is unconfirmed. Check Threads on iPhone before sending again."
+            let uncertain = RelayWatchReply(outcome: .uncertain, error: uncertainMessage)
             try saveReceipt(command, reply: uncertain)
             sentToServer = true
             var reply = RelayWatchReply()
             switch command.kind {
             case .refresh, .delivery: break
+            case .powerOn, .powerOff:
+                guard let credential = powerCredential() else {
+                    throw RelayWatchError("Set up machine power in Relay on iPhone first.")
+                }
+                let state = command.kind == .powerOn
+                    ? try await powerClient.start(nodeID: credential.nodeID, wakeToken: credential.token)
+                    : try await powerClient.stop(nodeID: credential.nodeID, wakeToken: credential.token)
+                try requireMachine(command.sourceID)
+                powerTransition = (command.sourceID, command.kind == .powerOn ? .on : .off, Date())
+                let machine = holdPowerTransition(RelayWatchProjection.machine(name: snapshot.machine?.name ?? "Machine", state: state))
+                reply.snapshot = RelayWatchProjection.powerSnapshot(sourceID: command.sourceID, machine: machine,
+                    cached: cachedSnapshot, notice: "Chats refresh when your machine is ready.")
+                if let powerModel { Task { await powerModel.refresh() } }
             case .send:
                 guard let model = models.first(where: { $0.id == command.modelID }), let folder = command.workspaceID else {
                     throw RelayWatchError("Refresh your model and folder choices.")
@@ -193,12 +278,14 @@ final class RelayWatchBridge: NSObject, WCSessionDelegate {
             // Persist the receipt BEFORE attempting another read. A failed
             // refresh must never turn an accepted send into a second job.
             try saveReceipt(command, reply: reply)
+            if let snapshot = reply.snapshot { publish(snapshot) }
             return reply
         } catch {
             return RelayWatchReply(
                 outcome: sentToServer ? .uncertain : .rejected,
                 error: sentToServer
-                    ? "Delivery is unconfirmed. Check Threads on iPhone before sending again."
+                    ? (command.isPowerCommand ? "Power request unconfirmed. Check the machine on iPhone before trying again."
+                       : "Delivery is unconfirmed. Check Threads on iPhone before sending again.")
                     : error.localizedDescription
             )
         }

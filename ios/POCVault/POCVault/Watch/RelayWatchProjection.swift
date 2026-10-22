@@ -1,6 +1,26 @@
 import Foundation
 
 enum RelayWatchProjection {
+    static func machine(name: String, state: RelayMachinePowerState) -> RelayWatchMachine {
+        let status: RelayWatchMachine.State
+        switch state.instanceState {
+        case "running": status = .on
+        case "stopped": status = .off
+        case "pending": status = .starting
+        case "stopping": status = .stopping
+        default: status = .unknown
+        }
+        return RelayWatchMachine(name: name, state: status, canControl: state.resize?.isActive != true)
+    }
+
+    static func powerSnapshot(sourceID: String, machine: RelayWatchMachine,
+                              cached: RelayWatchSnapshot?, notice: String? = nil) -> RelayWatchSnapshot {
+        let previous = cached?.sourceID == sourceID ? cached : nil
+        return RelayWatchSnapshot(sourceID: sourceID, updatedAt: Date(), models: previous?.models ?? [],
+                                  folders: previous?.folders ?? [], threads: previous?.threads ?? [],
+                                  approvals: [], machine: machine, activityNotice: notice)
+    }
+
     static func update(_ row: inout RelayWatchThread, from timeline: RelayTimeline) {
         let steps = timeline.blocks.flatMap { timeline.steps(in: $0) }
         let progress = RelayTimeline.summary(of: steps)
