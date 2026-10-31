@@ -153,6 +153,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/v1/codex/jobs":
             body = self.read_json_body()
+            # A machine slow to accept (one still waking, say): long enough to
+            # leave the app mid-send and see whether the send survives.
+            time.sleep(float(os.environ.get("SIM_JOB_ACCEPT_DELAY", "0")))
             provider = str(body.get("provider") or "codex")
             if provider not in {"codex", "claude", "cursor", "kimi"}:
                 provider = "codex"

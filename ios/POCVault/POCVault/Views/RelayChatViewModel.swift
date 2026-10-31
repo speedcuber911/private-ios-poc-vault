@@ -380,6 +380,31 @@ enum RelayModelDiscovery {
     }
 }
 
+/// Time iOS grants to finish a send after Relay leaves the screen.
+///
+/// A run starts only once its request lands on the machine. Without this,
+/// switching apps right after tapping Send suspends Relay within seconds and
+/// the request never arrives. iOS allows about thirty seconds, so a machine
+/// still waking after that is not covered, and nothing survives a force-quit.
+@MainActor
+final class RelayBackgroundSend {
+    private var identifier = UIBackgroundTaskIdentifier.invalid
+
+    init(_ name: String = "Relay send") {
+        // Held strongly: iOS ends an app whose expired task was never ended.
+        identifier = UIApplication.shared.beginBackgroundTask(withName: name) { [self] in
+            end()
+        }
+    }
+
+    /// Safe to call more than once; iOS hears about the task exactly once.
+    func end() {
+        guard identifier != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(identifier)
+        identifier = .invalid
+    }
+}
+
 /// Everything the chat reads from the machine while a conversation is live,
 /// as closures, so the stream and poll paths can be driven in tests without a
 /// network. `live(_:)` is the real one; it only forwards to the client, so
@@ -434,6 +459,9 @@ final class RelayChatViewModel: ObservableObject {
     @Published private(set) var harnessesByProvider: [CodexProvider: RelayHarnessStatus] = [:]
     @Published private(set) var isLoading = false
     @Published private(set) var isSending = false
+    /// A prompt is on its way to the machine and not yet accepted. The draft
+    /// stays in the composer until it is, so nothing looks sent that is not.
+    @Published private(set) var isDeliveringPrompt = false
     @Published private(set) var isTranscribing = false
     /// True while `openThread` has seeded identity from the feed item and is still
     /// waiting on `fetchThreadDetail`. Cleared when detail lands or the request fails.
@@ -1118,7 +1146,13 @@ final class RelayChatViewModel: ObservableObject {
         let request = RelayJobInputRequest(id: id, text: text, mode: now ? "now" : "queue")
         retryInput = (job.id, request)
         isSending = true
-        defer { isSending = false }
+        isDeliveringPrompt = true
+        let backgroundSend = RelayBackgroundSend()
+        defer {
+            isSending = false
+            isDeliveringPrompt = false
+            backgroundSend.end()
+        }
         let revision = conversationRevision
         do {
             let updated = try await submitInput(job.id, request)
@@ -1489,30 +1523,24 @@ final class RelayChatViewModel: ObservableObject {
         let outgoingAttachments = draftAttachments
         guard (!text.isEmpty || !outgoingAttachments.isEmpty), !isSending else { return }
         isSending = true
-        defer { isSending = false }
+        isDeliveringPrompt = true
+        let backgroundSend = RelayBackgroundSend()
+        defer {
+            isSending = false
+            isDeliveringPrompt = false
+            backgroundSend.end()
+        }
 
         let provider = Self.taskProvider(for: model)
         let revision = conversationRevision
-        await refreshHarnesses()
-        if let status = harnessesByProvider[provider], status.isConfirmedUnavailable {
-            errorMessage = status.actionMessage ?? "\(provider.displayName) is not ready on this computer."
-            return
-        }
-        if let controls = harnessesByProvider[provider]?.taskControls {
-            if Self.taskModelParameter(for: model) != nil, !controls.model {
-                errorMessage = "This \(provider.displayName) runner does not support model selection."
-                return
-            }
-            if effectiveEffort != nil, !controls.reasoningEffort {
-                errorMessage = "This \(provider.displayName) runner does not support effort selection."
-                return
-            }
-            if provider == .claude, !controls.permissionModes.contains(claudePermissionMode.rawValue) {
-                errorMessage = "This Claude Code runner does not support the selected permission mode."
-                return
-            }
-            if provider == .codex, !controls.approvalPolicies.contains(codexApprovalPolicy.rawValue) {
-                errorMessage = "This Codex runner does not support the selected approval policy."
+        // Checked against the status this screen already holds, not a fresh
+        // round trip: the job request should leave the phone at once. A held
+        // "no" is asked again before it blocks, so a provider fixed since is
+        // not refused on stale news.
+        if taskSendProblem(provider: provider, model: model) != nil {
+            await refreshHarnesses()
+            if let problem = taskSendProblem(provider: provider, model: model) {
+                errorMessage = problem
                 return
             }
         }
@@ -1537,8 +1565,6 @@ final class RelayChatViewModel: ObservableObject {
             }
             return
         }
-        prompt = ""
-        draftAttachments = []
         errorMessage = nil
 
         // Resume this on-screen conversation. A brand-new Codex job has no
@@ -1562,8 +1588,6 @@ final class RelayChatViewModel: ObservableObject {
             modelLabel: model.label,
             attachments: outgoingAttachments.map(\.displayed)
         )
-        messages.append(outgoingItem)
-        var jobWasAccepted = false
         do {
             let created = try await submitJob(CodexCreateJobRequest(
                 workspaceId: workspaceID,
@@ -1579,7 +1603,14 @@ final class RelayChatViewModel: ObservableObject {
                 attachments: outgoingAttachments.map(\.jobAttachment),
                 resumeSessionId: resumeID
             ))
-            jobWasAccepted = true
+            // The machine has it: the run no longer needs this phone, and the
+            // draft is sent. Text typed meanwhile, or a conversation started
+            // meanwhile, is left alone.
+            backgroundSend.end()
+            isDeliveringPrompt = false
+            if prompt.trimmingCharacters(in: .whitespacesAndNewlines) == text { prompt = "" }
+            if draftAttachments.map(\.id) == outgoingAttachments.map(\.id) { draftAttachments = [] }
+            if conversationRevision == revision { messages.append(outgoingItem) }
             let job: CodexJob
             if let createdJob = created.job {
                 job = createdJob
@@ -1601,21 +1632,34 @@ final class RelayChatViewModel: ObservableObject {
             attachJobStream(to: job)
             await refreshThreads()
         } catch {
+            // Not accepted, the draft never left the composer; accepted, the
+            // run goes on and only showing it failed.
             guard conversationRevision == revision else { return }
-            if !jobWasAccepted,
-               case CodexClientError.httpFailure(let status, _) = error,
-               (400..<500).contains(status) {
-                messages.removeAll { $0.id == outgoingItem.id }
-            }
-            if prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                prompt = text
-            }
-            if draftAttachments.isEmpty {
-                draftAttachments = outgoingAttachments
-            }
             await refreshHarnesses()
             errorMessage = error.localizedDescription
         }
+    }
+
+    /// Why the machine would refuse this task, from the harness status already
+    /// held; nil when nothing known stands in the way.
+    private func taskSendProblem(provider: CodexProvider, model: CodexModelDescriptor) -> String? {
+        if let status = harnessesByProvider[provider], status.isConfirmedUnavailable {
+            return status.actionMessage ?? "\(provider.displayName) is not ready on this computer."
+        }
+        guard let controls = harnessesByProvider[provider]?.taskControls else { return nil }
+        if Self.taskModelParameter(for: model) != nil, !controls.model {
+            return "This \(provider.displayName) runner does not support model selection."
+        }
+        if effectiveEffort != nil, !controls.reasoningEffort {
+            return "This \(provider.displayName) runner does not support effort selection."
+        }
+        if provider == .claude, !controls.permissionModes.contains(claudePermissionMode.rawValue) {
+            return "This Claude Code runner does not support the selected permission mode."
+        }
+        if provider == .codex, !controls.approvalPolicies.contains(codexApprovalPolicy.rawValue) {
+            return "This Codex runner does not support the selected approval policy."
+        }
+        return nil
     }
 
     // MARK: - Live job stream (SSE with polling fallback)

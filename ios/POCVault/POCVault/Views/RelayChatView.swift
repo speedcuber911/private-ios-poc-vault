@@ -244,6 +244,7 @@ struct RelayChatView: View {
                         onAddAttachments: { viewModel.addDraftAttachments($0) },
                         onRemoveAttachment: { viewModel.removeDraftAttachment(id: $0) },
                         machineState: composerMachineState,
+                        isDeliveringPrompt: viewModel.isDeliveringPrompt,
                         activeRunProvider: viewModel.canSteerConversation ? viewModel.activeConversationJob?.provider : nil,
                         onSendNow: {
                             requestPromptSend(now: true)
@@ -578,7 +579,7 @@ struct RelayChatView: View {
     }
 
     /// Sending always returns the reader to the end of the transcript, where
-    /// their message and its answer appear.
+    /// their message and its answer appear once the machine accepts it.
     private func sendPrompt() {
         scroller.jumpToLatest()
         let now = sendImmediately
@@ -1008,6 +1009,8 @@ private struct RelayComposer: View {
     var onRemoveAttachment: (UUID) -> Void = { _ in }
     /// Set while the machine is off or in motion; takes the readiness line.
     var machineState: RelayComposerMachineState? = nil
+    /// The draft is on its way to the machine and stays here until it lands.
+    var isDeliveringPrompt = false
     var activeRunProvider: CodexProvider? = nil
     var onSendNow: () -> Void = {}
     @State private var showingSendOptions = false
@@ -1404,6 +1407,19 @@ private struct RelayComposer: View {
                 }
                 .padding(.horizontal, 6)
                 .accessibilityIdentifier("relay-machine-readiness")
+            } else if isDeliveringPrompt {
+                HStack(alignment: .center, spacing: 8) {
+                    Text("Sending…")
+                        .font(RelayChatStyle.labelFont)
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(AppTheme.accent)
+                        .frame(minWidth: 44, minHeight: 44)
+                }
+                .padding(.horizontal, 6)
+                .accessibilityIdentifier("relay-prompt-sending")
             } else if let harnessStatus, harnessStatus.isConfirmedUnavailable {
                 HStack(alignment: .center, spacing: 8) {
                     Text(harnessStatus.actionMessage ?? "This provider is not ready on the linked computer.")

@@ -1389,6 +1389,77 @@ final class RelayChatLiveDataTests: XCTestCase {
         XCTAssertEqual(model.messages.filter { $0.job != nil }.count, 1)
     }
 
+    func testTheDraftStaysInTheComposerUntilTheMachineAcceptsTheJob() async throws {
+        let script = LiveScript()
+        let (released, release) = AsyncStream<Void>.makeStream()
+        var submitted = false
+        let response = try CodexClient.makeDecoder().decode(CodexCreateJobResponse.self, from: Data(#"""
+        {"id":"job-1","job":{"id":"job-1","provider":"claude","status":"queued","workspaceId":"ws","prompt":"Fix the bug"}}
+        """#.utf8))
+        let model = RelayChatViewModel(
+            client: CodexClient(baseURL: URL(string: "http://127.0.0.1:9")!, identityStore: ClientIdentityStore()),
+            workspaceID: "ws", workspacePath: nil,
+            submitJob: { _ in
+                submitted = true
+                for await _ in released { break }
+                return response
+            },
+            live: script.source()
+        )
+        let descriptor = try JSONDecoder().decode(CodexModelDescriptor.self, from: Data(
+            #"{"id":"claude-default","label":"Claude Code","provider":"claude","modes":["task"]}"#.utf8
+        ))
+        model.selectChoice(RelayModelChoice(model: descriptor, mode: .task))
+        model.prompt = "Fix the bug"
+        let sending = Task { await model.sendCurrentPrompt() }
+
+        // The request is out, and nothing yet claims it arrived.
+        try await waitUntil("the job request leaves the phone") { submitted }
+        XCTAssertEqual(model.prompt, "Fix the bug", "the draft stays put until the machine has it")
+        XCTAssertTrue(model.messages.isEmpty, "no sent bubble for a prompt the machine has not accepted")
+        XCTAssertTrue(model.isDeliveringPrompt)
+
+        release.yield(())
+        await sending.value
+        XCTAssertEqual(model.prompt, "")
+        XCTAssertEqual(model.messages.first?.role, .user)
+        XCTAssertEqual(model.messages.first?.text, "Fix the bug")
+        XCTAssertEqual(model.messages.compactMap { $0.job?.id }, ["job-1"])
+        XCTAssertFalse(model.isDeliveringPrompt)
+        XCTAssertFalse(model.isSending)
+    }
+
+    func testTextTypedWhileSendingIsNotClearedWhenTheJobLands() async throws {
+        let script = LiveScript()
+        let (released, release) = AsyncStream<Void>.makeStream()
+        var submitted = false
+        let response = try CodexClient.makeDecoder().decode(CodexCreateJobResponse.self, from: Data(#"""
+        {"id":"job-1","job":{"id":"job-1","provider":"claude","status":"queued","workspaceId":"ws","prompt":"Fix the bug"}}
+        """#.utf8))
+        let model = RelayChatViewModel(
+            client: CodexClient(baseURL: URL(string: "http://127.0.0.1:9")!, identityStore: ClientIdentityStore()),
+            workspaceID: "ws", workspacePath: nil,
+            submitJob: { _ in
+                submitted = true
+                for await _ in released { break }
+                return response
+            },
+            live: script.source()
+        )
+        let descriptor = try JSONDecoder().decode(CodexModelDescriptor.self, from: Data(
+            #"{"id":"claude-default","label":"Claude Code","provider":"claude","modes":["task"]}"#.utf8
+        ))
+        model.selectChoice(RelayModelChoice(model: descriptor, mode: .task))
+        model.prompt = "Fix the bug"
+        let sending = Task { await model.sendCurrentPrompt() }
+        try await waitUntil("the job request leaves the phone") { submitted }
+        model.prompt = "Fix the bug, then run the tests"
+        release.yield(())
+        await sending.value
+        XCTAssertEqual(model.prompt, "Fix the bug, then run the tests")
+        XCTAssertEqual(model.messages.first?.text, "Fix the bug")
+    }
+
     func testARejectedHandoffRestoresTheDraftWithoutASentBubble() async throws {
         let script = LiveScript()
         var sent = false

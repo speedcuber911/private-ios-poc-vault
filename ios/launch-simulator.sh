@@ -40,7 +40,8 @@
 # Machine power (app side, Debug builds): SIMCTL_CHILD_RELAY_SIM_POWER_STATUS=off
 #   (or starting/stopping) fakes EC2's answer to show the machine-off screens;
 #   Start then brings it "up" after a few seconds.
-# Fixture pacing knobs (server side): SIM_CHAT_DELTA_DELAY, SIM_JOB_STREAM_DELAY.
+# Fixture pacing knobs (server side): SIM_CHAT_DELTA_DELAY, SIM_JOB_STREAM_DELAY,
+#   SIM_JOB_ACCEPT_DELAY (seconds before a new job is accepted).
 # Scripted agent turn (server side): SIM_TIMELINE=0 (a machine with no timeline),
 #   SIM_TIMELINE_APPROVAL=1 (pause at the first command until approved),
 #   SIM_TIMELINE_APPROVAL=question (pause on a Claude question to answer instead),
