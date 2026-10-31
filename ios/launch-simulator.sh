@@ -43,6 +43,7 @@
 # Fixture pacing knobs (server side): SIM_CHAT_DELTA_DELAY, SIM_JOB_STREAM_DELAY.
 # Scripted agent turn (server side): SIM_TIMELINE=0 (a machine with no timeline),
 #   SIM_TIMELINE_APPROVAL=1 (pause at the first command until approved),
+#   SIM_TIMELINE_APPROVAL=question (pause on a Claude question to answer instead),
 #   SIM_TIMELINE_REPEAT=<n> (a long transcript), SIM_STREAM_DROP_AFTER=<n> (drop the
 #   job stream after n events, to exercise re-attach), SIM_HISTORY_STEPS=1 (thread
 #   history carries steps).

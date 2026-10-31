@@ -253,6 +253,7 @@ async function routeRequest(req, res) {
     const record = approvalStore.decide(decodeURIComponent(approvalMatch[1]), decision, {
       decidedBy: auth.subject || "phone",
       message: body?.message,
+      answers: body?.answers,
     });
     appendAudit("approval_decided", jobs.get(record.jobId) || null, { approvalId: record.id, decision });
     emitEvent("approval.resolved", publicApproval(record));

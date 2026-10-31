@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import readline from "node:readline";
-import { ApprovalStore } from "./approval-store.mjs";
+import { ApprovalStore, questionKey } from "./approval-store.mjs";
 
 const jobId = requiredEnv("RELAY_JOB_ID");
 const workspacePath = requiredEnv("RELAY_WORKSPACE_PATH");
@@ -64,24 +64,53 @@ async function handleApproval(message) {
   const args = message.params?.arguments || {};
   const toolName = String(args.tool_name || args.toolName || "Tool");
   const input = args.input && typeof args.input === "object" ? args.input : {};
+  // AskUserQuestion reaches this hook like any tool, but "allow" alone answers
+  // nothing: the CLI expects the user's picks back in updatedInput.answers.
+  const questions = isQuestionTool(toolName, input) ? input.questions : null;
   const record = store.create({
     jobId,
     provider: "claude",
-    kind: claudeKind(toolName),
-    title: claudeTitle(toolName),
-    reason: args.reason,
-    command: safeClaudePreview(toolName, input),
+    kind: questions ? "question" : claudeKind(toolName),
+    title: questions ? questionTitle(questions) : claudeTitle(toolName),
+    reason: questions ? questions.map((entry) => entry?.question).filter(Boolean).join("\n\n") : args.reason,
+    command: questions ? "" : safeClaudePreview(toolName, input),
     cwd: typeof input.cwd === "string" ? input.cwd : workspacePath,
     toolName,
+    questions,
   });
   const resolution = await store.waitForDecision(record.id, {
     signal: controller.signal,
     timeoutMs: approvalWaitTimeoutMs(),
   });
-  const payload = resolution.decision.startsWith("accept")
-    ? { behavior: "allow", updatedInput: input }
-    : { behavior: "deny", message: resolution.message || "Denied from Relay." };
+  const payload = questions
+    ? questionPayload(input, resolution)
+    : resolution.decision.startsWith("accept")
+      ? { behavior: "allow", updatedInput: input }
+      : { behavior: "deny", message: resolution.message || "Denied from Relay." };
   respond(message.id, { content: [{ type: "text", text: JSON.stringify(payload) }] });
+}
+
+function isQuestionTool(toolName, input) {
+  return toolName === "AskUserQuestion" && Array.isArray(input.questions) && input.questions.length > 0;
+}
+function questionTitle(questions) {
+  return questions.length === 1 ? "Claude has a question" : `Claude has ${questions.length} questions`;
+}
+// The store keys answers by its cleaned copy of each question; the CLI matches
+// them against the text it sent, so key them by that text again.
+function questionPayload(input, resolution) {
+  const answers = {};
+  for (const entry of input.questions) {
+    const answer = resolution.answers?.[questionKey(entry?.question)];
+    if (typeof entry?.question === "string" && answer) answers[entry.question] = answer;
+  }
+  if (resolution.decision.startsWith("accept") && Object.keys(answers).length) {
+    return { behavior: "allow", updatedInput: { ...input, answers } };
+  }
+  return {
+    behavior: "deny",
+    message: resolution.message || "The user dismissed these questions in Relay without answering.",
+  };
 }
 
 function safeClaudePreview(toolName, input) {

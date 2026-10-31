@@ -28,6 +28,7 @@ class ApprovalStore {
       turnId: cleanText(input.turnId, 180),
       requestId: input.requestId ?? null,
       availableDecisions: cleanDecisions(input.availableDecisions),
+      questions: cleanQuestions(input.questions),
       createdAt: new Date().toISOString(),
     };
     if (!record.jobId || !safeId.test(record.jobId)) throw new Error("approval job id is invalid");
@@ -62,17 +63,24 @@ class ApprovalStore {
     return this.list({ jobId, status: "pending" }).length;
   }
 
-  decide(id, decision, { decidedBy = "phone", message = "" } = {}) {
+  decide(id, decision, { decidedBy = "phone", message = "", answers = null } = {}) {
     const record = this.get(id);
     if (!record) throw Object.assign(new Error("approval not found"), { status: 404 });
     if (record.status !== "pending") throw Object.assign(new Error("approval is already resolved"), { status: 409 });
     if (!terminalDecisions.has(decision)) {
       throw Object.assign(new Error("decision must be accept, acceptForSession, decline, or cancel"), { status: 400 });
     }
+    const cleanedAnswers = cleanAnswers(record, answers);
+    // Accepting a question without an answer would hand the agent an empty
+    // reply it reads as the user's choice. Refuse it; Deny is the way out.
+    if (record.questions && decision.startsWith("accept") && !cleanedAnswers) {
+      throw Object.assign(new Error("answer the question in Relay to continue"), { status: 400 });
+    }
     const resolution = {
       decision,
       decidedBy: cleanText(decidedBy, 80) || "phone",
       message: cleanText(message, 1000),
+      ...(cleanedAnswers && decision.startsWith("accept") ? { answers: cleanedAnswers } : {}),
       decidedAt: new Date().toISOString(),
     };
     try {
@@ -170,6 +178,67 @@ function cleanDecisions(value) {
   return result.length ? [...new Set(result)] : ["accept", "decline", "cancel"];
 }
 
+const questionKinds = new Set(["choice", "text", "number"]);
+
+// Answers are keyed by this form of a question's text, so the runner can match
+// them back to the exact text the agent wrote.
+function questionKey(value) {
+  return cleanText(value, 1000);
+}
+
+// The questions an agent asked (Claude's AskUserQuestion), in its order.
+function cleanQuestions(value) {
+  if (!Array.isArray(value)) return null;
+  const questions = value.slice(0, 4).map((entry) => {
+    const question = questionKey(entry?.question);
+    if (!question) return null;
+    const options = Array.isArray(entry.options)
+      ? entry.options.slice(0, 8)
+        .map((option) => ({
+          label: cleanText(option?.label, 200),
+          description: cleanText(option?.description, 600) || null,
+        }))
+        .filter((option) => option.label)
+      : [];
+    const kind = questionKinds.has(entry.kind) ? entry.kind : "choice";
+    return {
+      question,
+      header: cleanText(entry.header, 60) || null,
+      kind: kind === "choice" && options.length === 0 ? "text" : kind,
+      multiSelect: entry.multiSelect === true,
+      options,
+      placeholder: cleanText(entry.placeholder, 200) || null,
+    };
+  }).filter(Boolean);
+  return questions.length ? questions : null;
+}
+
+// Answers keyed by question text. A multi-select answer may arrive as a list;
+// the agent takes it comma-joined, as its own terminal dialog sends it.
+function cleanAnswers(record, value) {
+  if (value === null || value === undefined) return null;
+  if (!record.questions) {
+    throw Object.assign(new Error("answers apply only to questions"), { status: 400 });
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw Object.assign(new Error("answers must be an object keyed by question"), { status: 400 });
+  }
+  const known = new Set(record.questions.map((entry) => entry.question));
+  const answers = {};
+  for (const [question, raw] of Object.entries(value)) {
+    if (!known.has(question)) {
+      throw Object.assign(new Error("answers name a question that was not asked"), { status: 400 });
+    }
+    const parts = Array.isArray(raw) ? raw : [raw];
+    if (!parts.every((part) => typeof part === "string")) {
+      throw Object.assign(new Error("each answer must be text"), { status: 400 });
+    }
+    const answer = cleanText(parts.map((part) => cleanText(part, 4000)).filter(Boolean).join(", "), 4000);
+    if (answer) answers[question] = answer;
+  }
+  return Object.keys(answers).length ? answers : null;
+}
+
 function publicApproval(record) {
   return {
     id: record.id,
@@ -184,12 +253,14 @@ function publicApproval(record) {
     createdAt: record.createdAt,
     status: record.status,
     availableDecisions: record.availableDecisions,
+    questions: record.questions || null,
     resolution: record.resolution ? {
       decision: record.resolution.decision,
       decidedAt: record.resolution.decidedAt,
       message: record.resolution.message || null,
+      answers: record.resolution.answers || null,
     } : null,
   };
 }
 
-export { ApprovalStore, publicApproval, terminalDecisions };
+export { ApprovalStore, publicApproval, questionKey, terminalDecisions };

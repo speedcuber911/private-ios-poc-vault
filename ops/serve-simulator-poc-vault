@@ -215,12 +215,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json_error(400, "decision is invalid")
                 return
             if scripted is not None:
+                if scripted.approval.get("questions") and decision.startswith("accept") and not body.get("answers"):
+                    self.send_json_error(400, "answer the question in Relay to continue")
+                    return
                 with self.server.fixture_lock:
                     scripted.approval["status"] = "resolved"
                     scripted.approval["resolution"] = {
                         "decision": decision,
                         "decidedAt": sim_now_iso(),
                         "message": body.get("message"),
+                        "answers": body.get("answers"),
                     }
                     scripted.waiting_for_approval = False
                 self.send_json({"approval": dict(scripted.approval)})
@@ -1963,7 +1967,10 @@ def sim_now_iso() -> str:
 
 def start_sim_timeline(server: SimulatorVaultServer, job: SimJob) -> None:
     enabled = os.environ.get("SIM_TIMELINE", "1") != "0"
-    asks_approval = os.environ.get("SIM_TIMELINE_APPROVAL", "0") == "1"
+    # "1" parks the first command on an approval; "question" parks it on a
+    # Claude AskUserQuestion the phone answers by picking options instead.
+    approval_mode = os.environ.get("SIM_TIMELINE_APPROVAL", "0")
+    asks_approval = approval_mode in {"1", "question"}
     now = sim_now_iso()
     with server.fixture_lock:
         job.generation += 1
@@ -2028,6 +2035,8 @@ def start_sim_timeline(server: SimulatorVaultServer, job: SimJob) -> None:
                         "availableDecisions": ["accept", "acceptForSession", "decline", "cancel"],
                         "resolution": None,
                     }
+                    if approval_mode == "question":
+                        job.approval.update(sim_question_approval())
                     job.waiting_for_approval = True
                 # Parked, like the real runner, until the phone decides.
                 while True:
@@ -2057,6 +2066,32 @@ def sim_job_for(server: SimulatorVaultServer, job_id: str) -> SimJob | None:
         if job_id == "sim-job-running":
             return server.active_job
         return server.sim_jobs.get(job_id)
+
+
+def sim_question_approval() -> dict:
+    """The fields relayd adds when Claude's AskUserQuestion parks a run."""
+    return {
+        "kind": "question",
+        "title": "Claude has a question",
+        "reason": "Which two should I build now?",
+        "command": None,
+        "toolName": "AskUserQuestion",
+        "questions": [{
+            "question": "Which two should I build now?",
+            "header": "Fixes to build",
+            "kind": "choice",
+            "multiSelect": True,
+            "options": [
+                {"label": "Waiting-ask stays silent",
+                 "description": "Stop a question waiting on you from re-surfacing when your next message doesn't address it."},
+                {"label": "Ack must drive the task",
+                 "description": "Make an \u2018I\u2019m checking\u2026\u2019 promise actually continue the work."},
+                {"label": "Clarify ambiguous replies",
+                 "description": None},
+            ],
+            "placeholder": None,
+        }],
+    }
 
 
 def sim_job_for_approval(server: SimulatorVaultServer, approval_id: str) -> SimJob | None:

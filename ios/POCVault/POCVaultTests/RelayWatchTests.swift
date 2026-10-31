@@ -498,6 +498,30 @@ final class RelayWatchTests: XCTestCase {
         XCTAssertLessThanOrEqual(projected.detail.count, 700)
     }
 
+    func testQuestionDecodesItsOptionsAndIsAnsweredOnThePhone() throws {
+        let json = #"""
+        {"id":"q","jobId":"job","provider":"claude","kind":"question","title":"Claude has a question",
+         "status":"pending","availableDecisions":["accept","decline","cancel"],
+         "questions":[{"question":"Which two should I build?","header":"Fixes","kind":"choice","multiSelect":true,
+           "options":[{"label":"Waiting-ask stays silent","description":"Surgical."},{"label":"Ack drives the task","description":null}],
+           "placeholder":null}]}
+        """#
+        let approval = try CodexClient.makeDecoder().decode(CodexApproval.self, from: Data(json.utf8))
+        XCTAssertTrue(approval.isQuestion)
+        let question = try XCTUnwrap(approval.questions?.first)
+        XCTAssertTrue(question.allowsMultiple)
+        XCTAssertFalse(question.isOpenEnded)
+        XCTAssertEqual(question.options.map(\.label), ["Waiting-ask stays silent", "Ack drives the task"])
+        XCTAssertTrue(RelayWatchProjection.approval(approval).requiresPhone, "the watch cannot pick options")
+
+        // A machine that predates questions sends none.
+        let plain = try CodexClient.makeDecoder().decode(CodexApproval.self, from: Data(
+            #"{"id":"a","jobId":"job","provider":"claude","kind":"command","title":"Run","status":"pending","availableDecisions":["accept"]}"#.utf8
+        ))
+        XCTAssertFalse(plain.isQuestion)
+        XCTAssertFalse(RelayWatchProjection.approval(plain).requiresPhone)
+    }
+
     func testProgressProjectsAgentProseAndCountsWithoutToolOutput() throws {
         var timeline = RelayTimeline()
         let lines = [

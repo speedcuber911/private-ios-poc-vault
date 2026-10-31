@@ -147,6 +147,92 @@ test("Claude permission MCP waits for and returns the exact phone decision", asy
   await stopped;
 });
 
+test("Claude AskUserQuestion parks as a question and returns the phone's answers", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-claude-question-"));
+  const approvals = path.join(dir, "approvals");
+  const child = spawn(process.execPath, [path.join(srcDir, "claude-permission-mcp.mjs")], {
+    env: { ...process.env, RELAY_JOB_ID: "job-claude-q", RELAY_WORKSPACE_PATH: dir, RELAY_APPROVAL_DIR: approvals },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const lines = [];
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => lines.push(...chunk.trim().split("\n").filter(Boolean).map(JSON.parse)));
+  const questions = [
+    { question: "Which fixes should I build? ", header: "Fixes", multiSelect: true, options: [
+      { label: "Silence the ask", description: "Surgical." },
+      { label: "Ack drives the task" },
+      { label: "Both" },
+    ] },
+    { question: "Ship today?", header: "Ship", multiSelect: false, options: [{ label: "Yes" }, { label: "No" }] },
+  ];
+  child.stdin.write(`${JSON.stringify({jsonrpc:"2.0",id:1,method:"initialize",params:{protocolVersion:"2025-06-18"}})}\n`);
+  child.stdin.write(`${JSON.stringify({jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"approve",arguments:{tool_name:"AskUserQuestion",input:{questions}}}})}\n`);
+  const store = new ApprovalStore(approvals);
+  const pending = await waitFor(() => store.list({ jobId: "job-claude-q", status: "pending" })[0]);
+  const shaped = publicApproval(pending);
+  assert.equal(shaped.kind, "question");
+  assert.equal(shaped.title, "Claude has 2 questions");
+  assert.equal(shaped.command, null);
+  assert.equal(shaped.questions.length, 2);
+  // Stored trimmed; answers come back keyed by that form.
+  assert.equal(shaped.questions[0].question, "Which fixes should I build?");
+  assert.equal(shaped.questions[0].multiSelect, true);
+  assert.deepEqual(shaped.questions[0].options.map((option) => option.label), ["Silence the ask", "Ack drives the task", "Both"]);
+
+  assert.throws(() => store.decide(pending.id, "accept"), /answer the question/);
+  assert.throws(() => store.decide(pending.id, "accept", { answers: { "Not asked?": "Yes" } }), /not asked/);
+  store.decide(pending.id, "accept", { answers: {
+    "Which fixes should I build?": ["Silence the ask", "Ack drives the task"],
+    "Ship today?": "Not until the tests pass",
+  } });
+
+  const response = await waitFor(() => lines.find((line) => line.id === 2));
+  const payload = JSON.parse(response.result.content[0].text);
+  assert.equal(payload.behavior, "allow");
+  assert.deepEqual(payload.updatedInput.questions, questions);
+  // Keyed by the exact text Claude sent, trailing space included.
+  assert.deepEqual(payload.updatedInput.answers, {
+    "Which fixes should I build? ": "Silence the ask, Ack drives the task",
+    "Ship today?": "Not until the tests pass",
+  });
+  const stopped = new Promise((resolve) => child.once("exit", resolve));
+  child.kill("SIGTERM");
+  await stopped;
+});
+
+test("a dismissed Claude question denies with a message the agent can act on", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-claude-question-deny-"));
+  const approvals = path.join(dir, "approvals");
+  const child = spawn(process.execPath, [path.join(srcDir, "claude-permission-mcp.mjs")], {
+    env: { ...process.env, RELAY_JOB_ID: "job-claude-qd", RELAY_WORKSPACE_PATH: dir, RELAY_APPROVAL_DIR: approvals },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const lines = [];
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => lines.push(...chunk.trim().split("\n").filter(Boolean).map(JSON.parse)));
+  const input = { questions: [{ question: "Pick one?", header: "Pick", options: [{ label: "A" }, { label: "B" }] }] };
+  child.stdin.write(`${JSON.stringify({jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"approve",arguments:{tool_name:"AskUserQuestion",input}}})}\n`);
+  const store = new ApprovalStore(approvals);
+  const pending = await waitFor(() => store.list({ jobId: "job-claude-qd", status: "pending" })[0]);
+  assert.equal(publicApproval(pending).title, "Claude has a question");
+  store.decide(pending.id, "decline");
+  const response = await waitFor(() => lines.find((line) => line.id === 2));
+  const payload = JSON.parse(response.result.content[0].text);
+  assert.equal(payload.behavior, "deny");
+  assert.match(payload.message, /without answering/);
+  const stopped = new Promise((resolve) => child.once("exit", resolve));
+  child.kill("SIGTERM");
+  await stopped;
+});
+
+test("answers are refused on an approval that asked no question", () => {
+  const store = new ApprovalStore(fs.mkdtempSync(path.join(os.tmpdir(), "relay-approval-answers-")));
+  const created = store.create({ jobId: "job-2", provider: "claude", kind: "command", title: "Run command", command: "ls" });
+  assert.equal(publicApproval(store.get(created.id)).questions, null);
+  assert.throws(() => store.decide(created.id, "accept", { answers: { "Q?": "A" } }), /only to questions/);
+  assert.equal(store.decide(created.id, "accept").resolution.answers, undefined);
+});
+
 async function waitFor(read, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {

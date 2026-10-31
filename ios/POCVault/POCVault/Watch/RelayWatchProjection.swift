@@ -84,7 +84,8 @@ enum RelayWatchProjection {
             id: value.id, jobID: value.jobId, title: String(value.title.prefix(200)),
             detail: tooLong ? RelayWatchText.excerpt(detail, limit: 700) : detail,
             decisions: value.availableDecisions.filter { ["accept", "decline"].contains($0) },
-            requiresPhone: tooLong
+            // A question is answered by picking options; the watch has no room.
+            requiresPhone: tooLong || value.isQuestion
         )
     }
 }

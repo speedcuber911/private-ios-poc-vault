@@ -832,13 +832,24 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         }
     }
 
-    func decideApproval(id: String, decision: CodexApprovalDecision, message: String? = nil) async throws -> CodexApproval {
-        try await decideApproval(id: id, decision: decision, message: message, expectedBaseURL: nil)
+    func decideApproval(
+        id: String,
+        decision: CodexApprovalDecision,
+        message: String? = nil,
+        answers: [String: String]? = nil
+    ) async throws -> CodexApproval {
+        try await decideApproval(id: id, decision: decision, message: message, answers: answers, expectedBaseURL: nil)
     }
 
-    func decideApproval(id: String, decision: CodexApprovalDecision, message: String? = nil, expectedBaseURL: URL?) async throws -> CodexApproval {
-        var payload: [String: String] = ["decision": decision.rawValue]
-        if let message { payload["message"] = message }
+    /// `answers` is keyed by question text and only applies to a question.
+    func decideApproval(
+        id: String,
+        decision: CodexApprovalDecision,
+        message: String? = nil,
+        answers: [String: String]? = nil,
+        expectedBaseURL: URL?
+    ) async throws -> CodexApproval {
+        let payload = CodexApprovalDecisionRequest(decision: decision.rawValue, message: message, answers: answers)
         let data = try await perform(
             path: "/v1/codex/approvals/\(Self.pathComponent(id))/decision",
             method: "POST",
@@ -848,8 +859,11 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
         return try decoder.decode(CodexApprovalEnvelope.self, from: data).approval
     }
 
+    /// A notification's Approve cannot carry answers, so a question is left
+    /// parked for the app to open on.
     func decideFirstPendingApproval(jobID: String, decision: CodexApprovalDecision) async throws {
-        guard let approval = try await fetchApprovals(jobID: jobID, pendingOnly: true).first else { return }
+        guard let approval = try await fetchApprovals(jobID: jobID, pendingOnly: true).first,
+              !approval.isQuestion || decision != .accept else { return }
         _ = try await decideApproval(id: approval.id, decision: decision)
     }
 
@@ -1957,6 +1971,12 @@ private struct CodexListEnvelope<Element: Decodable>: Decodable {
 }
 
 private struct CodexApprovalEnvelope: Decodable { let approval: CodexApproval }
+/// Absent fields are left out rather than sent as null.
+private struct CodexApprovalDecisionRequest: Encodable {
+    let decision: String
+    let message: String?
+    let answers: [String: String]?
+}
 private struct CodexTerminalEnvelope: Decodable { let terminal: CodexTerminal }
 
 private struct RelayHandoffEnvelope: Decodable {

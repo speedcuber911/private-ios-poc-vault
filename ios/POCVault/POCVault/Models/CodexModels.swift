@@ -1149,8 +1149,33 @@ struct CodexApproval: Decodable, Hashable, Identifiable {
     let status: String
     let availableDecisions: [String]
     let resolution: CodexApprovalResolution?
+    /// Set when the agent asked the user something (Claude's AskUserQuestion)
+    /// rather than for permission. Older machines omit it.
+    var questions: [CodexApprovalQuestion]? = nil
 
     var isPending: Bool { status == "pending" }
+    var isQuestion: Bool { !(questions ?? []).isEmpty }
+}
+
+/// One question an agent asked. Answered with an option's label, the user's own
+/// words, or, for a multi-select, the picked labels comma-joined.
+struct CodexApprovalQuestion: Decodable, Hashable, Identifiable {
+    struct Option: Decodable, Hashable {
+        let label: String
+        let description: String?
+    }
+
+    let question: String
+    let header: String?
+    /// `choice`, `text`, or `number`.
+    let kind: String?
+    let multiSelect: Bool?
+    let options: [Option]
+    let placeholder: String?
+
+    var id: String { question }
+    var allowsMultiple: Bool { multiSelect == true }
+    var isOpenEnded: Bool { kind == "text" || kind == "number" || options.isEmpty }
 }
 
 enum CodexApprovalDecision: String, Encodable {

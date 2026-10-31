@@ -21,6 +21,12 @@ routes as the job's logs.
 - `GET /v1/codex/approvals?status=pending&jobId=<id>` lists blocked runtime requests.
   `POST /v1/codex/approvals/:id/decision` accepts `accept`, `acceptForSession`,
   `decline`, or `cancel`.
+  Claude's `AskUserQuestion` parks as `kind: "question"` with a `questions` list
+  (`question`, `header`, `kind` choice|text|number, `multiSelect`, `options[]`
+  of `label`/`description`). Accepting one requires `answers`, an object keyed by
+  question text whose values are a label, the user's own text, or a list of
+  labels for a multi-select; they reach Claude as the tool's `answers`. Deny
+  tells Claude the user dismissed the questions.
 - `POST /v1/codex/terminals` starts a sandboxed PTY in a registered workspace. The
   returned id supports `/stream`, `/input`, `/resize`, and `/close` subroutes.
 - `POST /v1/codex/previews` turns an HTTP localhost URL returned by a specific job

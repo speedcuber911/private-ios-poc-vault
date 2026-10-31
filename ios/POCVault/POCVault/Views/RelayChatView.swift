@@ -714,8 +714,8 @@ struct RelayChatView: View {
                 // until it is answered.
                 ForEach(viewModel.pendingApprovals) { approval in
                     if !inlineApprovalJobs.contains(approval.jobId) {
-                        RelayApprovalCard(approval: approval) { decision in
-                            Task { await viewModel.decideApproval(approval, decision) }
+                        RelayApprovalCard(approval: approval) { decision, answers in
+                            Task { await viewModel.decideApproval(approval, decision, answers: answers) }
                         }
                         .id(approval.id)
                         .padding(.top, Self.turnSpacing)
@@ -817,8 +817,8 @@ struct RelayChatView: View {
                     showsByline: showsByline,
                     isCancelling: viewModel.cancellingJobIDs.contains(job.id),
                     approvals: approvals,
-                    onDecide: { approval, decision in
-                        Task { await viewModel.decideApproval(approval, decision) }
+                    onDecide: { approval, decision, answers in
+                        Task { await viewModel.decideApproval(approval, decision, answers: answers) }
                     },
                     onCancel: {
                         Task { await viewModel.cancel(job: job) }
@@ -2418,7 +2418,7 @@ private struct RelayJobTurn: View, Equatable {
     let isCancelling: Bool
     /// Approvals parked on this job: drawn under its "Waiting" row.
     var approvals: [CodexApproval] = []
-    var onDecide: (CodexApproval, CodexApprovalDecision) -> Void = { _, _ in }
+    var onDecide: (CodexApproval, CodexApprovalDecision, _ answers: [String: String]?) -> Void = { _, _, _ in }
     let onCancel: () -> Void
     let onFullLog: () -> Void
     let onArtifact: (CodexJobArtifact) -> Void
@@ -2480,8 +2480,8 @@ private struct RelayJobTurn: View, Equatable {
                     } label: { Label("Copy", systemImage: "doc.on.doc") }
                 }
                 ForEach(approvals) { approval in
-                    RelayApprovalCard(approval: approval) { decision in
-                        onDecide(approval, decision)
+                    RelayApprovalCard(approval: approval) { decision, answers in
+                        onDecide(approval, decision, answers)
                     }
                     .accessibilityIdentifier("relay-chat-approval")
                 }

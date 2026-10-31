@@ -561,7 +561,12 @@ private final class FakeChatsFeedSource: RelayChatsFeedSource, @unchecked Sendab
         return try await approvals()
     }
 
-    func decideApproval(id: String, decision: CodexApprovalDecision, message: String?) async throws -> CodexApproval {
+    func decideApproval(
+        id: String,
+        decision: CodexApprovalDecision,
+        message: String?,
+        answers: [String: String]?
+    ) async throws -> CodexApproval {
         throw URLError(.unsupportedURL)
     }
 }

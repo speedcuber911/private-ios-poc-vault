@@ -1192,12 +1192,16 @@ final class RelayChatViewModel: ObservableObject {
 
     /// Answer an approval. The card clears immediately so the run visibly resumes,
     /// and comes back if the machine rejected the decision — a job must never look
-    /// answered when it is still parked.
-    func decideApproval(_ approval: CodexApproval, _ decision: CodexApprovalDecision) async {
+    /// answered when it is still parked. A question carries its `answers`.
+    func decideApproval(
+        _ approval: CodexApproval,
+        _ decision: CodexApprovalDecision,
+        answers: [String: String]? = nil
+    ) async {
         let previous = pendingApprovals
         pendingApprovals.removeAll { $0.id == approval.id }
         do {
-            _ = try await client.decideApproval(id: approval.id, decision: decision)
+            _ = try await client.decideApproval(id: approval.id, decision: decision, answers: answers)
             await refreshActiveJobDetails()
         } catch {
             guard !isCancellation(error) else { return }

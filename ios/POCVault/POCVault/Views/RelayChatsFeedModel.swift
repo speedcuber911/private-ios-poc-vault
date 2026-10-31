@@ -6,7 +6,12 @@ protocol RelayChatsFeedSource: AnyObject {
     func fetchChatsThreads(budget: CodexRequestBudget) async throws -> [CodexThread]
     func fetchChatsJobs(budget: CodexRequestBudget) async throws -> [CodexJob]
     func fetchChatsApprovals(budget: CodexRequestBudget) async throws -> [CodexApproval]
-    func decideApproval(id: String, decision: CodexApprovalDecision, message: String?) async throws -> CodexApproval
+    func decideApproval(
+        id: String,
+        decision: CodexApprovalDecision,
+        message: String?,
+        answers: [String: String]?
+    ) async throws -> CodexApproval
 }
 
 extension CodexClient: RelayChatsFeedSource {
@@ -406,9 +411,9 @@ final class StatusFeedViewModel: ObservableObject, RelayActivityFeedProviding {
         publish()
     }
 
-    func decide(_ approval: CodexApproval, _ decision: CodexApprovalDecision) async {
+    func decide(_ approval: CodexApproval, _ decision: CodexApprovalDecision, answers: [String: String]? = nil) async {
         do {
-            _ = try await source.decideApproval(id: approval.id, decision: decision, message: nil)
+            _ = try await source.decideApproval(id: approval.id, decision: decision, message: nil, answers: answers)
             state.markDecided(approvalID: approval.id)
             publish()
             await refresh()

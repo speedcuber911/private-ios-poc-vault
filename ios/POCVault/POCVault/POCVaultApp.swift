@@ -1191,8 +1191,8 @@ private struct CodexStatusView: View {
                             RelayApprovalCard(
                                 approval: approval,
                                 onOpen: { openApproval(approval) },
-                                onDecision: { decision in
-                                    Task { await feedViewModel.decide(approval, decision) }
+                                onDecision: { decision, answers in
+                                    Task { await feedViewModel.decide(approval, decision, answers: answers) }
                                 }
                             )
                             .padding(.horizontal, 16)
