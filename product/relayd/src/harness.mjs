@@ -63,7 +63,7 @@ const providerCapabilities = {
     taskControls: {
       model: true,
       reasoningEffort: true,
-      permissionModes: ["manual", "acceptEdits", "plan", "dontAsk", "auto"],
+      permissionModes: ["manual", "acceptEdits", "plan", "dontAsk", "auto", "bypassPermissions"],
       approvalPolicies: [],
     },
   },

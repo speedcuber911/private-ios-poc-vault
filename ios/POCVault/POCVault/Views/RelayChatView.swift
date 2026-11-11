@@ -228,7 +228,7 @@ struct RelayChatView: View {
                         onToggleSkill: { viewModel.toggleSkill($0) },
                         onPickClaudePermission: { viewModel.claudePermissionMode = $0 },
                         onPickCodexApproval: { viewModel.codexApprovalPolicy = $0 },
-                        onPickCodexSandbox: { viewModel.codexSandbox = $0 },
+                        onPickCodexSandbox: { viewModel.selectCodexSandbox($0) },
                         onNewConversation: { viewModel.startNewConversation() },
                         onSend: {
                             UIImpactFeedbackGenerator(style: .medium).impactOccurred()

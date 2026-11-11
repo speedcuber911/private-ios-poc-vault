@@ -763,15 +763,19 @@ struct CodexSkillDescriptor: Decodable, Hashable, Identifiable {
     var isCommand: Bool { kind == "command" }
 }
 
-/// Claude Code's non-destructive permission modes supported by the current Relay job
-/// contract. `bypassPermissions` remains server/operator-only and is never offered by
-/// the phone as an ordinary convenience setting.
+/// Claude Code's permission modes supported by the current Relay job contract.
+/// `bypassPermissions` is Claude Code's own bypass mode; it is offered last, and
+/// the picker states its consequence where it is chosen.
 enum RelayClaudePermissionMode: String, CaseIterable, Identifiable, Codable {
     case manual
     case plan
     case acceptEdits
     case dontAsk
     case auto
+    case bypassPermissions
+
+    /// What a task gets until the user picks otherwise.
+    static let `default` = RelayClaudePermissionMode.bypassPermissions
 
     var id: String { rawValue }
 
@@ -783,10 +787,14 @@ enum RelayClaudePermissionMode: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .manual:
             return "default"
-        case .plan, .acceptEdits, .dontAsk, .auto:
+        case .plan, .acceptEdits, .dontAsk, .auto, .bypassPermissions:
             return rawValue
         }
     }
+
+    /// True where nothing pauses for the phone, and the picker owes the user a
+    /// plain sentence about it.
+    var isBypass: Bool { self == .bypassPermissions }
 
     var label: String {
         switch self {
@@ -800,6 +808,8 @@ enum RelayClaudePermissionMode: String, CaseIterable, Identifiable, Codable {
             return "Deny prompts"
         case .auto:
             return "Auto"
+        case .bypassPermissions:
+            return "Bypass permissions"
         }
     }
 
@@ -815,6 +825,8 @@ enum RelayClaudePermissionMode: String, CaseIterable, Identifiable, Codable {
             return "Reject tools that would need an interactive approval."
         case .auto:
             return "Let the installed Claude Code choose its automatic policy."
+        case .bypassPermissions:
+            return "Run every tool without asking. Nothing pauses for this phone."
         }
     }
 }
@@ -823,13 +835,34 @@ enum RelayCodexApprovalPolicy: String, CaseIterable, Identifiable, Codable {
     case onRequest = "on-request"
     case untrusted
     case never
+    /// Codex's `--dangerously-bypass-approvals-and-sandbox`: never ask, and no
+    /// sandbox. A phone-side choice only; it travels as `never` plus
+    /// `danger-full-access`, which is exactly what that flag sets, so every
+    /// runner that takes those two values takes this.
+    case bypass
+
+    /// What a task gets until the user picks otherwise.
+    static let `default` = RelayCodexApprovalPolicy.bypass
 
     var id: String { rawValue }
+
+    /// The `approvalPolicy` relayd receives.
+    var apiValue: String {
+        self == .bypass ? RelayCodexApprovalPolicy.never.rawValue : rawValue
+    }
+
+    /// The sandbox a job actually gets. Bypass overrides the File access
+    /// choice without forgetting it, so leaving bypass gives it back.
+    func effectiveSandbox(_ chosen: RelayCodexSandbox) -> RelayCodexSandbox {
+        self == .bypass ? .fullAccess : chosen
+    }
+
     var label: String {
         switch self {
         case .onRequest: return "Ask when needed"
         case .untrusted: return "Ask for untrusted commands"
         case .never: return "Never ask"
+        case .bypass: return "Bypass permissions"
         }
     }
     var detail: String {
@@ -837,6 +870,7 @@ enum RelayCodexApprovalPolicy: String, CaseIterable, Identifiable, Codable {
         case .onRequest: return "Codex decides when an exact command or file change needs your approval."
         case .untrusted: return "Known-safe reads can run; other commands pause for approval."
         case .never: return "Codex cannot ask. Operations outside the workspace sandbox are rejected."
+        case .bypass: return "Never ask and no sandbox. Codex runs every command without stopping."
         }
     }
 }

@@ -629,14 +629,20 @@ final class RelayComposerTests: XCTestCase {
         try render(modelSheet(thread: .claude), size: sheet, to: output, name: "sheet-model-thread")
         try render(modelSheet(thread: .claude, page: .effort), size: sheet, to: output, name: "sheet-effort")
 
-        func addSheet(_ page: RelayAddSheetPage, provider: CodexProvider, sandbox: RelayCodexSandbox = .workspace) -> some View {
+        func addSheet(
+            _ page: RelayAddSheetPage,
+            provider: CodexProvider,
+            sandbox: RelayCodexSandbox = .workspace,
+            claudeMode: RelayClaudePermissionMode = .acceptEdits,
+            codexApproval: RelayCodexApprovalPolicy = .onRequest
+        ) -> some View {
             RelayAddSheet(
                 startPage: page,
                 provider: provider,
                 cameraAvailable: true,
                 attachDisabled: false,
-                claudePermissionMode: .acceptEdits,
-                codexApprovalPolicy: .onRequest,
+                claudePermissionMode: claudeMode,
+                codexApprovalPolicy: codexApproval,
                 codexSandbox: sandbox,
                 skills: skills,
                 selectedSkillIDs: ["s1"],
@@ -654,6 +660,10 @@ final class RelayComposerTests: XCTestCase {
         try render(addSheet(.permissions, provider: .claude), size: sheet, to: output, name: "sheet-permissions")
         try render(addSheet(.fileAccess, provider: .codex, sandbox: .fullAccess), size: sheet, to: output, name: "sheet-file-access-unsandboxed")
         try render(addSheet(.approvals, provider: .codex), size: sheet, to: output, name: "sheet-approvals")
+        try render(addSheet(.permissions, provider: .claude, claudeMode: .bypassPermissions), size: sheet, to: output, name: "sheet-permissions-bypass")
+        try render(addSheet(.approvals, provider: .codex, codexApproval: .bypass), size: sheet, to: output, name: "sheet-approvals-bypass")
+        try render(addSheet(.fileAccess, provider: .codex, codexApproval: .bypass), size: sheet, to: output, name: "sheet-file-access-bypass")
+        try render(addSheet(.root, provider: .codex, codexApproval: .bypass), size: sheet, to: output, name: "sheet-add-codex-bypass")
         try render(addSheet(.skills, provider: .claude), size: sheet, to: output, name: "sheet-skills")
 
         // The same sheets really presented, to check the fitted detent, the drag

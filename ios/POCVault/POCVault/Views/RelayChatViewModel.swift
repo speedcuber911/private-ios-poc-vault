@@ -615,9 +615,25 @@ final class RelayChatViewModel: ObservableObject {
     nonisolated static let streamRetryAfterGivingUp: TimeInterval = 30
 
     private static let liveTailCharacterCap = 12_000
-    private static let claudePermissionDefaultsKey = "relay.claude.permissionMode"
-    private static let codexApprovalDefaultsKey = "relay.codex.approvalPolicy"
+    // v2: bypass became the default. The new keys put every phone on it once;
+    // after that the user's own pick is remembered as before.
+    private static let claudePermissionDefaultsKey = "relay.claude.permissionMode.v2"
+    private static let codexApprovalDefaultsKey = "relay.codex.approvalPolicy.v2"
     private static let codexSandboxDefaultsKey = "relay.codex.sandbox"
+
+    /// The permissions a new task starts with: the user's last pick, else the
+    /// default. The Watch has no picker, so it sends these too.
+    static func savedClaudePermissionMode(_ defaults: UserDefaults = .standard) -> RelayClaudePermissionMode {
+        RelayClaudePermissionMode(rawValue: defaults.string(forKey: claudePermissionDefaultsKey) ?? "") ?? .default
+    }
+
+    static func savedCodexApprovalPolicy(_ defaults: UserDefaults = .standard) -> RelayCodexApprovalPolicy {
+        RelayCodexApprovalPolicy(rawValue: defaults.string(forKey: codexApprovalDefaultsKey) ?? "") ?? .default
+    }
+
+    static func savedCodexSandbox(_ defaults: UserDefaults = .standard) -> RelayCodexSandbox {
+        RelayCodexSandbox(rawValue: defaults.string(forKey: codexSandboxDefaultsKey) ?? "") ?? .default
+    }
     /// Matches relayd's default `CODEX_MAX_TIMEOUT_MS`. Approvals already pause
     /// this clock; the cap is only for a run that never finishes on its own.
     static let taskTimeoutMs = 4 * 60 * 60 * 1000
@@ -697,14 +713,9 @@ final class RelayChatViewModel: ObservableObject {
         }
         self.workspaceID = workspaceID?.trimmedNonEmpty
         self.workspacePath = workspacePath?.trimmedNonEmpty
-        let savedClaudeMode = UserDefaults.standard.string(forKey: Self.claudePermissionDefaultsKey)
-        self.claudePermissionMode = RelayClaudePermissionMode(rawValue: savedClaudeMode ?? "") ?? .manual
-        self.codexApprovalPolicy = RelayCodexApprovalPolicy(
-            rawValue: UserDefaults.standard.string(forKey: Self.codexApprovalDefaultsKey) ?? ""
-        ) ?? .onRequest
-        self.codexSandbox = RelayCodexSandbox(
-            rawValue: UserDefaults.standard.string(forKey: Self.codexSandboxDefaultsKey) ?? ""
-        ) ?? .default
+        self.claudePermissionMode = Self.savedClaudePermissionMode()
+        self.codexApprovalPolicy = Self.savedCodexApprovalPolicy()
+        self.codexSandbox = Self.savedCodexSandbox()
         foregroundObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.willEnterForegroundNotification,
             object: nil,
@@ -839,6 +850,22 @@ final class RelayChatViewModel: ObservableObject {
         selectionRevision = UUID()
         selectedEffort = effort
         rememberSelectedEffort()
+    }
+
+    /// Whether a runner takes a Claude permission mode. relayd has accepted
+    /// `bypassPermissions` since it first took Claude modes at all, but only
+    /// lists it from 2026-11, so a runner that lists any mode takes bypass too.
+    nonisolated static func runnerAccepts(_ mode: RelayClaudePermissionMode, listed: [String]) -> Bool {
+        listed.contains(mode.rawValue) || (mode == .bypassPermissions && !listed.isEmpty)
+    }
+
+    /// File access is the sandbox half of Codex's bypass. Narrowing it while
+    /// bypass is on gives the sandbox back and keeps the "never ask" half.
+    func selectCodexSandbox(_ level: RelayCodexSandbox) {
+        codexSandbox = level
+        if codexApprovalPolicy == .bypass, level != .fullAccess {
+            codexApprovalPolicy = .never
+        }
     }
 
     private func effortDefaultsKey(for choice: RelayModelChoice) -> String? {
@@ -1597,8 +1624,8 @@ final class RelayChatViewModel: ObservableObject {
                 reasoningEffort: effectiveEffort?.rawValue,
                 provider: provider,
                 permissionMode: provider == .claude ? claudePermissionMode.apiValue : nil,
-                approvalPolicy: provider == .codex ? codexApprovalPolicy.rawValue : nil,
-                sandbox: provider == .codex ? codexSandbox.rawValue : nil,
+                approvalPolicy: provider == .codex ? codexApprovalPolicy.apiValue : nil,
+                sandbox: provider == .codex ? codexApprovalPolicy.effectiveSandbox(codexSandbox).rawValue : nil,
                 skills: Array(selectedSkillIDsByProvider[provider] ?? []).sorted(),
                 attachments: outgoingAttachments.map(\.jobAttachment),
                 resumeSessionId: resumeID
@@ -1653,10 +1680,10 @@ final class RelayChatViewModel: ObservableObject {
         if effectiveEffort != nil, !controls.reasoningEffort {
             return "This \(provider.displayName) runner does not support effort selection."
         }
-        if provider == .claude, !controls.permissionModes.contains(claudePermissionMode.rawValue) {
+        if provider == .claude, !Self.runnerAccepts(claudePermissionMode, listed: controls.permissionModes) {
             return "This Claude Code runner does not support the selected permission mode."
         }
-        if provider == .codex, !controls.approvalPolicies.contains(codexApprovalPolicy.rawValue) {
+        if provider == .codex, !controls.approvalPolicies.contains(codexApprovalPolicy.apiValue) {
             return "This Codex runner does not support the selected approval policy."
         }
         return nil

@@ -998,12 +998,83 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(fileAccess.contains("onPickCodexSandbox(level)"))
         XCTAssertTrue(fileAccess.contains("detail: level.detail"))
         // Full access states its consequence where it is chosen, as a warning.
-        XCTAssertTrue(fileAccess.contains("codexSandbox.isUnsandboxed"))
+        XCTAssertTrue(fileAccess.contains("effectiveSandbox.isUnsandboxed"))
         XCTAssertTrue(fileAccess.contains("Codex will not be stopped from changing anything on this machine"))
-        XCTAssertTrue(fileAccess.contains(".foregroundStyle(AppTheme.statusWarn)"))
+        XCTAssertTrue(fileAccess.contains("consequence("))
+        let consequence = try sourceSnippet(
+            in: sheets,
+            from: "private func consequence(",
+            to: "// MARK: Skills"
+        )
+        XCTAssertTrue(consequence.contains(".foregroundStyle(AppTheme.statusWarn)"))
 
         XCTAssertTrue(model.contains("relay.codex.sandbox"))
-        XCTAssertTrue(model.contains("sandbox: provider == .codex ? codexSandbox.rawValue : nil"))
+        XCTAssertTrue(model.contains("sandbox: provider == .codex ? codexApprovalPolicy.effectiveSandbox(codexSandbox).rawValue : nil"))
+    }
+
+    func testCodexBypassTravelsAsNeverAskWithNoSandbox() throws {
+        // Offered last, beside the policies it is made of.
+        XCTAssertEqual(RelayCodexApprovalPolicy.allCases.last, .bypass)
+        XCTAssertEqual(RelayCodexApprovalPolicy.bypass.label, "Bypass permissions")
+
+        // Exactly what `--dangerously-bypass-approvals-and-sandbox` sets, so any
+        // runner advertising `never` takes it.
+        XCTAssertEqual(RelayCodexApprovalPolicy.bypass.apiValue, "never")
+        for chosen in RelayCodexSandbox.allCases {
+            XCTAssertEqual(RelayCodexApprovalPolicy.bypass.effectiveSandbox(chosen), .fullAccess)
+        }
+        // Every other policy sends itself and leaves File access alone.
+        for policy in RelayCodexApprovalPolicy.allCases where policy != .bypass {
+            XCTAssertEqual(policy.apiValue, policy.rawValue)
+            for chosen in RelayCodexSandbox.allCases {
+                XCTAssertEqual(policy.effectiveSandbox(chosen), chosen)
+            }
+        }
+
+        let model = try AppSourceFixture.load("POCVault/Views/RelayChatViewModel.swift")
+        let sheets = try AppSourceFixture.load("POCVault/Views/RelayComposerSheets.swift")
+        XCTAssertTrue(model.contains("approvalPolicy: provider == .codex ? codexApprovalPolicy.apiValue : nil"))
+        XCTAssertTrue(model.contains("controls.approvalPolicies.contains(codexApprovalPolicy.apiValue)"))
+        let approvals = try sourceSnippet(
+            in: sheets,
+            from: "private var approvalsPage: some View",
+            to: "private func consequence("
+        )
+        XCTAssertTrue(approvals.contains("codexApprovalPolicy == .bypass"))
+        XCTAssertTrue(approvals.contains("Codex will not stop to ask"))
+    }
+
+    @MainActor
+    func testNarrowingFileAccessEndsCodexBypassButKeepsNeverAsk() throws {
+        let keys = ["relay.codex.approvalPolicy.v2", "relay.codex.sandbox"]
+        let saved = keys.map { UserDefaults.standard.object(forKey: $0) }
+        defer {
+            for (key, value) in zip(keys, saved) {
+                UserDefaults.standard.set(value, forKey: key)
+            }
+        }
+        let suiteName = "relay-codex-bypass-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let client = CodexClient(
+            baseURL: try XCTUnwrap(URL(string: "http://127.0.0.1:8787")),
+            identityStore: ClientIdentityStore(defaults: defaults)
+        )
+        let viewModel = RelayChatViewModel(client: client, workspaceID: nil, workspacePath: nil)
+
+        viewModel.codexSandbox = .workspace
+        viewModel.codexApprovalPolicy = .bypass
+        // Choosing full access again changes nothing.
+        viewModel.selectCodexSandbox(.fullAccess)
+        XCTAssertEqual(viewModel.codexApprovalPolicy, .bypass)
+        // A narrower level gives the sandbox back and keeps Never ask.
+        viewModel.selectCodexSandbox(.workspace)
+        XCTAssertEqual(viewModel.codexApprovalPolicy, .never)
+        XCTAssertEqual(viewModel.codexSandbox, .workspace)
+        // Outside bypass, File access never touches the approval policy.
+        viewModel.codexApprovalPolicy = .onRequest
+        viewModel.selectCodexSandbox(.readOnly)
+        XCTAssertEqual(viewModel.codexApprovalPolicy, .onRequest)
     }
 
     func testChatAnswersApprovalsForItsOwnJobsAndRestoresOnFailure() throws {
@@ -2545,6 +2616,68 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(RelayClaudePermissionMode.acceptEdits.apiValue, "acceptEdits")
         XCTAssertEqual(RelayClaudePermissionMode.dontAsk.apiValue, "dontAsk")
         XCTAssertEqual(RelayClaudePermissionMode.auto.apiValue, "auto")
+        XCTAssertEqual(RelayClaudePermissionMode.bypassPermissions.apiValue, "bypassPermissions")
+    }
+
+    @MainActor
+    func testNewTasksDefaultToBypassPermissionsOnPhoneAndWatch() throws {
+        XCTAssertEqual(RelayClaudePermissionMode.default, .bypassPermissions)
+        XCTAssertEqual(RelayCodexApprovalPolicy.default, .bypass)
+
+        // Nothing picked yet: bypass for both, and Codex runs unsandboxed.
+        let suiteName = "relay-bypass-default-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        XCTAssertEqual(RelayChatViewModel.savedClaudePermissionMode(defaults), .bypassPermissions)
+        XCTAssertEqual(RelayChatViewModel.savedCodexApprovalPolicy(defaults), .bypass)
+        XCTAssertEqual(
+            RelayChatViewModel.savedCodexApprovalPolicy(defaults)
+                .effectiveSandbox(RelayChatViewModel.savedCodexSandbox(defaults)),
+            .fullAccess
+        )
+
+        // A pick is still remembered, under keys new to this default so that
+        // a choice saved before it does not hold a phone off bypass.
+        defaults.set("plan", forKey: "relay.claude.permissionMode.v2")
+        defaults.set("on-request", forKey: "relay.codex.approvalPolicy.v2")
+        XCTAssertEqual(RelayChatViewModel.savedClaudePermissionMode(defaults), .plan)
+        XCTAssertEqual(RelayChatViewModel.savedCodexApprovalPolicy(defaults), .onRequest)
+        defaults.set("manual", forKey: "relay.claude.permissionMode")
+        defaults.removeObject(forKey: "relay.claude.permissionMode.v2")
+        XCTAssertEqual(RelayChatViewModel.savedClaudePermissionMode(defaults), .bypassPermissions)
+
+        // The Watch sends the same choices instead of its own fixed ones.
+        let bridge = try AppSourceFixture.load("POCVault/Watch/RelayWatchBridge.swift")
+        XCTAssertTrue(bridge.contains("permissionMode: model.provider == .claude ? claudeMode.apiValue : nil"))
+        XCTAssertTrue(bridge.contains("approvalPolicy: model.provider == .codex ? codexApproval.apiValue : nil"))
+        XCTAssertFalse(bridge.contains("\"manual\""))
+        XCTAssertFalse(bridge.contains("\"workspace-write\""))
+    }
+
+    func testClaudeBypassReachesRunnersThatTakeItBeforeListingIt() {
+        let before = ["manual", "acceptEdits", "plan", "dontAsk", "auto"]
+        XCTAssertTrue(RelayChatViewModel.runnerAccepts(.bypassPermissions, listed: before))
+        XCTAssertTrue(RelayChatViewModel.runnerAccepts(.bypassPermissions, listed: before + ["bypassPermissions"]))
+        XCTAssertTrue(RelayChatViewModel.runnerAccepts(.plan, listed: before))
+        // A runner with no Claude modes at all is still refused.
+        XCTAssertFalse(RelayChatViewModel.runnerAccepts(.bypassPermissions, listed: []))
+        XCTAssertFalse(RelayChatViewModel.runnerAccepts(.plan, listed: ["manual"]))
+    }
+
+    func testClaudeBypassIsOfferedLastAndStatesItsConsequence() throws {
+        XCTAssertEqual(RelayClaudePermissionMode.allCases.last, .bypassPermissions)
+        XCTAssertEqual(RelayClaudePermissionMode.bypassPermissions.label, "Bypass permissions")
+        XCTAssertTrue(RelayClaudePermissionMode.bypassPermissions.isBypass)
+        XCTAssertEqual(RelayClaudePermissionMode.allCases.filter(\.isBypass), [.bypassPermissions])
+
+        let sheets = try AppSourceFixture.load("POCVault/Views/RelayComposerSheets.swift")
+        let permissions = try sourceSnippet(
+            in: sheets,
+            from: "private var permissionsPage: some View",
+            to: "private var fileAccessPage: some View"
+        )
+        XCTAssertTrue(permissions.contains("claudePermissionMode.isBypass"))
+        XCTAssertTrue(permissions.contains("Claude Code will not stop to ask"))
     }
 
     func testCodexCreateJobRequestEncodesProviderSpecificApprovalPolicy() throws {

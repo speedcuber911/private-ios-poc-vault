@@ -255,13 +255,18 @@ final class RelayWatchBridge: NSObject, WCSessionDelegate {
                 guard let model = models.first(where: { $0.id == command.modelID }), let folder = command.workspaceID else {
                     throw RelayWatchError("Refresh your model and folder choices.")
                 }
+                // The phone's own permission choices, so a run started here
+                // behaves like one started on iPhone.
+                let claudeMode = RelayChatViewModel.savedClaudePermissionMode()
+                let codexApproval = RelayChatViewModel.savedCodexApprovalPolicy()
+                let codexSandbox = codexApproval.effectiveSandbox(RelayChatViewModel.savedCodexSandbox())
                 let created = try await client.createJob(CodexCreateJobRequest(
                     workspaceId: folder, prompt: (command.prompt ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
                     timeoutMs: nil, model: RelayChatViewModel.taskModelParameter(for: model),
                     reasoningEffort: command.effort, provider: model.provider,
-                    permissionMode: model.provider == .claude ? "manual" : nil,
-                    approvalPolicy: model.provider == .codex ? "on-request" : nil,
-                    sandbox: model.provider == .codex ? "workspace-write" : nil,
+                    permissionMode: model.provider == .claude ? claudeMode.apiValue : nil,
+                    approvalPolicy: model.provider == .codex ? codexApproval.apiValue : nil,
+                    sandbox: model.provider == .codex ? codexSandbox.rawValue : nil,
                     resumeSessionId: command.sessionID
                 ), expectedBaseURL: requestBaseURL)
                 reply.jobID = created.id

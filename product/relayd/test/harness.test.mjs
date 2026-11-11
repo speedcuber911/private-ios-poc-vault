@@ -120,7 +120,7 @@ test("GET /v1/harness detects installed CLIs with versions and capability flags"
     assert.equal(byProvider.claude.version, "fake-claude 1.2.3");
     assert.equal(byProvider.claude.loggedIn, true);
     assert.equal(byProvider.claude.supportsApprovals, true);
-    assert.deepEqual(byProvider.claude.taskControls.permissionModes, ["manual", "acceptEdits", "plan", "dontAsk", "auto"]);
+    assert.deepEqual(byProvider.claude.taskControls.permissionModes, ["manual", "acceptEdits", "plan", "dontAsk", "auto", "bypassPermissions"]);
     // Cursor is retired: relayd no longer reports it at all.
     assert.equal(byProvider.cursor, undefined);
     assert.equal(byProvider.kimi.installed, false);

@@ -874,6 +874,9 @@ struct RelayAddSheet: View {
 
     private var rows: [RelayAddSheetPage] { RelayComposerLogic.addRows(for: provider) }
 
+    /// What a Codex job will really get: bypass overrides the File access choice.
+    private var effectiveSandbox: RelayCodexSandbox { codexApprovalPolicy.effectiveSandbox(codexSandbox) }
+
     var body: some View {
         RelayFittedSheet(expands: page == .skills) {
             ZStack(alignment: .top) {
@@ -969,7 +972,7 @@ struct RelayAddSheet: View {
             RelaySheetValueRow(
                 systemImage: "folder",
                 title: "File access",
-                value: codexSandbox.label
+                value: effectiveSandbox.label
             ) { go(to: .fileAccess) }
             .accessibilityIdentifier("relay-permission-chip")
         case .approvals:
@@ -1015,6 +1018,14 @@ struct RelayAddSheet: View {
                 }
             }
             .padding(.top, 2)
+
+            // Bypass states its consequence where it is chosen.
+            if claudePermissionMode.isBypass {
+                consequence(
+                    "Claude Code will not stop to ask before running commands or changing files, including outside your work.",
+                    id: "relay-claude-bypass-consequence"
+                )
+            }
         }
     }
 
@@ -1025,7 +1036,7 @@ struct RelayAddSheet: View {
                     RelaySheetChoiceRow(
                         title: level.label,
                         detail: level.detail,
-                        selected: level == codexSandbox
+                        selected: level == effectiveSandbox
                     ) { onPickCodexSandbox(level) }
                     if level != RelayCodexSandbox.allCases.last {
                         RelaySheetDivider()
@@ -1035,14 +1046,16 @@ struct RelayAddSheet: View {
             .padding(.top, 2)
 
             // Full access states its consequence where it is chosen.
-            if codexSandbox.isUnsandboxed {
-                Text("Codex will not be stopped from changing anything on this machine, including files outside your work.")
-                    .font(AppTheme.uiFont(size: 13))
-                    .foregroundStyle(AppTheme.statusWarn)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, 32)
-                    .padding(.top, 12)
-                    .accessibilityIdentifier("relay-sandbox-consequence")
+            if codexApprovalPolicy == .bypass {
+                consequence(
+                    "Bypass permissions is on, so there is no sandbox. Choosing a narrower level keeps Never ask.",
+                    id: "relay-sandbox-consequence"
+                )
+            } else if effectiveSandbox.isUnsandboxed {
+                consequence(
+                    "Codex will not be stopped from changing anything on this machine, including files outside your work.",
+                    id: "relay-sandbox-consequence"
+                )
             }
         }
     }
@@ -1062,7 +1075,25 @@ struct RelayAddSheet: View {
                 }
             }
             .padding(.top, 2)
+
+            if codexApprovalPolicy == .bypass {
+                consequence(
+                    "Codex will not stop to ask, and nothing on this machine is off limits, including files outside your work.",
+                    id: "relay-codex-bypass-consequence"
+                )
+            }
         }
+    }
+
+    /// A grant's plain consequence, under the choice that made it.
+    private func consequence(_ text: String, id: String) -> some View {
+        Text(text)
+            .font(AppTheme.uiFont(size: 13))
+            .foregroundStyle(AppTheme.statusWarn)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 32)
+            .padding(.top, 12)
+            .accessibilityIdentifier(id)
     }
 
     // MARK: Skills

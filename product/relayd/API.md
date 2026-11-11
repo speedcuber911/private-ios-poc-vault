@@ -11,7 +11,12 @@ routes as the job's logs.
   metadata for real global and workspace skills/commands discovered on that runner.
 - Codex jobs accept `approvalPolicy` (`on-request`, `untrusted`, or `never`). Claude
   jobs accept `permissionMode` (`manual`, legacy alias `default`, `acceptEdits`, `plan`,
-  `dontAsk`, or `auto`). Current runners normalize `default` to `manual`.
+  `dontAsk`, `auto`, or `bypassPermissions`). Current runners normalize `default` to
+  `manual`.
+- Bypass permissions: Claude's is `permissionMode: "bypassPermissions"`, passed to the
+  CLI as `--permission-mode bypassPermissions`. Codex's is `approvalPolicy: "never"`
+  with `sandbox: "danger-full-access"`, which is exactly what
+  `--dangerously-bypass-approvals-and-sandbox` sets.
 - Codex and Claude jobs accept catalog-advertised `model` and `reasoningEffort` values.
   Relay rejects provider/model/control mismatches instead of silently dropping fields;
   Claude effort is passed as `--effort` only when the installed CLI advertises it,
@@ -1404,7 +1409,7 @@ capability flags (the catalog honesty rules extended):
   "supportsApprovals": true, "supportsResume": true, "supportsChat": false,
   "taskControls": {
     "model": true, "reasoningEffort": true,
-    "permissionModes": ["manual", "acceptEdits", "plan", "dontAsk", "auto"],
+    "permissionModes": ["manual", "acceptEdits", "plan", "dontAsk", "auto", "bypassPermissions"],
     "approvalPolicies": []
   },
   "lastSmoke": {"status": "succeeded", "finishedAt": "…Z", "jobId": "<uuid>"}  // or null
