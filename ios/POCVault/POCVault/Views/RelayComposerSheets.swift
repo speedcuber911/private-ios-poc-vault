@@ -398,8 +398,8 @@ struct RelayFittedSheet<Content: View>: View {
     }
 }
 
-/// Close or back circle on the leading side, serif title centred.
-struct RelaySheetHeader: View {
+/// Close or back circle on the leading side, title centred.
+struct RelayComposerSheetHeader: View {
     enum Leading {
         case close
         case back(to: String)
@@ -612,7 +612,7 @@ struct RelayModelSheet: View {
 
     private var modelPage: some View {
         VStack(alignment: .leading, spacing: 0) {
-            RelaySheetHeader(title: "Model", leading: .close, action: onClose)
+            RelayComposerSheetHeader(title: "Model", leading: .close, action: onClose)
 
             if threadProvider == nil {
                 agentPills
@@ -791,7 +791,7 @@ struct RelayModelSheet: View {
 
     private var effortPage: some View {
         VStack(alignment: .leading, spacing: 0) {
-            RelaySheetHeader(title: "Effort", leading: .back(to: "Model")) {
+            RelayComposerSheetHeader(title: "Effort", leading: .back(to: "Model")) {
                 withAnimation(.easeOut(duration: 0.22)) { shownPage = .model }
             }
             RelaySheetGroup {
@@ -906,7 +906,7 @@ struct RelayAddSheet: View {
 
     private var rootPage: some View {
         VStack(alignment: .leading, spacing: 0) {
-            RelaySheetHeader(title: "Add", leading: .close, action: onClose)
+            RelayComposerSheetHeader(title: "Add", leading: .close, action: onClose)
 
             HStack(spacing: 8) {
                 if cameraAvailable {
@@ -998,7 +998,7 @@ struct RelayAddSheet: View {
 
     private func subpage<Rows: View>(_ title: String, @ViewBuilder rows: () -> Rows) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            RelaySheetHeader(title: title, leading: .back(to: "Add")) { go(to: .root) }
+            RelayComposerSheetHeader(title: title, leading: .back(to: "Add")) { go(to: .root) }
             rows()
         }
     }

@@ -80,6 +80,18 @@
 		200000000000000000000092 /* RelayTranscriptViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000092 /* RelayTranscriptViews.swift */; };
 		200000000000000000000093 /* RelayActivitySheets.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000093 /* RelayActivitySheets.swift */; };
 		200000000000000000000096 /* RelaySubagentsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000096 /* RelaySubagentsView.swift */; };
+		200000000000000000000101 /* RelayTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000101 /* RelayTheme.swift */; };
+		200000000000000000000102 /* RelayPrimitives.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000102 /* RelayPrimitives.swift */; };
+		200000000000000000000103 /* RelayVT100Engine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000103 /* RelayVT100Engine.swift */; };
+		200000000000000000000104 /* RelayGitModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000104 /* RelayGitModels.swift */; };
+		200000000000000000000105 /* RelayWorkspaceStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000105 /* RelayWorkspaceStore.swift */; };
+		200000000000000000000106 /* RelaySyntaxHighlighter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000106 /* RelaySyntaxHighlighter.swift */; };
+		200000000000000000000107 /* RelayGitDiffView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000107 /* RelayGitDiffView.swift */; };
+		200000000000000000000108 /* RelayExplorerDrawerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000108 /* RelayExplorerDrawerView.swift */; };
+		200000000000000000000109 /* RelayMobilePanelsContainer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000109 /* RelayMobilePanelsContainer.swift */; };
+		20000000000000000000010A /* RelayWorkspacesSidebar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000010A /* RelayWorkspacesSidebar.swift */; };
+		20000000000000000000010B /* RelayWorkspaceHeader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000010B /* RelayWorkspaceHeader.swift */; };
+		20000000000000000000010C /* RelayPacedText.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000010C /* RelayPacedText.swift */; };
 		200000000000000000000094 /* RelayComposerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000094 /* RelayComposerTests.swift */; };
 		200000000000000000000095 /* RelayTranscriptTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000095 /* RelayTranscriptTests.swift */; };
 		A3ABC87830FA1576A2B26390 /* RelayWatchApp.swift in Watch Sources */ = {
@@ -215,6 +227,18 @@
 		100000000000000000000092 /* RelayTranscriptViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayTranscriptViews.swift; sourceTree = "<group>"; };
 		100000000000000000000093 /* RelayActivitySheets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayActivitySheets.swift; sourceTree = "<group>"; };
 		100000000000000000000096 /* RelaySubagentsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelaySubagentsView.swift; sourceTree = "<group>"; };
+		100000000000000000000101 /* RelayTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayTheme.swift; sourceTree = "<group>"; };
+		100000000000000000000102 /* RelayPrimitives.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayPrimitives.swift; sourceTree = "<group>"; };
+		100000000000000000000103 /* RelayVT100Engine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayVT100Engine.swift; sourceTree = "<group>"; };
+		100000000000000000000104 /* RelayGitModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayGitModels.swift; sourceTree = "<group>"; };
+		100000000000000000000105 /* RelayWorkspaceStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayWorkspaceStore.swift; sourceTree = "<group>"; };
+		100000000000000000000106 /* RelaySyntaxHighlighter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelaySyntaxHighlighter.swift; sourceTree = "<group>"; };
+		100000000000000000000107 /* RelayGitDiffView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayGitDiffView.swift; sourceTree = "<group>"; };
+		100000000000000000000108 /* RelayExplorerDrawerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayExplorerDrawerView.swift; sourceTree = "<group>"; };
+		100000000000000000000109 /* RelayMobilePanelsContainer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayMobilePanelsContainer.swift; sourceTree = "<group>"; };
+		10000000000000000000010A /* RelayWorkspacesSidebar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayWorkspacesSidebar.swift; sourceTree = "<group>"; };
+		10000000000000000000010B /* RelayWorkspaceHeader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayWorkspaceHeader.swift; sourceTree = "<group>"; };
+		10000000000000000000010C /* RelayPacedText.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayPacedText.swift; sourceTree = "<group>"; };
 		100000000000000000000094 /* RelayComposerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayComposerTests.swift; sourceTree = "<group>"; };
 		100000000000000000000095 /* RelayTranscriptTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayTranscriptTests.swift; sourceTree = "<group>"; };
 		34BCC44A496F5B805169396D /* RelayWatchApp.swift */ = {
@@ -300,6 +324,8 @@
 				500000000000000000000011 /* Services */,
 				500000000000000000000012 /* Audio */,
 				500000000000000000000013 /* Browser */,
+				500000000000000000000014 /* Theme */,
+				500000000000000000000015 /* Terminal */,
 				100000000000000000000015 /* Resources/AppIcon/AppIcon60x60@2x.png */,
 				100000000000000000000016 /* Resources/AppIcon/AppIcon60x60@3x.png */,
 				100000000000000000000017 /* Resources/AppIcon/AppIcon1024.png */,
@@ -353,6 +379,8 @@
 				100000000000000000000080 /* RelayMachineStats.swift */,
 				1000000000000000000000C1 /* RelayChatsFeedSnapshot.swift */,
 				100000000000000000000091 /* RelayTranscript.swift */,
+				100000000000000000000104 /* RelayGitModels.swift */,
+				100000000000000000000105 /* RelayWorkspaceStore.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -414,6 +442,12 @@
 				100000000000000000000092 /* RelayTranscriptViews.swift */,
 				100000000000000000000093 /* RelayActivitySheets.swift */,
 				100000000000000000000096 /* RelaySubagentsView.swift */,
+				100000000000000000000107 /* RelayGitDiffView.swift */,
+				100000000000000000000108 /* RelayExplorerDrawerView.swift */,
+				100000000000000000000109 /* RelayMobilePanelsContainer.swift */,
+				10000000000000000000010A /* RelayWorkspacesSidebar.swift */,
+				10000000000000000000010B /* RelayWorkspaceHeader.swift */,
+				10000000000000000000010C /* RelayPacedText.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -423,6 +457,7 @@
 			children = (
 				100000000000000000000027 /* CodexMarkdown.swift */,
 				100000000000000000000034 /* RelayMarkdownViews.swift */,
+				100000000000000000000106 /* RelaySyntaxHighlighter.swift */,
 			);
 			path = Rendering;
 			sourceTree = "<group>";
@@ -455,6 +490,23 @@
 				100000000000000000000033 /* FileViewerView.swift */,
 			);
 			path = Browser;
+			sourceTree = "<group>";
+		};
+		500000000000000000000014 /* Theme */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000101 /* RelayTheme.swift */,
+				100000000000000000000102 /* RelayPrimitives.swift */,
+			);
+			path = Theme;
+			sourceTree = "<group>";
+		};
+		500000000000000000000015 /* Terminal */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000103 /* RelayVT100Engine.swift */,
+			);
+			path = Terminal;
 			sourceTree = "<group>";
 		};
 		39A4D727DA13A70138747D13 /* RelayWatch */ = {
@@ -684,6 +736,18 @@
 				200000000000000000000092 /* RelayTranscriptViews.swift in Sources */,
 				200000000000000000000093 /* RelayActivitySheets.swift in Sources */,
 				200000000000000000000096 /* RelaySubagentsView.swift in Sources */,
+				200000000000000000000101 /* RelayTheme.swift in Sources */,
+				200000000000000000000102 /* RelayPrimitives.swift in Sources */,
+				200000000000000000000103 /* RelayVT100Engine.swift in Sources */,
+				200000000000000000000104 /* RelayGitModels.swift in Sources */,
+				200000000000000000000105 /* RelayWorkspaceStore.swift in Sources */,
+				200000000000000000000106 /* RelaySyntaxHighlighter.swift in Sources */,
+				200000000000000000000107 /* RelayGitDiffView.swift in Sources */,
+				200000000000000000000108 /* RelayExplorerDrawerView.swift in Sources */,
+				200000000000000000000109 /* RelayMobilePanelsContainer.swift in Sources */,
+				20000000000000000000010A /* RelayWorkspacesSidebar.swift in Sources */,
+				20000000000000000000010B /* RelayWorkspaceHeader.swift in Sources */,
+				20000000000000000000010C /* RelayPacedText.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -1909,6 +1909,393 @@ final class CodexClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
     }
 }
 
+// MARK: - Paseo Git, Worktree, Terminal Resize & File Autocomplete
+
+extension CodexClient: RelayGitAPI {
+    /// Full repository status for Paseo's Git sheet and workspace sidebar
+    /// (`GET /v1/codex/git/status?path=...`).
+    ///
+    /// Marked `@_disfavoredOverload` so legacy callers of
+    /// `fetchGitStatus(path: String?) -> RelayGitStatus` (`/v1/codex/fs/git`)
+    /// continue compiling without ambiguity, while `RelayGitAPI` callers and
+    /// explicit `RelayGitStatusResponse` call sites resolve directly here.
+    @_disfavoredOverload
+    func fetchGitStatus(path: String) async throws -> RelayGitStatusResponse {
+        try await fetchRepoGitStatus(path: path, budget: nil)
+    }
+
+    func fetchGitDiff(
+        path: String,
+        mode: RelayGitDiffMode,
+        file: String?
+    ) async throws -> RelayGitDiffResponse {
+        var queryItems = [
+            URLQueryItem(name: "path", value: path),
+            URLQueryItem(name: "mode", value: mode.rawValue)
+        ]
+        if let file = file?.trimmedNonEmpty {
+            queryItems.append(URLQueryItem(name: "file", value: file))
+        }
+        let data = try await perform(
+            path: "/v1/codex/git/diff",
+            queryItems: queryItems,
+            cachePolicy: .reloadIgnoringLocalCacheData
+        )
+        guard !data.isEmpty else {
+            throw CodexClientError.emptyResponse
+        }
+        return try decoder.decode(RelayGitDiffResponse.self, from: data)
+    }
+
+    func fetchGitCommits(path: String, limit: Int) async throws -> RelayGitCommitsResponse {
+        let clampedLimit = max(1, min(200, limit))
+        let data = try await perform(
+            path: "/v1/codex/git/commits",
+            queryItems: [
+                URLQueryItem(name: "path", value: path),
+                URLQueryItem(name: "limit", value: String(clampedLimit))
+            ],
+            cachePolicy: .reloadIgnoringLocalCacheData
+        )
+        guard !data.isEmpty else {
+            throw CodexClientError.emptyResponse
+        }
+        return try decoder.decode(RelayGitCommitsResponse.self, from: data)
+    }
+
+    func fetchGitCommitDiff(path: String, sha: String) async throws -> RelayGitDiffResponse {
+        let data = try await perform(
+            path: "/v1/codex/git/commit-diff",
+            queryItems: [
+                URLQueryItem(name: "path", value: path),
+                URLQueryItem(name: "sha", value: sha)
+            ],
+            cachePolicy: .reloadIgnoringLocalCacheData
+        )
+        guard !data.isEmpty else {
+            throw CodexClientError.emptyResponse
+        }
+        return try decoder.decode(RelayGitDiffResponse.self, from: data)
+    }
+
+    func fetchGitBranches(path: String) async throws -> RelayGitBranchesResponse {
+        let data = try await perform(
+            path: "/v1/codex/git/branches",
+            queryItems: [URLQueryItem(name: "path", value: path)],
+            cachePolicy: .reloadIgnoringLocalCacheData
+        )
+        guard !data.isEmpty else {
+            throw CodexClientError.emptyResponse
+        }
+        return try decoder.decode(RelayGitBranchesResponse.self, from: data)
+    }
+
+    func checkoutGitBranch(path: String, branch: String, create: Bool) async throws {
+        let payload = RelayGitCheckoutRequest(path: path, branch: branch, create: create)
+        let body = try encoder.encode(payload)
+        _ = try await perform(
+            path: "/v1/codex/git/checkout",
+            method: "POST",
+            body: body,
+            cachePolicy: .reloadIgnoringLocalCacheData
+        )
+    }
+
+    func discardGitFiles(path: String, files: [String]) async throws {
+        let payload = RelayGitDiscardRequest(path: path, files: files)
+        let body = try encoder.encode(payload)
+        _ = try await perform(
+            path: "/v1/codex/git/discard",
+            method: "POST",
+            body: body,
+            cachePolicy: .reloadIgnoringLocalCacheData
+        )
+    }
+
+    func commitGitChanges(
+        path: String,
+        message: String,
+        stageAll: Bool,
+        push: Bool
+    ) async throws -> RelayGitCommitResult {
+        let payload = RelayGitCommitRequest(
+            path: path,
+            message: message,
+            stageAll: stageAll,
+            push: push
+        )
+        let body = try encoder.encode(payload)
+        let data = try await perform(
+            path: "/v1/codex/git/commit",
+            method: "POST",
+            body: body,
+            cachePolicy: .reloadIgnoringLocalCacheData,
+            timeout: push ? 65 : 45
+        )
+        guard !data.isEmpty else {
+            throw CodexClientError.emptyResponse
+        }
+        return try decoder.decode(RelayGitCommitResult.self, from: data)
+    }
+}
+
+extension CodexClient {
+    /// Convenience forwarding to `fetchCodexWorkspaces(budget:)` for workspace-store callers.
+    func fetchWorkspaces(budget: CodexRequestBudget? = nil) async throws -> [CodexWorkspace] {
+        try await fetchCodexWorkspaces(budget: budget)
+    }
+
+    /// Budgeted variant of `fetchWorkspaceDirectories` so sidebar refreshes never wake
+    /// a stopped machine or block on a 45-second default timeout.
+    func fetchWorkspaceDirectories(
+        path: String? = nil,
+        query: String? = nil,
+        budget: CodexRequestBudget
+    ) async throws -> CodexWorkspaceDirectoryListing {
+        var queryItems: [URLQueryItem] = []
+        if let path = path?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty {
+            queryItems.append(URLQueryItem(name: "path", value: path))
+        }
+        if let query = query?.trimmingCharacters(in: .whitespacesAndNewlines), !query.isEmpty {
+            queryItems.append(URLQueryItem(name: "q", value: query))
+        }
+
+        let data = try await perform(
+            path: "/v1/codex/workspace-dirs",
+            queryItems: queryItems,
+            cachePolicy: .reloadIgnoringLocalCacheData,
+            timeout: budget.timeout,
+            allowWake: budget.allowsMachineWake
+        )
+        return try decoder.decode(CodexWorkspaceDirectoryListing.self, from: data)
+    }
+
+    /// Unambiguous repository git status fetch (`GET /v1/codex/git/status?path=...`)
+    /// with optional request budget for background workspace refreshes.
+    func fetchRepoGitStatus(
+        path: String,
+        budget: CodexRequestBudget? = nil
+    ) async throws -> RelayGitStatusResponse {
+        let data = try await perform(
+            path: "/v1/codex/git/status",
+            queryItems: [URLQueryItem(name: "path", value: path)],
+            cachePolicy: .reloadIgnoringLocalCacheData,
+            timeout: budget?.timeout,
+            allowWake: budget?.allowsMachineWake ?? true
+        )
+        guard !data.isEmpty else {
+            throw CodexClientError.emptyResponse
+        }
+        return try decoder.decode(RelayGitStatusResponse.self, from: data)
+    }
+
+    /// Lists persistent git worktrees for a repository (`GET /v1/codex/worktrees?path=...`).
+    func fetchWorktrees(
+        path: String,
+        budget: CodexRequestBudget? = nil
+    ) async throws -> [RelayWorktreeDescriptor] {
+        let data = try await perform(
+            path: "/v1/codex/worktrees",
+            queryItems: [URLQueryItem(name: "path", value: path)],
+            cachePolicy: .reloadIgnoringLocalCacheData,
+            timeout: budget?.timeout,
+            allowWake: budget?.allowsMachineWake ?? true
+        )
+        guard !data.isEmpty else {
+            return []
+        }
+        return try decoder.decode(RelayWorktreesResponse.self, from: data).worktrees
+    }
+
+    /// Creates a managed git worktree (`POST /v1/codex/worktrees`).
+    func createWorktree(
+        projectPath: String,
+        name: String? = nil,
+        branch: String? = nil,
+        baseBranch: String? = nil,
+        action: String = "branch-off"
+    ) async throws -> RelayWorktreeDescriptor {
+        let payload = RelayCreateWorktreeRequest(
+            projectPath: projectPath,
+            name: name?.trimmedNonEmpty,
+            branch: branch?.trimmedNonEmpty,
+            baseBranch: baseBranch?.trimmedNonEmpty,
+            action: action.trimmedNonEmpty ?? "branch-off"
+        )
+        let body = try encoder.encode(payload)
+        let data = try await perform(
+            path: "/v1/codex/worktrees",
+            method: "POST",
+            body: body,
+            cachePolicy: .reloadIgnoringLocalCacheData,
+            timeout: 65
+        )
+        guard !data.isEmpty else {
+            throw CodexClientError.emptyResponse
+        }
+        if let wrapped = try? decoder.decode(RelayWorktreeCreateResponse.self, from: data) {
+            return wrapped.worktree
+        }
+        return try decoder.decode(RelayWorktreeDescriptor.self, from: data)
+    }
+
+    /// Removes a managed git worktree (`POST /v1/codex/worktrees/remove`).
+    func removeWorktree(path: String, force: Bool = false) async throws {
+        let payload = RelayRemoveWorktreeRequest(path: path, force: force)
+        let body = try encoder.encode(payload)
+        _ = try await perform(
+            path: "/v1/codex/worktrees/remove",
+            method: "POST",
+            body: body,
+            cachePolicy: .reloadIgnoringLocalCacheData,
+            timeout: 65
+        )
+    }
+
+    /// Resizes a live PTY terminal session (`POST /v1/codex/terminals/<id>/resize`).
+    func resizeTerminal(id: String, cols: Int, rows: Int) async throws {
+        let clampedCols = max(20, min(300, cols))
+        let clampedRows = max(8, min(120, rows))
+        let body = try JSONSerialization.data(withJSONObject: [
+            "cols": clampedCols,
+            "rows": clampedRows
+        ])
+        _ = try await perform(
+            path: "/v1/codex/terminals/\(Self.pathComponent(id))/resize",
+            method: "POST",
+            body: body,
+            cachePolicy: .reloadIgnoringLocalCacheData
+        )
+    }
+
+    /// Lightweight relative file list for `@files` composer autocomplete.
+    /// Uses `/v1/codex/fs/list`, never throws, and returns bounded relative file paths
+    /// (top-level files plus one level of visible subdirectories).
+    func fetchWorkspaceFilesForAutocomplete(folderPath: String) async -> [String] {
+        let trimmedFolder = folderPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let queryPath = trimmedFolder.isEmpty ? nil : trimmedFolder
+
+        guard let rootListing = try? await fetchDirectory(path: queryPath, offset: 0, limit: 200) else {
+            return []
+        }
+
+        let basePath = Self.normalizedAutocompletePathPrefix(rootListing.currentPath.trimmedNonEmpty ?? trimmedFolder)
+        var results: [String] = []
+        var seen: Set<String> = []
+        var candidateSubdirs: [CodexWorkspaceDirectoryEntry] = []
+
+        func appendRelative(_ candidate: String) {
+            let cleaned = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleaned.isEmpty, seen.insert(cleaned).inserted else { return }
+            results.append(cleaned)
+        }
+
+        func relativePath(for entry: CodexWorkspaceDirectoryEntry, fallbackPrefix: String?) -> String {
+            let entryPath = entry.path.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !basePath.isEmpty, entryPath.hasPrefix("\(basePath)/") {
+                return String(entryPath.dropFirst(basePath.count + 1))
+            }
+            if let fallbackPrefix, !fallbackPrefix.isEmpty {
+                return "\(fallbackPrefix)/\(entry.displayName)"
+            }
+            return entry.displayName
+        }
+
+        for entry in rootListing.entries {
+            if entry.isDirectory {
+                let name = entry.displayName
+                guard !entry.isHiddenFolder, !Self.autocompleteIgnoredDirectories.contains(name) else {
+                    continue
+                }
+                if candidateSubdirs.count < 8 {
+                    candidateSubdirs.append(entry)
+                }
+            } else if !entry.readDenied {
+                appendRelative(relativePath(for: entry, fallbackPrefix: nil))
+            }
+        }
+
+        if !candidateSubdirs.isEmpty && results.count < 180 {
+            let subListings = await withTaskGroup(of: (String, [CodexWorkspaceDirectoryEntry]).self) { group in
+                for dir in candidateSubdirs {
+                    let dirPath = dir.path
+                    let dirName = dir.displayName
+                    group.addTask {
+                        guard let listing = try? await self.fetchDirectory(path: dirPath, offset: 0, limit: 60) else {
+                            return (dirName, [])
+                        }
+                        return (dirName, listing.entries)
+                    }
+                }
+                var collected: [(String, [CodexWorkspaceDirectoryEntry])] = []
+                for await pair in group {
+                    collected.append(pair)
+                }
+                return collected
+            }
+
+            for (dirName, entries) in subListings.sorted(by: { $0.0.localizedCaseInsensitiveCompare($1.0) == .orderedAscending }) {
+                for entry in entries where !entry.isDirectory && !entry.readDenied {
+                    appendRelative(relativePath(for: entry, fallbackPrefix: dirName))
+                    if results.count >= 200 { break }
+                }
+                if results.count >= 200 { break }
+            }
+        }
+
+        return results.sorted { lhs, rhs in
+            let lhsDepth = lhs.filter { $0 == "/" }.count
+            let rhsDepth = rhs.filter { $0 == "/" }.count
+            if lhsDepth != rhsDepth { return lhsDepth < rhsDepth }
+            return lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
+        }
+    }
+
+    private static let autocompleteIgnoredDirectories: Set<String> = [
+        ".git", ".relay", "node_modules", ".build", "DerivedData",
+        "build", "dist", ".next", "target", "__pycache__", ".venv", "Pods"
+    ]
+
+    private static func normalizedAutocompletePathPrefix(_ path: String) -> String {
+        var trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        while trimmed.count > 1, trimmed.hasSuffix("/") {
+            trimmed.removeLast()
+        }
+        return trimmed
+    }
+}
+
+private struct RelayGitCheckoutRequest: Encodable {
+    let path: String
+    let branch: String
+    let create: Bool
+}
+
+private struct RelayGitDiscardRequest: Encodable {
+    let path: String
+    let files: [String]
+}
+
+private struct RelayGitCommitRequest: Encodable {
+    let path: String
+    let message: String
+    let stageAll: Bool
+    let push: Bool
+}
+
+private struct RelayCreateWorktreeRequest: Encodable {
+    let projectPath: String
+    let name: String?
+    let branch: String?
+    let baseBranch: String?
+    let action: String
+}
+
+private struct RelayRemoveWorktreeRequest: Encodable {
+    let path: String
+    let force: Bool
+}
+
 private extension CodexChatEvent {
     var isTerminalChatEvent: Bool {
         switch self {

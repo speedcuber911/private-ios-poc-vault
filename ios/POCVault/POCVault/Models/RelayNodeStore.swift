@@ -7,9 +7,9 @@ import Foundation
 /// the machine can later be registered with a Relay account: `relay handoff`
 /// seals to the X25519 key, and nothing else in the system writes it now that
 /// trial enrolment is gone. Neither is needed to use files or chat.
-struct RelayPairedNode: Codable, Equatable {
+struct RelayPairedNode: Codable, Equatable, Identifiable, Hashable {
     let nodeID: String
-    let nodeName: String
+    var nodeName: String
     let apiBaseURL: URL
     /// The machine's own id for this phone. Kept because it is the argument to
     /// `relayd devices revoke`, which is the remedy when the confirmation code
@@ -34,6 +34,14 @@ struct RelayPairedNode: Codable, Equatable {
     /// `nil` is a normal, supported state: the machine still serves files and
     /// chat, it just has no laptop handoff and no push.
     var registeredAccountID: String?
+    /// Optional user-chosen index into `RelayIdentityColor` for distinguishing
+    /// this host in multi-host lists and badges. Nil uses the deterministic hash.
+    var colorIndex: Int?
+    /// Optional timestamp recording when this host was paired. Nil for legacy
+    /// records or fixtures that did not stamp a date.
+    var addedAt: Date?
+
+    var id: String { nodeID }
 
     /// The single host the pinned CA and the device bearer token apply to.
     /// An IP literal is a first-class case here — a BYO node usually has no DNS
@@ -43,18 +51,30 @@ struct RelayPairedNode: Codable, Equatable {
     var host: String? { apiBaseURL.host }
 }
 
-/// Runtime-mutable pointer to the machine the app talks to.
+/// Runtime-mutable multi-host store for the machines this phone has paired with,
+/// plus the currently active selection.
 ///
 /// Defaults to `AppConfiguration.codexBaseURL` (the personal install someone
 /// configured through `support/vault-config.json`) until a node is paired, at
-/// which point every surface is repointed without a relaunch. The paired node
-/// persists across launches.
+/// which point every surface is repointed without a relaunch. All paired hosts
+/// and the active selection persist across launches, auto-migrating any legacy
+/// single-host record on first load.
 @MainActor
 final class RelayNodeStore: ObservableObject {
+    @Published private(set) var hosts: [RelayPairedNode] = []
+    @Published private(set) var activeHostID: String?
     @Published private(set) var pairedNode: RelayPairedNode?
 
+    /// Optional observer invoked whenever the active host changes (selection,
+    /// adoption, or removal), allowing the app shell to switch host-scoped TLS
+    /// pinning and bearer credentials in lockstep.
+    var onActiveHostChanged: ((RelayPairedNode?) -> Void)?
+
     private let defaults: UserDefaults
-    private static let storageKey = "com.parikshit.pocvault.paired.node"
+    private static let storageKeyV2 = "com.parikshit.pocvault.paired.nodes.v2"
+    private static let activeHostStorageKey = "com.parikshit.pocvault.paired.activeNodeID"
+    /// Legacy single-host key read once and migrated into `storageKeyV2`.
+    private static let legacyStorageKey = "com.parikshit.pocvault.paired.node"
     /// The trial pointer this store used to persist. Removed on first launch
     /// after the upgrade: a machine allocated by Relay no longer exists, and a
     /// dead pointer left in defaults is a host the app would otherwise dial.
@@ -63,10 +83,25 @@ final class RelayNodeStore: ObservableObject {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         defaults.removeObject(forKey: Self.legacyTrialKey)
-        if let data = defaults.data(forKey: Self.storageKey),
-           let restored = try? JSONDecoder().decode(RelayPairedNode.self, from: data) {
-            pairedNode = restored
+
+        if let data = defaults.data(forKey: Self.storageKeyV2),
+           let restored = try? JSONDecoder().decode([RelayPairedNode].self, from: data) {
+            hosts = restored
+            let storedActiveID = defaults.string(forKey: Self.activeHostStorageKey)
+            if let storedActiveID, hosts.contains(where: { $0.nodeID == storedActiveID }) {
+                activeHostID = storedActiveID
+            } else {
+                activeHostID = hosts.first?.nodeID
+            }
+        } else if let legacyData = defaults.data(forKey: Self.legacyStorageKey),
+                  let restored = try? JSONDecoder().decode(RelayPairedNode.self, from: legacyData) {
+            hosts = [restored]
+            activeHostID = restored.nodeID
+            persist()
+            defaults.removeObject(forKey: Self.legacyStorageKey)
         }
+
+        syncPairedNode()
     }
 
     var activeNodeURL: URL? { pairedNode?.apiBaseURL }
@@ -76,8 +111,8 @@ final class RelayNodeStore: ObservableObject {
     /// against a machine whose relayd does not send one.
     var pendingVerificationCode: String? { pairedNode?.pendingVerificationCode }
 
-    /// The base URL the app should actually talk to: the paired node when there
-    /// is one, else the personal install's configured Codex base URL.
+    /// The base URL the app should actually talk to: the active paired node when
+    /// there is one, else the personal install's configured Codex base URL.
     var effectiveBaseURL: URL {
         activeNodeURL ?? AppConfiguration.codexBaseURL
     }
@@ -97,10 +132,79 @@ final class RelayNodeStore: ObservableObject {
         pairedNode != nil || AppConfiguration.hasConfiguredPersonalInstall
     }
 
-    /// Adopts a freshly paired machine: persists it and points the app at it.
+    func host(id: String) -> RelayPairedNode? {
+        hosts.first(where: { $0.nodeID == id })
+    }
+
+    /// Adopts a freshly paired machine: adds or updates it in `hosts`, makes it
+    /// active, and persists.
     func adopt(_ node: RelayPairedNode) {
-        pairedNode = node
-        persist(node)
+        var updated = node
+        if let index = hosts.firstIndex(where: { $0.nodeID == node.nodeID }) {
+            let previous = hosts[index]
+            if updated.colorIndex == nil {
+                updated.colorIndex = previous.colorIndex
+            }
+            if updated.addedAt == nil {
+                updated.addedAt = previous.addedAt
+            }
+            hosts[index] = updated
+        } else {
+            hosts.append(updated)
+        }
+
+        let previousActive = pairedNode
+        activeHostID = updated.nodeID
+        syncPairedNode()
+        persist()
+        if previousActive?.nodeID != pairedNode?.nodeID || previousActive?.host != pairedNode?.host {
+            onActiveHostChanged?(pairedNode)
+        }
+    }
+
+    /// Switches the active host to the paired machine with `id`.
+    func selectHost(id: String) {
+        guard hosts.contains(where: { $0.nodeID == id }) else { return }
+        guard activeHostID != id else { return }
+        activeHostID = id
+        syncPairedNode()
+        persist()
+        onActiveHostChanged?(pairedNode)
+    }
+
+    /// Removes the paired host with `id`, activating another remaining host if
+    /// available, or reverting to nil when none remain.
+    func removeHost(id: String) {
+        let previousActiveID = activeHostID
+        hosts.removeAll { $0.nodeID == id }
+        if activeHostID == id {
+            activeHostID = hosts.first?.nodeID
+        }
+        syncPairedNode()
+        persist()
+        if previousActiveID != activeHostID || previousActiveID == id {
+            onActiveHostChanged?(pairedNode)
+        }
+    }
+
+    /// Updates the display name of the paired host with `id`.
+    func renameHost(id: String, name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let index = hosts.firstIndex(where: { $0.nodeID == id }) else {
+            return
+        }
+        hosts[index].nodeName = trimmed
+        syncPairedNode()
+        persist()
+    }
+
+    /// Sets or clears the user-selected identity color index for the paired host with `id`.
+    func setHostColor(id: String, colorIndex: Int?) {
+        guard let index = hosts.firstIndex(where: { $0.nodeID == id }) else { return }
+        hosts[index].colorIndex = colorIndex
+        syncPairedNode()
+        persist()
     }
 
     /// The user has compared the confirmation code with their terminal and
@@ -108,30 +212,85 @@ final class RelayNodeStore: ObservableObject {
     /// before the code could be shown, which is why the copy says "confirm",
     /// not "approve".
     func confirmVerification() {
-        guard var node = pairedNode, node.pendingVerificationCode != nil else { return }
-        node.pendingVerificationCode = nil
-        pairedNode = node
-        persist(node)
+        guard let activeHostID,
+              let index = hosts.firstIndex(where: { $0.nodeID == activeHostID }),
+              hosts[index].pendingVerificationCode != nil else {
+            return
+        }
+        hosts[index].pendingVerificationCode = nil
+        syncPairedNode()
+        persist()
     }
 
-    /// Records that this machine is now published to `accountID`, so Settings
-    /// stops offering to connect it.
+    /// Records that the active machine is now published to `accountID`, so
+    /// Settings stops offering to connect it.
     func markRegistered(accountID: String) {
-        guard var node = pairedNode else { return }
-        node.registeredAccountID = accountID
-        pairedNode = node
-        persist(node)
+        guard let activeHostID else { return }
+        markRegistered(accountID: accountID, nodeID: activeHostID)
     }
 
-    /// Forgets the paired machine and reverts to the personal install, if any.
+    /// Records that the specified machine is now published to `accountID`.
+    func markRegistered(accountID: String, nodeID: String) {
+        guard let index = hosts.firstIndex(where: { $0.nodeID == nodeID }) else { return }
+        hosts[index].registeredAccountID = accountID
+        syncPairedNode()
+        persist()
+    }
+
+    /// Forgets the active paired machine. When only one host existed, clears the
+    /// store completely and reverts to the personal install, if any; when other
+    /// hosts exist, activates the next available host gracefully.
     func clear() {
-        pairedNode = nil
-        defaults.removeObject(forKey: Self.storageKey)
+        if let activeHostID {
+            removeHost(id: activeHostID)
+        } else {
+            clearAll()
+        }
     }
 
-    private func persist(_ node: RelayPairedNode) {
-        guard let data = try? JSONEncoder().encode(node) else { return }
-        defaults.set(data, forKey: Self.storageKey)
+    /// Forgets every paired machine and reverts to the personal install, if any.
+    func clearAll() {
+        let hadActive = pairedNode != nil
+        hosts = []
+        activeHostID = nil
+        pairedNode = nil
+        defaults.removeObject(forKey: Self.storageKeyV2)
+        defaults.removeObject(forKey: Self.activeHostStorageKey)
+        defaults.removeObject(forKey: Self.legacyStorageKey)
+        if hadActive {
+            onActiveHostChanged?(nil)
+        }
+    }
+
+    private func syncPairedNode() {
+        if let activeHostID,
+           let matched = hosts.first(where: { $0.nodeID == activeHostID }) {
+            pairedNode = matched
+        } else if let first = hosts.first {
+            activeHostID = first.nodeID
+            pairedNode = first
+        } else {
+            activeHostID = nil
+            pairedNode = nil
+        }
+    }
+
+    private func persist() {
+        if hosts.isEmpty {
+            defaults.removeObject(forKey: Self.storageKeyV2)
+            defaults.removeObject(forKey: Self.activeHostStorageKey)
+            defaults.removeObject(forKey: Self.legacyStorageKey)
+            return
+        }
+        if let data = try? JSONEncoder().encode(hosts) {
+            defaults.set(data, forKey: Self.storageKeyV2)
+        }
+        if let activeHostID {
+            defaults.set(activeHostID, forKey: Self.activeHostStorageKey)
+        } else {
+            defaults.removeObject(forKey: Self.activeHostStorageKey)
+        }
+        defaults.removeObject(forKey: Self.legacyStorageKey)
     }
 }
 
@@ -173,7 +332,7 @@ enum RelayNodeRegistration {
                 encPubkey: encPubkey,
                 bearerToken: bearer
             )
-            nodeStore.markRegistered(accountID: accountID)
+            nodeStore.markRegistered(accountID: accountID, nodeID: node.nodeID)
             return nil
         } catch {
             return "Relay couldn't connect this machine to your account. Handoff and notifications stay off until it does."

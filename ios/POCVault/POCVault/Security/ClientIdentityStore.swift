@@ -79,6 +79,15 @@ final class ClientIdentityStore: ObservableObject {
     /// `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`: survives reinstall,
     /// available to background refresh, and never leaves this device in a backup
     /// — matching the identity it describes, which is device-bound by design.
+    private struct HostMaterial: Codable, Equatable {
+        var host: String
+        var pinnedCADER: Data?
+        var deviceToken: String?
+        var wakeToken: String?
+        var wakeNodeID: String?
+        var identityPersistentRef: Data?
+    }
+
     private struct PairedMaterial: Codable, Equatable {
         var pairingIssued: Bool = false
         var pinnedHost: String?
@@ -87,6 +96,10 @@ final class ClientIdentityStore: ObservableObject {
         var deviceTokenHost: String?
         var wakeToken: String?
         var wakeNodeID: String?
+        /// Per-host pinned CA, device bearer token, wake credential, and client
+        /// identity reference keyed by normalized host name. Optional so legacy
+        /// single-host keychain payloads decode cleanly with nil.
+        var hostsByKey: [String: HostMaterial]?
 
         static let empty = PairedMaterial()
 
@@ -98,6 +111,7 @@ final class ClientIdentityStore: ObservableObject {
             case pairingIssued = "trialIssued"
             case pinnedHost, pinnedCADER, deviceToken, deviceTokenHost
             case wakeToken, wakeNodeID
+            case hostsByKey
         }
     }
 
@@ -442,6 +456,42 @@ final class ClientIdentityStore: ObservableObject {
         return certificate
     }
 
+    /// Looks up the pinned CA certificate for a specific host (or nodeID) without
+    /// altering which host is currently active.
+    func pinnedCACertificate(for host: String) -> SecCertificate? {
+        let wanted = Self.normalizedHostKey(host)
+        guard !wanted.isEmpty else { return nil }
+        let material = pairedMaterial()
+        if let entry = resolveHostEntry(for: host, in: material),
+           let der = entry.pinnedCADER,
+           let certificate = SecCertificateCreateWithData(nil, der as CFData) {
+            return certificate
+        }
+        if material.pinnedHost?.lowercased() == wanted,
+           let der = material.pinnedCADER,
+           let certificate = SecCertificateCreateWithData(nil, der as CFData) {
+            return certificate
+        }
+        return nil
+    }
+
+    /// The active host's device bearer token, or nil when no paired host token
+    /// is currently active.
+    var deviceBearerToken: String? {
+        pairedMaterial().deviceToken?.trimmedNonEmpty
+    }
+
+    /// Normalized hostnames currently stored in multi-host paired material.
+    var storedPairedHosts: [String] {
+        let material = pairedMaterial()
+        var hosts = Set(material.hostsByKey?.keys.map { $0 } ?? [])
+        if let active = material.pinnedHost?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           !active.isEmpty {
+            hosts.insert(active)
+        }
+        return hosts.sorted()
+    }
+
     /// Stores the bearer token this device authenticates to `host` with, and
     /// the host it belongs to.
     ///
@@ -454,6 +504,12 @@ final class ClientIdentityStore: ObservableObject {
             return
         }
         updatePairedMaterial { material in
+            captureActiveHost(in: &material)
+            var map = material.hostsByKey ?? [:]
+            var entry = map[host] ?? HostMaterial(host: host)
+            entry.deviceToken = token
+            map[host] = entry
+            material.hostsByKey = map
             material.deviceToken = token
             material.deviceTokenHost = host
         }
@@ -462,15 +518,18 @@ final class ClientIdentityStore: ObservableObject {
 
     /// The token for `host`, or nil when this device has none for it.
     func deviceToken(for host: String) -> String? {
-        let wanted = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let wanted = Self.normalizedHostKey(host)
         let material = pairedMaterial()
-        guard !wanted.isEmpty,
-              let stored = material.deviceTokenHost?.lowercased(),
-              stored == wanted,
-              let token = material.deviceToken?.trimmedNonEmpty else {
-            return nil
+        guard !wanted.isEmpty else { return nil }
+        if let stored = material.deviceTokenHost?.lowercased(),
+           stored == wanted,
+           let token = material.deviceToken?.trimmedNonEmpty {
+            return token
         }
-        return token
+        if let token = material.hostsByKey?[wanted]?.deviceToken?.trimmedNonEmpty {
+            return token
+        }
+        return nil
     }
 
     /// Told when a wake credential lands, so the push service can subscribe the
@@ -490,6 +549,17 @@ final class ClientIdentityStore: ObservableObject {
         updatePairedMaterial { material in
             material.wakeToken = value
             material.wakeNodeID = node
+            if let activeHost = (material.pinnedHost ?? material.deviceTokenHost)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased(),
+               !activeHost.isEmpty {
+                var map = material.hostsByKey ?? [:]
+                var entry = map[activeHost] ?? HostMaterial(host: activeHost)
+                entry.wakeToken = value
+                entry.wakeNodeID = node
+                map[activeHost] = entry
+                material.hostsByKey = map
+            }
         }
         CodexDiagnostics.log("identity_wake_token_stored", fields: ["nodeId": node])
         onWakeCredentialStored?()
@@ -505,6 +575,24 @@ final class ClientIdentityStore: ObservableObject {
         return (nodeID, token)
     }
 
+    /// Looks up the wake credential for a specific host or nodeID.
+    func wakeCredential(for hostOrNodeID: String) -> (nodeID: String, token: String)? {
+        let trimmed = hostOrNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let material = pairedMaterial()
+        if let entry = resolveHostEntry(for: trimmed, in: material),
+           let nodeID = entry.wakeNodeID?.trimmedNonEmpty,
+           let token = entry.wakeToken?.trimmedNonEmpty {
+            return (nodeID, token)
+        }
+        if let nodeID = material.wakeNodeID?.trimmedNonEmpty,
+           let token = material.wakeToken?.trimmedNonEmpty,
+           nodeID == trimmed || material.pinnedHost?.lowercased() == trimmed.lowercased() {
+            return (nodeID, token)
+        }
+        return nil
+    }
+
     /// The single host `pinnedCACertificate` may be applied to.
     var pinnedHost: String? {
         pairedMaterial().pinnedHost?.trimmedNonEmpty
@@ -516,19 +604,146 @@ final class ClientIdentityStore: ObservableObject {
         pairedMaterial().pairingIssued
     }
 
-    /// Unpair / account-change purge: drops the pairing-issued identity and the
-    /// pinned node CA so the next account on this phone inherits neither a
+    /// Convenience installer for a host's paired CA, bearer token, and optional
+    /// wake credential in one call. Activates that host immediately.
+    func installPairedMaterial(
+        caCertificate: SecCertificate?,
+        host: String?,
+        deviceToken: String? = nil,
+        wakeToken: String? = nil,
+        nodeID: String? = nil
+    ) {
+        pinPairedMaterial(caCertificate: caCertificate, host: host)
+        if let deviceToken, !deviceToken.isEmpty {
+            storeDeviceToken(deviceToken, host: host)
+        }
+        if let wakeToken = wakeToken?.trimmedNonEmpty, let nodeID = nodeID?.trimmedNonEmpty {
+            storeWakeToken(wakeToken, nodeID: nodeID)
+        }
+    }
+
+    /// Switches the active `pinnedHost`, `pinnedCACertificate`, `deviceBearerToken`,
+    /// wake credential, and per-host client identity reference to the stored material
+    /// for `host` (accepting either a hostname or a paired `nodeID`).
+    ///
+    /// Passing `nil` clears the active pointer without erasing other stored hosts.
+    func activateHostMaterial(for host: String?) {
+        let trimmed = host?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        var restoredIdentityRef: Data?
+        var shouldClearIdentityCache = false
+
+        updatePairedMaterial { material in
+            captureActiveHost(in: &material)
+            guard !trimmed.isEmpty,
+                  let entry = resolveHostEntry(for: trimmed, in: material) else {
+                material.pinnedHost = nil
+                material.pinnedCADER = nil
+                material.deviceToken = nil
+                material.deviceTokenHost = nil
+                material.wakeToken = nil
+                material.wakeNodeID = nil
+                return
+            }
+            material.pinnedHost = entry.host
+            material.pinnedCADER = entry.pinnedCADER
+            material.deviceToken = entry.deviceToken
+            material.deviceTokenHost = entry.deviceToken != nil ? entry.host : nil
+            material.wakeToken = entry.wakeToken
+            material.wakeNodeID = entry.wakeNodeID
+            if let ref = entry.identityPersistentRef {
+                restoredIdentityRef = ref
+                shouldClearIdentityCache = true
+            }
+        }
+
+        cachedPinnedCA = nil
+        if shouldClearIdentityCache, let restoredIdentityRef {
+            defaults.set(restoredIdentityRef, forKey: persistentRefKey)
+            cachedIdentity = nil
+        }
+        CodexDiagnostics.log("identity_host_material_activated", fields: [
+            "host": trimmed.isEmpty ? "none" : trimmed
+        ])
+    }
+
+    /// Unpair / account-change purge: drops the pairing-issued identity and all
+    /// pinned node CAs so the next account on this phone inherits neither a
     /// pointer to another account's machine nor a certificate that would
     /// authenticate to it. A BYO identity the user imported themselves is
     /// deliberately left in place.
     func discardPairedMaterial() {
+        let material = pairedMaterial()
+        var notifiedNodes = Set<String>()
         if let credential = wakeCredential() {
+            notifiedNodes.insert(credential.nodeID)
             onWakeCredentialDiscarding?(credential.nodeID, credential.token)
+        }
+        if let hosts = material.hostsByKey?.values {
+            for entry in hosts {
+                if let nodeID = entry.wakeNodeID?.trimmedNonEmpty,
+                   let token = entry.wakeToken?.trimmedNonEmpty,
+                   notifiedNodes.insert(nodeID).inserted {
+                    onWakeCredentialDiscarding?(nodeID, token)
+                }
+            }
         }
         if hasPairedIdentity {
             try? deleteStoredIdentity()
         }
         clearPinnedMaterial()
+    }
+
+    /// Removes paired material for a single host (or nodeID) without disturbing
+    /// other paired hosts. When that host was the last paired host, purges the
+    /// pairing-issued client identity as well.
+    func discardPairedMaterial(for host: String) {
+        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        let before = pairedMaterial()
+        let matchedEntry = resolveHostEntry(for: trimmed, in: before)
+        let targetHost = matchedEntry?.host ?? Self.normalizedHostKey(trimmed)
+
+        if let nodeID = matchedEntry?.wakeNodeID?.trimmedNonEmpty,
+           let token = matchedEntry?.wakeToken?.trimmedNonEmpty {
+            onWakeCredentialDiscarding?(nodeID, token)
+        } else if before.pinnedHost?.lowercased() == targetHost,
+                  let credential = wakeCredential() {
+            onWakeCredentialDiscarding?(credential.nodeID, credential.token)
+        }
+
+        var remainingCount = 0
+        var removedWasActive = false
+        updatePairedMaterial { material in
+            captureActiveHost(in: &material)
+            var map = material.hostsByKey ?? [:]
+            map.removeValue(forKey: targetHost)
+            material.hostsByKey = map.isEmpty ? nil : map
+            remainingCount = map.count
+
+            if material.pinnedHost?.lowercased() == targetHost ||
+                material.deviceTokenHost?.lowercased() == targetHost {
+                removedWasActive = true
+                material.pinnedHost = nil
+                material.pinnedCADER = nil
+                material.deviceToken = nil
+                material.deviceTokenHost = nil
+                material.wakeToken = nil
+                material.wakeNodeID = nil
+            }
+            if remainingCount == 0 && material.pinnedHost == nil && material.deviceToken == nil {
+                material.pairingIssued = false
+            }
+        }
+
+        if removedWasActive {
+            cachedPinnedCA = nil
+        }
+
+        if remainingCount == 0 && before.pairingIssued {
+            try? deleteStoredIdentity()
+            clearPinnedMaterial()
+        }
     }
 
     /// Records the CA to pin and the one host it applies to. Called by the
@@ -542,25 +757,89 @@ final class ClientIdentityStore: ObservableObject {
               !host.isEmpty else {
             return
         }
-        guard let caCertificate else {
-            // No CA in the blob: leave the app on default handling rather than
-            // pinning something arbitrary. TLS to the machine will fail loudly.
-            updatePairedMaterial { material in
-                material.pairingIssued = true
-                material.pinnedHost = host
-                material.pinnedCADER = nil
-            }
-            cachedPinnedCA = nil
-            CodexDiagnostics.log("identity_trial_ca_missing")
-            return
-        }
+        let caDER = caCertificate.map { SecCertificateCopyData($0) as Data }
+        let currentIdentityRef = defaults.data(forKey: persistentRefKey)
+
         updatePairedMaterial { material in
+            captureActiveHost(in: &material)
+            let switchingHosts = material.pinnedHost?.lowercased() != nil &&
+                material.pinnedHost?.lowercased() != host
+
+            var map = material.hostsByKey ?? [:]
+            var entry = map[host] ?? HostMaterial(host: host)
+            entry.pinnedCADER = caDER
+            if let currentIdentityRef {
+                entry.identityPersistentRef = currentIdentityRef
+            }
+            map[host] = entry
+            material.hostsByKey = map
+
             material.pairingIssued = true
             material.pinnedHost = host
-            material.pinnedCADER = SecCertificateCopyData(caCertificate) as Data
+            material.pinnedCADER = caDER
+
+            if switchingHosts {
+                if material.deviceTokenHost?.lowercased() != host {
+                    material.deviceToken = entry.deviceToken
+                    material.deviceTokenHost = entry.deviceToken != nil ? host : nil
+                }
+                material.wakeToken = entry.wakeToken
+                material.wakeNodeID = entry.wakeNodeID
+            }
         }
+
         cachedPinnedCA = caCertificate
-        CodexDiagnostics.log("identity_trial_ca_pinned", fields: ["host": host])
+        if caCertificate == nil {
+            CodexDiagnostics.log("identity_trial_ca_missing")
+        } else {
+            CodexDiagnostics.log("identity_trial_ca_pinned", fields: ["host": host])
+        }
+    }
+
+    private static func normalizedHostKey(_ raw: String) -> String {
+        raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    /// Snapshots the currently active host's CA, bearer token, wake credential,
+    /// and identity reference into `hostsByKey` before switching or overwriting.
+    private func captureActiveHost(in material: inout PairedMaterial) {
+        guard let activeHost = (material.pinnedHost ?? material.deviceTokenHost)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+            !activeHost.isEmpty else {
+            return
+        }
+        var map = material.hostsByKey ?? [:]
+        var entry = map[activeHost] ?? HostMaterial(host: activeHost)
+        if material.pinnedHost?.lowercased() == activeHost, let der = material.pinnedCADER {
+            entry.pinnedCADER = der
+        }
+        if material.deviceTokenHost?.lowercased() == activeHost,
+           let token = material.deviceToken?.trimmedNonEmpty {
+            entry.deviceToken = token
+        }
+        if let wakeToken = material.wakeToken?.trimmedNonEmpty,
+           let wakeNodeID = material.wakeNodeID?.trimmedNonEmpty,
+           entry.wakeNodeID == nil || entry.wakeNodeID == wakeNodeID {
+            entry.wakeToken = wakeToken
+            entry.wakeNodeID = wakeNodeID
+        }
+        if entry.identityPersistentRef == nil,
+           let ref = defaults.data(forKey: persistentRefKey) {
+            entry.identityPersistentRef = ref
+        }
+        map[activeHost] = entry
+        material.hostsByKey = map
+    }
+
+    private func resolveHostEntry(for hostOrNodeID: String, in material: PairedMaterial) -> HostMaterial? {
+        let trimmed = hostOrNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let map = material.hostsByKey else { return nil }
+        let normalized = trimmed.lowercased()
+        if let direct = map[normalized] {
+            return direct
+        }
+        return map.values.first { $0.wakeNodeID == trimmed }
     }
 
     /// Unpair purge. The device token is machine access just as much as the

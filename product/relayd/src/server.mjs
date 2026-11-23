@@ -16,6 +16,8 @@ import { workspaces, workspaceList, pickerWorkspaceList, resolveWorkspaceById, p
 import { publicRuntimeModelCatalog } from "./catalog.mjs";
 import { fsListResponse, serveFsFile } from "./fsapi.mjs";
 import { fsGitStatus } from "./fsgit.mjs";
+import { gitStatus, gitDiff, gitCommits, gitCommitDiff, gitBranches, gitCheckout, gitDiscard, gitCommit } from "./git-api.mjs";
+import { listWorktrees, createWorktree, removeWorktree } from "./worktree-api.mjs";
 import { listProviderSkills, publicSkill } from "./skills.mjs";
 import { cleanThreadProviderFilter, workspaceForJob, listWorkspaceSessions, listWorkspaceThreads, resolveOptionalWorkspaceFilter, threadDetailResponse, subagentThreadDetailResponse, serveThreadAttachment, isSafeThreadAttachmentId, deleteThread } from "./threads.mjs";
 import { handleChatRequest } from "./chat.mjs";
@@ -304,6 +306,58 @@ async function routeRequest(req, res) {
 
   if (req.method === "GET" && url.pathname === "/v1/codex/fs/git") {
     return sendJson(res, 200, await fsGitStatus(url.searchParams));
+  }
+
+  if (req.method === "GET" && url.pathname === "/v1/codex/git/status") {
+    return sendJson(res, 200, await gitStatus(url.searchParams));
+  }
+
+  if (req.method === "GET" && url.pathname === "/v1/codex/git/diff") {
+    return sendJson(res, 200, await gitDiff(url.searchParams));
+  }
+
+  if (req.method === "GET" && url.pathname === "/v1/codex/git/commits") {
+    return sendJson(res, 200, await gitCommits(url.searchParams));
+  }
+
+  if (req.method === "GET" && url.pathname === "/v1/codex/git/commit-diff") {
+    return sendJson(res, 200, await gitCommitDiff(url.searchParams));
+  }
+
+  if (req.method === "GET" && url.pathname === "/v1/codex/git/branches") {
+    return sendJson(res, 200, await gitBranches(url.searchParams));
+  }
+
+  if (req.method === "POST" && url.pathname === "/v1/codex/git/checkout") {
+    const body = await readBody(req);
+    return sendJson(res, 200, await gitCheckout(body));
+  }
+
+  if (req.method === "POST" && url.pathname === "/v1/codex/git/discard") {
+    const body = await readBody(req);
+    return sendJson(res, 200, await gitDiscard(body));
+  }
+
+  if (req.method === "POST" && url.pathname === "/v1/codex/git/commit") {
+    const body = await readBody(req);
+    return sendJson(res, 200, await gitCommit(body));
+  }
+
+  if (req.method === "GET" && url.pathname === "/v1/codex/worktrees") {
+    return sendJson(res, 200, await listWorktrees(url.searchParams));
+  }
+
+  if (req.method === "POST" && url.pathname === "/v1/codex/worktrees") {
+    const body = await readBody(req);
+    return sendJson(res, 201, await createWorktree(body));
+  }
+
+  if (
+    (req.method === "DELETE" && url.pathname === "/v1/codex/worktrees") ||
+    (req.method === "POST" && url.pathname === "/v1/codex/worktrees/remove")
+  ) {
+    const body = await readBody(req);
+    return sendJson(res, 200, await removeWorktree(body, url.searchParams));
   }
 
   if (req.method === "POST" && url.pathname === "/v1/codex/workspaces/select") {

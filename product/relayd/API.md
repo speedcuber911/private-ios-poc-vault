@@ -1798,6 +1798,24 @@ line per step (`Running <command>`, `Reading <file>`, `Editing <file>`,
 `Writing <file>`, `Searching <pattern>`, `Fetching <url>`, `Agent:
 <description>`, `Using <tool>`), plus anything the CLI itself printed.
 
+### 2.12 Git inspection, actions, and persistent worktrees
+
+All routes below validate `path` / `projectPath` through `resolveBrowsePath(..., { kind: "dir" })`
+against `CODEX_WORKSPACE_BROWSE_ROOT`, run `git` / `gh` via `execFile` without a shell, and
+exclude files matching `CODEX_FS_READ_DENYLIST` from status/diff/discard.
+
+- `GET /v1/codex/git/status?path=<abs-dir>` — returns `{ isGitRepo, repoRoot, branch, baseBranch, ahead, behind, dirty, added, deleted, files, pr }`. Non-git directories inside the jail return `{ isGitRepo: false, repoRoot: null, branch: null, baseBranch: null, ahead: 0, behind: 0, dirty: false, added: 0, deleted: 0, files: [], pr: null }`. `pr` is best-effort via `gh pr view` (2s timeout, cached 30s per repo+branch) and `null` when unavailable.
+- `GET /v1/codex/git/diff?path=<abs-dir>&mode=uncommitted|committed|all&file=<rel-path>` — structured unified diff (`{ mode, branch, baseBranch, totalAdded, totalDeleted, truncated, files }`) with hunks/lines capped at 2 MiB / 8,000 lines; `uncommitted` and `all` include synthetic diffs for untracked text files up to 256 KiB (skipping read-denied and binary files).
+- `GET /v1/codex/git/commits?path=<abs-dir>&limit=30` — recent commits (`{ branch, commits: [{ sha, shortSha, subject, author, relativeDate, committedAt }] }`).
+- `GET /v1/codex/git/commit-diff?path=<abs-dir>&sha=<hex>` — structured diff for one commit (`mode: "commit"`, `sha`). Rejects non-hex SHAs with 400 and unknown commits with 404.
+- `GET /v1/codex/git/branches?path=<abs-dir>` — `{ current, baseBranch, branches: [{ name, isCurrent, isRemote, upstream }] }`.
+- `POST /v1/codex/git/checkout` (`{ path, branch, create? }`) — validates `branch` (no leading `-`, passes `git check-ref-format --branch`), switches or creates+switches, returns `{ ok: true, branch }`.
+- `POST /v1/codex/git/discard` (`{ path, files }`) — restores tracked files or removes untracked files inside `repoRoot`; refuses read-denied (403) or escaping/`..`/`.git` (400) paths before mutating anything. Returns `{ ok: true, discarded }`.
+- `POST /v1/codex/git/commit` (`{ path, message, stageAll?, push? }`) — stages all by default, commits (using a fallback identity only when `user.name`/`user.email` are unset), optionally pushes without `--force`, returns `{ ok: true, sha, shortSha, branch, pushed }`.
+- `GET /v1/codex/worktrees?path=<abs-dir>` — parses `git worktree list --porcelain`, filters to entries inside the browse root, returns `{ repoRoot, worktrees: [{ path, name, head, branch, isMain, isManaged, dirty, added, deleted }] }`.
+- `POST /v1/codex/worktrees` (`{ projectPath, name?, branch?, baseBranch?, action?: "branch-off"|"checkout" }`) — creates a persistent managed worktree under `<repoRoot>/.relay/worktrees/<slug>` with pre-mutation symlink containment verification and post-creation realpath verification. Returns `201 { worktree: { path, name, branch, isMain: false, isManaged: true } }`.
+- `DELETE /v1/codex/worktrees` and `POST /v1/codex/worktrees/remove` (`{ path, force? }`) — removes a managed worktree and prunes git metadata. Refuses the main checkout and any path outside `<repoRoot>/.relay/worktrees/` (403); refuses dirty worktrees unless `force: true` (409). Returns `{ ok: true, removed }`.
+
 ---
 
 ## Part 3 — Ambiguities & inconsistencies found during the freeze

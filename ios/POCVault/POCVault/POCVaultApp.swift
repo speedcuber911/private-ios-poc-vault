@@ -14,6 +14,8 @@ struct POCVaultApp: App {
     /// The one power model. Settings and Usage both draw their switch from it,
     /// and it is told about the starts and stops it did not issue itself.
     @StateObject private var powerModel: RelayMachinePowerModel
+    @StateObject private var themeStore: RelayThemeStore
+    @StateObject private var workspaceStore: RelayWorkspaceStore
     private let codexClient: CodexClient
     private let authClient: RelayAuthClient
     private let watchBridge: RelayWatchBridge
@@ -26,6 +28,12 @@ struct POCVaultApp: App {
         // install). Chat, status and the browser all share it, so `retarget`
         // moves every surface at once instead of only the browser's copy.
         let nodeStore = RelayNodeStore()
+        if let active = nodeStore.pairedNode {
+            identityStore.activateHostMaterial(for: active.host ?? active.nodeID)
+        }
+        nodeStore.onActiveHostChanged = { [weak identityStore] nextNode in
+            identityStore?.activateHostMaterial(for: nextNode?.host ?? nextNode?.nodeID)
+        }
         let codexClient = CodexClient(
             baseURL: nodeStore.effectiveBaseURL,
             identityStore: identityStore
@@ -39,6 +47,8 @@ struct POCVaultApp: App {
 
         _identityStore = StateObject(wrappedValue: identityStore)
         _nodeStore = StateObject(wrappedValue: nodeStore)
+        _themeStore = StateObject(wrappedValue: RelayThemeStore.shared)
+        _workspaceStore = StateObject(wrappedValue: RelayWorkspaceStore())
         // Seeds synchronously from this machine's saved Chats snapshot, so the
         // list paints on the first frame of a cold launch.
         let statusFeedViewModel = StatusFeedViewModel(client: codexClient)
@@ -92,11 +102,19 @@ struct POCVaultApp: App {
     var body: some Scene {
         WindowGroup {
             phaseContent
+            .environment(\.relayTheme, themeStore.palette)
+            .environmentObject(themeStore)
+            .tint(themeStore.palette.accent)
+            .preferredColorScheme(themeStore.colorScheme)
             // Repointing happens here rather than in `body`: constructing a client
             // per body evaluation leaked a URLSession every time SwiftUI re-ran it.
-            .onChange(of: nodeStore.effectiveBaseURL, initial: true) { _, newBaseURL in
+            .onChange(of: nodeStore.effectiveBaseURL, initial: true) { previousURL, newBaseURL in
+                identityStore.activateHostMaterial(for: nodeStore.pairedNode?.host ?? nodeStore.pairedNode?.nodeID)
                 codexClient.retarget(baseURL: newBaseURL)
                 statusFeedViewModel.switchMachine(to: newBaseURL)
+                if previousURL != newBaseURL {
+                    workspaceStore.reset()
+                }
             }
             // A machine unpaired from this phone (or replaced by another
             // pairing) takes its saved Chats list with it.
@@ -144,7 +162,9 @@ struct POCVaultApp: App {
                 codexClient: codexClient,
                 authClient: authClient,
                 pushService: pushService,
-                powerModel: powerModel
+                powerModel: powerModel,
+                workspaceStore: workspaceStore,
+                themeStore: themeStore
             )
             // Pairing (or unpairing) a machine restarts the browser stack so
             // listings refetch; the shared client and the chat/status
@@ -252,13 +272,20 @@ struct POCVaultRootView: View {
     /// Observed here, not just passed through: whether the machine is up
     /// decides what Chats, Folders and Previews show and whether they poll.
     @ObservedObject var powerModel: RelayMachinePowerModel
+    @ObservedObject var workspaceStore: RelayWorkspaceStore
+    @ObservedObject var themeStore: RelayThemeStore
 
     @Environment(\.scenePhase) private var scenePhase
+    @StateObject private var panelController = RelayMobilePanelController()
     @State private var browserPath: [BrowserRoute] = []
     /// Restoring is a launch-time act, not an on-appear one: returning to the
     /// Workspaces tab must not yank the user back to a folder they just left.
     @State private var didRestoreBrowserPath = false
     @State private var chatLaunch: RelayChatLaunch?
+    @State private var chatLaunchesByID: [UUID: RelayChatLaunch] = [:]
+    @State private var terminalSessionsByTabID: [UUID: RelayTerminalSessionModel] = [:]
+    @State private var workspaceFilesByPath: [String: [String]] = [:]
+    @State private var explorerInitialTab: RelayExplorerTab = .changes
     @State private var terminalLaunch: RelayTerminalLaunch?
     @State private var pendingTerminalLaunch: RelayTerminalLaunch?
     @State private var pendingDiagnostics = false
@@ -269,16 +296,110 @@ struct POCVaultRootView: View {
     @State private var selectedRootTab = RelayRootTab.sessions
     @State private var showingSidebar = false
     @State private var showingWorkspacePicker = false
+    @State private var showingAddHost = false
+    @State private var worktreeAlertMessage: String?
     @State private var lastChatFolderPath: String?
     @State private var lastChatWorkspaceID: String?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showingDiagnostics = false
     @State private var showingMachineMonitor = false
 
+    private var theme: RelayThemePalette { themeStore.palette }
+
+    private var activeWorkspacePath: String {
+        if let path = lastChatFolderPath?.trimmedNonEmpty { return path }
+        if let selected = workspaceStore.selectedWorkspacePath?.trimmedNonEmpty { return selected }
+        if let first = workspaceStore.projects.first?.workspaces.first?.path { return first }
+        return "/srv/codex-workspaces/poc-vault"
+    }
+
+    private var activeWorkspaceRecord: RelayWorkspaceRecord? {
+        workspaceStore.workspace(forPath: activeWorkspacePath)
+    }
+
+    private var activeWorkspaceDisplayName: String {
+        if let record = activeWorkspaceRecord {
+            return record.displayBranch.trimmedNonEmpty ?? record.name
+        }
+        let trimmed = activeWorkspacePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        if let last = trimmed.split(separator: "/").last { return String(last) }
+        return "Workspace"
+    }
+
+    private var activeProjectDisplayName: String? {
+        if let record = activeWorkspaceRecord {
+            return record.projectName == activeWorkspaceDisplayName ? nil : record.projectName
+        }
+        return nil
+    }
+
+    private var activeWorkspaceID: String {
+        if let id = activeWorkspaceRecord?.workspaceID?.trimmedNonEmpty { return id }
+        if let id = lastChatWorkspaceID?.trimmedNonEmpty { return id }
+        return "poc-vault"
+    }
+
+    private var activeWorkspaceTabs: [RelayWorkspaceTab] {
+        workspaceStore.tabs(for: activeWorkspacePath)
+    }
+
+    private var activeWorkspaceTab: RelayWorkspaceTab? {
+        workspaceStore.activeTab(for: activeWorkspacePath)
+    }
+
+    private var headerTabItems: [RelayWorkspaceTabItem] {
+        let activeID = activeWorkspaceTab?.id
+        return activeWorkspaceTabs.map { tab in
+            var item = RelayWorkspaceTabItem.from(tab, activeTabID: activeID)
+            if case .agent(let launchID, _, _, _) = tab.kind,
+               let launch = chatLaunchesByID[launchID] {
+                let liveTitle = launch.viewModel.conversationTitle.trimmedNonEmpty
+                let status: RelayStatusBucket = !launch.viewModel.pendingApprovals.isEmpty
+                    ? .needsInput
+                    : ((launch.viewModel.isStreaming || launch.viewModel.hasActiveConversationJob) ? .running : .idle)
+                item = RelayWorkspaceTabItem(
+                    id: tab.id.uuidString,
+                    kind: .agent(provider: launch.viewModel.currentSessionProvider ?? tab.kind.provider),
+                    title: liveTitle ?? tab.title,
+                    status: status,
+                    isActive: tab.id == activeID
+                )
+            }
+            return item
+        }
+    }
+
+    private var activeHeaderTabItem: RelayWorkspaceTabItem? {
+        if let active = headerTabItems.first(where: { $0.isActive }) {
+            return active
+        }
+        if let launch = chatLaunch {
+            let status: RelayStatusBucket = !launch.viewModel.pendingApprovals.isEmpty
+                ? .needsInput
+                : ((launch.viewModel.isStreaming || launch.viewModel.hasActiveConversationJob) ? .running : .idle)
+            return RelayWorkspaceTabItem(
+                id: launch.id,
+                kind: .agent(provider: launch.viewModel.currentSessionProvider ?? launch.viewModel.selectedTaskProvider),
+                title: launch.viewModel.conversationTitle.trimmedNonEmpty ?? "New agent",
+                status: status,
+                isActive: true
+            )
+        }
+        return nil
+    }
+
+    private var activeWorkspaceHasGitChanges: Bool {
+        if let status = workspaceStore.gitStatus(for: activeWorkspacePath) {
+            return status.dirty || status.added > 0 || status.deleted > 0
+        }
+        return activeWorkspaceRecord?.hasChanges ?? false
+    }
+
     var body: some View {
         chatShell
-        .tint(AppTheme.accent)
-        .preferredColorScheme(.dark)
+        .environment(\.relayTheme, theme)
+        .tint(theme.accent)
+        .preferredColorScheme(themeStore.colorScheme)
         .sheet(isPresented: Binding(
             get: { selectedRootTab != .sessions },
             set: { if !$0 { selectedRootTab = .sessions } }
@@ -295,35 +416,62 @@ struct POCVaultRootView: View {
             }
         }) {
             secondaryDestination
-            .background(AppTheme.bgCanvas)
-            .tint(AppTheme.accent)
-            .preferredColorScheme(.dark)
+            .environment(\.relayTheme, theme)
+            .background(theme.surface0)
+            .tint(theme.accent)
+            .preferredColorScheme(themeStore.colorScheme)
         }
         .sheet(isPresented: $showingWorkspacePicker) {
-            RelayChatProjectPicker(client: codexClient) { workspace in
-                let previous = chatLaunch?.viewModel
-                let next = chatSessionStore.launchNewSession(
-                    folderPath: workspace.path, workspaceID: workspace.id, preservingDraftFrom: previous
-                )
-                next.viewModel.adoptWorkspaceID(workspace.id, name: workspace.name)
-                chatLaunch = next
-                rememberChatContext(folderPath: workspace.path, workspaceID: workspace.id)
-                showingWorkspacePicker = false
-            }
+            RelayChatProjectPicker(
+                client: codexClient,
+                onBrowseAllFolders: {
+                    showingWorkspacePicker = false
+                    openDestination(.workspaces)
+                },
+                onChoose: { workspace in
+                    let previous = chatLaunch?.viewModel
+                    let next = chatSessionStore.launchNewSession(
+                        folderPath: workspace.path, workspaceID: workspace.id, preservingDraftFrom: previous
+                    )
+                    next.viewModel.adoptWorkspaceID(workspace.id, name: workspace.name)
+                    registerAndActivateChatLaunch(next, folderPath: workspace.path, workspaceID: workspace.id)
+                    showingWorkspacePicker = false
+                }
+            )
+            .environment(\.relayTheme, theme)
+            .preferredColorScheme(themeStore.colorScheme)
+        }
+        .sheet(isPresented: $showingAddHost) {
+            NodePairingView(
+                identityStore: identityStore,
+                nodeStore: nodeStore,
+                accountStore: accountStore,
+                authClient: authClient,
+                onDismiss: { showingAddHost = false }
+            )
+            .environment(\.relayTheme, theme)
+            .preferredColorScheme(themeStore.colorScheme)
         }
         .fullScreenCover(item: $terminalLaunch) { launch in
             RelayTerminalView(
                 client: codexClient,
                 workspaceID: launch.workspaceID,
                 workspaceName: launch.workspaceName,
+                onResizeRequest: { id, cols, rows in
+                    Task { try? await codexClient.resizeTerminal(id: id, cols: cols, rows: rows) }
+                },
                 onDismiss: { terminalLaunch = nil }
             )
+            .environment(\.relayTheme, theme)
+            .preferredColorScheme(themeStore.colorScheme)
         }
         .sheet(isPresented: $showingDiagnostics) {
             DiagnosticsView(
                 identityStore: identityStore,
                 nodeStore: nodeStore
             )
+            .environment(\.relayTheme, theme)
+            .preferredColorScheme(themeStore.colorScheme)
         }
         .sheet(isPresented: $showingMachineMonitor) {
             NavigationStack {
@@ -335,7 +483,16 @@ struct POCVaultRootView: View {
                     showsDismissButton: true
                 )
             }
-            .preferredColorScheme(.dark)
+            .environment(\.relayTheme, theme)
+            .preferredColorScheme(themeStore.colorScheme)
+        }
+        .alert("Worktree", isPresented: Binding(
+            get: { worktreeAlertMessage != nil },
+            set: { if !$0 { worktreeAlertMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) { worktreeAlertMessage = nil }
+        } message: {
+            Text(worktreeAlertMessage ?? "")
         }
         .task {
             identityStore.importIdentityFromSetupEnvironmentIfNeeded()
@@ -345,6 +502,27 @@ struct POCVaultRootView: View {
                 lastChatWorkspaceID = saved?["workspace"] as? String
                 openNewSession(folderPath: lastChatFolderPath, workspaceID: lastChatWorkspaceID)
             }
+            if !powerModel.isDown {
+                await statusFeedViewModel.refresh()
+                await workspaceStore.refreshProjects(client: codexClient, feedItems: statusFeedViewModel.feedItems)
+                await refreshWorkspaceContext(for: activeWorkspacePath)
+            }
+        }
+        .onChange(of: panelController.target) { _, newTarget in
+            showingSidebar = (newTarget == .leftSidebar)
+            if newTarget == .leftSidebar, !powerModel.isDown {
+                Task {
+                    await statusFeedViewModel.refresh()
+                    await workspaceStore.refreshProjects(client: codexClient, feedItems: statusFeedViewModel.feedItems)
+                }
+            }
+        }
+        .onChange(of: statusFeedViewModel.feedItems) { _, items in
+            workspaceStore.updateFeedItems(items)
+        }
+        .onChange(of: activeWorkspacePath) { _, path in
+            guard !powerModel.isDown else { return }
+            Task { await refreshWorkspaceContext(for: path) }
         }
         // Two independent reasons to register for pushes: an account (the
         // session-authed device route, for handoffs and runs) or a paired
@@ -460,56 +638,187 @@ struct POCVaultRootView: View {
     }
 
     private var chatShell: some View {
-        ZStack(alignment: .leading) {
-            AppTheme.bgCanvas.ignoresSafeArea()
-            if let launch = chatLaunch {
-                RelayChatView(
-                    viewModel: launch.viewModel,
-                    client: codexClient,
-                    identityStore: identityStore,
-                    onOpenSidebar: { setSidebar(true) },
-                    onNewChat: { openNewSession(folderPath: lastChatFolderPath, workspaceID: lastChatWorkspaceID) },
-                    onChooseProject: { showingWorkspacePicker = true },
-                    threadsRequest: $opensThreadsForHandoff,
-                    onBindChatToFolder: { path, workspaceID, card in
-                        opensThreadsForHandoff = false
-                        openChat(folderPath: path, workspaceID: workspaceID)
-                        if let model = chatLaunch?.viewModel { Task { await model.continueHandoff(card) } }
-                    },
-                    automaticallyOpensPreviews: false,
-                    powerModel: powerModel,
-                    machineName: machineName
-                )
-                .id(launch.id)
-                .accessibilityHidden(showingSidebar)
-                .allowsHitTesting(!showingSidebar)
-            }
-            if showingSidebar {
-                Color.black.opacity(0.4)
-                    .ignoresSafeArea()
-                    .onTapGesture { setSidebar(false) }
-                    .accessibilityLabel("Close sidebar")
-                    .accessibilityAddTraits(.isButton)
-                GeometryReader { geometry in
-                    RelayChatSidebar(
-                        feed: statusFeedViewModel,
-                        onClose: { setSidebar(false) },
-                        onNewChat: { openNewSession(folderPath: lastChatFolderPath, workspaceID: lastChatWorkspaceID) },
-                        onOpenChat: openSession,
-                        onHandoffs: { setSidebar(false); opensThreadsForHandoff = true },
-                        onFolders: { openDestination(.workspaces) },
-                        onPreviews: { openDestination(.previews) },
-                        onSettings: { openDestination(.settings) }
-                    )
-                    .frame(width: min(340, geometry.size.width - 44))
-                    .frame(maxHeight: .infinity)
-                    .background(AppTheme.canvasBottom.ignoresSafeArea())
-                    .gesture(DragGesture().onEnded { value in
-                        if value.translation.width < -60 { setSidebar(false) }
-                    })
+        RelayMobilePanelsContainer(controller: panelController) {
+            RelayWorkspacesSidebar(
+                feed: statusFeedViewModel,
+                nodeStore: nodeStore,
+                identityStore: identityStore,
+                powerModel: powerModel,
+                projects: workspaceStore.projects.map(RelaySidebarProjectGroup.from),
+                selectedWorkspaceID: activeWorkspaceRecord?.workspaceID ?? lastChatWorkspaceID,
+                selectedWorkspacePath: activeWorkspacePath,
+                selectedThreadID: chatLaunch?.viewModel.nativeSessionID,
+                pendingHandoffCount: 0,
+                onSelectWorkspace: { item in
+                    openWorkspaceItem(item)
+                },
+                onSelectThread: { thread in
+                    openSession(thread)
+                },
+                onNewAgent: { item in
+                    openNewSession(folderPath: item.path, workspaceID: item.workspaceID)
+                },
+                onOpenTerminal: { item in
+                    openEmbeddedTerminal(folderPath: item.path, workspaceID: item.workspaceID)
+                },
+                onViewChanges: { item in
+                    selectWorkspaceContext(folderPath: item.path, workspaceID: item.workspaceID)
+                    explorerInitialTab = .changes
+                    panelController.openExplorer()
+                },
+                onArchiveWorkspace: { item in
+                    Task { await archiveWorkspaceWorktree(item) }
+                },
+                onCreateWorkspace: { request in
+                    Task { await handleCreateWorkspace(request) }
+                },
+                onNewChat: {
+                    openNewSession(folderPath: activeWorkspacePath, workspaceID: activeWorkspaceRecord?.workspaceID ?? lastChatWorkspaceID)
+                },
+                onBrowseFolders: {
+                    openDestination(.workspaces)
+                },
+                onOpenHandoffs: {
+                    panelController.showCenter()
+                    opensThreadsForHandoff = true
+                },
+                onSelectHost: { host in
+                    nodeStore.selectHost(id: host.nodeID)
+                    panelController.showCenter()
+                },
+                onAddHost: {
+                    panelController.showCenter()
+                    showingAddHost = true
+                },
+                onOpenSettings: {
+                    openDestination(.settings)
                 }
-                .transition(.move(edge: .leading))
+            )
+        } center: {
+            VStack(spacing: 0) {
+                RelayWorkspaceHeader(
+                    workspaceName: activeWorkspaceDisplayName,
+                    projectName: activeProjectDisplayName,
+                    activeTab: activeHeaderTabItem,
+                    tabs: headerTabItems,
+                    hasGitChanges: activeWorkspaceHasGitChanges,
+                    isExplorerOpen: panelController.target == .rightExplorer,
+                    pendingHandoffCount: 0,
+                    showsTabStrip: true,
+                    onOpenSidebar: { panelController.openSidebar() },
+                    onToggleExplorer: {
+                        explorerInitialTab = .changes
+                        panelController.toggleExplorer()
+                    },
+                    onTapWorkspaceTitle: { showingWorkspacePicker = true },
+                    onSelectTab: { tabItem in
+                        selectWorkspaceTab(tabItem)
+                    },
+                    onNewAgent: {
+                        openNewSession(folderPath: activeWorkspacePath, workspaceID: activeWorkspaceRecord?.workspaceID ?? lastChatWorkspaceID)
+                    },
+                    onNewTerminal: {
+                        openEmbeddedTerminal(folderPath: activeWorkspacePath, workspaceID: activeWorkspaceRecord?.workspaceID ?? lastChatWorkspaceID)
+                    },
+                    onRenameTab: { tabItem, newTitle in
+                        if let tabUUID = UUID(uuidString: tabItem.id) {
+                            workspaceStore.renameTab(tabUUID, title: newTitle, in: activeWorkspacePath)
+                        }
+                    },
+                    onReloadTab: { tabItem in
+                        reloadWorkspaceTab(tabItem)
+                    },
+                    onCloseTab: { tabItem in
+                        closeWorkspaceTab(tabItem)
+                    },
+                    onOpenPreviews: {
+                        explorerInitialTab = .previews
+                        panelController.openExplorer()
+                    },
+                    onOpenHandoffs: {
+                        opensThreadsForHandoff = true
+                    },
+                    onOpenMachineStatus: {
+                        showingMachineMonitor = true
+                    },
+                    onOpenSettings: {
+                        openDestination(.settings)
+                    }
+                )
+                activeWorkspaceSurface
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+            .background(theme.surface0.ignoresSafeArea())
+        } right: {
+            RelayExplorerDrawerView(
+                client: codexClient,
+                identityStore: identityStore,
+                workspacePath: activeWorkspacePath,
+                workspaceName: activeWorkspaceDisplayName,
+                workspaceID: activeWorkspaceRecord?.workspaceID ?? lastChatWorkspaceID,
+                workspaceAccessIsAvailable: !foldersAreHiddenAfterComputerDisconnect && !powerModel.isDown,
+                initialTab: explorerInitialTab,
+                onClose: { panelController.showCenter() },
+                onAttachFileToChat: { mention in
+                    injectTextIntoActiveComposer(mention)
+                    panelController.showCenter()
+                },
+                onSendReviewComment: { comment in
+                    injectTextIntoActiveComposer(comment)
+                    panelController.showCenter()
+                },
+                onOpenJob: { job in
+                    panelController.showCenter()
+                    openPreviewSourceJob(job)
+                },
+                onHorizontalDragActive: { active in
+                    panelController.horizontalScrollBlocked = active
+                }
+            )
+            .id("\(activeWorkspacePath)|\(explorerInitialTab.rawValue)")
+        }
+    }
+
+    @ViewBuilder
+    private var activeWorkspaceSurface: some View {
+        if let activeTab = activeWorkspaceTab,
+           case .terminal(let terminalTabID, let wsID, let title) = activeTab.kind {
+            RelayTerminalView(
+                session: retainedTerminalSession(for: terminalTabID, workspaceID: wsID, title: title),
+                isEmbeddedTab: true,
+                onDismiss: { closeWorkspaceTab(RelayWorkspaceTabItem.from(activeTab, activeTabID: activeTab.id)) }
+            )
+            .id(terminalTabID)
+        } else if let launch = chatLaunch {
+            RelayChatView(
+                viewModel: launch.viewModel,
+                client: codexClient,
+                identityStore: identityStore,
+                onOpenSidebar: { panelController.openSidebar() },
+                onNewChat: { openNewSession(folderPath: activeWorkspacePath, workspaceID: activeWorkspaceRecord?.workspaceID ?? lastChatWorkspaceID) },
+                onChooseProject: { showingWorkspacePicker = true },
+                threadsRequest: $opensThreadsForHandoff,
+                onBindChatToFolder: { path, workspaceID, card in
+                    opensThreadsForHandoff = false
+                    openChat(folderPath: path, workspaceID: workspaceID)
+                    if let model = chatLaunch?.viewModel { Task { await model.continueHandoff(card) } }
+                },
+                automaticallyOpensPreviews: false,
+                powerModel: powerModel,
+                machineName: machineName,
+                embedsOwnHeader: false,
+                onOpenExplorer: {
+                    explorerInitialTab = .changes
+                    panelController.openExplorer()
+                },
+                workspaceFiles: workspaceFilesByPath[activeWorkspacePath] ?? [],
+                onForkConversation: { seed in
+                    forkCurrentConversation(seed: seed)
+                }
+            )
+            .id(launch.id)
+        } else {
+            theme.surface0.ignoresSafeArea()
         }
     }
 
@@ -534,9 +843,22 @@ struct POCVaultRootView: View {
             )
         case .settings:
             AccountSettingsView(
-                accountStore: accountStore, nodeStore: nodeStore, identityStore: identityStore,
-                computerLinkStore: computerLinkStore, codexClient: codexClient,
-                authClient: authClient, powerModel: powerModel
+                accountStore: accountStore,
+                nodeStore: nodeStore,
+                identityStore: identityStore,
+                computerLinkStore: computerLinkStore,
+                codexClient: codexClient,
+                authClient: authClient,
+                powerModel: powerModel,
+                pushService: pushService,
+                onOpenDiagnostics: {
+                    pendingDiagnostics = true
+                    selectedRootTab = .sessions
+                },
+                onOpenMachineMonitor: {
+                    pendingMachineMonitor = true
+                    selectedRootTab = .sessions
+                }
             )
         case .sessions:
             EmptyView()
@@ -544,8 +866,12 @@ struct POCVaultRootView: View {
     }
 
     private func setSidebar(_ visible: Bool) {
-        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.22)) { showingSidebar = visible }
+        if visible {
+            panelController.openSidebar()
+        } else if panelController.target == .leftSidebar {
+            panelController.showCenter()
+        }
+        showingSidebar = visible
     }
 
     private func openDestination(_ destination: RelayRootTab) {
@@ -739,32 +1065,39 @@ struct POCVaultRootView: View {
     }
 
     private func openChat(folderPath: String?, workspaceID: String?) {
-        setSidebar(false)
+        panelController.showCenter()
         selectedRootTab = .sessions
-        rememberChatContext(folderPath: folderPath, workspaceID: workspaceID)
-        chatLaunch = chatSessionStore.launch(folderPath: folderPath, workspaceID: workspaceID)
+        let launch = chatSessionStore.launch(folderPath: folderPath, workspaceID: workspaceID)
+        registerAndActivateChatLaunch(launch, folderPath: folderPath, workspaceID: workspaceID)
     }
 
     private func openNewSession(folderPath: String?, workspaceID: String?) {
-        setSidebar(false)
+        panelController.showCenter()
         selectedRootTab = .sessions
-        rememberChatContext(folderPath: folderPath, workspaceID: workspaceID)
-        chatLaunch = chatSessionStore.launchNewSession(folderPath: folderPath, workspaceID: workspaceID)
+        let launch = chatSessionStore.launchNewSession(folderPath: folderPath, workspaceID: workspaceID)
+        registerAndActivateChatLaunch(launch, folderPath: folderPath, workspaceID: workspaceID)
     }
 
     private func openSession(_ item: CodexThreadFeedItem) {
-        setSidebar(false)
+        panelController.showCenter()
         selectedRootTab = .sessions
-        rememberChatContext(folderPath: item.folderPath, workspaceID: item.workspaceID)
         let launch = chatSessionStore.launch(
             folderPath: item.folderPath,
             workspaceID: item.workspaceID
         )
-        chatLaunch = launch
+        registerAndActivateChatLaunch(
+            launch,
+            folderPath: item.folderPath,
+            workspaceID: item.workspaceID,
+            tabTitle: item.title,
+            provider: item.provider,
+            threadID: item.sessionID ?? item.id
+        )
         Task { await launch.viewModel.openHistoryItem(item) }
     }
 
     private func openPreviewSourceJob(_ job: CodexJob) {
+        panelController.showCenter()
         selectedRootTab = .sessions
         let item = CodexThreadFeedItem(source: .pendingJob(job))
         let launch = chatSessionStore.launch(
@@ -772,8 +1105,215 @@ struct POCVaultRootView: View {
             workspaceID: item.workspaceID,
             automaticallyOpensPreviews: false
         )
-        chatLaunch = launch
+        registerAndActivateChatLaunch(
+            launch,
+            folderPath: item.folderPath,
+            workspaceID: item.workspaceID,
+            tabTitle: item.title,
+            provider: item.provider,
+            threadID: item.sessionID ?? item.id
+        )
         Task { await launch.viewModel.openHistoryItem(item) }
+    }
+
+    private func selectWorkspaceContext(folderPath: String?, workspaceID: String?) {
+        rememberChatContext(folderPath: folderPath, workspaceID: workspaceID)
+        if let path = folderPath?.trimmedNonEmpty {
+            workspaceStore.selectedWorkspacePath = path
+        }
+    }
+
+    private func registerAndActivateChatLaunch(
+        _ launch: RelayChatLaunch,
+        folderPath: String?,
+        workspaceID: String?,
+        tabTitle: String? = nil,
+        provider: CodexProvider? = nil,
+        threadID: String? = nil
+    ) {
+        selectWorkspaceContext(folderPath: folderPath, workspaceID: workspaceID)
+        chatLaunch = launch
+        let targetPath = folderPath?.trimmedNonEmpty ?? activeWorkspacePath
+        let resolvedTitle = tabTitle?.trimmedNonEmpty ?? launch.viewModel.conversationTitle.trimmedNonEmpty ?? "New agent"
+        let launchUUID = chatLaunchesByID.first(where: { $0.value.id == launch.id })?.key ?? UUID()
+        chatLaunchesByID[launchUUID] = launch
+        _ = workspaceStore.openAgentTab(
+            in: targetPath,
+            launchID: launchUUID,
+            title: resolvedTitle,
+            provider: provider ?? launch.viewModel.currentSessionProvider ?? launch.viewModel.selectedTaskProvider,
+            threadID: threadID ?? launch.viewModel.nativeSessionID
+        )
+    }
+
+    private func openWorkspaceItem(_ item: RelaySidebarWorkspaceItem) {
+        let itemPath = item.path?.trimmedNonEmpty ?? activeWorkspacePath
+        selectWorkspaceContext(folderPath: itemPath, workspaceID: item.workspaceID)
+        selectedRootTab = .sessions
+        panelController.showCenter()
+        if let activeTab = workspaceStore.activeTab(for: itemPath) {
+            selectWorkspaceTab(RelayWorkspaceTabItem.from(activeTab, activeTabID: activeTab.id), in: itemPath)
+            return
+        }
+        if let recent = item.recentThread {
+            openSession(recent)
+        } else {
+            openChat(folderPath: itemPath, workspaceID: item.workspaceID)
+        }
+    }
+
+    private func openEmbeddedTerminal(folderPath: String?, workspaceID: String?) {
+        let path = folderPath?.trimmedNonEmpty ?? activeWorkspacePath
+        let wsID = workspaceID?.trimmedNonEmpty ?? workspaceStore.workspace(forPath: path)?.workspaceID ?? activeWorkspaceID
+        selectWorkspaceContext(folderPath: path, workspaceID: wsID)
+        selectedRootTab = .sessions
+        panelController.showCenter()
+        let tab = workspaceStore.openTerminalTab(in: path, workspaceID: wsID)
+        _ = retainedTerminalSession(for: tab.id, workspaceID: wsID, title: tab.title)
+    }
+
+    private func retainedTerminalSession(
+        for tabID: UUID,
+        workspaceID: String,
+        title: String
+    ) -> RelayTerminalSessionModel {
+        if let existing = terminalSessionsByTabID[tabID] {
+            return existing
+        }
+        let session = RelayTerminalSessionModel(
+            client: codexClient,
+            workspaceID: workspaceID,
+            workspaceName: activeWorkspaceDisplayName,
+            onTitleChange: { newTitle in
+                let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return }
+                workspaceStore.renameTab(tabID, title: trimmed, in: activeWorkspacePath)
+            },
+            onResizeTerminal: { [codexClient] id, cols, rows in
+                try? await codexClient.resizeTerminal(id: id, cols: cols, rows: rows)
+            }
+        )
+        terminalSessionsByTabID[tabID] = session
+        return session
+    }
+
+    private func selectWorkspaceTab(_ tabItem: RelayWorkspaceTabItem, in workspacePath: String? = nil) {
+        guard let tabUUID = UUID(uuidString: tabItem.id) else { return }
+        let path = workspacePath ?? activeWorkspacePath
+        workspaceStore.selectTab(tabUUID, in: path)
+        guard let tab = workspaceStore.tabs(for: path).first(where: { $0.id == tabUUID }) else { return }
+        switch tab.kind {
+        case .agent(let launchID, _, _, _):
+            if let launch = chatLaunchesByID[launchID] {
+                chatLaunch = launch
+            } else {
+                let launch = chatSessionStore.launch(folderPath: path, workspaceID: workspaceStore.workspace(forPath: path)?.workspaceID)
+                chatLaunch = launch
+                chatLaunchesByID[launchID] = launch
+            }
+        case .terminal(let termID, let wsID, let title):
+            _ = retainedTerminalSession(for: termID, workspaceID: wsID, title: title)
+        }
+    }
+
+    private func reloadWorkspaceTab(_ tabItem: RelayWorkspaceTabItem) {
+        guard let tabUUID = UUID(uuidString: tabItem.id),
+              let tab = workspaceStore.tabs(for: activeWorkspacePath).first(where: { $0.id == tabUUID }) else { return }
+        switch tab.kind {
+        case .agent(let launchID, _, _, _):
+            if let launch = chatLaunchesByID[launchID] ?? chatLaunch {
+                Task { await launch.viewModel.bootstrap() }
+            }
+        case .terminal(let termID, _, _):
+            terminalSessionsByTabID[termID]?.restart()
+        }
+    }
+
+    private func closeWorkspaceTab(_ tabItem: RelayWorkspaceTabItem) {
+        guard let tabUUID = UUID(uuidString: tabItem.id) else { return }
+        if let session = terminalSessionsByTabID.removeValue(forKey: tabUUID) {
+            session.close()
+        }
+        workspaceStore.closeTab(tabUUID, in: activeWorkspacePath)
+        if let next = workspaceStore.activeTab(for: activeWorkspacePath) {
+            selectWorkspaceTab(RelayWorkspaceTabItem.from(next, activeTabID: next.id))
+        } else {
+            openNewSession(folderPath: activeWorkspacePath, workspaceID: activeWorkspaceRecord?.workspaceID ?? lastChatWorkspaceID)
+        }
+    }
+
+    private func injectTextIntoActiveComposer(_ text: String) {
+        if let activeTab = activeWorkspaceTab, activeTab.kind.isTerminal {
+            if let agentTab = activeWorkspaceTabs.first(where: { $0.kind.isAgent }) {
+                selectWorkspaceTab(RelayWorkspaceTabItem.from(agentTab, activeTabID: agentTab.id))
+            } else {
+                openChat(folderPath: activeWorkspacePath, workspaceID: activeWorkspaceRecord?.workspaceID ?? lastChatWorkspaceID)
+            }
+        }
+        guard let vm = chatLaunch?.viewModel else { return }
+        if vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            vm.prompt = text
+        } else {
+            let separator = vm.prompt.hasSuffix(" ") || vm.prompt.hasSuffix("\n") ? "" : "\n"
+            vm.prompt += separator + text
+        }
+    }
+
+    private func forkCurrentConversation(seed: String) {
+        let path = activeWorkspacePath
+        let wsID = activeWorkspaceRecord?.workspaceID ?? lastChatWorkspaceID
+        let next = chatSessionStore.launchNewSession(folderPath: path, workspaceID: wsID)
+        next.viewModel.prompt = seed
+        registerAndActivateChatLaunch(next, folderPath: path, workspaceID: wsID, tabTitle: "Forked agent")
+    }
+
+    private func handleCreateWorkspace(_ request: RelayNewWorkspaceRequest) async {
+        let projectRoot = request.projectRootPath?.trimmedNonEmpty ?? activeWorkspacePath
+        switch request.isolation {
+        case .projectDirectory:
+            let wsID = workspaceStore.workspace(forPath: projectRoot)?.workspaceID
+            if request.launchMode == .terminal {
+                openEmbeddedTerminal(folderPath: projectRoot, workspaceID: wsID)
+            } else {
+                openNewSession(folderPath: projectRoot, workspaceID: wsID)
+            }
+        case .newGitWorktree:
+            do {
+                let created = try await workspaceStore.createWorktree(
+                    client: codexClient,
+                    projectPath: projectRoot,
+                    name: request.branchName?.trimmedNonEmpty,
+                    branch: request.branchName?.trimmedNonEmpty,
+                    baseBranch: request.baseBranch?.trimmedNonEmpty,
+                    action: "branch-off"
+                )
+                if request.launchMode == .terminal {
+                    openEmbeddedTerminal(folderPath: created.path, workspaceID: created.workspaceID)
+                } else {
+                    openNewSession(folderPath: created.path, workspaceID: created.workspaceID)
+                }
+            } catch {
+                worktreeAlertMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func archiveWorkspaceWorktree(_ item: RelaySidebarWorkspaceItem) async {
+        guard let path = item.path?.trimmedNonEmpty else { return }
+        do {
+            try await workspaceStore.archiveWorktree(client: codexClient, path: path, force: true)
+            await workspaceStore.refreshProjects(client: codexClient, feedItems: statusFeedViewModel.feedItems)
+        } catch {
+            worktreeAlertMessage = error.localizedDescription
+        }
+    }
+
+    private func refreshWorkspaceContext(for path: String) async {
+        async let files = codexClient.fetchWorkspaceFilesForAutocomplete(folderPath: path)
+        async let gitStatus = workspaceStore.refreshGitStatus(client: codexClient, path: path)
+        let loadedFiles = await files
+        _ = await gitStatus
+        workspaceFilesByPath[path] = loadedFiles
     }
 
     private var shouldStartAgentMonitor: Bool {
@@ -790,12 +1330,17 @@ struct POCVaultRootView: View {
     ///   folder when set, else the root); the existing RELAY_UITEST_MODEL /
     ///   RELAY_UITEST_PROMPT / RELAY_UITEST_TASK_PROMPT auto-drive then takes over.
     /// - RELAY_UITEST_OPEN=previews|library|status|account|usage select that tab
-    ///   (`usage` also presents the machine Usage sheet)
+    /// - RELAY_UITEST_PANEL=left|center|right|files|previews open Paseo 3-panel surface
+    /// - RELAY_UITEST_TERMINAL=1           open an embedded VT100 terminal tab
+    /// - RELAY_UITEST_SETTINGS=1           open Paseo Settings sheet
     private func applyUITestHooks() {
         let env = ProcessInfo.processInfo.environment
         if let folder = env["RELAY_UITEST_PATH"]?.trimmedNonEmpty {
             browserPath.append(.folder(path: folder))
-            selectedRootTab = .workspaces
+            selectWorkspaceContext(folderPath: folder, workspaceID: nil)
+            if env["RELAY_UITEST_PANEL"] == nil && env["RELAY_UITEST_TERMINAL"] == nil && env["RELAY_UITEST_CHAT"] != "1" {
+                selectedRootTab = .workspaces
+            }
         }
         if let file = env["RELAY_UITEST_FILE"]?.trimmedNonEmpty,
            let data = try? JSONSerialization.data(withJSONObject: ["path": file, "kind": "file"]),
@@ -807,7 +1352,7 @@ struct POCVaultRootView: View {
             selectedRootTab = .previews
         case "status":
             selectedRootTab = .sessions
-            showingSidebar = true
+            panelController.openSidebar()
         case "account":
             selectedRootTab = .settings
         case "usage":
@@ -818,6 +1363,30 @@ struct POCVaultRootView: View {
         }
         if env["RELAY_UITEST_CHAT"] == "1" {
             openChat(folderPath: env["RELAY_UITEST_PATH"]?.trimmedNonEmpty, workspaceID: nil)
+        }
+        if env["RELAY_UITEST_TERMINAL"] == "1" {
+            openEmbeddedTerminal(folderPath: env["RELAY_UITEST_PATH"]?.trimmedNonEmpty, workspaceID: nil)
+        }
+        if env["RELAY_UITEST_SETTINGS"] == "1" {
+            selectedRootTab = .settings
+        }
+        if let panel = env["RELAY_UITEST_PANEL"]?.trimmedNonEmpty {
+            selectedRootTab = .sessions
+            switch panel {
+            case "left", "sidebar":
+                panelController.openSidebar()
+            case "right", "changes":
+                explorerInitialTab = .changes
+                panelController.openExplorer()
+            case "files":
+                explorerInitialTab = .files
+                panelController.openExplorer()
+            case "previews":
+                explorerInitialTab = .previews
+                panelController.openExplorer()
+            default:
+                panelController.showCenter()
+            }
         }
     }
     #endif
@@ -935,8 +1504,10 @@ private struct RelayChatSidebar: View {
 
 private struct RelayChatProjectPicker: View {
     let client: CodexClient
+    var onBrowseAllFolders: (() -> Void)? = nil
     let onChoose: (CodexWorkspace) -> Void
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.relayTheme) private var theme
     @State private var workspaces: [CodexWorkspace] = []
     @State private var error: String?
     @State private var loading = true
@@ -945,27 +1516,40 @@ private struct RelayChatProjectPicker: View {
     var body: some View {
         NavigationStack {
             List {
+                if let onBrowseAllFolders {
+                    Section {
+                        Button(action: onBrowseAllFolders) {
+                            Label("Browse all folders…", systemImage: "folder.badge.gearshape")
+                                .foregroundStyle(theme.accentBright)
+                                .frame(minHeight: 38)
+                        }
+                        .listRowBackground(theme.surface1)
+                    }
+                }
                 Section {
-                    if loading { ProgressView("Loading projects…") }
-                    if let error { Text(error).foregroundStyle(AppTheme.statusError) }
+                    if loading { ProgressView("Loading folders…").listRowBackground(theme.surface1) }
+                    if let error { Text(error).foregroundStyle(theme.statusDanger).listRowBackground(theme.surface1) }
                     ForEach(workspaces.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) }) { workspace in
                         Button { onChoose(workspace) } label: {
                             Label(workspace.name, systemImage: "folder")
-                                .foregroundStyle(AppTheme.textPrimary)
+                                .foregroundStyle(theme.foreground)
                                 .frame(minHeight: 36)
                         }
+                        .listRowBackground(theme.surface1)
                     }
                     if !loading, workspaces.isEmpty, error == nil {
-                        Text("Open Files from the sidebar to choose a folder on your computer.")
+                        Text("Tap Browse all folders to choose any directory on your computer.")
+                            .foregroundStyle(theme.foregroundMuted)
+                            .listRowBackground(theme.surface1)
                     }
                 } footer: {
                     Text("Choose where your agent works. Your draft stays with you.")
                 }
             }
-            .searchable(text: $search, prompt: "Find a project")
+            .searchable(text: $search, prompt: "Find a folder")
             .scrollContentBackground(.hidden)
-            .background(AppTheme.bgCanvas)
-            .navigationTitle("Choose project")
+            .background(theme.surface0)
+            .navigationTitle("Choose folder")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } } }
             .task {
@@ -974,7 +1558,7 @@ private struct RelayChatProjectPicker: View {
                 loading = false
             }
         }
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(theme.colorScheme)
     }
 }
 

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import mimetypes
 import os
@@ -69,6 +71,9 @@ class SimulatorVaultServer(ThreadingHTTPServer):
         self.sim_job_counter = 0
         self.active_job = SimJob("sim-job-running")
         self.handoff_job_id: str | None = None
+        self.sim_git_repos: dict[str, dict] = init_sim_git_repos()
+        self.sim_worktrees: dict[str, list[dict]] = init_sim_worktrees(self.sim_git_repos)
+        self.sim_commit_counter = 0
         self.fixture_lock = threading.Lock()
 
 
@@ -244,8 +249,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/codex/terminals":
             body = self.read_json_body()
             workspace_id = str(body.get("workspaceId") or "")
-            workspace = next((item for item in _SIM_WORKSPACES if item["id"] == workspace_id), None)
-            workspace = workspace or self.server.dynamic_workspaces.get(workspace_id)
+            workspace = sim_resolve_workspace(self.server, workspace_id)
             if workspace is None:
                 self.send_json_error(400, "unknown workspaceId")
                 return
@@ -255,43 +259,59 @@ class Handler(BaseHTTPRequestHandler):
                 terminal = codex_fixture_terminal(
                     terminal_id,
                     workspace,
-                    cols=bounded_int(body.get("cols"), 80, 20, 240),
-                    rows=bounded_int(body.get("rows"), 24, 8, 100),
+                    cols=bounded_int(body.get("cols"), 80, 20, 300),
+                    rows=bounded_int(body.get("rows"), 24, 8, 120),
                 )
+                startup_output = sim_terminal_startup_output(self.server, workspace)
                 self.server.terminals[terminal_id] = {
                     "terminal": terminal,
-                    "output": f"Relay terminal · {workspace['name']}\n$ ",
+                    "workspace": dict(workspace),
+                    "output": startup_output,
+                    "line_buffer": "",
+                    "sequence": 0,
                     "version": 0,
                 }
-            self.send_json({"terminal": terminal})
+            self.send_json({"terminal": terminal}, status=201)
             return
         terminal_input_match = re.fullmatch(r"/v1/codex/terminals/([^/]+)/input", path)
         if terminal_input_match:
             body = self.read_json_body()
-            text = str(body.get("text") or "")
             record = self.server.terminals.get(terminal_input_match.group(1))
             if record is None:
                 self.send_json_error(404, "terminal was not found")
                 return
+            if record["terminal"]["status"] not in {"starting", "running"}:
+                self.send_json_error(409, "terminal is not running")
+                return
+            if isinstance(body.get("dataBase64"), str):
+                try:
+                    text = base64.b64decode(body["dataBase64"]).decode("utf-8", errors="replace")
+                except ValueError:
+                    self.send_json_error(400, "invalid dataBase64")
+                    return
+            elif isinstance(body.get("text"), str):
+                text = body["text"]
+            else:
+                self.send_json_error(400, "text or dataBase64 is required")
+                return
             with self.server.fixture_lock:
-                command = text.strip()
-                record["output"] += text
-                if command == "pwd":
-                    workspace_id = record["terminal"]["workspaceId"]
-                    workspace = next((item for item in _SIM_WORKSPACES if item["id"] == workspace_id), None)
-                    workspace = workspace or self.server.dynamic_workspaces[workspace_id]
-                    record["output"] += f"{workspace['path']}\n$ "
-                elif command in {"exit", "logout"}:
-                    record["output"] += "logout\n"
-                    record["terminal"].update({
-                        "status": "exited",
-                        "updatedAt": "2026-08-14T11:01:00Z",
-                        "finishedAt": "2026-08-14T11:01:00Z",
-                        "exitCode": 0,
-                    })
-                elif command:
-                    record["output"] += f"simulator: {command}\n$ "
-                record["version"] += 1
+                sim_terminal_ingest_input(self.server, record, text)
+            self.send_json({"ok": True, "terminal": record["terminal"]})
+            return
+        terminal_resize_match = re.fullmatch(r"/v1/codex/terminals/([^/]+)/resize", path)
+        if terminal_resize_match:
+            body = self.read_json_body()
+            record = self.server.terminals.get(terminal_resize_match.group(1))
+            if record is None:
+                self.send_json_error(404, "terminal was not found")
+                return
+            if record["terminal"]["status"] not in {"starting", "running"}:
+                self.send_json_error(409, "terminal is not running")
+                return
+            with self.server.fixture_lock:
+                record["terminal"]["cols"] = bounded_int(body.get("cols"), record["terminal"]["cols"], 20, 300)
+                record["terminal"]["rows"] = bounded_int(body.get("rows"), record["terminal"]["rows"], 8, 120)
+                record["terminal"]["updatedAt"] = sim_now_iso()
             self.send_json({"terminal": record["terminal"]})
             return
         terminal_close_match = re.fullmatch(r"/v1/codex/terminals/([^/]+)/close", path)
@@ -301,22 +321,46 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json_error(404, "terminal was not found")
                 return
             with self.server.fixture_lock:
+                now = sim_now_iso()
                 record["terminal"].update({
                     "status": "closed",
-                    "updatedAt": "2026-08-14T11:01:00Z",
-                    "finishedAt": "2026-08-14T11:01:00Z",
+                    "updatedAt": now,
+                    "finishedAt": now,
                     "exitCode": record["terminal"].get("exitCode"),
                 })
                 record["version"] += 1
             self.send_json({"terminal": record["terminal"]})
+            return
+        if path == "/v1/codex/git/checkout":
+            status, payload = sim_git_checkout(self.server, self.read_json_body())
+            self.send_json(payload, status=status)
+            return
+        if path == "/v1/codex/git/discard":
+            status, payload = sim_git_discard(self.server, self.read_json_body())
+            self.send_json(payload, status=status)
+            return
+        if path == "/v1/codex/git/commit":
+            status, payload = sim_git_commit(self.server, self.read_json_body())
+            self.send_json(payload, status=status)
+            return
+        if path == "/v1/codex/worktrees":
+            status, payload = sim_worktree_create(self.server, self.read_json_body())
+            self.send_json(payload, status=status)
+            return
+        if path == "/v1/codex/worktrees/remove":
+            status, payload = sim_worktree_remove(self.server, self.read_json_body())
+            self.send_json(payload, status=status)
             return
         if path == "/v1/codex/transcriptions":
             self.send_json({"text": "Simulator voice transcript", "durationMs": 1200})
             return
         if path == "/v1/codex/workspaces/select":
             body = self.read_json_body()
-            listing = codex_fixture_fs_list(str(body.get("path") or ""), {})
-            workspace = listing.get("workspace") if listing else None
+            requested_path = str(body.get("path") or "")
+            workspace = sim_workspace_for_worktree_path(self.server, requested_path)
+            if workspace is None:
+                listing = codex_fixture_fs_list(requested_path, {})
+                workspace = listing.get("workspace") if listing else None
             if workspace is None:
                 self.send_json_error(400, "workspace root cannot be selected")
                 return
@@ -330,9 +374,20 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_DELETE(self) -> None:
-        path = unquote(urlparse(self.path).path)
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path)
         if path == "/v1/auth/device/link":
             self.send_json({"ok": True})
+            return
+        if path == "/v1/codex/worktrees":
+            body = self.read_json_body()
+            params = parse_qs(parsed.query)
+            if "path" not in body and params.get("path"):
+                body["path"] = params["path"][0]
+            if "force" not in body and params.get("force"):
+                body["force"] = params["force"][0].lower() in {"1", "true", "yes"}
+            status, payload = sim_worktree_remove(self.server, body)
+            self.send_json(payload, status=status)
             return
         self.send_error(404)
 
@@ -378,6 +433,43 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/v1/codex/fs/file":
             self.serve_codex_fs_file(parse_qs(query))
+            return
+        if path == "/v1/codex/fs/git":
+            self.send_json(sim_fs_git_status(self.server, parse_qs(query)))
+            return
+        if path == "/v1/codex/git/status":
+            status, payload = sim_git_status(self.server, parse_qs(query))
+            self.send_json(payload, status=status)
+            return
+        if path == "/v1/codex/git/diff":
+            status, payload = sim_git_diff(self.server, parse_qs(query))
+            self.send_json(payload, status=status)
+            return
+        if path == "/v1/codex/git/commits":
+            status, payload = sim_git_commits(self.server, parse_qs(query))
+            self.send_json(payload, status=status)
+            return
+        if path == "/v1/codex/git/commit-diff":
+            status, payload = sim_git_commit_diff(self.server, parse_qs(query))
+            self.send_json(payload, status=status)
+            return
+        if path == "/v1/codex/git/branches":
+            status, payload = sim_git_branches(self.server, parse_qs(query))
+            self.send_json(payload, status=status)
+            return
+        if path == "/v1/codex/worktrees":
+            status, payload = sim_worktree_list(self.server, parse_qs(query))
+            self.send_json(payload, status=status)
+            return
+        if path == "/v1/codex/terminals":
+            workspace_id = parse_qs(query).get("workspaceId", [""])[0].strip()
+            with self.server.fixture_lock:
+                terminals = [
+                    dict(rec["terminal"])
+                    for rec in self.server.terminals.values()
+                    if not workspace_id or rec["terminal"]["workspaceId"] == workspace_id
+                ]
+            self.send_json({"terminals": terminals})
             return
         if path == "/v1/codex/jobs":
             jobs = [codex_fixture_approval_job(self.server), codex_fixture_job()]
@@ -464,6 +556,15 @@ class Handler(BaseHTTPRequestHandler):
         if terminal_stream_match:
             self.serve_codex_terminal_stream(terminal_stream_match.group(1))
             return
+        terminal_detail_match = re.fullmatch(r"/v1/codex/terminals/([^/]+)", path)
+        if terminal_detail_match:
+            record = self.server.terminals.get(terminal_detail_match.group(1))
+            if record is None:
+                self.send_json_error(404, "terminal was not found")
+                return
+            with self.server.fixture_lock:
+                self.send_json({"terminal": dict(record["terminal"])})
+            return
         self.send_error(404)
 
     def serve_codex_terminal_stream(self, terminal_id: str) -> None:
@@ -472,37 +573,44 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json_error(404, "terminal was not found")
             return
         self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache, no-transform")
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
 
-        def emit(event: str, payload: dict) -> None:
+        def emit(event: str, payload: dict, event_id: int | None = None) -> None:
+            if event_id is not None:
+                self.wfile.write(f"id: {event_id}\n".encode("utf-8"))
             self.wfile.write(f"event: {event}\n".encode("utf-8"))
             self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode("utf-8"))
             self.wfile.flush()
 
-        emitted_version = -1
+        sent_offset = -1
+        last_heartbeat = time.monotonic()
         try:
-            for _ in range(240):
+            while True:
                 with self.server.fixture_lock:
                     snapshot = dict(record["terminal"])
                     output = str(record["output"])
-                    version = int(record["version"])
-                if emitted_version == -1:
-                    emit("snapshot", {"terminal": snapshot, "output": output})
-                    emitted_version = version
-                elif version != emitted_version:
-                    emit("snapshot", {"terminal": snapshot, "output": output})
-                    emitted_version = version
+                    sequence = int(record.get("sequence", 0))
+                if sent_offset == -1:
+                    emit("snapshot", {"terminal": snapshot, "output": output}, event_id=sequence)
+                    sent_offset = len(output)
+                elif len(output) > sent_offset:
+                    delta = output[sent_offset:]
+                    sent_offset = len(output)
+                    emit("output", {"sequence": sequence, "text": delta}, event_id=sequence)
                 if snapshot["status"] not in {"starting", "running"}:
-                    emit("done", {"terminal": snapshot})
+                    emit("done", {"terminal": snapshot}, event_id=sequence)
                     return
-                self.wfile.write(b": heartbeat\n\n")
-                self.wfile.flush()
-                time.sleep(0.25)
-        except (BrokenPipeError, ConnectionResetError):
+                now_mono = time.monotonic()
+                if now_mono - last_heartbeat >= 10.0:
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+                    last_heartbeat = now_mono
+                time.sleep(0.08)
+        except (BrokenPipeError, ConnectionResetError, OSError):
             return
 
     def serve_codex_job_stream(self, job: "SimJob", query: dict | None = None) -> None:
@@ -690,6 +798,8 @@ class Handler(BaseHTTPRequestHandler):
     def serve_codex_fs_list(self, query: dict) -> None:
         requested = (query.get("path", [""])[0] or "").strip()
         listing = codex_fixture_fs_list(requested, query)
+        if listing is None:
+            listing = sim_worktree_fs_list(self.server, requested, query)
         if listing is None:
             self.send_json_error(404, "workspace directory was not found")
             return
@@ -2305,6 +2415,1597 @@ def codex_fixture_job(
         "completedAt": None if status == "running" else "2026-05-23T13:35:30Z",
         "updatedAt": "2026-05-23T13:35:30Z",
     }
+
+
+# --- Paseo Git, Worktree, and ANSI Terminal simulator fixtures ----------------
+
+_SIM_DEFAULT_WORKTREE_PATH = f"{_SIM_WORKSPACE_ROOT}/poc-vault/.relay/worktrees/fix-138-number-keys"
+_SIM_PASEO_WORKTREE_PATH = f"{_SIM_WORKSPACE_ROOT}/poc-vault/.relay/worktrees/feat-paseo-ui"
+_SIM_POC_VAULT_MAIN_PATH = f"{_SIM_WORKSPACE_ROOT}/poc-vault"
+_SIM_SIGIQ_MAIN_PATH = f"{_SIM_WORKSPACE_ROOT}/sigiq"
+
+_SIM_PR_BY_BRANCH: dict[str, dict] = {
+    "fix-138-number-keys": {
+        "number": 142,
+        "title": "Fix number-key input handling in VT100 terminal",
+        "state": "OPEN",
+        "url": "https://github.com/relay-demo/launch-checklist/pull/142",
+        "headBranch": "fix-138-number-keys",
+        "checksStatus": "passing",
+    },
+    "feat/paseo-ui": {
+        "number": 145,
+        "title": "Paseo workspace sidebar, multi-tab strip, and diff viewer",
+        "state": "OPEN",
+        "url": "https://github.com/relay-demo/launch-checklist/pull/145",
+        "headBranch": "feat/paseo-ui",
+        "checksStatus": "pending",
+    },
+}
+
+
+def _sim_norm_path(raw: str | None) -> str:
+    value = (raw or "").strip()
+    while len(value) > 1 and value.endswith("/"):
+        value = value[:-1]
+    return value
+
+
+def _sim_slugify_worktree(value: str) -> str | None:
+    slug = re.sub(r"[^a-z0-9._-]+", "-", value.strip().lower())
+    slug = re.sub(r"--+", "-", slug).strip(".-")[:64]
+    if not slug or slug in {".", ".."}:
+        return None
+    return slug
+
+
+def _sim_build_hunk(
+    old_start: int,
+    new_start: int,
+    raw_lines: list[tuple[str, str]],
+    header_context: str = "",
+) -> dict:
+    old_line = old_start
+    new_line = new_start
+    old_count = 0
+    new_count = 0
+    lines: list[dict] = []
+    for prefix, text in raw_lines:
+        if prefix == "+":
+            lines.append({"kind": "add", "oldLine": None, "newLine": new_line, "text": text})
+            new_line += 1
+            new_count += 1
+        elif prefix == "-":
+            lines.append({"kind": "del", "oldLine": old_line, "newLine": None, "text": text})
+            old_line += 1
+            old_count += 1
+        else:
+            lines.append({"kind": "context", "oldLine": old_line, "newLine": new_line, "text": text})
+            old_line += 1
+            new_line += 1
+            old_count += 1
+            new_count += 1
+    suffix = f" {header_context}" if header_context else ""
+    return {
+        "header": f"@@ -{old_start},{old_count} +{new_start},{new_count} @@{suffix}",
+        "oldStart": old_start,
+        "oldCount": old_count,
+        "newStart": new_start,
+        "newCount": new_count,
+        "lines": lines,
+    }
+
+
+def _sim_build_diff_file(
+    path: str,
+    *,
+    status: str = "modified",
+    staged: bool = False,
+    unstaged: bool = True,
+    old_path: str | None = None,
+    binary: bool = False,
+    hunks: list[dict] | None = None,
+) -> dict:
+    hunk_list = list(hunks or [])
+    added = sum(1 for h in hunk_list for ln in h["lines"] if ln["kind"] == "add")
+    deleted = sum(1 for h in hunk_list for ln in h["lines"] if ln["kind"] == "del")
+    return {
+        "path": path,
+        "oldPath": old_path,
+        "status": status,
+        "staged": staged,
+        "unstaged": unstaged,
+        "added": added,
+        "deleted": deleted,
+        "binary": binary,
+        "hunks": hunk_list,
+    }
+
+
+def _sim_diff_file_public(entry: dict) -> dict:
+    return {
+        "path": entry["path"],
+        "oldPath": entry.get("oldPath"),
+        "status": entry["status"],
+        "added": entry["added"],
+        "deleted": entry["deleted"],
+        "binary": entry.get("binary", False),
+        "hunks": entry.get("hunks", []),
+    }
+
+
+def _sim_status_file_public(entry: dict) -> dict:
+    return {
+        "path": entry["path"],
+        "oldPath": entry.get("oldPath"),
+        "status": entry["status"],
+        "staged": bool(entry.get("staged", False)),
+        "unstaged": bool(entry.get("unstaged", True)),
+        "added": entry["added"],
+        "deleted": entry["deleted"],
+        "binary": bool(entry.get("binary", False)),
+    }
+
+
+def _sim_fix138_uncommitted_files() -> list[dict]:
+    """Three Swift + TypeScript modified files totaling exactly +68 -23."""
+    swift_vt100 = _sim_build_diff_file(
+        "ios/POCVault/POCVault/Terminal/RelayVT100Engine.swift",
+        status="modified",
+        staged=False,
+        unstaged=True,
+        hunks=[
+            _sim_build_hunk(
+                74,
+                74,
+                [
+                    (" ", "    private(set) var cols: Int"),
+                    (" ", "    private(set) var rows: Int"),
+                    (" ", "    private(set) var isCursorVisible: Bool = true"),
+                    (" ", "    private(set) var applicationCursorKeys: Bool = false"),
+                    ("+", "    private(set) var applicationKeypadMode: Bool = false"),
+                    ("+", "    private(set) var modifyOtherKeysLevel: Int = 0"),
+                    (" ", "    private(set) var bracketedPasteMode: Bool = false"),
+                ],
+                header_context="final class RelayVT100Engine",
+            ),
+            _sim_build_hunk(
+                412,
+                414,
+                [
+                    (" ", "    private func handleEscapeScalar(_ scalar: UnicodeScalar) {"),
+                    (" ", "        switch scalar.value {"),
+                    ("-", "        case 0x3D, 0x3E: // DECKPAM / DECKPNM"),
+                    ("-", "            parserState = .ground"),
+                    ("+", "        case 0x3D: // DECKPAM — enable application keypad mode"),
+                    ("+", "            applicationKeypadMode = true"),
+                    ("+", "            parserState = .ground"),
+                    ("+", "        case 0x3E: // DECKPNM — restore numeric keypad mode"),
+                    ("+", "            applicationKeypadMode = false"),
+                    ("+", "            parserState = .ground"),
+                    (" ", "        case 0x5B: // CSI"),
+                    (" ", "            resetCSIState()"),
+                    (" ", "            parserState = .csiEntry"),
+                    (" ", "        default:"),
+                    (" ", "            parserState = .ground"),
+                    (" ", "        }"),
+                    (" ", "    }"),
+                ],
+                header_context="private func handleEscapeScalar",
+            ),
+            _sim_build_hunk(
+                520,
+                526,
+                [
+                    (" ", "    /// Encodes a hardware or soft keyboard digit press into the exact"),
+                    ("-", "    /// VT100 byte sequence expected by the remote shell."),
+                    ("-", "    func encodeDigitKey(_ digit: Character, modifiers: UIKeyModifierFlags) -> String {"),
+                    ("-", "        if modifiers.contains(.control) {"),
+                    ("-", "            return String(digit)"),
+                    ("-", "        }"),
+                    ("-", "        if modifiers.contains(.alternate) {"),
+                    ("-", "            return \"\\u{1B}\\(digit)\""),
+                    ("-", "        }"),
+                    ("-", "        return String(digit)"),
+                    ("+", "    /// VT100/xterm byte sequence expected by zsh, tmux, and Neovim."),
+                    ("+", "    func encodeDigitKey(_ digit: Character, modifiers: UIKeyModifierFlags, isNumpad: Bool = false) -> String {"),
+                    ("+", "        if isNumpad, applicationKeypadMode, modifiers.isEmpty,"),
+                    ("+", "           let ss3 = Self.applicationKeypadMap[digit] {"),
+                    ("+", "            return \"\\u{1B}O\\(ss3)\""),
+                    ("+", "        }"),
+                    ("+", "        if modifiers.contains(.control) {"),
+                    ("+", "            if let ctrlByte = Self.ctrlDigitControlMap[digit] { return ctrlByte }"),
+                    ("+", "            if modifyOtherKeysLevel >= 1 {"),
+                    ("+", "                let code = digit.asciiValue ?? 48"),
+                    ("+", "                return \"\\u{1B}[27;5;\\(code)~\""),
+                    ("+", "            }"),
+                    ("+", "            return String(digit)"),
+                    ("+", "        }"),
+                    ("+", "        if modifiers.contains(.alternate) {"),
+                    ("+", "            return \"\\u{1B}\\(digit)\""),
+                    ("+", "        }"),
+                    ("+", "        return String(digit)"),
+                    (" ", "    }"),
+                    (" ", ""),
+                    ("+", "    private static let applicationKeypadMap: [Character: String] = ["),
+                    ("+", "        \"0\": \"p\", \"1\": \"q\", \"2\": \"r\", \"3\": \"s\", \"4\": \"t\","),
+                    ("+", "        \"5\": \"u\", \"6\": \"v\", \"7\": \"w\", \"8\": \"x\", \"9\": \"y\""),
+                    ("+", "    ]"),
+                    ("+", "    private static let ctrlDigitControlMap: [Character: String] = ["),
+                    ("+", "        \"2\": \"\\u{00}\", \"3\": \"\\u{1B}\", \"4\": \"\\u{1C}\","),
+                    ("+", "        \"5\": \"\\u{1D}\", \"6\": \"\\u{1E}\", \"7\": \"\\u{1F}\""),
+                    ("+", "    ]"),
+                ],
+                header_context="func encodeDigitKey",
+            ),
+        ],
+    )
+
+    swift_terminal_view = _sim_build_diff_file(
+        "ios/POCVault/POCVault/Views/RelayTerminalView.swift",
+        status="modified",
+        staged=True,
+        unstaged=True,
+        hunks=[
+            _sim_build_hunk(
+                44,
+                44,
+                [
+                    (" ", "                HStack(spacing: 8) {"),
+                    ("-", "                    Button(\"^C\") { send(\"\\u{3}\") }"),
+                    ("-", "                        .font(AppTheme.monoFont(size: 13, weight: .semibold))"),
+                    ("-", "                        .buttonStyle(.bordered)"),
+                    ("+", "                    ForEach(quickControlKeys, id: \\.label) { item in"),
+                    ("+", "                        Button(item.label) { send(item.sequence) }"),
+                    ("+", "                            .font(AppTheme.monoFont(size: 12, weight: .semibold))"),
+                    ("+", "                            .buttonStyle(.bordered)"),
+                    ("+", "                    }"),
+                    (" ", "                    TextField(\"Command\", text: $input)"),
+                ],
+                header_context="var body: some View",
+            ),
+            _sim_build_hunk(
+                114,
+                116,
+                [
+                    (" ", "    private func sendLine() {"),
+                    (" ", "        guard !input.isEmpty else { return }"),
+                    ("-", "        let value = input"),
+                    ("-", "        input = \"\""),
+                    ("-", "        send(\"\\(value)\\n\")"),
+                    ("+", "        let value = input"),
+                    ("+", "        input = \"\""),
+                    ("+", "        send(\"\\(value)\\r\")"),
+                    (" ", "    }"),
+                    (" ", ""),
+                    ("-", "    private func send(_ text: String) {"),
+                    ("+", "    private func sendKeyPress(_ key: UIKey) {"),
+                    ("+", "        guard let first = key.charactersIgnoringModifiers.first, first.isNumber else {"),
+                    ("+", "            send(key.characters)"),
+                    ("+", "            return"),
+                    ("+", "        }"),
+                    ("+", "        let isNumpad = key.modifierFlags.contains(.numericPad)"),
+                    ("+", "        let encoded = engine.encodeDigitKey(first, modifiers: key.modifierFlags, isNumpad: isNumpad)"),
+                    ("+", "        send(encoded)"),
+                    ("+", "    }"),
+                    ("+", ""),
+                    ("+", "    private func send(_ text: String) {"),
+                    (" ", "        guard let terminal else { return }"),
+                ],
+                header_context="private func sendLine",
+            ),
+        ],
+    )
+
+    ts_key_encoder = _sim_build_diff_file(
+        "web/src/terminal/keyEncoder.ts",
+        status="modified",
+        staged=False,
+        unstaged=True,
+        hunks=[
+            _sim_build_hunk(
+                18,
+                18,
+                [
+                    (" ", "export interface KeyEncoderState {"),
+                    (" ", "  applicationCursorKeys: boolean;"),
+                    ("+", "  applicationKeypadMode: boolean;"),
+                    ("+", "  modifyOtherKeysLevel: 0 | 1 | 2;"),
+                    (" ", "}"),
+                    (" ", ""),
+                    ("+", "const SS3_DIGIT_MAP: Record<string, string> = {"),
+                    ("+", "  '0': 'p', '1': 'q', '2': 'r', '3': 's', '4': 't', '5': 'u', '6': 'v', '7': 'w', '8': 'x', '9': 'y',"),
+                    ("+", "};"),
+                    (" ", ""),
+                    (" ", "export function encodeTerminalKey(ev: KeyboardEvent, state: KeyEncoderState): string | null {"),
+                    ("-", "  if (ev.key.length === 1 && !ev.ctrlKey && !ev.metaKey) {"),
+                    ("-", "    return ev.altKey ? `\\x1b${ev.key}` : ev.key;"),
+                    ("-", "  }"),
+                    ("-", "  if (ev.ctrlKey && /^[a-z]$/i.test(ev.key)) {"),
+                    ("-", "    return String.fromCharCode(ev.key.toUpperCase().charCodeAt(0) - 64);"),
+                    ("+", "  const isDigit = /^[0-9]$/.test(ev.key);"),
+                    ("+", "  if (isDigit && ev.location === KeyboardEvent.DOM_KEY_LOCATION_NUMPAD && state.applicationKeypadMode) {"),
+                    ("+", "    return `\\x1bO${SS3_DIGIT_MAP[ev.key]}`;"),
+                    ("+", "  }"),
+                    ("+", "  if (isDigit && ev.ctrlKey && state.modifyOtherKeysLevel >= 1) {"),
+                    ("+", "    return `\\x1b[27;5;${ev.key.charCodeAt(0)}~`;"),
+                    ("+", "  }"),
+                    ("+", "  if (ev.key.length === 1 && !ev.ctrlKey && !ev.metaKey) return ev.altKey ? `\\x1b${ev.key}` : ev.key;"),
+                    ("+", "  if (ev.ctrlKey && /^[a-z]$/i.test(ev.key)) {"),
+                    ("+", "    return String.fromCharCode(ev.key.toUpperCase().charCodeAt(0) - 64);"),
+                    (" ", "  }"),
+                    (" ", "  return null;"),
+                    (" ", "}"),
+                ],
+                header_context="export function encodeTerminalKey",
+            ),
+        ],
+    )
+
+    return [swift_vt100, swift_terminal_view, ts_key_encoder]
+
+
+def _sim_paseo_uncommitted_files() -> list[dict]:
+    """Two Swift + TypeScript modified files for the feat/paseo-ui worktree (+42 -9)."""
+    swift_sidebar = _sim_build_diff_file(
+        "ios/POCVault/POCVault/Views/RelayWorkspaceSidebarView.swift",
+        status="modified",
+        staged=False,
+        unstaged=True,
+        hunks=[
+            _sim_build_hunk(
+                28,
+                28,
+                [
+                    (" ", "struct RelayWorkspaceSidebarRow: View {"),
+                    (" ", "    let workspace: RelayWorkspaceRecord"),
+                    (" ", "    let isSelected: Bool"),
+                    ("+", "    let onOpenDiff: () -> Void"),
+                    ("+", "    let onArchive: (() -> Void)?"),
+                    (" ", ""),
+                    (" ", "    var body: some View {"),
+                    ("-", "        HStack(spacing: 10) {"),
+                    ("-", "            Image(systemName: workspace.isWorktree ? \"arrow.triangle.branch\" : \"folder\")"),
+                    ("-", "            Text(workspace.displayBranch)"),
+                    ("-", "                .font(AppTheme.uiFont(size: 14, weight: .medium))"),
+                    ("-", "            Spacer()"),
+                    ("-", "        }"),
+                    ("+", "        VStack(alignment: .leading, spacing: 4) {"),
+                    ("+", "            HStack(spacing: 8) {"),
+                    ("+", "                Image(systemName: workspace.isWorktree ? \"arrow.triangle.branch\" : \"folder.fill\")"),
+                    ("+", "                    .font(.system(size: 12, weight: .semibold))"),
+                    ("+", "                    .foregroundStyle(isSelected ? AppTheme.accent : AppTheme.textSecondary)"),
+                    ("+", "                Text(workspace.displayBranch)"),
+                    ("+", "                    .font(AppTheme.uiFont(size: 14, weight: isSelected ? .semibold : .medium))"),
+                    ("+", "                    .lineLimit(1)"),
+                    ("+", "                Spacer(minLength: 4)"),
+                    ("+", "                if workspace.hasRunningThread {"),
+                    ("+", "                    Circle().fill(AppTheme.accent).frame(width: 7, height: 7)"),
+                    ("+", "                }"),
+                    ("+", "            }"),
+                    ("+", "            HStack(spacing: 8) {"),
+                    ("+", "                if let diff = workspace.diffSummary {"),
+                    ("+", "                    Button(action: onOpenDiff) {"),
+                    ("+", "                        Text(diff)"),
+                    ("+", "                            .font(AppTheme.monoFont(size: 11, weight: .medium))"),
+                    ("+", "                    }"),
+                    ("+", "                    .buttonStyle(.plain)"),
+                    ("+", "                }"),
+                    ("+", "                if let pr = workspace.pr {"),
+                    ("+", "                    Text(\"#\\(pr.number) · \\(pr.state.capitalized)\")"),
+                    ("+", "                        .font(AppTheme.uiFont(size: 11, weight: .medium))"),
+                    ("+", "                        .foregroundStyle(AppTheme.textSecondary)"),
+                    ("+", "                }"),
+                    ("+", "            }"),
+                    ("+", "        }"),
+                    ("+", "        .padding(.vertical, 6)"),
+                    (" ", "    }"),
+                    (" ", "}"),
+                ],
+                header_context="struct RelayWorkspaceSidebarRow",
+            ),
+        ],
+    )
+
+    ts_tab_strip = _sim_build_diff_file(
+        "web/src/workspace/tabStrip.ts",
+        status="modified",
+        staged=True,
+        unstaged=False,
+        hunks=[
+            _sim_build_hunk(
+                10,
+                10,
+                [
+                    (" ", "export interface WorkspaceTab {"),
+                    (" ", "  id: string;"),
+                    (" ", "  kind: 'agent' | 'terminal';"),
+                    (" ", "  title: string;"),
+                    ("+", "  isRunning: boolean;"),
+                    ("+", "  needsInput: boolean;"),
+                    (" ", "}"),
+                    (" ", ""),
+                    (" ", "export function selectNextActiveTab(tabs: WorkspaceTab[], closingId: string): string | null {"),
+                    ("-", "  const remaining = tabs.filter((t) => t.id !== closingId);"),
+                    ("-", "  return remaining[0]?.id ?? null;"),
+                    ("-", "}"),
+                    ("+", "  const idx = tabs.findIndex((t) => t.id === closingId);"),
+                    ("+", "  const remaining = tabs.filter((t) => t.id !== closingId);"),
+                    ("+", "  if (remaining.length === 0) return null;"),
+                    ("+", "  return remaining[Math.min(Math.max(0, idx), remaining.length - 1)].id;"),
+                    ("+", "}"),
+                    ("+", ""),
+                    ("+", "export function formatTabBadge(tab: WorkspaceTab): string | null {"),
+                    ("+", "  return tab.needsInput ? 'Needs input' : tab.isRunning ? 'Running' : null;"),
+                    ("+", "}"),
+                ],
+                header_context="export function selectNextActiveTab",
+            ),
+        ],
+    )
+
+    return [swift_sidebar, ts_tab_strip]
+
+
+def _sim_main_uncommitted_files() -> list[dict]:
+    """Representative uncommitted Swift + TS edits on poc-vault main checkout."""
+    ts_pricing = _sim_build_diff_file(
+        "pricing.ts",
+        status="modified",
+        staged=False,
+        unstaged=True,
+        hunks=[
+            _sim_build_hunk(
+                12,
+                12,
+                [
+                    (" ", "export function roundPrice(total: number): number {"),
+                    ("-", "  return Math.floor(total * 100) / 100;"),
+                    ("+", "  return Math.round((total + Number.EPSILON) * 100) / 100;"),
+                    (" ", "}"),
+                    (" ", ""),
+                    ("+", "export function formatCurrency(amount: number, currency = 'USD'): string {"),
+                    ("+", "  return new Intl.NumberFormat('en-US', { style: 'currency', currency }).format(roundPrice(amount));"),
+                    ("+", "}"),
+                ],
+                header_context="export function roundPrice",
+            ),
+        ],
+    )
+
+    swift_header = _sim_build_diff_file(
+        "ios/POCVault/POCVault/Views/RelayWorkspaceHeader.swift",
+        status="added",
+        staged=True,
+        unstaged=False,
+        hunks=[
+            _sim_build_hunk(
+                0,
+                1,
+                [
+                    ("+", "import SwiftUI"),
+                    ("+", ""),
+                    ("+", "struct RelayDirtyBadge: View {"),
+                    ("+", "    let added: Int"),
+                    ("+", "    let deleted: Int"),
+                    ("+", "    let dirty: Bool"),
+                    ("+", ""),
+                    ("+", "    var body: some View {"),
+                    ("+", "        HStack(spacing: 4) {"),
+                    ("+", "            Text(\"±\")"),
+                    ("+", "                .font(AppTheme.monoFont(size: 12, weight: .bold))"),
+                    ("+", "            if added > 0 || deleted > 0 {"),
+                    ("+", "                Text(\"+\\(added) -\\(deleted)\")"),
+                    ("+", "                    .font(AppTheme.monoFont(size: 11, weight: .medium))"),
+                    ("+", "            }"),
+                    ("+", "        }"),
+                    ("+", "        .opacity(dirty ? 1 : 0.6)"),
+                    ("+", "    }"),
+                    ("+", "}"),
+                ],
+                header_context="",
+            ),
+        ],
+    )
+
+    return [ts_pricing, swift_header]
+
+
+def _sim_committed_files_for_branch() -> list[dict]:
+    """Branch commits diff relative to main (shown in mode='committed' and mode='all')."""
+    return [
+        _sim_build_diff_file(
+            "ios/POCVault/POCVaultTests/RelayVT100KeyEncoderTests.swift",
+            status="added",
+            staged=False,
+            unstaged=False,
+            hunks=[
+                _sim_build_hunk(
+                    0,
+                    1,
+                    [
+                        ("+", "import XCTest"),
+                        ("+", "@testable import POCVault"),
+                        ("+", ""),
+                        ("+", "final class RelayVT100KeyEncoderTests: XCTestCase {"),
+                        ("+", "    func testApplicationKeypadDigitsEmitSS3() {"),
+                        ("+", "        let engine = RelayVT100Engine(cols: 80, rows: 24)"),
+                        ("+", "        engine.feed(\"\\u{1B}=\")"),
+                        ("+", "        XCTAssertTrue(engine.applicationKeypadMode)"),
+                        ("+", "        XCTAssertEqual(engine.encodeDigitKey(\"5\", modifiers: [], isNumpad: true), \"\\u{1B}Ou\")"),
+                        ("+", "    }"),
+                        ("+", ""),
+                        ("+", "    func testNumericKeypadRestoresPlainDigits() {"),
+                        ("+", "        let engine = RelayVT100Engine(cols: 80, rows: 24)"),
+                        ("+", "        engine.feed(\"\\u{1B}=\\u{1B}>\")"),
+                        ("+", "        XCTAssertFalse(engine.applicationKeypadMode)"),
+                        ("+", "        XCTAssertEqual(engine.encodeDigitKey(\"5\", modifiers: [], isNumpad: true), \"5\")"),
+                        ("+", "    }"),
+                        ("+", "}"),
+                    ],
+                ),
+            ],
+        ),
+        _sim_build_diff_file(
+            "web/src/terminal/keyEncoder.test.ts",
+            status="modified",
+            staged=False,
+            unstaged=False,
+            hunks=[
+                _sim_build_hunk(
+                    24,
+                    24,
+                    [
+                        (" ", "describe('encodeTerminalKey', () => {"),
+                        ("-", "  it('forwards plain digits', () => {"),
+                        ("+", "  it('forwards plain digits and SS3 numpad sequences', () => {"),
+                        (" ", "    expect(encodeTerminalKey(digitEvent('7'), { applicationCursorKeys: false, applicationKeypadMode: false, modifyOtherKeysLevel: 0 })).toBe('7');"),
+                        ("+", "    expect(encodeTerminalKey(numpadEvent('7'), { applicationCursorKeys: false, applicationKeypadMode: true, modifyOtherKeysLevel: 0 })).toBe('\\x1bOw');"),
+                        (" ", "  });"),
+                        (" ", "});"),
+                    ],
+                    header_context="describe('encodeTerminalKey')",
+                ),
+            ],
+        ),
+    ]
+
+
+def _sim_default_commits() -> tuple[list[dict], dict[str, list[dict]]]:
+    commits = [
+        {
+            "sha": "c84f19a3e21b60d4c77f891a2b3c4d5e6f7a8b9c",
+            "shortSha": "c84f19a",
+            "subject": "Handle application keypad mode for number row keys",
+            "author": "Parikshit Joon",
+            "relativeDate": "18 minutes ago",
+            "committedAt": "2026-11-23T12:20:00Z",
+        },
+        {
+            "sha": "7d2a48e19b30c5f6a12d84e9f0c3b5a7d9e1f2a3",
+            "shortSha": "7d2a48e",
+            "subject": "Add CSI u key encoder tests for shifted digits",
+            "author": "Parikshit Joon",
+            "relativeDate": "2 hours ago",
+            "committedAt": "2026-11-23T10:35:00Z",
+        },
+        {
+            "sha": "9f4e2a1b8c3d7e6f0a1b2c3d4e5f6a7b8c9d0e1f",
+            "shortSha": "9f4e2a1",
+            "subject": "Wire SSE terminal resize and scrollback compaction",
+            "author": "Parikshit Joon",
+            "relativeDate": "Yesterday",
+            "committedAt": "2026-11-22T18:10:00Z",
+        },
+        {
+            "sha": "4e8b12c9a7d305f1e2c4b6a8d0f2e4c6a8b0d2e4",
+            "shortSha": "4e8b12c",
+            "subject": "Implement managed .relay/worktrees API with containment checks",
+            "author": "Parikshit Joon",
+            "relativeDate": "2 days ago",
+            "committedAt": "2026-11-21T15:42:00Z",
+        },
+        {
+            "sha": "1a9c3e5f7b2d4068a1c3e5f7b9d1f3a5c7e9b1d3",
+            "shortSha": "1a9c3e5",
+            "subject": "Bootstrap Paseo workspace shell and theme tokens",
+            "author": "Parikshit Joon",
+            "relativeDate": "4 days ago",
+            "committedAt": "2026-11-19T09:15:00Z",
+        },
+    ]
+
+    committed_pair = _sim_committed_files_for_branch()
+    commit_diffs: dict[str, list[dict]] = {
+        commits[0]["sha"]: [committed_pair[0]],
+        commits[1]["sha"]: [committed_pair[1]],
+        commits[2]["sha"]: [
+            _sim_build_diff_file(
+                "product/relayd/src/terminals.mjs",
+                status="modified",
+                hunks=[
+                    _sim_build_hunk(
+                        62,
+                        62,
+                        [
+                            (" ", "    if (action === \"resize\" && req.method === \"POST\") {"),
+                            (" ", "      if (session.status !== \"running\") { sendError(res, 409, \"terminal is not running\"); return true; }"),
+                            (" ", "      const body = await readBody(req);"),
+                            ("-", "      const size = { cols: body?.cols || 80, rows: body?.rows || 24 };"),
+                            ("+", "      const size = cleanSize(body);"),
+                            (" ", "      await session.client.request(\"command/exec/resize\", { processId: session.processId, size });"),
+                            (" ", "      session.cols = size.cols;"),
+                            (" ", "      session.rows = size.rows;"),
+                            (" ", "      sendJson(res, 200, { terminal: publicTerminal(session) });"),
+                            (" ", "      return true;"),
+                            (" ", "    }"),
+                        ],
+                        header_context="async function route",
+                    )
+                ],
+            )
+        ],
+        commits[3]["sha"]: [
+            _sim_build_diff_file(
+                "product/relayd/src/worktree-api.mjs",
+                status="added",
+                hunks=[
+                    _sim_build_hunk(
+                        0,
+                        1,
+                        [
+                            ("+", "export async function listWorktrees(searchParams) {"),
+                            ("+", "  const targetDir = resolveTargetDir(searchParams.get('path'), 'path');"),
+                            ("+", "  const repoRoot = findGitRoot(targetDir);"),
+                            ("+", "  if (!repoRoot) return { repoRoot: null, worktrees: [] };"),
+                            ("+", "  return readEnrichedWorktrees(repoRoot);"),
+                            ("+", "}"),
+                        ],
+                    )
+                ],
+            )
+        ],
+        commits[4]["sha"]: [
+            _sim_build_diff_file(
+                "ios/POCVault/POCVault/Theme/RelayTheme.swift",
+                status="added",
+                hunks=[
+                    _sim_build_hunk(
+                        0,
+                        1,
+                        [
+                            ("+", "import SwiftUI"),
+                            ("+", ""),
+                            ("+", "enum RelayThemeTokens {"),
+                            ("+", "    static let diffAddedBackground = Color.green.opacity(0.16)"),
+                            ("+", "    static let diffDeletedBackground = Color.red.opacity(0.16)"),
+                            ("+", "}"),
+                        ],
+                    )
+                ],
+            )
+        ],
+    }
+    return commits, commit_diffs
+
+
+def _sim_default_branches(current_branch: str) -> list[dict]:
+    local_specs = [
+        ("main", "origin/main"),
+        ("fix-138-number-keys", "origin/fix-138-number-keys"),
+        ("feat/paseo-ui", "origin/feat/paseo-ui"),
+        ("chore/ansi-256-colors", None),
+    ]
+    branches: list[dict] = []
+    seen_local: set[str] = set()
+    for name, upstream in local_specs:
+        seen_local.add(name)
+        branches.append({
+            "name": name,
+            "isCurrent": name == current_branch,
+            "isRemote": False,
+            "upstream": upstream,
+        })
+    if current_branch and current_branch not in seen_local:
+        branches.append({
+            "name": current_branch,
+            "isCurrent": True,
+            "isRemote": False,
+            "upstream": None,
+        })
+    branches.sort(key=lambda item: (0 if item["isCurrent"] else 1, item["name"]))
+    for remote_name in ("origin/main", "origin/fix-138-number-keys", "origin/feat/paseo-ui"):
+        branches.append({
+            "name": remote_name,
+            "isCurrent": False,
+            "isRemote": True,
+            "upstream": None,
+        })
+    return branches
+
+
+def _sim_make_git_repo_state(
+    repo_root: str,
+    *,
+    branch: str,
+    base_branch: str = "main",
+    ahead: int = 0,
+    behind: int = 0,
+    uncommitted_files: list[dict] | None = None,
+    committed_files: list[dict] | None = None,
+    pr: dict | None = None,
+) -> dict:
+    commits, commit_diffs = _sim_default_commits()
+    return {
+        "repoRoot": repo_root,
+        "branch": branch,
+        "baseBranch": base_branch,
+        "ahead": ahead,
+        "behind": behind,
+        "uncommitted_files": list(uncommitted_files or []),
+        "committed_files": list(committed_files or []),
+        "commits": [dict(c) for c in commits],
+        "commit_diffs": {sha: list(files) for sha, files in commit_diffs.items()},
+        "branches": _sim_default_branches(branch),
+        "pr": dict(pr) if pr else None,
+    }
+
+
+def init_sim_git_repos() -> dict[str, dict]:
+    return {
+        _SIM_POC_VAULT_MAIN_PATH: _sim_make_git_repo_state(
+            _SIM_POC_VAULT_MAIN_PATH,
+            branch="main",
+            base_branch="main",
+            ahead=1,
+            behind=0,
+            uncommitted_files=_sim_main_uncommitted_files(),
+            committed_files=[],
+            pr=None,
+        ),
+        _SIM_DEFAULT_WORKTREE_PATH: _sim_make_git_repo_state(
+            _SIM_DEFAULT_WORKTREE_PATH,
+            branch="fix-138-number-keys",
+            base_branch="main",
+            ahead=2,
+            behind=0,
+            uncommitted_files=_sim_fix138_uncommitted_files(),
+            committed_files=_sim_committed_files_for_branch(),
+            pr=_SIM_PR_BY_BRANCH["fix-138-number-keys"],
+        ),
+        _SIM_PASEO_WORKTREE_PATH: _sim_make_git_repo_state(
+            _SIM_PASEO_WORKTREE_PATH,
+            branch="feat/paseo-ui",
+            base_branch="main",
+            ahead=4,
+            behind=1,
+            uncommitted_files=_sim_paseo_uncommitted_files(),
+            committed_files=_sim_committed_files_for_branch(),
+            pr=_SIM_PR_BY_BRANCH["feat/paseo-ui"],
+        ),
+        _SIM_SIGIQ_MAIN_PATH: _sim_make_git_repo_state(
+            _SIM_SIGIQ_MAIN_PATH,
+            branch="main",
+            base_branch="main",
+            ahead=0,
+            behind=0,
+            uncommitted_files=[],
+            committed_files=[],
+            pr=None,
+        ),
+    }
+
+
+def _sim_repo_stats(repo: dict) -> tuple[bool, int, int]:
+    files = repo.get("uncommitted_files", [])
+    added = sum(int(f.get("added", 0)) for f in files)
+    deleted = sum(int(f.get("deleted", 0)) for f in files)
+    return (len(files) > 0, added, deleted)
+
+
+def init_sim_worktrees(git_repos: dict[str, dict]) -> dict[str, list[dict]]:
+    def descriptor(path: str, name: str, is_main: bool, is_managed: bool) -> dict:
+        repo = git_repos[path]
+        dirty, added, deleted = _sim_repo_stats(repo)
+        head = repo["commits"][0]["sha"] if repo["commits"] else "0" * 40
+        return {
+            "path": path,
+            "name": name,
+            "head": head,
+            "branch": repo["branch"],
+            "isMain": is_main,
+            "isManaged": is_managed,
+            "dirty": dirty,
+            "added": added,
+            "deleted": deleted,
+        }
+
+    return {
+        _SIM_POC_VAULT_MAIN_PATH: [
+            descriptor(_SIM_POC_VAULT_MAIN_PATH, "poc-vault", True, False),
+            descriptor(_SIM_DEFAULT_WORKTREE_PATH, "fix-138-number-keys", False, True),
+            descriptor(_SIM_PASEO_WORKTREE_PATH, "feat-paseo-ui", False, True),
+        ],
+        _SIM_SIGIQ_MAIN_PATH: [
+            descriptor(_SIM_SIGIQ_MAIN_PATH, "sigiq", True, False),
+        ],
+    }
+
+
+def _sim_sync_worktree_descriptor(server: SimulatorVaultServer, repo_path: str) -> None:
+    repo = server.sim_git_repos.get(repo_path)
+    if repo is None:
+        return
+    dirty, added, deleted = _sim_repo_stats(repo)
+    head = repo["commits"][0]["sha"] if repo["commits"] else "0" * 40
+    for entries in server.sim_worktrees.values():
+        for wt in entries:
+            if wt["path"] == repo_path:
+                wt["branch"] = repo["branch"]
+                wt["head"] = head
+                wt["dirty"] = dirty
+                wt["added"] = added
+                wt["deleted"] = deleted
+
+
+def _sim_resolve_git_repo_unlocked(server: SimulatorVaultServer, raw_path: str | None) -> tuple[str | None, dict | None]:
+    norm = _sim_norm_path(raw_path)
+    if not norm:
+        return (_SIM_DEFAULT_WORKTREE_PATH, server.sim_git_repos.get(_SIM_DEFAULT_WORKTREE_PATH))
+    if not norm.startswith("/"):
+        norm = f"{_SIM_WORKSPACE_ROOT}/{norm.lstrip('/')}"
+    if norm == f"{_SIM_WORKSPACE_ROOT}/scratch" or norm.startswith(f"{_SIM_WORKSPACE_ROOT}/scratch/"):
+        return (None, None)
+    # Longest-prefix match so worktrees inside <repo>/.relay/worktrees/<slug> win over <repo>.
+    for candidate in sorted(server.sim_git_repos.keys(), key=len, reverse=True):
+        if norm == candidate or norm.startswith(candidate + "/"):
+            return (candidate, server.sim_git_repos[candidate])
+    return (None, None)
+
+
+def _sim_resolve_project_root_unlocked(server: SimulatorVaultServer, raw_path: str | None) -> str | None:
+    norm = _sim_norm_path(raw_path)
+    if not norm:
+        return _SIM_POC_VAULT_MAIN_PATH
+    if not norm.startswith("/"):
+        norm = f"{_SIM_WORKSPACE_ROOT}/{norm.lstrip('/')}"
+    for project_root, entries in server.sim_worktrees.items():
+        if norm == project_root or norm.startswith(project_root + "/"):
+            return project_root
+        for wt in entries:
+            if norm == wt["path"] or norm.startswith(wt["path"] + "/"):
+                return project_root
+    return None
+
+
+def sim_fs_git_status(server: SimulatorVaultServer, query: dict) -> dict:
+    requested = (query.get("path", [""])[0] or "").strip()
+    with server.fixture_lock:
+        _, repo = _sim_resolve_git_repo_unlocked(server, requested or _SIM_POC_VAULT_MAIN_PATH)
+        if repo is None:
+            return {
+                "git": False,
+                "branch": None,
+                "detached": False,
+                "added": 0,
+                "deleted": 0,
+                "binary": False,
+                "size": None,
+                "modifiedAt": None,
+                "addedLines": [],
+                "removedAt": [],
+            }
+        _, added, deleted = _sim_repo_stats(repo)
+        return {
+            "git": True,
+            "branch": repo["branch"],
+            "detached": False,
+            "added": added,
+            "deleted": deleted,
+            "binary": False,
+            "size": None,
+            "modifiedAt": sim_now_iso(),
+            "addedLines": [],
+            "removedAt": [],
+        }
+
+
+def sim_git_status(server: SimulatorVaultServer, query: dict) -> tuple[int, dict]:
+    requested = (query.get("path", [""])[0] or "").strip()
+    with server.fixture_lock:
+        repo_path, repo = _sim_resolve_git_repo_unlocked(server, requested)
+        if repo is None:
+            return (
+                200,
+                {
+                    "isGitRepo": False,
+                    "repoRoot": None,
+                    "branch": None,
+                    "baseBranch": None,
+                    "ahead": 0,
+                    "behind": 0,
+                    "dirty": False,
+                    "added": 0,
+                    "deleted": 0,
+                    "files": [],
+                    "pr": None,
+                },
+            )
+        dirty, added, deleted = _sim_repo_stats(repo)
+        return (
+            200,
+            {
+                "isGitRepo": True,
+                "repoRoot": repo_path,
+                "branch": repo["branch"],
+                "baseBranch": repo["baseBranch"],
+                "ahead": repo["ahead"],
+                "behind": repo["behind"],
+                "dirty": dirty,
+                "added": added,
+                "deleted": deleted,
+                "files": [_sim_status_file_public(f) for f in repo["uncommitted_files"]],
+                "pr": dict(repo["pr"]) if repo.get("pr") else None,
+            },
+        )
+
+
+def sim_git_diff(server: SimulatorVaultServer, query: dict) -> tuple[int, dict]:
+    requested = (query.get("path", [""])[0] or "").strip()
+    mode = (query.get("mode", ["uncommitted"])[0] or "uncommitted").strip().lower()
+    if mode not in {"uncommitted", "committed", "all"}:
+        return (400, {"error": "mode must be uncommitted, committed, or all"})
+    file_filter = (query.get("file", [""])[0] or "").strip() or None
+
+    with server.fixture_lock:
+        _, repo = _sim_resolve_git_repo_unlocked(server, requested)
+        if repo is None:
+            return (400, {"error": "directory is not a git repository"})
+
+        if mode == "uncommitted":
+            selected = list(repo["uncommitted_files"])
+        elif mode == "committed":
+            selected = list(repo["committed_files"])
+        else:
+            merged_by_path: dict[str, dict] = {}
+            for item in repo["committed_files"]:
+                merged_by_path[item["path"]] = dict(item, hunks=list(item["hunks"]))
+            for item in repo["uncommitted_files"]:
+                existing = merged_by_path.get(item["path"])
+                if existing is None:
+                    merged_by_path[item["path"]] = dict(item, hunks=list(item["hunks"]))
+                else:
+                    existing["hunks"] = existing["hunks"] + list(item["hunks"])
+                    existing["added"] = existing["added"] + item["added"]
+                    existing["deleted"] = existing["deleted"] + item["deleted"]
+            selected = list(merged_by_path.values())
+
+        if file_filter:
+            selected = [f for f in selected if f["path"] == file_filter]
+
+        public_files = [_sim_diff_file_public(f) for f in selected]
+        total_added = sum(f["added"] for f in public_files)
+        total_deleted = sum(f["deleted"] for f in public_files)
+        return (
+            200,
+            {
+                "mode": mode,
+                "branch": repo["branch"],
+                "baseBranch": repo["baseBranch"],
+                "totalAdded": total_added,
+                "totalDeleted": total_deleted,
+                "truncated": False,
+                "files": public_files,
+            },
+        )
+
+
+def sim_git_commits(server: SimulatorVaultServer, query: dict) -> tuple[int, dict]:
+    requested = (query.get("path", [""])[0] or "").strip()
+    limit = bounded_int((query.get("limit", ["30"])[0] or "30"), 30, 1, 200)
+    with server.fixture_lock:
+        _, repo = _sim_resolve_git_repo_unlocked(server, requested)
+        if repo is None:
+            return (400, {"error": "directory is not a git repository"})
+        return (
+            200,
+            {
+                "branch": repo["branch"],
+                "commits": [dict(c) for c in repo["commits"][:limit]],
+            },
+        )
+
+
+def sim_git_commit_diff(server: SimulatorVaultServer, query: dict) -> tuple[int, dict]:
+    requested = (query.get("path", [""])[0] or "").strip()
+    sha_query = (query.get("sha", [""])[0] or "").strip().lower()
+    if not re.fullmatch(r"[a-f0-9]{4,40}", sha_query):
+        return (400, {"error": "sha must be a 4 to 40 character hexadecimal string"})
+    file_filter = (query.get("file", [""])[0] or "").strip() or None
+
+    with server.fixture_lock:
+        _, repo = _sim_resolve_git_repo_unlocked(server, requested)
+        if repo is None:
+            return (400, {"error": "directory is not a git repository"})
+        matched = next(
+            (c for c in repo["commits"] if c["sha"].lower().startswith(sha_query)),
+            None,
+        )
+        if matched is None:
+            return (404, {"error": "commit not found"})
+        files = list(repo["commit_diffs"].get(matched["sha"], []))
+        if file_filter:
+            files = [f for f in files if f["path"] == file_filter]
+        public_files = [_sim_diff_file_public(f) for f in files]
+        return (
+            200,
+            {
+                "mode": "commit",
+                "sha": matched["sha"],
+                "branch": repo["branch"],
+                "baseBranch": repo["baseBranch"],
+                "totalAdded": sum(f["added"] for f in public_files),
+                "totalDeleted": sum(f["deleted"] for f in public_files),
+                "truncated": False,
+                "files": public_files,
+            },
+        )
+
+
+def sim_git_branches(server: SimulatorVaultServer, query: dict) -> tuple[int, dict]:
+    requested = (query.get("path", [""])[0] or "").strip()
+    with server.fixture_lock:
+        _, repo = _sim_resolve_git_repo_unlocked(server, requested)
+        if repo is None:
+            return (400, {"error": "directory is not a git repository"})
+        locals_list = [dict(b) for b in repo["branches"] if not b["isRemote"]]
+        remotes_list = [dict(b) for b in repo["branches"] if b["isRemote"]]
+        locals_list.sort(key=lambda b: (0 if b["isCurrent"] else 1, b["name"]))
+        return (
+            200,
+            {
+                "current": repo["branch"],
+                "baseBranch": repo["baseBranch"],
+                "branches": locals_list + remotes_list,
+            },
+        )
+
+
+def sim_git_checkout(server: SimulatorVaultServer, body: dict) -> tuple[int, dict]:
+    raw_branch = body.get("branch")
+    if not isinstance(raw_branch, str) or not raw_branch.strip():
+        return (400, {"error": "branch is required"})
+    branch = raw_branch.strip()
+    if branch.startswith("-") or branch in {"HEAD", "@"} or ".." in branch or " " in branch:
+        return (400, {"error": "invalid branch name"})
+    create = bool(body.get("create", False))
+
+    with server.fixture_lock:
+        repo_path, repo = _sim_resolve_git_repo_unlocked(server, body.get("path"))
+        if repo is None or repo_path is None:
+            return (400, {"error": "directory is not a git repository"})
+
+        local_names = {b["name"] for b in repo["branches"] if not b["isRemote"]}
+        remote_names = {b["name"] for b in repo["branches"] if b["isRemote"]}
+        if create:
+            if branch in local_names:
+                return (409, {"error": f"a branch named '{branch}' already exists"})
+            repo["branches"].append({
+                "name": branch,
+                "isCurrent": True,
+                "isRemote": False,
+                "upstream": None,
+            })
+        else:
+            if branch not in local_names:
+                remote_candidate = branch if branch.startswith("origin/") else f"origin/{branch}"
+                if remote_candidate in remote_names:
+                    local_branch = remote_candidate[len("origin/"):]
+                    branch = local_branch
+                    if local_branch not in local_names:
+                        repo["branches"].append({
+                            "name": local_branch,
+                            "isCurrent": True,
+                            "isRemote": False,
+                            "upstream": remote_candidate,
+                        })
+                else:
+                    return (404, {"error": f"pathspec '{branch}' did not match any branch"})
+
+        for item in repo["branches"]:
+            item["isCurrent"] = (not item["isRemote"]) and item["name"] == branch
+        repo["branch"] = branch
+        pr = _SIM_PR_BY_BRANCH.get(branch)
+        repo["pr"] = dict(pr) if pr else None
+        _sim_sync_worktree_descriptor(server, repo_path)
+        return (200, {"ok": True, "branch": branch})
+
+
+def sim_git_discard(server: SimulatorVaultServer, body: dict) -> tuple[int, dict]:
+    files = body.get("files")
+    if not isinstance(files, list) or not files:
+        return (400, {"error": "files must be a non-empty array of relative paths"})
+    requested_paths = [str(item).strip() for item in files if isinstance(item, str) and item.strip()]
+    if not requested_paths:
+        return (400, {"error": "files must contain valid relative paths"})
+
+    with server.fixture_lock:
+        repo_path, repo = _sim_resolve_git_repo_unlocked(server, body.get("path"))
+        if repo is None or repo_path is None:
+            return (400, {"error": "directory is not a git repository"})
+        target_set = set(requested_paths)
+        remaining = []
+        discarded = []
+        for entry in repo["uncommitted_files"]:
+            if entry["path"] in target_set:
+                discarded.append(entry["path"])
+            else:
+                remaining.append(entry)
+        if not discarded:
+            return (404, {"error": f"file not found in working tree: {requested_paths[0]}"})
+        repo["uncommitted_files"] = remaining
+        _sim_sync_worktree_descriptor(server, repo_path)
+        return (200, {"ok": True, "discarded": discarded})
+
+
+def sim_git_commit(server: SimulatorVaultServer, body: dict) -> tuple[int, dict]:
+    message = body.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return (400, {"error": "commit message is required"})
+    clean_message = message.strip()
+    stage_all = body.get("stageAll", True) is not False
+    push = bool(body.get("push", False))
+
+    with server.fixture_lock:
+        repo_path, repo = _sim_resolve_git_repo_unlocked(server, body.get("path"))
+        if repo is None or repo_path is None:
+            return (400, {"error": "directory is not a git repository"})
+
+        if stage_all:
+            to_commit = list(repo["uncommitted_files"])
+            remaining: list[dict] = []
+        else:
+            to_commit = [f for f in repo["uncommitted_files"] if f.get("staged")]
+            remaining = [f for f in repo["uncommitted_files"] if not f.get("staged")]
+
+        if not to_commit:
+            return (400, {"error": "nothing to commit"})
+
+        server.sim_commit_counter += 1
+        digest = hashlib.sha1(
+            f"{repo_path}:{repo['branch']}:{server.sim_commit_counter}:{clean_message}".encode("utf-8")
+        ).hexdigest()
+        short_sha = digest[:7]
+        subject = clean_message.splitlines()[0]
+        commit_record = {
+            "sha": digest,
+            "shortSha": short_sha,
+            "subject": subject,
+            "author": "Relay Demo",
+            "relativeDate": "just now",
+            "committedAt": sim_now_iso(),
+        }
+        repo["commits"].insert(0, commit_record)
+        repo["commit_diffs"][digest] = [dict(item, hunks=list(item["hunks"])) for item in to_commit]
+
+        # Fold committed changes into branch committed_files so mode='committed' reflects them.
+        by_path = {item["path"]: item for item in repo["committed_files"]}
+        for item in to_commit:
+            by_path[item["path"]] = dict(item, staged=False, unstaged=False, hunks=list(item["hunks"]))
+        repo["committed_files"] = list(by_path.values())
+        repo["uncommitted_files"] = remaining
+        repo["ahead"] = 0 if push else (repo["ahead"] + 1)
+        _sim_sync_worktree_descriptor(server, repo_path)
+        return (
+            200,
+            {
+                "ok": True,
+                "sha": digest,
+                "shortSha": short_sha,
+                "branch": repo["branch"],
+                "pushed": push,
+            },
+        )
+
+
+def sim_worktree_list(server: SimulatorVaultServer, query: dict) -> tuple[int, dict]:
+    requested = (query.get("path", [""])[0] or "").strip()
+    with server.fixture_lock:
+        project_root = _sim_resolve_project_root_unlocked(server, requested)
+        if project_root is None:
+            return (200, {"repoRoot": None, "worktrees": []})
+        for wt in server.sim_worktrees.get(project_root, []):
+            _sim_sync_worktree_descriptor(server, wt["path"])
+        return (
+            200,
+            {
+                "repoRoot": project_root,
+                "worktrees": [dict(wt) for wt in server.sim_worktrees.get(project_root, [])],
+            },
+        )
+
+
+def sim_worktree_create(server: SimulatorVaultServer, body: dict) -> tuple[int, dict]:
+    raw_project = body.get("projectPath") or body.get("path")
+    action = str(body.get("action") or "branch-off").strip().lower()
+    if action not in {"branch-off", "checkout"}:
+        return (400, {"error": "action must be branch-off or checkout"})
+
+    with server.fixture_lock:
+        project_root = _sim_resolve_project_root_unlocked(server, raw_project)
+        if project_root is None:
+            return (400, {"error": "directory is not a git repository"})
+
+        existing = server.sim_worktrees.setdefault(project_root, [])
+        existing_paths = {wt["path"] for wt in existing}
+        existing_branches = {wt["branch"] for wt in existing if wt.get("branch")}
+
+        raw_name = body.get("name")
+        raw_branch = body.get("branch")
+        raw_base = body.get("baseBranch")
+        requested_slug = _sim_slugify_worktree(raw_name) if isinstance(raw_name, str) and raw_name.strip() else None
+
+        if action == "checkout":
+            if not isinstance(raw_branch, str) or not raw_branch.strip():
+                return (400, {"error": "branch is required"})
+            branch = raw_branch.strip()
+            if branch in existing_branches:
+                return (409, {"error": f"branch {branch} is already checked out in another worktree"})
+            base_slug = requested_slug or _sim_slugify_worktree(branch) or f"wt-{len(existing) + 1}"
+        else:
+            if isinstance(raw_branch, str) and raw_branch.strip():
+                desired_branch = raw_branch.strip()
+            elif requested_slug:
+                desired_branch = requested_slug
+            else:
+                desired_branch = f"wt-{len(existing) + 1:02d}"
+            branch = desired_branch
+            suffix = 2
+            while branch in existing_branches:
+                branch = f"{desired_branch}-{suffix}"
+                suffix += 1
+            base_slug = requested_slug or _sim_slugify_worktree(branch) or f"wt-{len(existing) + 1}"
+
+        slug = base_slug
+        wt_path = f"{project_root}/.relay/worktrees/{slug}"
+        suffix = 2
+        while wt_path in existing_paths:
+            slug = f"{base_slug}-{suffix}"
+            wt_path = f"{project_root}/.relay/worktrees/{slug}"
+            suffix += 1
+
+        base_branch = raw_base.strip() if isinstance(raw_base, str) and raw_base.strip() else "main"
+        parent_repo = server.sim_git_repos.get(project_root)
+        head_sha = parent_repo["commits"][0]["sha"] if parent_repo and parent_repo["commits"] else "9f4e2a1b8c3d7e6f0a1b2c3d4e5f6a7b8c9d0e1f"
+
+        new_repo = _sim_make_git_repo_state(
+            wt_path,
+            branch=branch,
+            base_branch=base_branch,
+            ahead=0,
+            behind=0,
+            uncommitted_files=[],
+            committed_files=[],
+            pr=_SIM_PR_BY_BRANCH.get(branch),
+        )
+        server.sim_git_repos[wt_path] = new_repo
+
+        descriptor = {
+            "path": wt_path,
+            "name": slug,
+            "head": head_sha,
+            "branch": branch,
+            "isMain": False,
+            "isManaged": True,
+            "dirty": False,
+            "added": 0,
+            "deleted": 0,
+        }
+        existing.append(descriptor)
+        return (201, {"worktree": dict(descriptor)})
+
+
+def sim_worktree_remove(server: SimulatorVaultServer, body: dict) -> tuple[int, dict]:
+    raw_path = body.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return (400, {"error": "path is required"})
+    target_path = _sim_norm_path(raw_path)
+    force = bool(body.get("force", False))
+
+    with server.fixture_lock:
+        for project_root, entries in server.sim_worktrees.items():
+            for index, wt in enumerate(entries):
+                if wt["path"] != target_path:
+                    continue
+                if wt.get("isMain"):
+                    return (403, {"error": "cannot remove the main checkout"})
+                if not wt.get("isManaged"):
+                    return (403, {"error": "cannot remove non-managed worktree outside .relay/worktrees"})
+                _sim_sync_worktree_descriptor(server, target_path)
+                if wt.get("dirty") and not force:
+                    return (409, {"error": "worktree has uncommitted changes"})
+                entries.pop(index)
+                server.sim_git_repos.pop(target_path, None)
+                return (200, {"ok": True, "removed": target_path})
+        return (403, {"error": "cannot remove non-managed worktree outside .relay/worktrees"})
+
+
+def sim_workspace_for_worktree_path(server: SimulatorVaultServer, raw_path: str) -> dict | None:
+    target = _sim_norm_path(raw_path)
+    if not target:
+        return None
+    with server.fixture_lock:
+        for project_root, entries in server.sim_worktrees.items():
+            project_ws = next((w for w in _SIM_WORKSPACES if w["path"] == project_root), None)
+            project_name = project_ws["name"] if project_ws else Path(project_root).name
+            for wt in entries:
+                if wt["path"] == target and not wt.get("isMain"):
+                    wt_id = f"wt-{Path(project_root).name}-{wt['name']}"
+                    return {
+                        "id": wt_id,
+                        "name": f"{project_name} · {wt['name']}",
+                        "path": wt["path"],
+                    }
+    return None
+
+
+def sim_worktree_fs_list(server: SimulatorVaultServer, requested: str, query: dict) -> dict | None:
+    target = _sim_norm_path(requested)
+    if "/.relay/worktrees/" not in target:
+        return None
+    prefix, _, rest = target.partition("/.relay/worktrees/")
+    parts = [p for p in rest.split("/") if p]
+    if not parts:
+        return None
+    wt_slug = parts[0]
+    wt_root = f"{prefix}/.relay/worktrees/{wt_slug}"
+    sub_rel = "/".join(parts[1:])
+    mapped_target = f"{prefix}/{sub_rel}" if sub_rel else prefix
+    listing = codex_fixture_fs_list(mapped_target, query)
+    if listing is None:
+        return None
+    listing = dict(listing)
+    listing["absolutePath"] = target
+    listing["currentPath"] = target
+    rewritten_entries = []
+    for entry in listing.get("entries", []):
+        copied = dict(entry)
+        abs_path = copied.get("absolutePath", "")
+        if abs_path.startswith(prefix + "/"):
+            copied["absolutePath"] = wt_root + abs_path[len(prefix):]
+        rewritten_entries.append(copied)
+    listing["entries"] = rewritten_entries
+    wt_workspace = sim_workspace_for_worktree_path(server, wt_root)
+    if wt_workspace:
+        listing["workspace"] = wt_workspace
+    return listing
+
+
+def sim_resolve_workspace(server: SimulatorVaultServer, workspace_id: str) -> dict | None:
+    if not workspace_id:
+        return None
+    workspace = next((item for item in _SIM_WORKSPACES if item["id"] == workspace_id), None)
+    if workspace is not None:
+        return workspace
+    with server.fixture_lock:
+        if workspace_id in server.dynamic_workspaces:
+            return server.dynamic_workspaces[workspace_id]
+        for project_root, entries in server.sim_worktrees.items():
+            project_ws = next((w for w in _SIM_WORKSPACES if w["path"] == project_root), None)
+            project_name = project_ws["name"] if project_ws else Path(project_root).name
+            for wt in entries:
+                wt_id = f"wt-{Path(project_root).name}-{wt['name']}"
+                if workspace_id in {wt_id, wt["path"], wt["name"]}:
+                    resolved = {
+                        "id": wt_id,
+                        "name": f"{project_name} · {wt['name']}",
+                        "path": wt["path"],
+                    }
+                    server.dynamic_workspaces[wt_id] = resolved
+                    return resolved
+    return None
+
+
+def sim_terminal_prompt(server: SimulatorVaultServer, workspace: dict) -> str:
+    ws_path = workspace.get("path") or _SIM_POC_VAULT_MAIN_PATH
+    short_dir = Path(ws_path).name or "workspace"
+    _, repo = _sim_resolve_git_repo_unlocked(server, ws_path)
+    git_segment = ""
+    if repo is not None:
+        dirty, _, _ = _sim_repo_stats(repo)
+        dirty_mark = " \x1b[33m±\x1b[0m" if dirty else ""
+        git_segment = f" \x1b[35mgit:(\x1b[1;35m{repo['branch']}\x1b[0;35m)\x1b[0m{dirty_mark}"
+    return f"\x1b[1;32mrelay@macbook\x1b[0m \x1b[1;36m{short_dir}\x1b[0m{git_segment} \x1b[1;34m❯\x1b[0m "
+
+
+def sim_terminal_ls_output(workspace: dict) -> str:
+    ws_path = workspace.get("path") or _SIM_POC_VAULT_MAIN_PATH
+    base_rel = sim_fs_relative(ws_path.partition("/.relay/worktrees/")[0]) or "poc-vault"
+    node = sim_fs_node(base_rel)
+    children = (node or {}).get("children", {})
+    lines = [f"\x1b[2mtotal {max(8, len(children) * 8)}\x1b[0m"]
+    lines.append("\x1b[2mdrwxr-xr-x   8 relay  staff    256 Nov 23 12:18 \x1b[1;34m.\x1b[0m")
+    lines.append("\x1b[2mdrwxr-xr-x   5 relay  staff    160 Nov 23 11:02 \x1b[1;34m..\x1b[0m")
+    for name, child in sorted(children.items()):
+        if child.get("kind") == "dir":
+            lines.append(f"\x1b[2mdrwxr-xr-x   4 relay  staff    128 Nov 23 12:14 \x1b[1;36m{name}/\x1b[0m")
+        else:
+            size = len(sim_fs_content(child))
+            color = "\x1b[33m" if name.endswith((".ts", ".swift", ".py")) else "\x1b[37m"
+            if name.startswith("."):
+                color = "\x1b[2;37m"
+            lines.append(f"\x1b[2m-rw-r--r--   1 relay  staff {size:6d} Nov 23 12:18 \x1b[0m{color}{name}\x1b[0m")
+    return "\r\n".join(lines) + "\r\n"
+
+
+def sim_terminal_startup_output(server: SimulatorVaultServer, workspace: dict) -> str:
+    prompt = sim_terminal_prompt(server, workspace)
+    banner = (
+        f"\x1b[1;36m● Relay PTY\x1b[0m \x1b[2m·\x1b[0m \x1b[1m{workspace['name']}\x1b[0m "
+        f"\x1b[2m({workspace['path']})\x1b[0m\r\n"
+    )
+    uname_block = (
+        f"{prompt}uname -a\r\n"
+        f"\x1b[37mDarwin relay-macbook.local 24.4.0 Darwin Kernel Version 24.4.0: "
+        f"arm64 RELEASE_ARM64_T6030\x1b[0m\r\n"
+    )
+    ls_block = f"{prompt}ls -la\r\n{sim_terminal_ls_output(workspace)}"
+    return banner + uname_block + ls_block + prompt
+
+
+def sim_terminal_run_command(server: SimulatorVaultServer, record: dict, command: str) -> str:
+    workspace = record["workspace"]
+    ws_path = workspace["path"]
+    prompt = sim_terminal_prompt(server, workspace)
+    stripped = command.strip()
+
+    if not stripped:
+        return prompt
+    if stripped in {"exit", "logout"}:
+        now = sim_now_iso()
+        record["terminal"].update({
+            "status": "exited",
+            "updatedAt": now,
+            "finishedAt": now,
+            "exitCode": 0,
+        })
+        return "\x1b[2mlogout\x1b[0m\r\n"
+    if stripped == "clear":
+        return "\x1b[2J\x1b[H" + prompt
+    if stripped == "pwd":
+        return f"\x1b[36m{ws_path}\x1b[0m\r\n{prompt}"
+    if stripped == "whoami":
+        return f"relay-demo\r\n{prompt}"
+    if stripped == "date":
+        return f"{datetime.now(timezone.utc).strftime('%a %b %d %H:%M:%S UTC %Y')}\r\n{prompt}"
+    if stripped == "uname" or stripped.startswith("uname "):
+        if "-a" in stripped:
+            return (
+                "Darwin relay-macbook.local 24.4.0 Darwin Kernel Version 24.4.0: "
+                f"arm64 RELEASE_ARM64_T6030\r\n{prompt}"
+            )
+        return f"Darwin\r\n{prompt}"
+    if stripped in {"ls", "ll"} or stripped.startswith("ls "):
+        return sim_terminal_ls_output(workspace) + prompt
+    if stripped.startswith("echo "):
+        return f"{stripped[5:]}\r\n{prompt}"
+    if stripped in {"git status", "git st"}:
+        _, repo = _sim_resolve_git_repo_unlocked(server, ws_path)
+        if repo is None:
+            return f"\x1b[31mfatal: not a git repository\x1b[0m\r\n{prompt}"
+        out = [f"On branch \x1b[1;36m{repo['branch']}\x1b[0m"]
+        if repo["ahead"]:
+            out.append(f"Your branch is ahead of 'origin/{repo['baseBranch']}' by {repo['ahead']} commit(s).")
+        if not repo["uncommitted_files"]:
+            out.append("\x1b[32mnothing to commit, working tree clean\x1b[0m")
+        else:
+            out.append("")
+            out.append("Changes not staged for commit:")
+            for item in repo["uncommitted_files"]:
+                out.append(f"\t\x1b[31m{item['status']}:   {item['path']}\x1b[0m  \x1b[32m+{item['added']}\x1b[0m \x1b[31m-{item['deleted']}\x1b[0m")
+        return "\r\n".join(out) + "\r\n" + prompt
+    if stripped == "git branch" or stripped.startswith("git branch "):
+        _, repo = _sim_resolve_git_repo_unlocked(server, ws_path)
+        if repo is None:
+            return f"\x1b[31mfatal: not a git repository\x1b[0m\r\n{prompt}"
+        lines = []
+        for item in repo["branches"]:
+            if item["isRemote"]:
+                continue
+            if item["isCurrent"]:
+                lines.append(f"\x1b[1;32m* {item['name']}\x1b[0m")
+            else:
+                lines.append(f"  {item['name']}")
+        return "\r\n".join(lines) + "\r\n" + prompt
+    if stripped == "git log" or stripped.startswith("git log "):
+        _, repo = _sim_resolve_git_repo_unlocked(server, ws_path)
+        if repo is None:
+            return f"\x1b[31mfatal: not a git repository\x1b[0m\r\n{prompt}"
+        lines = [
+            f"\x1b[33m{c['shortSha']}\x1b[0m {c['subject']} \x1b[2m({c['relativeDate']})\x1b[0m"
+            for c in repo["commits"][:5]
+        ]
+        return "\r\n".join(lines) + "\r\n" + prompt
+    if stripped == "git diff" or stripped.startswith("git diff "):
+        _, repo = _sim_resolve_git_repo_unlocked(server, ws_path)
+        if repo is None:
+            return f"\x1b[31mfatal: not a git repository\x1b[0m\r\n{prompt}"
+        if not repo["uncommitted_files"]:
+            return prompt
+        lines = []
+        for item in repo["uncommitted_files"][:2]:
+            lines.append(f"\x1b[1mdiff --git a/{item['path']} b/{item['path']}\x1b[0m")
+            for hunk in item["hunks"][:1]:
+                lines.append(f"\x1b[36m{hunk['header']}\x1b[0m")
+                for ln in hunk["lines"][:8]:
+                    if ln["kind"] == "add":
+                        lines.append(f"\x1b[32m+{ln['text']}\x1b[0m")
+                    elif ln["kind"] == "del":
+                        lines.append(f"\x1b[31m-{ln['text']}\x1b[0m")
+                    else:
+                        lines.append(f" {ln['text']}")
+        return "\r\n".join(lines) + "\r\n" + prompt
+    if stripped == "help":
+        return (
+            "\x1b[1;36mSimulator commands:\x1b[0m "
+            "ls, pwd, uname -a, git status, git branch, git log, git diff, echo, date, whoami, clear, exit\r\n"
+            + prompt
+        )
+    return f"\x1b[2m[simulator]\x1b[0m ran: \x1b[37m{stripped}\x1b[0m\r\n{prompt}"
+
+
+def sim_terminal_ingest_input(server: SimulatorVaultServer, record: dict, text: str) -> None:
+    """Supports both per-keystroke VT100 input (char echo, backspace, ^C, ^L)
+    and full-line submits (`command\\n`)."""
+    out_parts: list[str] = []
+    buf: str = record.get("line_buffer", "")
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        # Swallow CSI/SS3 navigation escape sequences (e.g., arrow keys) cleanly.
+        if ch == "\x1b" and i + 1 < n and text[i + 1] in {"[", "O"}:
+            i += 2
+            while i < n and not (0x40 <= ord(text[i]) <= 0x7E):
+                i += 1
+            i += 1
+            continue
+        if ch == "\x03":  # Ctrl-C
+            buf = ""
+            out_parts.append("^C\r\n" + sim_terminal_prompt(server, record["workspace"]))
+            i += 1
+            continue
+        if ch == "\x0c":  # Ctrl-L
+            buf = ""
+            out_parts.append("\x1b[2J\x1b[H" + sim_terminal_prompt(server, record["workspace"]))
+            i += 1
+            continue
+        if ch in {"\x7f", "\x08"}:  # Backspace
+            if buf:
+                buf = buf[:-1]
+                out_parts.append("\b \b")
+            i += 1
+            continue
+        if ch in {"\r", "\n"}:
+            if ch == "\r" and i + 1 < n and text[i + 1] == "\n":
+                i += 1
+            command = buf
+            buf = ""
+            out_parts.append("\r\n")
+            out_parts.append(sim_terminal_run_command(server, record, command))
+            i += 1
+            continue
+        if ord(ch) >= 32 or ch == "\t":
+            buf += ch
+            out_parts.append(ch)
+        i += 1
+
+    record["line_buffer"] = buf
+    if out_parts:
+        record["output"] += "".join(out_parts)
+        record["sequence"] = int(record.get("sequence", 0)) + 1
+        record["version"] = int(record.get("version", 0)) + 1
+        record["terminal"]["updatedAt"] = sim_now_iso()
 
 
 def simulator_signing_key(manifest_dir: Path) -> Path:

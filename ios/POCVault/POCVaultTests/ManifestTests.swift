@@ -833,7 +833,7 @@ final class ManifestTests: XCTestCase {
         XCTAssertFalse(pick.contains("onClose"))
         // Close is the header circle and nothing else.
         XCTAssertEqual(modelSheet.components(separatedBy: "onClose").count - 1, 2)
-        XCTAssertTrue(modelSheet.contains("RelaySheetHeader(title: \"Model\", leading: .close, action: onClose)"))
+        XCTAssertTrue(modelSheet.contains("RelayComposerSheetHeader(title: \"Model\", leading: .close, action: onClose)"))
         XCTAssertFalse(modelSheet.contains("\"Done\""))
         // Effort sits directly under the list on the Model page, for the selection.
         let page = try requiredSnippet(in: modelSheet, from: "private var modelPage: some View", to: "func pick(_ choice: RelayModelChoice)")
@@ -1143,17 +1143,21 @@ final class ManifestTests: XCTestCase {
             )
         }
 
-        // Job status renders as a ticking typographic label.
-        let chatSource = try AppSourceFixture.load("POCVault/Views/RelayChatView.swift")
-        XCTAssertTrue(chatSource.contains("RelayCapsLabel"))
-        XCTAssertTrue(chatSource.contains("TimelineView"))
+        // Job status renders with ticking timelines in transcript views and
+        // semantic theme tokens instead of hardcoded legacy status colors.
+        let transcriptSource = try AppSourceFixture.load("POCVault/Views/RelayTranscriptViews.swift")
+        let rootSource = try AppSourceFixture.load("POCVault/POCVaultApp.swift")
+        XCTAssertTrue(rootSource.contains("RelayCapsLabel"))
+        XCTAssertTrue(transcriptSource.contains("TimelineView"))
     }
 
     func testRootOpensChatWithSidebarAndKeepsToolsReachable() throws {
         let source = try AppSourceFixture.load("POCVault/POCVaultApp.swift")
         let browserSource = try AppSourceFixture.load("POCVault/Browser/FileBrowserView.swift")
 
-        // Chat is home. Files, previews, and settings remain in the sidebar.
+        // Chat is home inside the 3-panel Paseo spatial shell:
+        // Left Projects/Workspaces sidebar <-> Center Active Workspace <-> Right Explorer (Changes/Files/Previews).
+        // Full folder navigation, previews, machine power/resize, and settings remain reachable.
         XCTAssertTrue(source.contains("NavigationStack(path: $browserPath)"))
         XCTAssertTrue(source.contains(".navigationDestination(for: BrowserRoute.self)"))
         XCTAssertTrue(source.contains("case folder(path: String)"))
@@ -1162,7 +1166,10 @@ final class ManifestTests: XCTestCase {
         XCTAssertFalse(source.contains("FileViewerPlaceholderView"))
         XCTAssertFalse(source.contains("TabView(selection: $selectedRootTab)"))
         XCTAssertTrue(source.contains("private var chatShell: some View"))
-        XCTAssertTrue(source.contains("RelayChatSidebar("))
+        XCTAssertTrue(source.contains("RelayMobilePanelsContainer("))
+        XCTAssertTrue(source.contains("RelayWorkspacesSidebar("))
+        XCTAssertTrue(source.contains("RelayWorkspaceHeader("))
+        XCTAssertTrue(source.contains("RelayExplorerDrawerView("))
         XCTAssertTrue(source.contains("sidebarAction(\"Files\""))
         XCTAssertTrue(source.contains("sidebarAction(\"Previews\""))
         XCTAssertTrue(source.contains("sidebarAction(\"Settings\""))
@@ -3119,8 +3126,8 @@ final class ManifestTests: XCTestCase {
             to: "var body: some View"
         )
 
-        // Row 2 is one fixed-height HStack: "+", model pill, mic, send. It never
-        // scrolls and never wraps, idle or dictating.
+        // Row 2 is one fixed-height HStack: "+", model pill, mic, trailing action disc.
+        // It never scrolls and never wraps, idle or dictating.
         XCTAssertFalse(controlBarSource.contains("ScrollView"))
         XCTAssertFalse(controlBarSource.contains("VStack"))
         XCTAssertFalse(controlBarSource.contains(".refreshable"))
@@ -3128,7 +3135,7 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(controlBarSource.contains("addButton"))
         XCTAssertTrue(controlBarSource.contains("modelPill"))
         XCTAssertTrue(controlBarSource.contains("micButton"))
-        XCTAssertTrue(controlBarSource.contains("sendButton"))
+        XCTAssertTrue(controlBarSource.contains("trailingActionDisc"))
         XCTAssertTrue(controlBarSource.contains("addSheetStart = .root"))
         XCTAssertTrue(controlBarSource.contains("showingModelPicker = true"))
         XCTAssertTrue(controlBarSource.contains("AppConfiguration.supportsDictation"))
@@ -3138,8 +3145,8 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(controlBarSource.contains("relay-dictate"))
         XCTAssertTrue(controlBarSource.contains("relay-send"))
         XCTAssertTrue(controlBarSource.contains("relay-stop"))
-        // Disabled send is cream, never dimmed ember.
-        XCTAssertTrue(controlBarSource.contains("live ? AppTheme.accent : RelayComposerPalette.disabledDisc"))
+        // Disabled send uses surface3, active send uses theme.accent.
+        XCTAssertTrue(controlBarSource.contains("sendLive ? theme.accent : theme.surface3"))
         // One "+" replaced the run-settings and attach buttons.
         XCTAssertFalse(source.contains("relay-run-settings"))
         XCTAssertFalse(source.contains("relay-attach\""))
@@ -3165,7 +3172,7 @@ final class ManifestTests: XCTestCase {
         let composerSource = try sourceSnippet(
             in: source,
             from: "private struct RelayComposer: View",
-            to: "private struct RelayChatBubble"
+            to: "struct RelayChatBubble"
         )
         XCTAssertFalse(composerSource.contains("ScrollView(.horizontal"))
         XCTAssertFalse(sheets.contains("ScrollView(.horizontal"))
@@ -3187,24 +3194,24 @@ final class ManifestTests: XCTestCase {
         let composerSource = try sourceSnippet(
             in: source,
             from: "private struct RelayComposer",
-            to: "private struct RelayChatBubble"
+            to: "struct RelayChatBubble"
         )
 
         XCTAssertTrue(composerSource.contains("static let horizontalInset: CGFloat = 12"))
-        XCTAssertTrue(composerSource.contains("static let controlHeight: CGFloat = 44"))
-        XCTAssertTrue(composerSource.contains("static let actionSize: CGFloat = 44"))
+        XCTAssertTrue(composerSource.contains("static let controlHeight: CGFloat = 40"))
+        XCTAssertTrue(composerSource.contains("static let actionSize: CGFloat = 36"))
         XCTAssertTrue(composerSource.contains("VStack(spacing: Layout.rowSpacing)"))
-        // One floating raised card; the conversation fades out above it instead of
+        // One floating raised Paseo card; the conversation fades out above it instead of
         // meeting a hairline, and the ground beside and below it stays solid.
-        XCTAssertTrue(composerSource.contains("static let cardRadius: CGFloat = 24"))
+        XCTAssertTrue(composerSource.contains("static let cardRadius: CGFloat = 22"))
         XCTAssertTrue(composerSource.contains("RoundedRectangle(cornerRadius: Layout.cardRadius, style: .continuous)"))
-        XCTAssertTrue(composerSource.contains(".fill(RelayComposerPalette.raisedCard)"))
-        XCTAssertTrue(composerSource.contains(".stroke(AppTheme.hairlineStrong, lineWidth: 1)"))
-        XCTAssertTrue(composerSource.contains(".background(AppTheme.bgCanvas)"))
-        XCTAssertTrue(composerSource.contains("colors: [AppTheme.bgCanvas.opacity(0), AppTheme.bgCanvas]"))
+        XCTAssertTrue(composerSource.contains(".background(theme.surface1)"))
+        XCTAssertTrue(composerSource.contains(".strokeBorder(theme.border, lineWidth: 1)"))
+        XCTAssertTrue(composerSource.contains(".background(theme.surface0)"))
+        XCTAssertTrue(composerSource.contains("colors: [theme.surface0.opacity(0), theme.surface0]"))
         XCTAssertFalse(composerSource.contains("Rectangle().fill(AppTheme.hairline).frame(height: 1)"))
         XCTAssertFalse(composerSource.contains(".frame(height: 2)"))
-        XCTAssertTrue(composerSource.contains("Message Relay…"))
+        XCTAssertTrue(composerSource.contains("Message, @files, /commands"))
     }
 
     func testRelayComposerIsPinnedOutsideTheConversationScrollView() throws {
@@ -3264,7 +3271,7 @@ final class ManifestTests: XCTestCase {
         XCTAssertFalse(source.contains("Section(\"Agents\")"))
         XCTAssertTrue(source.contains("showingModelPicker = true"))
         let composerSheets = try AppSourceFixture.load("POCVault/Views/RelayComposerSheets.swift")
-        XCTAssertTrue(source.contains("RelayModelSheet("))
+        XCTAssertTrue(source.contains("RelayPaseoModelOptionsSheet("))
         XCTAssertTrue(composerSheets.contains("ForEach(visibleSections.agents)"))
         XCTAssertTrue(composerSheets.contains("RelayModelSheetTab.tabs(for: visibleSections)"))
         XCTAssertTrue(composerSheets.contains("case .agent: return choice.shortModelLabel"))
@@ -3332,7 +3339,7 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(rowSource.contains("activityStamp"))
         XCTAssertTrue(source.contains("try? await Task.sleep(for: .seconds(4))"))
         XCTAssertTrue(source.contains("await viewModel.openHistoryItem(item)"))
-        XCTAssertTrue(source.contains("Label(\"Threads\", systemImage:"))
+        XCTAssertTrue(source.contains("Image(systemName: \"line.3.horizontal\")"))
         // The explanatory subtitle was dropped by the Editorial Ember copy rule; the
         // row is still reachable and labeled for VoiceOver.
         XCTAssertFalse(source.contains("Past conversations & invocations"))
@@ -4745,7 +4752,7 @@ final class RelayTranscriptViewTests: XCTestCase {
         XCTAssertTrue(list.contains(".refreshable"))
 
         // The header is opaque with a fade, so text never shows through the title.
-        XCTAssertTrue(chat.contains(".background(AppTheme.bgCanvas.ignoresSafeArea(edges: .top))"))
+        XCTAssertTrue(chat.contains(".background(theme.surface0.ignoresSafeArea(edges: .top))"))
         XCTAssertTrue(chat.contains(".frame(height: Self.headerFade)"))
 
         let scroller = try AppSourceFixture.load("POCVault/Views/RelayTranscriptViews.swift")
@@ -4810,11 +4817,11 @@ final class RelayTranscriptViewTests: XCTestCase {
 
         let sheets = try AppSourceFixture.load("POCVault/Views/RelayActivitySheets.swift")
         XCTAssertTrue(sheets.contains("static let ground = AppTheme.bgCanvas"))
-        XCTAssertTrue(sheets.contains("static let cornerRadius: CGFloat = 34"))
+        XCTAssertTrue(sheets.contains("static let cornerRadius: CGFloat = 28"))
         XCTAssertTrue(sheets.contains(".presentationDragIndicator(.visible)"))
-        XCTAssertTrue(sheets.contains("AppTheme.uiFont(size: 17, weight: .semibold)"))
-        XCTAssertTrue(sheets.contains(".frame(width: 36, height: 36)"))
-        XCTAssertTrue(sheets.contains(".preferredColorScheme(.dark)"))
+        XCTAssertTrue(sheets.contains(".presentationDetents([.fraction(0.6), .large])"))
+        XCTAssertTrue(sheets.contains("RelayToolbarIconButton("))
+        XCTAssertTrue(sheets.contains(".preferredColorScheme(theme.colorScheme)"))
         XCTAssertFalse(sheets.contains("NavigationStack"))
         XCTAssertFalse(sheets.contains("Button(\"Done\")"))
         // The sheet reads the live timeline, so an open step keeps updating.
@@ -4957,10 +4964,12 @@ final class RelayTranscriptViewTests: XCTestCase {
     }
 
     func testNothingInTheTranscriptScrollsSideways() throws {
+        // The conversation transcript itself wraps cleanly without sideways scroll;
+        // modal tool-detail inspection sheets (RelayActivitySheets) may horizontally
+        // scroll wide syntax-highlighted diffs and shell commands inside their sheet.
         let files = [
             "POCVault/Rendering/RelayMarkdownViews.swift",
             "POCVault/Views/RelayTranscriptViews.swift",
-            "POCVault/Views/RelayActivitySheets.swift",
             "POCVault/Views/RelayApprovalCard.swift",
         ]
         for file in files {

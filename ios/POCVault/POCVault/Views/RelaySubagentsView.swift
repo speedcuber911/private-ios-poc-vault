@@ -37,6 +37,27 @@ struct RelaySubagent: Identifiable, Hashable {
         }
     }
 
+    var statusBucket: RelayStatusBucket {
+        if isWorking {
+            return step.agent?.statusLabel == "Waiting" ? .needsInput : .running
+        }
+        if statusLabel == "Failed" || step.status == .failed { return .error }
+        if statusLabel == "Done" || step.status == .done { return .done }
+        return .idle
+    }
+
+    var modelSubtitle: String? {
+        var parts: [String] = []
+        if let provider {
+            parts.append(provider.relayPresentation.title)
+        }
+        if let role = (step.agent?.role ?? step.input.agentType)?.trimmedNonEmpty,
+           role.caseInsensitiveCompare(name) != .orderedSame {
+            parts.append(role)
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
     static func collect(messages: [RelayConversationItem], timelines: [String: RelayTimeline]) -> [RelaySubagent] {
         var result: [RelaySubagent] = []
         var aliases: [String: String] = [:]
@@ -138,6 +159,273 @@ extension RelayStep {
     var subagentAvatarSeed: String { agent?.id ?? agent?.callId ?? id }
 }
 
+// MARK: - Paseo Floating Subagents Pill & In-Place Sheet
+
+/// Paseo Floating Subagents Track pill sitting just above the composer.
+/// Shows live running status ring and concise count/status summary.
+struct RelayFloatingSubagentsPill: View {
+    let subagents: [RelaySubagent]
+    let action: () -> Void
+    @Environment(\.relayTheme) private var theme
+
+    private var activeCount: Int {
+        subagents.filter(\.isWorking).count
+    }
+
+    private var failedCount: Int {
+        subagents.filter { $0.statusLabel == "Failed" || $0.step.status == .failed }.count
+    }
+
+    private var summaryText: String {
+        let total = subagents.count
+        if activeCount > 0 {
+            if total == 1 {
+                return "\(subagents[0].name) · running"
+            }
+            return "\(activeCount)/\(total) subagents running"
+        }
+        return total == 1 ? "1 subagent" : "\(total) subagents"
+    }
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 7) {
+                if activeCount > 0 {
+                    RelayStatusRing(isActive: true, size: 12, lineWidth: 1.5, showsCenterDot: true)
+                } else if failedCount > 0 {
+                    RelayStatusDot(bucket: .error, size: 7)
+                } else {
+                    Image(systemName: "person.2")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(theme.foregroundMuted)
+                }
+
+                Text(summaryText)
+                    .font(RelayTheme.uiFont(13, weight: .medium))
+                    .foregroundStyle(theme.foreground)
+                    .lineLimit(1)
+
+                Image(systemName: "chevron.up")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(theme.foregroundExtraMuted)
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 34)
+            .background(theme.surface2, in: Capsule())
+            .overlay {
+                Capsule()
+                    .strokeBorder(theme.border, lineWidth: 1)
+            }
+            .shadow(color: Color.black.opacity(theme.isDark ? 0.28 : 0.10), radius: 8, y: 3)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("relay-floating-subagents-pill")
+        .accessibilityLabel(summaryText)
+        .accessibilityHint("Opens subagents list")
+    }
+}
+
+/// Paseo compact subagents sheet (`presentationDetents([.medium, .large])`)
+/// where tapping any child navigates in-place inside a `NavigationStack` with
+/// Back to list, showing that subagent's live/replayed timeline, status, and
+/// model subtitle.
+struct RelaySubagentsSheet: View {
+    let subagents: [RelaySubagent]
+    let client: CodexClient
+    @ObservedObject var parentModel: RelayChatViewModel
+    @ObservedObject var powerModel: RelayMachinePowerModel
+    var isLoading: Bool = false
+    var errorMessage: String? = nil
+
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.relayTheme) private var theme
+    @State private var path: [RelaySubagent] = []
+
+    private var activeCount: Int {
+        subagents.filter(\.isWorking).count
+    }
+
+    private var headerSubtitle: String {
+        if activeCount > 0 {
+            return "\(activeCount) running · \(subagents.count) total"
+        }
+        return subagents.count == 1 ? "1 task" : "\(subagents.count) tasks"
+    }
+
+    var body: some View {
+        NavigationStack(path: $path) {
+            VStack(spacing: 0) {
+                sheetRootHeader
+
+                RelaySubagentsView(
+                    subagents: subagents,
+                    isLoading: isLoading,
+                    errorMessage: errorMessage,
+                    onOpen: { agent in
+                        path.append(agent)
+                    }
+                )
+            }
+            .background(theme.surface0)
+            .toolbar(.hidden, for: .navigationBar)
+            .navigationDestination(for: RelaySubagent.self) { agent in
+                if agent.step.agent?.id != nil, let sessionID = parentModel.nativeSessionID {
+                    RelaySubagentChatView(
+                        agent: agent,
+                        parentSessionID: sessionID,
+                        client: client,
+                        parentModel: parentModel,
+                        powerModel: powerModel,
+                        onClose: nil,
+                        inSheet: true,
+                        onDismissSheet: { dismiss() }
+                    )
+                } else {
+                    RelaySubagentTimelineDetailView(
+                        agent: agent,
+                        parentModel: parentModel,
+                        onDismissSheet: { dismiss() }
+                    )
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+        .presentationCornerRadius(28)
+        .presentationBackground(theme.surface0)
+        .preferredColorScheme(theme.colorScheme)
+    }
+
+    private var sheetRootHeader: some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .center, spacing: 10) {
+                if activeCount > 0 {
+                    RelayStatusRing(isActive: true, size: 15, lineWidth: 1.6, showsCenterDot: true)
+                        .frame(width: 24, height: 24)
+                } else {
+                    Image(systemName: "person.2")
+                        .font(.system(size: 16, weight: .regular))
+                        .foregroundStyle(theme.foregroundMuted)
+                        .frame(width: 24, height: 24)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Subagents")
+                        .font(RelayTheme.uiFont(16, weight: .medium))
+                        .foregroundStyle(theme.foreground)
+                    Text(headerSubtitle)
+                        .font(RelayTheme.uiFont(12.5))
+                        .foregroundStyle(theme.foregroundMuted)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityAddTraits(.isHeader)
+
+                RelayToolbarIconButton(
+                    systemImage: "xmark",
+                    accessibilityLabel: "Close subagents",
+                    iconSize: 14,
+                    weight: .medium,
+                    isMuted: true
+                ) {
+                    dismiss()
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 12)
+            .background(theme.surface0)
+
+            Rectangle().fill(theme.border).frame(height: 1)
+        }
+    }
+}
+
+/// In-place recorded/live timeline detail view for a subagent pushed inside
+/// `RelaySubagentsSheet` when no separate native child session file exists.
+private struct RelaySubagentTimelineDetailView: View {
+    let agent: RelaySubagent
+    @ObservedObject var parentModel: RelayChatViewModel
+    var onDismissSheet: (() -> Void)? = nil
+
+    @Environment(\.relayTheme) private var theme
+    @State private var childStepRequest: RelayActivityRequest?
+
+    private var currentAgent: RelaySubagent {
+        parentModel.subagents.first { $0.id == agent.id } ?? agent
+    }
+
+    private var timeline: RelayTimeline {
+        switch currentAgent.request.source {
+        case .job(let id):
+            return parentModel.timeline(forJobID: id) ?? RelayTimeline()
+        case .message(let id):
+            return parentModel.messages.first { $0.id == id }?.historyTimeline ?? RelayTimeline()
+        }
+    }
+
+    private var liveStep: RelayStep {
+        timeline.step(currentAgent.step.id) ?? currentAgent.step
+    }
+
+    var body: some View {
+        ScrollView {
+            RelayStepDetail(
+                step: liveStep,
+                children: timeline.children(of: liveStep.id)
+            ) { childID in
+                childStepRequest = RelayActivityRequest(source: currentAgent.request.source, root: .step(childID))
+            }
+            .padding(.bottom, 28)
+        }
+        .background(theme.surface0)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(theme.surface0, for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                HStack(spacing: 8) {
+                    RelayAgentAvatar(seed: currentAgent.step.subagentAvatarSeed)
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(spacing: 6) {
+                            Text(currentAgent.name)
+                                .font(RelayTheme.uiFont(14.5, weight: .semibold))
+                                .foregroundStyle(theme.foreground)
+                                .lineLimit(1)
+                            if let status = currentAgent.statusLabel {
+                                RelayStatusBadge(status, bucket: currentAgent.statusBucket, showsDot: currentAgent.isWorking, compact: true)
+                            }
+                        }
+                        if let subtitle = currentAgent.modelSubtitle {
+                            Text(subtitle)
+                                .font(RelayTheme.uiFont(11.5))
+                                .foregroundStyle(theme.foregroundMuted)
+                                .lineLimit(1)
+                        }
+                    }
+                }
+            }
+            if let onDismissSheet {
+                ToolbarItem(placement: .topBarTrailing) {
+                    RelayToolbarIconButton(
+                        systemImage: "xmark",
+                        accessibilityLabel: "Close",
+                        iconSize: 13,
+                        weight: .medium,
+                        isMuted: true,
+                        action: onDismissSheet
+                    )
+                }
+            }
+        }
+        .sheet(item: $childStepRequest) { req in
+            RelayActivitySheet(request: req, viewModel: parentModel)
+        }
+    }
+}
+
+// MARK: - Deterministic Avatar
+
 /// A deterministic identity mark, independent of status and row order.
 /// Swift's randomized Hasher would change the avatar after every app launch.
 struct RelayAgentAvatar: View {
@@ -169,14 +457,17 @@ struct RelayAgentAvatar: View {
             }
         }
         .frame(width: 28, height: 28)
-        .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
+        .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
         .accessibilityHidden(true)
     }
 }
 
+// MARK: - Section Picker (kept for compatibility with tests & legacy callers)
+
 struct RelayChatSectionPicker: View {
     @Binding var selection: RelayChatSection
     let subagentCount: Int
+    @Environment(\.relayTheme) private var theme
 
     var body: some View {
         HStack(spacing: 4) {
@@ -184,7 +475,11 @@ struct RelayChatSectionPicker: View {
             sectionButton(subagentCount == 0 ? "Subagents" : "Subagents (\(subagentCount))", section: .subagents)
         }
         .padding(4)
-        .background(Color.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 13))
+        .background(theme.surface1, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(theme.border, lineWidth: 1)
+        }
         .padding(.horizontal, 16)
         .padding(.bottom, 8)
         .accessibilityElement(children: .contain)
@@ -196,14 +491,14 @@ struct RelayChatSectionPicker: View {
         let isSelected = selection == section
         return Button { selection = section } label: {
             Text(title)
-                .font(AppTheme.uiFont(size: 16, weight: isSelected ? .semibold : .medium))
-                .foregroundStyle(isSelected ? AppTheme.textPrimary : AppTheme.textSecondary)
+                .font(RelayTheme.uiFont(14, weight: isSelected ? .semibold : .medium))
+                .foregroundStyle(isSelected ? theme.foreground : theme.foregroundMuted)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 10)
-                .padding(.vertical, 10)
-                .frame(maxWidth: .infinity, minHeight: 48)
-                .background(isSelected ? AppTheme.textPrimary.opacity(0.12) : .clear,
-                            in: RoundedRectangle(cornerRadius: 9))
+                .padding(.vertical, 8)
+                .frame(maxWidth: .infinity, minHeight: 38)
+                .background(isSelected ? theme.surface2 : .clear,
+                            in: RoundedRectangle(cornerRadius: 9, style: .continuous))
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -211,11 +506,14 @@ struct RelayChatSectionPicker: View {
     }
 }
 
+// MARK: - Subagents List
+
 struct RelaySubagentsView: View {
     let subagents: [RelaySubagent]
     let isLoading: Bool
     let errorMessage: String?
     let onOpen: (RelaySubagent) -> Void
+    @Environment(\.relayTheme) private var theme
 
     var body: some View {
         ScrollView {
@@ -227,16 +525,13 @@ struct RelaySubagentsView: View {
                 if subagents.isEmpty {
                     if isLoading {
                         ProgressView("Loading subagents…")
-                            .tint(AppTheme.accent)
+                            .tint(theme.accent)
+                            .foregroundStyle(theme.foregroundMuted)
                             .frame(maxWidth: .infinity, minHeight: 180)
                     } else if errorMessage == nil {
-                        ContentUnavailableView {
-                            Label("No subagents to show", systemImage: "person.2")
-                        } description: {
-                            Text("Subagent tasks reported by this chat will appear here.")
-                        }
-                        .padding(.top, 40)
-                        .accessibilityIdentifier("relay-subagents-empty")
+                        RelayEmptyStateView("No subagents in this conversation")
+                            .padding(.top, 40)
+                            .accessibilityIdentifier("relay-subagents-empty")
                     }
                 } else {
                     ForEach(Array(subagents.enumerated()), id: \.element.id) { index, subagent in
@@ -247,15 +542,16 @@ struct RelaySubagentsView: View {
                         .buttonStyle(.plain)
                         .accessibilityIdentifier("relay-subagent-row")
                         if index + 1 < subagents.count, subagents[index + 1].depth == 0 {
-                            Divider().overlay(AppTheme.textPrimary.opacity(0.08))
+                            Rectangle().fill(theme.border).frame(height: 1)
                         }
                     }
                 }
             }
-            .padding(.horizontal, 20)
-            .padding(.top, 12)
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
             .padding(.bottom, 24)
         }
+        .background(theme.surface0)
         .scrollDismissesKeyboard(.interactively)
         .accessibilityIdentifier("relay-subagents")
     }
@@ -265,43 +561,54 @@ struct RelaySubagentsView: View {
             if subagent.depth > 0 {
                 Image(systemName: "arrow.turn.down.right")
                     .font(.caption)
-                    .foregroundStyle(AppTheme.textSecondary)
+                    .foregroundStyle(theme.foregroundExtraMuted)
                     .padding(.top, 8)
                     .accessibilityHidden(true)
             }
             RelayAgentAvatar(seed: subagent.step.subagentAvatarSeed)
                 .padding(.top, 2)
-            VStack(alignment: .leading, spacing: 6) {
-                Text(subagent.name)
-                    .font(.body.weight(.medium))
-                    .foregroundStyle(AppTheme.textPrimary)
-                    .lineLimit(3)
-                    .multilineTextAlignment(.leading)
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(alignment: .center, spacing: 8) {
+                    Text(subagent.name)
+                        .font(RelayTheme.uiFont(15, weight: .medium))
+                        .foregroundStyle(theme.foreground)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+
+                    if let status = subagent.statusLabel {
+                        RelayStatusBadge(
+                            status,
+                            bucket: subagent.statusBucket,
+                            showsDot: subagent.isWorking,
+                            compact: true
+                        )
+                    }
+                }
                 if subagent.name != subagent.step.displaySummary {
                     Text(subagent.step.displaySummary)
-                        .font(.subheadline)
-                        .foregroundStyle(AppTheme.textSecondary)
+                        .font(RelayTheme.uiFont(13.5))
+                        .foregroundStyle(theme.foregroundMuted)
                         .lineLimit(2)
                         .multilineTextAlignment(.leading)
                 }
                 if let parent = subagent.parentTitle, subagent.depth == 0 || subagent.depth > 4 {
                     Text("Within \(parent)")
-                        .font(.caption)
-                        .foregroundStyle(AppTheme.textSecondary)
+                        .font(RelayTheme.uiFont(12))
+                        .foregroundStyle(theme.foregroundExtraMuted)
                         .lineLimit(1)
                 }
                 ViewThatFits(in: .horizontal) {
                     HStack(spacing: 8) { metadata(subagent) }
                     VStack(alignment: .leading, spacing: 4) { metadata(subagent) }
                 }
-                .font(.caption)
-                .foregroundStyle(AppTheme.textSecondary)
+                .font(RelayTheme.uiFont(12))
+                .foregroundStyle(theme.foregroundExtraMuted)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            RelayRowChevron().padding(.top, 5)
+            RelayRowChevron().padding(.top, 6)
         }
-        .padding(.vertical, 16)
-        .frame(minHeight: 72)
+        .padding(.vertical, 14)
+        .frame(minHeight: 68)
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
         .accessibilityHint("Level \(subagent.depth + 1). Opens the subagent conversation")
@@ -309,21 +616,19 @@ struct RelaySubagentsView: View {
 
     @ViewBuilder
     private func metadata(_ subagent: RelaySubagent) -> some View {
-        if let status = subagent.statusLabel {
-            Text(status)
-                .foregroundStyle(status == "Failed" ? AppTheme.statusError : AppTheme.textSecondary)
-        }
-        if let type = (subagent.step.agent?.role ?? subagent.step.input.agentType)?.trimmedNonEmpty, type != subagent.name {
-            Text(type).lineLimit(1)
+        if let subtitle = subagent.modelSubtitle {
+            Text(subtitle).lineLimit(1)
         }
         let count = subagent.descendants.count
         if count > 0 {
             Text(count == 1 ? "1 step" : "\(count) steps")
-        } else if subagent.statusLabel == nil, subagent.step.input.agentType?.trimmedNonEmpty == nil {
+        } else if subagent.statusLabel == nil, subagent.modelSubtitle == nil {
             Text("View task")
         }
     }
 }
+
+// MARK: - Subagent Live Conversation Reader
 
 @MainActor
 final class RelaySubagentChatModel: ObservableObject {
@@ -363,22 +668,36 @@ struct RelaySubagentChatView: View {
     @ObservedObject var parentModel: RelayChatViewModel
     @ObservedObject var powerModel: RelayMachinePowerModel
     var onClose: (() -> Void)?
+    var inSheet: Bool = false
+    var onDismissSheet: (() -> Void)? = nil
+
     @StateObject private var model: RelaySubagentChatModel
     @StateObject private var scroller = RelayTranscriptScroller()
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.relayTheme) private var theme
     @State private var activityRequest: RelayActivityRequest?
     @State private var attachmentRequest: RelayDisplayedAttachment?
     @State private var nestedAgent: RelaySubagent?
     @State private var showsRecordedActivity = false
 
-    init(agent: RelaySubagent, parentSessionID: String, client: CodexClient,
-         parentModel: RelayChatViewModel, powerModel: RelayMachinePowerModel, onClose: (() -> Void)? = nil) {
+    init(
+        agent: RelaySubagent,
+        parentSessionID: String,
+        client: CodexClient,
+        parentModel: RelayChatViewModel,
+        powerModel: RelayMachinePowerModel,
+        onClose: (() -> Void)? = nil,
+        inSheet: Bool = false,
+        onDismissSheet: (() -> Void)? = nil
+    ) {
         self.agent = agent
         self.parentSessionID = parentSessionID
         self.client = client
         self.parentModel = parentModel
         self.powerModel = powerModel
         self.onClose = onClose
+        self.inSheet = inSheet
+        self.onDismissSheet = onDismissSheet
         _model = StateObject(wrappedValue: RelaySubagentChatModel {
             try await client.fetchSubagentDetail(parentSessionID: parentSessionID,
                 agentID: agent.step.agent?.id ?? "", provider: agent.provider ?? .codex)
@@ -392,24 +711,28 @@ struct RelaySubagentChatView: View {
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 24) {
+                LazyVStack(alignment: .leading, spacing: 20) {
                     if let error = model.errorMessage {
-                        VStack(alignment: .leading, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 10) {
                             RelayInlineNotice(text: error)
-                            HStack(spacing: 24) {
+                            HStack(spacing: 16) {
                                 Button("Retry") { Task { await model.refresh() } }
-                                if onClose != nil {
-                                    Button("View recorded activity") { showsRecordedActivity = true }
-                                }
+                                    .foregroundStyle(theme.accentBright)
+                                Button("View recorded activity") { showsRecordedActivity = true }
+                                    .foregroundStyle(theme.foregroundMuted)
                             }
-                            .font(.subheadline)
+                            .font(RelayTheme.uiFont(13.5, weight: .medium))
+                            .buttonStyle(.plain)
                         }
                     }
                     if model.isLoading {
-                        ProgressView("Loading conversation…").frame(maxWidth: .infinity, minHeight: 180)
+                        ProgressView("Loading conversation…")
+                            .tint(theme.accent)
+                            .foregroundStyle(theme.foregroundMuted)
+                            .frame(maxWidth: .infinity, minHeight: 160)
                     } else if model.messages.isEmpty && model.errorMessage == nil {
-                        ContentUnavailableView("No messages yet", systemImage: "bubble.left.and.bubble.right",
-                            description: Text("This subagent’s conversation will appear here as it works."))
+                        RelayEmptyStateView("Waiting for subagent output")
+                            .padding(.top, 36)
                     }
                     ForEach(model.messages) { item in
                         RelayChatBubble(item: item, client: client, showsByline: false, showsActions: false,
@@ -424,31 +747,46 @@ struct RelaySubagentChatView: View {
                             })
                     }
                     if !model.subagents.isEmpty {
-                        VStack(alignment: .leading, spacing: 16) {
-                            Text("Subagents").font(.subheadline).foregroundStyle(AppTheme.textSecondary)
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("Subagents")
+                                .font(RelayTheme.uiFont(13, weight: .medium))
+                                .foregroundStyle(theme.foregroundMuted)
                             ForEach(model.subagents) { child in
                                 Button {
                                     if child.step.agent?.id != nil { nestedAgent = child }
                                     else { activityRequest = child.request }
                                 } label: {
-                                    HStack(spacing: 12) {
+                                    HStack(spacing: 10) {
                                         RelayAgentAvatar(seed: child.step.subagentAvatarSeed)
-                                        Text(child.name).foregroundStyle(AppTheme.textPrimary)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(child.name)
+                                                .font(RelayTheme.uiFont(14.5, weight: .medium))
+                                                .foregroundStyle(theme.foreground)
+                                            if let subtitle = child.modelSubtitle {
+                                                Text(subtitle)
+                                                    .font(RelayTheme.uiFont(12))
+                                                    .foregroundStyle(theme.foregroundMuted)
+                                            }
+                                        }
                                         Spacer()
-                                        if let status = child.statusLabel { Text(status).font(.caption) }
+                                        if let status = child.statusLabel {
+                                            RelayStatusBadge(status, bucket: child.statusBucket, showsDot: child.isWorking, compact: true)
+                                        }
                                         RelayRowChevron()
                                     }
+                                    .padding(.vertical, 8)
                                     .frame(minHeight: 44)
                                     .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.plain)
-                                .padding(.leading, CGFloat(min(child.depth, 4)) * 20)
+                                .padding(.leading, CGFloat(min(child.depth, 4)) * 18)
                             }
                         }
+                        .padding(.top, 8)
                     }
                     Color.clear.frame(height: 1).id("child-bottom")
                 }
-                .padding(20)
+                .padding(18)
                 .background(RelayScrollViewFinder(scroller: scroller))
             }
             .onAppear {
@@ -461,26 +799,52 @@ struct RelaySubagentChatView: View {
                 }
             }
         }
-        .background(AppTheme.bgCanvas)
-        .toolbarBackground(AppTheme.bgCanvas, for: .navigationBar)
+        .background(theme.surface0)
+        .toolbarBackground(theme.surface0, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .principal) {
-                HStack(spacing: 10) {
+                HStack(spacing: 8) {
                     RelayAgentAvatar(seed: agent.step.subagentAvatarSeed)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(currentAgent.name).font(.subheadline.weight(.semibold)).lineLimit(1)
-                        if let status = currentAgent.statusLabel {
-                            Text(status).font(.caption).foregroundStyle(AppTheme.textSecondary)
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(spacing: 6) {
+                            Text(currentAgent.name)
+                                .font(RelayTheme.uiFont(14.5, weight: .semibold))
+                                .foregroundStyle(theme.foreground)
+                                .lineLimit(1)
+                            if let status = currentAgent.statusLabel {
+                                RelayStatusBadge(status, bucket: currentAgent.statusBucket, showsDot: currentAgent.isWorking, compact: true)
+                            }
+                        }
+                        if let subtitle = currentAgent.modelSubtitle {
+                            Text(subtitle)
+                                .font(RelayTheme.uiFont(11.5))
+                                .foregroundStyle(theme.foregroundMuted)
+                                .lineLimit(1)
                         }
                     }
                 }
             }
             if let onClose {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button(action: onClose) { Image(systemName: "chevron.left") }
-                        .accessibilityLabel("Back to subagents")
+                    Button(action: onClose) {
+                        Image(systemName: "chevron.left")
+                            .foregroundStyle(theme.foregroundMuted)
+                    }
+                    .accessibilityLabel("Back to subagents")
+                }
+            }
+            if inSheet, let onDismissSheet {
+                ToolbarItem(placement: .topBarTrailing) {
+                    RelayToolbarIconButton(
+                        systemImage: "xmark",
+                        accessibilityLabel: "Close",
+                        iconSize: 13,
+                        weight: .medium,
+                        isMuted: true,
+                        action: onDismissSheet
+                    )
                 }
             }
         }
@@ -505,8 +869,15 @@ struct RelaySubagentChatView: View {
             RelayAttachmentViewer(attachment: attachment, client: client)
         }
         .navigationDestination(item: $nestedAgent) { child in
-            RelaySubagentChatView(agent: child, parentSessionID: parentSessionID, client: client,
-                parentModel: parentModel, powerModel: powerModel)
+            RelaySubagentChatView(
+                agent: child,
+                parentSessionID: parentSessionID,
+                client: client,
+                parentModel: parentModel,
+                powerModel: powerModel,
+                inSheet: inSheet,
+                onDismissSheet: onDismissSheet
+            )
         }
         .accessibilityIdentifier("relay-subagent-conversation")
     }
