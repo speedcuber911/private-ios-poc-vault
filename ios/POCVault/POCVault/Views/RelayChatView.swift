@@ -368,182 +368,50 @@ struct RelayChatView: View {
                     }
                 }
             }
-            .task {
-                honorThreadsRequest()
-                await viewModel.bootstrap()
-                if presentsProviderPickerOnAppear, !didHandleInitialProviderPicker {
-                    didHandleInitialProviderPicker = true
-                    modelPickerRequest += 1
-                }
-                await loadWorkspaceFilesIfNeeded()
-            }
-            .task(id: "\(scenePhase)-\(viewModel.watchedSessionID ?? "")") {
-                guard scenePhase == .active, viewModel.watchedSessionID != nil else { return }
-                while !Task.isCancelled {
-                    if !powerModel.isDown { await viewModel.refreshWatchedThreadIfNeeded() }
-                    do { try await Task.sleep(for: .seconds(viewModel.nativeWatchPollInterval)) }
-                    catch { return }
-                    if Task.isCancelled { return }
-                    if powerModel.isDown { continue }
-                    if viewModel.watchedSessionID == nil { return }
-                }
-            }
-            .onChange(of: scenePhase) { _, phase in
-                if phase == .active, !powerModel.isDown {
-                    Task { await viewModel.refreshModels() }
-                }
-            }
-            .task(id: scenePhase) {
-                guard scenePhase == .active else { return }
-                while !Task.isCancelled {
-                    do { try await Task.sleep(for: .seconds(60)) }
-                    catch { return }
-                    if powerModel.isDown { continue }
-                    await viewModel.refreshModels()
-                }
-            }
-            .onChange(of: powerModel.isDown) { wasDown, isDown in
-                guard wasDown, !isDown else { return }
-                Task {
-                    await viewModel.refreshHarnesses()
-                    await viewModel.refreshModels()
-                }
-            }
-            .onChange(of: latestSignInFailureJobID) { _, jobID in
-                guard jobID != nil else { return }
-                Task { await viewModel.refreshHarnesses() }
-            }
-            .onChange(of: threadsRequest.wrappedValue) { _, _ in
-                honorThreadsRequest()
-            }
-            .onChange(of: viewModel.conversationSelectionID) { _, _ in
-                activityRequest = nil
-                showingSubagentsSheet = false
-                showingTasksSheet = false
-                localQueue.removeAll()
-            }
-            .onChange(of: isTurnRunning) { wasRunning, running in
-                if wasRunning && !running {
-                    drainNextLocalQueuedDraftIfReady()
-                }
-            }
-            .onChange(of: automaticPreviewCandidate?.key) { _, _ in
-                openRequestedPreviewIfNeeded()
-            }
-            .sheet(item: $providerLoginRequest, onDismiss: {
-                Task {
-                    await viewModel.refreshHarnesses()
-                    await viewModel.refreshModels()
-                }
-            }) { provider in
-                ProviderLoginView(client: client, provider: provider)
-            }
-            .sheet(isPresented: $showingThreads) {
-                RelayThreadDrawer(
-                    viewModel: viewModel,
-                    onContinueHandoff: { card in
-                        Task { await continueHandoff(card) }
-                    }
-                )
-                .presentationDetents(threadsPreferLarge ? [.large] : [.medium, .large])
-                .presentationDragIndicator(.visible)
-            }
-            .sheet(item: $fullLogRequest) { request in
-                RelayFullLogSheet(jobID: request.jobID, viewModel: viewModel)
-            }
-            .sheet(isPresented: $showingUsage) {
-                RelayConversationUsageSheet(viewModel: viewModel)
-            }
-            .sheet(item: $activityRequest) { request in
-                RelayActivitySheet(request: request, viewModel: viewModel)
-            }
-            .sheet(isPresented: $showingSubagentsSheet) {
-                RelaySubagentsSheet(
-                    subagents: viewModel.subagents,
-                    client: client,
-                    parentModel: viewModel,
-                    powerModel: powerModel,
-                    isLoading: viewModel.isLoadingThreadDetail,
-                    errorMessage: viewModel.errorMessage
-                )
-            }
-            .sheet(isPresented: $showingTasksSheet) {
-                RelayTasksSheet(items: activeTodoItems)
-            }
-            .sheet(isPresented: $showingTerminalSheet) {
-                if let terminalContent = activeTerminalContent {
-                    VStack(spacing: 0) {
-                        HStack(spacing: 10) {
-                            Image(systemName: "terminal")
-                                .font(.system(size: 16))
-                                .foregroundStyle(theme.foregroundMuted)
-                            Text("Terminal")
-                                .font(RelayTheme.uiFont(16, weight: .medium))
-                                .foregroundStyle(theme.foreground)
-                            Spacer()
-                            RelayToolbarIconButton(
-                                systemImage: "xmark",
-                                accessibilityLabel: "Close terminal",
-                                iconSize: 14,
-                                weight: .medium,
-                                isMuted: true
-                            ) {
-                                showingTerminalSheet = false
-                            }
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 12)
-                        .background(theme.surface0)
-                        Rectangle().fill(theme.border).frame(height: 1)
-                        terminalContent()
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    }
-                    .background(theme.surface0)
-                    .presentationDetents([.fraction(0.6), .large])
-                    .presentationDragIndicator(.visible)
-                    .presentationBackground(theme.surface0)
-                    .preferredColorScheme(theme.colorScheme)
-                }
-            }
-            .sheet(item: $aiDataConsentRequest) { request in
-                RelayAIDataConsentSheet(
-                    provider: request.provider,
-                    purpose: request.purpose,
-                    isConsentGranted: RelayAIDataConsentStore.hasConsent(for: request.provider),
-                    onAllow: {
-                        RelayAIDataConsentStore.grantConsent(for: request.provider)
-                        aiDataConsentRequest = nil
-                        if request.purpose == .sendPrompt {
-                            sendPrompt()
-                        }
-                    },
-                    onCancel: {
-                        aiDataConsentRequest = nil
-                    }
-                )
-                .interactiveDismissDisabled()
-            }
-            .fullScreenCover(item: $artifactRequest) { artifact in
-                RelayArtifactViewer(
-                    artifact: artifact,
-                    client: client,
-                    identityStore: identityStore
-                )
-            }
-            .fullScreenCover(item: $attachmentRequest) { attachment in
-                RelayAttachmentViewer(
-                    attachment: attachment,
-                    client: client
-                )
-            }
-            .fullScreenCover(item: $remotePreviewRequest) { request in
-                RelayRemotePreviewViewer(
-                    request: request,
-                    client: client,
-                    identityStore: identityStore
-                )
-            }
         }
+        .modifier(RelayChatLifecycleModifier(
+            viewModel: viewModel,
+            powerModel: powerModel,
+            presentsProviderPickerOnAppear: presentsProviderPickerOnAppear,
+            threadsRequest: threadsRequest,
+            latestSignInFailureJobID: latestSignInFailureJobID,
+            isTurnRunning: isTurnRunning,
+            automaticPreviewCandidateKey: automaticPreviewCandidate?.key,
+            didHandleInitialProviderPicker: $didHandleInitialProviderPicker,
+            modelPickerRequest: $modelPickerRequest,
+            activityRequest: $activityRequest,
+            showingSubagentsSheet: $showingSubagentsSheet,
+            showingTasksSheet: $showingTasksSheet,
+            localQueue: $localQueue,
+            onHonorThreadsRequest: honorThreadsRequest,
+            onLoadWorkspaceFilesIfNeeded: { await loadWorkspaceFilesIfNeeded() },
+            onDrainNextLocalQueuedDraftIfReady: drainNextLocalQueuedDraftIfReady,
+            onOpenRequestedPreviewIfNeeded: openRequestedPreviewIfNeeded
+        ))
+        .modifier(RelayChatPresentationsModifier(
+            viewModel: viewModel,
+            client: client,
+            identityStore: identityStore,
+            powerModel: powerModel,
+            theme: theme,
+            activeTodoItems: todos,
+            activeTerminalContent: activeTerminalContent,
+            threadsPreferLarge: threadsPreferLarge,
+            providerLoginRequest: $providerLoginRequest,
+            showingThreads: $showingThreads,
+            fullLogRequest: $fullLogRequest,
+            showingUsage: $showingUsage,
+            activityRequest: $activityRequest,
+            showingSubagentsSheet: $showingSubagentsSheet,
+            showingTasksSheet: $showingTasksSheet,
+            showingTerminalSheet: $showingTerminalSheet,
+            aiDataConsentRequest: $aiDataConsentRequest,
+            artifactRequest: $artifactRequest,
+            attachmentRequest: $attachmentRequest,
+            remotePreviewRequest: $remotePreviewRequest,
+            onContinueHandoff: { card in await continueHandoff(card) },
+            onSendPrompt: sendPrompt
+        ))
         .preferredColorScheme(theme.colorScheme)
         .background {
             GeometryReader { geometry in
@@ -1474,6 +1342,273 @@ private struct RelayTasksSheet: View {
         .presentationCornerRadius(28)
         .presentationBackground(theme.surface0)
         .preferredColorScheme(theme.colorScheme)
+    }
+}
+
+// MARK: - Shallow Chat Lifecycle & Presentation Modifiers
+
+private struct RelayChatLifecycleModifier: ViewModifier {
+    @ObservedObject var viewModel: RelayChatViewModel
+    @ObservedObject var powerModel: RelayMachinePowerModel
+    let presentsProviderPickerOnAppear: Bool
+    let threadsRequest: Binding<Bool>
+    let latestSignInFailureJobID: String?
+    let isTurnRunning: Bool
+    let automaticPreviewCandidateKey: String?
+
+    @Binding var didHandleInitialProviderPicker: Bool
+    @Binding var modelPickerRequest: Int
+    @Binding var activityRequest: RelayActivityRequest?
+    @Binding var showingSubagentsSheet: Bool
+    @Binding var showingTasksSheet: Bool
+    @Binding var localQueue: [RelayLocalQueuedDraft]
+
+    let onHonorThreadsRequest: () -> Void
+    let onLoadWorkspaceFilesIfNeeded: () async -> Void
+    let onDrainNextLocalQueuedDraftIfReady: () -> Void
+    let onOpenRequestedPreviewIfNeeded: () -> Void
+
+    @Environment(\.scenePhase) private var scenePhase
+
+    func body(content: Content) -> some View {
+        content
+            .task {
+                onHonorThreadsRequest()
+                await viewModel.bootstrap()
+                if presentsProviderPickerOnAppear, !didHandleInitialProviderPicker {
+                    didHandleInitialProviderPicker = true
+                    modelPickerRequest += 1
+                }
+                await onLoadWorkspaceFilesIfNeeded()
+            }
+            .task(id: "\(scenePhase)-\(viewModel.watchedSessionID ?? "")") {
+                guard scenePhase == .active, viewModel.watchedSessionID != nil else { return }
+                while !Task.isCancelled {
+                    if !powerModel.isDown { await viewModel.refreshWatchedThreadIfNeeded() }
+                    do { try await Task.sleep(for: .seconds(viewModel.nativeWatchPollInterval)) }
+                    catch { return }
+                    if Task.isCancelled { return }
+                    if powerModel.isDown { continue }
+                    if viewModel.watchedSessionID == nil { return }
+                }
+            }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active, !powerModel.isDown {
+                    Task { await viewModel.refreshModels() }
+                }
+            }
+            .task(id: scenePhase) {
+                guard scenePhase == .active else { return }
+                while !Task.isCancelled {
+                    do { try await Task.sleep(for: .seconds(60)) }
+                    catch { return }
+                    if powerModel.isDown { continue }
+                    await viewModel.refreshModels()
+                }
+            }
+            .onChange(of: powerModel.isDown) { wasDown, isDown in
+                guard wasDown, !isDown else { return }
+                Task {
+                    await viewModel.refreshHarnesses()
+                    await viewModel.refreshModels()
+                }
+            }
+            .onChange(of: latestSignInFailureJobID) { _, jobID in
+                guard jobID != nil else { return }
+                Task { await viewModel.refreshHarnesses() }
+            }
+            .onChange(of: threadsRequest.wrappedValue) { _, _ in
+                onHonorThreadsRequest()
+            }
+            .onChange(of: viewModel.conversationSelectionID) { _, _ in
+                activityRequest = nil
+                showingSubagentsSheet = false
+                showingTasksSheet = false
+                localQueue.removeAll()
+            }
+            .onChange(of: isTurnRunning) { wasRunning, running in
+                if wasRunning && !running {
+                    onDrainNextLocalQueuedDraftIfReady()
+                }
+            }
+            .onChange(of: automaticPreviewCandidateKey) { _, _ in
+                onOpenRequestedPreviewIfNeeded()
+            }
+    }
+}
+
+private struct RelayChatPresentationsModifier: ViewModifier {
+    @ObservedObject var viewModel: RelayChatViewModel
+    let client: CodexClient
+    let identityStore: ClientIdentityStore
+    @ObservedObject var powerModel: RelayMachinePowerModel
+    let theme: RelayThemePalette
+    let activeTodoItems: [RelayTodoItem]
+    let activeTerminalContent: (() -> AnyView)?
+    let threadsPreferLarge: Bool
+
+    @Binding var providerLoginRequest: CodexProvider?
+    @Binding var showingThreads: Bool
+    @Binding var fullLogRequest: RelayFullLogRequest?
+    @Binding var showingUsage: Bool
+    @Binding var activityRequest: RelayActivityRequest?
+    @Binding var showingSubagentsSheet: Bool
+    @Binding var showingTasksSheet: Bool
+    @Binding var showingTerminalSheet: Bool
+    @Binding var aiDataConsentRequest: RelayAIDataConsentRequest?
+    @Binding var artifactRequest: CodexJobArtifact?
+    @Binding var attachmentRequest: RelayDisplayedAttachment?
+    @Binding var remotePreviewRequest: RelayRemotePreviewRequest?
+
+    let onContinueHandoff: (RelayHandoffCard) async -> Void
+    let onSendPrompt: () -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .sheet(item: $providerLoginRequest, onDismiss: {
+                Task {
+                    await viewModel.refreshHarnesses()
+                    await viewModel.refreshModels()
+                }
+            }) { provider in
+                ProviderLoginView(client: client, provider: provider)
+            }
+            .sheet(isPresented: $showingThreads) {
+                RelayThreadDrawer(
+                    viewModel: viewModel,
+                    onContinueHandoff: { card in
+                        Task { await onContinueHandoff(card) }
+                    }
+                )
+                .presentationDetents(threadsPreferLarge ? [.large] : [.medium, .large])
+                .presentationDragIndicator(.visible)
+            }
+            .sheet(item: $fullLogRequest) { request in
+                RelayFullLogSheet(jobID: request.jobID, viewModel: viewModel)
+            }
+            .sheet(isPresented: $showingUsage) {
+                RelayConversationUsageSheet(viewModel: viewModel)
+            }
+            .sheet(item: $activityRequest) { request in
+                RelayActivitySheet(request: request, viewModel: viewModel)
+            }
+            .sheet(isPresented: $showingSubagentsSheet) {
+                RelaySubagentsSheet(
+                    subagents: viewModel.subagents,
+                    client: client,
+                    parentModel: viewModel,
+                    powerModel: powerModel,
+                    isLoading: viewModel.isLoadingThreadDetail,
+                    errorMessage: viewModel.errorMessage
+                )
+            }
+            .sheet(isPresented: $showingTasksSheet) {
+                RelayTasksSheet(items: activeTodoItems)
+            }
+            .modifier(RelayChatSecondaryPresentationsModifier(
+                client: client,
+                identityStore: identityStore,
+                theme: theme,
+                activeTerminalContent: activeTerminalContent,
+                showingTerminalSheet: $showingTerminalSheet,
+                aiDataConsentRequest: $aiDataConsentRequest,
+                artifactRequest: $artifactRequest,
+                attachmentRequest: $attachmentRequest,
+                remotePreviewRequest: $remotePreviewRequest,
+                onSendPrompt: onSendPrompt
+            ))
+    }
+}
+
+private struct RelayChatSecondaryPresentationsModifier: ViewModifier {
+    let client: CodexClient
+    let identityStore: ClientIdentityStore
+    let theme: RelayThemePalette
+    let activeTerminalContent: (() -> AnyView)?
+
+    @Binding var showingTerminalSheet: Bool
+    @Binding var aiDataConsentRequest: RelayAIDataConsentRequest?
+    @Binding var artifactRequest: CodexJobArtifact?
+    @Binding var attachmentRequest: RelayDisplayedAttachment?
+    @Binding var remotePreviewRequest: RelayRemotePreviewRequest?
+
+    let onSendPrompt: () -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .sheet(isPresented: $showingTerminalSheet) {
+                if let terminalContent = activeTerminalContent {
+                    VStack(spacing: 0) {
+                        HStack(spacing: 10) {
+                            Image(systemName: "terminal")
+                                .font(.system(size: 16))
+                                .foregroundStyle(theme.foregroundMuted)
+                            Text("Terminal")
+                                .font(RelayTheme.uiFont(16, weight: .medium))
+                                .foregroundStyle(theme.foreground)
+                            Spacer()
+                            RelayToolbarIconButton(
+                                systemImage: "xmark",
+                                accessibilityLabel: "Close terminal",
+                                iconSize: 14,
+                                weight: .medium,
+                                isMuted: true
+                            ) {
+                                showingTerminalSheet = false
+                            }
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 12)
+                        .background(theme.surface0)
+                        Rectangle().fill(theme.border).frame(height: 1)
+                        terminalContent()
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                    .background(theme.surface0)
+                    .presentationDetents([.fraction(0.6), .large])
+                    .presentationDragIndicator(.visible)
+                    .presentationBackground(theme.surface0)
+                    .preferredColorScheme(theme.colorScheme)
+                }
+            }
+            .sheet(item: $aiDataConsentRequest) { request in
+                RelayAIDataConsentSheet(
+                    provider: request.provider,
+                    purpose: request.purpose,
+                    isConsentGranted: RelayAIDataConsentStore.hasConsent(for: request.provider),
+                    onAllow: {
+                        RelayAIDataConsentStore.grantConsent(for: request.provider)
+                        aiDataConsentRequest = nil
+                        if request.purpose == .sendPrompt {
+                            onSendPrompt()
+                        }
+                    },
+                    onCancel: {
+                        aiDataConsentRequest = nil
+                    }
+                )
+                .interactiveDismissDisabled()
+            }
+            .fullScreenCover(item: $artifactRequest) { artifact in
+                RelayArtifactViewer(
+                    artifact: artifact,
+                    client: client,
+                    identityStore: identityStore
+                )
+            }
+            .fullScreenCover(item: $attachmentRequest) { attachment in
+                RelayAttachmentViewer(
+                    attachment: attachment,
+                    client: client
+                )
+            }
+            .fullScreenCover(item: $remotePreviewRequest) { request in
+                RelayRemotePreviewViewer(
+                    request: request,
+                    client: client,
+                    identityStore: identityStore
+                )
+            }
     }
 }
 

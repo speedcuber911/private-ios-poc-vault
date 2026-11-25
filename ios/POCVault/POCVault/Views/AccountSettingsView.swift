@@ -1,5 +1,35 @@
 import SwiftUI
 
+// MARK: - Account Settings View State
+
+@MainActor
+private final class AccountSettingsState: ObservableObject {
+    @Published var showingDeleteConfirmation = false
+    @Published var deletionPassword = ""
+    @Published var showingCLILink = false
+    @Published var showingSignIn = false
+    @Published var showingPairing = false
+    @Published var showingDiagnosticsSheet = false
+    @Published var showingAccountDetails = false
+    @Published var hostPendingUnpair: RelayPairedNode?
+    @Published var hostPendingRename: RelayPairedNode?
+    @Published var renameHostDraft = ""
+    @Published var isRegisteringMachine = false
+    @Published var machineNotice: String?
+    @Published var browsers: [RelayBrowserSession] = []
+    @Published var isRemovingBrowser = false
+    @Published var signedInPlacesError: String?
+    @Published var showingDisconnectConfirmation = false
+    @Published var browserToRemove: RelayBrowserSession?
+    @Published var harnesses: [RelayHarnessStatus] = []
+    @Published var isLoadingHarnesses = false
+    @Published var harnessError: String?
+    @Published var providerLoginRequest: CodexProvider?
+    @Published var showingStopPower = false
+}
+
+// MARK: - Account Settings View
+
 struct AccountSettingsView: View {
     @ObservedObject var accountStore: RelayAccountStore
     @ObservedObject var nodeStore: RelayNodeStore
@@ -17,31 +47,8 @@ struct AccountSettingsView: View {
     var onDisconnect: (() -> Void)?
 
     @ObservedObject private var themeStore = RelayThemeStore.shared
+    @StateObject private var state = AccountSettingsState()
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.scenePhase) private var scenePhase
-
-    @State private var showingDeleteConfirmation = false
-    @State private var deletionPassword = ""
-    @State private var showingCLILink = false
-    @State private var showingSignIn = false
-    @State private var showingPairing = false
-    @State private var showingDiagnosticsSheet = false
-    @State private var showingAccountDetails = false
-    @State private var hostPendingUnpair: RelayPairedNode?
-    @State private var hostPendingRename: RelayPairedNode?
-    @State private var renameHostDraft = ""
-    @State private var isRegisteringMachine = false
-    @State private var machineNotice: String?
-    @State private var browsers: [RelayBrowserSession] = []
-    @State private var isRemovingBrowser = false
-    @State private var signedInPlacesError: String?
-    @State private var showingDisconnectConfirmation = false
-    @State private var browserToRemove: RelayBrowserSession?
-    @State private var harnesses: [RelayHarnessStatus] = []
-    @State private var isLoadingHarnesses = false
-    @State private var harnessError: String?
-    @State private var providerLoginRequest: CodexProvider?
-    @State private var showingStopPower = false
 
     /// Primary initializer matching existing `POCVaultApp` call sites.
     init(
@@ -107,55 +114,333 @@ struct AccountSettingsView: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 0) {
-                    hostsSection
-                    appearanceSection
-                    chatSection
-                    accountAndHandoffSection
-                    diagnosticsSection
-                    aboutSection
-                }
-                .frame(maxWidth: 720, alignment: .leading)
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(.horizontal, 16)
-                .padding(.top, 16)
-                .padding(.bottom, 32)
-            }
-            .scrollBounceBehavior(.basedOnSize)
-            .refreshable {
-                await loadLinkedComputer()
+            AccountSettingsMainContent(
+                accountStore: accountStore,
+                nodeStore: nodeStore,
+                identityStore: identityStore,
+                computerLinkStore: computerLinkStore,
+                codexClient: codexClient,
+                authClient: authClient,
+                powerModel: powerModel,
+                themeStore: themeStore,
+                state: state,
+                pushService: pushService,
+                showsDismissButton: showsDismissButton,
+                onDismiss: { dismiss() },
+                onOpenDiagnostics: onOpenDiagnostics,
+                onOpenMachineMonitor: onOpenMachineMonitor,
+                onRefreshAll: {
+                    await loadLinkedComputer()
+                    await refreshHarnessesForMachineState()
+                },
+                onLoadLinkedComputer: { showProgress in
+                    await loadLinkedComputer(showProgress: showProgress)
+                },
+                onLoadHarnesses: {
+                    await loadHarnesses()
+                },
+                onSwitchHost: switchActiveHost,
+                onRegisterMachine: registerMachine
+            )
+        }
+        .modifier(AccountSettingsAlertsModifier(
+            accountStore: accountStore,
+            nodeStore: nodeStore,
+            computerLinkStore: computerLinkStore,
+            powerModel: powerModel,
+            state: state,
+            onDismiss: { dismiss() },
+            onDisconnectComputer: { await disconnectLinkedComputer() },
+            onRemoveBrowser: { browser in await removeBrowser(browser) },
+            onUnpairHost: unpairHost
+        ))
+        .modifier(AccountSettingsSheetsModifier(
+            accountStore: accountStore,
+            nodeStore: nodeStore,
+            identityStore: identityStore,
+            codexClient: codexClient,
+            authClient: authClient,
+            themeStore: themeStore,
+            state: state,
+            onReloadHarnesses: { await loadHarnesses() },
+            onReloadLinkedComputer: { await loadLinkedComputer() }
+        ))
+        .modifier(AccountSettingsLifecycleModifier(
+            accountStore: accountStore,
+            nodeStore: nodeStore,
+            identityStore: identityStore,
+            computerLinkStore: computerLinkStore,
+            powerModel: powerModel,
+            state: state,
+            agentsMachineState: agentsMachineState,
+            onLoadLinkedComputer: { showProgress in
+                await loadLinkedComputer(showProgress: showProgress)
+            },
+            onRefreshHarnesses: {
                 await refreshHarnessesForMachineState()
             }
-            .background(theme.surface0.ignoresSafeArea())
-            .navigationTitle("Settings")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                if showsDismissButton {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        RelayToolbarIconButton(
-                            systemImage: "xmark",
-                            accessibilityLabel: "Back to workspace",
-                            iconSize: 15,
-                            weight: .medium,
-                            isMuted: true,
-                            action: { dismiss() }
-                        )
-                    }
+        ))
+        .tint(theme.accentBright)
+        .relayThemeStore(themeStore)
+    }
+
+    // MARK: - Actions & Machine Helpers
+
+    private func switchActiveHost(to host: RelayPairedNode) {
+        identityStore.activateHostMaterial(for: host.host ?? host.nodeID)
+        nodeStore.selectHost(id: host.nodeID)
+        state.machineNotice = nil
+        Task {
+            await powerModel.refresh()
+            await refreshHarnessesForMachineState()
+        }
+    }
+
+    private func registerMachine(_ node: RelayPairedNode) async {
+        state.isRegisteringMachine = true
+        state.machineNotice = nil
+        defer { state.isRegisteringMachine = false }
+        state.machineNotice = await RelayNodeRegistration.register(
+            node: node,
+            accountStore: accountStore,
+            nodeStore: nodeStore,
+            client: authClient
+        )
+    }
+
+    private func unpairHost(_ host: RelayPairedNode) {
+        let key = host.host ?? host.nodeID
+        if nodeStore.hosts.count <= 1 {
+            nodeStore.removeHost(id: host.nodeID)
+            identityStore.discardPairedMaterial()
+            onDisconnect?()
+        } else {
+            identityStore.discardPairedMaterial(for: key)
+            nodeStore.removeHost(id: host.nodeID)
+            if let nextActive = nodeStore.pairedNode {
+                identityStore.activateHostMaterial(for: nextActive.host ?? nextActive.nodeID)
+            }
+        }
+        state.machineNotice = nil
+    }
+
+    /// Whether the machine is worth asking about its agents. Without power
+    /// control there is nothing to go on, so it is simply asked.
+    private var agentsMachineState: AgentsLoadTrigger.Machine {
+        AccountSettingsHelpers.agentsMachineState(powerModel: powerModel)
+    }
+
+    private var isMachineKnownDown: Bool { agentsMachineState == .down }
+
+    private func refreshHarnessesForMachineState() async {
+        if agentsMachineState == .down {
+            state.harnesses = []
+            state.harnessError = nil
+        }
+        guard nodeStore.hasMachine, agentsMachineState == .reachable else { return }
+        await loadHarnesses()
+    }
+
+    private func loadHarnesses() async {
+        guard nodeStore.hasMachine, !isMachineKnownDown else { return }
+        state.isLoadingHarnesses = true
+        state.harnessError = nil
+        defer { state.isLoadingHarnesses = false }
+        do {
+            state.harnesses = try await codexClient.fetchHarnesses(budget: .statusRead)
+        } catch {
+            guard !Task.isCancelled else { return }
+            if powerModel.isWarmingUp {
+                try? await Task.sleep(for: .seconds(4))
+                if !Task.isCancelled { await loadHarnesses() }
+                return
+            }
+            state.harnesses = []
+            state.harnessError = "Relay couldn't check the agents on your machine."
+        }
+    }
+
+    private func loadLinkedComputer(showProgress: Bool = true) async {
+        guard let bearer = accountStore.currentSessionToken,
+              let accountID = accountStore.user?.id else {
+            state.browsers = []
+            return
+        }
+        state.signedInPlacesError = nil
+        await computerLinkStore.refresh(
+            bearerToken: bearer,
+            accountID: accountID,
+            showProgress: showProgress
+        )
+        do {
+            let places = try await RelayAuthClient(
+                baseURL: AppConfiguration.authBaseURL
+            ).signedInPlaces(bearerToken: bearer)
+            state.browsers = places.browsers
+            computerLinkStore.adoptPlaces(places, accountID: accountID)
+        } catch {
+            state.signedInPlacesError = "Couldn’t refresh your signed-in devices."
+        }
+    }
+
+    private func disconnectLinkedComputer() async {
+        guard let bearer = accountStore.currentSessionToken,
+              let accountID = accountStore.user?.id else { return }
+        await computerLinkStore.disconnect(bearerToken: bearer, accountID: accountID)
+    }
+
+    private func removeBrowser(_ browser: RelayBrowserSession) async {
+        guard let bearer = accountStore.currentSessionToken else { return }
+        state.isRemovingBrowser = true
+        state.signedInPlacesError = nil
+        defer {
+            state.isRemovingBrowser = false
+            state.browserToRemove = nil
+        }
+        do {
+            try await RelayAuthClient(
+                baseURL: AppConfiguration.authBaseURL
+            ).removeBrowser(id: browser.id, bearerToken: bearer)
+            state.browsers.removeAll { $0.id == browser.id }
+        } catch let error as RelayAuthClientError {
+            if case .server(let status, let code, _) = error,
+               status == 404, code == "unknown_browser" {
+                state.browsers.removeAll { $0.id == browser.id }
+                state.signedInPlacesError = "That browser is already signed out."
+                return
+            }
+            state.signedInPlacesError = "Relay couldn't remove this browser. Try again."
+        } catch {
+            state.signedInPlacesError = "Relay couldn't remove this browser. Try again."
+        }
+    }
+}
+
+// MARK: - Shallow NavigationStack Root Content
+
+private struct AccountSettingsMainContent: View {
+    @ObservedObject var accountStore: RelayAccountStore
+    @ObservedObject var nodeStore: RelayNodeStore
+    @ObservedObject var identityStore: ClientIdentityStore
+    @ObservedObject var computerLinkStore: RelayComputerLinkStore
+    let codexClient: CodexClient
+    let authClient: RelayAuthClient
+    @ObservedObject var powerModel: RelayMachinePowerModel
+    @ObservedObject var themeStore: RelayThemeStore
+    @ObservedObject var state: AccountSettingsState
+    var pushService: RelayPushService?
+    var showsDismissButton: Bool
+    let onDismiss: () -> Void
+    var onOpenDiagnostics: (() -> Void)?
+    var onOpenMachineMonitor: (() -> Void)?
+    let onRefreshAll: () async -> Void
+    let onLoadLinkedComputer: (Bool) async -> Void
+    let onLoadHarnesses: () async -> Void
+    let onSwitchHost: (RelayPairedNode) -> Void
+    let onRegisterMachine: (RelayPairedNode) async -> Void
+
+    private var theme: RelayThemePalette { themeStore.palette }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                AccountSettingsHostsSection(
+                    accountStore: accountStore,
+                    nodeStore: nodeStore,
+                    identityStore: identityStore,
+                    codexClient: codexClient,
+                    powerModel: powerModel,
+                    themeStore: themeStore,
+                    state: state,
+                    onSwitchHost: onSwitchHost,
+                    onRegisterMachine: onRegisterMachine,
+                    onLoadHarnesses: onLoadHarnesses
+                )
+                AccountSettingsAppearanceSection(themeStore: themeStore)
+                AccountSettingsChatSection(
+                    nodeStore: nodeStore,
+                    powerModel: powerModel,
+                    themeStore: themeStore,
+                    state: state,
+                    onLoadHarnesses: onLoadHarnesses
+                )
+                AccountSettingsAccountSection(
+                    accountStore: accountStore,
+                    computerLinkStore: computerLinkStore,
+                    themeStore: themeStore,
+                    state: state,
+                    pushService: pushService,
+                    onDismiss: onDismiss,
+                    onLoadLinkedComputer: onLoadLinkedComputer
+                )
+                AccountSettingsDiagnosticsSection(
+                    nodeStore: nodeStore,
+                    identityStore: identityStore,
+                    codexClient: codexClient,
+                    powerModel: powerModel,
+                    state: state,
+                    onOpenDiagnostics: onOpenDiagnostics,
+                    onOpenMachineMonitor: onOpenMachineMonitor
+                )
+                AccountSettingsAboutSection(themeStore: themeStore)
+            }
+            .frame(maxWidth: 720, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.horizontal, 16)
+            .padding(.top, 16)
+            .padding(.bottom, 32)
+        }
+        .scrollBounceBehavior(.basedOnSize)
+        .refreshable {
+            await onRefreshAll()
+        }
+        .background(theme.surface0.ignoresSafeArea())
+        .navigationTitle("Settings")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if showsDismissButton {
+                ToolbarItem(placement: .topBarTrailing) {
+                    RelayToolbarIconButton(
+                        systemImage: "xmark",
+                        accessibilityLabel: "Back to workspace",
+                        iconSize: 15,
+                        weight: .medium,
+                        isMuted: true,
+                        action: onDismiss
+                    )
                 }
             }
-            .alert("Delete your Relay account?", isPresented: $showingDeleteConfirmation) {
+        }
+    }
+}
+
+// MARK: - Shallow Modifiers (Alerts/Dialogs, Sheets, Lifecycle)
+
+private struct AccountSettingsAlertsModifier: ViewModifier {
+    @ObservedObject var accountStore: RelayAccountStore
+    @ObservedObject var nodeStore: RelayNodeStore
+    @ObservedObject var computerLinkStore: RelayComputerLinkStore
+    @ObservedObject var powerModel: RelayMachinePowerModel
+    @ObservedObject var state: AccountSettingsState
+    let onDismiss: () -> Void
+    let onDisconnectComputer: () async -> Void
+    let onRemoveBrowser: (RelayBrowserSession) async -> Void
+    let onUnpairHost: (RelayPairedNode) -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .alert("Delete your Relay account?", isPresented: $state.showingDeleteConfirmation) {
                 if accountStore.user?.usesPassword == true {
-                    SecureField("Current password", text: $deletionPassword)
+                    SecureField("Current password", text: $state.deletionPassword)
                 }
                 Button("Delete account", role: .destructive) {
                     Task {
                         let didDelete = await accountStore.deleteAccount(
                             password: accountStore.user?.usesPassword == true
-                                ? deletionPassword
+                                ? state.deletionPassword
                                 : nil
                         )
-                        if didDelete { dismiss() }
+                        if didDelete { onDismiss() }
                     }
                 }
                 Button("Cancel", role: .cancel) {}
@@ -163,74 +448,97 @@ struct AccountSettingsView: View {
                 Text("This action cannot be undone. Data on servers you own is not deleted.")
             }
             .alert("Rename host", isPresented: Binding(
-                get: { hostPendingRename != nil },
-                set: { if !$0 { hostPendingRename = nil } }
+                get: { state.hostPendingRename != nil },
+                set: { if !$0 { state.hostPendingRename = nil } }
             )) {
-                TextField("Host name", text: $renameHostDraft)
+                TextField("Host name", text: $state.renameHostDraft)
                 Button("Save") {
-                    if let host = hostPendingRename {
-                        nodeStore.renameHost(id: host.nodeID, name: renameHostDraft)
+                    if let host = state.hostPendingRename {
+                        nodeStore.renameHost(id: host.nodeID, name: state.renameHostDraft)
                     }
-                    hostPendingRename = nil
+                    state.hostPendingRename = nil
                 }
                 Button("Cancel", role: .cancel) {
-                    hostPendingRename = nil
+                    state.hostPendingRename = nil
                 }
             }
+            .modifier(AccountSettingsDialogsModifier(
+                nodeStore: nodeStore,
+                computerLinkStore: computerLinkStore,
+                powerModel: powerModel,
+                state: state,
+                onDisconnectComputer: onDisconnectComputer,
+                onRemoveBrowser: onRemoveBrowser,
+                onUnpairHost: onUnpairHost
+            ))
+    }
+}
+
+private struct AccountSettingsDialogsModifier: ViewModifier {
+    @ObservedObject var nodeStore: RelayNodeStore
+    @ObservedObject var computerLinkStore: RelayComputerLinkStore
+    @ObservedObject var powerModel: RelayMachinePowerModel
+    @ObservedObject var state: AccountSettingsState
+    let onDisconnectComputer: () async -> Void
+    let onRemoveBrowser: (RelayBrowserSession) async -> Void
+    let onUnpairHost: (RelayPairedNode) -> Void
+
+    func body(content: Content) -> some View {
+        content
             .confirmationDialog(
-                "Disconnect \(computerLinkStore.computer.map(computerName) ?? "computer")?",
-                isPresented: $showingDisconnectConfirmation,
+                "Disconnect \(computerLinkStore.computer.map(AccountSettingsHelpers.computerName) ?? "computer")?",
+                isPresented: $state.showingDisconnectConfirmation,
                 titleVisibility: .visible
             ) {
                 Button("Disconnect computer", role: .destructive) {
-                    Task { await disconnectLinkedComputer() }
+                    Task { await onDisconnectComputer() }
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("Relay will revoke this computer’s CLI access and hide its folders on this phone. Files on the Relay machine are not deleted.")
             }
             .confirmationDialog(
-                "Remove \(browserToRemove.map(browserName) ?? "browser")?",
+                "Remove \(state.browserToRemove.map(AccountSettingsHelpers.browserName) ?? "browser")?",
                 isPresented: Binding(
-                    get: { browserToRemove != nil },
-                    set: { if !$0 { browserToRemove = nil } }
+                    get: { state.browserToRemove != nil },
+                    set: { if !$0 { state.browserToRemove = nil } }
                 ),
                 titleVisibility: .visible
             ) {
                 Button("Remove", role: .destructive) {
-                    if let browserToRemove {
-                        Task { await removeBrowser(browserToRemove) }
+                    if let browser = state.browserToRemove {
+                        Task { await onRemoveBrowser(browser) }
                     }
                 }
                 Button("Cancel", role: .cancel) {
-                    browserToRemove = nil
+                    state.browserToRemove = nil
                 }
             } message: {
                 Text("That browser will be signed out.")
             }
             .confirmationDialog(
-                "Unpair \(hostPendingUnpair?.nodeName ?? "this machine")?",
+                "Unpair \(state.hostPendingUnpair?.nodeName ?? "this machine")?",
                 isPresented: Binding(
-                    get: { hostPendingUnpair != nil },
-                    set: { if !$0 { hostPendingUnpair = nil } }
+                    get: { state.hostPendingUnpair != nil },
+                    set: { if !$0 { state.hostPendingUnpair = nil } }
                 ),
                 titleVisibility: .visible
             ) {
-                if let host = hostPendingUnpair {
+                if let host = state.hostPendingUnpair {
                     Button("Unpair", role: .destructive) {
-                        unpairHost(host)
-                        hostPendingUnpair = nil
+                        onUnpairHost(host)
+                        state.hostPendingUnpair = nil
                     }
                 }
                 Button("Cancel", role: .cancel) {
-                    hostPendingUnpair = nil
+                    state.hostPendingUnpair = nil
                 }
             } message: {
                 Text("This phone forgets the machine and deletes the credential it was issued. To retire that credential on the machine too, run `relayd devices revoke` there. Nothing else on the machine is deleted; run `relayd pair` again to reconnect.")
             }
             .confirmationDialog(
                 "Stop \(nodeStore.pairedNode?.nodeName ?? "this machine")?",
-                isPresented: $showingStopPower,
+                isPresented: $state.showingStopPower,
                 titleVisibility: .visible
             ) {
                 Button("Stop machine", role: .destructive) {
@@ -240,6 +548,24 @@ struct AccountSettingsView: View {
             } message: {
                 Text("Runs stop. Pairing stays on disk. Start it again from this phone when you need it.")
             }
+    }
+}
+
+private struct AccountSettingsSheetsModifier: ViewModifier {
+    @ObservedObject var accountStore: RelayAccountStore
+    @ObservedObject var nodeStore: RelayNodeStore
+    @ObservedObject var identityStore: ClientIdentityStore
+    let codexClient: CodexClient
+    let authClient: RelayAuthClient
+    @ObservedObject var themeStore: RelayThemeStore
+    @ObservedObject var state: AccountSettingsState
+    let onReloadHarnesses: () async -> Void
+    let onReloadLinkedComputer: () async -> Void
+
+    private var theme: RelayThemePalette { themeStore.palette }
+
+    func body(content: Content) -> some View {
+        content
             .interactiveDismissDisabled(accountStore.isWorking)
             .overlay {
                 if accountStore.isWorking {
@@ -249,39 +575,39 @@ struct AccountSettingsView: View {
                     }
                 }
             }
-            .sheet(item: $providerLoginRequest, onDismiss: {
-                Task { await loadHarnesses() }
+            .sheet(item: $state.providerLoginRequest, onDismiss: {
+                Task { await onReloadHarnesses() }
             }) { provider in
                 ProviderLoginView(client: codexClient, provider: provider)
             }
-            .sheet(isPresented: $showingSignIn) {
+            .sheet(isPresented: $state.showingSignIn) {
                 NavigationStack {
                     AuthenticationView(accountStore: accountStore)
                         .toolbar {
                             ToolbarItem(placement: .cancellationAction) {
-                                Button("Cancel") { showingSignIn = false }
+                                Button("Cancel") { state.showingSignIn = false }
                             }
                         }
                 }
                 .preferredColorScheme(theme.colorScheme)
             }
-            .sheet(isPresented: $showingPairing) {
+            .sheet(isPresented: $state.showingPairing) {
                 NodePairingView(
                     identityStore: identityStore,
                     nodeStore: nodeStore,
                     accountStore: accountStore,
                     authClient: authClient,
-                    onDismiss: { showingPairing = false }
+                    onDismiss: { state.showingPairing = false }
                 )
             }
-            .sheet(isPresented: $showingDiagnosticsSheet) {
+            .sheet(isPresented: $state.showingDiagnosticsSheet) {
                 DiagnosticsView(
                     identityStore: identityStore,
                     nodeStore: nodeStore
                 )
             }
-            .sheet(isPresented: $showingCLILink, onDismiss: {
-                Task { await loadLinkedComputer() }
+            .sheet(isPresented: $state.showingCLILink, onDismiss: {
+                Task { await onReloadLinkedComputer() }
             }) {
                 if let bearer = accountStore.currentSessionToken {
                     CLILinkScannerView(
@@ -290,12 +616,30 @@ struct AccountSettingsView: View {
                     )
                 }
             }
+    }
+}
+
+private struct AccountSettingsLifecycleModifier: ViewModifier {
+    @ObservedObject var accountStore: RelayAccountStore
+    @ObservedObject var nodeStore: RelayNodeStore
+    @ObservedObject var identityStore: ClientIdentityStore
+    @ObservedObject var computerLinkStore: RelayComputerLinkStore
+    @ObservedObject var powerModel: RelayMachinePowerModel
+    @ObservedObject var state: AccountSettingsState
+    let agentsMachineState: AgentsLoadTrigger.Machine
+    let onLoadLinkedComputer: (Bool) async -> Void
+    let onRefreshHarnesses: () async -> Void
+
+    @Environment(\.scenePhase) private var scenePhase
+
+    func body(content: Content) -> some View {
+        content
             .onChange(of: accountStore.user?.id) { _, id in
-                if id != nil { showingSignIn = false }
-                Task { await loadLinkedComputer() }
+                if id != nil { state.showingSignIn = false }
+                Task { await onLoadLinkedComputer(true) }
             }
             .task {
-                await loadLinkedComputer()
+                await onLoadLinkedComputer(true)
             }
             // Waits for the first power read, and reloads when the machine
             // comes up: a stopped machine is not asked, and is never powered
@@ -305,14 +649,14 @@ struct AccountSettingsView: View {
                 activeHostID: nodeStore.activeHostID,
                 machine: agentsMachineState
             )) {
-                await refreshHarnessesForMachineState()
+                await onRefreshHarnesses()
             }
             .task(id: computerLinkStore.computer?.id) {
                 guard computerLinkStore.computer?.status == .connecting else { return }
                 for _ in 0..<30 {
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
                     guard !Task.isCancelled else { return }
-                    await loadLinkedComputer(showProgress: false)
+                    await onLoadLinkedComputer(false)
                     if computerLinkStore.computer?.status != .connecting { return }
                 }
             }
@@ -327,42 +671,75 @@ struct AccountSettingsView: View {
                 await powerModel.waitForResize()
             }
             .modifier(RelayResizeProgressPresenter(model: powerModel))
-        }
-        .tint(theme.accentBright)
-        .relayThemeStore(themeStore)
     }
+}
 
-    // MARK: - Section 1: Hosts
+// MARK: - Section 1: Hosts
 
-    private var hostsSection: some View {
-        RelaySettingsSection("Hosts", info: machineInfo) {
+private struct AccountSettingsHostsSection: View {
+    @ObservedObject var accountStore: RelayAccountStore
+    @ObservedObject var nodeStore: RelayNodeStore
+    @ObservedObject var identityStore: ClientIdentityStore
+    let codexClient: CodexClient
+    @ObservedObject var powerModel: RelayMachinePowerModel
+    @ObservedObject var themeStore: RelayThemeStore
+    @ObservedObject var state: AccountSettingsState
+    let onSwitchHost: (RelayPairedNode) -> Void
+    let onRegisterMachine: (RelayPairedNode) async -> Void
+    let onLoadHarnesses: () async -> Void
+
+    private var theme: RelayThemePalette { themeStore.palette }
+
+    var body: some View {
+        RelaySettingsSection("Hosts", info: AccountSettingsHelpers.machineInfo(for: nodeStore.pairedNode)) {
             VStack(alignment: .leading, spacing: 10) {
                 if !nodeStore.hosts.isEmpty {
                     ForEach(nodeStore.hosts) { host in
                         let isActive = host.nodeID == nodeStore.activeHostID
                         NavigationLink {
-                            hostDetailDestination(for: host)
+                            AccountSettingsHostDetailView(
+                                host: host,
+                                accountStore: accountStore,
+                                nodeStore: nodeStore,
+                                identityStore: identityStore,
+                                codexClient: codexClient,
+                                powerModel: powerModel,
+                                themeStore: themeStore,
+                                state: state,
+                                onSwitchHost: onSwitchHost,
+                                onRegisterMachine: onRegisterMachine,
+                                onLoadHarnesses: onLoadHarnesses
+                            )
                         } label: {
-                            hostCard(host: host, isActive: isActive)
+                            AccountSettingsHostCard(
+                                host: host,
+                                isActive: isActive,
+                                showActiveCheck: isActive && nodeStore.hosts.count > 1,
+                                statusBucket: AccountSettingsHelpers.hostStatusBucket(
+                                    isActive: isActive,
+                                    hasMachine: nodeStore.hasMachine,
+                                    powerStatus: powerModel.status
+                                )
+                            )
                         }
                         .buttonStyle(.plain)
                         .contextMenu {
                             if !isActive {
                                 Button {
-                                    switchActiveHost(to: host)
+                                    onSwitchHost(host)
                                 } label: {
                                     Label("Switch to host", systemImage: "checkmark.circle")
                                 }
                             }
                             Button {
-                                renameHostDraft = host.nodeName
-                                hostPendingRename = host
+                                state.renameHostDraft = host.nodeName
+                                state.hostPendingRename = host
                             } label: {
                                 Label("Rename", systemImage: "pencil")
                             }
                             Divider()
                             Button(role: .destructive) {
-                                hostPendingUnpair = host
+                                state.hostPendingUnpair = host
                             } label: {
                                 Label("Unpair machine", systemImage: "trash")
                             }
@@ -370,9 +747,22 @@ struct AccountSettingsView: View {
                     }
                 } else if AppConfiguration.hasConfiguredPersonalInstall {
                     NavigationLink {
-                        personalInstallDetailDestination
+                        AccountSettingsPersonalInstallDetailView(
+                            nodeStore: nodeStore,
+                            identityStore: identityStore,
+                            codexClient: codexClient,
+                            powerModel: powerModel,
+                            themeStore: themeStore,
+                            state: state,
+                            onLoadHarnesses: onLoadHarnesses
+                        )
                     } label: {
-                        personalInstallHostCard
+                        AccountSettingsPersonalInstallHostCard(
+                            statusBucket: AccountSettingsHelpers.activePowerStatusBucket(
+                                hasMachine: nodeStore.hasMachine,
+                                powerStatus: powerModel.status
+                            )
+                        )
                     }
                     .buttonStyle(.plain)
                 }
@@ -381,7 +771,7 @@ struct AccountSettingsView: View {
                     RelaySettingsCard {
                         RelayMachinePowerSwitch(
                             model: powerModel,
-                            confirmStop: { showingStopPower = true },
+                            confirmStop: { state.showingStopPower = true },
                             accessibilityIdentifier: "relay-settings-hosts-power"
                         )
                         .padding(.horizontal, 16)
@@ -404,7 +794,7 @@ struct AccountSettingsView: View {
 
                 // Paseo "+ Add connection" outlined card action
                 Button {
-                    showingPairing = true
+                    state.showingPairing = true
                 } label: {
                     HStack(spacing: 8) {
                         Image(systemName: "plus")
@@ -427,8 +817,16 @@ struct AccountSettingsView: View {
             }
         }
     }
+}
 
-    private func hostCard(host: RelayPairedNode, isActive: Bool) -> some View {
+private struct AccountSettingsHostCard: View {
+    let host: RelayPairedNode
+    let isActive: Bool
+    let showActiveCheck: Bool
+    let statusBucket: RelayStatusBucket
+    @Environment(\.relayTheme) private var theme
+
+    var body: some View {
         RelaySettingsCard {
             HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
@@ -450,16 +848,16 @@ struct AccountSettingsView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
                 HStack(spacing: 10) {
-                    if isActive && nodeStore.hosts.count > 1 {
+                    if showActiveCheck {
                         Image(systemName: "checkmark")
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(theme.accentBright)
                             .accessibilityLabel("Active host")
                     }
 
-                    RelayStatusDot(bucket: hostStatusBucket(for: host, isActive: isActive), size: 7)
+                    RelayStatusDot(bucket: statusBucket, size: 7)
 
-                    Image(systemName: isLocalHost(host.apiBaseURL) ? "desktopcomputer" : "globe")
+                    Image(systemName: AccountSettingsHelpers.isLocalHost(host.apiBaseURL) ? "desktopcomputer" : "globe")
                         .font(.system(size: 14, weight: .regular))
                         .foregroundStyle(theme.foregroundMuted)
 
@@ -474,8 +872,13 @@ struct AccountSettingsView: View {
             .contentShape(Rectangle())
         }
     }
+}
 
-    private var personalInstallHostCard: some View {
+private struct AccountSettingsPersonalInstallHostCard: View {
+    let statusBucket: RelayStatusBucket
+    @Environment(\.relayTheme) private var theme
+
+    var body: some View {
         RelaySettingsCard {
             HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
@@ -492,8 +895,8 @@ struct AccountSettingsView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
                 HStack(spacing: 10) {
-                    RelayStatusDot(bucket: activePowerStatusBucket, size: 7)
-                    Image(systemName: isLocalHost(AppConfiguration.codexBaseURL) ? "desktopcomputer" : "globe")
+                    RelayStatusDot(bucket: statusBucket, size: 7)
+                    Image(systemName: AccountSettingsHelpers.isLocalHost(AppConfiguration.codexBaseURL) ? "desktopcomputer" : "globe")
                         .font(.system(size: 14, weight: .regular))
                         .foregroundStyle(theme.foregroundMuted)
                     Image(systemName: "gearshape")
@@ -507,218 +910,50 @@ struct AccountSettingsView: View {
             .contentShape(Rectangle())
         }
     }
+}
 
-    private func hostDetailDestination(for host: RelayPairedNode) -> some View {
+// MARK: - Host Detail Destinations
+
+private struct AccountSettingsHostDetailView: View {
+    let host: RelayPairedNode
+    @ObservedObject var accountStore: RelayAccountStore
+    @ObservedObject var nodeStore: RelayNodeStore
+    @ObservedObject var identityStore: ClientIdentityStore
+    let codexClient: CodexClient
+    @ObservedObject var powerModel: RelayMachinePowerModel
+    @ObservedObject var themeStore: RelayThemeStore
+    @ObservedObject var state: AccountSettingsState
+    let onSwitchHost: (RelayPairedNode) -> Void
+    let onRegisterMachine: (RelayPairedNode) async -> Void
+    let onLoadHarnesses: () async -> Void
+
+    private var theme: RelayThemePalette { themeStore.palette }
+
+    var body: some View {
         let liveHost = nodeStore.host(id: host.nodeID) ?? host
         let isActive = liveHost.nodeID == nodeStore.activeHostID
 
-        return ScrollView {
+        ScrollView {
             VStack(alignment: .leading, spacing: 0) {
-                // Identity & Status
-                RelaySettingsSection("Host") {
-                    RelaySettingsCard {
-                        HStack(spacing: 12) {
-                            RelayProjectIcon(
-                                name: liveHost.nodeName,
-                                seed: liveHost.nodeID,
-                                colorIndex: liveHost.colorIndex,
-                                size: 28
-                            )
+                identitySection(liveHost: liveHost, isActive: isActive)
 
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(liveHost.nodeName)
-                                    .font(RelayTheme.uiFont(16, weight: .medium))
-                                    .foregroundStyle(theme.foreground)
-                                Text(liveHost.registeredAccountID == nil ? "Paired to this phone" : "Connected to your account")
-                                    .font(RelayTheme.uiFont(13, weight: .regular))
-                                    .foregroundStyle(theme.foregroundMuted)
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-
-                            RelayStatusBadge(
-                                isActive ? "Active" : "Standby",
-                                bucket: hostStatusBucket(for: liveHost, isActive: isActive),
-                                showsDot: true,
-                                compact: true
-                            )
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 14)
-
-                        if !isActive {
-                            RelaySettingsDivider()
-                            HStack {
-                                RelayButton("Switch to this host", variant: .primary, size: .sm, isFullWidth: true) {
-                                    switchActiveHost(to: liveHost)
-                                }
-                            }
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 12)
-                        }
-
-                        RelaySettingsDivider()
-
-                        RelaySettingsRow(
-                            "Rename host",
-                            subtitle: liveHost.nodeName,
-                            systemImage: "pencil",
-                            action: {
-                                renameHostDraft = liveHost.nodeName
-                                hostPendingRename = liveHost
-                            }
-                        ) {
-                            RelayButton("Rename", variant: .outline, size: .sm) {
-                                renameHostDraft = liveHost.nodeName
-                                hostPendingRename = liveHost
-                            }
-                        }
-
-                        RelaySettingsDivider()
-
-                        hostColorPickerRow(for: liveHost)
-
-                        RelaySettingsDivider()
-
-                        connectionDetailsRow(liveHost.apiBaseURL)
-                    }
-                }
-
-                // EC2 Power, Resize & Auto-stop (active host with wake credentials)
                 if isActive && identityStore.wakeCredential() != nil {
-                    VStack(alignment: .leading, spacing: 10) {
-                        RelayFormHeader("Power & compute", info: "Control EC2 power, instance compute tier, and idle auto-stop directly from this phone.")
-                            .font(RelayTheme.uiFont(13, weight: .medium))
-                            .foregroundStyle(theme.foregroundMuted)
-                            .padding(.horizontal, 4)
-
-                        RelaySettingsCard {
-                            RelayMachinePowerSwitch(
-                                model: powerModel,
-                                confirmStop: { showingStopPower = true },
-                                accessibilityIdentifier: "relay-settings-power"
-                            )
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 14)
-
-                            RelaySettingsDivider()
-
-                            RelayMachineSizeControl(model: powerModel)
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 14)
-
-                            if powerModel.autoStopEnabled != nil || !powerModel.status.isResolved {
-                                RelaySettingsDivider()
-                                RelayMachineAutoStopToggle(model: powerModel)
-                                    .padding(.horizontal, 16)
-                                    .padding(.vertical, 14)
-                            }
-
-                            if let notice = powerModel.notice {
-                                RelaySettingsDivider()
-                                RelayInlineNotice(text: notice)
-                                    .padding(.horizontal, 16)
-                                    .padding(.vertical, 10)
-                            }
-                        }
-                    }
-                    .padding(.bottom, 24)
+                    powerAndComputeSection
                 }
 
-                // Usage / Machine Monitor
                 if isActive {
-                    RelaySettingsSection("Monitoring") {
-                        RelaySettingsCard {
-                            NavigationLink {
-                                RelayMachineMonitorView(
-                                    client: codexClient,
-                                    identityStore: identityStore,
-                                    powerModel: powerModel,
-                                    machineName: liveHost.nodeName
-                                )
-                            } label: {
-                                RelaySettingsRow(
-                                    "Machine monitor",
-                                    subtitle: "CPU, memory, disk and active runs",
-                                    systemImage: "gauge.with.dots.needle.67percent",
-                                    showsChevron: true
-                                )
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
+                    monitoringSection(liveHost: liveHost)
 
-                    // Coding Agents / Provider Sign-ins
-                    codingAgentsSection
+                    AccountSettingsCodingAgentsSection(
+                        nodeStore: nodeStore,
+                        powerModel: powerModel,
+                        state: state,
+                        onLoadHarnesses: onLoadHarnesses
+                    )
                 }
 
-                // Account Registration
-                RelaySettingsSection("Relay account") {
-                    RelaySettingsCard {
-                        if liveHost.registeredAccountID == nil {
-                            RelaySettingsRow(
-                                accountStore.user == nil
-                                    ? "Sign in to connect this machine"
-                                    : "Connect this machine to your account",
-                                subtitle: "Enables laptop handoff and push alerts for this host",
-                                systemImage: "person.badge.plus",
-                                action: {
-                                    if accountStore.user == nil {
-                                        showingSignIn = true
-                                    } else {
-                                        Task { await registerMachine(liveHost) }
-                                    }
-                                }
-                            ) {
-                                if isRegisteringMachine {
-                                    ProgressView().controlSize(.small)
-                                } else {
-                                    RelayButton(
-                                        accountStore.user == nil ? "Sign in" : "Connect",
-                                        variant: .outline,
-                                        size: .sm
-                                    ) {
-                                        if accountStore.user == nil {
-                                            showingSignIn = true
-                                        } else {
-                                            Task { await registerMachine(liveHost) }
-                                        }
-                                    }
-                                    .disabled(isRegisteringMachine)
-                                }
-                            }
-                            .accessibilityIdentifier("relay-settings-register-machine")
-                        } else {
-                            RelaySettingsRow(
-                                "Connected to Relay account",
-                                subtitle: "`relay handoff` and push alerts reach this phone",
-                                systemImage: "checkmark.circle",
-                                iconColor: theme.statusSuccess
-                            )
-                        }
-
-                        if let machineNotice {
-                            RelaySettingsDivider()
-                            RelayInlineNotice(text: machineNotice)
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 10)
-                        }
-                    }
-                }
-
-                // Danger Zone (outline button on page; destructive red inside confirm dialog)
-                RelaySettingsSection("Danger zone", flush: true) {
-                    RelaySettingsCard {
-                        RelaySettingsRow(
-                            "Unpair machine",
-                            subtitle: "Forgets this host and deletes its credential on this phone"
-                        ) {
-                            RelayButton("Unpair", variant: .outline, size: .sm) {
-                                hostPendingUnpair = liveHost
-                            }
-                            .accessibilityIdentifier("relay-settings-unpair")
-                        }
-                    }
-                }
+                accountRegistrationSection(liveHost: liveHost)
+                dangerZoneSection(liveHost: liveHost)
             }
             .frame(maxWidth: 720, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .center)
@@ -732,7 +967,224 @@ struct AccountSettingsView: View {
         .navigationBarTitleDisplayMode(.inline)
     }
 
-    private var personalInstallDetailDestination: some View {
+    private func identitySection(liveHost: RelayPairedNode, isActive: Bool) -> some View {
+        RelaySettingsSection("Host") {
+            RelaySettingsCard {
+                HStack(spacing: 12) {
+                    RelayProjectIcon(
+                        name: liveHost.nodeName,
+                        seed: liveHost.nodeID,
+                        colorIndex: liveHost.colorIndex,
+                        size: 28
+                    )
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(liveHost.nodeName)
+                            .font(RelayTheme.uiFont(16, weight: .medium))
+                            .foregroundStyle(theme.foreground)
+                        Text(liveHost.registeredAccountID == nil ? "Paired to this phone" : "Connected to your account")
+                            .font(RelayTheme.uiFont(13, weight: .regular))
+                            .foregroundStyle(theme.foregroundMuted)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                    RelayStatusBadge(
+                        isActive ? "Active" : "Standby",
+                        bucket: AccountSettingsHelpers.hostStatusBucket(
+                            isActive: isActive,
+                            hasMachine: nodeStore.hasMachine,
+                            powerStatus: powerModel.status
+                        ),
+                        showsDot: true,
+                        compact: true
+                    )
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 14)
+
+                if !isActive {
+                    RelaySettingsDivider()
+                    HStack {
+                        RelayButton("Switch to this host", variant: .primary, size: .sm, isFullWidth: true) {
+                            onSwitchHost(liveHost)
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+                }
+
+                RelaySettingsDivider()
+
+                RelaySettingsRow(
+                    "Rename host",
+                    subtitle: liveHost.nodeName,
+                    systemImage: "pencil",
+                    action: {
+                        state.renameHostDraft = liveHost.nodeName
+                        state.hostPendingRename = liveHost
+                    }
+                ) {
+                    RelayButton("Rename", variant: .outline, size: .sm) {
+                        state.renameHostDraft = liveHost.nodeName
+                        state.hostPendingRename = liveHost
+                    }
+                }
+
+                RelaySettingsDivider()
+                AccountSettingsHostColorPickerRow(host: liveHost, nodeStore: nodeStore)
+                RelaySettingsDivider()
+                AccountSettingsConnectionDetailsRow(url: liveHost.apiBaseURL)
+            }
+        }
+    }
+
+    private var powerAndComputeSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            RelayFormHeader("Power & compute", info: "Control EC2 power, instance compute tier, and idle auto-stop directly from this phone.")
+                .font(RelayTheme.uiFont(13, weight: .medium))
+                .foregroundStyle(theme.foregroundMuted)
+                .padding(.horizontal, 4)
+
+            RelaySettingsCard {
+                RelayMachinePowerSwitch(
+                    model: powerModel,
+                    confirmStop: { state.showingStopPower = true },
+                    accessibilityIdentifier: "relay-settings-power"
+                )
+                .padding(.horizontal, 16)
+                .padding(.vertical, 14)
+
+                RelaySettingsDivider()
+
+                RelayMachineSizeControl(model: powerModel)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 14)
+
+                if powerModel.autoStopEnabled != nil || !powerModel.status.isResolved {
+                    RelaySettingsDivider()
+                    RelayMachineAutoStopToggle(model: powerModel)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 14)
+                }
+
+                if let notice = powerModel.notice {
+                    RelaySettingsDivider()
+                    RelayInlineNotice(text: notice)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                }
+            }
+        }
+        .padding(.bottom, 24)
+    }
+
+    private func monitoringSection(liveHost: RelayPairedNode) -> some View {
+        RelaySettingsSection("Monitoring") {
+            RelaySettingsCard {
+                NavigationLink {
+                    RelayMachineMonitorView(
+                        client: codexClient,
+                        identityStore: identityStore,
+                        powerModel: powerModel,
+                        machineName: liveHost.nodeName
+                    )
+                } label: {
+                    RelaySettingsRow(
+                        "Machine monitor",
+                        subtitle: "CPU, memory, disk and active runs",
+                        systemImage: "gauge.with.dots.needle.67percent",
+                        showsChevron: true
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private func accountRegistrationSection(liveHost: RelayPairedNode) -> some View {
+        RelaySettingsSection("Relay account") {
+            RelaySettingsCard {
+                if liveHost.registeredAccountID == nil {
+                    RelaySettingsRow(
+                        accountStore.user == nil
+                            ? "Sign in to connect this machine"
+                            : "Connect this machine to your account",
+                        subtitle: "Enables laptop handoff and push alerts for this host",
+                        systemImage: "person.badge.plus",
+                        action: {
+                            if accountStore.user == nil {
+                                state.showingSignIn = true
+                            } else {
+                                Task { await onRegisterMachine(liveHost) }
+                            }
+                        }
+                    ) {
+                        if state.isRegisteringMachine {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            RelayButton(
+                                accountStore.user == nil ? "Sign in" : "Connect",
+                                variant: .outline,
+                                size: .sm
+                            ) {
+                                if accountStore.user == nil {
+                                    state.showingSignIn = true
+                                } else {
+                                    Task { await onRegisterMachine(liveHost) }
+                                }
+                            }
+                            .disabled(state.isRegisteringMachine)
+                        }
+                    }
+                    .accessibilityIdentifier("relay-settings-register-machine")
+                } else {
+                    RelaySettingsRow(
+                        "Connected to Relay account",
+                        subtitle: "`relay handoff` and push alerts reach this phone",
+                        systemImage: "checkmark.circle",
+                        iconColor: theme.statusSuccess
+                    )
+                }
+
+                if let machineNotice = state.machineNotice {
+                    RelaySettingsDivider()
+                    RelayInlineNotice(text: machineNotice)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                }
+            }
+        }
+    }
+
+    private func dangerZoneSection(liveHost: RelayPairedNode) -> some View {
+        RelaySettingsSection("Danger zone", flush: true) {
+            RelaySettingsCard {
+                RelaySettingsRow(
+                    "Unpair machine",
+                    subtitle: "Forgets this host and deletes its credential on this phone"
+                ) {
+                    RelayButton("Unpair", variant: .outline, size: .sm) {
+                        state.hostPendingUnpair = liveHost
+                    }
+                    .accessibilityIdentifier("relay-settings-unpair")
+                }
+            }
+        }
+    }
+}
+
+private struct AccountSettingsPersonalInstallDetailView: View {
+    @ObservedObject var nodeStore: RelayNodeStore
+    @ObservedObject var identityStore: ClientIdentityStore
+    let codexClient: CodexClient
+    @ObservedObject var powerModel: RelayMachinePowerModel
+    @ObservedObject var themeStore: RelayThemeStore
+    @ObservedObject var state: AccountSettingsState
+    let onLoadHarnesses: () async -> Void
+
+    private var theme: RelayThemePalette { themeStore.palette }
+
+    var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 RelaySettingsSection("Host") {
@@ -742,11 +1194,19 @@ struct AccountSettingsView: View {
                             subtitle: "Configured via support settings",
                             systemImage: "desktopcomputer"
                         ) {
-                            RelayStatusBadge("Active", bucket: activePowerStatusBucket, showsDot: true, compact: true)
+                            RelayStatusBadge(
+                                "Active",
+                                bucket: AccountSettingsHelpers.activePowerStatusBucket(
+                                    hasMachine: nodeStore.hasMachine,
+                                    powerStatus: powerModel.status
+                                ),
+                                showsDot: true,
+                                compact: true
+                            )
                         }
 
                         RelaySettingsDivider()
-                        connectionDetailsRow(AppConfiguration.codexBaseURL)
+                        AccountSettingsConnectionDetailsRow(url: AppConfiguration.codexBaseURL)
                     }
                 }
 
@@ -771,7 +1231,12 @@ struct AccountSettingsView: View {
                     }
                 }
 
-                codingAgentsSection
+                AccountSettingsCodingAgentsSection(
+                    nodeStore: nodeStore,
+                    powerModel: powerModel,
+                    state: state,
+                    onLoadHarnesses: onLoadHarnesses
+                )
             }
             .frame(maxWidth: 720, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .center)
@@ -784,10 +1249,16 @@ struct AccountSettingsView: View {
         .navigationTitle("Linked computer")
         .navigationBarTitleDisplayMode(.inline)
     }
+}
 
-    private func hostColorPickerRow(for host: RelayPairedNode) -> some View {
+private struct AccountSettingsHostColorPickerRow: View {
+    let host: RelayPairedNode
+    @ObservedObject var nodeStore: RelayNodeStore
+    @Environment(\.relayTheme) private var theme
+
+    var body: some View {
         let activeIndex = host.colorIndex ?? RelayIdentityColor.index(for: host.nodeID)
-        return VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 10) {
             Text("Identity color")
                 .font(RelayTheme.uiFont(14, weight: .regular))
                 .foregroundStyle(theme.foreground)
@@ -820,8 +1291,13 @@ struct AccountSettingsView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
     }
+}
 
-    private func connectionDetailsRow(_ url: URL) -> some View {
+private struct AccountSettingsConnectionDetailsRow: View {
+    let url: URL
+    @Environment(\.relayTheme) private var theme
+
+    var body: some View {
         DisclosureGroup {
             Text(url.absoluteString)
                 .font(RelayTheme.monoFont(13, weight: .regular))
@@ -839,10 +1315,20 @@ struct AccountSettingsView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
     }
+}
 
-    // MARK: - Section 2: Appearance
+// MARK: - Section 2: Appearance
 
-    private var appearanceSection: some View {
+private struct AccountSettingsAppearanceSection: View {
+    @ObservedObject var themeStore: RelayThemeStore
+
+    private var theme: RelayThemePalette { themeStore.palette }
+
+    private static let orderedThemes: [RelayThemeID] = [
+        .light, .paseoDark, .zinc, .midnight, .claude, .ghostty, .pureBlack, .ember
+    ]
+
+    var body: some View {
         RelaySettingsSection("Appearance") {
             RelaySettingsCard {
                 // Theme row with live 8-theme horizontal swatches
@@ -979,10 +1465,6 @@ struct AccountSettingsView: View {
         }
     }
 
-    private static let orderedThemes: [RelayThemeID] = [
-        .light, .paseoDark, .zinc, .midnight, .claude, .ghostty, .pureBlack, .ember
-    ]
-
     private func themeSwatchPill(_ themeID: RelayThemeID) -> some View {
         let isSelected = themeStore.selectedTheme == themeID
         let previewPalette = themeID.palette
@@ -1027,10 +1509,36 @@ struct AccountSettingsView: View {
         .accessibilityLabel("\(themeID.displayName) theme")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
+}
 
-    // MARK: - Section 3: Chat
+// MARK: - Section 3: Chat
 
-    private var chatSection: some View {
+private struct AccountSettingsChatSection: View {
+    @ObservedObject var nodeStore: RelayNodeStore
+    @ObservedObject var powerModel: RelayMachinePowerModel
+    @ObservedObject var themeStore: RelayThemeStore
+    @ObservedObject var state: AccountSettingsState
+    let onLoadHarnesses: () async -> Void
+
+    private var theme: RelayThemePalette { themeStore.palette }
+
+    private var codingAgentsSummary: String {
+        if AccountSettingsHelpers.agentsMachineState(powerModel: powerModel) == .down {
+            let name = nodeStore.pairedNode?.nodeName ?? RelayMachineLabel.fallback
+            return powerModel.status == .starting ? "Starting machine…" : "\(name) is off"
+        }
+        let installed = state.harnesses.filter(\.installed)
+        if installed.isEmpty {
+            return state.isLoadingHarnesses ? "Checking agents…" : "Manage Codex, Claude Code and provider sign-ins"
+        }
+        let connected = installed.filter { $0.loggedIn == true && $0.authRejection == nil }
+        if connected.isEmpty {
+            return "\(installed.count) installed · sign in from phone"
+        }
+        return connected.map(\.provider.displayName).joined(separator: ", ")
+    }
+
+    var body: some View {
         RelaySettingsSection(
             "Chat",
             info: "What happens when you send a message while the agent is running."
@@ -1080,20 +1588,13 @@ struct AccountSettingsView: View {
                     RelaySettingsDivider()
 
                     NavigationLink {
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 0) {
-                                codingAgentsSection
-                            }
-                            .frame(maxWidth: 720, alignment: .leading)
-                            .frame(maxWidth: .infinity, alignment: .center)
-                            .padding(.horizontal, 16)
-                            .padding(.top, 16)
-                            .padding(.bottom, 32)
-                        }
-                        .scrollBounceBehavior(.basedOnSize)
-                        .background(theme.surface0.ignoresSafeArea())
-                        .navigationTitle("Coding agents")
-                        .navigationBarTitleDisplayMode(.inline)
+                        AccountSettingsCodingAgentsDestination(
+                            nodeStore: nodeStore,
+                            powerModel: powerModel,
+                            themeStore: themeStore,
+                            state: state,
+                            onLoadHarnesses: onLoadHarnesses
+                        )
                     } label: {
                         RelaySettingsRow(
                             "Coding agents & sign-ins",
@@ -1107,132 +1608,209 @@ struct AccountSettingsView: View {
             }
         }
     }
+}
 
-    private var codingAgentsSummary: String {
-        if isMachineKnownDown {
-            return powerModel.status == .starting ? "Starting machine…" : "\(machineName) is off"
+private struct AccountSettingsCodingAgentsDestination: View {
+    @ObservedObject var nodeStore: RelayNodeStore
+    @ObservedObject var powerModel: RelayMachinePowerModel
+    @ObservedObject var themeStore: RelayThemeStore
+    @ObservedObject var state: AccountSettingsState
+    let onLoadHarnesses: () async -> Void
+
+    private var theme: RelayThemePalette { themeStore.palette }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                AccountSettingsCodingAgentsSection(
+                    nodeStore: nodeStore,
+                    powerModel: powerModel,
+                    state: state,
+                    onLoadHarnesses: onLoadHarnesses
+                )
+            }
+            .frame(maxWidth: 720, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.horizontal, 16)
+            .padding(.top, 16)
+            .padding(.bottom, 32)
         }
-        let installed = harnesses.filter(\.installed)
-        if installed.isEmpty {
-            return isLoadingHarnesses ? "Checking agents…" : "Manage Codex, Claude Code and provider sign-ins"
-        }
-        let connected = installed.filter { $0.loggedIn == true && $0.authRejection == nil }
-        if connected.isEmpty {
-            return "\(installed.count) installed · sign in from phone"
-        }
-        return connected.map(\.provider.displayName).joined(separator: ", ")
+        .scrollBounceBehavior(.basedOnSize)
+        .background(theme.surface0.ignoresSafeArea())
+        .navigationTitle("Coding agents")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct AccountSettingsCodingAgentsSection: View {
+    @ObservedObject var nodeStore: RelayNodeStore
+    @ObservedObject var powerModel: RelayMachinePowerModel
+    @ObservedObject var state: AccountSettingsState
+    let onLoadHarnesses: () async -> Void
+
+    @Environment(\.relayTheme) private var theme
+
+    private var machineName: String {
+        nodeStore.pairedNode?.nodeName ?? RelayMachineLabel.fallback
     }
 
-    // MARK: - Section 4: Account & Handoff
+    private var isMachineKnownDown: Bool {
+        AccountSettingsHelpers.agentsMachineState(powerModel: powerModel) == .down
+    }
 
-    private var accountAndHandoffSection: some View {
-        RelaySettingsSection("Account & handoff", info: accountInfo) {
+    var body: some View {
+        RelaySettingsSection("Coding agents", info: AccountSettingsHelpers.agentsInfo) {
+            RelaySettingsCard {
+                if isMachineKnownDown {
+                    // Sign-in lives on the machine, so a machine that is off has no
+                    // answer to give; an old "Connected" would be a guess.
+                    Text(powerModel.status == .starting
+                         ? "Starting \(RelayMachineLabel.inSentence(machineName)). Agents appear once it is up."
+                         : "\(machineName) is off. Its agents and their sign-in show here once it is on.")
+                        .font(RelayTheme.uiFont(14, weight: .regular))
+                        .foregroundStyle(theme.foregroundMuted)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 14)
+                        .accessibilityIdentifier("relay-agents-machine-down")
+                } else if state.isLoadingHarnesses && state.harnesses.isEmpty {
+                    HStack(spacing: 10) {
+                        ProgressView().controlSize(.small)
+                        Text("Checking agents on your machine…")
+                            .font(RelayTheme.uiFont(14, weight: .regular))
+                            .foregroundStyle(theme.foregroundMuted)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 14)
+                } else {
+                    let installed = state.harnesses.filter(\.installed)
+                    if installed.isEmpty && state.harnessError == nil {
+                        Text("No coding agents reported by \(machineName).")
+                            .font(RelayTheme.uiFont(14, weight: .regular))
+                            .foregroundStyle(theme.foregroundMuted)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 14)
+                    } else {
+                        ForEach(Array(installed.enumerated()), id: \.element.id) { index, harness in
+                            harnessRow(harness, showsTopDivider: index > 0)
+                        }
+                    }
+                }
+
+                if let harnessError = state.harnessError, !isMachineKnownDown {
+                    if !state.harnesses.filter(\.installed).isEmpty {
+                        RelaySettingsDivider()
+                    }
+                    RelayInlineNotice(text: harnessError, actionTitle: "Retry", isWorking: state.isLoadingHarnesses) {
+                        Task { await onLoadHarnesses() }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                }
+            }
+        }
+    }
+
+    private func harnessRow(_ harness: RelayHarnessStatus, showsTopDivider: Bool) -> some View {
+        VStack(spacing: 0) {
+            if showsTopDivider {
+                RelaySettingsDivider()
+            }
+
+            HStack(spacing: 12) {
+                RelayProviderMark(provider: harness.provider, size: 17)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(harness.provider.displayName)
+                        .font(RelayTheme.uiFont(15, weight: .regular))
+                        .foregroundStyle(theme.foreground)
+                    if harness.authRejection != nil {
+                        // The provider turned the stored sign-in away on a real run,
+                        // whatever the CLI's own status check still says.
+                        Text("Sign-in expired")
+                            .font(RelayTheme.uiFont(12, weight: .regular))
+                            .foregroundStyle(theme.statusWarning)
+                    }
+                }
+
+                Spacer()
+
+                if harness.loggedIn == true {
+                    // "Connected" is the CLI's own reading, and it cannot see a
+                    // token the provider revoked; signing in again stays one tap away.
+                    Menu {
+                        Button("Sign in again") {
+                            state.providerLoginRequest = harness.provider
+                        }
+                    } label: {
+                        HStack(spacing: 5) {
+                            RelayStatusDot(
+                                bucket: harness.authRejection != nil ? .needsInput : .done,
+                                size: 6
+                            )
+                            Text("Connected")
+                                .font(RelayTheme.uiFont(13, weight: .regular))
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.system(size: 10, weight: .semibold))
+                        }
+                        .foregroundStyle(theme.foregroundMuted)
+                    }
+                    .accessibilityIdentifier("relay-agent-connected-\(harness.provider.rawValue)")
+                } else {
+                    RelayButton(
+                        harness.loggedIn == false ? "Sign in" : "Check sign-in",
+                        variant: .outline,
+                        size: .sm
+                    ) {
+                        state.providerLoginRequest = harness.provider
+                    }
+                    .accessibilityIdentifier("relay-agent-sign-in-\(harness.provider.rawValue)")
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .frame(minHeight: 52)
+        }
+    }
+}
+
+// MARK: - Section 4: Account & Handoff
+
+private struct AccountSettingsAccountSection: View {
+    @ObservedObject var accountStore: RelayAccountStore
+    @ObservedObject var computerLinkStore: RelayComputerLinkStore
+    @ObservedObject var themeStore: RelayThemeStore
+    @ObservedObject var state: AccountSettingsState
+    var pushService: RelayPushService?
+    let onDismiss: () -> Void
+    let onLoadLinkedComputer: (Bool) async -> Void
+
+    private var theme: RelayThemePalette { themeStore.palette }
+
+    private var computerSummary: String {
+        guard let linkedComputer = computerLinkStore.computer else {
+            return "Scan QR from `relay login` or Sign in with iPhone"
+        }
+        switch linkedComputer.status {
+        case .connecting:
+            return "Link approved — finish `relay login` on your computer"
+        case .connected:
+            return "Scan QR to approve another computer or browser sign-in"
+        }
+    }
+
+    var body: some View {
+        RelaySettingsSection("Account & handoff", info: AccountSettingsHelpers.accountInfo) {
             VStack(alignment: .leading, spacing: 10) {
                 RelaySettingsCard {
                     if let user = accountStore.user {
-                        RelaySettingsRow(
-                            user.preferredName,
-                            subtitle: user.email,
-                            systemImage: "person.circle"
-                        ) {
-                            Button {
-                                withAnimation(.easeOut(duration: 0.16)) {
-                                    showingAccountDetails.toggle()
-                                }
-                            } label: {
-                                Image(systemName: showingAccountDetails ? "chevron.up" : "chevron.down")
-                                    .font(.system(size: 12, weight: .semibold))
-                                    .foregroundStyle(theme.foregroundExtraMuted)
-                                    .frame(width: 28, height: 28)
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel("Account details")
-                        }
-
-                        if showingAccountDetails {
-                            RelaySettingsDivider()
-                            VStack(alignment: .leading, spacing: 8) {
-                                if let username = user.username, !username.isEmpty {
-                                    detailPair("Username", value: username)
-                                }
-                                detailPair("Sign-in method", value: user.usesPassword ? "Username and password" : "Apple")
-                            }
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 12)
-                        }
-
-                        RelaySettingsDivider()
-
-                        // Linked CLI computer + web browsers
-                        if !computerLinkStore.hasLoaded && computerLinkStore.isLoading {
-                            HStack(spacing: 10) {
-                                ProgressView().controlSize(.small)
-                                Text("Checking signed-in devices…")
-                                    .font(RelayTheme.uiFont(14, weight: .regular))
-                                    .foregroundStyle(theme.foregroundMuted)
-                            }
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 14)
-                        } else {
-                            if let computer = computerLinkStore.computer {
-                                linkedComputerRow(computer)
-                                RelaySettingsDivider()
-                            }
-
-                            ForEach(browsers) { browser in
-                                browserRow(browser)
-                                RelaySettingsDivider()
-                            }
-
-                            RelaySettingsRow(
-                                "Approve a sign-in",
-                                subtitle: computerSummary,
-                                systemImage: "qrcode.viewfinder",
-                                showsChevron: true,
-                                action: { showingCLILink = true }
-                            )
-                            .disabled(computerLinkStore.isLoading || computerLinkStore.isDisconnecting || isRemovingBrowser)
-                            .accessibilityIdentifier("relay-approve-sign-in")
-                        }
-
-                        if let pushService {
-                            RelaySettingsDivider()
-                            pushNotificationsRow(pushService)
-                        }
-
-                        RelaySettingsDivider()
-
-                        RelaySettingsRow(
-                            "Sign out",
-                            systemImage: "rectangle.portrait.and.arrow.right",
-                            action: {
-                                Task {
-                                    await accountStore.signOut()
-                                    dismiss()
-                                }
-                            }
-                        )
-                        .disabled(accountStore.isWorking)
-
-                        RelaySettingsDivider()
-
-                        RelaySettingsRow(
-                            "Delete account",
-                            subtitle: securityInfo
-                        ) {
-                            RelayButton("Delete", variant: .outline, size: .sm, isDisabled: accountStore.isWorking) {
-                                deletionPassword = ""
-                                showingDeleteConfirmation = true
-                            }
-                            .accessibilityIdentifier("relay-delete-account")
-                        }
+                        signedInAccountContent(user)
                     } else {
                         RelaySettingsRow(
                             "Sign in to Relay",
                             subtitle: "Optional — adds laptop handoff, push alerts and `relay login`",
                             systemImage: "person.badge.key",
                             showsChevron: true,
-                            action: { showingSignIn = true }
+                            action: { state.showingSignIn = true }
                         )
                         .accessibilityIdentifier("relay-settings-sign-in")
 
@@ -1243,9 +1821,9 @@ struct AccountSettingsView: View {
                     }
                 }
 
-                if let error = signedInPlacesError ?? computerLinkStore.errorMessage {
+                if let error = state.signedInPlacesError ?? computerLinkStore.errorMessage {
                     RelayInlineNotice(text: error, actionTitle: "Retry", isWorking: computerLinkStore.isLoading) {
-                        Task { await loadLinkedComputer() }
+                        Task { await onLoadLinkedComputer(true) }
                     }
                     .padding(.horizontal, 4)
                 }
@@ -1255,6 +1833,105 @@ struct AccountSettingsView: View {
                         .padding(.horizontal, 4)
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private func signedInAccountContent(_ user: RelayAccountUser) -> some View {
+        RelaySettingsRow(
+            user.preferredName,
+            subtitle: user.email,
+            systemImage: "person.circle"
+        ) {
+            Button {
+                withAnimation(.easeOut(duration: 0.16)) {
+                    state.showingAccountDetails.toggle()
+                }
+            } label: {
+                Image(systemName: state.showingAccountDetails ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(theme.foregroundExtraMuted)
+                    .frame(width: 28, height: 28)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Account details")
+        }
+
+        if state.showingAccountDetails {
+            RelaySettingsDivider()
+            VStack(alignment: .leading, spacing: 8) {
+                if let username = user.username, !username.isEmpty {
+                    detailPair("Username", value: username)
+                }
+                detailPair("Sign-in method", value: user.usesPassword ? "Username and password" : "Apple")
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+        }
+
+        RelaySettingsDivider()
+
+        if !computerLinkStore.hasLoaded && computerLinkStore.isLoading {
+            HStack(spacing: 10) {
+                ProgressView().controlSize(.small)
+                Text("Checking signed-in devices…")
+                    .font(RelayTheme.uiFont(14, weight: .regular))
+                    .foregroundStyle(theme.foregroundMuted)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+        } else {
+            if let computer = computerLinkStore.computer {
+                linkedComputerRow(computer)
+                RelaySettingsDivider()
+            }
+
+            ForEach(state.browsers) { browser in
+                browserRow(browser)
+                RelaySettingsDivider()
+            }
+
+            RelaySettingsRow(
+                "Approve a sign-in",
+                subtitle: computerSummary,
+                systemImage: "qrcode.viewfinder",
+                showsChevron: true,
+                action: { state.showingCLILink = true }
+            )
+            .disabled(computerLinkStore.isLoading || computerLinkStore.isDisconnecting || state.isRemovingBrowser)
+            .accessibilityIdentifier("relay-approve-sign-in")
+        }
+
+        if let pushService {
+            RelaySettingsDivider()
+            pushNotificationsRow(pushService)
+        }
+
+        RelaySettingsDivider()
+
+        RelaySettingsRow(
+            "Sign out",
+            systemImage: "rectangle.portrait.and.arrow.right",
+            action: {
+                Task {
+                    await accountStore.signOut()
+                    onDismiss()
+                }
+            }
+        )
+        .disabled(accountStore.isWorking)
+
+        RelaySettingsDivider()
+
+        RelaySettingsRow(
+            "Delete account",
+            subtitle: AccountSettingsHelpers.securityInfo
+        ) {
+            RelayButton("Delete", variant: .outline, size: .sm, isDisabled: accountStore.isWorking) {
+                state.deletionPassword = ""
+                state.showingDeleteConfirmation = true
+            }
+            .accessibilityIdentifier("relay-delete-account")
         }
     }
 
@@ -1288,20 +1965,20 @@ struct AccountSettingsView: View {
 
     private func linkedComputerRow(_ computer: CLIComputerLink) -> some View {
         let details = [
-            computer.platform.map(platformLabel),
-            computerStatus(computer),
+            computer.platform.map(AccountSettingsHelpers.platformLabel),
+            AccountSettingsHelpers.computerStatus(computer),
             computer.connectedAt.map {
-                "Connected " + Self.computerDateFormatter.string(from: Date(timeIntervalSince1970: Double($0) / 1_000))
+                "Connected " + AccountSettingsHelpers.computerDateFormatter.string(from: Date(timeIntervalSince1970: Double($0) / 1_000))
             }
         ].compactMap { $0 }.joined(separator: " · ")
 
         return RelaySettingsRow(
-            computerName(computer),
+            AccountSettingsHelpers.computerName(computer),
             subtitle: details,
             systemImage: "laptopcomputer"
         ) {
             Menu {
-                Button("Disconnect computer", role: .destructive) { showingDisconnectConfirmation = true }
+                Button("Disconnect computer", role: .destructive) { state.showingDisconnectConfirmation = true }
                     .accessibilityIdentifier("relay-disconnect-computer")
             } label: {
                 Image(systemName: "ellipsis")
@@ -1310,25 +1987,25 @@ struct AccountSettingsView: View {
                     .foregroundStyle(theme.foregroundMuted)
                     .frame(width: 32, height: 32)
             }
-            .disabled(computerLinkStore.isDisconnecting || isRemovingBrowser)
+            .disabled(computerLinkStore.isDisconnecting || state.isRemovingBrowser)
             .buttonStyle(.plain)
-            .accessibilityLabel("Manage \(computerName(computer))")
+            .accessibilityLabel("Manage \(AccountSettingsHelpers.computerName(computer))")
         }
     }
 
     private func browserRow(_ browser: RelayBrowserSession) -> some View {
         let details = [
-            browser.platform.map(platformLabel),
-            "Signed in " + Self.computerDateFormatter.string(from: Date(timeIntervalSince1970: Double(browser.createdAt) / 1_000))
+            browser.platform.map(AccountSettingsHelpers.platformLabel),
+            "Signed in " + AccountSettingsHelpers.computerDateFormatter.string(from: Date(timeIntervalSince1970: Double(browser.createdAt) / 1_000))
         ].compactMap { $0 }.joined(separator: " · ")
 
         return RelaySettingsRow(
-            browserName(browser),
+            AccountSettingsHelpers.browserName(browser),
             subtitle: details,
             systemImage: "globe"
         ) {
             Menu {
-                Button("Remove", role: .destructive) { browserToRemove = browser }
+                Button("Remove", role: .destructive) { state.browserToRemove = browser }
                     .accessibilityIdentifier("relay-remove-browser")
             } label: {
                 Image(systemName: "ellipsis")
@@ -1337,15 +2014,29 @@ struct AccountSettingsView: View {
                     .foregroundStyle(theme.foregroundMuted)
                     .frame(width: 32, height: 32)
             }
-            .disabled(computerLinkStore.isDisconnecting || isRemovingBrowser)
+            .disabled(computerLinkStore.isDisconnecting || state.isRemovingBrowser)
             .buttonStyle(.plain)
-            .accessibilityLabel("Manage \(browserName(browser))")
+            .accessibilityLabel("Manage \(AccountSettingsHelpers.browserName(browser))")
         }
     }
+}
 
-    // MARK: - Section 5: Diagnostics
+// MARK: - Section 5: Diagnostics
 
-    private var diagnosticsSection: some View {
+private struct AccountSettingsDiagnosticsSection: View {
+    @ObservedObject var nodeStore: RelayNodeStore
+    @ObservedObject var identityStore: ClientIdentityStore
+    let codexClient: CodexClient
+    @ObservedObject var powerModel: RelayMachinePowerModel
+    @ObservedObject var state: AccountSettingsState
+    var onOpenDiagnostics: (() -> Void)?
+    var onOpenMachineMonitor: (() -> Void)?
+
+    private var machineName: String {
+        nodeStore.pairedNode?.nodeName ?? RelayMachineLabel.fallback
+    }
+
+    var body: some View {
         RelaySettingsSection("Diagnostics") {
             RelaySettingsCard {
                 RelaySettingsRow(
@@ -1357,7 +2048,7 @@ struct AccountSettingsView: View {
                         if let onOpenDiagnostics {
                             onOpenDiagnostics()
                         } else {
-                            showingDiagnosticsSheet = true
+                            state.showingDiagnosticsSheet = true
                         }
                     }
                 )
@@ -1397,10 +2088,22 @@ struct AccountSettingsView: View {
             }
         }
     }
+}
 
-    // MARK: - Section 6: About
+// MARK: - Section 6: About
 
-    private var aboutSection: some View {
+private struct AccountSettingsAboutSection: View {
+    @ObservedObject var themeStore: RelayThemeStore
+
+    private var theme: RelayThemePalette { themeStore.palette }
+
+    private var versionText: String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—"
+        return "\(version) (\(build))"
+    }
+
+    var body: some View {
         RelaySettingsSection("About", flush: true) {
             RelaySettingsCard {
                 RelaySettingsRow("Version") {
@@ -1419,163 +2122,75 @@ struct AccountSettingsView: View {
     private func settingsLinkRow(_ title: String, url: String) -> some View {
         VStack(spacing: 0) {
             RelaySettingsDivider()
-            Link(destination: URL(string: url)!) {
-                HStack(spacing: 12) {
-                    Text(title)
-                        .font(RelayTheme.uiFont(15, weight: .regular))
-                        .foregroundStyle(theme.foreground)
-                    Spacer()
-                    Image(systemName: "arrow.up.right")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(theme.foregroundExtraMuted)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 13)
-                .frame(minHeight: 50)
-                .contentShape(Rectangle())
-            }
-        }
-    }
-
-    // MARK: - Coding Agents Section (Host Detail & Chat Settings)
-
-    private var codingAgentsSection: some View {
-        RelaySettingsSection("Coding agents", info: agentsInfo) {
-            RelaySettingsCard {
-                if isMachineKnownDown {
-                    // Sign-in lives on the machine, so a machine that is off has no
-                    // answer to give; an old "Connected" would be a guess.
-                    Text(powerModel.status == .starting
-                         ? "Starting \(RelayMachineLabel.inSentence(machineName)). Agents appear once it is up."
-                         : "\(machineName) is off. Its agents and their sign-in show here once it is on.")
-                        .font(RelayTheme.uiFont(14, weight: .regular))
-                        .foregroundStyle(theme.foregroundMuted)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 14)
-                        .accessibilityIdentifier("relay-agents-machine-down")
-                } else if isLoadingHarnesses && harnesses.isEmpty {
-                    HStack(spacing: 10) {
-                        ProgressView().controlSize(.small)
-                        Text("Checking agents on your machine…")
-                            .font(RelayTheme.uiFont(14, weight: .regular))
-                            .foregroundStyle(theme.foregroundMuted)
+            if let destination = URL(string: url) {
+                Link(destination: destination) {
+                    HStack(spacing: 12) {
+                        Text(title)
+                            .font(RelayTheme.uiFont(15, weight: .regular))
+                            .foregroundStyle(theme.foreground)
+                        Spacer()
+                        Image(systemName: "arrow.up.right")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(theme.foregroundExtraMuted)
                     }
                     .padding(.horizontal, 16)
-                    .padding(.vertical, 14)
-                } else {
-                    let installed = harnesses.filter(\.installed)
-                    if installed.isEmpty && harnessError == nil {
-                        Text("No coding agents reported by \(machineName).")
-                            .font(RelayTheme.uiFont(14, weight: .regular))
-                            .foregroundStyle(theme.foregroundMuted)
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 14)
-                    } else {
-                        ForEach(Array(installed.enumerated()), id: \.element.id) { index, harness in
-                            harnessRow(harness, showsTopDivider: index > 0)
-                        }
-                    }
-                }
-
-                if let harnessError, !isMachineKnownDown {
-                    if !harnesses.filter(\.installed).isEmpty {
-                        RelaySettingsDivider()
-                    }
-                    RelayInlineNotice(text: harnessError, actionTitle: "Retry", isWorking: isLoadingHarnesses) {
-                        Task { await loadHarnesses() }
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
+                    .padding(.vertical, 13)
+                    .frame(minHeight: 50)
+                    .contentShape(Rectangle())
                 }
             }
         }
     }
+}
 
-    private func harnessRow(_ harness: RelayHarnessStatus, showsTopDivider: Bool) -> some View {
-        VStack(spacing: 0) {
-            if showsTopDivider {
-                RelaySettingsDivider()
-            }
+// MARK: - Helpers
 
-            HStack(spacing: 12) {
-                RelayProviderMark(provider: harness.provider, size: 17)
+private enum AccountSettingsHelpers {
+    static let accountInfo = "Optional. An account adds handoff from a laptop, push notifications, and approving `relay login` on a computer. Files, agents and terminals work without one."
+    static let securityInfo = "Deletes your Relay account and device records. Files on servers you own are not deleted."
+    static let agentsInfo = "Sign in to each agent right from this iPhone — no laptop needed. The session is stored on your machine, and `relay sync-auth` from a Mac still works too."
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(harness.provider.displayName)
-                        .font(RelayTheme.uiFont(15, weight: .regular))
-                        .foregroundStyle(theme.foreground)
-                    if harness.authRejection != nil {
-                        // The provider turned the stored sign-in away on a real run,
-                        // whatever the CLI's own status check still says.
-                        Text("Sign-in expired")
-                            .font(RelayTheme.uiFont(12, weight: .regular))
-                            .foregroundStyle(theme.statusWarning)
-                    }
-                }
-
-                Spacer()
-
-                if harness.loggedIn == true {
-                    // "Connected" is the CLI's own reading, and it cannot see a
-                    // token the provider revoked; signing in again stays one tap away.
-                    Menu {
-                        Button("Sign in again") {
-                            providerLoginRequest = harness.provider
-                        }
-                    } label: {
-                        HStack(spacing: 5) {
-                            RelayStatusDot(
-                                bucket: harness.authRejection != nil ? .needsInput : .done,
-                                size: 6
-                            )
-                            Text("Connected")
-                                .font(RelayTheme.uiFont(13, weight: .regular))
-                            Image(systemName: "chevron.up.chevron.down")
-                                .font(.system(size: 10, weight: .semibold))
-                        }
-                        .foregroundStyle(theme.foregroundMuted)
-                    }
-                    .accessibilityIdentifier("relay-agent-connected-\(harness.provider.rawValue)")
-                } else {
-                    RelayButton(
-                        harness.loggedIn == false ? "Sign in" : "Check sign-in",
-                        variant: .outline,
-                        size: .sm
-                    ) {
-                        providerLoginRequest = harness.provider
-                    }
-                    .accessibilityIdentifier("relay-agent-sign-in-\(harness.provider.rawValue)")
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-            .frame(minHeight: 52)
+    static func machineInfo(for node: RelayPairedNode?) -> String {
+        guard let node else {
+            return "Run `relayd pair` on a computer or server you own and scan the code it prints."
         }
+        if node.registeredAccountID == nil {
+            return "Paired machines connect directly over TLS pinned to each machine's CA. Connecting to a Relay account is optional and adds laptop handoff and push alerts."
+        }
+        return "Connected to your Relay account, so `relay handoff` from a laptop and usage alerts reach this phone."
     }
 
-    // MARK: - Copy & Status Helpers
-
-    private var machineName: String {
-        nodeStore.pairedNode?.nodeName ?? RelayMachineLabel.fallback
-    }
-
-    private var activePowerStatusBucket: RelayStatusBucket {
-        guard nodeStore.hasMachine else { return .idle }
+    @MainActor
+    static func agentsMachineState(powerModel: RelayMachinePowerModel) -> AgentsLoadTrigger.Machine {
+        guard powerModel.canControl else { return .reachable }
         switch powerModel.status {
+        case .loading: return .checking
+        case .off, .starting, .stopping: return .down
+        case .unknown, .unavailable, .on: return .reachable
+        }
+    }
+
+    static func activePowerStatusBucket(
+        hasMachine: Bool,
+        powerStatus: RelayMachinePowerModel.Status
+    ) -> RelayStatusBucket {
+        guard hasMachine else { return .idle }
+        switch powerStatus {
         case .on, .unknown, .unavailable: return .done
         case .starting, .stopping, .loading: return .needsInput
         case .off: return .error
         }
     }
 
-    private func hostStatusBucket(for host: RelayPairedNode, isActive: Bool) -> RelayStatusBucket {
-        if isActive {
-            return activePowerStatusBucket
-        }
-        return .idle
+    static func hostStatusBucket(
+        isActive: Bool,
+        hasMachine: Bool,
+        powerStatus: RelayMachinePowerModel.Status
+    ) -> RelayStatusBucket {
+        isActive ? activePowerStatusBucket(hasMachine: hasMachine, powerStatus: powerStatus) : .idle
     }
 
-    private func isLocalHost(_ url: URL) -> Bool {
+    static func isLocalHost(_ url: URL) -> Bool {
         guard let host = url.host?.lowercased() else { return false }
         return host.hasSuffix(".local")
             || host == "localhost"
@@ -1585,202 +2200,24 @@ struct AccountSettingsView: View {
             || host.hasPrefix("10.")
     }
 
-    private var computerSummary: String {
-        guard let linkedComputer = computerLinkStore.computer else {
-            return "Scan QR from `relay login` or Sign in with iPhone"
-        }
-        switch linkedComputer.status {
-        case .connecting:
-            return "Link approved — finish `relay login` on your computer"
-        case .connected:
-            return "Scan QR to approve another computer or browser sign-in"
-        }
-    }
-
-    private var versionText: String {
-        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
-        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—"
-        return "\(version) (\(build))"
-    }
-
-    private var machineInfo: String {
-        guard let node = nodeStore.pairedNode else {
-            return "Run `relayd pair` on a computer or server you own and scan the code it prints."
-        }
-        if node.registeredAccountID == nil {
-            return "Paired machines connect directly over TLS pinned to each machine's CA. Connecting to a Relay account is optional and adds laptop handoff and push alerts."
-        }
-        return "Connected to your Relay account, so `relay handoff` from a laptop and usage alerts reach this phone."
-    }
-
-    private var accountInfo: String {
-        "Optional. An account adds handoff from a laptop, push notifications, and approving `relay login` on a computer. Files, agents and terminals work without one."
-    }
-
-    private var securityInfo: String {
-        "Deletes your Relay account and device records. Files on servers you own are not deleted."
-    }
-
-    private var agentsInfo: String {
-        "Sign in to each agent right from this iPhone — no laptop needed. The session is stored on your machine, and `relay sync-auth` from a Mac still works too."
-    }
-
-    // MARK: - Actions
-
-    private func switchActiveHost(to host: RelayPairedNode) {
-        identityStore.activateHostMaterial(for: host.host ?? host.nodeID)
-        nodeStore.selectHost(id: host.nodeID)
-        machineNotice = nil
-        Task {
-            await powerModel.refresh()
-            await refreshHarnessesForMachineState()
-        }
-    }
-
-    private func registerMachine(_ node: RelayPairedNode) async {
-        isRegisteringMachine = true
-        machineNotice = nil
-        defer { isRegisteringMachine = false }
-        machineNotice = await RelayNodeRegistration.register(
-            node: node,
-            accountStore: accountStore,
-            nodeStore: nodeStore,
-            client: authClient
-        )
-    }
-
-    private func unpairHost(_ host: RelayPairedNode) {
-        let key = host.host ?? host.nodeID
-        if nodeStore.hosts.count <= 1 {
-            nodeStore.removeHost(id: host.nodeID)
-            identityStore.discardPairedMaterial()
-            onDisconnect?()
-        } else {
-            identityStore.discardPairedMaterial(for: key)
-            nodeStore.removeHost(id: host.nodeID)
-            if let nextActive = nodeStore.pairedNode {
-                identityStore.activateHostMaterial(for: nextActive.host ?? nextActive.nodeID)
-            }
-        }
-        machineNotice = nil
-    }
-
-    /// Whether the machine is worth asking about its agents. Without power
-    /// control there is nothing to go on, so it is simply asked.
-    private var agentsMachineState: AgentsLoadTrigger.Machine {
-        guard powerModel.canControl else { return .reachable }
-        switch powerModel.status {
-        case .loading: return .checking
-        case .off, .starting, .stopping: return .down
-        case .unknown, .unavailable, .on: return .reachable
-        }
-    }
-
-    /// EC2 says the machine is stopped or in motion, so a node request that
-    /// fails is not news and the agents section has nothing to add.
-    private var isMachineKnownDown: Bool { agentsMachineState == .down }
-
-    private func refreshHarnessesForMachineState() async {
-        if agentsMachineState == .down {
-            harnesses = []
-            harnessError = nil
-        }
-        guard nodeStore.hasMachine, agentsMachineState == .reachable else { return }
-        await loadHarnesses()
-    }
-
-    private func loadHarnesses() async {
-        guard nodeStore.hasMachine, !isMachineKnownDown else { return }
-        isLoadingHarnesses = true
-        harnessError = nil
-        defer { isLoadingHarnesses = false }
-        do {
-            harnesses = try await codexClient.fetchHarnesses(budget: .statusRead)
-        } catch {
-            guard !Task.isCancelled else { return }
-            if powerModel.isWarmingUp {
-                try? await Task.sleep(for: .seconds(4))
-                if !Task.isCancelled { await loadHarnesses() }
-                return
-            }
-            harnesses = []
-            harnessError = "Relay couldn't check the agents on your machine."
-        }
-    }
-
-    private func loadLinkedComputer(showProgress: Bool = true) async {
-        guard let bearer = accountStore.currentSessionToken,
-              let accountID = accountStore.user?.id else {
-            browsers = []
-            return
-        }
-        signedInPlacesError = nil
-        await computerLinkStore.refresh(
-            bearerToken: bearer,
-            accountID: accountID,
-            showProgress: showProgress
-        )
-        do {
-            let places = try await RelayAuthClient(
-                baseURL: AppConfiguration.authBaseURL
-            ).signedInPlaces(bearerToken: bearer)
-            browsers = places.browsers
-            computerLinkStore.adoptPlaces(places, accountID: accountID)
-        } catch {
-            signedInPlacesError = "Couldn’t refresh your signed-in devices."
-        }
-    }
-
-    private func disconnectLinkedComputer() async {
-        guard let bearer = accountStore.currentSessionToken,
-              let accountID = accountStore.user?.id else { return }
-        await computerLinkStore.disconnect(bearerToken: bearer, accountID: accountID)
-    }
-
-    private func removeBrowser(_ browser: RelayBrowserSession) async {
-        guard let bearer = accountStore.currentSessionToken else { return }
-        isRemovingBrowser = true
-        signedInPlacesError = nil
-        defer {
-            isRemovingBrowser = false
-            browserToRemove = nil
-        }
-        do {
-            try await RelayAuthClient(
-                baseURL: AppConfiguration.authBaseURL
-            ).removeBrowser(id: browser.id, bearerToken: bearer)
-            browsers.removeAll { $0.id == browser.id }
-        } catch let error as RelayAuthClientError {
-            if case .server(let status, let code, _) = error,
-               status == 404, code == "unknown_browser" {
-                browsers.removeAll { $0.id == browser.id }
-                signedInPlacesError = "That browser is already signed out."
-                return
-            }
-            signedInPlacesError = "Relay couldn't remove this browser. Try again."
-        } catch {
-            signedInPlacesError = "Relay couldn't remove this browser. Try again."
-        }
-    }
-
-    private func computerName(_ computer: CLIComputerLink) -> String {
+    static func computerName(_ computer: CLIComputerLink) -> String {
         guard let name = computer.machineName, !name.isEmpty else { return "Linked computer" }
         return name
     }
 
-    private func browserName(_ browser: RelayBrowserSession) -> String {
+    static func browserName(_ browser: RelayBrowserSession) -> String {
         guard let name = browser.name, !name.isEmpty else { return "Browser" }
         return name
     }
 
-    private func computerStatus(_ computer: CLIComputerLink) -> String {
+    static func computerStatus(_ computer: CLIComputerLink) -> String {
         switch computer.status {
         case .connecting: return "Waiting for computer"
         case .connected: return "Connected"
         }
     }
 
-    private func platformLabel(_ platform: String) -> String {
+    static func platformLabel(_ platform: String) -> String {
         switch platform {
         case "macos": return "macOS"
         case "linux": return "Linux"
@@ -1791,7 +2228,7 @@ struct AccountSettingsView: View {
         }
     }
 
-    private static let computerDateFormatter: DateFormatter = {
+    static let computerDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
         formatter.timeStyle = .short

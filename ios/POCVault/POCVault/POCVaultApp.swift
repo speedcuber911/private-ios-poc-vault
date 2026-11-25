@@ -822,27 +822,26 @@ struct POCVaultRootView: View {
         }
     }
 
-    @ViewBuilder
-    private var secondaryDestination: some View {
+    private var secondaryDestination: AnyView {
         switch selectedRootTab {
         case .workspaces:
             if foldersAreHiddenAfterComputerDisconnect {
-                disconnectedComputerScreen
+                return AnyView(disconnectedComputerScreen)
             } else if powerModel.isDown {
-                machineDownScreen(title: "Files", purpose: "its folders")
+                return AnyView(machineDownScreen(title: "Files", purpose: "its folders"))
             } else {
-                browserNavigation
+                return AnyView(browserNavigation)
             }
         case .previews:
-            RelayPreviewsView(
+            return AnyView(RelayPreviewsView(
                 identityStore: identityStore, client: codexClient,
                 workspaceAccessIsAvailable: !foldersAreHiddenAfterComputerDisconnect && !powerModel.isDown,
                 onOpenWorkspaces: { selectedRootTab = .workspaces },
                 onOpenJob: openPreviewSourceJob,
                 onClose: { selectedRootTab = .sessions }
-            )
+            ))
         case .settings:
-            AccountSettingsView(
+            return AnyView(AccountSettingsView(
                 accountStore: accountStore,
                 nodeStore: nodeStore,
                 identityStore: identityStore,
@@ -859,9 +858,9 @@ struct POCVaultRootView: View {
                     pendingMachineMonitor = true
                     selectedRootTab = .sessions
                 }
-            )
+            ))
         case .sessions:
-            EmptyView()
+            return AnyView(EmptyView())
         }
     }
 
