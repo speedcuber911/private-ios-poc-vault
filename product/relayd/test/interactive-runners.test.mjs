@@ -128,7 +128,7 @@ test("the daemon accepts a phone follow-up and reports native delivery on the sa
       RELAYD_DIRECT_TLS: "false", RELAYD_PAIRING_ENABLED: "false", CODEX_REQUIRE_MTLS: "false",
       CODEX_DATA_DIR: path.join(root, "data"), CODEX_RUN_HOME: home, CODEX_HOME: path.join(home, ".codex"),
       CODEX_WORKSPACE_BROWSE_ROOT: root, CODEX_WORKSPACES: JSON.stringify([{ id: "scratch", name: "Scratch", path: workspace }]),
-      CLAUDE_BIN: binary, CODEX_BIN: path.join(root, "no-codex"), KIMI_BIN: path.join(root, "no-kimi"),
+      CLAUDE_BIN: binary, CODEX_BIN: path.join(root, "no-codex"), KIMI_BIN: path.join(root, "no-kimi"), ANTIGRAVITY_BIN: path.join(root, "no-antigravity"),
       CLAUDE_CODE_USE_BEDROCK: "", CLAUDE_AWS_PROFILE: "", RELAYD_CLAUDE_TRANSPORT: "stream" },
     stdio: ["ignore", "pipe", "pipe"],
   });

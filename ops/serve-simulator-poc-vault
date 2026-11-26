@@ -162,7 +162,7 @@ class Handler(BaseHTTPRequestHandler):
             # leave the app mid-send and see whether the send survives.
             time.sleep(float(os.environ.get("SIM_JOB_ACCEPT_DELAY", "0")))
             provider = str(body.get("provider") or "codex")
-            if provider not in {"codex", "claude", "cursor", "kimi"}:
+            if provider not in {"codex", "claude", "antigravity", "cursor", "kimi"}:
                 provider = "codex"
             model = body.get("model")
             prompt = body.get("prompt")
@@ -403,7 +403,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/v1/codex/skills":
             provider = parse_qs(query).get("provider", ["codex"])[0]
-            if provider not in {"codex", "claude", "cursor", "kimi"}:
+            if provider not in {"codex", "claude", "antigravity", "cursor", "kimi"}:
                 self.send_json_error(400, "provider is invalid")
                 return
             self.send_json({"provider": provider, "skills": codex_fixture_skills(provider)})
@@ -1122,6 +1122,13 @@ def simulator_harnesses() -> list[dict]:
             "authKind": "subscription",
         },
         {
+            "provider": "antigravity",
+            "installed": True,
+            "version": "Antigravity CLI 1.5.12",
+            "loggedIn": True,
+            "authKind": "subscription",
+        },
+        {
             "provider": "cursor",
             "installed": True,
             "version": "Cursor Agent simulator",
@@ -1188,6 +1195,9 @@ def codex_fixture_skills(provider: str) -> list[dict]:
         "claude": [
             ("claude:command:review-pr", "review-pr", "Review PR", "command", "Review a pull request with Claude Code"),
             ("claude:skill:frontend-design", "frontend-design", "Frontend design", "skill", "Build a polished product interface"),
+        ],
+        "antigravity": [
+            ("antigravity:skill:codebase-review", "codebase-review", "Codebase review", "skill", "Review workspace changes with Antigravity"),
         ],
         "cursor": [
             ("cursor:skill:project-rules", "project-rules", "Project rules", "skill", "Apply the workspace's Cursor rules"),
@@ -1544,6 +1554,10 @@ def _sim_task_entries() -> list[dict]:
         {"id": "claude-code-sonnet", "label": "Claude Code · Sonnet", "provider": "claude", "modes": ["task"], "taskModel": "sonnet", "effortLevels": claude_effort},
         {"id": "claude-code-opus", "label": "Claude Code · Opus", "provider": "claude", "modes": ["task"], "taskModel": "opus", "effortLevels": claude_effort},
         {"id": "claude-code-haiku", "label": "Claude Code · Haiku", "provider": "claude", "modes": ["task"], "taskModel": "haiku", "effortLevels": claude_effort},
+        {"id": "antigravity-cli", "label": "Antigravity", "provider": "antigravity", "modes": ["task"], "effortLevels": ["low", "medium", "high", "xhigh", "max"]},
+        {"id": "antigravity-gemini-4-neon-high", "label": "Antigravity · Gemini 4 Neon (High)", "provider": "antigravity", "modes": ["task"], "taskModel": "gemini-4-neon-high", "effortLevels": ["low", "medium", "high", "xhigh", "max"]},
+        {"id": "antigravity-gemini-4-carbon-medium", "label": "Antigravity · Gemini 4 Carbon (Medium)", "provider": "antigravity", "modes": ["task"], "taskModel": "gemini-4-carbon-medium", "effortLevels": ["low", "medium", "high", "xhigh", "max"]},
+        {"id": "antigravity-gemini-3.8-flash-high", "label": "Antigravity · Gemini 3.8 Flash (High)", "provider": "antigravity", "modes": ["task"], "taskModel": "gemini-3.8-flash-high", "effortLevels": ["low", "medium", "high"]},
         {"id": "cursor-agent-auto", "label": "Cursor Agent · Auto", "provider": "cursor", "modes": ["task"], "taskModel": "auto", "effortLevels": []},
         {"id": "kimi-k3", "label": "Kimi K3", "provider": "kimi", "modes": ["task"], "taskModel": "kimi-code/k3", "effortLevels": []},
     ]

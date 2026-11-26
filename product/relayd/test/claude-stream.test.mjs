@@ -145,6 +145,7 @@ async function startServer(sandbox, env = {}) {
       CLAUDE_BIN: sandbox.claude,
       CODEX_BIN: path.join(sandbox.root, "no-codex"),
       KIMI_BIN: path.join(sandbox.root, "no-kimi"),
+      ANTIGRAVITY_BIN: path.join(sandbox.root, "no-antigravity"),
       CLAUDE_CODE_USE_BEDROCK: "",
       CLAUDE_AWS_PROFILE: "",
       CLAUDE_DEFAULT_MODEL: "",

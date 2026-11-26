@@ -11,11 +11,12 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 
-import { codexBin, claudeBin, kimiBin, runHome, codexHome, claudeHome, kimiHome, dataDir, allowedJobProviders } from "./config.mjs";
+import { codexBin, claudeBin, kimiBin, antigravityBin, runHome, codexHome, claudeHome, kimiHome, antigravityHome, dataDir, allowedJobProviders } from "./config.mjs";
 import { nowIso, cleanApiText, suffixByBytes } from "./util.mjs";
 import { appendAudit } from "./audit.mjs";
 import { emitEvent } from "./events.mjs";
-import { providerBinary, providerEnv, providerHelp, parseClaudeEffortLevels, claudeEffortLevels } from "./provider-help.mjs";
+import { providerBinary, providerEnv, providerHelp, parseClaudeEffortLevels, claudeEffortLevels, parseAntigravityEffortLevels, antigravityEffortLevels } from "./provider-help.mjs";
+import { parseAntigravityModelsOutput } from "./adapters/antigravity.mjs";
 
 const opLogTailBytes = 8 * 1024;
 
@@ -67,6 +68,17 @@ const providerCapabilities = {
       approvalPolicies: [],
     },
   },
+  antigravity: {
+    supportsApprovals: false,
+    supportsResume: true,
+    supportsChat: false,
+    taskControls: {
+      model: true,
+      reasoningEffort: true,
+      permissionModes: [],
+      approvalPolicies: [],
+    },
+  },
   kimi: {
     supportsApprovals: false,
     supportsResume: true,
@@ -83,7 +95,7 @@ const providerCapabilities = {
 function cleanHarnessProvider(value) {
   const normalized = String(value || "").trim().toLowerCase();
   if (!allowedJobProviders.has(normalized)) {
-    throw Object.assign(new Error("provider must be codex, claude, or kimi"), { status: 400 });
+    throw Object.assign(new Error("provider must be codex, claude, antigravity, or kimi"), { status: 400 });
   }
   return normalized;
 }
@@ -92,6 +104,9 @@ function cleanHarnessProvider(value) {
 // Claude Code has no top-level `login` command: `claude login` runs "login" as
 // a prompt and exits "Not logged in". `claude auth login` prints the sign-in
 // URL and waits for the pasted code, which is the flow the phone drives.
+// Antigravity (`agy`) has no `login` subcommand either (`agy login` prints
+// usage); running bare `agy` with SSH_CONNECTION/BROWSER=false enters Remote
+// SSH OAuth paste-back mode.
 function loginArgsFor(provider) {
   const raw = process.env.RELAYD_HARNESS_LOGIN_ARGS;
   if (raw) {
@@ -102,7 +117,9 @@ function loginArgsFor(provider) {
       // Fall through to defaults.
     }
   }
-  return provider === "claude" ? ["auth", "login"] : ["login"];
+  if (provider === "claude") return ["auth", "login"];
+  if (provider === "antigravity") return [];
+  return ["login"];
 }
 
 function authStatusArgsFor(provider) {
@@ -118,6 +135,58 @@ function detectKimiAuth() {
     if (hasCredential) return { loggedIn: true, authKind: "subscription" };
   } catch {}
   return { loggedIn: false, authKind: "unknown" };
+}
+
+const antigravityAuthErrorPattern = /(?:authentication required|not logged in|not signed in|unauthenticated|GEMINI_API_KEY|token[_ ]expired|invalid_grant|\b401\b)/i;
+
+function readAntigravitySettings() {
+  try {
+    return jsonObject(fs.readFileSync(path.join(antigravityHome, "settings.json"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function detectAntigravityApiKeyMode(env = providerEnv("antigravity")) {
+  const settings = readAntigravitySettings();
+  if (String(settings?.modelProvider || "").trim().toLowerCase() === "gemini") {
+    const hasKey = typeof env.GEMINI_API_KEY === "string" && env.GEMINI_API_KEY.trim().length > 0;
+    return { loggedIn: hasKey, authKind: "api" };
+  }
+  return null;
+}
+
+function parseAntigravityModelsAuth(stdout, stderr, commandSucceeded) {
+  const cleanStdout = cleanApiText(stdout);
+  const combined = cleanApiText(`${stdout || ""}\n${stderr || ""}`);
+  if (!commandSucceeded || antigravityAuthErrorPattern.test(combined)) {
+    return { loggedIn: false, authKind: "unknown" };
+  }
+  const parsed = parseAntigravityModelsOutput(cleanStdout);
+  if (parsed.length > 0 || cleanStdout.trim().length > 0) {
+    return { loggedIn: true, authKind: "subscription" };
+  }
+  return { loggedIn: false, authKind: "unknown" };
+}
+
+function detectAntigravityAuth() {
+  const env = providerEnv("antigravity");
+  const apiMode = detectAntigravityApiKeyMode(env);
+  if (apiMode) return apiMode;
+  try {
+    const stdout = execFileSync(providerBinary("antigravity"), ["models"], {
+      encoding: "utf8",
+      timeout: 10000,
+      env,
+      cwd: runHome,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return parseAntigravityModelsAuth(stdout, "", true);
+  } catch (error) {
+    const stdout = Buffer.isBuffer(error?.stdout) ? error.stdout.toString("utf8") : String(error?.stdout || "");
+    const stderr = Buffer.isBuffer(error?.stderr) ? error.stderr.toString("utf8") : String(error?.stderr || "");
+    return parseAntigravityModelsAuth(stdout, stderr, false);
+  }
 }
 
 function jsonObject(text) {
@@ -198,6 +267,18 @@ const authFailurePatterns = {
     /please (?:log|sign) (?:out and sign )?in again/i,
     /\b401 Unauthorized\b/i,
     /\bNot logged in\b/i,
+  ],
+  antigravity: [
+    /authentication required/i,
+    /\bnot logged in\b/i,
+    /\bnot signed in\b/i,
+    /\bunauthenticated\b/i,
+    /\bGEMINI_API_KEY\b/i,
+    /\btoken[_ ]expired\b/i,
+    /\binvalid_grant\b/i,
+    /Failed to authenticate\b/i,
+    /\b401 Unauthorized\b/i,
+    /\b(?:HTTP|status(?: code)?|API Error:)\s*401\b/i,
   ],
 };
 
@@ -303,6 +384,7 @@ function withAuthRejection(provider, auth) {
 
 function detectProviderAuth(provider) {
   if (provider === "kimi") return detectKimiAuth();
+  if (provider === "antigravity") return detectAntigravityAuth();
   const bin = providerBinary(provider);
   try {
     const output = execFileSync(bin, authStatusArgsFor(provider), {
@@ -340,7 +422,7 @@ function detectProviderVersion(provider) {
 
 function providerTaskControls(provider) {
   const declared = providerCapabilities[provider].taskControls;
-  if (provider !== "claude") return declared;
+  if (provider !== "claude" && provider !== "antigravity") return declared;
   return { ...declared, reasoningEffort: /(?:^|\s)--effort(?:\s|$)/m.test(providerHelp(provider)) };
 }
 
@@ -373,6 +455,7 @@ function listHarnesses() {
 
 function providerDisplayName(provider) {
   if (provider === "claude") return "Claude Code";
+  if (provider === "antigravity") return "Antigravity";
   if (provider === "kimi") return "Kimi K3";
   return "Codex";
 }
@@ -381,6 +464,27 @@ function providerAuthResult(provider) {
   const bin = providerBinary(provider);
   if (provider === "kimi") {
     return Promise.resolve({ missing: !fs.existsSync(bin), auth: detectKimiAuth() });
+  }
+  if (provider === "antigravity") {
+    const env = providerEnv("antigravity");
+    const apiMode = detectAntigravityApiKeyMode(env);
+    if (apiMode) {
+      return Promise.resolve({ missing: !fs.existsSync(bin), auth: apiMode });
+    }
+    return new Promise((resolve) => {
+      const child = execFile(bin, ["models"], {
+        encoding: "utf8",
+        timeout: 10000,
+        env,
+        cwd: runHome,
+      }, (error, stdout, stderr) => {
+        resolve({
+          missing: error?.code === "ENOENT",
+          auth: parseAntigravityModelsAuth(stdout, stderr, !error),
+        });
+      });
+      child.stdin?.end();
+    });
   }
   return new Promise((resolve) => {
     const child = execFile(bin, authStatusArgsFor(provider), {
@@ -424,9 +528,9 @@ async function assertProviderReady(provider, requirements = {}) {
     const action = `Connect ${displayName} from the Relay app (Settings → Coding agents), or run relay sync-auth on your Mac, then try again.`;
     throw Object.assign(new Error(`${displayName} is not connected on this computer. ${action}`), { status: 503 });
   }
-  if (cleanProvider === "claude" && requirements.reasoningEffort && !providerTaskControls(cleanProvider).reasoningEffort) {
+  if ((cleanProvider === "claude" || cleanProvider === "antigravity") && requirements.reasoningEffort && !providerTaskControls(cleanProvider).reasoningEffort) {
     throw Object.assign(
-      new Error("The installed Claude Code does not support --effort. Upgrade Claude Code on this computer, then try again."),
+      new Error(`The installed ${displayName} does not support --effort. Upgrade ${displayName} on this computer, then try again.`),
       { status: 503 },
     );
   }
@@ -586,8 +690,15 @@ function attachOpChild(op, child, { timeoutMs, onExpire, onStdout = null }) {
   return record;
 }
 
-function opEnv(provider) {
-  return providerEnv(provider);
+function opEnv(provider, { action = null } = {}) {
+  const env = providerEnv(provider);
+  if (provider === "antigravity" && action === "login") {
+    env.SSH_CONNECTION = env.SSH_CONNECTION || "127.0.0.1 12345 127.0.0.1 22";
+    env.SSH_CLIENT = env.SSH_CLIENT || "127.0.0.1 12345 22";
+    env.BROWSER = "false";
+    delete env.DISPLAY;
+  }
+  return env;
 }
 
 // POST /v1/harness/:provider/login — spawns the CLI's device-code flow,
@@ -604,7 +715,7 @@ function startLoginOp(provider) {
   // provider's site displays after sign-in) can be completed remotely via
   // sendLoginInput. CLIs that never read stdin are unaffected.
   const child = spawn(providerBinary(cleanProvider), loginArgsFor(cleanProvider), {
-    env: opEnv(cleanProvider),
+    env: opEnv(cleanProvider, { action: "login" }),
     stdio: ["pipe", "pipe", "pipe"],
   });
   child.stdin?.on("error", () => {});
@@ -788,6 +899,8 @@ function startSmokeOp(provider) {
   let args;
   if (cleanProvider === "kimi") {
     args = ["--model", "kimi-code/k3", "--prompt", prompt, "--output-format", "stream-json"];
+  } else if (cleanProvider === "antigravity") {
+    args = ["--print", prompt, "--output-format", "stream-json", "--disable-slash-commands", "--print-timeout", "90s"];
   } else if (cleanProvider === "claude") {
     args = ["--print"];
   } else {
@@ -796,12 +909,12 @@ function startSmokeOp(provider) {
 
   const child = spawn(providerBinary(cleanProvider), args, {
     cwd: smokeDir,
-    env: opEnv(cleanProvider),
+    env: opEnv(cleanProvider, { action: "smoke" }),
     stdio: ["pipe", "pipe", "pipe"],
   });
   attachOpChild(op, child, { timeoutMs: smokeTimeoutMs, onExpire: "expired" });
   child.stdin.on("error", () => {});
-  if (cleanProvider !== "kimi") child.stdin.end(prompt);
+  if (cleanProvider !== "kimi" && cleanProvider !== "antigravity") child.stdin.end(prompt);
   else child.stdin.end();
 
   child.on("close", (code) => {
@@ -832,6 +945,8 @@ export {
   providerTaskControls,
   parseClaudeEffortLevels,
   claudeEffortLevels,
+  parseAntigravityEffortLevels,
+  antigravityEffortLevels,
   listHarnesses,
   assertProviderReady,
   redactSecrets,

@@ -1635,7 +1635,7 @@ private struct AccountSettingsChatSection: View {
         }
         let installed = state.harnesses.filter(\.installed)
         if installed.isEmpty {
-            return state.isLoadingHarnesses ? "Checking agents…" : "Manage Codex, Claude Code and provider sign-ins"
+            return state.isLoadingHarnesses ? "Checking agents…" : "Manage Codex, Claude Code, Antigravity and provider sign-ins"
         }
         let connected = installed.filter { $0.loggedIn == true && $0.authRejection == nil }
         if connected.isEmpty {
@@ -1710,6 +1710,7 @@ private struct AccountSettingsChatSection: View {
                         )
                     }
                     .buttonStyle(.plain)
+                    .accessibilityIdentifier("relay-settings-coding-agents")
                 }
             }
         }
@@ -1788,22 +1789,22 @@ private struct AccountSettingsCodingAgentsSection: View {
                     .padding(.horizontal, 16)
                     .padding(.vertical, 14)
                 } else {
-                    let installed = state.harnesses.filter(\.installed)
-                    if installed.isEmpty && state.harnessError == nil {
+                    let displayed = AccountSettingsHelpers.displayedHarnesses(from: state.harnesses)
+                    if displayed.isEmpty && state.harnessError == nil {
                         Text("No coding agents reported by \(machineName).")
                             .font(RelayTheme.uiFont(14, weight: .regular))
                             .foregroundStyle(theme.foregroundMuted)
                             .padding(.horizontal, 16)
                             .padding(.vertical, 14)
                     } else {
-                        ForEach(Array(installed.enumerated()), id: \.element.id) { index, harness in
+                        ForEach(Array(displayed.enumerated()), id: \.element.id) { index, harness in
                             harnessRow(harness, showsTopDivider: index > 0)
                         }
                     }
                 }
 
                 if let harnessError = state.harnessError, !isMachineKnownDown {
-                    if !state.harnesses.filter(\.installed).isEmpty {
+                    if !AccountSettingsHelpers.displayedHarnesses(from: state.harnesses).isEmpty {
                         RelaySettingsDivider()
                     }
                     RelayInlineNotice(text: harnessError, actionTitle: "Retry", isWorking: state.isLoadingHarnesses) {
@@ -1828,8 +1829,12 @@ private struct AccountSettingsCodingAgentsSection: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(harness.provider.displayName)
                         .font(RelayTheme.uiFont(15, weight: .regular))
-                        .foregroundStyle(theme.foreground)
-                    if harness.authRejection != nil {
+                        .foregroundStyle(harness.installed ? theme.foreground : theme.foregroundMuted)
+                    if !harness.installed {
+                        Text(notInstalledSubtitle(for: harness.provider))
+                            .font(RelayTheme.uiFont(12, weight: .regular))
+                            .foregroundStyle(theme.foregroundExtraMuted)
+                    } else if harness.authRejection != nil {
                         // The provider turned the stored sign-in away on a real run,
                         // whatever the CLI's own status check still says.
                         Text("Sign-in expired")
@@ -1840,7 +1845,12 @@ private struct AccountSettingsCodingAgentsSection: View {
 
                 Spacer()
 
-                if harness.loggedIn == true {
+                if !harness.installed {
+                    Text("Not installed")
+                        .font(RelayTheme.uiFont(13, weight: .regular))
+                        .foregroundStyle(theme.foregroundExtraMuted)
+                        .accessibilityIdentifier("relay-agent-not-installed-\(harness.provider.rawValue)")
+                } else if harness.loggedIn == true {
                     // "Connected" is the CLI's own reading, and it cannot see a
                     // token the provider revoked; signing in again stays one tap away.
                     Menu {
@@ -1875,6 +1885,15 @@ private struct AccountSettingsCodingAgentsSection: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
             .frame(minHeight: 52)
+        }
+    }
+
+    private func notInstalledSubtitle(for provider: CodexProvider) -> String {
+        switch provider {
+        case .antigravity:
+            return "Install `agy` on this machine"
+        default:
+            return "Not installed on this machine"
         }
     }
 }
@@ -2251,10 +2270,44 @@ private struct AccountSettingsAboutSection: View {
 
 // MARK: - Helpers
 
-private enum AccountSettingsHelpers {
+enum AccountSettingsHelpers {
     static let accountInfo = "Optional. An account adds handoff from a laptop, push notifications, and approving `relay login` on a computer. Files, agents and terminals work without one."
     static let securityInfo = "Deletes your Relay account and device records. Files on servers you own are not deleted."
     static let agentsInfo = "Sign in to each agent right from this iPhone — no laptop needed. The session is stored on your machine, and `relay sync-auth` from a Mac still works too."
+
+    private static let harnessDisplayOrder: [CodexProvider] = [
+        .codex, .claude, .antigravity, .kimi, .bedrock, .azure
+    ]
+
+    /// Ordered coding-agent rows for Settings → Coding agents.
+    /// Keeps empty/loading/error states intact when `harnesses` is empty; otherwise
+    /// lists all installed agents in canonical order and always surfaces Antigravity
+    /// right after Claude Code (showing "Not installed" if relayd reports it missing,
+    /// or a direct sign-in row if an older relayd omits it completely).
+    static func displayedHarnesses(from harnesses: [RelayHarnessStatus]) -> [RelayHarnessStatus] {
+        guard !harnesses.isEmpty else { return [] }
+        var rows = harnesses.filter(\.installed)
+        if !rows.contains(where: { $0.provider == .antigravity }) {
+            if let reported = harnesses.first(where: { $0.provider == .antigravity }) {
+                rows.append(reported)
+            } else {
+                rows.append(
+                    RelayHarnessStatus(
+                        provider: .antigravity,
+                        installed: true,
+                        version: nil,
+                        loggedIn: nil,
+                        authKind: "unknown"
+                    )
+                )
+            }
+        }
+        return rows.sorted { lhs, rhs in
+            let lhsIndex = harnessDisplayOrder.firstIndex(of: lhs.provider) ?? harnessDisplayOrder.count
+            let rhsIndex = harnessDisplayOrder.firstIndex(of: rhs.provider) ?? harnessDisplayOrder.count
+            return lhsIndex < rhsIndex
+        }
+    }
 
     static func machineInfo(for node: RelayPairedNode?) -> String {
         guard let node else {
@@ -2267,7 +2320,7 @@ private enum AccountSettingsHelpers {
     }
 
     @MainActor
-    static func agentsMachineState(powerModel: RelayMachinePowerModel) -> AgentsLoadTrigger.Machine {
+    fileprivate static func agentsMachineState(powerModel: RelayMachinePowerModel) -> AgentsLoadTrigger.Machine {
         guard powerModel.canControl else { return .reachable }
         switch powerModel.status {
         case .loading: return .checking
@@ -2343,7 +2396,7 @@ private enum AccountSettingsHelpers {
 }
 
 /// What the coding-agents list is loaded against: a machine, active host, and what EC2 says about it.
-private struct AgentsLoadTrigger: Equatable {
+fileprivate struct AgentsLoadTrigger: Equatable {
     enum Machine { case checking, down, reachable }
     var hasMachine: Bool
     var activeHostID: String?

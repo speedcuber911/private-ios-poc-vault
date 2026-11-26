@@ -131,6 +131,57 @@ class SimulatorReviewFixtureTests(unittest.TestCase):
                 status, _, _ = self.request("/v1/codex/previews", method="POST", body={"jobId": "sim-job-linear", "url": source})
                 self.assertEqual(status, 400)
 
+    def test_antigravity_harness_models_skills_and_jobs(self):
+        harnesses = self.get_json("/v1/harness")["harnesses"]
+        providers = [item["provider"] for item in harnesses]
+        self.assertIn("antigravity", providers)
+        self.assertEqual(providers.index("antigravity"), providers.index("claude") + 1)
+        antigravity_harness = next(item for item in harnesses if item["provider"] == "antigravity")
+        self.assertTrue(antigravity_harness["installed"])
+        self.assertTrue(antigravity_harness["loggedIn"])
+        self.assertEqual(antigravity_harness["authKind"], "subscription")
+        self.assertEqual(antigravity_harness["version"], "Antigravity CLI 1.5.12")
+
+        models = self.get_json("/v1/codex/models")["models"]
+        antigravity_models = [item for item in models if item.get("provider") == "antigravity"]
+        self.assertEqual(
+            [item["id"] for item in antigravity_models],
+            [
+                "antigravity-cli",
+                "antigravity-gemini-4-neon-high",
+                "antigravity-gemini-4-carbon-medium",
+                "antigravity-gemini-3.8-flash-high",
+            ],
+        )
+        neon = next(item for item in antigravity_models if item["id"] == "antigravity-gemini-4-neon-high")
+        self.assertEqual(neon["label"], "Antigravity · Gemini 4 Neon (High)")
+        self.assertEqual(neon["taskModel"], "gemini-4-neon-high")
+        self.assertEqual(neon["effortLevels"], ["low", "medium", "high", "xhigh", "max"])
+
+        skills_payload = self.get_json("/v1/codex/skills?provider=antigravity")
+        self.assertEqual(skills_payload["provider"], "antigravity")
+        self.assertTrue(skills_payload["skills"])
+        self.assertTrue(all(skill["provider"] == "antigravity" for skill in skills_payload["skills"]))
+        self.assertIn("antigravity:skill:codebase-review", {skill["id"] for skill in skills_payload["skills"]})
+
+        status, _, payload = self.request(
+            "/v1/codex/jobs",
+            method="POST",
+            body={
+                "workspaceId": "poc-vault",
+                "provider": "antigravity",
+                "model": "gemini-4-neon-high",
+                "prompt": "Review the workspace with Antigravity.",
+            },
+        )
+        self.assertEqual(status, 200)
+        created = json.loads(payload)
+        self.assertEqual(created["job"]["provider"], "antigravity")
+        self.assertEqual(created["job"]["model"], "gemini-4-neon-high")
+        self.assertEqual(created["job"]["prompt"], "Review the workspace with Antigravity.")
+        fetched = self.get_json("/v1/codex/jobs/" + created["id"])
+        self.assertEqual(fetched["provider"], "antigravity")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -35,18 +35,20 @@ enum RelayWatchProjection {
         }
     }
 
+    private static let supportedProviders: Set<CodexProvider> = [.codex, .claude, .antigravity]
+
     static func snapshot(
         sourceID: String, models: [CodexModelDescriptor], folders: [CodexWorkspace],
         threads: [CodexThread], jobs: [CodexJob], approvals: [CodexApproval], now: Date = Date()
     ) -> RelayWatchSnapshot {
         // Direct subscription task models only. A model's API value is resolved
         // on the phone; the watch cannot invent a provider or a workspace path.
-        let supportedModels = models.filter { $0.supports(.task) && [.codex, .claude].contains($0.provider) }
+        let supportedModels = models.filter { $0.supports(.task) && Self.supportedProviders.contains($0.provider) }
         let feed = CodexThreadFeedItem.makeFeed(threads: threads, jobs: jobs)
         let rows = feed.compactMap { item -> RelayWatchThread? in
             switch item.source {
             case .thread(let thread):
-                guard [.codex, .claude].contains(thread.provider), thread.mode == .task else { return nil }
+                guard Self.supportedProviders.contains(thread.provider), thread.mode == .task else { return nil }
                 return RelayWatchThread(
                     id: item.id, sessionID: thread.sessionId, jobID: thread.lastJobId,
                     workspaceID: thread.workspaceId, provider: thread.provider.rawValue,
@@ -55,7 +57,7 @@ enum RelayWatchProjection {
                     excerpt: RelayWatchText.excerpt(thread.lastError ?? thread.lastResult ?? "")
                 )
             case .pendingJob(let job):
-                guard [.codex, .claude].contains(job.provider) else { return nil }
+                guard Self.supportedProviders.contains(job.provider) else { return nil }
                 return RelayWatchThread(
                     id: item.id, sessionID: job.threadSessionId, jobID: job.id,
                     workspaceID: job.workspaceId, provider: job.provider.rawValue,

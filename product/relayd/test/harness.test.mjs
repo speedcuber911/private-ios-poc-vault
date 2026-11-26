@@ -64,6 +64,7 @@ async function startServer(extraEnv = {}) {
       CODEX_BIN: fakeCodex,
       CLAUDE_BIN: fakeClaude,
       KIMI_BIN: path.join(dir, "missing-kimi"),
+      ANTIGRAVITY_BIN: path.join(dir, "missing-antigravity"),
       ...extraEnv,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -127,6 +128,9 @@ test("GET /v1/harness detects installed CLIs with versions and capability flags"
     assert.equal(byProvider.kimi.loggedIn, false);
     assert.equal(byProvider.kimi.taskControls.model, true);
     assert.equal(byProvider.kimi.taskControls.reasoningEffort, false);
+    assert.equal(byProvider.antigravity.installed, false);
+    assert.equal(byProvider.antigravity.loggedIn, false);
+    assert.equal(byProvider.antigravity.taskControls.model, true);
   } finally {
     await server.stop();
   }
@@ -261,7 +265,7 @@ test("smoke op: succeeds with output, updates lastSmoke; unknown provider is 400
 
     const bad = await fetch(`${server.baseUrl}/v1/harness/gemini/smoke`, { method: "POST" });
     assert.equal(bad.status, 400);
-    assert.match((await bad.json()).error, /provider must be codex, claude, or kimi/);
+    assert.match((await bad.json()).error, /provider must be codex, claude, antigravity, or kimi/);
     const retired = await fetch(`${server.baseUrl}/v1/harness/cursor/smoke`, { method: "POST" });
     assert.equal(retired.status, 400);
 

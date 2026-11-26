@@ -435,6 +435,171 @@ final class ProviderLoginTests: XCTestCase {
         ]).needsProviderSignIn, "an agent quoting a 401 deep in its answer is not its own sign-in failing")
     }
 
+    // MARK: - Antigravity (agy) direct sign-in
+
+    func testHarnessOpDecodesAntigravityProvider() throws {
+        let op = try Self.decodeOp(
+            """
+            {"op": {
+              "id": "0a0b0c0d-0000-4000-8000-000000000003",
+              "provider": "antigravity",
+              "action": "login",
+              "status": "waiting_for_user",
+              "verificationUrl": "https://accounts.google.com/o/oauth2/v2/auth?client_id=agy"
+            }}
+            """
+        )
+        XCTAssertEqual(op.provider, .antigravity)
+        XCTAssertEqual(op.action, "login")
+        XCTAssertEqual(op.status, .waitingForUser)
+        XCTAssertTrue(op.isActive)
+        XCTAssertEqual(op.verificationURL?.absoluteString, "https://accounts.google.com/o/oauth2/v2/auth?client_id=agy")
+        XCTAssertNil(op.userCode)
+    }
+
+    @MainActor
+    func testAntigravityFlowUsesPasteBackAndBareAgyCommand() {
+        let flow = ProviderLoginFlowModel(client: StubHarnessLoginClient(), provider: .antigravity)
+        XCTAssertFalse(flow.usesLocalCallback, "Google OAuth blocks embedded WKWebView and must use Safari paste-back")
+        XCTAssertEqual(flow.loginBinaryName, "agy")
+        XCTAssertEqual(flow.terminalLoginCommand, "agy", "agy has no login subcommand and must have no trailing space")
+    }
+
+    func testExecLaunchCommandSupportsEmptyArgumentAndEnvPrefix() {
+        let command = ProviderLoginFlowModel.execLaunchCommand(
+            binary: "/home/user/.local/bin/agy",
+            argument: "",
+            logPath: "/tmp/relay-phone-login-antigravity.log",
+            inputPath: "/tmp/relay-phone-login-antigravity.in",
+            envPrefix: "env -u DISPLAY SSH_CONNECTION='127.0.0.1 12345 127.0.0.1 22' SSH_CLIENT='127.0.0.1 12345 22' BROWSER=false"
+        )
+        XCTAssertTrue(command.contains("SSH_CONNECTION"))
+        XCTAssertTrue(command.contains("SSH_CLIENT"))
+        XCTAssertTrue(command.contains("BROWSER=false"))
+        XCTAssertTrue(command.contains("/home/user/.local/bin/agy\""))
+        XCTAssertFalse(command.contains("agy login"), "agy must never be invoked with a login subcommand")
+    }
+
+    @MainActor
+    func testAntigravityOpModePasteBackSucceeds() async throws {
+        let stub = StubHarnessLoginClient()
+        let waiting = try Self.op(
+            id: "op-agy-1",
+            provider: "antigravity",
+            status: "waiting_for_user",
+            url: "https://accounts.google.com/o/oauth2/v2/auth?client_id=agy"
+        )
+        stub.startResult = waiting
+        stub.currentOp = waiting
+        let flow = Self.makeFastFlow(client: stub, provider: .antigravity)
+
+        await flow.start()
+        guard case .waitingForSignIn(let op) = flow.step else {
+            return XCTFail("expected waitingForSignIn, got \(flow.step)")
+        }
+        XCTAssertEqual(op.provider, .antigravity)
+        XCTAssertEqual(op.verificationURL?.host, "accounts.google.com")
+
+        await flow.submitPasted(["  4/0A-google-auth-code  \n"])
+        XCTAssertEqual(stub.sentInputs, [StubHarnessLoginClient.SentInput(opID: "op-agy-1", text: "4/0A-google-auth-code")])
+        XCTAssertNil(flow.pasteError, "Antigravity codes are not Claude code#state pairs")
+        XCTAssertEqual(flow.step, .completing)
+
+        stub.currentOp = try Self.op(id: "op-agy-1", provider: "antigravity", status: "succeeded")
+        try await Self.waitUntil { flow.step == .succeeded }
+    }
+
+    @MainActor
+    func testAntigravity400FallsBackToExecWithSSHEnvAndModelsProbe() async throws {
+        let stub = StubHarnessLoginClient()
+        // Pre-Antigravity relayd rejects POST /v1/harness/antigravity/login with HTTP 400
+        // and omits antigravity from GET /v1/harnesses.
+        stub.startError = CodexClientError.httpFailure(400, "provider must be codex, claude, or kimi")
+        stub.harnesses = [
+            try Self.harness(provider: "codex", loggedIn: true),
+            try Self.harness(provider: "claude", loggedIn: true),
+        ]
+        stub.execResults = [
+            (contains: "command -v agy", result: CodexExecResult(exitCode: 0, stdout: "/home/runner/.local/bin/agy\n")),
+            (contains: "pgrep", result: CodexExecResult(exitCode: 0, stdout: "RELAY_LOGIN_RUNNING\n")),
+            (contains: "/home/runner/.local/bin/agy models", result: CodexExecResult(exitCode: 0, stdout: "gemini-2.5-pro\n")),
+        ]
+        let flow = Self.makeFastFlow(client: stub, provider: .antigravity)
+
+        await flow.start()
+
+        let pkill = try XCTUnwrap(stub.execCommands.first(where: { $0.contains("pkill") }))
+        XCTAssertTrue(pkill.contains("/tmp/relay-phone-login-antigravity.log"),
+                      "pkill must scope to the login log path rather than bare agy: \(pkill)")
+        XCTAssertFalse(pkill.contains("pkill -f 'agy'"), "must never kill unrelated agy jobs")
+
+        let probe = try XCTUnwrap(stub.execCommands.first(where: { $0.contains("command -v agy") }))
+        XCTAssertTrue(probe.contains("$HOME/.local/bin"), "binary resolution must search $HOME/.local/bin: \(probe)")
+
+        let launch = try XCTUnwrap(stub.execCommands.first(where: { $0.contains("mkfifo") }))
+        XCTAssertTrue(launch.contains("SSH_CONNECTION"), "must force remote SSH OAuth mode: \(launch)")
+        XCTAssertTrue(launch.contains("BROWSER=false"), "must disable browser auto-open: \(launch)")
+        XCTAssertTrue(launch.contains("/home/runner/.local/bin/agy"), "must launch resolved agy binary: \(launch)")
+        XCTAssertFalse(launch.contains("agy login"), "must not pass login subcommand to agy: \(launch)")
+
+        stub.loginLog = "Visit this URL to sign in:\r\nhttps://accounts.google.com/o/oauth2/v2/auth?response_type=code\r\nPaste authorization code: "
+        try await Self.waitUntil {
+            if case .waitingForSignIn(let op) = flow.step { return op.verificationURL != nil }
+            return false
+        }
+
+        await flow.submitPasted(["4/0A-remote-oauth-code"])
+        XCTAssertEqual(flow.step, .completing)
+        let fifoWrite = try XCTUnwrap(stub.execCommands.last(where: { $0.contains(".in") && $0.contains("printf") }))
+        XCTAssertTrue(fifoWrite.contains("'4/0A-remote-oauth-code'"))
+
+        // While agy is still exchanging the code, stay completing.
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(flow.step, .completing)
+
+        // Once agy exits, the watcher probes `agy models` because older relayd omitted antigravity.
+        stub.execResults[1] = (contains: "pgrep", result: CodexExecResult(exitCode: 0, stdout: "Signed in successfully.\n"))
+        try await Self.waitUntil { flow.step == .succeeded }
+        XCTAssertTrue(
+            stub.execCommands.contains(where: { $0.contains("/home/runner/.local/bin/agy models") }),
+            "older relayd fallback must verify sign-in with `agy models`"
+        )
+    }
+
+    func testAntigravitySignInFailurePatternsMatchAuthErrors() throws {
+        let matching = [
+            "Error: authentication required to list models",
+            "You are not signed in. Please run agy.",
+            "Not logged in",
+            "gRPC error: UNAUTHENTICATED",
+            "Failed to authenticate: invalid credentials",
+            "OAuth access token has expired",
+            "Access token expired",
+            "oauth2: invalid_grant",
+            "GEMINI_API_KEY environment variable is not set",
+            "Please sign in with your Google account",
+        ]
+        for error in matching {
+            XCTAssertTrue(
+                RelayProviderSignInFailure.matches(provider: .antigravity, error: error),
+                "expected Antigravity sign-in failure match for: \(error)"
+            )
+        }
+        XCTAssertFalse(RelayProviderSignInFailure.matches(provider: .antigravity, error: "agy exited with code 1"))
+        XCTAssertFalse(RelayProviderSignInFailure.matches(provider: .antigravity, error: nil))
+
+        let job = try CodexClient.makeDecoder().decode(
+            CodexJob.self,
+            from: JSONSerialization.data(withJSONObject: [
+                "id": "job-agy-1",
+                "provider": "antigravity",
+                "status": "failed",
+                "error": "Error: authentication required (invalid_grant)",
+            ])
+        )
+        XCTAssertTrue(job.needsProviderSignIn)
+    }
+
     // MARK: - Helpers
 
     @MainActor

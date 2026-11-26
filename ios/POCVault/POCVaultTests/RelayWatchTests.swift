@@ -489,6 +489,31 @@ final class RelayWatchTests: XCTestCase {
         XCTAssertFalse(encoded.contains("RAW-ERROR"))
     }
 
+    func testProjectionIncludesAntigravityTaskModelsThreadsAndJobs() throws {
+        let models = try CodexClient.makeDecoder().decode([CodexModelDescriptor].self, from: Data("""
+        [
+          {"id":"agy-default","label":"Antigravity","provider":"antigravity","modes":["task"],"effortLevels":["low","high"]},
+          {"id":"codex-task","label":"Codex","provider":"codex","modes":["task"]}
+        ]
+        """.utf8))
+        let thread = try CodexClient.makeDecoder().decode(CodexThread.self, from: Data("""
+        {"id":"agy-thread","sessionId":"agy-thread","provider":"antigravity","mode":"task","workspaceId":"ws","lastPrompt":"Audit changes"}
+        """.utf8))
+        let job = try CodexClient.makeDecoder().decode(CodexJob.self, from: Data("""
+        {"id":"agy-job","provider":"antigravity","workspaceId":"ws","status":"running","prompt":"Run tests"}
+        """.utf8))
+        let projected = RelayWatchProjection.snapshot(
+            sourceID: "machine-a",
+            models: models,
+            folders: [CodexWorkspace(id: "ws", name: "Relay")],
+            threads: [thread],
+            jobs: [job],
+            approvals: []
+        )
+        XCTAssertEqual(projected.models.map(\.provider), ["antigravity", "codex"])
+        XCTAssertEqual(projected.threads.map(\.provider), ["antigravity", "antigravity"])
+    }
+
     func testLargeApprovalIsReadOnlyOnWatch() throws {
         let input: [String: Any] = ["id": "approval", "jobId": "job", "provider": "codex", "kind": "command",
             "title": "Run command", "command": String(repeating: "x", count: 1_401), "status": "pending", "availableDecisions": ["accept", "decline"]]

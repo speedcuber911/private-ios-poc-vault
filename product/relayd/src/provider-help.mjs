@@ -8,7 +8,7 @@
 
 import { execFileSync } from "node:child_process";
 
-import { codexBin, claudeBin, kimiBin, runHome, codexHome, kimiHome } from "./config.mjs";
+import { codexBin, claudeBin, kimiBin, antigravityBin, runHome, codexHome, kimiHome, antigravityHome } from "./config.mjs";
 import { cleanApiText } from "./util.mjs";
 
 const providerHelpCacheMs = 5 * 60 * 1000;
@@ -16,6 +16,7 @@ const providerHelpCache = new Map();
 
 function providerBinary(provider) {
   if (provider === "claude") return claudeBin;
+  if (provider === "antigravity") return antigravityBin;
   if (provider === "kimi") return kimiBin;
   return codexBin;
 }
@@ -29,8 +30,9 @@ function providerEnv(provider) {
     HOME: runHome,
     CODEX_HOME: codexHome,
     KIMI_CODE_HOME: kimiHome,
+    ANTIGRAVITY_HOME: antigravityHome,
   };
-  if (provider === "claude" || provider === "kimi") {
+  if (provider === "claude" || provider === "antigravity" || provider === "kimi") {
     delete env.AWS_ACCESS_KEY_ID;
     delete env.AWS_SECRET_ACCESS_KEY;
     delete env.AWS_SESSION_TOKEN;
@@ -93,10 +95,33 @@ function claudeEffortLevels() {
   return parseClaudeEffortLevels(providerHelp("claude"));
 }
 
+// Reads the levels an Antigravity CLI accepts out of `agy --help`, e.g.
+//   --effort   Reasoning effort for the current CLI session (low|medium|high|xhigh|max)
+// Unlike Claude Code, agy omits a `<level>` placeholder after `--effort`.
+function parseAntigravityEffortLevels(help) {
+  const text = String(help || "");
+  const flag = text.match(/(?:^|\s)--effort(?:\s+<[^>\n]*>)?(?=\s|$)/);
+  if (!flag) return null;
+  const rest = text.slice(flag.index + flag[0].length);
+  const nextOption = rest.search(/\n\s*-{1,2}[A-Za-z]/);
+  const description = nextOption === -1 ? rest.slice(0, 400) : rest.slice(0, Math.min(nextOption, 400));
+  const list = description.match(/\(([^()]*)\)/);
+  if (!list) return null;
+  const named = new Set(list[1].split(/[,|/\s]+/).map((level) => level.trim().toLowerCase()).filter(Boolean));
+  const levels = relayEffortLevels.filter((level) => named.has(level));
+  return levels.length ? levels : null;
+}
+
+function antigravityEffortLevels() {
+  return parseAntigravityEffortLevels(providerHelp("antigravity"));
+}
+
 export {
   providerBinary,
   providerEnv,
   providerHelp,
   parseClaudeEffortLevels,
   claudeEffortLevels,
+  parseAntigravityEffortLevels,
+  antigravityEffortLevels,
 };

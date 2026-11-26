@@ -93,6 +93,8 @@ const claudeBin = resolveHarnessBin(process.env.CLAUDE_BIN, "claude", "/usr/bin/
 
 const kimiBin = resolveHarnessBin(process.env.KIMI_BIN, "kimi", path.join(process.env.CODEX_RUN_HOME || process.env.HOME || "/home/ec2-user", ".local", "bin", "kimi"));
 
+const antigravityBin = resolveHarnessBin(process.env.ANTIGRAVITY_BIN, "agy", path.join(process.env.CODEX_RUN_HOME || process.env.HOME || "/home/ec2-user", ".local", "bin", "agy"));
+
 // git binary used by worktree.mjs (job worktree push-back) and handoff.mjs
 // (handoff clone/commit/push). One definition so both stay in sync.
 const gitBin = process.env.RELAYD_GIT_BIN || "git";
@@ -104,6 +106,8 @@ const codexHome = process.env.CODEX_HOME || path.join(runHome, ".codex");
 const claudeHome = process.env.CLAUDE_HOME || path.join(runHome, ".claude");
 
 const kimiHome = process.env.KIMI_CODE_HOME || path.join(runHome, ".kimi-code");
+
+const antigravityHome = process.env.ANTIGRAVITY_HOME || path.join(runHome, ".gemini", "antigravity-cli");
 
 const npmCacheDir = process.env.NPM_CONFIG_CACHE || process.env.npm_config_cache || path.join(runHome, ".npm-cache");
 
@@ -201,7 +205,7 @@ const terminalStatuses = new Set(["succeeded", "failed", "cancelled", "timeout"]
 
 const allowedReasoningEfforts = new Set(["low", "medium", "high", "xhigh", "max", "ultra"]);
 
-const allowedJobProviders = new Set(["codex", "claude", "kimi"]);
+const allowedJobProviders = new Set(["codex", "claude", "antigravity", "kimi"]);
 
 // Harnesses relayd no longer runs (Cursor, retired 2026-10-07). Their stored
 // jobs and configured catalog rows are skipped as they load, never read as
@@ -1147,11 +1151,13 @@ export {
   codexBin,
   claudeBin,
   kimiBin,
+  antigravityBin,
   gitBin,
   runHome,
   codexHome,
   claudeHome,
   kimiHome,
+  antigravityHome,
   npmCacheDir,
   bunCacheDir,
   dangerousMode,

@@ -15,6 +15,7 @@ import kotlinx.serialization.json.JsonNames
 enum class RelayProvider(val wireValue: String, val displayName: String) {
     CODEX("codex", "Codex"),
     CLAUDE("claude", "Claude Code"),
+    ANTIGRAVITY("antigravity", "Antigravity"),
     KIMI("kimi", "Kimi K3"),
     BEDROCK("bedrock", "Bedrock"),
     AZURE("azure", "Azure"),
@@ -29,6 +30,7 @@ enum class RelayProvider(val wireValue: String, val displayName: String) {
     companion object {
         fun fromWireValue(value: String?): RelayProvider = when (value?.trim()?.lowercase()) {
             "claude", "anthropic" -> CLAUDE
+            "antigravity", "agy", "google-antigravity" -> ANTIGRAVITY
             "cursor", "cursor-agent", "unsupported" -> UNSUPPORTED
             "kimi", "kimi-code", "moonshot" -> KIMI
             "bedrock" -> BEDROCK
@@ -42,6 +44,7 @@ object RelayAIDataSharing {
     fun recipient(provider: RelayProvider): String = when (provider) {
         RelayProvider.CODEX -> "OpenAI (Codex)"
         RelayProvider.CLAUDE -> "Anthropic (Claude)"
+        RelayProvider.ANTIGRAVITY -> "Google (Antigravity)"
         RelayProvider.KIMI -> "Moonshot AI (Kimi)"
         RelayProvider.BEDROCK -> "Amazon Web Services (Amazon Bedrock)"
         RelayProvider.AZURE -> "Microsoft (Azure OpenAI)"
@@ -246,7 +249,7 @@ data class ThreadMessage(
     val normalizedRole: String
         get() = when (role.trim().lowercase()) {
             "user" -> "user"
-            "assistant", "codex", "claude" -> "assistant"
+            "assistant", "codex", "claude", "antigravity", "agy" -> "assistant"
             else -> "status"
         }
 }
@@ -482,6 +485,7 @@ object RelayModelCatalog {
     private val providerOrder = listOf(
         RelayProvider.CODEX,
         RelayProvider.CLAUDE,
+        RelayProvider.ANTIGRAVITY,
         RelayProvider.KIMI,
         RelayProvider.BEDROCK,
         RelayProvider.AZURE,
@@ -513,6 +517,7 @@ object RelayModelCatalog {
 private fun providerLabelAliases(provider: RelayProvider): List<String> = when (provider) {
     RelayProvider.CODEX -> listOf("Codex")
     RelayProvider.CLAUDE -> listOf("Claude Code", "Claude")
+    RelayProvider.ANTIGRAVITY -> listOf("Google Antigravity", "Antigravity", "agy")
     RelayProvider.KIMI -> listOf("Kimi K3", "Kimi Code", "Kimi")
     RelayProvider.BEDROCK -> listOf("Bedrock")
     RelayProvider.AZURE -> listOf("Azure OpenAI", "Azure")

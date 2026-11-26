@@ -383,6 +383,7 @@ struct CodexWorkspaceDirectoryEntry: Decodable, Hashable, Identifiable {
 enum CodexProvider: String, CaseIterable, Identifiable, Codable {
     case codex
     case claude
+    case antigravity
     case kimi
     case bedrock
     case azure
@@ -396,7 +397,7 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
     static let defaultProvider = CodexProvider.codex
 
     /// Every provider the app offers. `unsupported` is never offered.
-    static let allCases: [CodexProvider] = [.codex, .claude, .kimi, .bedrock, .azure]
+    static let allCases: [CodexProvider] = [.codex, .claude, .antigravity, .kimi, .bedrock, .azure]
 
     init(rawProvider: String?) {
         let normalized = relaySharedContract.normalizedProvider(value: rawProvider)
@@ -408,12 +409,19 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
             self = .azure
         case "claude":
             self = .claude
+        case "antigravity":
+            self = .antigravity
         case "unsupported":
             self = .unsupported
         case "kimi":
             self = .kimi
         default:
-            self = .codex
+            let raw = rawProvider?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if raw == "antigravity" || raw == "agy" || raw == "google-antigravity" {
+                self = .antigravity
+            } else {
+                self = .codex
+            }
         }
     }
 
@@ -433,6 +441,8 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
             return "Codex"
         case .claude:
             return "Claude Code"
+        case .antigravity:
+            return "Antigravity"
         case .kimi:
             return "Kimi K3"
         case .bedrock:
@@ -464,7 +474,7 @@ enum CodexProvider: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .codex:
             return .xhigh
-        case .claude, .kimi, .bedrock, .azure, .unsupported:
+        case .claude, .antigravity, .kimi, .bedrock, .azure, .unsupported:
             return .high
         }
     }
@@ -519,6 +529,24 @@ struct RelayHarnessStatus: Decodable, Hashable, Identifiable {
         case authKind
         case taskControls
         case authRejected
+    }
+
+    init(
+        provider: CodexProvider,
+        installed: Bool,
+        version: String? = nil,
+        loggedIn: Bool? = nil,
+        authKind: String = "unknown",
+        taskControls: RelayHarnessTaskControls? = nil,
+        authRejection: RelayHarnessAuthRejection? = nil
+    ) {
+        self.provider = provider
+        self.installed = installed
+        self.version = version
+        self.loggedIn = loggedIn
+        self.authKind = authKind
+        self.taskControls = taskControls
+        self.authRejection = authRejection
     }
 
     init(from decoder: Decoder) throws {
@@ -604,6 +632,17 @@ enum RelayProviderSignInFailure {
             #"\btoken_expired\b"#,
             #"access token could not be refreshed"#,
             #"Provided authentication token is expired"#,
+        ],
+        .antigravity: [
+            #"authentication required"#,
+            #"not (?:logged|signed) in"#,
+            #"\bunauthenticated\b"#,
+            #"Failed to authenticate\b"#,
+            #"OAuth (?:access )?token (?:has been revoked|has expired|is invalid)"#,
+            #"token (?:has )?expired"#,
+            #"\binvalid_grant\b"#,
+            #"GEMINI_API_KEY.*not set"#,
+            #"Please (?:log|sign) in"#,
         ],
     ]
 

@@ -27,7 +27,7 @@ function cleanThreadProviderFilter(value) {
   }
   const normalized = value.trim().toLowerCase();
   if (!allowedThreadProviders.has(normalized)) {
-    throw Object.assign(new Error("provider must be codex, claude, kimi, azure, or bedrock"), { status: 400 });
+    throw Object.assign(new Error("provider must be codex, claude, antigravity, kimi, azure, or bedrock"), { status: 400 });
   }
   return normalized;
 }

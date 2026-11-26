@@ -37,7 +37,16 @@ class RelayCoreTest {
 
     @Test
     fun providerAliasesMatchTheExistingRelayContract() {
+        val contract = RelayCoreInfo()
         assertEquals(RelayProvider.CLAUDE, RelayProvider.fromWireValue("anthropic"))
+        assertEquals(RelayProvider.ANTIGRAVITY, RelayProvider.fromWireValue("antigravity"))
+        assertEquals(RelayProvider.ANTIGRAVITY, RelayProvider.fromWireValue("agy"))
+        assertEquals(RelayProvider.ANTIGRAVITY, RelayProvider.fromWireValue("google-antigravity"))
+        assertEquals("antigravity", contract.normalizedProvider("agy"))
+        assertEquals("antigravity", contract.normalizedProvider("google-antigravity"))
+        assertEquals(listOf("codex", "claude", "antigravity", "kimi", "bedrock", "azure"), contract.supportedProviders)
+        assertEquals("assistant", ThreadMessage(role = "antigravity").normalizedRole)
+        assertEquals("assistant", ThreadMessage(role = "agy").normalizedRole)
         assertEquals(RelayProvider.UNSUPPORTED, RelayProvider.fromWireValue("cursor"))
         assertEquals(RelayProvider.UNSUPPORTED, RelayProvider.fromWireValue("cursor-agent"))
         assertEquals(RelayProvider.KIMI, RelayProvider.fromWireValue("moonshot"))
@@ -49,6 +58,11 @@ class RelayCoreTest {
         val contract = RelayCoreInfo()
         assertEquals("OpenAI (Codex)", contract.aiDataRecipient("codex"))
         assertEquals("Anthropic (Claude)", contract.aiDataRecipient("anthropic"))
+        assertEquals("Google (Antigravity)", contract.aiDataRecipient("antigravity"))
+        assertEquals("Google (Antigravity)", contract.aiDataRecipient("agy"))
+        assertTrue(contract.aiDataDisclosure("antigravity").contains("Google (Antigravity)"))
+        assertTrue(contract.aiDataDisclosure("antigravity").contains("prompt and conversation history"))
+        assertTrue(contract.aiDataDisclosure("antigravity").contains("workspace files, attachments, and command output"))
         assertTrue(contract.aiDataDisclosure("kimi").contains("prompt and conversation history"))
         assertTrue(contract.aiDataDisclosure("kimi").contains("workspace files, attachments, and command output"))
         assertTrue(contract.aiDataDisclosure("kimi").contains("can include personal data"))
@@ -94,15 +108,42 @@ class RelayCoreTest {
                 listOf("task"),
                 taskModel = "opus",
             ),
+            ModelDescriptor(
+                "antigravity-gemini-4-neon-high",
+                "Antigravity · Gemini 4 Neon (High)",
+                RelayProvider.ANTIGRAVITY,
+                listOf("task"),
+                taskModel = "gemini-4-neon-high",
+            ),
+            ModelDescriptor(
+                "antigravity-gemini-4-carbon-medium",
+                "Google Antigravity · Gemini 4 Carbon (Medium)",
+                RelayProvider.ANTIGRAVITY,
+                listOf("task"),
+                taskModel = "gemini-4-carbon-medium",
+            ),
+            ModelDescriptor("antigravity-cli", "Antigravity", RelayProvider.ANTIGRAVITY, listOf("task")),
         )
 
         val groups = RelayModelCatalog.taskGroups(models)
 
-        assertEquals(listOf(RelayProvider.CODEX, RelayProvider.CLAUDE), groups.map(TaskModelGroup::provider))
+        assertEquals(
+            listOf(RelayProvider.CODEX, RelayProvider.CLAUDE, RelayProvider.ANTIGRAVITY),
+            groups.map(TaskModelGroup::provider),
+        )
         assertEquals(listOf("Default", "GPT-5.6 Sol"), groups[0].models.map(ModelDescriptor::selectionLabel))
         assertEquals(listOf("Default", "Opus"), groups[1].models.map(ModelDescriptor::selectionLabel))
+        assertEquals(
+            listOf("Default", "Gemini 4 Neon (High)", "Gemini 4 Carbon (Medium)"),
+            groups[2].models.map(ModelDescriptor::selectionLabel),
+        )
         assertEquals("gpt-5.6-sol", RelayModelCatalog.preferredModel(models, RelayProvider.CODEX, currentTaskModel = "gpt-5.6-sol")?.taskModel)
         assertEquals(null, RelayModelCatalog.preferredModel(models, RelayProvider.CLAUDE)?.taskModel)
+        assertEquals(null, RelayModelCatalog.preferredModel(models, RelayProvider.ANTIGRAVITY)?.taskModel)
+        assertEquals(
+            "gemini-4-neon-high",
+            RelayModelCatalog.preferredModel(models, RelayProvider.ANTIGRAVITY, currentTaskModel = "gemini-4-neon-high")?.taskModel,
+        )
     }
 
     @Test

@@ -186,7 +186,7 @@ struct ProviderLoginView: View {
                         // scrape — usually an outdated Relay build on the
                         // machine, or a login command that needs configuring
                         // there. The Terminal path works regardless.
-                        Text("Still nothing? You can also open this folder's Terminal and run \(flow.provider.displayName)'s own login command — the link and code appear right there.")
+                        Text("Still nothing? You can also open this folder's Terminal and run `\(flow.terminalLoginCommand)` — the link and code appear right there.")
                             .font(AppTheme.uiFont(size: 12))
                             .foregroundStyle(AppTheme.statusWarn)
                             .multilineTextAlignment(.center)
@@ -336,6 +336,9 @@ struct ProviderLoginView: View {
         }
         if op.userCode != nil {
             return "Open the sign-in page and enter the code below. Your machine confirms as soon as the provider approves it."
+        }
+        if flow.provider == .antigravity {
+            return "Sign in with your Google account for Antigravity and copy the code the page shows. Then come back and tap Paste."
         }
         return "Sign in with your own \(flow.provider.displayName) account and copy the code the page shows. Then come back and tap Paste."
     }

@@ -47,6 +47,7 @@ process.env.RELAYD_CODEX_TRANSPORT = "exec";
 process.env.CLAUDE_BIN = fakeClaude;
 process.env.CODEX_BIN = path.join(dir, "unconfigured-codex");
 process.env.KIMI_BIN = path.join(dir, "unconfigured-kimi");
+process.env.ANTIGRAVITY_BIN = path.join(dir, "unconfigured-antigravity");
 delete process.env.CODEX_MODEL_CATALOG;
 fs.mkdirSync(process.env.CODEX_RUN_HOME, { recursive: true });
 
@@ -218,6 +219,7 @@ async function startDaemon(name, help) {
       CLAUDE_BIN: daemonClaude,
       CODEX_BIN: path.join(home, "unconfigured-codex"),
       KIMI_BIN: path.join(home, "unconfigured-kimi"),
+      ANTIGRAVITY_BIN: path.join(home, "unconfigured-antigravity"),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

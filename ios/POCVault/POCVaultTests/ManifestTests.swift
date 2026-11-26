@@ -204,11 +204,24 @@ final class ManifestTests: XCTestCase {
         XCTAssertFalse(CodexProvider.allCases.contains(.unsupported))
         XCTAssertEqual(CodexProvider.kimi.displayName, "Kimi K3")
         XCTAssertEqual(CodexProvider.kimi.defaultReasoningEffort, .high)
+
+        XCTAssertEqual(CodexProvider(rawProvider: "antigravity"), .antigravity)
+        XCTAssertEqual(CodexProvider(rawProvider: "agy"), .antigravity)
+        XCTAssertEqual(CodexProvider(rawProvider: "google-antigravity"), .antigravity)
+        XCTAssertEqual(CodexProvider.antigravity.displayName, "Antigravity")
+        XCTAssertEqual(CodexProvider.antigravity.defaultReasoningEffort, .high)
+        XCTAssertTrue(CodexProvider.allCases.contains(.antigravity))
+        let antigravityEncoded = try JSONEncoder().encode(CodexProvider.antigravity)
+        XCTAssertEqual(String(data: antigravityEncoded, encoding: .utf8), "\"antigravity\"")
     }
 
     func testAIDataSharingDisclosureAndConsentAreProviderSpecific() throws {
         XCTAssertEqual(CodexProvider.codex.aiDataRecipient, "OpenAI (Codex)")
         XCTAssertEqual(CodexProvider.claude.aiDataRecipient, "Anthropic (Claude)")
+        XCTAssertEqual(CodexProvider.antigravity.aiDataRecipient, "Google (Antigravity)")
+        XCTAssertTrue(CodexProvider.antigravity.aiDataDisclosure.contains("Google (Antigravity)"))
+        XCTAssertTrue(CodexProvider.antigravity.aiDataDisclosure.contains("workspace files, attachments, and command output"))
+        XCTAssertTrue(CodexProvider.antigravity.aiDataDisclosure.contains("can include personal data"))
         XCTAssertTrue(CodexProvider.kimi.aiDataDisclosure.contains("workspace files, attachments, and command output"))
         XCTAssertTrue(CodexProvider.kimi.aiDataDisclosure.contains("can include personal data"))
 
@@ -511,6 +524,54 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(RelayChatViewModel.taskModelParameter(for: models[3]), "opus")
         // Bedrock alias without a taskModel and without chat support: runner default.
         XCTAssertNil(RelayChatViewModel.taskModelParameter(for: models[5]))
+    }
+
+    func testRelayModelDiscoveryOrdersAntigravityAfterClaudeAndRoutesTaskProvider() throws {
+        let models = try decodeCodexModels(
+            """
+            [
+              { "id": "kimi-k3", "label": "Kimi K3", "provider": "kimi", "modes": ["task"], "taskModel": "kimi-code/k3" },
+              { "id": "agy-default", "label": "Google Antigravity", "provider": "antigravity", "modes": ["task"] },
+              { "id": "agy-gemini-pro", "label": "Google Antigravity · Gemini 2.5 Pro", "provider": "antigravity", "modes": ["task"], "taskModel": "gemini-2.5-pro" },
+              { "id": "agy-flash", "label": "agy · Gemini 2.5 Flash", "provider": "antigravity", "modes": ["task"], "taskModel": "gemini-2.5-flash" },
+              { "id": "claude-opus", "label": "Claude Code · Opus", "provider": "claude", "modes": ["task"], "taskModel": "opus" },
+              { "id": "codex-sol", "label": "Codex · GPT-5.6 Sol", "provider": "codex", "modes": ["task"], "taskModel": "gpt-5.6-sol" }
+            ]
+            """
+        )
+
+        let sections = RelayModelDiscovery.sections(from: models)
+        XCTAssertEqual(sections.agents.map(\.provider), [.codex, .claude, .antigravity, .kimi])
+        XCTAssertEqual(sections.agents.map(\.title), ["Codex", "Claude Code", "Antigravity", "Kimi K3"])
+
+        let antigravityGroup = try XCTUnwrap(sections.agents.first { $0.provider == .antigravity })
+        XCTAssertEqual(antigravityGroup.choices.map(\.model.id), ["agy-default", "agy-gemini-pro", "agy-flash"])
+        XCTAssertEqual(antigravityGroup.choices.map(\.shortModelLabel), ["Default", "Gemini 2.5 Pro", "Gemini 2.5 Flash"])
+        XCTAssertEqual(antigravityGroup.choices[1].chipLabel, "Antigravity · Gemini 2.5 Pro")
+
+        let antigravityModel = try XCTUnwrap(models.first { $0.id == "agy-gemini-pro" })
+        XCTAssertEqual(RelayChatViewModel.taskProvider(for: antigravityModel), .antigravity)
+        XCTAssertEqual(RelayChatViewModel.taskModelParameter(for: antigravityModel), "gemini-2.5-pro")
+        XCTAssertEqual(RelayModelChoice(model: antigravityModel, mode: .task).executionProvider, .antigravity)
+    }
+
+    @MainActor
+    func testAntigravityShowsSubagentsTab() throws {
+        let models = try decodeCodexModels(
+            """
+            [
+              { "id": "agy-default", "label": "Antigravity", "provider": "antigravity", "modes": ["task"] }
+            ]
+            """
+        )
+        let choice = RelayModelChoice(model: try XCTUnwrap(models.first), mode: .task)
+        let viewModel = RelayChatViewModel(
+            client: makeOfflineCodexClient(),
+            workspaceID: "ws-alpha",
+            workspacePath: "/srv/codex-workspaces/alpha"
+        )
+        viewModel.selectChoice(choice)
+        XCTAssertTrue(viewModel.showsSubagentsTab)
     }
 
     /// A dual-mode Codex model is selectable as either an agent (task) or a chat model,
@@ -924,6 +985,7 @@ final class ManifestTests: XCTestCase {
     func testCodexProviderTabIconsUseBrandAssets() throws {
         XCTAssertEqual(CodexProvider.codex.tabIconAssetName, "ChatGPTMark")
         XCTAssertEqual(CodexProvider.claude.tabIconAssetName, "ClaudeMark")
+        XCTAssertEqual(CodexProvider.antigravity.tabIconAssetName, "atom")
         XCTAssertEqual(CodexProvider.kimi.tabIconAssetName, "moon.stars")
         XCTAssertEqual(CodexProvider.bedrock.tabIconAssetName, "cube.transparent")
         XCTAssertEqual(CodexProvider.azure.tabIconAssetName, "cloud")
@@ -931,6 +993,7 @@ final class ManifestTests: XCTestCase {
         XCTAssertNotEqual(CodexProvider.bedrock.tabIconAssetName, CodexProvider.claude.tabIconAssetName)
         XCTAssertTrue(CodexProvider.codex.hasTaskPermissionControls)
         XCTAssertTrue(CodexProvider.claude.hasTaskPermissionControls)
+        XCTAssertFalse(CodexProvider.antigravity.hasTaskPermissionControls)
         XCTAssertFalse(CodexProvider.kimi.hasTaskPermissionControls)
     }
 

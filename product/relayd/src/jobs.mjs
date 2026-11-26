@@ -9,7 +9,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { dataDir, jobsDir, logsDir, attachmentsDir, artifactsDir, approvalsDir, codexBin, claudeBin, kimiBin, runHome, codexHome, kimiHome, npmCacheDir, bunCacheDir, codexTransport, maxConcurrent, maxJobStreams, jobStreamHeartbeatMs, maxBodyBytes, maxJobAttachments, maxJobAttachmentBytes, maxJobAttachmentTotalBytes, maxOutputBytes, maxJobSkills, maxSkillPromptBytes, responseOutputBytes, listOutputBytes, maxTimeoutMs, defaultTimeoutMs, terminalStatuses, allowedReasoningEfforts, allowedJobProviders, retiredJobProviders, allowedClaudePermissionModes, allowedCodexApprovalPolicies, allowedCodexSandboxes, claudeAwsProfile, claudeAwsRegion, claudeDefaultModel, cleanOptionalModel, normalizeClaudeModel, realpathOrResolve, pathWithinRoot } from "./config.mjs";
+import { dataDir, jobsDir, logsDir, attachmentsDir, artifactsDir, approvalsDir, codexBin, claudeBin, kimiBin, antigravityBin, runHome, codexHome, kimiHome, antigravityHome, npmCacheDir, bunCacheDir, dangerousMode, codexTransport, maxConcurrent, maxJobStreams, jobStreamHeartbeatMs, maxBodyBytes, maxJobAttachments, maxJobAttachmentBytes, maxJobAttachmentTotalBytes, maxOutputBytes, maxJobSkills, maxSkillPromptBytes, responseOutputBytes, listOutputBytes, maxTimeoutMs, defaultTimeoutMs, terminalStatuses, allowedReasoningEfforts, allowedJobProviders, retiredJobProviders, allowedClaudePermissionModes, allowedCodexApprovalPolicies, allowedCodexSandboxes, claudeAwsProfile, claudeAwsRegion, claudeDefaultModel, cleanOptionalModel, normalizeClaudeModel, realpathOrResolve, pathWithinRoot } from "./config.mjs";
 import { nowIso, durationMs, sendError, sendBytes, initSse, sendSse, isSafeJobId, headerValue, shapeTextPayload, prefixByBytes, cleanAssistantResult, cleanApiText, readTextFileBounded } from "./util.mjs";
 import { appendAudit } from "./audit.mjs";
 import { resolveWorkspaceById, cleanWorkspaceId } from "./workspaces.mjs";
@@ -19,6 +19,7 @@ import { extractJobArtifacts, sanitizePersistedArtifacts, publicArtifactResponse
 import { buildCodexArgs } from "./adapters/codex.mjs";
 import { buildClaudeArgs } from "./adapters/claude.mjs";
 import { buildKimiArgs, parseKimiResult } from "./adapters/kimi.mjs";
+import { buildAntigravityArgs } from "./adapters/antigravity.mjs";
 import { isResumableSessionId, isKimiSessionId } from "./sessionid.mjs";
 import { store } from "./store.mjs";
 import { emitEvent } from "./events.mjs";
@@ -32,6 +33,7 @@ import { readTimeline, createTimelineTail, cleanTimelineStrings } from "./timeli
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const codexJobRunner = path.join(moduleDir, "codex-job-runner.mjs");
 const claudeJobRunner = path.join(moduleDir, "claude-job-runner.mjs");
+const antigravityJobRunner = path.join(moduleDir, "antigravity-job-runner.mjs");
 
 // How Claude Code jobs run. `stream` (default) wraps the CLI in
 // claude-job-runner.mjs, which reads its stream-json output and records a
@@ -338,7 +340,7 @@ function createJob(body, certSubject, validatedTaskSelection = null) {
     certSubject,
     timeoutMs,
     model: cleanProviderModel(provider, taskSelection.model),
-    reasoningEffort: provider === "codex" || provider === "claude" ? taskSelection.reasoningEffort : null,
+    reasoningEffort: provider === "codex" || provider === "claude" || provider === "antigravity" ? taskSelection.reasoningEffort : null,
     permissionMode,
     approvalPolicy,
     sandbox,
@@ -408,11 +410,11 @@ function cleanProviderModel(provider, value) {
 function cleanOptionalProvider(value) {
   if (value === undefined || value === null || value === "") return "codex";
   if (typeof value !== "string") {
-    throw Object.assign(new Error("provider must be codex, claude, or kimi"), { status: 400 });
+    throw Object.assign(new Error("provider must be codex, claude, antigravity, or kimi"), { status: 400 });
   }
   const normalized = value.trim().toLowerCase();
   if (!allowedJobProviders.has(normalized)) {
-    throw Object.assign(new Error("provider must be codex, claude, or kimi"), { status: 400 });
+    throw Object.assign(new Error("provider must be codex, claude, antigravity, or kimi"), { status: 400 });
   }
   return normalized;
 }
@@ -647,9 +649,11 @@ function promptWithSelectedSkills(prompt, provider, skills) {
   if (!skills.length) return prompt;
   const label = provider === "claude"
     ? "Claude"
-    : provider === "kimi"
-      ? "Kimi"
-      : "Codex";
+    : provider === "antigravity"
+      ? "Antigravity"
+      : provider === "kimi"
+        ? "Kimi"
+        : "Codex";
   const blocks = skills
     .map((skill) => {
       const body = boundedSkillBody(skill.file);
@@ -736,7 +740,7 @@ function attachDiscoveredSessionId(job, sessionId) {
 
 
 function watchJobSessionId(job, active) {
-  if (job.sessionId || (job.provider !== "codex" && job.provider !== "claude")) return;
+  if (job.sessionId || (job.provider !== "codex" && job.provider !== "claude" && job.provider !== "antigravity")) return;
   const poll = () => {
     if (active.finalized || job.sessionId) {
       if (active.sessionIdTimer) {
@@ -1074,6 +1078,9 @@ function buildJobArgs(job) {
       ? [claudeJobRunner, ...buildClaudeArgs(job, { transport: "stream" })]
       : buildClaudeArgs(job);
   }
+  if (job.provider === "antigravity") {
+    return [antigravityJobRunner, ...buildAntigravityArgs(job, { transport: "stream", dangerousMode })];
+  }
   if (job.provider === "kimi") return buildKimiArgs(job);
   return codexTransport === "app-server" ? [codexJobRunner] : buildCodexArgs(job);
 }
@@ -1081,6 +1088,7 @@ function buildJobArgs(job) {
 
 function jobBinary(provider) {
   if (provider === "claude") return claudeTransport === "stream" ? process.execPath : claudeBin;
+  if (provider === "antigravity") return process.execPath;
   if (provider === "kimi") return kimiBin;
   return codexTransport === "app-server" ? process.execPath : codexBin;
 }
@@ -1098,6 +1106,7 @@ function buildJobEnv(job) {
     HOME: runHome,
     CODEX_HOME: codexHome,
     KIMI_CODE_HOME: kimiHome,
+    ANTIGRAVITY_HOME: antigravityHome,
     NPM_CONFIG_CACHE: npmCacheDir,
     npm_config_cache: npmCacheDir,
     NPM_CONFIG_LOGLEVEL: process.env.NPM_CONFIG_LOGLEVEL || "error",
@@ -1123,6 +1132,7 @@ function buildJobEnv(job) {
     RELAY_ERROR_PATH: jobErrorPath(job),
     RELAY_CLAUDE_BIN: claudeBin,
     RELAY_CODEX_BIN: codexBin,
+    RELAY_ANTIGRAVITY_BIN: antigravityBin,
     RELAY_INTERACTIVE_INPUT: supportsJobInput(job) ? "1" : "0",
     RELAY_CODEX_APPROVAL_POLICY: job.approvalPolicy || "on-request",
     RELAY_CODEX_SANDBOX: job.sandbox || "workspace-write",
@@ -1135,8 +1145,8 @@ function buildJobEnv(job) {
   if (job.reasoningEffort) env.RELAY_REASONING_EFFORT = job.reasoningEffort;
   if (job.resumeSessionId) env.RELAY_RESUME_SESSION_ID = job.resumeSessionId;
 
-  if (job.provider === "kimi") {
-    // Direct Kimi subscription jobs never inherit ambient AWS
+  if (job.provider === "kimi" || job.provider === "antigravity") {
+    // Direct Kimi and Antigravity jobs never inherit ambient AWS
     // credential or Bedrock configuration, mirroring direct Claude auth.
     delete env.AWS_ACCESS_KEY_ID;
     delete env.AWS_SECRET_ACCESS_KEY;
@@ -1182,9 +1192,11 @@ function buildExecutionReceipt(job) {
   const provider = normalizeJobProvider(job.provider);
   const providerBin = provider === "claude"
     ? claudeBin
-    : provider === "kimi"
-      ? kimiBin
-      : codexBin;
+    : provider === "antigravity"
+      ? antigravityBin
+      : provider === "kimi"
+        ? kimiBin
+        : codexBin;
   return {
     provider,
     transport: provider === "codex" ? codexTransport : "cli",
@@ -1669,12 +1681,14 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
 
   const finishedAt = nowIso();
   const stderrText = cleanApiText(stderr).trim();
-  // A Claude job run through the stream runner keeps prose on stdout for old
-  // phones and writes its final answer to the result file, like Codex.
+  // A Claude or Antigravity job run through its stream runner keeps prose on
+  // stdout for old phones and writes its final answer to the result file.
   const claudeStream = job.provider === "claude" && job.claudeTransport === "stream";
-  const stdoutResultProvider = !claudeStream
+  const antigravityStream = job.provider === "antigravity";
+  const streamRunner = claudeStream || antigravityStream;
+  const stdoutResultProvider = !streamRunner
     && (job.provider === "claude" || job.provider === "kimi");
-  const runnerError = claudeStream
+  const runnerError = streamRunner
     ? cleanApiText(await readTextFileBounded(jobErrorPath(job), 16 * 1024).catch(() => "")).trim()
     : "";
   const resultText = stdoutResultProvider
@@ -1710,11 +1724,15 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
     job.status = "failed";
     job.result = null;
     job.error = spawnError.message;
-  } else if (code === 0 && (stdoutResultProvider || claudeStream) && !cleanResult) {
+  } else if (code === 0 && (stdoutResultProvider || streamRunner) && !cleanResult) {
     job.status = "failed";
     job.result = null;
     job.artifacts = [];
-    const providerName = job.provider === "kimi" ? "Kimi K3" : "Claude";
+    const providerName = job.provider === "kimi"
+      ? "Kimi K3"
+      : job.provider === "antigravity"
+        ? "Antigravity"
+        : "Claude";
     job.error = `${providerName} exited successfully without producing output.`;
   } else if (code === 0) {
     job.status = "succeeded";
@@ -1732,7 +1750,7 @@ async function finishJob(job, active, { code, signal, stdout, stderr, spawnError
     job.artifacts = [];
     job.error =
       runnerError ||
-      (claudeStream ? withoutRelayStepLines(stderrText) : stderrText) ||
+      (streamRunner ? withoutRelayStepLines(stderrText) : stderrText) ||
       failedOutputText ||
       `${job.provider} exited with code ${code}${signal ? ` and signal ${signal}` : ""}`;
     // The provider refusing its own credentials is not this job's fault: the

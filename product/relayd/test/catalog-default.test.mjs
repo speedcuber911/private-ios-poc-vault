@@ -16,12 +16,15 @@
 // anyone configured Bedrock, so it is never absent.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 process.env.CODEX_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-catalog-"));
 process.env.KIMI_BIN = path.join(process.env.CODEX_DATA_DIR, "unconfigured-kimi");
+process.env.ANTIGRAVITY_BIN = path.join(process.env.CODEX_DATA_DIR, "unconfigured-antigravity");
 
 const { defaultModelCatalog } = await import("../src/catalog.mjs");
 
@@ -157,4 +160,38 @@ test("Azure remains opt-in and independent of Bedrock", () => {
 
   const neither = withEnv(CLEAN, () => defaultModelCatalog());
   assert.ok(!neither.some((entry) => entry.provider === "azure"));
+});
+
+test("when ANTIGRAVITY_BIN exists, defaultModelCatalog advertises Antigravity default and curated Gemini 4 models", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-catalog-agy-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const fakeAgy = path.join(dir, "fake-agy");
+  fs.writeFileSync(fakeAgy, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  const catalogPath = fileURLToPath(new URL("../src/catalog.mjs", import.meta.url));
+  const script = `import { defaultModelCatalog } from ${JSON.stringify(catalogPath)}; process.stdout.write(JSON.stringify(defaultModelCatalog()));`;
+  const env = {
+    ...process.env,
+    CODEX_DATA_DIR: path.join(dir, "data"),
+    KIMI_BIN: path.join(dir, "unconfigured-kimi"),
+    ANTIGRAVITY_BIN: fakeAgy,
+  };
+  delete env.BEDROCK_CHAT_MODEL;
+  delete env.AZURE_OPENAI_DEPLOYMENT;
+  delete env.CODEX_MODEL_CATALOG;
+  const catalog = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+    env,
+    encoding: "utf8",
+  }));
+
+  const agy = catalog.filter((entry) => entry.provider === "antigravity");
+  assert.equal(agy[0].id, "antigravity-cli");
+  assert.equal(agy[0].label, "Antigravity");
+  assert.equal(agy[0].taskModel, undefined);
+  assert.deepEqual(agy[0].effortLevels, ["low", "medium", "high", "xhigh", "max"]);
+  assert.deepEqual(
+    agy.slice(1).map((entry) => entry.taskModel),
+    ["gemini-4-neon-high", "gemini-4-carbon-medium", "gemini-4-argon-medium", "gemini-3.8-flash-high"],
+  );
+  const ids = catalog.map((entry) => entry.id);
+  assert.equal(new Set(ids).size, ids.length);
 });

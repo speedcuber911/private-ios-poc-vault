@@ -104,7 +104,7 @@ final class ProviderLoginFlowModel: ObservableObject {
 
     private enum Engine: Equatable {
         case op(id: String)
-        case exec(logPath: String, inputPath: String, launchCommand: String)
+        case exec(logPath: String, inputPath: String, launchCommand: String, binaryPath: String)
     }
 
     private let client: HarnessLoginClient
@@ -148,6 +148,8 @@ final class ProviderLoginFlowModel: ObservableObject {
         switch provider {
         case .claude:
             return "claude"
+        case .antigravity:
+            return "agy"
         case .kimi:
             return "kimi"
         case .codex, .bedrock, .azure, .unsupported:
@@ -159,12 +161,21 @@ final class ProviderLoginFlowModel: ObservableObject {
     /// waits for the pasted code, then stores the session. (`setup-token`
     /// only prints a token for an env var and stores nothing; `claude login`
     /// is not a command at all and runs "login" as a prompt.)
+    /// Antigravity (`agy`) has no `login` subcommand; launching bare `agy`
+    /// over SSH triggers its remote Google OAuth paste-back flow.
     private var loginArgument: String {
-        provider == .claude ? "auth login" : "login"
+        switch provider {
+        case .claude:
+            return "auth login"
+        case .antigravity:
+            return ""
+        case .codex, .kimi, .bedrock, .azure, .unsupported:
+            return "login"
+        }
     }
 
     var terminalLoginCommand: String {
-        "\(loginBinaryName) \(loginArgument)"
+        loginArgument.isEmpty ? loginBinaryName : "\(loginBinaryName) \(loginArgument)"
     }
 
     func start() async {
@@ -191,8 +202,9 @@ final class ProviderLoginFlowModel: ObservableObject {
             } else {
                 await startExecFallback()
             }
-        } catch let error as CodexClientError where error.statusCode == 404 {
-            // No harness login op route at all — drive it through exec.
+        } catch let error as CodexClientError where error.statusCode == 404 || (provider == .antigravity && error.statusCode == 400) {
+            // No harness login op route (or pre-Antigravity relayd rejecting
+            // "antigravity" with 400) — drive it through exec.
             await startExecFallback()
         } catch {
             step = .failed(Self.notReachableMessage)
@@ -228,7 +240,7 @@ final class ProviderLoginFlowModel: ObservableObject {
                 stopEverythingKeepingStep()
                 step = .failed(Self.completionFailedMessage)
             }
-        case .exec(_, let inputPath, _):
+        case .exec(_, let inputPath, _, _):
             guard let quoted = Self.shellSingleQuoted(text) else {
                 step = .failed(Self.completionFailedMessage)
                 return
@@ -390,6 +402,25 @@ final class ProviderLoginFlowModel: ObservableObject {
     private var execLogPath: String { "/tmp/relay-phone-login-\(provider.rawValue).log" }
     private var execInputPath: String { "/tmp/relay-phone-login-\(provider.rawValue).in" }
 
+    /// Process pattern for `pkill -f` / `pgrep -f`. Providers with no login
+    /// subcommand (Antigravity runs bare `agy`) match the login log path so we
+    /// never kill an active agent job or unrelated CLI session.
+    private var execProcessMatchPattern: String {
+        loginArgument.isEmpty ? execLogPath : "\(loginBinaryName) \(loginArgument)"
+    }
+
+    /// Environment prefix for exec-mode launches. Antigravity's `agy` inspects
+    /// SSH environment variables to enter its remote OAuth paste-back flow
+    /// instead of trying to open a local desktop browser.
+    private var execEnvPrefix: String {
+        switch provider {
+        case .antigravity:
+            return "env -u DISPLAY SSH_CONNECTION='127.0.0.1 12345 127.0.0.1 22' SSH_CLIENT='127.0.0.1 12345 22' BROWSER=false"
+        case .codex, .claude, .kimi, .bedrock, .azure, .unsupported:
+            return ""
+        }
+    }
+
     private func startExecFallback() async {
         guard !usedExecFallback else { return }
         usedExecFallback = true
@@ -401,7 +432,7 @@ final class ProviderLoginFlowModel: ObservableObject {
         // Clear any stray login from earlier attempts — a silent
         // `codex login` still holds its localhost port. Best effort.
         _ = try? await client.execCommand(
-            "pkill -f '\(loginBinaryName) \(loginArgument)' >/dev/null 2>&1; true",
+            "pkill -f '\(execProcessMatchPattern)' >/dev/null 2>&1; true",
             timeoutMs: 8000
         )
 
@@ -417,7 +448,8 @@ final class ProviderLoginFlowModel: ObservableObject {
             binary: binary,
             argument: loginArgument,
             logPath: execLogPath,
-            inputPath: execInputPath
+            inputPath: execInputPath,
+            envPrefix: execEnvPrefix
         )
         do {
             let result = try await client.execCommand(launch, timeoutMs: 15000)
@@ -430,7 +462,7 @@ final class ProviderLoginFlowModel: ObservableObject {
             return
         }
 
-        engine = .exec(logPath: execLogPath, inputPath: execInputPath, launchCommand: launch)
+        engine = .exec(logPath: execLogPath, inputPath: execInputPath, launchCommand: launch, binaryPath: binary)
         step = .waitingForSignIn(RelayHarnessOp(id: "exec:\(provider.rawValue)", provider: provider))
         progressDetail = "Running `\(terminalLoginCommand)` on your machine…"
         startLogPolling(logPath: execLogPath)
@@ -444,7 +476,7 @@ final class ProviderLoginFlowModel: ObservableObject {
                 guard let self else { return }
                 try? await Task.sleep(for: self.pollInterval)
                 if Task.isCancelled { return }
-                guard case .exec(let currentLog, _, _) = self.engine, currentLog == logPath else { return }
+                guard case .exec(let currentLog, _, _, _) = self.engine, currentLog == logPath else { return }
                 guard let result = try? await self.client.execCommand(
                     "tail -c 4000 \(logPath) 2>/dev/null; true",
                     timeoutMs: 8000
@@ -497,12 +529,13 @@ final class ProviderLoginFlowModel: ObservableObject {
 
     /// Resolve the provider CLI's absolute path on the machine, via one
     /// bounded exec: PATH lookup first, then the conventional headless
-    /// locations (node's own bin dir is where npm-global CLIs live).
+    /// locations (node's own bin dir is where npm-global CLIs live, and
+    /// `~/.local/bin` is where `agy` and `kimi` install).
     private func resolveLoginBinaryPath() async -> String? {
         let name = loginBinaryName
         let probe = "command -v \(name) 2>/dev/null || "
             + "for d in \"$(dirname \"$(command -v node 2>/dev/null || echo /nonexistent)\")\" "
-            + "/opt/node/bin /opt/node22/bin /usr/local/bin /usr/bin; do "
+            + "\"$HOME/.local/bin\" /opt/node/bin /opt/node22/bin /usr/local/bin /usr/bin; do "
             + "[ -x \"$d/\(name)\" ] && { echo \"$d/\(name)\"; break; }; done"
         guard let result = try? await client.execCommand(probe, timeoutMs: 8000) else { return nil }
         let line = result.stdout
@@ -515,7 +548,7 @@ final class ProviderLoginFlowModel: ObservableObject {
 
     private func cleanUpExecLogin() async {
         _ = try? await client.execCommand(
-            "pkill -f '\(loginBinaryName) \(loginArgument)' >/dev/null 2>&1; rm -f \(execLogPath) \(execInputPath); true",
+            "pkill -f '\(execProcessMatchPattern)' >/dev/null 2>&1; rm -f \(execLogPath) \(execInputPath); true",
             timeoutMs: 8000
         )
     }
@@ -558,7 +591,10 @@ final class ProviderLoginFlowModel: ObservableObject {
                 // And on the exec engine, only once the login itself has ended:
                 // the old session still reads as signed in while the CLI is
                 // exchanging the code, and calling it done there would kill it.
-                if mayTrustStatus, self.startedSignedIn, case .exec(let logPath, _, _) = self.engine {
+                var execEnded = false
+                if mayTrustStatus,
+                   case .exec(let logPath, _, _, _) = self.engine,
+                   self.startedSignedIn || (self.provider == .antigravity && self.step == .completing) {
                     switch await self.execLoginOutcome(logPath: logPath) {
                     case .running:
                         continue
@@ -567,14 +603,24 @@ final class ProviderLoginFlowModel: ObservableObject {
                         self.step = .failed("The sign-in failed on the machine: \(line)")
                         return
                     case .ended:
-                        break
+                        execEnded = true
                     }
                 }
                 if mayTrustStatus,
-                   let statuses = try? await self.client.fetchHarnesses(),
-                   statuses.first(where: { $0.provider == self.provider })?.loggedIn == true {
-                    self.finishConnected()
-                    return
+                   let statuses = try? await self.client.fetchHarnesses() {
+                    if let status = statuses.first(where: { $0.provider == self.provider }) {
+                        if status.loggedIn == true {
+                            self.finishConnected()
+                            return
+                        }
+                    } else if self.provider == .antigravity,
+                              self.step == .completing,
+                              execEnded,
+                              case .exec(_, _, _, let binaryPath) = self.engine,
+                              await self.probeAntigravitySignedIn(binaryPath: binaryPath) {
+                        self.finishConnected()
+                        return
+                    }
                 }
                 if ContinuousClock.now - started > self.overallDeadline {
                     if self.step == .completing || self.isWaiting {
@@ -585,6 +631,13 @@ final class ProviderLoginFlowModel: ObservableObject {
                 }
             }
         }
+    }
+
+    private func probeAntigravitySignedIn(binaryPath: String) async -> Bool {
+        guard let result = try? await client.execCommand("\(binaryPath) models", timeoutMs: 12000) else {
+            return false
+        }
+        return result.exitCode == 0
     }
 
     private var isWaiting: Bool {
@@ -601,7 +654,7 @@ final class ProviderLoginFlowModel: ObservableObject {
     /// One exec: is the login CLI still running, and if not, did it refuse
     /// the code? An unreadable answer counts as still running.
     private func execLoginOutcome(logPath: String) async -> ExecLoginOutcome {
-        let command = "pgrep -f '\(loginBinaryName) \(loginArgument)' >/dev/null 2>&1 && echo RELAY_LOGIN_RUNNING; "
+        let command = "pgrep -f '\(execProcessMatchPattern)' >/dev/null 2>&1 && echo RELAY_LOGIN_RUNNING; "
             + "tail -c 2000 \(logPath) 2>/dev/null; true"
         guard let result = try? await client.execCommand(command, timeoutMs: 8000) else { return .running }
         if result.stdout.contains("RELAY_LOGIN_RUNNING") { return .running }
@@ -654,14 +707,20 @@ final class ProviderLoginFlowModel: ObservableObject {
         binary: String,
         argument: String,
         logPath: String,
-        inputPath: String
+        inputPath: String,
+        envPrefix: String = ""
     ) -> String {
-        let command = "\(binary) \(argument)"
+        let invocation = argument.isEmpty ? binary : "\(binary) \(argument)"
+        let command = envPrefix.isEmpty ? invocation : "\(envPrefix) \(invocation)"
+        let scriptBody = "exec 3>\(inputPath); exec script -qefc \"\(command)\" \(logPath) < \(inputPath)"
+            .replacingOccurrences(of: "'", with: "'\\''")
+        let fallbackBody = "exec 3>\(inputPath); exec \(command) < \(inputPath) >> \(logPath) 2>&1"
+            .replacingOccurrences(of: "'", with: "'\\''")
         return "rm -f \(logPath) \(inputPath) && mkfifo \(inputPath) && "
             + "if command -v script >/dev/null 2>&1; then "
-            + "setsid bash -c 'exec 3>\(inputPath); exec script -qefc \"\(command)\" \(logPath) < \(inputPath)' >/dev/null 2>&1 & "
+            + "setsid bash -c '\(scriptBody)' >/dev/null 2>&1 & "
             + "else "
-            + "setsid bash -c 'exec 3>\(inputPath); exec \(command) < \(inputPath) >> \(logPath) 2>&1' >/dev/null 2>&1 & "
+            + "setsid bash -c '\(fallbackBody)' >/dev/null 2>&1 & "
             + "fi; echo launched"
     }
 

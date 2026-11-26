@@ -54,6 +54,7 @@ async function startServer(dir, homeDir, extraEnv = {}) {
       CODEX_BIN: fakeCodex,
       CLAUDE_BIN: fakeClaude,
       KIMI_BIN: path.join(dir, "missing-kimi"),
+      ANTIGRAVITY_BIN: path.join(dir, "missing-antigravity"),
       ...extraEnv,
     },
     stdio: ["ignore", "pipe", "pipe"],

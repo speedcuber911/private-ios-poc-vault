@@ -369,6 +369,7 @@ async function startServer(env) {
       AWS_REGION: "",
       AWS_DEFAULT_REGION: "",
       KIMI_BIN: path.join(os.tmpdir(), "relayd-unconfigured-kimi"),
+      ANTIGRAVITY_BIN: path.join(os.tmpdir(), "relayd-unconfigured-antigravity"),
       ...env,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -3063,7 +3064,7 @@ localTest("rejects provider/model and provider/control mismatches before queuein
       [{ provider: "codex", permissionMode: "plan" }, /permissionMode is supported only for Claude/],
       [{ provider: "claude", approvalPolicy: "never" }, /approvalPolicy is supported only for Codex/],
       // Cursor is retired: refused outright, never run as the Codex fallback.
-      [{ provider: "cursor" }, /provider must be codex, claude, or kimi/],
+      [{ provider: "cursor" }, /provider must be codex, claude, antigravity, or kimi/],
     ];
     for (const [fields, expected] of cases) {
       const response = await fetch(`${server.baseUrl}/v1/codex/jobs`, {

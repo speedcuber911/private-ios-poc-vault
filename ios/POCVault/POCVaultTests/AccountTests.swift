@@ -1,3 +1,4 @@
+import Network
 import SwiftUI
 import UIKit
 import XCTest
@@ -58,6 +59,176 @@ final class AccountTests: XCTestCase {
         XCTAssertEqual(
             error.localizedDescription,
             "This Apple ID is already used on a different Relay account. Sign in with your username and password, or use the Apple ID that created that account."
+        )
+    }
+
+    // MARK: - Coding Agents (Antigravity + Codex + Claude Code)
+
+    func testDisplayedHarnessesShowsAntigravityInstalledUninstalledAndFallbackForOlderRelayd() {
+        XCTAssertTrue(AccountSettingsHelpers.displayedHarnesses(from: []).isEmpty)
+
+        // Case 1: Modern relayd with Antigravity installed alongside Codex, Claude Code, and Kimi.
+        let installedInput = [
+            RelayHarnessStatus(provider: .kimi, installed: true, loggedIn: true, authKind: "subscription"),
+            RelayHarnessStatus(provider: .antigravity, installed: true, version: "agy 0.1.0", loggedIn: false, authKind: "oauth"),
+            RelayHarnessStatus(provider: .claude, installed: true, loggedIn: true, authKind: "subscription"),
+            RelayHarnessStatus(provider: .codex, installed: true, loggedIn: true, authKind: "subscription"),
+        ]
+        let installedRows = AccountSettingsHelpers.displayedHarnesses(from: installedInput)
+        XCTAssertEqual(installedRows.map(\.provider), [.codex, .claude, .antigravity, .kimi])
+        XCTAssertEqual(installedRows[2].installed, true)
+        XCTAssertEqual(installedRows[2].loggedIn, false)
+
+        // Case 2: Modern relayd reporting Antigravity as not installed (while uninstalled Kimi stays hidden).
+        let uninstalledInput = [
+            RelayHarnessStatus(provider: .codex, installed: true, loggedIn: true, authKind: "subscription"),
+            RelayHarnessStatus(provider: .claude, installed: true, loggedIn: false, authKind: "subscription"),
+            RelayHarnessStatus(provider: .antigravity, installed: false, loggedIn: nil, authKind: "unknown"),
+            RelayHarnessStatus(provider: .kimi, installed: false, loggedIn: nil, authKind: "unknown"),
+        ]
+        let uninstalledRows = AccountSettingsHelpers.displayedHarnesses(from: uninstalledInput)
+        XCTAssertEqual(uninstalledRows.map(\.provider), [.codex, .claude, .antigravity])
+        XCTAssertFalse(uninstalledRows[2].installed)
+        XCTAssertFalse(uninstalledRows[2].supportsDirectLogin)
+
+        // Case 3: Older relayd that omits Antigravity completely — synthesize a sign-in row right after Claude Code.
+        let legacyInput = [
+            RelayHarnessStatus(provider: .claude, installed: true, loggedIn: true, authKind: "subscription"),
+            RelayHarnessStatus(provider: .codex, installed: true, loggedIn: true, authKind: "subscription"),
+            RelayHarnessStatus(provider: .kimi, installed: false, loggedIn: nil, authKind: "unknown"),
+        ]
+        let legacyRows = AccountSettingsHelpers.displayedHarnesses(from: legacyInput)
+        XCTAssertEqual(legacyRows.map(\.provider), [.codex, .claude, .antigravity])
+        XCTAssertTrue(legacyRows[2].installed)
+        XCTAssertNil(legacyRows[2].loggedIn)
+        XCTAssertEqual(legacyRows[2].authKind, "unknown")
+    }
+
+    @MainActor
+    func testSettingsCodingAgentsDisplaysAntigravityAlongsideCodexAndClaude() throws {
+        let server = try LocalHarnessHTTPStubServer { path in
+            if path.hasPrefix("/v1/harness/antigravity/login") {
+                return (
+                    200,
+                    #"{"op":{"id":"op-agy-ui","provider":"antigravity","action":"login","status":"running"}}"#
+                )
+            }
+            if path.hasPrefix("/v1/harness/ops/op-agy-ui") {
+                return (
+                    200,
+                    #"{"op":{"id":"op-agy-ui","provider":"antigravity","action":"login","status":"running"}}"#
+                )
+            }
+            if path.hasPrefix("/v1/harness") {
+                return (
+                    200,
+                    """
+                    {"harnesses":[
+                      {"provider":"codex","installed":true,"loggedIn":true,"authKind":"subscription"},
+                      {"provider":"claude","installed":true,"loggedIn":false,"authKind":"subscription"},
+                      {"provider":"antigravity","installed":true,"loggedIn":false,"authKind":"unknown"}
+                    ]}
+                    """
+                )
+            }
+            return (404, #"{"error":"not found"}"#)
+        }
+        defer { server.stop() }
+
+        let deps = try makeInteractiveDependencies(baseURL: server.baseURL)
+        defer { deps.cleanup() }
+
+        let pairedHost = RelayPairedNode(
+            nodeID: "node-coding-agents-test",
+            nodeName: "Dev Box",
+            apiBaseURL: server.baseURL
+        )
+        deps.nodeStore.adopt(pairedHost)
+
+        let probe = SettingsSheetHostProbe()
+        let rootVC = UIHostingController(
+            rootView: DrivenSettingsSheetHost(deps: deps, probe: probe)
+        )
+        let harness = try RelayLiveUIWindowHarness(rootViewController: rootVC)
+        defer { harness.tearDown() }
+
+        let settingsVC = try XCTUnwrap(
+            RelayLiveUIWindowHarness.waitForPresentedChild(from: rootVC),
+            "AccountSettingsView did not present inside its parent sheet"
+        )
+
+        try RelayLiveUIWindowHarness.activateControl(
+            in: settingsVC,
+            description: "Coding agents & sign-ins",
+            identifier: "relay-settings-coding-agents",
+            labelMatches: { $0.localizedCaseInsensitiveContains("Coding agents") }
+        )
+
+        let hasCodex = RelayLiveUIWindowHarness.waitForElement(
+            in: settingsVC.view,
+            identifier: "relay-agent-connected-codex",
+            labelMatches: { $0 == "Codex" },
+            timeout: 4.0
+        )
+        XCTAssertTrue(
+            hasCodex,
+            "Coding agents screen is missing Codex. Visible: \(RelayLiveUIWindowHarness.debugSummary(in: settingsVC.view))"
+        )
+
+        let hasClaude = RelayLiveUIWindowHarness.waitForElement(
+            in: settingsVC.view,
+            identifier: "relay-agent-sign-in-claude",
+            labelMatches: { $0 == "Claude Code" },
+            timeout: 3.0
+        )
+        XCTAssertTrue(
+            hasClaude,
+            "Coding agents screen is missing Claude Code. Visible: \(RelayLiveUIWindowHarness.debugSummary(in: settingsVC.view))"
+        )
+
+        let hasAntigravity = RelayLiveUIWindowHarness.waitForElement(
+            in: settingsVC.view,
+            identifier: "relay-agent-sign-in-antigravity",
+            labelMatches: { $0 == "Antigravity" },
+            timeout: 3.0
+        )
+        XCTAssertTrue(
+            hasAntigravity,
+            "Coding agents screen is missing Antigravity alongside Codex and Claude Code. Visible: \(RelayLiveUIWindowHarness.debugSummary(in: settingsVC.view))"
+        )
+
+        try RelayLiveUIWindowHarness.activateControl(
+            in: settingsVC,
+            description: "Sign in to Antigravity",
+            identifier: "relay-agent-sign-in-antigravity",
+            labelMatches: nil
+        )
+
+        let loginVC = try XCTUnwrap(
+            RelayLiveUIWindowHarness.waitForPresentedChild(from: settingsVC),
+            "Tapping Antigravity Sign in did not present ProviderLoginView"
+        )
+
+        let hasLoginTitle = RelayLiveUIWindowHarness.waitForElement(
+            in: loginVC.view,
+            identifier: "relay-provider-login-close",
+            labelMatches: { $0.localizedCaseInsensitiveContains("Antigravity") },
+            timeout: 3.0
+        )
+        XCTAssertTrue(
+            hasLoginTitle,
+            "Antigravity ProviderLoginView sheet did not render expected controls. Visible: \(RelayLiveUIWindowHarness.debugSummary(in: loginVC.view))"
+        )
+
+        try RelayLiveUIWindowHarness.activateControl(
+            in: loginVC,
+            description: "Cancel Antigravity sign-in",
+            identifier: "relay-provider-login-close",
+            labelMatches: { $0 == "Cancel" || $0 == "Done" }
+        )
+        XCTAssertTrue(
+            RelayLiveUIWindowHarness.waitForDismissal(ofChildFrom: settingsVC),
+            "Closing Antigravity ProviderLoginView did not dismiss the sheet"
         )
     }
 
@@ -296,12 +467,13 @@ final class AccountTests: XCTestCase {
     }
 
     @MainActor
-    private func makeInteractiveDependencies() throws -> InteractiveTestDependencies {
+    private func makeInteractiveDependencies(baseURL: URL? = nil) throws -> InteractiveTestDependencies {
         let suiteName = "account-interactive-tests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defaults.removePersistentDomain(forName: suiteName)
 
         let offlineURL = try XCTUnwrap(URL(string: "http://127.0.0.1:1"))
+        let codexBaseURL = baseURL ?? offlineURL
         let identityStore = ClientIdentityStore(defaults: defaults)
         identityStore.forgetPairedMaterialForTesting()
         let nodeStore = RelayNodeStore(defaults: defaults)
@@ -315,7 +487,7 @@ final class AccountTests: XCTestCase {
         let computerLinkStore = RelayComputerLinkStore(client: authClient, defaults: defaults)
         let stubPower = StubPowerClient()
         let codexClient = CodexClient(
-            baseURL: offlineURL,
+            baseURL: codexBaseURL,
             identityStore: identityStore,
             powerClient: stubPower
         )
@@ -913,5 +1085,90 @@ private final class RelayLiveUIWindowHarness {
 
         walk(root, depth: 0)
         return entries.joined(separator: ", ")
+    }
+}
+
+private final class LocalHarnessHTTPStubServer {
+    private let listener: NWListener
+    private let queue = DispatchQueue(label: "relay.tests.harness-stub")
+    private let responseProvider: (String) -> (Int, String)
+    private(set) var port: UInt16 = 0
+
+    var baseURL: URL {
+        URL(string: "http://127.0.0.1:\(port)")!
+    }
+
+    init(responseProvider: @escaping (String) -> (Int, String)) throws {
+        self.responseProvider = responseProvider
+        let listener = try NWListener(using: .tcp, on: .any)
+        self.listener = listener
+
+        let ready = DispatchSemaphore(value: 0)
+        var didSignal = false
+        var readyPort: UInt16?
+        let signalOnce = {
+            guard !didSignal else { return }
+            didSignal = true
+            ready.signal()
+        }
+
+        listener.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                readyPort = listener.port?.rawValue
+                signalOnce()
+            case .failed, .cancelled:
+                signalOnce()
+            default:
+                break
+            }
+        }
+        listener.newConnectionHandler = { [weak self] connection in
+            self?.handle(connection)
+        }
+        listener.start(queue: queue)
+
+        guard ready.wait(timeout: .now() + 3) == .success, let boundPort = readyPort, boundPort > 0 else {
+            listener.cancel()
+            throw XCTSkip("Could not bind local loopback HTTP stub server")
+        }
+        self.port = boundPort
+    }
+
+    func stop() {
+        listener.cancel()
+    }
+
+    private func handle(_ connection: NWConnection) {
+        connection.start(queue: queue)
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 16_384) { [weak self] data, _, _, _ in
+            guard let self else {
+                connection.cancel()
+                return
+            }
+            let requestLine = data
+                .flatMap { String(data: $0, encoding: .utf8) }?
+                .components(separatedBy: "\r\n")
+                .first ?? ""
+            let path = requestLine.split(separator: " ").dropFirst().first.map(String.init) ?? "/"
+            let (status, body) = self.responseProvider(path)
+            let bodyData = Data(body.utf8)
+            let statusText: String
+            switch status {
+            case 200: statusText = "OK"
+            case 202: statusText = "Accepted"
+            case 400: statusText = "Bad Request"
+            default: statusText = "Not Found"
+            }
+            let header = "HTTP/1.1 \(status) \(statusText)\r\n"
+                + "Content-Type: application/json\r\n"
+                + "Content-Length: \(bodyData.count)\r\n"
+                + "Connection: close\r\n\r\n"
+            var payload = Data(header.utf8)
+            payload.append(bodyData)
+            connection.send(content: payload, completion: .contentProcessed { _ in
+                connection.cancel()
+            })
+        }
     }
 }

@@ -44,6 +44,8 @@
     "CODEX_BIN": "/usr/local/bin/codex",
     "CLAUDE_BIN": "/usr/local/bin/claude",
     "CURSOR_BIN": "/home/relay/.local/bin/cursor-agent",
+    "ANTIGRAVITY_BIN": "/home/relay/.local/bin/agy",
+    "ANTIGRAVITY_HOME": "/home/relay/.gemini/antigravity-cli",
     "KIMI_BIN": "/home/relay/.local/bin/kimi",
     "KIMI_CODE_HOME": "/home/relay/.kimi-code",
     "CODEX_RUN_HOME": "/home/relay"

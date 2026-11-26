@@ -7,7 +7,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 
-import { runHome, codexHome, claudeHome, kimiHome, maxSkillDiscoveryFiles, splitPathList } from "./config.mjs";
+import { runHome, codexHome, claudeHome, kimiHome, antigravityHome, maxSkillDiscoveryFiles, splitPathList } from "./config.mjs";
 import { cleanApiText } from "./util.mjs";
 
 function listProviderSkills(provider, workspacePath = null) {
@@ -41,6 +41,18 @@ function skillRoots(provider, workspacePath = null) {
       path.join(claudeHome, "commands"),
       path.join(claudeHome, "skills"),
       path.join(claudeHome, "plugins", "cache"),
+    ]);
+  }
+
+  if (provider === "antigravity") {
+    return uniqueExistingDirectories([
+      projectRoot && path.join(projectRoot, ".agents", "skills"),
+      projectRoot && path.join(projectRoot, ".gemini", "antigravity", "skills"),
+      projectRoot && path.join(projectRoot, ".agent", "skills"),
+      ...splitPathList(process.env.ANTIGRAVITY_SKILL_DIRS),
+      path.join(antigravityHome, "skills"),
+      path.join(runHome, ".gemini", "antigravity", "skills"),
+      path.join(runHome, ".agents", "skills"),
     ]);
   }
 

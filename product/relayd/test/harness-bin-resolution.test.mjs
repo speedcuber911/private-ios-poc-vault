@@ -29,8 +29,8 @@ function resolveUnder(env) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-data-"));
   try {
     const script =
-      `import { codexBin, claudeBin, kimiBin } from ${JSON.stringify(CONFIG)};` +
-      `process.stdout.write(JSON.stringify({ codexBin, claudeBin, kimiBin }));`;
+      `import { codexBin, claudeBin, kimiBin, antigravityBin } from ${JSON.stringify(CONFIG)};` +
+      `process.stdout.write(JSON.stringify({ codexBin, claudeBin, kimiBin, antigravityBin }));`;
     const out = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
       env: { ...process.env, CODEX_DATA_DIR: dataDir, ...env },
       encoding: "utf8",
@@ -121,6 +121,19 @@ test("kimi resolves under CODEX_RUN_HOME and can be found on PATH", (t) => {
 
   const fromPath = resolveUnder({ CODEX_RUN_HOME: home, PATH: binDir, KIMI_BIN: "" });
   assert.equal(fromPath.kimiBin, path.join(binDir, "kimi"));
+});
+
+test("antigravity (agy) resolves under CODEX_RUN_HOME and can be found on PATH", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "relayd-agy-home-"));
+  const binDir = tempBinDir(["agy"]);
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(binDir, { recursive: true, force: true }));
+
+  const fromHome = resolveUnder({ CODEX_RUN_HOME: home, PATH: "", ANTIGRAVITY_BIN: "" });
+  assert.equal(fromHome.antigravityBin, path.join(home, ".local", "bin", "agy"));
+
+  const fromPath = resolveUnder({ CODEX_RUN_HOME: home, PATH: binDir, ANTIGRAVITY_BIN: "" });
+  assert.equal(fromPath.antigravityBin, path.join(binDir, "agy"));
 });
 
 // A PATH entry that cannot be read must not abort resolution.

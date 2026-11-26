@@ -7,13 +7,17 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 
-import { allowedThreadProviders, bedrockRegion, cleanDisplayName, cleanOptionalEndpoint, cleanOptionalFilePath, cleanEnvironmentVariableName, cleanOptionalAwsProfile, codexBin, kimiBin, codexHome, runHome, workspaceBrowseRoot, retiredJobProviders } from "./config.mjs";
+import { allowedThreadProviders, bedrockRegion, cleanDisplayName, cleanOptionalEndpoint, cleanOptionalFilePath, cleanEnvironmentVariableName, cleanOptionalAwsProfile, codexBin, kimiBin, antigravityBin, codexHome, runHome, workspaceBrowseRoot, retiredJobProviders } from "./config.mjs";
 import { AppServerClient } from "./appserver-client.mjs";
 import { claudeEffortLevels } from "./provider-help.mjs";
+import { antigravityEffortLevels, providerEnv } from "./provider-help.mjs";
+import { parseAntigravityModelsOutput } from "./adapters/antigravity.mjs";
 
 const modelCatalog = loadModelCatalog();
 let runtimeCodexModelsCache = { expiresAt: 0, models: null };
 let runtimeCodexModelsRefresh = null;
+let runtimeAntigravityModelsCache = { expiresAt: 0, models: null };
+let runtimeAntigravityModelsRefresh = null;
 
 function loadModelCatalog() {
   const configured = process.env.CODEX_MODEL_CATALOG
@@ -124,6 +128,50 @@ function defaultModelCatalog() {
       effortLevels: ["low", "medium", "high"],
     },
   ];
+  if (fs.existsSync(antigravityBin)) {
+    const effortLevels = ["low", "medium", "high", "xhigh", "max"];
+    catalog.push(
+      {
+        id: "antigravity-cli",
+        label: "Antigravity",
+        provider: "antigravity",
+        modes: ["task"],
+        effortLevels,
+      },
+      {
+        id: "antigravity-gemini-4-neon-high",
+        label: "Antigravity · Gemini 4 Neon (High)",
+        provider: "antigravity",
+        modes: ["task"],
+        taskModel: "gemini-4-neon-high",
+        effortLevels,
+      },
+      {
+        id: "antigravity-gemini-4-carbon-medium",
+        label: "Antigravity · Gemini 4 Carbon (Medium)",
+        provider: "antigravity",
+        modes: ["task"],
+        taskModel: "gemini-4-carbon-medium",
+        effortLevels,
+      },
+      {
+        id: "antigravity-gemini-4-argon-medium",
+        label: "Antigravity · Gemini 4 Argon (Medium)",
+        provider: "antigravity",
+        modes: ["task"],
+        taskModel: "gemini-4-argon-medium",
+        effortLevels,
+      },
+      {
+        id: "antigravity-gemini-3.8-flash-high",
+        label: "Antigravity · Gemini 3.8 Flash (High)",
+        provider: "antigravity",
+        modes: ["task"],
+        taskModel: "gemini-3.8-flash-high",
+        effortLevels,
+      },
+    );
+  }
   if (fs.existsSync(kimiBin)) {
     catalog.push({
       id: "kimi-k3",
@@ -218,7 +266,7 @@ function cleanModelProvider(value) {
   }
   const normalized = value.trim().toLowerCase();
   if (!allowedThreadProviders.has(normalized)) {
-    throw new Error("model provider must be codex, claude, kimi, azure, or bedrock");
+    throw new Error("model provider must be codex, claude, antigravity, kimi, azure, or bedrock");
   }
   return normalized;
 }
@@ -263,19 +311,34 @@ async function publicRuntimeModelCatalog() {
   const configured = publicModelCatalog();
   // Discovery is independent of whether jobs run through exec or app-server.
   // Share refreshes across phone requests and task validation.
+  const refreshes = [];
   if (runtimeCodexModelsCache.expiresAt <= Date.now()) {
     if (!runtimeCodexModelsRefresh) {
       runtimeCodexModelsRefresh = refreshRuntimeCodexModels().finally(() => {
         runtimeCodexModelsRefresh = null;
       });
     }
-    await runtimeCodexModelsRefresh;
+    refreshes.push(runtimeCodexModelsRefresh);
   }
-  return withInstalledClaudeEfforts(
-    runtimeCodexModelsCache.models
-      ? mergeRuntimeCodexModels(configured, runtimeCodexModelsCache.models)
-      : configured,
-  );
+  const wantsAntigravity = fs.existsSync(antigravityBin)
+    && configured.some((entry) => entry.provider === "antigravity");
+  if (wantsAntigravity && runtimeAntigravityModelsCache.expiresAt <= Date.now()) {
+    if (!runtimeAntigravityModelsRefresh) {
+      runtimeAntigravityModelsRefresh = refreshRuntimeAntigravityModels().finally(() => {
+        runtimeAntigravityModelsRefresh = null;
+      });
+    }
+    refreshes.push(runtimeAntigravityModelsRefresh);
+  }
+  if (refreshes.length > 0) await Promise.all(refreshes);
+
+  let merged = runtimeCodexModelsCache.models
+    ? mergeRuntimeCodexModels(configured, runtimeCodexModelsCache.models)
+    : configured;
+  if (wantsAntigravity && runtimeAntigravityModelsCache.models) {
+    merged = mergeRuntimeAntigravityModels(merged, runtimeAntigravityModelsCache.models);
+  }
+  return withInstalledClaudeEfforts(withInstalledAntigravityEfforts(merged));
 }
 
 // Claude Code rows offer the effort levels the INSTALLED CLI accepts, read from
@@ -299,6 +362,68 @@ function withInstalledClaudeEfforts(catalog, readLevels = claudeEffortLevels) {
   const levels = readLevels();
   if (!Array.isArray(levels) || levels.length === 0) return catalog;
   return catalog.map((entry) => (offersEffort(entry) ? { ...entry, effortLevels: [...levels] } : entry));
+}
+
+function withInstalledAntigravityEfforts(catalog, readLevels = antigravityEffortLevels) {
+  const offersEffort = (entry) =>
+    entry.provider === "antigravity"
+    && Array.isArray(entry.modes) && entry.modes.includes("task")
+    && Array.isArray(entry.effortLevels) && entry.effortLevels.length > 0;
+  if (!catalog.some(offersEffort)) return catalog;
+  const levels = readLevels();
+  if (!Array.isArray(levels) || levels.length === 0) return catalog;
+  return catalog.map((entry) => (offersEffort(entry) ? { ...entry, effortLevels: [...levels] } : entry));
+}
+
+async function refreshRuntimeAntigravityModels() {
+  try {
+    const stdout = await new Promise((resolve, reject) => {
+      const child = execFile(antigravityBin, ["models"], {
+        encoding: "utf8",
+        timeout: 10000,
+        env: providerEnv("antigravity"),
+        cwd: runHome,
+      }, (error, out) => {
+        if (error) reject(error);
+        else resolve(out || "");
+      });
+      child.stdin?.end();
+    });
+    const parsed = parseAntigravityModelsOutput(stdout);
+    const models = parsed.map((entry) => runtimeAntigravityDescriptor(entry)).filter(Boolean);
+    if (!models.length) throw new Error("Empty Antigravity model list");
+    runtimeAntigravityModelsCache = { models, expiresAt: Date.now() + 60 * 1000 };
+  } catch {
+    runtimeAntigravityModelsCache.expiresAt = Date.now() + 30 * 1000;
+  }
+}
+
+function runtimeAntigravityDescriptor(entry, effortLevels = ["low", "medium", "high", "xhigh", "max"]) {
+  if (!entry || typeof entry.slug !== "string") return null;
+  const taskModel = entry.slug.trim();
+  if (!/^[A-Za-z0-9._:/-]{1,180}$/.test(taskModel)) return null;
+  const display = cleanDisplayName(entry.label || taskModel, "model label", 120);
+  return {
+    id: `antigravity-${taskModel}`,
+    label: `Antigravity · ${display}`,
+    provider: "antigravity",
+    modes: ["task"],
+    taskModel,
+    effortLevels: [...effortLevels],
+  };
+}
+
+function mergeRuntimeAntigravityModels(configured, runtimeModels) {
+  if (!Array.isArray(runtimeModels) || runtimeModels.length === 0) return configured;
+  const defaultEntry = configured.find((model) => model.provider === "antigravity" && !model.taskModel);
+  const firstIndex = configured.findIndex((model) => model.provider === "antigravity");
+  const antigravityEntries = [...(defaultEntry ? [defaultEntry] : []), ...runtimeModels];
+  if (firstIndex === -1) {
+    return [...configured.filter((model) => model.provider !== "antigravity"), ...antigravityEntries];
+  }
+  const before = configured.slice(0, firstIndex).filter((model) => model.provider !== "antigravity");
+  const after = configured.slice(firstIndex).filter((model) => model.provider !== "antigravity");
+  return [...before, ...antigravityEntries, ...after];
 }
 
 async function refreshRuntimeCodexModels() {
@@ -447,8 +572,12 @@ export {
   publicModelCatalog,
   publicRuntimeModelCatalog,
   withInstalledClaudeEfforts,
+  withInstalledAntigravityEfforts,
   runtimeCodexDescriptor,
   mergeRuntimeCodexModels,
+  parseAntigravityModelsOutput,
+  runtimeAntigravityDescriptor,
+  mergeRuntimeAntigravityModels,
   findCatalogModel,
   validateTaskSelectionFromCatalog,
   validateConfiguredTaskSelection,

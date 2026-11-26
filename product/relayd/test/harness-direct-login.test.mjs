@@ -139,6 +139,7 @@ async function startServer({ claudeScript = PARKED_LOGIN_CLAUDE, withLoginServer
       CODEX_BIN: fakeCodex,
       CLAUDE_BIN: fakeClaude,
       KIMI_BIN: path.join(dir, "missing-kimi"),
+      ANTIGRAVITY_BIN: path.join(dir, "missing-antigravity"),
       ...(callbackPort
         ? {
             RELAYD_HARNESS_CALLBACK_PORTS: JSON.stringify({ codex: callbackPort }),

@@ -1744,6 +1744,15 @@ extension CodexProvider {
                 permissionsTitle: "Claude Code permissions",
                 skillsTitle: "Claude Code skills"
             )
+        case .antigravity:
+            return RelayProviderPresentation(
+                title: "Antigravity",
+                assetName: nil,
+                systemImage: "atom",
+                accent: Color(hex: 0x6EA8FE),
+                permissionsTitle: nil,
+                skillsTitle: "Antigravity skills"
+            )
         case .kimi:
             return RelayProviderPresentation(
                 title: "Kimi K3",
@@ -1860,7 +1869,15 @@ struct RelayProviderBadge: View {
 
         // Server labels sometimes already include the harness (for example
         // "Claude Code · Sonnet"). Keep the badge harness-first without repeating it.
-        let aliases = provider == .claude ? ["Claude Code", "Claude"] : [title]
+        let aliases: [String]
+        switch provider {
+        case .claude:
+            aliases = ["Claude Code", "Claude"]
+        case .antigravity:
+            aliases = ["Google Antigravity", "Antigravity", "agy"]
+        case .codex, .kimi, .bedrock, .azure, .unsupported:
+            aliases = [title]
+        }
         for alias in aliases where detail.lowercased().hasPrefix(alias.lowercased()) {
             let suffix = String(detail.dropFirst(alias.count))
                 .trimmingCharacters(in: CharacterSet(charactersIn: " \t·:-–—"))

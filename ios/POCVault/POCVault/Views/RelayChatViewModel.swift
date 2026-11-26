@@ -231,7 +231,7 @@ struct RelayModelChoice: Identifiable, Hashable {
         switch provider {
         case .claude:
             return "Claude Code"
-        case .codex, .kimi, .bedrock, .azure, .unsupported:
+        case .codex, .antigravity, .kimi, .bedrock, .azure, .unsupported:
             return provider.displayName
         }
     }
@@ -287,6 +287,8 @@ struct RelayModelChoice: Identifiable, Hashable {
             return ["Codex"]
         case .claude:
             return ["Claude Code", "Claude"]
+        case .antigravity:
+            return ["Google Antigravity", "Antigravity", "agy"]
         case .kimi:
             return ["Kimi K3", "Kimi Code", "Kimi"]
         case .bedrock:
@@ -346,8 +348,8 @@ struct RelayModelPickerSections: Hashable {
 }
 
 enum RelayModelDiscovery {
-    static let agentProviderOrder: [CodexProvider] = [.codex, .claude, .kimi, .bedrock, .azure]
-    static let chatProviderOrder: [CodexProvider] = [.codex, .azure, .bedrock, .claude, .kimi]
+    static let agentProviderOrder: [CodexProvider] = [.codex, .claude, .antigravity, .kimi, .bedrock, .azure]
+    static let chatProviderOrder: [CodexProvider] = [.codex, .azure, .bedrock, .claude, .antigravity, .kimi]
 
     /// Build the harness-first picker sections from the server catalog. Catalog order is
     /// preserved within each provider (the server curates it); providers absent from the
@@ -654,7 +656,7 @@ final class RelayChatViewModel: ObservableObject {
 
     var showsSubagentsTab: Bool {
         let provider = currentSessionProvider ?? selectedChoice?.model.provider
-        return provider == .codex || provider == .claude || !subagents.isEmpty
+        return provider == .codex || provider == .claude || provider == .antigravity || !subagents.isEmpty
     }
 
     var conversationTitle: String {
@@ -2793,12 +2795,14 @@ final class RelayChatViewModel: ObservableObject {
         return choices.first
     }
 
-    /// Which task runner executes a model's jobs. Kimi keeps its own runner; Azure
-    /// descriptors fall back to the Codex runner (they are chat-first).
+    /// Which task runner executes a model's jobs. Antigravity and Kimi keep their
+    /// own runners; Azure descriptors fall back to the Codex runner (chat-first).
     nonisolated static func taskProvider(for model: CodexModelDescriptor) -> CodexProvider {
         switch model.provider {
         case .claude, .bedrock:
             return .claude
+        case .antigravity:
+            return .antigravity
         case .kimi:
             return .kimi
         case .codex, .azure:
