@@ -509,6 +509,159 @@ final class NodePairingTests: XCTestCase {
         XCTAssertNil(RelayNodeStore(defaults: defaults).pairedNode)
     }
 
+    /// Pairing a second host must keep both hosts' CA pins, bearer tokens, and
+    /// wake credentials isolated in the Keychain so switching back to the first
+    /// host — or unpairing only the second host — never overwrites or wipes the
+    /// first host's material.
+    @MainActor
+    func testMultiHostPairingAndSwitchingPreservesEachHostsMaterial() throws {
+        let suite = "node-store-multihost-material-tests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let identityStore = ClientIdentityStore(defaults: defaults)
+        identityStore.forgetPairedMaterialForTesting()
+        defer { identityStore.forgetPairedMaterialForTesting() }
+
+        let nodeStore = RelayNodeStore(defaults: defaults)
+
+        let caA = try XCTUnwrap(SecCertificateCreateWithData(nil, Self.caDER as CFData))
+        let caB = try XCTUnwrap(SecCertificateCreateWithData(nil, Self.leafDER as CFData))
+        XCTAssertNotEqual(Self.caDER, Self.leafDER)
+
+        let hostA = RelayPairedNode(
+            nodeID: "node-host-a",
+            nodeName: "Host A",
+            apiBaseURL: try XCTUnwrap(URL(string: "https://host-a.local:8443"))
+        )
+        let hostB = RelayPairedNode(
+            nodeID: "node-host-b",
+            nodeName: "Host B",
+            apiBaseURL: try XCTUnwrap(URL(string: "https://host-b.local:8443"))
+        )
+        let tokenA = RelayPairing.deviceToken(secret: "secret-for-host-a")
+        let tokenB = RelayPairing.deviceToken(secret: "secret-for-host-b")
+        let wakeTokenA = String(repeating: "aa", count: 32)
+        let wakeTokenB = String(repeating: "bb", count: 32)
+
+        // Pair / install Host A.
+        identityStore.installPairedMaterial(
+            caCertificate: caA,
+            host: hostA.host,
+            deviceToken: tokenA,
+            wakeToken: wakeTokenA,
+            nodeID: hostA.nodeID
+        )
+        nodeStore.adopt(hostA)
+
+        // Pair / install Host B.
+        identityStore.installPairedMaterial(
+            caCertificate: caB,
+            host: hostB.host,
+            deviceToken: tokenB,
+            wakeToken: wakeTokenB,
+            nodeID: hostB.nodeID
+        )
+        nodeStore.adopt(hostB)
+
+        // Both hosts remain stored; Host B is currently active.
+        XCTAssertEqual(nodeStore.hosts.map(\.nodeID), [hostA.nodeID, hostB.nodeID])
+        XCTAssertEqual(nodeStore.activeHostID, hostB.nodeID)
+        XCTAssertEqual(nodeStore.pairedNode, hostB)
+        XCTAssertEqual(identityStore.pinnedHost, "host-b.local")
+        XCTAssertEqual(
+            identityStore.pinnedCACertificate.map { SecCertificateCopyData($0) as Data },
+            Self.leafDER
+        )
+        XCTAssertEqual(identityStore.deviceBearerToken, tokenB)
+        XCTAssertEqual(identityStore.wakeCredential()?.nodeID, hostB.nodeID)
+        XCTAssertEqual(identityStore.wakeCredential()?.token, wakeTokenB)
+
+        // Host A's material is already preserved under its host key.
+        XCTAssertEqual(
+            identityStore.pinnedCACertificate(for: "host-a.local").map { SecCertificateCopyData($0) as Data },
+            Self.caDER
+        )
+        XCTAssertEqual(identityStore.deviceToken(for: "host-a.local"), tokenA)
+        XCTAssertEqual(identityStore.wakeCredential(for: "host-a.local")?.nodeID, hostA.nodeID)
+        XCTAssertEqual(identityStore.wakeCredential(for: "host-a.local")?.token, wakeTokenA)
+
+        // Switch back to Host A and verify its active material is restored intact.
+        nodeStore.selectHost(id: hostA.nodeID)
+        identityStore.activateHostMaterial(for: hostA.host)
+
+        XCTAssertEqual(nodeStore.activeHostID, hostA.nodeID)
+        XCTAssertEqual(nodeStore.pairedNode, hostA)
+        XCTAssertEqual(nodeStore.hosts.count, 2)
+        XCTAssertEqual(identityStore.pinnedHost, "host-a.local")
+        XCTAssertEqual(
+            identityStore.pinnedCACertificate.map { SecCertificateCopyData($0) as Data },
+            Self.caDER
+        )
+        XCTAssertEqual(identityStore.deviceBearerToken, tokenA)
+        XCTAssertEqual(identityStore.deviceToken(for: "host-a.local"), tokenA)
+        XCTAssertEqual(identityStore.wakeCredential()?.nodeID, hostA.nodeID)
+        XCTAssertEqual(identityStore.wakeCredential()?.token, wakeTokenA)
+
+        // Fresh instances reloaded from Keychain + UserDefaults agree on both hosts.
+        let reloadedIdentity = ClientIdentityStore(defaults: defaults)
+        let reloadedNodes = RelayNodeStore(defaults: defaults)
+        XCTAssertEqual(reloadedNodes.hosts.map(\.nodeID), [hostA.nodeID, hostB.nodeID])
+        XCTAssertEqual(reloadedNodes.activeHostID, hostA.nodeID)
+        XCTAssertEqual(reloadedIdentity.pinnedHost, "host-a.local")
+        XCTAssertEqual(
+            reloadedIdentity.pinnedCACertificate.map { SecCertificateCopyData($0) as Data },
+            Self.caDER
+        )
+        XCTAssertEqual(reloadedIdentity.deviceBearerToken, tokenA)
+        XCTAssertEqual(reloadedIdentity.wakeCredential()?.nodeID, hostA.nodeID)
+        XCTAssertEqual(reloadedIdentity.wakeCredential()?.token, wakeTokenA)
+        XCTAssertEqual(
+            reloadedIdentity.pinnedCACertificate(for: "host-b.local").map { SecCertificateCopyData($0) as Data },
+            Self.leafDER
+        )
+        XCTAssertEqual(reloadedIdentity.deviceToken(for: "host-b.local"), tokenB)
+        XCTAssertEqual(reloadedIdentity.wakeCredential(for: "host-b.local")?.nodeID, hostB.nodeID)
+        XCTAssertEqual(reloadedIdentity.wakeCredential(for: "host-b.local")?.token, wakeTokenB)
+
+        // Discard only Host B; Host A must remain completely intact.
+        identityStore.discardPairedMaterial(for: "host-b.local")
+        nodeStore.removeHost(id: hostB.nodeID)
+
+        XCTAssertEqual(nodeStore.hosts, [hostA])
+        XCTAssertEqual(nodeStore.activeHostID, hostA.nodeID)
+        XCTAssertEqual(nodeStore.pairedNode, hostA)
+
+        XCTAssertNil(identityStore.pinnedCACertificate(for: "host-b.local"))
+        XCTAssertNil(identityStore.deviceToken(for: "host-b.local"))
+        XCTAssertNil(identityStore.wakeCredential(for: "host-b.local"))
+
+        XCTAssertTrue(identityStore.hasPairedIdentity)
+        XCTAssertEqual(identityStore.pinnedHost, "host-a.local")
+        XCTAssertEqual(
+            identityStore.pinnedCACertificate.map { SecCertificateCopyData($0) as Data },
+            Self.caDER
+        )
+        XCTAssertEqual(identityStore.deviceBearerToken, tokenA)
+        XCTAssertEqual(identityStore.deviceToken(for: "host-a.local"), tokenA)
+        XCTAssertEqual(identityStore.wakeCredential()?.nodeID, hostA.nodeID)
+        XCTAssertEqual(identityStore.wakeCredential()?.token, wakeTokenA)
+
+        let afterDiscardIdentity = ClientIdentityStore(defaults: defaults)
+        XCTAssertNil(afterDiscardIdentity.pinnedCACertificate(for: "host-b.local"))
+        XCTAssertNil(afterDiscardIdentity.deviceToken(for: "host-b.local"))
+        XCTAssertNil(afterDiscardIdentity.wakeCredential(for: "host-b.local"))
+        XCTAssertEqual(afterDiscardIdentity.pinnedHost, "host-a.local")
+        XCTAssertEqual(
+            afterDiscardIdentity.pinnedCACertificate.map { SecCertificateCopyData($0) as Data },
+            Self.caDER
+        )
+        XCTAssertEqual(afterDiscardIdentity.deviceBearerToken, tokenA)
+        XCTAssertEqual(afterDiscardIdentity.wakeCredential()?.nodeID, hostA.nodeID)
+        XCTAssertEqual(afterDiscardIdentity.wakeCredential()?.token, wakeTokenA)
+    }
+
     /// The trial pointer this store used to keep is not migrated, it is
     /// removed: those machines no longer exist, and a dead pointer is a host
     /// the app would otherwise dial.

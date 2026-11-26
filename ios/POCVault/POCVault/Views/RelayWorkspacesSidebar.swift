@@ -367,13 +367,26 @@ struct RelayWorkspacesSidebar: View {
 
     @Environment(\.relayTheme) private var theme
 
+    private enum SidebarSheet: Identifiable {
+        case hostSwitcher
+        case newWorkspace(project: RelaySidebarProjectGroup?, isolation: RelayNewWorkspaceRequest.Isolation)
+
+        var id: String {
+            switch self {
+            case .hostSwitcher:
+                return "host-switcher"
+            case .newWorkspace(let project, let isolation):
+                return "new-workspace-\(project?.id ?? "none")-\(isolation.rawValue)"
+            }
+        }
+    }
+
     @State private var isSearchVisible = false
     @State private var showingInlineSessions = false
     @State private var searchText = ""
-    @State private var showingHostSwitcher = false
-    @State private var showingNewWorkspaceSheet = false
-    @State private var newWorkspacePreselectedProject: RelaySidebarProjectGroup?
-    @State private var newWorkspaceInitialIsolation: RelayNewWorkspaceRequest.Isolation = .newGitWorktree
+    @State private var activeSheet: SidebarSheet?
+    @State private var pendingAddHost = false
+    @State private var pendingSelectHost: RelayPairedNode?
     @State private var workspacePendingArchive: RelaySidebarWorkspaceItem?
 
     init(
@@ -536,39 +549,41 @@ struct RelayWorkspacesSidebar: View {
         }
         .background(theme.surfaceSidebar.ignoresSafeArea(edges: .vertical))
         .accessibilityIdentifier("relay-workspaces-sidebar")
-        .sheet(isPresented: $showingHostSwitcher) {
-            RelayHostSwitcherSheet(
-                nodeStore: nodeStore,
-                identityStore: identityStore,
-                powerModel: powerModel,
-                onSelectHost: { host in
-                    showingHostSwitcher = false
-                    onSelectHost?(host)
-                },
-                onAddHost: {
-                    showingHostSwitcher = false
-                    onAddHost?()
-                }
-            )
-            .presentationDetents([.medium, .large])
-            .presentationDragIndicator(.visible)
-        }
-        .sheet(isPresented: $showingNewWorkspaceSheet) {
-            RelayNewWorkspaceSheet(
-                projects: effectiveProjects,
-                preselectedProject: newWorkspacePreselectedProject,
-                initialIsolation: newWorkspaceInitialIsolation,
-                onSubmit: { request in
-                    showingNewWorkspaceSheet = false
-                    if let onCreateWorkspace {
-                        onCreateWorkspace(request)
-                    } else {
-                        onNewChat?()
+        .sheet(item: $activeSheet, onDismiss: handleSheetDismiss) { sheet in
+            switch sheet {
+            case .hostSwitcher:
+                RelayHostSwitcherSheet(
+                    nodeStore: nodeStore,
+                    identityStore: identityStore,
+                    powerModel: powerModel,
+                    onSelectHost: { host in
+                        pendingSelectHost = host
+                        activeSheet = nil
+                    },
+                    onAddHost: {
+                        pendingAddHost = true
+                        activeSheet = nil
                     }
-                }
-            )
-            .presentationDetents([.medium, .large])
-            .presentationDragIndicator(.visible)
+                )
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+            case .newWorkspace(let preselectedProject, let initialIsolation):
+                RelayNewWorkspaceSheet(
+                    projects: effectiveProjects,
+                    preselectedProject: preselectedProject,
+                    initialIsolation: initialIsolation,
+                    onSubmit: { request in
+                        activeSheet = nil
+                        if let onCreateWorkspace {
+                            onCreateWorkspace(request)
+                        } else {
+                            onNewChat?()
+                        }
+                    }
+                )
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+            }
         }
         .confirmationDialog(
             "Archive \(workspacePendingArchive?.displayTitle ?? "workspace")?",
@@ -1198,7 +1213,7 @@ struct RelayWorkspacesSidebar: View {
 
             HStack(spacing: 4) {
                 Button {
-                    showingHostSwitcher = true
+                    activeSheet = .hostSwitcher
                 } label: {
                     HStack(spacing: 8) {
                         RelayStatusDot(bucket: activeHostStatusBucket, size: 7)
@@ -1257,9 +1272,25 @@ struct RelayWorkspacesSidebar: View {
         for project: RelaySidebarProjectGroup?,
         isolation: RelayNewWorkspaceRequest.Isolation
     ) {
-        newWorkspacePreselectedProject = project ?? effectiveProjects.first
-        newWorkspaceInitialIsolation = isolation
-        showingNewWorkspaceSheet = true
+        activeSheet = .newWorkspace(
+            project: project ?? effectiveProjects.first,
+            isolation: isolation
+        )
+    }
+
+    private func handleSheetDismiss() {
+        if pendingAddHost {
+            pendingAddHost = false
+            onAddHost?()
+        } else if let host = pendingSelectHost {
+            pendingSelectHost = nil
+            if let onSelectHost {
+                onSelectHost(host)
+            } else if host.nodeID != nodeStore.activeHostID {
+                identityStore?.activateHostMaterial(for: host.host ?? host.nodeID)
+                nodeStore.selectHost(id: host.nodeID)
+            }
+        }
     }
 
     private func handleArchiveRequest(_ workspace: RelaySidebarWorkspaceItem) {
@@ -1511,6 +1542,11 @@ struct RelayHostSwitcherSheet: View {
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.relayTheme) private var theme
+    @State private var showingStopConfirm = false
+
+    private var activeHostName: String {
+        nodeStore.pairedNode?.nodeName.trimmedNonEmpty ?? "this machine"
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1551,10 +1587,6 @@ struct RelayHostSwitcherSheet: View {
                                     subtitle: host.apiBaseURL.host ?? host.apiBaseURL.absoluteString,
                                     showsTopDivider: index > 0,
                                     action: {
-                                        if !isActive {
-                                            identityStore?.activateHostMaterial(for: host.host ?? host.nodeID)
-                                            nodeStore.selectHost(id: host.nodeID)
-                                        }
                                         onSelectHost(host)
                                     }
                                 ) {
@@ -1579,7 +1611,7 @@ struct RelayHostSwitcherSheet: View {
                             RelaySettingsCard {
                                 RelayMachinePowerSwitch(
                                     model: powerModel,
-                                    confirmStop: { Task { await powerModel.stop() } },
+                                    confirmStop: { showingStopConfirm = true },
                                     accessibilityIdentifier: "relay-host-switcher-power"
                                 )
                                 .padding(.horizontal, 16)
@@ -1608,6 +1640,7 @@ struct RelayHostSwitcherSheet: View {
                         isFullWidth: true,
                         action: onAddHost
                     )
+                    .accessibilityIdentifier("relay-host-switcher-add-host")
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 16)
@@ -1617,6 +1650,19 @@ struct RelayHostSwitcherSheet: View {
         }
         .background(theme.surface0.ignoresSafeArea())
         .preferredColorScheme(theme.colorScheme)
+        .confirmationDialog(
+            "Stop \(activeHostName)?",
+            isPresented: $showingStopConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Stop machine", role: .destructive) {
+                guard let powerModel else { return }
+                Task { await powerModel.stop() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Runs stop. Pairing stays on disk. Start it again from this phone when you need it.")
+        }
     }
 
     private func statusBucket(for host: RelayPairedNode, isActive: Bool) -> RelayStatusBucket {

@@ -14,7 +14,9 @@ struct NodePairingView: View {
     /// see `Step.paired`.
     let onDismiss: () -> Void
 
+    @Environment(\.relayTheme) private var theme
     @State private var showingManualEntry = false
+    @State private var pasteNotice: String?
 
     init(
         identityStore: ClientIdentityStore,
@@ -37,7 +39,7 @@ struct NodePairingView: View {
     var body: some View {
         NavigationStack {
             ZStack {
-                AppTheme.canvasGradient.ignoresSafeArea()
+                theme.surface0.ignoresSafeArea()
                 content
             }
             .navigationTitle("")
@@ -51,10 +53,12 @@ struct NodePairingView: View {
             // confirmation code happens from the root, where it survives this
             // screen being replaced.
             .onChange(of: model.step) { _, step in
+                if step != .entry { pasteNotice = nil }
                 if case .paired = step { onDismiss() }
             }
         }
-        .preferredColorScheme(.dark)
+        .tint(theme.accentBright)
+        .preferredColorScheme(theme.colorScheme)
         .accessibilityIdentifier("relay-node-pairing")
     }
 
@@ -88,16 +92,16 @@ struct NodePairingView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text("Connect your machine")
-                            .font(AppTheme.uiFont(size: 31, weight: .semibold))
-                            .foregroundStyle(AppTheme.textPrimary)
+                            .font(RelayTheme.uiFont(31, weight: .semibold))
+                            .foregroundStyle(theme.foreground)
                         RelayInfoButton(
                             title: "Pairing",
                             message: "The code carries your machine's address and the fingerprint of its certificate authority, so this phone can verify the very first connection. Nothing is sent to Relay."
                         )
                     }
                     Text("On the computer or server you want to work from, run `relayd pair`. Scan the QR code it prints.")
-                        .font(AppTheme.uiFont(size: 16))
-                        .foregroundStyle(AppTheme.textSecondary)
+                        .font(RelayTheme.uiFont(16))
+                        .foregroundStyle(theme.foregroundMuted)
                         .lineSpacing(4)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -140,36 +144,63 @@ struct NodePairingView: View {
     private var cameraUnavailable: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Camera unavailable")
-                .font(AppTheme.uiFont(size: 17, weight: .semibold))
-                .foregroundStyle(AppTheme.textPrimary)
-            Text("Relay uses the camera to scan the pairing code. You can enter it by hand instead.")
-                .font(AppTheme.uiFont(size: 14))
-                .foregroundStyle(AppTheme.textSecondary)
+                .font(RelayTheme.uiFont(17, weight: .semibold))
+                .foregroundStyle(theme.foreground)
+            Text("Relay uses the camera to scan the pairing code. You can paste the pairing link or enter it by hand instead.")
+                .font(RelayTheme.uiFont(14))
+                .foregroundStyle(theme.foregroundMuted)
             if let url = URL(string: UIApplication.openSettingsURLString) {
                 Link("Open Settings", destination: url)
-                    .font(AppTheme.uiFont(size: 15, weight: .semibold))
-                    .foregroundStyle(AppTheme.accent)
+                    .font(RelayTheme.uiFont(15, weight: .semibold))
+                    .foregroundStyle(theme.accentBright)
             }
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(AppTheme.textPrimary.opacity(0.05), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .background(theme.surface1, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(theme.border, lineWidth: 1)
+        }
     }
 
-    // MARK: Type it instead
+    // MARK: Paste or type it instead
 
     private var manualEntry: some View {
         VStack(alignment: .leading, spacing: 14) {
+            RelayButton(
+                "Paste pairing link",
+                variant: .outline,
+                systemImage: "doc.on.clipboard",
+                isFullWidth: true
+            ) {
+                if let pasted = UIPasteboard.general.string?.trimmedNonEmpty {
+                    pasteNotice = nil
+                    Task { await model.submitScanned(pasted) }
+                } else {
+                    pasteNotice = "Clipboard is empty — copy the link printed by `relayd pair`, or scan the QR code."
+                }
+            }
+            .accessibilityIdentifier("relay-pair-paste-link")
+
+            if let pasteNotice {
+                Text(pasteNotice)
+                    .font(RelayTheme.uiFont(13))
+                    .foregroundStyle(theme.statusWarning)
+                    .lineSpacing(3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             Button {
                 withAnimation(.easeInOut(duration: 0.18)) { showingManualEntry.toggle() }
             } label: {
                 HStack(spacing: 6) {
                     Text("Enter it by hand")
                     Image(systemName: showingManualEntry ? "chevron.up" : "chevron.down")
-                        .font(AppTheme.uiFont(size: 12, weight: .semibold))
+                        .font(RelayTheme.uiFont(12, weight: .semibold))
                 }
-                .font(AppTheme.uiFont(size: 14, weight: .semibold))
-                .foregroundStyle(AppTheme.textSecondary)
+                .font(RelayTheme.uiFont(14, weight: .semibold))
+                .foregroundStyle(theme.foregroundMuted)
             }
             .buttonStyle(.plain)
             .accessibilityIdentifier("relay-pair-manual-toggle")
@@ -202,25 +233,28 @@ struct NodePairingView: View {
                     )
 
                     Text("`relayd pair` prints all three. The token is the credential — not the short code, which is only for comparing afterwards. Relay needs the fingerprint too, because a typed token carries no way to check your machine's certificate, and an app that offers to trust an unknown certificate on a tap is an app that trusts anything.")
-                        .font(AppTheme.uiFont(size: 12))
-                        .foregroundStyle(AppTheme.textTertiary)
+                        .font(RelayTheme.uiFont(12))
+                        .foregroundStyle(theme.foregroundExtraMuted)
                         .lineSpacing(3)
                         .fixedSize(horizontal: false, vertical: true)
 
                     if let problem = model.manualEntryProblem, !model.manualToken.isEmpty {
                         Text(problem.message)
-                            .font(AppTheme.uiFont(size: 12))
-                            .foregroundStyle(AppTheme.statusWarn)
+                            .font(RelayTheme.uiFont(12))
+                            .foregroundStyle(theme.statusWarning)
                             .lineSpacing(3)
                             .fixedSize(horizontal: false, vertical: true)
                             .accessibilityIdentifier("relay-pair-manual-problem")
                     }
 
-                    Button("Pair machine") {
+                    RelayButton(
+                        "Pair machine",
+                        variant: .primary,
+                        isFullWidth: true,
+                        isDisabled: !model.isManualEntryComplete
+                    ) {
                         Task { await model.submitManualEntry() }
                     }
-                    .buttonStyle(RelayPrimaryButtonStyle(isEnabled: model.isManualEntryComplete))
-                    .disabled(!model.isManualEntryComplete)
                     .accessibilityIdentifier("relay-pair-manual-submit")
                 }
             }
@@ -238,16 +272,20 @@ struct NodePairingView: View {
     ) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title)
-                .font(AppTheme.uiFont(size: 13, weight: .semibold))
-                .foregroundStyle(AppTheme.textSecondary)
+                .font(RelayTheme.uiFont(13, weight: .semibold))
+                .foregroundStyle(theme.foregroundMuted)
             TextField(placeholder, text: text)
-                .font(mono ? AppTheme.monoFont(size: 15) : AppTheme.uiFont(size: 15))
-                .foregroundStyle(AppTheme.textPrimary)
+                .font(mono ? RelayTheme.monoFont(15) : RelayTheme.uiFont(15))
+                .foregroundStyle(theme.foreground)
                 .textInputAutocapitalization(autocapitalizes ? .characters : .never)
                 .autocorrectionDisabled()
                 .keyboardType(keyboard)
                 .padding(12)
-                .background(AppTheme.textPrimary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .background(theme.surface1, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(theme.border, lineWidth: 1)
+                }
                 .accessibilityIdentifier(identifier)
         }
     }
@@ -258,14 +296,14 @@ struct NodePairingView: View {
         VStack(spacing: 14) {
             Spacer()
             if showsProgress {
-                ProgressView().tint(AppTheme.accent)
+                ProgressView().tint(theme.accentBright)
             }
             Text(title)
-                .font(AppTheme.uiFont(size: 28, weight: .semibold))
-                .foregroundStyle(AppTheme.textPrimary)
+                .font(RelayTheme.uiFont(28, weight: .semibold))
+                .foregroundStyle(theme.foreground)
             Text(detail)
-                .font(AppTheme.uiFont(size: 15))
-                .foregroundStyle(AppTheme.textSecondary)
+                .font(RelayTheme.uiFont(15))
+                .foregroundStyle(theme.foregroundMuted)
                 .multilineTextAlignment(.center)
                 .lineSpacing(3)
             Spacer()
@@ -279,24 +317,28 @@ struct NodePairingView: View {
             Spacer()
             Image(systemName: isSecurityEvent ? "exclamationmark.shield" : "exclamationmark.triangle")
                 .font(.system(size: 32, weight: .medium))
-                .foregroundStyle(isSecurityEvent ? AppTheme.statusError : AppTheme.statusWarn)
+                .foregroundStyle(isSecurityEvent ? theme.statusDanger : theme.statusWarning)
             Text(isSecurityEvent ? "Pairing stopped" : "Couldn't pair")
-                .font(AppTheme.uiFont(size: 28, weight: .semibold))
-                .foregroundStyle(AppTheme.textPrimary)
+                .font(RelayTheme.uiFont(28, weight: .semibold))
+                .foregroundStyle(theme.foreground)
             Text(message)
-                .font(AppTheme.uiFont(size: 15))
-                .foregroundStyle(AppTheme.textSecondary)
+                .font(RelayTheme.uiFont(15))
+                .foregroundStyle(theme.foregroundMuted)
                 .lineSpacing(4)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer()
             // A security failure gets no one-tap retry: retrying against the
             // same attacker is exactly the wrong reflex, and the code is spent
             // either way.
-            Button(isSecurityEvent ? "Start over" : "Try again") { model.retry() }
-                .buttonStyle(isSecurityEvent
-                    ? AnyButtonStyleBox(RelayOutlineButtonStyle())
-                    : AnyButtonStyleBox(RelayPrimaryButtonStyle(isEnabled: true)))
-                .accessibilityIdentifier("relay-pair-retry")
+            RelayButton(
+                isSecurityEvent ? "Start over" : "Try again",
+                variant: isSecurityEvent ? .outline : .primary,
+                isFullWidth: true
+            ) {
+                pasteNotice = nil
+                model.retry()
+            }
+            .accessibilityIdentifier("relay-pair-retry")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(28)
@@ -335,12 +377,13 @@ struct NodeVerificationView: View {
     let code: String
     let onUnpair: () -> Void
 
+    @Environment(\.relayTheme) private var theme
     @State private var showingMismatch = false
 
     var body: some View {
         NavigationStack {
             ZStack {
-                AppTheme.canvasGradient.ignoresSafeArea()
+                theme.surface0.ignoresSafeArea()
                 if showingMismatch {
                     mismatchBody
                 } else {
@@ -350,7 +393,8 @@ struct NodeVerificationView: View {
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
         }
-        .preferredColorScheme(.dark)
+        .tint(theme.accentBright)
+        .preferredColorScheme(theme.colorScheme)
         .interactiveDismissDisabled()
         .accessibilityIdentifier("relay-node-verification")
     }
@@ -360,33 +404,33 @@ struct NodeVerificationView: View {
             Spacer()
 
             Text("Check the code")
-                .font(AppTheme.uiFont(size: 30, weight: .semibold))
-                .foregroundStyle(AppTheme.textPrimary)
+                .font(RelayTheme.uiFont(30, weight: .semibold))
+                .foregroundStyle(theme.foreground)
 
             Text(code)
-                .font(AppTheme.monoFont(size: 40, weight: .medium))
+                .font(RelayTheme.monoFont(40, weight: .medium))
                 .tracking(4)
-                .foregroundStyle(AppTheme.accent)
+                .foregroundStyle(theme.accentBright)
                 .padding(.vertical, 18)
                 .frame(maxWidth: .infinity)
-                .background(AppTheme.textPrimary.opacity(0.05), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .background(theme.surface1, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                 .overlay {
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .stroke(AppTheme.hairlineStrong, lineWidth: 1)
+                        .strokeBorder(theme.borderAccent, lineWidth: 1)
                 }
                 .accessibilityLabel("Confirmation code \(code.map(String.init).joined(separator: " "))")
                 .accessibilityIdentifier("relay-verification-code")
 
             Text("Confirm this matches the code shown in your terminal.")
-                .font(AppTheme.uiFont(size: 16))
-                .foregroundStyle(AppTheme.textSecondary)
+                .font(RelayTheme.uiFont(16))
+                .foregroundStyle(theme.foregroundMuted)
                 .multilineTextAlignment(.center)
                 .lineSpacing(4)
                 .fixedSize(horizontal: false, vertical: true)
 
             Text("Your machine is already connected — this is a check, not a gate. It catches the one thing the pairing itself cannot: that the machine which answered is the one in front of you.")
-                .font(AppTheme.uiFont(size: 12))
-                .foregroundStyle(AppTheme.textTertiary)
+                .font(RelayTheme.uiFont(12))
+                .foregroundStyle(theme.foregroundExtraMuted)
                 .multilineTextAlignment(.center)
                 .lineSpacing(3)
                 .fixedSize(horizontal: false, vertical: true)
@@ -395,15 +439,16 @@ struct NodeVerificationView: View {
             Spacer()
 
             VStack(spacing: 12) {
-                Button("It matches") { nodeStore.confirmVerification() }
-                    .buttonStyle(RelayPrimaryButtonStyle(isEnabled: true))
-                    .accessibilityIdentifier("relay-verification-confirm")
+                RelayButton("It matches", variant: .primary, isFullWidth: true) {
+                    nodeStore.confirmVerification()
+                }
+                .accessibilityIdentifier("relay-verification-confirm")
 
                 Button("It doesn't match") {
                     withAnimation(.easeInOut(duration: 0.18)) { showingMismatch = true }
                 }
-                .font(AppTheme.uiFont(size: 15, weight: .semibold))
-                .foregroundStyle(AppTheme.statusError)
+                .font(RelayTheme.uiFont(15, weight: .semibold))
+                .foregroundStyle(theme.statusDanger)
                 .frame(maxWidth: .infinity)
                 .accessibilityIdentifier("relay-verification-mismatch")
             }
@@ -416,38 +461,43 @@ struct NodeVerificationView: View {
             Spacer()
             Image(systemName: "exclamationmark.shield")
                 .font(.system(size: 32, weight: .medium))
-                .foregroundStyle(AppTheme.statusError)
+                .foregroundStyle(theme.statusDanger)
             Text("Unpair and revoke")
-                .font(AppTheme.uiFont(size: 28, weight: .semibold))
-                .foregroundStyle(AppTheme.textPrimary)
+                .font(RelayTheme.uiFont(28, weight: .semibold))
+                .foregroundStyle(theme.foreground)
             Text("Something else answered the pairing request. This phone already holds a credential it issued, so removing it here is only half the job — revoke it on your machine as well.")
-                .font(AppTheme.uiFont(size: 15))
-                .foregroundStyle(AppTheme.textSecondary)
+                .font(RelayTheme.uiFont(15))
+                .foregroundStyle(theme.foregroundMuted)
                 .lineSpacing(4)
                 .fixedSize(horizontal: false, vertical: true)
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("On your machine")
-                    .font(AppTheme.uiFont(size: 12, weight: .semibold))
-                    .foregroundStyle(AppTheme.textTertiary)
+                    .font(RelayTheme.uiFont(12, weight: .semibold))
+                    .foregroundStyle(theme.foregroundExtraMuted)
                 Text(revokeCommand)
-                    .font(AppTheme.monoFont(size: 13))
-                    .foregroundStyle(AppTheme.textPrimary)
+                    .font(RelayTheme.monoFont(13))
+                    .foregroundStyle(theme.foreground)
                     .textSelection(.enabled)
                     .padding(12)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(AppTheme.textPrimary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .background(theme.surface1, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(theme.border, lineWidth: 1)
+                    }
             }
 
             Spacer()
-            Button("Unpair this phone", role: .destructive) { onUnpair() }
-                .buttonStyle(RelayPrimaryButtonStyle(isEnabled: true))
-                .accessibilityIdentifier("relay-verification-unpair")
+            RelayButton("Unpair this phone", variant: .destructive, isFullWidth: true) {
+                onUnpair()
+            }
+            .accessibilityIdentifier("relay-verification-unpair")
             Button("Back") {
                 withAnimation(.easeInOut(duration: 0.18)) { showingMismatch = false }
             }
-            .font(AppTheme.uiFont(size: 15))
-            .foregroundStyle(AppTheme.textSecondary)
+            .font(RelayTheme.uiFont(15))
+            .foregroundStyle(theme.foregroundMuted)
             .frame(maxWidth: .infinity)
         }
         .frame(maxWidth: .infinity, alignment: .leading)

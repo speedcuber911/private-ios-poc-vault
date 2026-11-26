@@ -45,9 +45,62 @@ private struct RelayDiffLineTarget: Identifiable, Hashable {
     }
 }
 
-private struct RelayGitSafariURL: Identifiable {
-    let id = UUID()
-    let url: URL
+private enum RelayGitDiffSheet: Identifiable {
+    case branchSwitcher
+    case commit(pushDefault: Bool)
+    case jumpToFile
+    case commitDiff(RelayGitCommit)
+    case review(RelayDiffLineTarget)
+    case safari(URL)
+
+    var id: String {
+        switch self {
+        case .branchSwitcher:
+            return "branchSwitcher"
+        case .commit(let pushDefault):
+            return "commit:\(pushDefault)"
+        case .jumpToFile:
+            return "jumpToFile"
+        case .commitDiff(let commit):
+            return "commitDiff:\(commit.id)"
+        case .review(let target):
+            return "review:\(target.id)"
+        case .safari(let url):
+            return "safari:\(url.absoluteString)"
+        }
+    }
+}
+
+private enum RelayGitDiffAlert: Identifiable {
+    case discardFile(RelayGitDiffFile)
+    case discardAll
+
+    var id: String {
+        switch self {
+        case .discardFile(let file):
+            return "discardFile:\(file.id)"
+        case .discardAll:
+            return "discardAll"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .discardFile:
+            return "Discard changes?"
+        case .discardAll:
+            return "Discard all uncommitted changes?"
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .discardFile(let file):
+            return "Revert uncommitted changes in \(file.path)? This cannot be undone."
+        case .discardAll:
+            return "This reverts every modified file in this workspace. This cannot be undone."
+        }
+    }
 }
 
 // MARK: - ViewModel
@@ -354,16 +407,10 @@ struct RelayGitDiffView: View {
     private let onSendReviewComment: ((String) -> Void)?
     private let onHorizontalDragActive: ((Bool) -> Void)?
 
-    @State private var showingBranchSwitcher = false
-    @State private var showingCommitSheet = false
-    @State private var commitSheetPushDefault = false
-    @State private var showingJumpToFile = false
-    @State private var selectedCommit: RelayGitCommit?
-    @State private var pendingDiscardFile: RelayGitDiffFile?
-    @State private var showingDiscardAllConfirm = false
-    @State private var safariTarget: RelayGitSafariURL?
-    @State private var reviewTarget: RelayDiffLineTarget?
+    @State private var activeSheet: RelayGitDiffSheet?
+    @State private var activeAlert: RelayGitDiffAlert?
     @State private var pendingScrollFilePath: String?
+    @State private var pendingOpenFileAfterSheetDismiss: String?
 
     init(
         workspacePath: String,
@@ -403,79 +450,104 @@ struct RelayGitDiffView: View {
         .task {
             await viewModel.loadIfNeeded()
         }
-        .sheet(isPresented: $showingBranchSwitcher) {
-            RelayBranchSwitcherSheet(
-                currentBranch: viewModel.activeBranchName,
-                branchesResponse: viewModel.branchesResponse,
-                isLoading: viewModel.isLoadingBranches,
-                onReload: { await viewModel.loadBranches() },
-                onSelectBranch: { name, create in
-                    await viewModel.checkoutBranch(name, create: create)
-                }
-            )
-        }
-        .sheet(isPresented: $showingCommitSheet) {
-            RelayGitCommitSheet(
-                branchName: viewModel.activeBranchName,
-                changedFileCount: viewModel.status?.files.count ?? viewModel.diffFiles.count,
-                added: viewModel.status?.added ?? viewModel.diff?.totalAdded ?? 0,
-                deleted: viewModel.status?.deleted ?? viewModel.diff?.totalDeleted ?? 0,
-                pushByDefault: commitSheetPushDefault,
-                onCommit: { message, stageAll, push in
-                    await viewModel.commitChanges(message: message, stageAll: stageAll, push: push)
-                }
-            )
-        }
-        .sheet(isPresented: $showingJumpToFile) {
-            RelayJumpToFileSheet(files: viewModel.diffFiles) { path in
-                viewModel.expandFile(path)
-                pendingScrollFilePath = path
+        .onChange(of: activeSheet?.id) { _, id in
+            if id != nil {
+                onHorizontalDragActive?(false)
             }
         }
-        .sheet(item: $selectedCommit) { commit in
-            RelayCommitDiffSheet(
-                commit: commit,
-                fetchDiff: { try await viewModel.fetchCommitDiff(sha: commit.sha) },
-                onOpenFile: onOpenFile,
-                onAttachFileToChat: onAttachFileToChat,
-                onSendReviewComment: onSendReviewComment
-            )
-        }
-        .sheet(item: $reviewTarget) { target in
-            RelayDiffReviewCommentSheet(target: target) { formatted in
-                onSendReviewComment?(formatted)
+        .onChange(of: activeAlert?.id) { _, id in
+            if id != nil {
+                onHorizontalDragActive?(false)
             }
         }
-        .sheet(item: $safariTarget) { target in
-            RelayGitSafariSheet(url: target.url)
-                .ignoresSafeArea()
+        .onDisappear {
+            onHorizontalDragActive?(false)
+        }
+        .sheet(item: $activeSheet, onDismiss: {
+            if let path = pendingOpenFileAfterSheetDismiss {
+                pendingOpenFileAfterSheetDismiss = nil
+                onOpenFile?(path)
+            }
+        }) { sheet in
+            switch sheet {
+            case .branchSwitcher:
+                RelayBranchSwitcherSheet(
+                    currentBranch: viewModel.activeBranchName,
+                    branchesResponse: viewModel.branchesResponse,
+                    isLoading: viewModel.isLoadingBranches,
+                    onReload: { await viewModel.loadBranches() },
+                    onSelectBranch: { name, create in
+                        await viewModel.checkoutBranch(name, create: create)
+                    }
+                )
+            case .commit(let pushDefault):
+                RelayGitCommitSheet(
+                    branchName: viewModel.activeBranchName,
+                    changedFileCount: viewModel.status?.files.count ?? viewModel.diffFiles.count,
+                    added: viewModel.status?.added ?? viewModel.diff?.totalAdded ?? 0,
+                    deleted: viewModel.status?.deleted ?? viewModel.diff?.totalDeleted ?? 0,
+                    pushByDefault: pushDefault,
+                    onCommit: { message, stageAll, push in
+                        await viewModel.commitChanges(message: message, stageAll: stageAll, push: push)
+                    }
+                )
+            case .jumpToFile:
+                RelayJumpToFileSheet(files: viewModel.diffFiles) { path in
+                    viewModel.expandFile(path)
+                    pendingScrollFilePath = path
+                }
+            case .commitDiff(let commit):
+                RelayCommitDiffSheet(
+                    commit: commit,
+                    fetchDiff: { try await viewModel.fetchCommitDiff(sha: commit.sha) },
+                    onOpenFile: onOpenFile == nil ? nil : { path in
+                        pendingOpenFileAfterSheetDismiss = path
+                        activeSheet = nil
+                    },
+                    onAttachFileToChat: onAttachFileToChat == nil ? nil : { path in
+                        activeSheet = nil
+                        onAttachFileToChat?(path)
+                    },
+                    onSendReviewComment: onSendReviewComment
+                )
+            case .review(let target):
+                RelayDiffReviewCommentSheet(target: target) { formatted in
+                    onSendReviewComment?(formatted)
+                }
+            case .safari(let url):
+                RelayGitSafariSheet(url: url)
+                    .ignoresSafeArea()
+            }
         }
         .alert(
-            "Discard changes?",
+            activeAlert?.title ?? "",
             isPresented: Binding(
-                get: { pendingDiscardFile != nil },
-                set: { if !$0 { pendingDiscardFile = nil } }
+                get: { activeAlert != nil },
+                set: { if !$0 { activeAlert = nil } }
             ),
-            presenting: pendingDiscardFile
-        ) { file in
-            Button("Discard", role: .destructive) {
-                let paths = [file.path, file.oldPath].compactMap { $0 }
-                pendingDiscardFile = nil
-                Task { await viewModel.discardFiles(paths) }
+            presenting: activeAlert
+        ) { alert in
+            switch alert {
+            case .discardFile(let file):
+                Button("Discard", role: .destructive) {
+                    let paths = [file.path, file.oldPath].compactMap { $0 }
+                    activeAlert = nil
+                    Task { await viewModel.discardFiles(paths) }
+                }
+                Button("Cancel", role: .cancel) {
+                    activeAlert = nil
+                }
+            case .discardAll:
+                Button("Discard all", role: .destructive) {
+                    activeAlert = nil
+                    Task { await viewModel.discardAllChanges() }
+                }
+                Button("Cancel", role: .cancel) {
+                    activeAlert = nil
+                }
             }
-            Button("Cancel", role: .cancel) {
-                pendingDiscardFile = nil
-            }
-        } message: { file in
-            Text("Revert uncommitted changes in \(file.path)? This cannot be undone.")
-        }
-        .alert("Discard all uncommitted changes?", isPresented: $showingDiscardAllConfirm) {
-            Button("Discard all", role: .destructive) {
-                Task { await viewModel.discardAllChanges() }
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("This reverts every modified file in this workspace. This cannot be undone.")
+        } message: { alert in
+            Text(alert.message)
         }
     }
 
@@ -484,7 +556,7 @@ struct RelayGitDiffView: View {
     private var branchActionBar: some View {
         HStack(spacing: 10) {
             Button {
-                showingBranchSwitcher = true
+                activeSheet = .branchSwitcher
                 Task { await viewModel.loadBranches() }
             } label: {
                 HStack(spacing: 6) {
@@ -538,7 +610,7 @@ struct RelayGitDiffView: View {
             if let pr {
                 Button {
                     if let url = pr.resolvedURL {
-                        safariTarget = RelayGitSafariURL(url: url)
+                        activeSheet = .safari(url)
                     } else {
                         UIPasteboard.general.string = pr.url
                     }
@@ -560,8 +632,7 @@ struct RelayGitDiffView: View {
                 .accessibilityLabel("Open \(pr.shortLabel)")
             } else {
                 Button {
-                    commitSheetPushDefault = false
-                    showingCommitSheet = true
+                    activeSheet = .commit(pushDefault: false)
                 } label: {
                     HStack(spacing: 5) {
                         if viewModel.isPerformingAction {
@@ -596,7 +667,7 @@ struct RelayGitDiffView: View {
                 if let pr {
                     if let url = pr.resolvedURL {
                         Button {
-                            safariTarget = RelayGitSafariURL(url: url)
+                            activeSheet = .safari(url)
                         } label: {
                             Label("Open \(pr.shortLabel)", systemImage: "safari")
                         }
@@ -610,16 +681,14 @@ struct RelayGitDiffView: View {
                 }
 
                 Button {
-                    commitSheetPushDefault = false
-                    showingCommitSheet = true
+                    activeSheet = .commit(pushDefault: false)
                 } label: {
                     Label("Commit…", systemImage: "checkmark.circle")
                 }
                 .disabled(!isDirty)
 
                 Button {
-                    commitSheetPushDefault = true
-                    showingCommitSheet = true
+                    activeSheet = .commit(pushDefault: true)
                 } label: {
                     Label("Commit & Push…", systemImage: "arrow.up.circle")
                 }
@@ -634,7 +703,7 @@ struct RelayGitDiffView: View {
                 if isDirty {
                     Divider()
                     Button(role: .destructive) {
-                        showingDiscardAllConfirm = true
+                        activeAlert = .discardAll
                     } label: {
                         Label("Discard all changes…", systemImage: "arrow.uturn.backward")
                     }
@@ -728,7 +797,7 @@ struct RelayGitDiffView: View {
                         isActive: false,
                         isDisabled: viewModel.diffFiles.isEmpty
                     ) {
-                        showingJumpToFile = true
+                        activeSheet = .jumpToFile
                     }
 
                     toolbarIconButton(
@@ -879,10 +948,10 @@ struct RelayGitDiffView: View {
                 onToggleCollapse: { viewModel.toggleFileCollapsed($0) },
                 onOpenFile: onOpenFile,
                 onAttachFileToChat: onAttachFileToChat,
-                onDiscardFile: { pendingDiscardFile = $0 },
+                onDiscardFile: { activeAlert = .discardFile($0) },
                 onTapLine: { target in
                     guard onSendReviewComment != nil else { return }
-                    reviewTarget = target
+                    activeSheet = .review(target)
                 },
                 onHorizontalDragActive: onHorizontalDragActive,
                 onRefresh: { await viewModel.refresh() }
@@ -964,7 +1033,7 @@ struct RelayGitDiffView: View {
                 LazyVStack(spacing: 0) {
                     ForEach(viewModel.commits) { commit in
                         Button {
-                            selectedCommit = commit
+                            activeSheet = .commitDiff(commit)
                         } label: {
                             commitRow(commit)
                         }
@@ -1102,6 +1171,7 @@ private struct RelayUnifiedDiffDocumentView: View {
     let onHorizontalDragActive: ((Bool) -> Void)?
     let onRefresh: (() async -> Void)?
 
+    @GestureState private var isHorizontalDragging = false
     @State private var isReportingHorizontalDrag = false
 
     private static let gutterWidth: CGFloat = 42
@@ -1143,6 +1213,31 @@ private struct RelayUnifiedDiffDocumentView: View {
                 }
             }
         }
+        .onChange(of: isHorizontalDragging) { _, active in
+            if active {
+                if !isReportingHorizontalDrag {
+                    isReportingHorizontalDrag = true
+                    onHorizontalDragActive?(true)
+                }
+            } else {
+                resetHorizontalDragIfNeeded()
+            }
+        }
+        .onChange(of: wrapLines) { _, wrapped in
+            if wrapped {
+                resetHorizontalDragIfNeeded()
+            }
+        }
+        .onDisappear {
+            isReportingHorizontalDrag = false
+            onHorizontalDragActive?(false)
+        }
+    }
+
+    private func resetHorizontalDragIfNeeded() {
+        guard isReportingHorizontalDrag else { return }
+        isReportingHorizontalDrag = false
+        onHorizontalDragActive?(false)
     }
 
     private func fileAnchorID(_ path: String) -> String {
@@ -1361,6 +1456,12 @@ private struct RelayUnifiedDiffDocumentView: View {
             }
             .simultaneousGesture(
                 DragGesture(minimumDistance: 6)
+                    .updating($isHorizontalDragging) { value, state, _ in
+                        guard onHorizontalDragActive != nil else { return }
+                        if !state && abs(value.translation.width) > abs(value.translation.height) {
+                            state = true
+                        }
+                    }
                     .onChanged { value in
                         guard onHorizontalDragActive != nil else { return }
                         if !isReportingHorizontalDrag,
@@ -1370,17 +1471,11 @@ private struct RelayUnifiedDiffDocumentView: View {
                         }
                     }
                     .onEnded { _ in
-                        if isReportingHorizontalDrag {
-                            isReportingHorizontalDrag = false
-                            onHorizontalDragActive?(false)
-                        }
+                        resetHorizontalDragIfNeeded()
                     }
             )
             .onDisappear {
-                if isReportingHorizontalDrag {
-                    isReportingHorizontalDrag = false
-                    onHorizontalDragActive?(false)
-                }
+                resetHorizontalDragIfNeeded()
             }
         }
         .background(theme.surface0)
@@ -2207,6 +2302,20 @@ private struct RelayJumpToFileSheet: View {
 // MARK: - Commit Diff Sheet
 
 private struct RelayCommitDiffSheet: View {
+    private enum ActiveSheet: Identifiable {
+        case jumpToFile
+        case review(RelayDiffLineTarget)
+
+        var id: String {
+            switch self {
+            case .jumpToFile:
+                return "jumpToFile"
+            case .review(let target):
+                return "review:\(target.id)"
+            }
+        }
+    }
+
     @Environment(\.relayTheme) private var theme
     @Environment(\.dismiss) private var dismiss
 
@@ -2221,9 +2330,9 @@ private struct RelayCommitDiffSheet: View {
     @State private var errorMessage: String?
     @State private var collapsedFiles: Set<String> = []
     @State private var wrapLines = false
-    @State private var showingJumpToFile = false
+    @State private var activeSheet: ActiveSheet?
     @State private var pendingScrollFilePath: String?
-    @State private var reviewTarget: RelayDiffLineTarget?
+    @State private var dismissAfterNestedSheet = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -2260,7 +2369,7 @@ private struct RelayCommitDiffSheet: View {
 
                 HStack(spacing: 4) {
                     if let diff, !diff.files.isEmpty {
-                        Button { showingJumpToFile = true } label: {
+                        Button { activeSheet = .jumpToFile } label: {
                             Image(systemName: "list.bullet.indent")
                                 .font(.system(size: 14))
                                 .foregroundStyle(theme.foregroundMuted)
@@ -2344,7 +2453,7 @@ private struct RelayCommitDiffSheet: View {
                     onDiscardFile: nil,
                     onTapLine: { target in
                         guard onSendReviewComment != nil else { return }
-                        reviewTarget = target
+                        activeSheet = .review(target)
                     },
                     onHorizontalDragActive: nil,
                     onRefresh: nil
@@ -2369,16 +2478,23 @@ private struct RelayCommitDiffSheet: View {
             }
             isLoading = false
         }
-        .sheet(isPresented: $showingJumpToFile) {
-            RelayJumpToFileSheet(files: diff?.files ?? []) { path in
-                collapsedFiles.remove(path)
-                pendingScrollFilePath = path
-            }
-        }
-        .sheet(item: $reviewTarget) { target in
-            RelayDiffReviewCommentSheet(target: target) { formatted in
-                onSendReviewComment?(formatted)
+        .sheet(item: $activeSheet, onDismiss: {
+            if dismissAfterNestedSheet {
+                dismissAfterNestedSheet = false
                 dismiss()
+            }
+        }) { sheet in
+            switch sheet {
+            case .jumpToFile:
+                RelayJumpToFileSheet(files: diff?.files ?? []) { path in
+                    collapsedFiles.remove(path)
+                    pendingScrollFilePath = path
+                }
+            case .review(let target):
+                RelayDiffReviewCommentSheet(target: target) { formatted in
+                    onSendReviewComment?(formatted)
+                    dismissAfterNestedSheet = true
+                }
             }
         }
     }

@@ -19,6 +19,7 @@ struct POCVaultApp: App {
     private let codexClient: CodexClient
     private let authClient: RelayAuthClient
     private let watchBridge: RelayWatchBridge
+    @State private var showingVerificationSheet = false
 
     init() {
         let identityStore = ClientIdentityStore()
@@ -116,10 +117,11 @@ struct POCVaultApp: App {
                     workspaceStore.reset()
                 }
             }
-            // A machine unpaired from this phone (or replaced by another
-            // pairing) takes its saved Chats list with it.
+            // A machine unpaired from this phone takes its saved Chats list with it,
+            // while switching between paired hosts preserves each host's cached snapshot.
             .onChange(of: nodeStore.pairedNode?.apiBaseURL) { previousURL, currentURL in
                 guard let previousURL, previousURL != currentURL else { return }
+                guard !nodeStore.hosts.contains(where: { $0.apiBaseURL == previousURL }) else { return }
                 statusFeedViewModel.forgetSnapshot(for: previousURL)
             }
             .task {
@@ -166,27 +168,45 @@ struct POCVaultApp: App {
                 workspaceStore: workspaceStore,
                 themeStore: themeStore
             )
-            // Pairing (or unpairing) a machine restarts the browser stack so
-            // listings refetch; the shared client and the chat/status
-            // stores survive it.
-            .id("\(nodeStore.effectiveBaseURL.absoluteString)|\(accountStore.user?.id ?? "signed-out")")
+            // Keep the root shell alive across host switches so active modals
+            // finish dismissing cleanly instead of tearing down mid-transition.
+            .id(accountStore.user?.id ?? "signed-out")
             // Comparing the confirmation code is presented HERE, not from the
             // pairing screen, because that screen does not outlive its own
             // success: adopting the node flips `hasMachine` and this router
             // replaces the onboarding stack the sheet was attached to. Driving
             // it from the store also means backgrounding the app mid-comparison
-            // resumes the check instead of silently skipping it.
+            // resumes the check instead of silently skipping it. Deferring
+            // slightly lets any pairing or Settings sheet finish dismissing so
+            // UIKit does not drop the verification presentation.
+            .task(id: nodeStore.pendingVerificationCode) {
+                guard nodeStore.pendingVerificationCode != nil else {
+                    showingVerificationSheet = false
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(450))
+                guard !Task.isCancelled, nodeStore.pendingVerificationCode != nil else { return }
+                showingVerificationSheet = true
+            }
             .sheet(isPresented: Binding(
-                get: { nodeStore.pendingVerificationCode != nil },
-                set: { if !$0 { nodeStore.confirmVerification() } }
+                get: { showingVerificationSheet && nodeStore.pendingVerificationCode != nil },
+                set: { presented in
+                    showingVerificationSheet = presented
+                    if !presented { nodeStore.confirmVerification() }
+                }
             )) {
                 if let code = nodeStore.pendingVerificationCode {
                     NodeVerificationView(
                         nodeStore: nodeStore,
                         code: code,
                         onUnpair: {
+                            showingVerificationSheet = false
+                            if let key = nodeStore.pairedNode?.host ?? nodeStore.pairedNode?.nodeID {
+                                identityStore.discardPairedMaterial(for: key)
+                            } else {
+                                identityStore.discardPairedMaterial()
+                            }
                             nodeStore.clear()
-                            identityStore.discardPairedMaterial()
                         }
                     )
                 }
@@ -290,6 +310,8 @@ struct POCVaultRootView: View {
     @State private var pendingTerminalLaunch: RelayTerminalLaunch?
     @State private var pendingDiagnostics = false
     @State private var pendingMachineMonitor = false
+    @State private var pendingBrowseFolders = false
+    @State private var pendingAddHost = false
     /// Raised when a handoff push is tapped: the threads list is where handoff
     /// cards live, so that is where the tap has to land.
     @State private var opensThreadsForHandoff = false
@@ -413,20 +435,62 @@ struct POCVaultRootView: View {
             } else if pendingMachineMonitor {
                 pendingMachineMonitor = false
                 showingMachineMonitor = true
+            } else if pendingAddHost {
+                pendingAddHost = false
+                panelController.showCenter()
+                showingAddHost = true
             }
         }) {
-            secondaryDestination
+            RelaySecondaryDestinationView(
+                selectedRootTab: $selectedRootTab,
+                browserPath: $browserPath,
+                didRestoreBrowserPath: $didRestoreBrowserPath,
+                accountStore: accountStore,
+                nodeStore: nodeStore,
+                identityStore: identityStore,
+                computerLinkStore: computerLinkStore,
+                codexClient: codexClient,
+                authClient: authClient,
+                powerModel: powerModel,
+                pushService: pushService,
+                openPreviewSourceJob: openPreviewSourceJob,
+                onOpenChat: { path, workspaceID in
+                    openNewSession(folderPath: path, workspaceID: workspaceID)
+                },
+                onOpenConversation: openSession,
+                onOpenTerminal: { workspaceID, workspaceName in
+                    pendingTerminalLaunch = RelayTerminalLaunch(workspaceID: workspaceID, workspaceName: workspaceName)
+                    selectedRootTab = .sessions
+                },
+                onOpenDiagnostics: {
+                    pendingDiagnostics = true
+                    selectedRootTab = .sessions
+                },
+                onOpenMachineMonitor: {
+                    pendingMachineMonitor = true
+                    selectedRootTab = .sessions
+                }
+            )
             .environment(\.relayTheme, theme)
             .background(theme.surface0)
             .tint(theme.accent)
             .preferredColorScheme(themeStore.colorScheme)
         }
-        .sheet(isPresented: $showingWorkspacePicker) {
+        .sheet(isPresented: $showingWorkspacePicker, onDismiss: {
+            if pendingBrowseFolders {
+                pendingBrowseFolders = false
+                openDestination(.workspaces)
+            } else if pendingAddHost {
+                pendingAddHost = false
+                panelController.showCenter()
+                showingAddHost = true
+            }
+        }) {
             RelayChatProjectPicker(
                 client: codexClient,
                 onBrowseAllFolders: {
+                    pendingBrowseFolders = true
                     showingWorkspacePicker = false
-                    openDestination(.workspaces)
                 },
                 onChoose: { workspace in
                     let previous = chatLaunch?.viewModel
@@ -523,6 +587,66 @@ struct POCVaultRootView: View {
         .onChange(of: activeWorkspacePath) { _, path in
             guard !powerModel.isDown else { return }
             Task { await refreshWorkspaceContext(for: path) }
+        }
+        .onChange(of: nodeStore.pendingVerificationCode) { _, code in
+            guard code != nil else { return }
+            pendingAddHost = false
+            pendingBrowseFolders = false
+            showingAddHost = false
+            showingWorkspacePicker = false
+            showingDiagnostics = false
+            showingMachineMonitor = false
+            selectedRootTab = .sessions
+        }
+        .onChange(of: nodeStore.effectiveBaseURL) { oldURL, newURL in
+            guard oldURL != newURL else { return }
+            let keepSettingsOpen = (selectedRootTab == .settings && nodeStore.pendingVerificationCode == nil)
+            browserPath.removeAll()
+            didRestoreBrowserPath = false
+            chatLaunchesByID.removeAll()
+            for session in terminalSessionsByTabID.values {
+                session.close()
+            }
+            terminalSessionsByTabID.removeAll()
+            workspaceFilesByPath.removeAll()
+            chatLaunch = nil
+            showingAddHost = false
+            if !keepSettingsOpen {
+                selectedRootTab = .sessions
+            }
+
+            Task { @MainActor in
+                guard nodeStore.effectiveBaseURL == newURL else { return }
+                let saved = UserDefaults.standard.dictionary(forKey: chatContextDefaultsKey)
+                lastChatFolderPath = saved?["path"] as? String
+                lastChatWorkspaceID = saved?["workspace"] as? String
+                if keepSettingsOpen {
+                    let launch = chatSessionStore.launchNewSession(
+                        folderPath: lastChatFolderPath,
+                        workspaceID: lastChatWorkspaceID
+                    )
+                    registerAndActivateChatLaunch(
+                        launch,
+                        folderPath: lastChatFolderPath,
+                        workspaceID: lastChatWorkspaceID
+                    )
+                } else {
+                    openNewSession(folderPath: lastChatFolderPath, workspaceID: lastChatWorkspaceID)
+                }
+
+                await powerModel.refresh()
+                guard nodeStore.effectiveBaseURL == newURL else { return }
+                if !powerModel.isDown {
+                    await statusFeedViewModel.refresh()
+                    guard nodeStore.effectiveBaseURL == newURL else { return }
+                    await workspaceStore.refreshProjects(
+                        client: codexClient,
+                        feedItems: statusFeedViewModel.feedItems
+                    )
+                    guard nodeStore.effectiveBaseURL == newURL else { return }
+                    await refreshWorkspaceContext(for: activeWorkspacePath)
+                }
+            }
         }
         // Two independent reasons to register for pushes: an account (the
         // session-authed device route, for handoffs and runs) or a paired
@@ -683,12 +807,22 @@ struct POCVaultRootView: View {
                     opensThreadsForHandoff = true
                 },
                 onSelectHost: { host in
+                    identityStore.activateHostMaterial(for: host.host ?? host.nodeID)
                     nodeStore.selectHost(id: host.nodeID)
                     panelController.showCenter()
+                    Task { await powerModel.refresh() }
                 },
                 onAddHost: {
-                    panelController.showCenter()
-                    showingAddHost = true
+                    if selectedRootTab != .sessions {
+                        pendingAddHost = true
+                        selectedRootTab = .sessions
+                    } else if showingWorkspacePicker {
+                        pendingAddHost = true
+                        showingWorkspacePicker = false
+                    } else {
+                        panelController.showCenter()
+                        showingAddHost = true
+                    }
                 },
                 onOpenSettings: {
                     openDestination(.settings)
@@ -822,48 +956,6 @@ struct POCVaultRootView: View {
         }
     }
 
-    private var secondaryDestination: AnyView {
-        switch selectedRootTab {
-        case .workspaces:
-            if foldersAreHiddenAfterComputerDisconnect {
-                return AnyView(disconnectedComputerScreen)
-            } else if powerModel.isDown {
-                return AnyView(machineDownScreen(title: "Files", purpose: "its folders"))
-            } else {
-                return AnyView(browserNavigation)
-            }
-        case .previews:
-            return AnyView(RelayPreviewsView(
-                identityStore: identityStore, client: codexClient,
-                workspaceAccessIsAvailable: !foldersAreHiddenAfterComputerDisconnect && !powerModel.isDown,
-                onOpenWorkspaces: { selectedRootTab = .workspaces },
-                onOpenJob: openPreviewSourceJob,
-                onClose: { selectedRootTab = .sessions }
-            ))
-        case .settings:
-            return AnyView(AccountSettingsView(
-                accountStore: accountStore,
-                nodeStore: nodeStore,
-                identityStore: identityStore,
-                computerLinkStore: computerLinkStore,
-                codexClient: codexClient,
-                authClient: authClient,
-                powerModel: powerModel,
-                pushService: pushService,
-                onOpenDiagnostics: {
-                    pendingDiagnostics = true
-                    selectedRootTab = .sessions
-                },
-                onOpenMachineMonitor: {
-                    pendingMachineMonitor = true
-                    selectedRootTab = .sessions
-                }
-            ))
-        case .sessions:
-            return AnyView(EmptyView())
-        }
-    }
-
     private func setSidebar(_ visible: Bool) {
         if visible {
             panelController.openSidebar()
@@ -893,174 +985,12 @@ struct POCVaultRootView: View {
         UserDefaults.standard.set(context, forKey: chatContextDefaultsKey)
     }
 
-    private var browserNavigation: some View {
-        NavigationStack(path: $browserPath) {
-            browserScreen(folderPath: nil, isRoot: true)
-                .navigationDestination(for: BrowserRoute.self) { route in
-                    switch route {
-                    case .folder(let path):
-                        browserScreen(folderPath: path, isRoot: false)
-                    case .file(let entry):
-                        FileViewerView(
-                            client: codexClient,
-                            identityStore: identityStore,
-                            entry: entry
-                        )
-                        .toolbar { secondaryCloseToolbar }
-                    }
-                }
-        }
-        .onAppear(perform: restoreBrowserPathIfNeeded)
-        .onChange(of: browserPath) { _, path in
-            persistBrowserPath(path)
-        }
-    }
-
-    /// Where the browser reopens.
-    ///
-    /// Landing at the root every launch is wrong for a machine you actually
-    /// work on: the folder you were last in IS the folder you want. The stack
-    /// is keyed by machine, because a path from one node means nothing on
-    /// another, and it is stored rather than derived because the app is killed
-    /// and relaunched far more often than it is repaired.
-    private var browserPathDefaultsKey: String {
-        "relay.browserPath.\(nodeStore.effectiveBaseURL.absoluteString)"
-    }
-
-    /// Only folder routes are kept. A file route carries a decoded directory
-    /// entry whose size and mtime go stale between launches, and reopening a
-    /// file viewer unprompted is not what "where I left off" means — so the
-    /// folders beneath an open file are saved and the viewer itself is not.
-    private func persistBrowserPath(_ path: [BrowserRoute]) {
-        let folders = path.compactMap { route -> String? in
-            guard case .folder(let folderPath) = route else { return nil }
-            return folderPath
-        }
-        UserDefaults.standard.set(folders, forKey: browserPathDefaultsKey)
-    }
-
-    private func restoreBrowserPathIfNeeded() {
-        guard !didRestoreBrowserPath else { return }
-        didRestoreBrowserPath = true
-        guard browserPath.isEmpty,
-              !foldersAreHiddenAfterComputerDisconnect,
-              let folders = UserDefaults.standard.array(forKey: browserPathDefaultsKey) as? [String],
-              !folders.isEmpty
-        else { return }
-        browserPath = folders.map { BrowserRoute.folder(path: $0) }
-    }
-
-    private var disconnectedComputerScreen: some View {
-        NavigationStack {
-            ZStack {
-                AppTheme.canvasGradient.ignoresSafeArea()
-                VStack(spacing: 14) {
-                    Image(systemName: "desktopcomputer.trianglebadge.exclamationmark")
-                        .font(.system(size: 34, weight: .medium))
-                        .foregroundStyle(AppTheme.textTertiary)
-                    Text("Computer disconnected")
-                        .font(AppTheme.serifFont(size: 26))
-                        .foregroundStyle(AppTheme.textPrimary)
-                    Text("Its folders are hidden on this phone. Link a computer to show folders again; files on the Relay machine were not deleted.")
-                        .font(AppTheme.uiFont(size: 14))
-                        .foregroundStyle(AppTheme.textSecondary)
-                        .multilineTextAlignment(.center)
-                        .lineSpacing(3)
-                        .padding(.horizontal, 28)
-                    Button("Link a computer") {
-                        selectedRootTab = .settings
-                    }
-                    .buttonStyle(RelayPrimaryButtonStyle())
-                    .padding(.horizontal, 32)
-                    .padding(.top, 8)
-                }
-            }
-            .toolbar { secondaryCloseToolbar }
-        }
-    }
-
     private var machineName: String {
         nodeStore.pairedNode?.nodeName ?? RelayMachineLabel.fallback
     }
 
-    /// Folders and Previews have nothing to show from a machine that is off:
-    /// every listing and preview is read live from it. Say so and offer Start,
-    /// instead of a spinner that would itself have woken the machine.
-    private func machineDownScreen(title: String, purpose: String) -> some View {
-        NavigationStack {
-            ZStack {
-                AppTheme.canvasGradient.ignoresSafeArea()
-                RelayMachineDownView(powerModel: powerModel, machineName: machineName, purpose: purpose)
-            }
-            .navigationTitle(title)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar { secondaryCloseToolbar }
-        }
-    }
-
     private var foldersAreHiddenAfterComputerDisconnect: Bool {
         computerLinkStore.suppressesFolderAccess(for: accountStore.user?.id)
-    }
-
-    private func browserScreen(folderPath: String?, isRoot: Bool) -> some View {
-        FileBrowserView(
-            client: codexClient,
-            folderPath: folderPath,
-            isRoot: isRoot,
-            machineLabel: isRoot ? nodeStore.pairedNode?.nodeName : nil,
-            onOpenFolder: { path in
-                browserPath.append(.folder(path: path))
-            },
-            onNavigateToFolder: { path in
-                navigateBrowser(to: path)
-            },
-            onOpenFile: { entry in
-                browserPath.append(.file(entry: entry))
-            },
-            onOpenChat: { path, workspaceID in
-                openNewSession(folderPath: path, workspaceID: workspaceID)
-            },
-            onOpenConversation: openSession,
-            onOpenTerminal: { workspaceID, workspaceName in
-                pendingTerminalLaunch = RelayTerminalLaunch(workspaceID: workspaceID, workspaceName: workspaceName)
-                selectedRootTab = .sessions
-            },
-            onOpenDiagnostics: isRoot ? {
-                pendingDiagnostics = true
-                selectedRootTab = .sessions
-            } : nil
-        )
-        .toolbar { secondaryCloseToolbar }
-    }
-
-    @ToolbarContentBuilder
-    private var secondaryCloseToolbar: some ToolbarContent {
-        ToolbarItem(placement: .topBarTrailing) {
-            Button { selectedRootTab = .sessions } label: {
-                Image(systemName: "xmark").foregroundStyle(AppTheme.textPrimary)
-            }
-            .accessibilityLabel("Back to chat")
-        }
-    }
-
-    /// Breadcrumb taps move within the existing navigation stack when possible.
-    /// A direct visual-test route may not have its ancestors in the stack, so that
-    /// case starts a clean stack at the selected folder instead of pushing sideways
-    /// from a deeper location.
-    private func navigateBrowser(to folderPath: String?) {
-        guard let folderPath else {
-            browserPath.removeAll()
-            return
-        }
-
-        if let index = browserPath.firstIndex(where: { route in
-            guard case .folder(let path) = route else { return false }
-            return path == folderPath
-        }) {
-            browserPath = Array(browserPath.prefix(through: index))
-        } else {
-            browserPath = [.folder(path: folderPath)]
-        }
     }
 
     private func openChat(folderPath: String?, workspaceID: String?) {
@@ -1389,6 +1319,225 @@ struct POCVaultRootView: View {
         }
     }
     #endif
+}
+
+private struct RelaySecondaryDestinationView: View {
+    @Binding var selectedRootTab: RelayRootTab
+    @Binding var browserPath: [BrowserRoute]
+    @Binding var didRestoreBrowserPath: Bool
+    @ObservedObject var accountStore: RelayAccountStore
+    @ObservedObject var nodeStore: RelayNodeStore
+    @ObservedObject var identityStore: ClientIdentityStore
+    @ObservedObject var computerLinkStore: RelayComputerLinkStore
+    let codexClient: CodexClient
+    let authClient: RelayAuthClient
+    @ObservedObject var powerModel: RelayMachinePowerModel
+    @ObservedObject var pushService: RelayPushService
+    let openPreviewSourceJob: (CodexJob) -> Void
+    let onOpenChat: (String?, String?) -> Void
+    let onOpenConversation: (CodexThreadFeedItem) -> Void
+    let onOpenTerminal: (String, String) -> Void
+    let onOpenDiagnostics: () -> Void
+    let onOpenMachineMonitor: () -> Void
+
+    @ViewBuilder
+    var body: some View {
+        switch selectedRootTab {
+        case .workspaces:
+            if foldersAreHiddenAfterComputerDisconnect {
+                disconnectedComputerScreen
+            } else if powerModel.isDown {
+                machineDownScreen(title: "Files", purpose: "its folders")
+            } else {
+                browserNavigation
+            }
+        case .previews:
+            RelayPreviewsView(
+                identityStore: identityStore, client: codexClient,
+                workspaceAccessIsAvailable: !foldersAreHiddenAfterComputerDisconnect && !powerModel.isDown,
+                onOpenWorkspaces: { selectedRootTab = .workspaces },
+                onOpenJob: openPreviewSourceJob,
+                onClose: { selectedRootTab = .sessions }
+            )
+        case .settings:
+            AccountSettingsView(
+                accountStore: accountStore,
+                nodeStore: nodeStore,
+                identityStore: identityStore,
+                computerLinkStore: computerLinkStore,
+                codexClient: codexClient,
+                authClient: authClient,
+                powerModel: powerModel,
+                pushService: pushService,
+                onOpenDiagnostics: onOpenDiagnostics,
+                onOpenMachineMonitor: onOpenMachineMonitor
+            )
+        case .sessions:
+            EmptyView()
+        }
+    }
+
+    private var browserNavigation: some View {
+        NavigationStack(path: $browserPath) {
+            browserScreen(folderPath: nil, isRoot: true)
+                .navigationDestination(for: BrowserRoute.self) { route in
+                    switch route {
+                    case .folder(let path):
+                        browserScreen(folderPath: path, isRoot: false)
+                    case .file(let entry):
+                        FileViewerView(
+                            client: codexClient,
+                            identityStore: identityStore,
+                            entry: entry
+                        )
+                        .toolbar { secondaryCloseToolbar }
+                    }
+                }
+        }
+        .onAppear(perform: restoreBrowserPathIfNeeded)
+        .onChange(of: browserPath) { _, path in
+            persistBrowserPath(path)
+        }
+    }
+
+    /// Where the browser reopens.
+    ///
+    /// Landing at the root every launch is wrong for a machine you actually
+    /// work on: the folder you were last in IS the folder you want. The stack
+    /// is keyed by machine, because a path from one node means nothing on
+    /// another, and it is stored rather than derived because the app is killed
+    /// and relaunched far more often than it is repaired.
+    private var browserPathDefaultsKey: String {
+        "relay.browserPath.\(nodeStore.effectiveBaseURL.absoluteString)"
+    }
+
+    /// Only folder routes are kept. A file route carries a decoded directory
+    /// entry whose size and mtime go stale between launches, and reopening a
+    /// file viewer unprompted is not what "where I left off" means — so the
+    /// folders beneath an open file are saved and the viewer itself is not.
+    private func persistBrowserPath(_ path: [BrowserRoute]) {
+        let folders = path.compactMap { route -> String? in
+            guard case .folder(let folderPath) = route else { return nil }
+            return folderPath
+        }
+        UserDefaults.standard.set(folders, forKey: browserPathDefaultsKey)
+    }
+
+    private func restoreBrowserPathIfNeeded() {
+        guard !didRestoreBrowserPath else { return }
+        didRestoreBrowserPath = true
+        guard browserPath.isEmpty,
+              !foldersAreHiddenAfterComputerDisconnect,
+              let folders = UserDefaults.standard.array(forKey: browserPathDefaultsKey) as? [String],
+              !folders.isEmpty
+        else { return }
+        browserPath = folders.map { BrowserRoute.folder(path: $0) }
+    }
+
+    private var disconnectedComputerScreen: some View {
+        NavigationStack {
+            ZStack {
+                AppTheme.canvasGradient.ignoresSafeArea()
+                VStack(spacing: 14) {
+                    Image(systemName: "desktopcomputer.trianglebadge.exclamationmark")
+                        .font(.system(size: 34, weight: .medium))
+                        .foregroundStyle(AppTheme.textTertiary)
+                    Text("Computer disconnected")
+                        .font(AppTheme.serifFont(size: 26))
+                        .foregroundStyle(AppTheme.textPrimary)
+                    Text("Its folders are hidden on this phone. Link a computer to show folders again; files on the Relay machine were not deleted.")
+                        .font(AppTheme.uiFont(size: 14))
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .multilineTextAlignment(.center)
+                        .lineSpacing(3)
+                        .padding(.horizontal, 28)
+                    Button("Link a computer") {
+                        selectedRootTab = .settings
+                    }
+                    .buttonStyle(RelayPrimaryButtonStyle())
+                    .padding(.horizontal, 32)
+                    .padding(.top, 8)
+                }
+            }
+            .toolbar { secondaryCloseToolbar }
+        }
+    }
+
+    private var machineName: String {
+        nodeStore.pairedNode?.nodeName ?? RelayMachineLabel.fallback
+    }
+
+    /// Folders and Previews have nothing to show from a machine that is off:
+    /// every listing and preview is read live from it. Say so and offer Start,
+    /// instead of a spinner that would itself have woken the machine.
+    private func machineDownScreen(title: String, purpose: String) -> some View {
+        NavigationStack {
+            ZStack {
+                AppTheme.canvasGradient.ignoresSafeArea()
+                RelayMachineDownView(powerModel: powerModel, machineName: machineName, purpose: purpose)
+            }
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { secondaryCloseToolbar }
+        }
+    }
+
+    private var foldersAreHiddenAfterComputerDisconnect: Bool {
+        computerLinkStore.suppressesFolderAccess(for: accountStore.user?.id)
+    }
+
+    private func browserScreen(folderPath: String?, isRoot: Bool) -> some View {
+        FileBrowserView(
+            client: codexClient,
+            folderPath: folderPath,
+            isRoot: isRoot,
+            machineLabel: isRoot ? nodeStore.pairedNode?.nodeName : nil,
+            onOpenFolder: { path in
+                browserPath.append(.folder(path: path))
+            },
+            onNavigateToFolder: { path in
+                navigateBrowser(to: path)
+            },
+            onOpenFile: { entry in
+                browserPath.append(.file(entry: entry))
+            },
+            onOpenChat: onOpenChat,
+            onOpenConversation: onOpenConversation,
+            onOpenTerminal: onOpenTerminal,
+            onOpenDiagnostics: isRoot ? onOpenDiagnostics : nil
+        )
+        .toolbar { secondaryCloseToolbar }
+    }
+
+    @ToolbarContentBuilder
+    private var secondaryCloseToolbar: some ToolbarContent {
+        ToolbarItem(placement: .topBarTrailing) {
+            Button { selectedRootTab = .sessions } label: {
+                Image(systemName: "xmark").foregroundStyle(AppTheme.textPrimary)
+            }
+            .accessibilityLabel("Back to chat")
+        }
+    }
+
+    /// Breadcrumb taps move within the existing navigation stack when possible.
+    /// A direct visual-test route may not have its ancestors in the stack, so that
+    /// case starts a clean stack at the selected folder instead of pushing sideways
+    /// from a deeper location.
+    private func navigateBrowser(to folderPath: String?) {
+        guard let folderPath else {
+            browserPath.removeAll()
+            return
+        }
+
+        if let index = browserPath.firstIndex(where: { route in
+            guard case .folder(let path) = route else { return false }
+            return path == folderPath
+        }) {
+            browserPath = Array(browserPath.prefix(through: index))
+        } else {
+            browserPath = [.folder(path: folderPath)]
+        }
+    }
 }
 
 /// The only top-level navigation: a quiet list of conversations beside the chat.

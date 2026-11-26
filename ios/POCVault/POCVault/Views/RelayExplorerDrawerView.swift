@@ -183,12 +183,22 @@ struct RelayExplorerDrawerView: View {
                 previewsModel.discard()
             }
         }
+        .onChange(of: selectedTab) { _, tab in
+            if tab != .changes {
+                onHorizontalDragActive?(false)
+            }
+        }
+        .onDisappear {
+            onHorizontalDragActive?(false)
+        }
         .sheet(item: $selectedFile) { target in
             RelayWorkspaceFileSheet(
                 client: client,
                 identityStore: identityStore,
                 target: target,
                 onAttachToChat: { formattedRef in
+                    selectedFile = nil
+                    guard !formattedRef.isEmpty else { return }
                     onAttachFileToChat(formattedRef)
                 }
             )
@@ -206,7 +216,11 @@ struct RelayExplorerDrawerView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            Button(action: onClose) {
+            Button {
+                onHorizontalDragActive?(false)
+                selectedFile = nil
+                onClose()
+            } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(theme.foregroundMuted)
@@ -734,6 +748,7 @@ private struct RelayExplorerFilesTab: View {
     private func fileRow(_ entry: CodexWorkspaceDirectoryEntry) -> some View {
         let icon = RelayFileIconResolver.resolve(for: entry, theme: theme)
         return Button {
+            filterFocused = false
             if entry.isDirectory {
                 UISelectionFeedbackGenerator().selectionChanged()
                 Task { await viewModel.navigate(to: entry.path) }
@@ -981,8 +996,13 @@ struct RelayWorkspaceFileSheet: View {
             // Action strip
             HStack(spacing: 8) {
                 Button {
-                    onAttachToChat(RelayExplorerDrawerView.formatChatFileReference(target.relativePath))
+                    let ref = RelayExplorerDrawerView.formatChatFileReference(
+                        target.relativePath.trimmedNonEmpty ?? target.displayName
+                    )
                     dismiss()
+                    if !ref.isEmpty {
+                        onAttachToChat(ref)
+                    }
                 } label: {
                     HStack(spacing: 5) {
                         Image(systemName: "plus.bubble")
@@ -1336,6 +1356,20 @@ struct RelayWorkspaceFileSheet: View {
 
 // MARK: - Previews Tab
 
+private enum RelayExplorerPreviewCover: Identifiable {
+    case artifact(CodexJobArtifact)
+    case remotePreview(RelayRemotePreviewRequest)
+
+    var id: String {
+        switch self {
+        case .artifact(let artifact):
+            return "artifact:\(artifact.id)"
+        case .remotePreview(let request):
+            return "remote:\(request.id.uuidString)"
+        }
+    }
+}
+
 private struct RelayExplorerPreviewsTab: View {
     @Environment(\.relayTheme) private var theme
 
@@ -1347,8 +1381,7 @@ private struct RelayExplorerPreviewsTab: View {
     let workspaceAccessIsAvailable: Bool
     let onOpenJob: (CodexJob) -> Void
 
-    @State private var artifactRequest: CodexJobArtifact?
-    @State private var remotePreviewRequest: RelayRemotePreviewRequest?
+    @State private var activeCover: RelayExplorerPreviewCover?
 
     private var partitionedResults: (current: [WorkspacePreviewResult], other: [WorkspacePreviewResult]) {
         guard let all = model.results else { return ([], []) }
@@ -1443,16 +1476,17 @@ private struct RelayExplorerPreviewsTab: View {
             guard workspaceAccessIsAvailable else { return }
             await model.refresh()
         }
-        .fullScreenCover(item: $artifactRequest) { artifact in
-            RelayArtifactViewer(artifact: artifact, client: client, identityStore: identityStore)
-        }
-        .fullScreenCover(item: $remotePreviewRequest) { request in
-            RelayRemotePreviewViewer(request: request, client: client, identityStore: identityStore)
+        .fullScreenCover(item: $activeCover) { cover in
+            switch cover {
+            case .artifact(let artifact):
+                RelayArtifactViewer(artifact: artifact, client: client, identityStore: identityStore)
+            case .remotePreview(let request):
+                RelayRemotePreviewViewer(request: request, client: client, identityStore: identityStore)
+            }
         }
         .onChange(of: workspaceAccessIsAvailable) { _, available in
             guard !available else { return }
-            artifactRequest = nil
-            remotePreviewRequest = nil
+            activeCover = nil
         }
     }
 
@@ -1513,7 +1547,7 @@ private struct RelayExplorerPreviewsTab: View {
             ForEach(result.job.artifacts) { artifact in
                 Rectangle().fill(theme.border).frame(height: 1)
                 Button {
-                    artifactRequest = artifact
+                    activeCover = .artifact(artifact)
                 } label: {
                     previewRow(
                         symbol: "doc.richtext",
@@ -1527,7 +1561,7 @@ private struct RelayExplorerPreviewsTab: View {
             ForEach(result.liveURLs, id: \.absoluteString) { url in
                 Rectangle().fill(theme.border).frame(height: 1)
                 Button {
-                    remotePreviewRequest = RelayRemotePreviewRequest(jobID: result.job.id, sourceURL: url)
+                    activeCover = .remotePreview(RelayRemotePreviewRequest(jobID: result.job.id, sourceURL: url))
                 } label: {
                     previewRow(
                         symbol: "safari",

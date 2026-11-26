@@ -1,31 +1,83 @@
 import SwiftUI
 
-// MARK: - Account Settings View State
+// MARK: - Account Settings Presentation Enums & State
+
+private enum AccountSettingsSheet: Identifiable {
+    case pairing
+    case signIn
+    case diagnostics
+    case cliLink
+    case providerLogin(CodexProvider)
+
+    var id: String {
+        switch self {
+        case .pairing: return "pairing"
+        case .signIn: return "signIn"
+        case .diagnostics: return "diagnostics"
+        case .cliLink: return "cliLink"
+        case .providerLogin(let provider): return "providerLogin-\(provider.rawValue)"
+        }
+    }
+}
+
+private enum AccountSettingsConfirmation: Identifiable {
+    case disconnectComputer
+    case removeBrowser(RelayBrowserSession)
+    case unpairHost(RelayPairedNode)
+    case stopMachine
+
+    var id: String {
+        switch self {
+        case .disconnectComputer: return "disconnectComputer"
+        case .removeBrowser(let browser): return "removeBrowser-\(browser.id)"
+        case .unpairHost(let host): return "unpairHost-\(host.nodeID)"
+        case .stopMachine: return "stopMachine"
+        }
+    }
+}
+
+private enum AccountSettingsAlert: Identifiable {
+    case deleteAccount
+    case renameHost(RelayPairedNode)
+
+    var id: String {
+        switch self {
+        case .deleteAccount: return "deleteAccount"
+        case .renameHost(let host): return "renameHost-\(host.nodeID)"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .deleteAccount: return "Delete your Relay account?"
+        case .renameHost: return "Rename host"
+        }
+    }
+}
 
 @MainActor
 private final class AccountSettingsState: ObservableObject {
-    @Published var showingDeleteConfirmation = false
+    @Published var activeSheet: AccountSettingsSheet? {
+        didSet {
+            if let activeSheet {
+                lastPresentedSheet = activeSheet
+            }
+        }
+    }
+    var lastPresentedSheet: AccountSettingsSheet?
+    @Published var activeConfirmation: AccountSettingsConfirmation?
+    @Published var activeAlert: AccountSettingsAlert?
     @Published var deletionPassword = ""
-    @Published var showingCLILink = false
-    @Published var showingSignIn = false
-    @Published var showingPairing = false
-    @Published var showingDiagnosticsSheet = false
     @Published var showingAccountDetails = false
-    @Published var hostPendingUnpair: RelayPairedNode?
-    @Published var hostPendingRename: RelayPairedNode?
     @Published var renameHostDraft = ""
     @Published var isRegisteringMachine = false
     @Published var machineNotice: String?
     @Published var browsers: [RelayBrowserSession] = []
     @Published var isRemovingBrowser = false
     @Published var signedInPlacesError: String?
-    @Published var showingDisconnectConfirmation = false
-    @Published var browserToRemove: RelayBrowserSession?
     @Published var harnesses: [RelayHarnessStatus] = []
     @Published var isLoadingHarnesses = false
     @Published var harnessError: String?
-    @Published var providerLoginRequest: CodexProvider?
-    @Published var showingStopPower = false
 }
 
 // MARK: - Account Settings View
@@ -163,7 +215,11 @@ struct AccountSettingsView: View {
             themeStore: themeStore,
             state: state,
             onReloadHarnesses: { await loadHarnesses() },
-            onReloadLinkedComputer: { await loadLinkedComputer() }
+            onReloadLinkedComputer: { await loadLinkedComputer() },
+            onPairingDismissed: {
+                await powerModel.refresh()
+                await refreshHarnessesForMachineState()
+            }
         ))
         .modifier(AccountSettingsLifecycleModifier(
             accountStore: accountStore,
@@ -295,7 +351,6 @@ struct AccountSettingsView: View {
         state.signedInPlacesError = nil
         defer {
             state.isRemovingBrowser = false
-            state.browserToRemove = nil
         }
         do {
             try await RelayAuthClient(
@@ -429,37 +484,43 @@ private struct AccountSettingsAlertsModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .alert("Delete your Relay account?", isPresented: $state.showingDeleteConfirmation) {
-                if accountStore.user?.usesPassword == true {
-                    SecureField("Current password", text: $state.deletionPassword)
-                }
-                Button("Delete account", role: .destructive) {
-                    Task {
-                        let didDelete = await accountStore.deleteAccount(
-                            password: accountStore.user?.usesPassword == true
-                                ? state.deletionPassword
-                                : nil
-                        )
-                        if didDelete { onDismiss() }
+            .alert(
+                state.activeAlert?.title ?? "",
+                isPresented: Binding(
+                    get: { state.activeAlert != nil },
+                    set: { if !$0 { state.activeAlert = nil } }
+                ),
+                presenting: state.activeAlert
+            ) { alert in
+                switch alert {
+                case .deleteAccount:
+                    if accountStore.user?.usesPassword == true {
+                        SecureField("Current password", text: $state.deletionPassword)
                     }
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("This action cannot be undone. Data on servers you own is not deleted.")
-            }
-            .alert("Rename host", isPresented: Binding(
-                get: { state.hostPendingRename != nil },
-                set: { if !$0 { state.hostPendingRename = nil } }
-            )) {
-                TextField("Host name", text: $state.renameHostDraft)
-                Button("Save") {
-                    if let host = state.hostPendingRename {
+                    Button("Delete account", role: .destructive) {
+                        Task {
+                            let didDelete = await accountStore.deleteAccount(
+                                password: accountStore.user?.usesPassword == true
+                                    ? state.deletionPassword
+                                    : nil
+                            )
+                            if didDelete { onDismiss() }
+                        }
+                    }
+                    Button("Cancel", role: .cancel) {}
+                case .renameHost(let host):
+                    TextField("Host name", text: $state.renameHostDraft)
+                    Button("Save") {
                         nodeStore.renameHost(id: host.nodeID, name: state.renameHostDraft)
                     }
-                    state.hostPendingRename = nil
+                    Button("Cancel", role: .cancel) {}
                 }
-                Button("Cancel", role: .cancel) {
-                    state.hostPendingRename = nil
+            } message: { alert in
+                switch alert {
+                case .deleteAccount:
+                    Text("This action cannot be undone. Data on servers you own is not deleted.")
+                case .renameHost:
+                    EmptyView()
                 }
             }
             .modifier(AccountSettingsDialogsModifier(
@@ -483,70 +544,66 @@ private struct AccountSettingsDialogsModifier: ViewModifier {
     let onRemoveBrowser: (RelayBrowserSession) async -> Void
     let onUnpairHost: (RelayPairedNode) -> Void
 
+    @MainActor
+    private var confirmationTitle: String {
+        switch state.activeConfirmation {
+        case .disconnectComputer:
+            return "Disconnect \(computerLinkStore.computer.map(AccountSettingsHelpers.computerName) ?? "computer")?"
+        case .removeBrowser(let browser):
+            return "Remove \(AccountSettingsHelpers.browserName(browser))?"
+        case .unpairHost(let host):
+            return "Unpair \(host.nodeName)?"
+        case .stopMachine:
+            return "Stop \(nodeStore.pairedNode?.nodeName ?? "this machine")?"
+        case nil:
+            return ""
+        }
+    }
+
     func body(content: Content) -> some View {
         content
             .confirmationDialog(
-                "Disconnect \(computerLinkStore.computer.map(AccountSettingsHelpers.computerName) ?? "computer")?",
-                isPresented: $state.showingDisconnectConfirmation,
-                titleVisibility: .visible
-            ) {
-                Button("Disconnect computer", role: .destructive) {
-                    Task { await onDisconnectComputer() }
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("Relay will revoke this computer’s CLI access and hide its folders on this phone. Files on the Relay machine are not deleted.")
-            }
-            .confirmationDialog(
-                "Remove \(state.browserToRemove.map(AccountSettingsHelpers.browserName) ?? "browser")?",
+                confirmationTitle,
                 isPresented: Binding(
-                    get: { state.browserToRemove != nil },
-                    set: { if !$0 { state.browserToRemove = nil } }
+                    get: { state.activeConfirmation != nil },
+                    set: { if !$0 { state.activeConfirmation = nil } }
                 ),
-                titleVisibility: .visible
-            ) {
-                Button("Remove", role: .destructive) {
-                    if let browser = state.browserToRemove {
+                titleVisibility: .visible,
+                presenting: state.activeConfirmation
+            ) { confirmation in
+                switch confirmation {
+                case .disconnectComputer:
+                    Button("Disconnect computer", role: .destructive) {
+                        Task { await onDisconnectComputer() }
+                    }
+                    Button("Cancel", role: .cancel) {}
+                case .removeBrowser(let browser):
+                    Button("Remove", role: .destructive) {
                         Task { await onRemoveBrowser(browser) }
                     }
-                }
-                Button("Cancel", role: .cancel) {
-                    state.browserToRemove = nil
-                }
-            } message: {
-                Text("That browser will be signed out.")
-            }
-            .confirmationDialog(
-                "Unpair \(state.hostPendingUnpair?.nodeName ?? "this machine")?",
-                isPresented: Binding(
-                    get: { state.hostPendingUnpair != nil },
-                    set: { if !$0 { state.hostPendingUnpair = nil } }
-                ),
-                titleVisibility: .visible
-            ) {
-                if let host = state.hostPendingUnpair {
+                    Button("Cancel", role: .cancel) {}
+                case .unpairHost(let host):
                     Button("Unpair", role: .destructive) {
                         onUnpairHost(host)
-                        state.hostPendingUnpair = nil
                     }
+                    Button("Cancel", role: .cancel) {}
+                case .stopMachine:
+                    Button("Stop machine", role: .destructive) {
+                        Task { await powerModel.stop() }
+                    }
+                    Button("Cancel", role: .cancel) {}
                 }
-                Button("Cancel", role: .cancel) {
-                    state.hostPendingUnpair = nil
+            } message: { confirmation in
+                switch confirmation {
+                case .disconnectComputer:
+                    Text("Relay will revoke this computer’s CLI access and hide its folders on this phone. Files on the Relay machine are not deleted.")
+                case .removeBrowser:
+                    Text("That browser will be signed out.")
+                case .unpairHost:
+                    Text("This phone forgets the machine and deletes the credential it was issued. To retire that credential on the machine too, run `relayd devices revoke` there. Nothing else on the machine is deleted; run `relayd pair` again to reconnect.")
+                case .stopMachine:
+                    Text("Runs stop. Pairing stays on disk. Start it again from this phone when you need it.")
                 }
-            } message: {
-                Text("This phone forgets the machine and deletes the credential it was issued. To retire that credential on the machine too, run `relayd devices revoke` there. Nothing else on the machine is deleted; run `relayd pair` again to reconnect.")
-            }
-            .confirmationDialog(
-                "Stop \(nodeStore.pairedNode?.nodeName ?? "this machine")?",
-                isPresented: $state.showingStopPower,
-                titleVisibility: .visible
-            ) {
-                Button("Stop machine", role: .destructive) {
-                    Task { await powerModel.stop() }
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("Runs stop. Pairing stays on disk. Start it again from this phone when you need it.")
             }
     }
 }
@@ -561,6 +618,7 @@ private struct AccountSettingsSheetsModifier: ViewModifier {
     @ObservedObject var state: AccountSettingsState
     let onReloadHarnesses: () async -> Void
     let onReloadLinkedComputer: () async -> Void
+    let onPairingDismissed: () async -> Void
 
     private var theme: RelayThemePalette { themeStore.palette }
 
@@ -575,47 +633,93 @@ private struct AccountSettingsSheetsModifier: ViewModifier {
                     }
                 }
             }
-            .sheet(item: $state.providerLoginRequest, onDismiss: {
-                Task { await onReloadHarnesses() }
-            }) { provider in
-                ProviderLoginView(client: codexClient, provider: provider)
-            }
-            .sheet(isPresented: $state.showingSignIn) {
-                NavigationStack {
-                    AuthenticationView(accountStore: accountStore)
-                        .toolbar {
-                            ToolbarItem(placement: .cancellationAction) {
-                                Button("Cancel") { state.showingSignIn = false }
-                            }
-                        }
-                }
-                .preferredColorScheme(theme.colorScheme)
-            }
-            .sheet(isPresented: $state.showingPairing) {
-                NodePairingView(
-                    identityStore: identityStore,
-                    nodeStore: nodeStore,
+            .sheet(item: $state.activeSheet, onDismiss: handleSheetDismiss) { sheet in
+                AccountSettingsSheetContent(
+                    sheet: sheet,
                     accountStore: accountStore,
-                    authClient: authClient,
-                    onDismiss: { state.showingPairing = false }
-                )
-            }
-            .sheet(isPresented: $state.showingDiagnosticsSheet) {
-                DiagnosticsView(
+                    nodeStore: nodeStore,
                     identityStore: identityStore,
-                    nodeStore: nodeStore
+                    codexClient: codexClient,
+                    authClient: authClient,
+                    themeStore: themeStore,
+                    onDismissSheet: { state.activeSheet = nil }
                 )
             }
-            .sheet(isPresented: $state.showingCLILink, onDismiss: {
-                Task { await onReloadLinkedComputer() }
-            }) {
-                if let bearer = accountStore.currentSessionToken {
-                    CLILinkScannerView(
-                        authClient: RelayAuthClient(baseURL: AppConfiguration.authBaseURL),
-                        bearerToken: bearer
-                    )
-                }
+    }
+
+    @MainActor
+    private func handleSheetDismiss() {
+        let dismissed = state.lastPresentedSheet
+        state.lastPresentedSheet = nil
+        switch dismissed {
+        case .providerLogin:
+            Task { await onReloadHarnesses() }
+        case .cliLink:
+            Task { await onReloadLinkedComputer() }
+        case .pairing:
+            Task { await onPairingDismissed() }
+        case .signIn, .diagnostics, .none:
+            break
+        }
+    }
+}
+
+private struct AccountSettingsSheetContent: View {
+    let sheet: AccountSettingsSheet
+    @ObservedObject var accountStore: RelayAccountStore
+    @ObservedObject var nodeStore: RelayNodeStore
+    @ObservedObject var identityStore: ClientIdentityStore
+    let codexClient: CodexClient
+    let authClient: RelayAuthClient
+    @ObservedObject var themeStore: RelayThemeStore
+    let onDismissSheet: () -> Void
+
+    private var theme: RelayThemePalette { themeStore.palette }
+
+    var body: some View {
+        switch sheet {
+        case .providerLogin(let provider):
+            ProviderLoginView(client: codexClient, provider: provider)
+                .environment(\.relayTheme, theme)
+        case .signIn:
+            NavigationStack {
+                AuthenticationView(accountStore: accountStore)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Cancel") { onDismissSheet() }
+                        }
+                    }
             }
+            .environment(\.relayTheme, theme)
+            .preferredColorScheme(theme.colorScheme)
+        case .pairing:
+            NodePairingView(
+                identityStore: identityStore,
+                nodeStore: nodeStore,
+                accountStore: accountStore,
+                authClient: authClient,
+                onDismiss: onDismissSheet
+            )
+            .environment(\.relayTheme, theme)
+            .preferredColorScheme(theme.colorScheme)
+        case .diagnostics:
+            DiagnosticsView(
+                identityStore: identityStore,
+                nodeStore: nodeStore
+            )
+            .environment(\.relayTheme, theme)
+        case .cliLink:
+            if let bearer = accountStore.currentSessionToken {
+                CLILinkScannerView(
+                    authClient: RelayAuthClient(baseURL: AppConfiguration.authBaseURL),
+                    bearerToken: bearer
+                )
+                .environment(\.relayTheme, theme)
+            } else {
+                Color.clear
+                    .onAppear { onDismissSheet() }
+            }
+        }
     }
 }
 
@@ -635,7 +739,9 @@ private struct AccountSettingsLifecycleModifier: ViewModifier {
     func body(content: Content) -> some View {
         content
             .onChange(of: accountStore.user?.id) { _, id in
-                if id != nil { state.showingSignIn = false }
+                if id != nil, case .signIn? = state.activeSheet {
+                    state.activeSheet = nil
+                }
                 Task { await onLoadLinkedComputer(true) }
             }
             .task {
@@ -733,13 +839,13 @@ private struct AccountSettingsHostsSection: View {
                             }
                             Button {
                                 state.renameHostDraft = host.nodeName
-                                state.hostPendingRename = host
+                                state.activeAlert = .renameHost(host)
                             } label: {
                                 Label("Rename", systemImage: "pencil")
                             }
                             Divider()
                             Button(role: .destructive) {
-                                state.hostPendingUnpair = host
+                                state.activeConfirmation = .unpairHost(host)
                             } label: {
                                 Label("Unpair machine", systemImage: "trash")
                             }
@@ -771,7 +877,7 @@ private struct AccountSettingsHostsSection: View {
                     RelaySettingsCard {
                         RelayMachinePowerSwitch(
                             model: powerModel,
-                            confirmStop: { state.showingStopPower = true },
+                            confirmStop: { state.activeConfirmation = .stopMachine },
                             accessibilityIdentifier: "relay-settings-hosts-power"
                         )
                         .padding(.horizontal, 16)
@@ -794,7 +900,7 @@ private struct AccountSettingsHostsSection: View {
 
                 // Paseo "+ Add connection" outlined card action
                 Button {
-                    state.showingPairing = true
+                    state.activeSheet = .pairing
                 } label: {
                     HStack(spacing: 8) {
                         Image(systemName: "plus")
@@ -1021,12 +1127,12 @@ private struct AccountSettingsHostDetailView: View {
                     systemImage: "pencil",
                     action: {
                         state.renameHostDraft = liveHost.nodeName
-                        state.hostPendingRename = liveHost
+                        state.activeAlert = .renameHost(liveHost)
                     }
                 ) {
                     RelayButton("Rename", variant: .outline, size: .sm) {
                         state.renameHostDraft = liveHost.nodeName
-                        state.hostPendingRename = liveHost
+                        state.activeAlert = .renameHost(liveHost)
                     }
                 }
 
@@ -1048,7 +1154,7 @@ private struct AccountSettingsHostDetailView: View {
             RelaySettingsCard {
                 RelayMachinePowerSwitch(
                     model: powerModel,
-                    confirmStop: { state.showingStopPower = true },
+                    confirmStop: { state.activeConfirmation = .stopMachine },
                     accessibilityIdentifier: "relay-settings-power"
                 )
                 .padding(.horizontal, 16)
@@ -1113,7 +1219,7 @@ private struct AccountSettingsHostDetailView: View {
                         systemImage: "person.badge.plus",
                         action: {
                             if accountStore.user == nil {
-                                state.showingSignIn = true
+                                state.activeSheet = .signIn
                             } else {
                                 Task { await onRegisterMachine(liveHost) }
                             }
@@ -1128,7 +1234,7 @@ private struct AccountSettingsHostDetailView: View {
                                 size: .sm
                             ) {
                                 if accountStore.user == nil {
-                                    state.showingSignIn = true
+                                    state.activeSheet = .signIn
                                 } else {
                                     Task { await onRegisterMachine(liveHost) }
                                 }
@@ -1164,7 +1270,7 @@ private struct AccountSettingsHostDetailView: View {
                     subtitle: "Forgets this host and deletes its credential on this phone"
                 ) {
                     RelayButton("Unpair", variant: .outline, size: .sm) {
-                        state.hostPendingUnpair = liveHost
+                        state.activeConfirmation = .unpairHost(liveHost)
                     }
                     .accessibilityIdentifier("relay-settings-unpair")
                 }
@@ -1739,7 +1845,7 @@ private struct AccountSettingsCodingAgentsSection: View {
                     // token the provider revoked; signing in again stays one tap away.
                     Menu {
                         Button("Sign in again") {
-                            state.providerLoginRequest = harness.provider
+                            state.activeSheet = .providerLogin(harness.provider)
                         }
                     } label: {
                         HStack(spacing: 5) {
@@ -1761,7 +1867,7 @@ private struct AccountSettingsCodingAgentsSection: View {
                         variant: .outline,
                         size: .sm
                     ) {
-                        state.providerLoginRequest = harness.provider
+                        state.activeSheet = .providerLogin(harness.provider)
                     }
                     .accessibilityIdentifier("relay-agent-sign-in-\(harness.provider.rawValue)")
                 }
@@ -1810,7 +1916,7 @@ private struct AccountSettingsAccountSection: View {
                             subtitle: "Optional — adds laptop handoff, push alerts and `relay login`",
                             systemImage: "person.badge.key",
                             showsChevron: true,
-                            action: { state.showingSignIn = true }
+                            action: { state.activeSheet = .signIn }
                         )
                         .accessibilityIdentifier("relay-settings-sign-in")
 
@@ -1896,7 +2002,7 @@ private struct AccountSettingsAccountSection: View {
                 subtitle: computerSummary,
                 systemImage: "qrcode.viewfinder",
                 showsChevron: true,
-                action: { state.showingCLILink = true }
+                action: { state.activeSheet = .cliLink }
             )
             .disabled(computerLinkStore.isLoading || computerLinkStore.isDisconnecting || state.isRemovingBrowser)
             .accessibilityIdentifier("relay-approve-sign-in")
@@ -1929,7 +2035,7 @@ private struct AccountSettingsAccountSection: View {
         ) {
             RelayButton("Delete", variant: .outline, size: .sm, isDisabled: accountStore.isWorking) {
                 state.deletionPassword = ""
-                state.showingDeleteConfirmation = true
+                state.activeAlert = .deleteAccount
             }
             .accessibilityIdentifier("relay-delete-account")
         }
@@ -1978,7 +2084,7 @@ private struct AccountSettingsAccountSection: View {
             systemImage: "laptopcomputer"
         ) {
             Menu {
-                Button("Disconnect computer", role: .destructive) { state.showingDisconnectConfirmation = true }
+                Button("Disconnect computer", role: .destructive) { state.activeConfirmation = .disconnectComputer }
                     .accessibilityIdentifier("relay-disconnect-computer")
             } label: {
                 Image(systemName: "ellipsis")
@@ -2005,7 +2111,7 @@ private struct AccountSettingsAccountSection: View {
             systemImage: "globe"
         ) {
             Menu {
-                Button("Remove", role: .destructive) { state.browserToRemove = browser }
+                Button("Remove", role: .destructive) { state.activeConfirmation = .removeBrowser(browser) }
                     .accessibilityIdentifier("relay-remove-browser")
             } label: {
                 Image(systemName: "ellipsis")
@@ -2048,7 +2154,7 @@ private struct AccountSettingsDiagnosticsSection: View {
                         if let onOpenDiagnostics {
                             onOpenDiagnostics()
                         } else {
-                            state.showingDiagnosticsSheet = true
+                            state.activeSheet = .diagnostics
                         }
                     }
                 )

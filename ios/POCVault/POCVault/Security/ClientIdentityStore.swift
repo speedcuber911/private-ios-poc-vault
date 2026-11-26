@@ -303,6 +303,10 @@ final class ClientIdentityStore: ObservableObject {
     func importIdentity(from url: URL, passphrase: String, pinnedHost: String?) throws -> URLCredential {
         let data = try Data(contentsOf: url)
         let imported = try Self.importPKCS12(data, passphrase: passphrase)
+        let existingMaterial = pairedMaterial()
+        if existingMaterial.pinnedHost != nil || existingMaterial.deviceTokenHost != nil {
+            updatePairedMaterial { captureActiveHost(in: &$0) }
+        }
         try save(identity: imported.identity, label: url.deletingPathExtension().lastPathComponent)
         // The issuing CA goes into the keychain alongside the identity, not
         // only into defaults for pinning.

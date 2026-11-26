@@ -40,8 +40,10 @@ final class RelayQRCameraUIView: UIView, AVCaptureMetadataOutputObjectsDelegate 
     var onDenied: (() -> Void)?
 
     private let session = AVCaptureSession()
+    private let sessionQueue = DispatchQueue(label: "com.parikshit.pocvault.qr-camera", qos: .userInitiated)
     private var previewLayer: AVCaptureVideoPreviewLayer?
     private var didEmit = false
+    private var isStopped = false
 
     override func layoutSubviews() {
         super.layoutSubviews()
@@ -49,16 +51,18 @@ final class RelayQRCameraUIView: UIView, AVCaptureMetadataOutputObjectsDelegate 
     }
 
     func start() {
+        isStopped = false
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
             configureSession()
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
                 DispatchQueue.main.async {
+                    guard let self, !self.isStopped else { return }
                     if granted {
-                        self?.configureSession()
+                        self.configureSession()
                     } else {
-                        self?.onDenied?()
+                        self.onDenied?()
                     }
                 }
             }
@@ -68,19 +72,23 @@ final class RelayQRCameraUIView: UIView, AVCaptureMetadataOutputObjectsDelegate 
     }
 
     func stop() {
-        if session.isRunning { session.stopRunning() }
+        isStopped = true
+        sessionQueue.async { [weak self] in
+            guard let self, self.session.isRunning else { return }
+            self.session.stopRunning()
+        }
     }
 
     private func configureSession() {
-        guard previewLayer == nil else { return }
+        guard !isStopped, previewLayer == nil else { return }
         session.beginConfiguration()
-        defer { session.commitConfiguration() }
 
         guard
             let device = AVCaptureDevice.default(for: .video),
             let input = try? AVCaptureDeviceInput(device: device),
             session.canAddInput(input)
         else {
+            session.commitConfiguration()
             onDenied?()
             return
         }
@@ -88,12 +96,20 @@ final class RelayQRCameraUIView: UIView, AVCaptureMetadataOutputObjectsDelegate 
 
         let output = AVCaptureMetadataOutput()
         guard session.canAddOutput(output) else {
+            session.commitConfiguration()
             onDenied?()
             return
         }
         session.addOutput(output)
         output.setMetadataObjectsDelegate(self, queue: DispatchQueue.main)
+        guard output.availableMetadataObjectTypes.contains(.qr) else {
+            session.commitConfiguration()
+            onDenied?()
+            return
+        }
         output.metadataObjectTypes = [.qr]
+
+        session.commitConfiguration()
 
         let layer = AVCaptureVideoPreviewLayer(session: session)
         layer.videoGravity = .resizeAspectFill
@@ -101,8 +117,9 @@ final class RelayQRCameraUIView: UIView, AVCaptureMetadataOutputObjectsDelegate 
         self.layer.addSublayer(layer)
         previewLayer = layer
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.session.startRunning()
+        sessionQueue.async { [weak self] in
+            guard let self, !self.session.isRunning else { return }
+            self.session.startRunning()
         }
     }
 
